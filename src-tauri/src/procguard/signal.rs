@@ -64,8 +64,29 @@ impl Me {
     }
 }
 
+/// The payload of every error [`refusal`] makes, so a refusal by this module
+/// can be told from an `InvalidInput` the system call itself returned (`EINVAL`).
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 fn refusal(why: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, why.into())
+    io::Error::new(io::ErrorKind::InvalidInput, Refused(why.into()))
+}
+
+/// Whether `error` is this module declining to signal, rather than the
+/// signalling call failing.
+pub fn is_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<Refused>().is_some())
 }
 
 /// Whether `id` could be an ordinary process or group id. 0 and negative values
@@ -154,6 +175,42 @@ pub fn vet_process(
             "pid {pid} now belongs to a different process"
         ))),
         None => Err(refusal(format!("pid {pid} is no longer running"))),
+    }
+}
+
+/// The decision behind retrying a pid whose earlier kill failed: `Ok` only when
+/// the process now holding `pid` started inside `born` (wall-clock µs readings
+/// taken just before and just after the child was created), give or take
+/// `slack_us` for clock granularity. A pid reused after the child exited starts
+/// after the window; an empty window and an unreadable start time refuse too.
+pub fn vet_spawn_window(
+    pid: i32,
+    born: (u64, u64),
+    slack_us: u64,
+    me: Me,
+    start_of: &dyn Fn(i32) -> Option<u64>,
+) -> io::Result<()> {
+    plain_id(pid, "process")?;
+    if pid == me.pid {
+        return Err(refusal("refusing to signal this process"));
+    }
+    let (before, after) = born;
+    if before == 0 || after < before {
+        return Err(refusal(
+            "no spawn window was recorded, so the pid cannot be told from a reused one",
+        ));
+    }
+    match start_of(pid) {
+        Some(started)
+            if started >= before.saturating_sub(slack_us)
+                && started <= after.saturating_add(slack_us) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(refusal(format!(
+            "pid {pid} started outside the window its child was spawned in"
+        ))),
+        None => Err(refusal(format!("pid {pid} start time cannot be read"))),
     }
 }
 
@@ -247,6 +304,23 @@ mod tests {
 
     /// The ids that reach more than one process, or the wrong one, are never
     /// delivered — including the `u32` values that wrap negative as a `pid_t`.
+    #[test]
+    fn a_pid_that_started_after_the_spawn_window_is_refused() {
+        let window = (1_000_000, 1_000_500);
+        let slack = 2_000;
+        let at = |t: u64| move |_: i32| Some(t);
+        assert!(vet_spawn_window(600, window, slack, ME, &at(1_000_200)).is_ok());
+        assert!(vet_spawn_window(600, window, slack, ME, &at(1_000_000 - slack)).is_ok());
+        assert!(vet_spawn_window(600, window, slack, ME, &at(1_000_500 + slack)).is_ok());
+        assert!(vet_spawn_window(600, window, slack, ME, &at(1_000_500 + slack + 1)).is_err());
+        assert!(vet_spawn_window(600, window, slack, ME, &at(1_000_000 - slack - 1)).is_err());
+        assert!(vet_spawn_window(600, window, slack, ME, &|_| None).is_err());
+        assert!(vet_spawn_window(600, (0, 0), slack, ME, &at(1)).is_err());
+        assert!(vet_spawn_window(600, (5, 4), slack, ME, &at(5)).is_err());
+        assert!(vet_spawn_window(ME.pid, window, slack, ME, &at(1_000_200)).is_err());
+        assert!(vet_spawn_window(1, window, slack, ME, &at(1_000_200)).is_err());
+    }
+
     #[test]
     fn ids_that_address_more_than_one_process_are_refused() {
         for id in [0, 1, -1, -2, i32::MIN] {
