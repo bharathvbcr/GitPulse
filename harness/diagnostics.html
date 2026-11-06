@@ -169,6 +169,87 @@
       fixture.cmd_devmap_status=()=>({available:true,reason:null,status:null});
       fixture.cmd_diagnostic_log_tail=()=>[];
     }
+    // cmd_devmap_status has a 30s deadline. A map that has already arrived
+    // must paint without waiting for that probe, and a superseded reload
+    // must not leave the panel loading once the newer map has settled.
+    {
+      const cap = (shown, total) => ({ shown, total, truncated: false });
+      const mapLoad = (area) => ({
+        available: true,
+        reason: null,
+        path: "/r/diagnostics/repo_map.json",
+        failure: null,
+        map: {
+          generated_head: "h",
+          indexed_hash: "h",
+          content_fingerprint: "h",
+          graph_degraded: false,
+          graph_degraded_reason: "",
+          liveness_unreachable_unreliable: false,
+          entry_roots: [],
+          subsystems: [{
+            area,
+            summary: "map arrived on its own",
+            entry_points: [],
+            critical_files: [],
+            neighbors: [],
+            handoff_paths: [],
+            role_files: {},
+            role_file_counts: {},
+          }],
+          unwired_candidates: [],
+          dead_symbol_candidates: [],
+          unreachable_files: [],
+          liveness_meta: {
+            dead_symbol: { shown: 0, total: 0, truncated: false, count: 0 },
+            entry_roots: cap(0, 0),
+            subsystems: {
+              shown: 1, total: 1, truncated: false, dropped_no_area: 0,
+              neighbors_shown: 0, neighbors_total: 0, neighbors_truncated: false,
+              handoff_paths_shown: 0, handoff_paths_total: 0, handoff_paths_truncated: false,
+              role_files_shown: 0, role_files_total: 0, role_files_truncated: false,
+              neighbors_endpoints_unresolved: 0,
+            },
+            important_files: cap(0, 0),
+            unwired: { shown: 0, total: 0, truncated: false, excluded_coverage_loss: 0, excluded_import_blind: 0 },
+            unavailable: {},
+          },
+          languages: [],
+          important_files: [],
+          package_managers: [],
+          test_commands: [],
+        },
+      });
+      const {liveIndex} = await import("../src/lib/codeintel/liveIndex.ts");
+      const snapshot = (revision) => ({ "/r/diagnostics": { phase: "ready", decision: "refresh", reason: null, updatedAt: revision, refreshing: false, revision } });
+      const quietStatus = { available: true, reason: null, status: null };
+      fixture.cmd_devmap_repo_map = () => defer("map-body", {});
+      fixture.cmd_devmap_status = () => defer("map-status", {});
+      liveIndex.snapshots.set(snapshot(41));
+      await settle();
+      const staleMap = requests.some((r) => r.kind === "map-body") ? take("map-body") : null;
+      const staleStatus = requests.some((r) => r.kind === "map-status") ? take("map-status") : null;
+      fixture.cmd_devmap_repo_map = () => mapLoad("NEWER-MAP-AREA");
+      liveIndex.snapshots.set(snapshot(42));
+      await settle();
+      check(
+        "a stalled devmap status probe does not hold an arrived map",
+        target.textContent.includes("NEWER-MAP-AREA") && !target.textContent.includes("Loading map") && staleMap !== null && requests.some((r) => r.kind === "map-status"),
+        `pending status=${requests.some((r) => r.kind === "map-status")} started=${staleMap !== null} text=${target.textContent.slice(0, 280)}`,
+      );
+      if (staleMap) staleMap.resolve(mapLoad("STALE-MAP-AREA"));
+      await settle();
+      check(
+        "a superseded reload does not replace the map or leave the panel loading",
+        target.textContent.includes("NEWER-MAP-AREA") && !target.textContent.includes("STALE-MAP-AREA") && !target.textContent.includes("Loading map"),
+        target.textContent.slice(0, 280),
+      );
+      while (requests.some((r) => r.kind === "map-status")) take("map-status").resolve(quietStatus);
+      if (staleStatus) staleStatus.resolve(quietStatus);
+      await settle();
+      fixture.cmd_devmap_repo_map = () => ({ available: false, reason: "Harness: map not indexed", map: null, path: null });
+      fixture.cmd_devmap_status = () => quietStatus;
+    }
     await click("Docs");
     check("250 repeated broken links show the honest 200-row cap",target.querySelectorAll("li").length===200 && target.textContent.includes("250"),target.textContent.slice(-150));
     const priorLoads=calls.get("cmd_devmap_repo_map");
