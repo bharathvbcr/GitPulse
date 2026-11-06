@@ -340,6 +340,7 @@ impl PartialEq<String> for CommandError {
 /// against the command sources by `every_replay_safe_read_is_a_command`.
 pub(crate) const REPLAY_SAFE_READS: &[&str] = &[
     "cmd_branch_stats",
+    "cmd_get_commit_bodies",
     "cmd_get_commit_details",
     "cmd_get_commit_diff",
     "cmd_get_commit_file_diff",

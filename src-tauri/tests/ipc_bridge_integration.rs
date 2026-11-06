@@ -55,6 +55,7 @@ fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime
             gitpulse_lib::commands::cmd_get_compare_diff,
             gitpulse_lib::commands::cmd_get_compare_files,
             gitpulse_lib::commands::cmd_get_commit_notes,
+            gitpulse_lib::commands::cmd_get_commit_bodies,
             gitpulse_lib::commands::cmd_get_reflog,
             gitpulse_lib::commands::cmd_hygiene_prepare,
             gitpulse_lib::commands::cmd_hygiene_execute,
@@ -930,6 +931,16 @@ fn compare_and_notes_reads_keep_their_wire_names() {
     assert!(rows[0]["note"].is_null(), "{notes}");
     assert_eq!(rows[1]["note"].as_str(), Some("reviewed"), "{notes}");
     assert!(rows[1].get("commit_id").is_some(), "{notes}");
+
+    let bodies = invoke(
+        "cmd_get_commit_bodies",
+        json!({ "repoPath": root, "commitIds": [second] }),
+    )
+    .expect("bodies");
+    let rows = bodies.as_array().expect("bodies array");
+    assert_eq!(rows.len(), 1, "{bodies}");
+    assert_eq!(rows[0]["body"].as_str(), Some(""), "{bodies}");
+    assert!(rows[0].get("commit_id").is_some(), "{bodies}");
 }
 
 #[test]

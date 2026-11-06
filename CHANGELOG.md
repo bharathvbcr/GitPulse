@@ -34,7 +34,10 @@ before that tag is pushed.
     Shift+Enter to start a comparison and Esc to cancel it.
 - New read commands `cmd_get_compare_diff` (whole or one file, with renames
   paired to their source like a commit's file), `cmd_get_compare_files` (capped,
-  and says when it was cut) and `cmd_get_commit_notes` (batched, input order).
+  and says when it was cut), `cmd_get_commit_notes` and `cmd_get_commit_bodies`
+  (batched, input order). The card reads a commit's message alone, one
+  `git log --no-walk`, never the whole patch the details pane walks, so the first
+  hover on a commit of thousands of files costs what any other does.
 
 ### Fixed
 

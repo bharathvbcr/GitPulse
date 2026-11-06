@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 106 contracts over
- * 262 structs, spanning both wire surfaces: command returns and event payloads.
+ * 263 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -145,7 +145,7 @@ export const CONTRACTS = Object.freeze([
   // The Diff view's history rail: a comparison's file list (whose `truncated`
   // is what keeps a cut list from passing as whole) and a commit's git note
   // (whose `note: null` is a measured "no note", never a failed read).
-  { label: "diff-compare", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("diff", "compareTypes.ts"), structs: ["CompareFiles", "CommitNote"] },
+  { label: "diff-compare", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("diff", "compareTypes.ts"), structs: ["CompareFiles", "CommitBody", "CommitNote"] },
   // The doc vault's coverage honesty (`notScanned` is what says a search or a
   // rename did not see every note) and a rename's per-file results, which are
   // how a partial rename is told apart from a complete one.

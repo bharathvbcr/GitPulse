@@ -137,6 +137,7 @@
     "allow-cmd-get-commit-file-diff",
     "allow-cmd-get-commit-files",
     "allow-cmd-get-commit-graph",
+    "allow-cmd-get-commit-bodies",
     "allow-cmd-get-commit-notes",
     "allow-cmd-get-compare-diff",
     "allow-cmd-get-compare-files",

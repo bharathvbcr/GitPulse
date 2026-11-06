@@ -2,7 +2,7 @@
  * Wire shapes of the two-commit comparison and commit-notes reads.
  *
  * Kept out of `.svelte` files (the `wire-type-locality-contract` forbids
- * snake_case payload shapes there). Mirrors `CompareFiles` and `CommitNote`
+ * snake_case payload shapes there). Mirrors `CompareFiles`, `CommitBody` and `CommitNote`
  * in `src-tauri/src/engine/git_reader.rs`.
  */
 import type { CommitFileChange } from "../stores/graphStore";
@@ -14,6 +14,13 @@ export interface CompareFiles {
   truncated?: boolean;
   /** Why it was cut, as a clause; absent (never null) when whole. */
   truncation_reason?: string;
+}
+
+/** One row of `cmd_get_commit_bodies`, in the order the ids were asked. */
+export interface CommitBody {
+  commit_id: string;
+  /** The message after its summary line; empty when there is none. */
+  body: string;
 }
 
 /** One row of `cmd_get_commit_notes`, in the order the ids were asked. */

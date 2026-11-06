@@ -259,7 +259,15 @@ pub struct CommitNote {
     pub note: Option<String>,
 }
 
-/// How many commits one notes read may name: the hover card asks for one at a
+/// One commit's message body ([`GitReader::get_commit_bodies`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitBody {
+    pub commit_id: String,
+    /// Everything after the summary line; empty when the message has none.
+    pub body: String,
+}
+
+/// How many commits one notes or bodies read may name: the hover card asks for one at a
 /// time, so this bounds a caller that asks for a whole history.
 pub const MAX_NOTES_BATCH: usize = 200;
 
@@ -1689,10 +1697,54 @@ impl GitReader {
         repo_path: &str,
         commit_ids: &[String],
     ) -> Result<Vec<CommitNote>, CommandError> {
+        let found = Self::log_field_per_commit(repo_path, commit_ids, "--notes", "%N", "notes")?;
+        Ok(commit_ids
+            .iter()
+            .zip(found)
+            .map(|(id, note)| CommitNote {
+                commit_id: id.clone(),
+                note: note.filter(|text| !text.trim().is_empty()),
+            })
+            .collect())
+    }
+
+    /// The message body (everything after the summary line) of each of
+    /// `commit_ids`, in input order: one `git log --no-walk` that reads the
+    /// commit objects and nothing else. The hover card's read, kept apart
+    /// from [`Self::get_commit_details`], whose `git show --numstat` walks the
+    /// whole patch — seconds on a commit that touched thousands of files, to
+    /// answer a question about its message. An empty body is a real answer.
+    pub fn get_commit_bodies(
+        repo_path: &str,
+        commit_ids: &[String],
+    ) -> Result<Vec<CommitBody>, CommandError> {
+        let found =
+            Self::log_field_per_commit(repo_path, commit_ids, "--no-notes", "%b", "messages")?;
+        Ok(commit_ids
+            .iter()
+            .zip(found)
+            .map(|(id, body)| CommitBody {
+                commit_id: id.clone(),
+                body: body.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// One `git log --no-walk` field per commit, in input order; `None` for an
+    /// id git printed nothing for. Bounded by [`MAX_NOTES_BATCH`] and refused
+    /// whole when git's answer was cut, so a partial read never passes for a
+    /// set of commits with nothing to say.
+    fn log_field_per_commit(
+        repo_path: &str,
+        commit_ids: &[String],
+        notes_flag: &str,
+        placeholder: &str,
+        what: &str,
+    ) -> Result<Vec<Option<String>>, CommandError> {
         let repo = validate_repo(repo_path)?;
         if commit_ids.len() > MAX_NOTES_BATCH {
             return Err(format!(
-                "asked for the notes of {} commits; at most {MAX_NOTES_BATCH} are read at once",
+                "asked for the {what} of {} commits; at most {MAX_NOTES_BATCH} are read at once",
                 commit_ids.len()
             )
             .into());
@@ -1703,26 +1755,23 @@ impl GitReader {
         if commit_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut args = vec![
-            "log",
-            "--no-walk=unsorted",
-            "--notes",
-            "--format=%H%x00%N%x1e",
-        ];
+        let format = format!("--format=%H%x00{placeholder}%x1e");
+        let mut args = vec!["log", "--no-walk=unsorted", notes_flag, format.as_str()];
         args.extend(commit_ids.iter().map(String::as_str));
         let (stdout, cut) = git_text_capped(&repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
         if let Some(reason) = cut {
-            return Err(format!("the notes could not be read whole: {}", reason.describe()).into());
+            return Err(
+                format!("the {what} could not be read whole: {}", reason.describe()).into(),
+            );
         }
-        let by_id = parse_commit_notes(&stdout);
+        let by_id = parse_log_fields(&stdout);
         Ok(commit_ids
             .iter()
-            .map(|id| CommitNote {
-                commit_id: id.clone(),
-                note: by_id
+            .map(|id| {
+                by_id
                     .iter()
                     .find(|(full, _)| full.starts_with(id.as_str()))
-                    .and_then(|(_, note)| note.clone()),
+                    .map(|(_, field)| field.clone().unwrap_or_default())
             })
             .collect())
     }
@@ -6295,10 +6344,11 @@ fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
     sources
 }
 
-/// Reads `git log --format=%H%x00%N%x1e` into (full id, note) pairs. Git ends
-/// a note with a newline of its own and `--format` puts one between records;
-/// both are layout, not note text. A blank note is no note.
-fn parse_commit_notes(stdout: &str) -> Vec<(String, Option<String>)> {
+/// Reads `git log --format=%H%x00<field>%x1e` (a note `%N`, a body `%b`) into
+/// (full id, field) pairs. Git ends the field with a newline of its own and
+/// `--format` puts one between records; both are layout, not text. A blank
+/// field is none.
+fn parse_log_fields(stdout: &str) -> Vec<(String, Option<String>)> {
     stdout
         .split('\u{1e}')
         .filter_map(|record| {
@@ -11145,18 +11195,63 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert!(GitReader::get_commit_notes(path, &too_many).is_err());
     }
 
+    /// Bodies come back in input order with the summary line left out, an
+    /// empty body as an empty string, and nothing a note says leaking in.
     #[test]
-    fn parse_commit_notes_keeps_note_text_and_drops_layout() {
+    fn commit_bodies_answer_each_id_in_order_without_notes() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "subject only"]);
+        let bare = rev_parse_at(dir.path(), "HEAD");
+        std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(
+            dir.path(),
+            &[
+                "commit",
+                "-m",
+                "subject",
+                "-m",
+                "why it changed\n\nsecond paragraph",
+            ],
+        );
+        let full = rev_parse_at(dir.path(), "HEAD");
+        git_in(dir.path(), &["notes", "add", "-m", "a note", &full]);
+
+        let bodies = GitReader::get_commit_bodies(path, &[full.clone(), bare[..10].to_string()])
+            .expect("bodies");
+        assert_eq!(
+            bodies,
+            vec![
+                CommitBody {
+                    commit_id: full,
+                    body: "why it changed\n\nsecond paragraph".to_string(),
+                },
+                CommitBody {
+                    commit_id: bare[..10].to_string(),
+                    body: String::new(),
+                },
+            ]
+        );
+        assert!(GitReader::get_commit_bodies(path, &["main".to_string()]).is_err());
+        let too_many = vec![bare; MAX_NOTES_BATCH + 1];
+        assert!(GitReader::get_commit_bodies(path, &too_many).is_err());
+    }
+
+    #[test]
+    fn parse_log_fields_keeps_field_text_and_drops_layout() {
         let out = "aaa\0first line\n\nthird\n\n\u{1e}\nbbb\0\n\u{1e}\nccc\0   \n\u{1e}\n";
         assert_eq!(
-            parse_commit_notes(out),
+            parse_log_fields(out),
             vec![
                 ("aaa".to_string(), Some("first line\n\nthird".to_string())),
                 ("bbb".to_string(), None),
                 ("ccc".to_string(), None),
             ]
         );
-        assert!(parse_commit_notes("").is_empty());
+        assert!(parse_log_fields("").is_empty());
     }
 
     /// Without `--diff-merges` (git < 2.31) the same first-parent rendering is

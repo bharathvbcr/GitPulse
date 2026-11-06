@@ -70,6 +70,7 @@ const fixtures={
  cmd_get_compare_diff:a=>{calls.push({cmd:"cmd_get_compare_diff",args:a});return {text:patch(a.filePath??"both.ts",`compare ${a.from.slice(0,4)}..${a.to.slice(0,4)}`),truncated:false};},
  cmd_get_compare_files:a=>{calls.push({cmd:"cmd_get_compare_files",args:a});return {files:[{path:"compared-a.ts",status_code:"M",additions:3,deletions:1},{path:"compared-b.ts",status_code:"R",additions:0,deletions:0}]};},
  cmd_get_commit_details:a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:"Ada",author_email:"ada@example.com",author_date:"",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:"s",body:`Body of ${a.commitId.slice(0,4)}: why this change was made.`,co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};},
+ cmd_get_commit_bodies:a=>{calls.push({cmd:"cmd_get_commit_bodies",args:a});return a.commitIds.map(id=>({commit_id:id,body:`Body of ${id.slice(0,4)}: why this change was made.`}));},
  cmd_get_commit_notes:a=>{calls.push({cmd:"cmd_get_commit_notes",args:a});return a.commitIds.map(id=>({commit_id:id,note:id===hex(2)?"Reviewed by Ana — ship it":null}));},
  // The card renders the body as Markdown, through the same Rust renderer the
  // details pane uses; the fixture answers as it would for one plain paragraph.
@@ -135,6 +136,7 @@ const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbl
  tab("History").click();await until(()=>list(),"history by click");
 
  // --- hover card ------------------------------------------------------------
+ const detailsBeforeHover=callsOf("cmd_get_commit_details").length;
  pointerEnter(row(2));await until(()=>card(),"card");
  check("hovering a row shows the commit card beside the rail",()=>card().textContent.includes("commit number 2")&&card().getBoundingClientRect().left>=rail().getBoundingClientRect().right-4);
  await until(()=>card()?.querySelector("[data-card-body]"),"card body");
@@ -145,9 +147,10 @@ const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbl
  await until(()=>card()?.querySelector("[data-card-provenance]"),"provenance");
  check("the card shows the commit's recorded verification",()=>card().querySelector("[data-card-provenance]").textContent.length>0);
  check("provenance is one batch for the rows in view",()=>callsOf("cmd_provenance_freshness_batch").length>=1&&callsOf("cmd_provenance_freshness_batch")[0].args.revisions.length>1);
- const detailReads=callsOf("cmd_get_commit_details").length;
+ const detailReads=callsOf("cmd_get_commit_bodies").length;
  pointerEnter(row(4));await wait(80);pointerEnter(row(2));await wait(350);
- check("hovering back answers from the cache, and a row only swept across is never read",()=>callsOf("cmd_get_commit_details").length===detailReads);
+ check("hovering back answers from the cache, and a row only swept across is never read",()=>callsOf("cmd_get_commit_bodies").length===detailReads);
+ check("the card reads the message alone, never the whole patch the details read walks",()=>callsOf("cmd_get_commit_details").length===detailsBeforeHover&&callsOf("cmd_get_commit_bodies").every(c=>c.args.commitIds.length===1));
  list().dispatchEvent(new PointerEvent("pointerleave",{bubbles:false,pointerType:"mouse"}));await tick();
  check("leaving the list hides the card",()=>!card());
 

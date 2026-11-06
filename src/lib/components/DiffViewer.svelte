@@ -57,7 +57,7 @@
   import { currentHeadTip } from "../stores/headTip";
   import { graphStore } from "../stores/graphStore";
   import { liveIndex } from "../codeintel/liveIndex";
-  import type { CommitDetails, CommitFileChange } from "../stores/graphStore";
+  import type { CommitFileChange } from "../stores/graphStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import DiffFileRail from "./DiffFileRail.svelte";
   import {
@@ -70,7 +70,7 @@
   import { commitLabel, compareLabel, type RailTab } from "../diff/historyRail";
   import { createCommitHover } from "../diff/commitHover";
   import { shortHash } from "../format";
-  import type { CompareFiles, CommitNote } from "../diff/compareTypes";
+  import type { CommitBody, CompareFiles, CommitNote } from "../diff/compareTypes";
   import {
     buildCloseTargets,
     buildRefsByCommit,
@@ -937,8 +937,16 @@
    * plain git note.
    */
   const commitHover = createCommitHover({
-    readBody: async (repoPath, commitId) =>
-      (await invoke<CommitDetails>("cmd_get_commit_details", { repoPath, commitId })).body ?? "",
+    // The message alone: the details read walks the whole patch, which on a
+    // commit of thousands of files is seconds spent to show a paragraph.
+    readBody: async (repoPath, commitId) => {
+      const rows = await invoke<CommitBody[]>("cmd_get_commit_bodies", {
+        repoPath,
+        commitIds: [commitId],
+      });
+      if (rows.length !== 1) throw new Error(`asked for 1 message and got ${rows.length}`);
+      return rows[0].body;
+    },
     readNote: async (repoPath, commitId) => {
       const rows = await invoke<CommitNote[]>("cmd_get_commit_notes", {
         repoPath,

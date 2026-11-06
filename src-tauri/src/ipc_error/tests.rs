@@ -341,6 +341,7 @@ fn replay_safe_reads_are_exactly_the_reviewed_list() {
         REPLAY_SAFE_READS,
         [
             "cmd_branch_stats",
+            "cmd_get_commit_bodies",
             "cmd_get_commit_details",
             "cmd_get_commit_diff",
             "cmd_get_commit_file_diff",

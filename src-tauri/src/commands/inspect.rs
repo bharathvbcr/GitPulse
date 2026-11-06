@@ -105,6 +105,17 @@ pub async fn cmd_get_compare_files(
     off_thread(move || GitReader::get_compare_files(&repo_path, &from, &to)).await
 }
 
+/// Message bodies for a batch of commits, in input order: the hover card's
+/// read, which needs the message and not the patch `cmd_get_commit_details`
+/// walks.
+#[tauri::command(async)]
+pub async fn cmd_get_commit_bodies(
+    repo_path: String,
+    commit_ids: Vec<String>,
+) -> Result<Vec<CommitBody>, IpcError> {
+    off_thread(move || GitReader::get_commit_bodies(&repo_path, &commit_ids)).await
+}
+
 /// Plain git notes for a batch of commits, in input order.
 #[tauri::command(async)]
 pub async fn cmd_get_commit_notes(
