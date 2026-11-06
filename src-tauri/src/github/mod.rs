@@ -126,6 +126,11 @@ pub struct GitHubContext {
     /// True when more open pull requests exist than the display cap kept.
     #[serde(default)]
     pub prs_truncated: bool,
+    /// Set when the `gh pr list` listing could not run or be parsed, while the
+    /// rest of the context is still usable. An empty `pull_requests` with this
+    /// set is "could not check", not "no open pull requests".
+    #[serde(default)]
+    pub prs_error: Option<String>,
     pub issues: Vec<IssueInfo>,
     pub issues_truncated: bool,
     pub issues_error: Option<String>,
@@ -2399,6 +2404,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 html_url: String::new(),
                 pull_requests: Vec::new(),
                 prs_truncated: false,
+                prs_error: None,
                 issues: Vec::new(),
                 issues_truncated: false,
                 runs_error: None,
@@ -2422,6 +2428,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 html_url: String::new(),
                 pull_requests: Vec::new(),
                 prs_truncated: false,
+                prs_error: None,
                 issues: Vec::new(),
                 issues_truncated: false,
                 runs_error: None,
@@ -2447,6 +2454,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             html_url: remote.html_url(),
             pull_requests: Vec::new(),
             prs_truncated: false,
+            prs_error: None,
             issues: Vec::new(),
             issues_truncated: false,
             runs_error: None,
@@ -2461,7 +2469,6 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         };
     }
 
-    let html_url = remote.html_url();
     let (
         (issues, issues_truncated, issues_error),
         (releases, releases_truncated, releases_error),
@@ -2495,6 +2502,27 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         )
     });
 
+    assemble_github_context(
+        remote,
+        (issues, issues_truncated, issues_error),
+        (releases, releases_truncated, releases_error),
+        pr_outcome,
+        run_outcome,
+    )
+}
+
+type ListingOutcome<T> = Result<(Vec<T>, bool), CommandError>;
+
+/// Folds the four section listings into one context. Pure, so the degradation
+/// rules are testable without spawning `gh`.
+fn assemble_github_context(
+    remote: GitHubRepoRef,
+    (issues, issues_truncated, issues_error): (Vec<IssueInfo>, bool, Option<CommandError>),
+    (releases, releases_truncated, releases_error): (Vec<ReleaseInfo>, bool, Option<CommandError>),
+    pr_outcome: ListingOutcome<PullRequestInfo>,
+    run_outcome: ListingOutcome<WorkflowRunInfo>,
+) -> GitHubContext {
+    let html_url = remote.html_url();
     // Degrade each section independently: a fetch/parse failure keeps the
     // repository facts and carries its reason in both the structured field
     // and `warnings`, never masquerading as an empty-but-complete list.
@@ -2566,6 +2594,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         html_url,
         pull_requests,
         prs_truncated,
+        prs_error: pr_error.map(CommandError::into_message),
         issues,
         issues_truncated,
         issues_error: issues_error.map(CommandError::into_message),
@@ -2679,6 +2708,69 @@ mod tests {
         let run = runs.first().expect("one run");
         assert_eq!(run.id, 42);
         assert_eq!(run.title, "build");
+    }
+
+    fn assembly_remote() -> GitHubRepoRef {
+        GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "alpha".into(),
+        }
+    }
+
+    fn assemble_with(
+        pr_outcome: ListingOutcome<PullRequestInfo>,
+        issues_error: Option<CommandError>,
+    ) -> GitHubContext {
+        assemble_github_context(
+            assembly_remote(),
+            (Vec::new(), false, issues_error),
+            (Vec::new(), false, None),
+            pr_outcome,
+            Ok((Vec::new(), false)),
+        )
+    }
+
+    /// Regression: a failed `gh pr list` became an empty, untruncated list
+    /// with the reason only in `warnings`, which the panel could not tell
+    /// from "no open pull requests". It now carries the reason structurally,
+    /// as issues, runs and releases do.
+    #[test]
+    fn a_failed_pr_listing_carries_its_reason_beside_the_empty_list() {
+        let ctx = assemble_with(Err("gh: API rate limit exceeded".into()), None);
+        assert!(ctx.pull_requests.is_empty() && !ctx.prs_truncated);
+        assert_eq!(
+            ctx.prs_error.as_deref(),
+            Some("gh: API rate limit exceeded")
+        );
+        assert!(ctx.available, "other sections still came back");
+        assert!(ctx.warnings.iter().any(|w| w.contains("rate limit")));
+    }
+
+    #[test]
+    fn a_successful_empty_pr_listing_has_no_error() {
+        let ctx = assemble_with(Ok((Vec::new(), false)), None);
+        assert!(ctx.pull_requests.is_empty());
+        assert_eq!(ctx.prs_error, None);
+        assert!(ctx.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_pr_error_alongside_another_failed_section_keeps_both_reasons() {
+        let ctx = assemble_with(Err("pr boom".into()), Some("issues boom".into()));
+        assert_eq!(ctx.prs_error.as_deref(), Some("pr boom"));
+        assert_eq!(ctx.issues_error.as_deref(), Some("issues boom"));
+        assert_eq!(ctx.warnings.len(), 2);
+    }
+
+    #[test]
+    fn the_pr_error_serialises_under_its_own_name_and_defaults_when_absent() {
+        let ctx = assemble_with(Err("x".into()), None);
+        let mut value = serde_json::to_value(&ctx).expect("serialises");
+        assert_eq!(value["prs_error"], "x");
+        value.as_object_mut().expect("object").remove("prs_error");
+        let back: GitHubContext = serde_json::from_value(value).expect("older payload parses");
+        assert_eq!(back.prs_error, None);
     }
 
     /// Regression: the PR and workflow-run sections fetch LIMIT+1 rows and

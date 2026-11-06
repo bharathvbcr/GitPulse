@@ -20,6 +20,7 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
             html_url: String::new(),
             pull_requests: Vec::new(),
             prs_truncated: false,
+            prs_error: None,
             workflow_runs: Vec::new(),
             runs_error: None,
             runs_truncated: false,

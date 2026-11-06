@@ -104,7 +104,7 @@
         },
         [C]: {
           available: true, cli_present: true, host: "github.com", owner: "acme", repo: "gamma", html_url: "https://github.com/acme/gamma",
-          pull_requests: [], prs_truncated: false, issues: [], issues_truncated: false, issues_error: null,
+          pull_requests: [], prs_truncated: false, prs_error: "gh pr list: HTTP 403 <b>forbidden</b>", issues: [], issues_truncated: false, issues_error: null,
           workflow_runs: [], runs_error: "gh: API rate limit exceeded", runs_truncated: false,
           releases: [], releases_truncated: false, releases_error: null, warnings: [], error: null,
         },
@@ -441,6 +441,8 @@
             !text().includes("npx vitest run") && text().includes("recorded on 01234567"));
 
           // ---- B: empty and narrowed states -------------------------------------------
+          check("a successful listing of zero pull requests still says there are none", () =>
+            text().includes("No open pull requests") && !text().includes("Pull request listing unavailable"));
           check("a failed issue listing says so rather than 'No open issues'", () =>
             text().includes("Issue listing unavailable: issues are disabled for this repository") && !text().includes("No open issues"));
           button("this branch").click();
@@ -462,6 +464,10 @@
           await until(() => text().includes("acme/gamma") && !text().includes("acme/beta"));
           check("a failed run listing says so instead of 'No recent Actions runs'", () =>
             text().includes("Run listing unavailable: gh: API rate limit exceeded") && !text().includes("No recent Actions runs"));
+
+          check("a failed pull-request listing says so, as text, instead of 'No open pull requests'", () =>
+            text().includes("Pull request listing unavailable: gh pr list: HTTP 403 <b>forbidden</b>") &&
+            !text().includes("No open pull requests") && !$("b", stage));
 
           // ---- switching back drops the previous repository's narrowing ---------------
           await activate(A);
