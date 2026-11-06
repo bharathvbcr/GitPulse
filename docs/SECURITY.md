@@ -470,6 +470,12 @@ flowchart TD
   the ledger row before it answers. A rule that fires refuses the operation.
   Reads (`status`, `rev-list`, `check-ignore`, `ls-files`) are not gated, as in
   the app.
+- **Removal discards confirmed work.** Claude Code asks the user before it
+  removes a worktree that holds uncommitted or untracked files or commits no
+  other branch or remote holds, and never sends the hook `discard_changes`.
+  So the hook forces such a removal (`git worktree remove --force`, then
+  `git branch -D`) and names what it discarded. A check that cannot run keeps
+  the worktree.
 - **Hook consent is unchanged.** `post_create` commands run only when the exact
   hooks file was approved in the Worktrees panel; an unapproved or changed file
   runs nothing, and the hook says so on stderr.
@@ -478,10 +484,12 @@ flowchart TD
   untrusted repository. The binary exits 75 untouched, and the plugin's launcher
   runs the plain `git worktree add` Claude Code would have run, with no hooks,
   caches or `.worktreeinclude`. Removal there takes the same road, with the same
-  "no work is lost" checks done in the launcher, and never `--force`.
+  checks done in the launcher; it keeps the branch, so no commit is lost.
 - **No path to a worktree that is not ready.** A git failure, a policy
-  refusal, a `post_create` failure (the new worktree is removed again) or the
-  540 s deadline all exit non-zero with nothing on stdout. A GitPulse failure
+  refusal or the 540 s deadline all exit non-zero with nothing on stdout. A
+  `post_create` failure keeps the worktree, as the Worktrees panel does; it is
+  recorded in the worktree's git directory and the session's start-up brief
+  warns the agent, because Claude Code does not show a successful hook's stderr. A GitPulse failure
   before any write exits 75 so plain git can still make the worktree.
 - **`.worktreeinclude` can copy secrets.** It copies the files the
   repository's owner listed and ignored, which in practice means `.env`,

@@ -2718,5 +2718,32 @@ mod tests {
 
 pub mod worktree_include;
 
+/// Only the files the anchor's `.worktreeinclude` names, for a worktree made
+/// without its build caches: the repository owner's list of local files is
+/// not an optional cache, so every worktree GitPulse makes gets it.
+/// [`clone_ignored_caches`] copies the same files after the caches.
+pub fn copy_worktree_include(
+    anchor: &Path,
+    worktree: &Path,
+    selection: &CacheSelection,
+) -> CacheReport {
+    let mut report = CacheReport::default();
+    if anchor == worktree {
+        return report;
+    }
+    let mut skipped = Vec::new();
+    worktree_include::copy_included(anchor, worktree, selection, &mut report, &mut skipped);
+    if !skipped.is_empty() {
+        report.low_disk = Some(LowDisk {
+            cause: LowDiskCause::BelowFloor,
+            free_bytes: None,
+            floor_bytes: LOW_DISK_FLOOR,
+            cap_bytes: None,
+            skipped,
+        });
+    }
+    report
+}
+
 #[cfg(test)]
 mod adv2;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::worktree::agent_layout;
 use crate::harness::PolicyStatus;
 use crate::test_support::git_in;
 use std::fs;
@@ -143,9 +144,14 @@ fn progress() -> AtomicI32 {
 }
 
 fn created(fixture: &Fixture, name: &str) -> PathBuf {
+    created_from(&fixture.root, name)
+}
+
+/// A worktree made by a session whose `cwd` is `cwd`.
+fn created_from(cwd: &Path, name: &str) -> PathBuf {
     let gate = Recorder::answering(PolicyStatus::Allowed);
     let finished = create(
-        &input_for_create(&fixture.root, name),
+        &input_for_create(cwd, name),
         &|r, a| gate.judge(r, a),
         &progress(),
     );
@@ -440,7 +446,9 @@ fn an_unapproved_hooks_file_runs_nothing_and_says_so() {
 
 #[cfg(unix)]
 #[test]
-fn a_failed_post_create_hook_hands_claude_code_no_path_and_removes_the_tree() {
+fn a_failed_post_create_hook_keeps_the_worktree_and_says_so() {
+    // As the Worktrees panel does: the worktree exists and is handed over, and
+    // the session is told its setup did not finish.
     const FAILING: &str = r#"{"worktree":{"post_create":["echo setup broke >&2; exit 3"]}}"#;
     let fixture = with_hooks(FAILING);
     crate::engine::approve_worktree_hooks(&fixture.root, FAILING).expect("approved");
@@ -452,26 +460,54 @@ fn a_failed_post_create_hook_hands_claude_code_no_path_and_removes_the_tree() {
         &progress(),
     );
 
-    assert_eq!(finished.exit_code, EXIT_FAILED, "{finished:?}");
-    assert_eq!(finished.path, None);
+    assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
+    let path = fixture.root.join(".claude/worktrees/broken-setup");
+    assert_eq!(finished.path.as_deref(), path.to_str());
+    assert!(path.join(".git").is_file());
     assert!(
         finished
             .notes
             .iter()
-            .any(|n| n.contains("post_create hook failed")),
+            .any(|n| n.contains("post_create hook failed") && n.contains("kept")),
         "{finished:?}"
     );
-    assert!(!fixture.root.join(".claude/worktrees/broken-setup").exists());
     assert!(crate::engine::git_cli::git_text(
         &fixture.root,
         &["rev-parse", "--verify", "refs/heads/worktree-broken-setup"]
     )
-    .is_err());
-    // The undo's writes were judged too.
-    let seen = gate.seen();
-    assert_eq!(seen.len(), 3, "{seen:?}");
-    assert_eq!(seen[1][..3], ["git", "worktree", "remove"]);
-    assert_eq!(seen[2][..3], ["git", "branch", "-D"]);
+    .is_ok());
+    // Only the add was written: nothing was undone.
+    assert_eq!(gate.seen().len(), 1, "{:?}", gate.seen());
+
+    // Claude Code shows the session none of the hook's stderr on success, so
+    // the session's own brief is what tells it, read from the worktree's git
+    // directory, never from its files.
+    let warning = setup_failure(&path).expect("the failure is recorded for the session");
+    assert!(warning.contains("setup did not finish"), "{warning}");
+    assert!(warning.contains("exit"), "{warning}");
+    let status = crate::engine::git_cli::git_text(&path, &["status", "--porcelain"]).unwrap();
+    assert_eq!(
+        status.trim(),
+        "",
+        "the marker is not in the working tree: {status}"
+    );
+    let brief = super::super::run_session_brief(&HookInput {
+        hook_event_name: "SessionStart".into(),
+        cwd: path.to_string_lossy().into_owned(),
+        source: "startup".into(),
+        ..HookInput::default()
+    });
+    let context = brief
+        .hook_specific_output
+        .and_then(|o| o.additional_context)
+        .expect("a brief");
+    assert!(
+        context.starts_with("WARNING: this worktree's setup did not finish"),
+        "{context}"
+    );
+
+    // And a worktree whose setup finished says nothing of the kind.
+    assert_eq!(setup_failure(&fixture.root), None);
 }
 
 #[test]
@@ -601,7 +637,10 @@ fn a_clean_worktree_is_removed_through_the_app_path_with_its_branch() {
 }
 
 #[test]
-fn uncommitted_untracked_or_unpushed_work_is_never_removed() {
+fn work_in_a_removed_worktree_is_discarded_as_claude_code_confirmed_and_said() {
+    // Claude Code asks before removing a worktree with work in it and never
+    // sends `discard_changes` to the hook, so a removal that arrives is a
+    // confirmed one: forced, with `-D`, and the discarded work is named.
     type MakeWork<'a> = &'a dyn Fn(&Path);
     let fixture = trusted();
     let cases: [(&str, MakeWork<'_>); 3] = [
@@ -621,20 +660,31 @@ fn uncommitted_untracked_or_unpushed_work_is_never_removed() {
 
         let (finished, gate) = removing(&path, false);
 
-        assert_eq!(finished.exit_code, EXIT_FAILED, "{name}: {finished:?}");
-        assert!(
-            path.join(".git").is_file(),
-            "{name}: the worktree was touched"
-        );
-        assert!(gate.seen().is_empty(), "{name}: a write was judged");
-        assert!(
-            finished
-                .notes
-                .iter()
-                .any(|n| n.contains("The worktree is kept")),
+        assert_eq!(finished.exit_code, EXIT_DONE, "{name}: {finished:?}");
+        assert!(!path.exists(), "{name}: the worktree is still there");
+        let seen = gate.seen();
+        assert_eq!(
+            seen[0],
+            remove_worktree_argv(path.to_str().unwrap(), true),
             "{name}"
         );
+        assert_eq!(
+            seen[1],
+            ["git", "branch", "-D", &format!("worktree-{name}")],
+            "{name}"
+        );
+        assert!(
+            finished.notes.iter().any(|n| n.contains("discarded")),
+            "{name}: {finished:?}"
+        );
     }
+}
+
+#[test]
+fn a_work_check_that_cannot_run_is_never_read_as_nothing_to_lose() {
+    // Not a repository: status cannot be read, so there is no answer.
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(work_held(elsewhere.path(), None).is_err());
 }
 
 #[test]
@@ -667,6 +717,49 @@ fn discard_changes_removes_the_work_and_the_branch() {
     let seen = gate.seen();
     assert_eq!(seen[0], remove_worktree_argv(path.to_str().unwrap(), true));
     assert_eq!(seen[1], ["git", "branch", "-D", "worktree-discarded"]);
+}
+
+#[test]
+fn a_worktree_made_from_inside_a_lane_nests_there_and_its_branch_is_still_deleted() {
+    // A session inside a linked worktree (here a GitPulse task lane) gets its
+    // worktree under that worktree, as Claude Code itself would. Attribution
+    // reads the outermost layout (the lane); the branch to delete is the
+    // innermost name.
+    let fixture = trusted();
+    let lane = fixture.root.join(".gitpulse/worktrees/lane-1");
+    git_in(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "gitpulse/lane-1",
+            lane.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let lane = lane.canonicalize().unwrap();
+
+    let path = created_from(&lane, "inner");
+    assert_eq!(path, lane.join(".claude/worktrees/inner"));
+
+    let (finished, gate) = removing(&path, false);
+    assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
+    assert_eq!(gate.seen()[1], ["git", "branch", "-d", "worktree-inner"]);
+}
+
+#[test]
+fn the_branch_to_delete_is_named_by_the_innermost_claude_worktree() {
+    let nested = Path::new("/r/.claude/worktrees/a/.claude/worktrees/b");
+    assert!(made_by_claude(nested, "worktree-b"));
+    assert!(!made_by_claude(nested, "worktree-a"));
+    assert!(made_by_claude(
+        Path::new("/r/.gitpulse/worktrees/l/.claude/worktrees/x"),
+        "worktree-x"
+    ));
+    assert!(!made_by_claude(Path::new("/r/.claude/worktrees/x"), "main"));
+    assert!(!made_by_claude(Path::new("/r/elsewhere/x"), "worktree-x"));
 }
 
 #[test]
@@ -815,10 +908,28 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
         "the same base rule as GitPulse's"
     );
 
-    // Removal: refused while the worktree holds work, then plain-removed.
+    // Removal of a worktree holding work: Claude Code confirmed it, so plain
+    // git forces it, and keeps the branch, so the commit stays reachable.
+    commit(&expected, "work.txt", "work\n", "only here");
+    let tip = head(&expected, "HEAD");
     fs::write(expected.join("new.txt"), "work").unwrap();
     let remove =
         serde_json::json!({"hook_event_name": "WorktreeRemove", "worktree_path": expected});
+    let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!expected.exists());
+    assert!(stderr.contains("discarded"), "{stderr}");
+    assert_eq!(
+        head(&fixture.root, "worktree-plain-oak"),
+        tip,
+        "the branch was kept"
+    );
+
+    // A path the launcher cannot read as a worktree is kept, never guessed at.
+    let not_a_worktree = fixture.root.join("plain-dir");
+    fs::create_dir(&not_a_worktree).unwrap();
+    let remove = serde_json::json!({"worktree_path": not_a_worktree});
     let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
     assert_eq!(
         out.status.code(),
@@ -826,20 +937,7 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(expected.join("new.txt").is_file());
-    fs::remove_file(expected.join("new.txt")).unwrap();
-    commit(&expected, "work.txt", "work\n", "only here");
-    let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
-    assert_eq!(out.status.code(), Some(1), "an unpushed commit is kept");
-    git_in(&expected, &["reset", "-q", "--hard", "HEAD~1"]);
-    let out = launch("/no/such/gitpulse-hook", REMOVE, &remove, &fixture.root);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!expected.exists());
+    assert!(not_a_worktree.is_dir());
 }
 
 #[cfg(unix)]

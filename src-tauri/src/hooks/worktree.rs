@@ -39,10 +39,17 @@
 //!   exists afterward". It does not run for subagent or workflow worktrees,
 //!   which Claude Code keeps, and "Claude Code never deletes a branch belonging
 //!   to a hook-created worktree", so the hook deletes the `worktree-<name>`
-//!   branch it made, when git agrees the branch is merged.
-//! * The documented `WorktreeRemove` input has no `discard_changes` (that is
-//!   the `ExitWorktree` tool's parameter). It is honoured if a payload ever
-//!   carries it; until then a worktree with work in it is never removed here.
+//!   branch it made: with `-d` when it held no work, so git keeps it unless it
+//!   is merged, and with `-D` when the removal discarded work.
+//! * The `WorktreeRemove` input has no `discard_changes` (that is the
+//!   `ExitWorktree` tool's parameter, and Claude Code 2.1.319 builds the hook
+//!   payload from `worktree_path` alone). Claude Code confirms with the user
+//!   before it removes a worktree that holds work, and removes one silently only
+//!   after finding it clean, so every removal that reaches the hook is a
+//!   confirmed one: work found is discarded and said on stderr. Only a check
+//!   that could not run refuses.
+//! * A `post_create` hook that fails leaves the worktree in place, as the
+//!   Worktrees panel does; the failure is said on stderr.
 //! * The command-hook `timeout` defaults to 600 s. The plugin declares that
 //!   number explicitly ([`HOST_TIMEOUT_SECS`]) and the work stops at
 //!   [`WORKTREE_BUDGET`], inside it.
@@ -52,7 +59,8 @@
 //! * [`EXIT_DONE`]: created (the path is the only stdout) or removed.
 //! * [`EXIT_FAILED`]: a refusal or a git failure. Creation or removal fails
 //!   and no path is printed. Falling back would not help: git itself said no,
-//!   a rule fired, the input was unusable, or the worktree holds work.
+//!   a rule fired, the input was unusable, or whether the worktree holds work
+//!   could not be checked.
 //! * [`EXIT_UNAVAILABLE`]: GitPulse could not do its part and did nothing, so
 //!   plain git can still do Claude Code's. The plugin's launcher
 //!   (`plugins/gitpulse/hooks/gitpulse-worktree.sh`) then runs the plain
@@ -65,7 +73,7 @@
 //!   the work ran out of time or panicked before its first git write.
 //!
 //! Every git write made here (the add, the remove, a branch delete, and the
-//! undo of a half-set-up worktree) is judged first by
+//! undo of a worktree a later GitPulse step refused) is judged first by
 //! [`crate::harness::judge_command`], which writes the ledger row before it
 //! answers; reads (`status`, `rev-list`, `check-ignore`) are not, as in the
 //! app.
@@ -78,8 +86,7 @@ use std::time::Duration;
 use super::HookInput;
 use crate::engine::cow_clone::CacheSelection;
 use crate::engine::worktree::{
-    add_worktree_argv, add_worktree_with_devmap, agent_layout, remove_worktree,
-    remove_worktree_argv, DevmapMode,
+    add_worktree_argv, add_worktree_with_devmap, remove_worktree, remove_worktree_argv, DevmapMode,
 };
 use crate::engine::GitWriter;
 use crate::harness::PolicyVerdict;
@@ -422,14 +429,21 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
         notes.push(format!("post_create hooks did not run: {notice}"));
     }
     if let Some(hook_error) = &created.hook_error {
-        // The repository's own setup did not finish, so the tree is not ready,
-        // exactly as the task-lane provisioner (`workbench::agent_worktree`)
-        // judges it: it goes, and Claude Code gets no path to it.
-        let undo = discard(&plan, gate);
-        return Finished::failed(
-            notes,
-            format!("the repository's post_create hook failed: {hook_error}; {undo}"),
-        );
+        // Kept, as the Worktrees panel keeps it (`cmd_add_worktree` reports
+        // `hook_error` beside the worktree): a hook-made worktree is set up
+        // exactly as an app-made one, and plain git would have given Claude
+        // Code a worktree here. The task-lane provisioner discards instead
+        // because nothing would tell its unattended agent; this session is
+        // told, on stderr.
+        notes.push(format!(
+            "the repository's post_create hook failed: {hook_error}; the worktree is kept, \
+             as the Worktrees panel keeps it, but its setup did not finish"
+        ));
+        // Claude Code shows the session none of this stderr on success; the
+        // session's brief carries it instead.
+        if let Err(why) = record_setup_failure(&plan.target, hook_error) {
+            notes.push(format!("the session will not be told: {why}"));
+        }
     }
     if let Some(cache) = &created.cache_error {
         notes.push(format!("build caches: {cache}"));
@@ -482,6 +496,54 @@ fn already_made(root: &Path, common: &Path, name: &str) -> Option<PathBuf> {
     let gitdir = registered_gitdir(&target, common)?;
     let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
     (head.trim() == format!("ref: refs/heads/{BRANCH_PREFIX}{name}")).then_some(target)
+}
+
+/// The file a failed `post_create` leaves in the new worktree's own git
+/// directory (beside the task lanes' `gitpulse-setup-complete`), holding the
+/// failure. Out of the working tree, so it is never committed and never shows
+/// in `git status`, and gone with the worktree.
+pub const SETUP_FAILED: &str = "gitpulse-post-create-failed";
+
+/// Most bytes of the failure kept in [`SETUP_FAILED`] and read back.
+const MAX_SETUP_FAILED_BYTES: usize = 2000;
+
+/// Why the marker exists: Claude Code shows nothing a `WorktreeCreate` hook
+/// writes to stderr when it succeeds (2.1.319 logs only the exit status, even
+/// in its debug log), so a session handed a worktree whose setup failed would
+/// never learn it. The `SessionStart` brief, which does reach the model, reads
+/// the marker back ([`setup_failure`]).
+fn record_setup_failure(worktree: &Path, failure: &str) -> Result<(), String> {
+    let gitdir = crate::engine::git_cli::resolve_git_dir(worktree).map_err(|e| e.into_message())?;
+    let mut text = failure.to_string();
+    if text.len() > MAX_SETUP_FAILED_BYTES {
+        let mut cut = MAX_SETUP_FAILED_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    std::fs::write(gitdir.join(SETUP_FAILED), text)
+        .map_err(|e| format!("could not record it for the session ({e})"))
+}
+
+/// The line a session brief opens with when the worktree at `root` was handed
+/// over with its `post_create` setup failed, `None` otherwise.
+pub fn setup_failure(root: &Path) -> Option<String> {
+    let gitdir = crate::engine::git_cli::resolve_git_dir(root).ok()?;
+    let mut text = std::fs::read_to_string(gitdir.join(SETUP_FAILED)).ok()?;
+    if text.len() > MAX_SETUP_FAILED_BYTES + '…'.len_utf8() {
+        let mut cut = MAX_SETUP_FAILED_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    Some(format!(
+        "WARNING: this worktree's setup did not finish. The repository's post_create hook failed \
+         when GitPulse created it, so dependencies or other setup it does may be missing: {}",
+        text.trim()
+    ))
 }
 
 /// The `cwd` the payload names, else this process's own.
@@ -769,22 +831,40 @@ pub(crate) fn remove(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
         );
     }
     let branch = current_branch(&worktree);
-    if !input.discard_changes {
-        if let Err(why) = holds_no_work(&worktree, branch.as_deref()) {
-            return Finished::failed(
-                notes,
-                format!(
-                    "refused: {why}. The worktree is kept. Commit, push or merge the work first, \
-                     or remove it yourself with `git worktree remove --force {}`",
-                    worktree.display()
-                ),
-            );
+    // Claude Code asks before it removes a worktree with work in it (the exit
+    // prompt's "Remove worktree" warns that uncommitted changes and commits
+    // only on its branch will be lost; `ExitWorktree` refuses one unless told
+    // to discard), and removes one silently only after finding it clean. It
+    // never sends `discard_changes` here. So a removal that reaches this hook
+    // has been confirmed: work found is discarded, with `--force` and `-D`,
+    // and said. A check that could not run is still a refusal, because then
+    // nobody knows what would be lost.
+    let work = if input.discard_changes {
+        None
+    } else {
+        match work_held(&worktree, branch.as_deref()) {
+            Ok(work) => work,
+            Err(why) => {
+                return Finished::failed(
+                    notes,
+                    format!(
+                        "refused: could not tell whether it holds work ({why}). The worktree is kept; \
+                         remove it yourself with `git worktree remove --force {}` once you have checked",
+                        worktree.display()
+                    ),
+                )
+            }
         }
-    }
+    };
     let (Some(main_text), Some(worktree_text)) = (main.to_str(), worktree.to_str()) else {
         return Finished::failed(notes, "refused: a path is not UTF-8".into());
     };
-    let force = input.discard_changes;
+    if let Some(work) = &work {
+        notes.push(format!(
+            "{work}; discarded, as Claude Code confirmed the removal"
+        ));
+    }
+    let force = input.discard_changes || work.is_some();
     let argv = remove_worktree_argv(worktree_text, force);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     if let Some(refused) = refusal(gate(main_text, &refs)) {
@@ -838,12 +918,13 @@ fn current_branch(worktree: &Path) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// `Ok` when removing `worktree` loses nothing: no uncommitted or untracked
-/// file, and no commit that only this worktree's branch (or detached `HEAD`)
-/// reaches, which is a commit neither pushed nor merged anywhere. Ignored files
-/// are not work (`git worktree remove` deletes them too). A check that cannot
-/// run is a refusal, never a pass.
-pub(crate) fn holds_no_work(worktree: &Path, branch: Option<&str>) -> Result<(), String> {
+/// The work removing `worktree` would discard: uncommitted or untracked files,
+/// or commits only this worktree's branch (or detached `HEAD`) reaches, which
+/// are neither pushed nor merged anywhere. `Ok(None)` when there is none.
+/// Ignored files are not work (`git worktree remove` deletes them too). `Err`
+/// when the check could not run, which the caller treats as a refusal, never
+/// as "nothing to lose".
+pub(crate) fn work_held(worktree: &Path, branch: Option<&str>) -> Result<Option<String>, String> {
     let status = crate::engine::git_cli::git_text(
         worktree,
         &[
@@ -857,7 +938,7 @@ pub(crate) fn holds_no_work(worktree: &Path, branch: Option<&str>) -> Result<(),
     let dirty: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
     if !dirty.is_empty() {
         let shown: Vec<&str> = dirty.iter().take(5).copied().collect();
-        return Err(format!(
+        return Ok(Some(format!(
             "it has {} uncommitted or untracked file(s) ({}{})",
             dirty.len(),
             shown.join(", "),
@@ -866,7 +947,7 @@ pub(crate) fn holds_no_work(worktree: &Path, branch: Option<&str>) -> Result<(),
             } else {
                 ""
             }
-        ));
+        )));
     }
     let exclude;
     let mut args = vec!["rev-list", "--count", "HEAD", "--not"];
@@ -885,22 +966,31 @@ pub(crate) fn holds_no_work(worktree: &Path, branch: Option<&str>) -> Result<(),
     let count = crate::engine::git_cli::git_text(worktree, &args)
         .map_err(|e| format!("could not count its unpushed commits: {}", e.into_message()))?;
     match count.trim().parse::<u64>() {
-        Ok(0) => Ok(()),
-        Ok(n) => Err(format!(
+        Ok(0) => Ok(None),
+        Ok(n) => Ok(Some(format!(
             "{n} commit(s) on {} are on no other branch and no remote (unpushed and unmerged)",
             branch.unwrap_or("its detached HEAD")
-        )),
+        ))),
         Err(_) => Err(format!("git rev-list answered {count:?}, not a count")),
     }
 }
 
 /// Whether `branch` is the one a `WorktreeCreate` made for this worktree:
-/// `worktree-<name>`, checked out at `.claude/worktrees/<name>`.
-fn made_by_claude(worktree: &Path, branch: &str) -> bool {
-    let Some(layout) = worktree.to_str().and_then(agent_layout) else {
-        return false;
-    };
-    layout.kind == "claude" && branch == format!("{BRANCH_PREFIX}{}", layout.slug)
+/// `worktree-<name>`, checked out at a path ending `.claude/worktrees/<name>`.
+///
+/// Read from the end of the path, not with `agent_layout`, whose outermost
+/// match is the right answer for attribution and the wrong one here: a session
+/// inside a GitPulse lane or another agent's worktree nests its worktree under
+/// it (`<lane>/.claude/worktrees/<name>`), and the branch to delete is named
+/// after the innermost segment.
+pub(crate) fn made_by_claude(worktree: &Path, branch: &str) -> bool {
+    let segments: Vec<&str> = worktree.iter().filter_map(|s| s.to_str()).collect();
+    match segments.as_slice() {
+        [.., claude, worktrees, name] if *claude == CONTAINER[0] && *worktrees == CONTAINER[1] => {
+            branch == format!("{BRANCH_PREFIX}{name}")
+        }
+        _ => false,
+    }
 }
 
 /// Deletes the branch a removed hook worktree was on, `-d` unless the removal

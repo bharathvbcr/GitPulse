@@ -2569,10 +2569,27 @@ fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
 /// stderr. `session-brief` cannot block anything, so it tells the session
 /// instead. Reports (`notify`) stay as they are: losing one loses a
 /// notification, never a decision. The worktree hooks keep their launcher
-/// (`plugin_root`'s [`crate::hooks::worktree::LAUNCHER`]), named by path. On
-/// Windows there is no `sh` to wrap with, so every command is the quoted path
-/// alone, and a missing binary there fails a `WorktreeCreate`.
+/// (`plugin_root`'s [`crate::hooks::worktree::LAUNCHER`]), named by path.
+///
+/// On Windows every command is the quoted path alone. Claude Code there runs
+/// under Git for Windows' bash or PowerShell, and which one runs a hook has
+/// not been checked, so nothing is wrapped in `sh`. That makes the worktree
+/// hooks unsafe there: a missing binary would fail every `WorktreeCreate`,
+/// where Claude Code's own `git worktree add` would have succeeded. So the
+/// Windows copy leaves `WorktreeCreate` and `WorktreeRemove` out, and Claude
+/// Code makes those worktrees itself, until the launcher is qualified there.
 fn hooks_config_with(template: &str, binary: &str, plugin_root: &str) -> Result<String, String> {
+    hooks_config_for(template, binary, plugin_root, cfg!(windows))
+}
+
+/// [`hooks_config_with`] for the platform `windows` names, so a test on one
+/// platform can check the other's copy.
+fn hooks_config_for(
+    template: &str,
+    binary: &str,
+    plugin_root: &str,
+    windows: bool,
+) -> Result<String, String> {
     let mut value: serde_json::Value = serde_json::from_str(template)
         .map_err(|e| format!("the hooks manifest is not JSON: {e}"))?;
     let events = value
@@ -2605,7 +2622,7 @@ fn hooks_config_with(template: &str, binary: &str, plugin_root: &str) -> Result<
                         crate::hooks::worktree::LAUNCHER
                     ));
                 }
-                let wrapped = if cfg!(windows) {
+                let wrapped = if windows {
                     format!("\"{binary}\" {args}")
                 } else if launched {
                     // Settings have no `${CLAUDE_PLUGIN_ROOT}`, so the launcher
@@ -2643,6 +2660,11 @@ fn hooks_config_with(template: &str, binary: &str, plugin_root: &str) -> Result<
                 handler["command"] = serde_json::Value::String(wrapped);
             }
         }
+    }
+    if windows {
+        // Checked above like every other entry, then left out: see
+        // [`hooks_config_with`].
+        events.retain(|event, _| event != "WorktreeCreate" && event != "WorktreeRemove");
     }
     serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
@@ -4713,6 +4735,51 @@ mod tests {
             }
         }
         found
+    }
+
+    /// The Windows copy has no launcher to fall back to plain git with, so it
+    /// leaves the worktree hooks out and Claude Code makes those worktrees
+    /// itself; every other hook is still there. Elsewhere both are kept, and
+    /// run through the launcher by path.
+    #[test]
+    fn the_windows_settings_copy_leaves_the_worktree_hooks_to_claude_code() {
+        let windows: serde_json::Value = serde_json::from_str(
+            &hooks_config_for(
+                &plugin_hooks_template(),
+                r"C:\GitPulse\gitpulse-hook.exe",
+                "C:/plugin",
+                true,
+            )
+            .expect("rewritten"),
+        )
+        .unwrap();
+        let hooks = windows["hooks"].as_object().unwrap();
+        assert!(!hooks.contains_key("WorktreeCreate"), "{hooks:?}");
+        assert!(!hooks.contains_key("WorktreeRemove"), "{hooks:?}");
+        assert!(hooks.contains_key("PreToolUse"));
+        assert!(hooks.contains_key("SessionStart"));
+
+        let unix: serde_json::Value = serde_json::from_str(
+            &hooks_config_for(
+                &plugin_hooks_template(),
+                "/opt/gitpulse-hook",
+                "/plugin",
+                false,
+            )
+            .expect("rewritten"),
+        )
+        .unwrap();
+        for event in ["WorktreeCreate", "WorktreeRemove"] {
+            let command = unix["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(
+                command.starts_with(
+                    "sh '/plugin/hooks/gitpulse-worktree.sh' '/opt/gitpulse-hook' worktree-"
+                ),
+                "{event}: {command}"
+            );
+        }
     }
 
     /// A released app has nothing on `PATH`, so the manifest it hands out must

@@ -20,8 +20,11 @@ before that tag is pushed.
   background sessions get the app's worktree setup: approved `post_create`
   hooks, copy-on-write caches, `.worktreeinclude` and a copy-on-write clone of
   the DevMap store. They branch from the local default branch, not `origin`. Untrusted
-  repositories and GitPulse failures fall back to plain git; removal never
-  deletes uncommitted, untracked or unpushed work. Reinstall `gitpulse-hook`
+  repositories and GitPulse failures fall back to plain git; removal discards
+  work only after Claude Code has confirmed it with the user, and a failed
+  `post_create` hook keeps the worktree, as the Worktrees panel does, and the
+  session's start-up brief tells the agent. On Windows the plugin needs Git
+  for Windows, and the Settings copy leaves these hooks out for now. Reinstall `gitpulse-hook`
   (`bun run mcp:install`): an older binary is detected and plain git is used.
 - **`.worktreeinclude`** is honoured by every worktree GitPulse creates. It can
   copy `.env`-style files; [Security](docs/SECURITY.md) says why that is

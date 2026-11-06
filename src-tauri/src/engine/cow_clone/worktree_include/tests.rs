@@ -224,6 +224,36 @@ fn a_link_is_never_followed_on_either_side() {
 }
 
 #[test]
+fn the_app_path_copies_the_include_even_with_build_caches_off() {
+    // The repository owner's list of local files is not an optional cache.
+    let (_main, parent, anchor, _worktree) = repo(".env\nnode_modules/\n");
+    write(&anchor, ".worktreeinclude", ".env\n");
+    write(&anchor, ".env", "SECRET=1");
+    write(&anchor, "node_modules/pkg/index.js", "x");
+    let target = parent.path().join("no-caches");
+    let created = crate::commands::add_worktree_guarded(
+        anchor.to_str().unwrap(),
+        target.to_str().unwrap(),
+        Some("no-caches"),
+        None,
+        false,
+        // Copy-on-Write dependency caches: off.
+        false,
+        false,
+        false,
+        None,
+        &|repo, argv| crate::harness::guard_command(repo, argv),
+    )
+    .expect("created");
+    assert_eq!(created.output.cache_error, None);
+    assert_eq!(fs::read_to_string(target.join(".env")).unwrap(), "SECRET=1");
+    assert!(
+        !target.join("node_modules").exists(),
+        "caches were asked off"
+    );
+}
+
+#[test]
 fn the_app_add_worktree_path_honours_the_include() {
     let (_main, parent, anchor, _worktree) = repo(".env\n");
     write(&anchor, ".worktreeinclude", ".env\n");

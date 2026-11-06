@@ -2046,12 +2046,19 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
             BUDGET.as_secs()
         ));
     };
+    let brief = session_brief(&snapshot, &here, &input.source);
+    // A worktree the WorktreeCreate hook handed over with its setup failed:
+    // the one place that reaches the session (`worktree::setup_failure`).
+    let brief = match worktree::setup_failure(&root) {
+        Some(warning) => format!("{warning}\n{brief}"),
+        None => brief,
+    };
     HookOutput {
         hook_specific_output: Some(HookSpecificOutput {
             hook_event_name: SESSION_START.to_string(),
             permission_decision: None,
             permission_decision_reason: None,
-            additional_context: Some(session_brief(&snapshot, &here, &input.source)),
+            additional_context: Some(brief),
         }),
         system_message: None,
     }

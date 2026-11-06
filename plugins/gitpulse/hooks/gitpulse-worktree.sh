@@ -16,9 +16,10 @@
 #   * Otherwise (not installed, not on PATH, older than this plugin, or 75), the
 #     plain git Claude Code would have run is run here, without GitPulse's setup:
 #     `git worktree add -b worktree-<name> <root>/.claude/worktrees/<name>` from
-#     the local default branch, and for removal `git worktree remove` (never
-#     --force) after the same checks GitPulse makes: no uncommitted or untracked
-#     file, and no commit that only this worktree reaches.
+#     the local default branch, and for removal `git worktree remove`, with
+#     --force only when the same checks GitPulse makes find work (Claude Code
+#     has already confirmed such a removal with the user). The branch is kept,
+#     so no commit becomes unreachable; a check that cannot run keeps the tree.
 #
 # stdout carries the created path and nothing else; every message goes to
 # stderr. POSIX sh, so it needs a shell: on Windows that is the sh Git for
@@ -144,9 +145,11 @@ remove() {
   common=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
     keep "cannot read its repository"
   [ "$gitdir" != "$common" ] || keep "$path is the repository's main checkout, not a linked worktree"
+  # Claude Code confirms with the user before it removes a worktree that holds
+  # work, so work found here is discarded (--force), as GitPulse's own path
+  # does. A check that cannot run still keeps the worktree.
   dirty=$(git -C "$path" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ||
     keep "could not read its status"
-  [ -z "$dirty" ] || keep "it has uncommitted or untracked files"
   branch=$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null)
   if [ -n "$branch" ]; then
     case $branch in
@@ -158,9 +161,17 @@ remove() {
     count=$(git -C "$path" rev-list --count HEAD --not --branches --remotes) ||
       keep "could not count its unpushed commits"
   fi
-  [ "$count" = 0 ] || keep "$count commit(s) are on no other branch and no remote (unpushed and unmerged)"
+  force=
+  if [ -n "$dirty" ]; then
+    force=--force
+    say "its uncommitted or untracked files are discarded, as Claude Code confirmed the removal"
+  fi
+  if [ "$count" != 0 ]; then
+    force=--force
+    say "$count commit(s) on no other branch and no remote stay reachable from ${branch:-nothing (detached HEAD)}"
+  fi
   main=$(dirname "$common")
-  git -C "$main" worktree remove "$path" >&2 || { say "git failed: git worktree remove kept $path"; exit 1; }
+  git -C "$main" worktree remove $force "$path" >&2 || { say "git failed: git worktree remove kept $path"; exit 1; }
   say "removed $path with plain git${branch:+; branch $branch is kept}"
 }
 
