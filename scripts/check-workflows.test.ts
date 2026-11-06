@@ -180,7 +180,25 @@ describe("check:workflows", () => {
     expect(pkg.scripts["ci:local"]).toContain("scripts/ci-local.mjs");
     const local = GATES.find((gate) => gate.args.includes("llvm-cov"));
     expect(local, "ci:local no longer runs llvm-cov").toBeDefined();
-    expect([local!.program, ...local!.args].join(" ")).toContain("--test-threads=1");
+    const command = [local!.program, ...local!.args].join(" ");
+    // 5394f4d3 moved the local coverage run onto nextest, where every test is
+    // its own process and the cap is nextest's process count, kept in
+    // src-tauri/.config/nextest.toml (four, measured there and in the gate's
+    // `why`). A `--test-threads=1` in the command would now be the wrong cap,
+    // so the invariant is checked where the cap lives: nextest runs the suite,
+    // nothing on the command line overrides the config, and the config bounds
+    // it to a handful rather than nextest's one-per-core default.
+    expect(command).toContain("llvm-cov nextest");
+    expect(command).not.toMatch(/--test-threads|-j\b|NEXTEST_TEST_THREADS/);
+    const nextestConfig = readFileSync(
+      fileURLToPath(new URL("../src-tauri/.config/nextest.toml", import.meta.url)),
+      "utf8",
+    );
+    const cap = /^\[profile\.default\][^[]*?^test-threads\s*=\s*(\d+)\s*$/m.exec(nextestConfig);
+    expect(cap, "nextest.toml no longer caps [profile.default] test-threads").not.toBeNull();
+    const processes = Number(cap![1]);
+    expect(processes).toBeGreaterThanOrEqual(1);
+    expect(processes).toBeLessThanOrEqual(4);
   });
 
   it("caps uninstrumented cargo test threads so sidecar hello fixtures are not starved", () => {
