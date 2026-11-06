@@ -309,7 +309,7 @@ fn maintenance_registration_reads_every_global_value_and_ignores_the_repo_list()
     let strategy = entry("maintenance.strategy", "incremental", ConfigScope::Global);
     let auto = entry("maintenance.auto", "false", ConfigScope::Global);
 
-    let none = repo.report(&[other.clone()]);
+    let none = repo.report(std::slice::from_ref(&other));
     assert_eq!(none.maintenance.registered, Some(false));
 
     let with_slash = format!("{}/", me.display());

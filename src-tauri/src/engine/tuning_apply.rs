@@ -1,7 +1,7 @@
 //! The user-clicked apply of recommended git tuning (owner decision,
 //! 2026-11-06): the only code that runs a config-writing or maintenance argv.
 //!
-//! It mirrors the commit-graph write it sits beside (`GitWriter::commit_graph_write`):
+//! It mirrors the graph writer it sits beside (`GitWriter::commit_graph_write`):
 //! the person sees the exact argv, scope and undo of each change first
 //! ([`tuning_plan`]), confirms it, and the command layer judges every argv with
 //! the command gate before this spawns anything. The rules it adds on top:
@@ -23,8 +23,8 @@ use crate::engine::git_writer::record_clicked_write;
 use crate::ipc_error::CommandError;
 use crate::singleflight::SingleFlight;
 use crate::storage::repo_tuning::{
-    is_apply_argv, plan_apply, GitEnv, TuningAdvice, TuningChange, TuningOutcome, TuningPlan,
-    TuningStepResult, TuningStepStatus, TUNING_APPLY_TIMEOUT_SECS,
+    is_apply_argv, plan_apply, GitEnv, TuningChange, TuningOutcome, TuningPlan, TuningStepResult,
+    TuningStepStatus, TUNING_APPLY_TIMEOUT_SECS,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

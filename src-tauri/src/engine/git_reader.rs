@@ -3922,7 +3922,7 @@ impl ConfigScope {
 /// [`config_snapshot`] every value of a multi-valued key is kept, in git's
 /// reading order (later wins for a single-valued key).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ConfigEntry {
+pub struct ConfigEntry {
     /// Lowercased section and variable, subsection case kept.
     pub key: String,
     pub value: String,
@@ -3932,7 +3932,7 @@ pub(crate) struct ConfigEntry {
 /// The effective config with each value's scope, through the same cache as
 /// [`config_snapshot`] (a distinct entry: the arguments differ). The repository
 /// tuning detector reads this so it spawns nothing of its own.
-pub(crate) fn config_entries(repo: &Path) -> Result<Vec<ConfigEntry>, CommandError> {
+pub fn config_entries(repo: &Path) -> Result<Vec<ConfigEntry>, CommandError> {
     config_entries_with(repo, Reads::Cached)
 }
 
@@ -3959,11 +3959,13 @@ fn parse_config_entries(text: &str) -> Result<Vec<ConfigEntry>, String> {
     if tokens.last() == Some(&"") {
         tokens.pop();
     }
-    if tokens.len() % 3 != 0 {
+    if !tokens.len().is_multiple_of(3) {
         return Err("git config --show-scope printed a truncated entry".to_string());
     }
     Ok(tokens
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|entry| {
             let (key, value) = match entry[2].split_once('\n') {
                 Some((key, value)) => (key, value),

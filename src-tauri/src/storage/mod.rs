@@ -1110,7 +1110,9 @@ pub(crate) fn tuning_advice(
     common: &Path,
     counted: Option<(u64, u64, u64, u64)>,
 ) -> repo_tuning::TuningAdvice {
-    advise_with(counted, |counts| repo_tuning::inspect(repo, private, common, counts))
+    advise_with(counted, |counts| {
+        repo_tuning::inspect(repo, private, common, counts)
+    })
 }
 
 /// [`tuning_advice`] for the apply: one `git count-objects -v` for the counts
@@ -1123,7 +1125,9 @@ pub(crate) fn tuning_advice_fresh(
     let counted = git_text(repo, &["count-objects", "-v"])
         .ok()
         .and_then(|text| parse_count_objects(&text));
-    advise_with(counted, |counts| repo_tuning::inspect_fresh(repo, private, common, counts))
+    advise_with(counted, |counts| {
+        repo_tuning::inspect_fresh(repo, private, common, counts)
+    })
 }
 
 fn advise_with(
@@ -2296,7 +2300,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
             .ok()
             .map(|private_dir| {
                 let mut advice = tuning_advice(&repo, &private_dir, &git_dir, counted);
-                advice.apply_in_flight = crate::engine::tuning_apply::tuning_apply_running(&git_dir);
+                advice.apply_in_flight =
+                    crate::engine::tuning_apply::tuning_apply_running(&git_dir);
                 advice
             }),
         scan: ScanStats {

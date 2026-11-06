@@ -11,6 +11,7 @@
 mod common;
 use common::run_git;
 use gitpulse_lib::engine::tuning_apply::{tuning_apply, tuning_apply_cancel, tuning_plan};
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::storage::repo_tuning::{TuningChange, TuningStepStatus};
 use std::io::Write;
 use std::path::Path;
@@ -52,7 +53,7 @@ fn import(dir: &Path, files: usize) {
         .args(["fast-import", "--quiet"])
         .current_dir(dir)
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("spawn fast-import");
     child
         .stdin
@@ -68,7 +69,7 @@ fn local_value(dir: &Path, key: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["config", "--local", "--get", key])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .unwrap();
     out.status
         .success()
@@ -106,7 +107,7 @@ fn an_untrusted_repository_is_refused_before_anything_is_read_or_run() {
     let init = Command::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(init.status.success());
     let path = dir.path().to_str().unwrap();

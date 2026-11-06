@@ -41,17 +41,32 @@ fn detect(dir: &Path) -> RepoTuningReport {
 #[test]
 fn index_versions_two_three_and_four_are_read_from_real_indexes() {
     let _g = serial();
-    for (version, config) in [("2", None), ("3", Some("3")), ("4", Some("4"))] {
+    // git writes v3 only when an entry needs extended flags, so the v3 case
+    // adds an intent-to-add entry; v2 and v4 are what `--index-version` sets.
+    for (version, config, ita) in [
+        ("2", None, false),
+        ("3", None, true),
+        ("4", Some("4"), false),
+    ] {
         let dir = repo_with_files(3);
         if let Some(v) = config {
             run_git(dir.path(), &["config", "index.version", v]);
         }
-        // Rewrite the index under the new version.
-        run_git(dir.path(), &["update-index", "--index-version", version]);
+        if ita {
+            std::fs::write(dir.path().join("planned.txt"), "later").unwrap();
+            run_git(dir.path(), &["add", "-N", "planned.txt"]);
+        }
+        if !ita {
+            run_git(dir.path(), &["update-index", "--index-version", version]);
+        }
         let report = detect(dir.path());
         assert_eq!(report.index.state, IndexReadState::Present, "{report:?}");
-        assert_eq!(report.index.version, Some(version.parse().unwrap()));
-        assert_eq!(report.index.entries, Some(3));
+        assert_eq!(
+            report.index.version,
+            Some(version.parse().unwrap()),
+            "{report:?}"
+        );
+        assert_eq!(report.index.entries, Some(if ita { 4 } else { 3 }));
         assert_eq!(
             report.index.skip_hash,
             Some(false),

@@ -3485,7 +3485,15 @@ fn record_commit_graph_write(
     ended: &str,
     elapsed: std::time::Duration,
 ) {
-    record_clicked_write(repo, common, argv, "commit_graph.write", ended == "written", ended, elapsed);
+    record_clicked_write(
+        repo,
+        common,
+        argv,
+        "commit_graph.write",
+        ended == "written",
+        ended,
+        elapsed,
+    );
 }
 
 /// Journals how one user-clicked, gated write ended: the shared tail of the

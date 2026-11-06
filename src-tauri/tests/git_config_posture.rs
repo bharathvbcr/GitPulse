@@ -140,7 +140,8 @@ fn violations(production: &str) -> Vec<String> {
             let is_argv = if needle.ends_with(',') {
                 // `["config", "config.worktree"]` lists the git-dir files the
                 // watcher classifies; it is a list of file names.
-                before.ends_with('[') && !rest.trim_start().starts_with("\"config.worktree\"")
+                (before.ends_with('[') || before.ends_with("\"git\","))
+                    && !rest.trim_start().starts_with("\"config.worktree\"")
             } else {
                 before.ends_with(".arg(")
             };
@@ -169,7 +170,8 @@ fn argv_literals(production: &str) -> Vec<Vec<String>> {
         let tokens: Vec<String> = rest[..end]
             .split('"')
             .enumerate()
-            .filter_map(|(i, part)| (i % 2 == 1).then(|| part.to_string()))
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, part)| part.to_string())
             .collect();
         out.push(tokens);
     }
@@ -291,6 +293,10 @@ fn the_scan_flags_each_way_of_setting_these_keys_and_writing_config() {
         r#"git(&["config", "--global", "core.editor", "vim"]);"#,
         "git(&[\n    \"config\",\n    \"--add\",\n    \"remote.origin.fetch\",\n    spec,\n]);",
         r#"cmd.arg("config").arg("alias.x").arg("!sh");"#,
+        // The program-first spelling the tuning apply uses: outside its own
+        // file it is a config write like any other.
+        r#"strings(&["git", "config", "--local", "core.hooksPath", "/evil"]);"#,
+        r#"let argv = vec!["git", "config", "--global", "user.name", "x"];"#,
     ];
     for source in flagged {
         assert!(!violations(source).is_empty(), "not flagged: {source}");

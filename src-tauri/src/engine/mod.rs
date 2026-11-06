@@ -18,12 +18,12 @@ pub mod sqlite_wal;
 pub mod stash;
 pub mod submodules;
 pub mod text_shape;
+pub mod tuning_apply;
 pub mod worktree;
 #[cfg(all(test, unix))]
 mod worktree_family_adversarial_tests;
 mod worktree_family_disk;
 pub mod worktree_hooks;
-pub mod tuning_apply;
 
 pub use agent_bus::{
     list_lanes, post_message, read_messages, register_or_update_lane,

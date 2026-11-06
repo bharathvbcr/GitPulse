@@ -7,6 +7,8 @@
 //! the executor, the command, or the argv builder is listed, and a new caller
 //! fails here until someone decides it belongs.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
@@ -77,6 +79,7 @@ fn only_the_storage_panel_command_reaches_the_tuning_apply() {
     who.dedup();
     let allowed = [
         // the executor and its own entry points
+        ("engine/tuning_apply.rs", "cmd_tuning_apply"),
         ("engine/tuning_apply.rs", "tuning_apply("),
         ("engine/tuning_apply.rs", "tuning_apply_within("),
         ("engine/tuning_apply.rs", "tuning_runnable("),
