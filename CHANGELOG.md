@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Code's own worktrees go through GitPulse.** The plugin registers
+  `WorktreeCreate` and `WorktreeRemove` (`gitpulse-hook worktree-create` /
+  `worktree-remove`, through `plugins/gitpulse/hooks/gitpulse-worktree.sh`), so
+  `claude --worktree`, `EnterWorktree`, isolated subagents, workflow agents and
+  background sessions get the app's worktree setup: approved `post_create`
+  hooks, copy-on-write caches, `.worktreeinclude` and a copy-on-write clone of
+  the DevMap store. They branch from the local default branch, not `origin`. Untrusted
+  repositories and GitPulse failures fall back to plain git; removal never
+  deletes uncommitted, untracked or unpushed work. Reinstall `gitpulse-hook`
+  (`bun run mcp:install`): an older binary is detected and plain git is used.
+- **`.worktreeinclude`** is honoured by every worktree GitPulse creates. It can
+  copy `.env`-style files; [Security](docs/SECURITY.md) says why that is
+  accepted.
+
 ## [1.5.0] - 2026-11-03
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

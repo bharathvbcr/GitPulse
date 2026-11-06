@@ -458,6 +458,43 @@ flowchart TD
   not on the target branch, and a squash whose commit fails stops before the
   worktree or branch is touched.
 
+### Claude Code worktree hooks and `.worktreeinclude`
+
+- **What changed.** The plugin's `gitpulse-hook` becomes a git writer:
+  `worktree-create` runs `git worktree add`, and `worktree-remove` runs
+  `git worktree remove` and `git branch -d`, from the agent's session. It also
+  runs the repository's approved `post_create` hooks there.
+- **Every write is judged and recorded.** Each of those git commands (and the
+  removal and branch delete that undo a worktree whose `post_create` failed)
+  goes to the command gate first, through `harness::judge_command`, which writes
+  the ledger row before it answers. A rule that fires refuses the operation.
+  Reads (`status`, `rev-list`, `check-ignore`, `ls-files`) are not gated, as in
+  the app.
+- **Hook consent is unchanged.** `post_create` commands run only when the exact
+  hooks file was approved in the Worktrees panel; an unapproved or changed file
+  runs nothing, and the hook says so on stderr.
+- **Untrusted repositories** (owner decision): GitPulse runs nothing in them;
+  `procguard` admits no child process whose working directory is in an
+  untrusted repository. The binary exits 75 untouched, and the plugin's launcher
+  runs the plain `git worktree add` Claude Code would have run, with no hooks,
+  caches or `.worktreeinclude`. Removal there takes the same road, with the same
+  "no work is lost" checks done in the launcher, and never `--force`.
+- **No path to a worktree that is not ready.** A git failure, a policy
+  refusal, a `post_create` failure (the new worktree is removed again) or the
+  540 s deadline all exit non-zero with nothing on stdout. A GitPulse failure
+  before any write exits 75 so plain git can still make the worktree.
+- **`.worktreeinclude` can copy secrets.** It copies the files the
+  repository's owner listed and ignored, which in practice means `.env`,
+  `.env.local`, private keys (`*.pem`, `*.key`) and cloud credential files.
+  This is accepted because the copy stays on the same machine, under the same
+  user and on the same volume, with the source's permission bits; the copy is
+  ignored in the new worktree too (checked with that worktree's own rules), so
+  it is no easier to commit than the original; nothing is copied without a
+  `.worktreeinclude` naming it; and an agent in the worktree could already read
+  the original through the main checkout. Links are never followed on either
+  side, existing files are never overwritten, and what is copied is logged by
+  path, never by content.
+
 ### Zero-Copy Worktree Pointers, Agent Bus & Build Cache Boundaries
 - **Cross-repository pointer validation**: Zero-copy DevMap pointers (`base_store_ref.json`) are accepted only when `resolve_git_common_dir` proves the linked worktree and `anchor_repo_root` share the exact canonical Git common directory and contain no `..` traversal components (`codeintel/worktree_overlay.rs`, `codeintel/store.rs`). Crafted pointers targeting unrelated repositories or arbitrary SQLite databases fail closed.
 - **Managed lane directory reservation**: `.gitpulse/worktrees/` is reserved for GitPulse-managed task-attempt lanes; manual UI, CLI, and MCP worktree creation inside that directory is refused (`refuse_gitpulse_lane_target`).

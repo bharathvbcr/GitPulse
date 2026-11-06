@@ -2568,9 +2568,11 @@ fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
 /// gate silently off. Exit status 2 is the host's "block", with the reason on
 /// stderr. `session-brief` cannot block anything, so it tells the session
 /// instead. Reports (`notify`) stay as they are: losing one loses a
-/// notification, never a decision. On Windows there is no `sh` to wrap with, so
-/// every command is the quoted path alone.
-fn hooks_config_with(template: &str, binary: &str) -> Result<String, String> {
+/// notification, never a decision. The worktree hooks keep their launcher
+/// (`plugin_root`'s [`crate::hooks::worktree::LAUNCHER`]), named by path. On
+/// Windows there is no `sh` to wrap with, so every command is the quoted path
+/// alone, and a missing binary there fails a `WorktreeCreate`.
+fn hooks_config_with(template: &str, binary: &str, plugin_root: &str) -> Result<String, String> {
     let mut value: serde_json::Value = serde_json::from_str(template)
         .map_err(|e| format!("the hooks manifest is not JSON: {e}"))?;
     let events = value
@@ -2589,11 +2591,32 @@ fn hooks_config_with(template: &str, binary: &str) -> Result<String, String> {
                 let Some(command) = handler.get("command").and_then(|c| c.as_str()) else {
                     continue;
                 };
-                let Some(args) = command.strip_prefix("gitpulse-hook ") else {
+                let (bare, launched) = crate::hooks::worktree::strip_launcher(command);
+                let Some(args) = bare.strip_prefix("gitpulse-hook ") else {
                     return Err(format!("unexpected hook command: {command}"));
                 };
+                let worktree_event = matches!(
+                    args.split_whitespace().next(),
+                    Some(crate::hooks::worktree::CREATE | crate::hooks::worktree::REMOVE)
+                );
+                if launched != worktree_event {
+                    return Err(format!(
+                        "unexpected hook command: {command} (only the worktree hooks run through {})",
+                        crate::hooks::worktree::LAUNCHER
+                    ));
+                }
                 let wrapped = if cfg!(windows) {
                     format!("\"{binary}\" {args}")
+                } else if launched {
+                    // Settings have no `${CLAUDE_PLUGIN_ROOT}`, so the launcher
+                    // is named by path too. It runs the binary when it can and
+                    // plain git when it cannot, so a missing binary never costs
+                    // Claude Code a worktree.
+                    let launcher = Path::new(plugin_root).join(crate::hooks::worktree::LAUNCHER);
+                    format!(
+                        "sh {} {quoted} {args}",
+                        sh_quote(&launcher.to_string_lossy())
+                    )
                 } else {
                     match args.split_whitespace().next() {
                         Some("collision-guard" | "command-gate") => format!(
@@ -2728,6 +2751,7 @@ pub fn mcp_info() -> McpInfo {
                         } else {
                             "gitpulse-hook"
                         },
+                        &plugin_path,
                     ),
                     hook.found,
                 ),
@@ -4656,6 +4680,15 @@ mod tests {
         assert!(!info.tools.is_empty());
     }
 
+    fn shipped_plugin_root() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../plugins/gitpulse")
+            .canonicalize()
+            .expect("the plugin package is in the tree")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn plugin_hooks_template() -> String {
         fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
@@ -4666,7 +4699,8 @@ mod tests {
     /// The commands of the generated hooks manifest, keyed by the subcommand
     /// they run.
     fn generated_commands(binary: &str) -> Vec<(String, String)> {
-        let json = hooks_config_with(&plugin_hooks_template(), binary).expect("rewritten");
+        let json = hooks_config_with(&plugin_hooks_template(), binary, &shipped_plugin_root())
+            .expect("rewritten");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let mut found = Vec::new();
         for groups in value["hooks"].as_object().unwrap().values() {
@@ -4707,7 +4741,25 @@ mod tests {
         assert!(mcp_config_with("{}", "/x").is_err());
         assert!(hooks_config_with(
             r#"{"hooks":{"Stop":[{"hooks":[{"command":"other x"}]}]}}"#,
-            "/x"
+            "/x",
+            "/plugin"
+        )
+        .is_err());
+        // The launcher is for the worktree events only, and they need it.
+        let launched = format!(
+            "{}gitpulse-hook notify turn_finished",
+            crate::hooks::worktree::LAUNCHER_PREFIX
+        );
+        assert!(hooks_config_with(
+            &serde_json::json!({"hooks":{"Stop":[{"hooks":[{"command": launched}]}]}}).to_string(),
+            "/x",
+            "/plugin"
+        )
+        .is_err());
+        assert!(hooks_config_with(
+            r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"command":"gitpulse-hook worktree-create"}]}]}}"#,
+            "/x",
+            "/plugin"
         )
         .is_err());
     }
@@ -4751,15 +4803,32 @@ mod tests {
                         "{stdout}"
                     );
                 }
+                // The launcher falls back to plain git, which refuses the
+                // empty payload this run hands it: proof it got that far.
+                crate::hooks::worktree::CREATE | crate::hooks::worktree::REMOVE => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(stderr.contains("plain git will"), "{sub}: {stderr}");
+                    assert_eq!(out.status.code(), Some(1), "{sub}: {stderr}");
+                    assert!(out.stdout.is_empty(), "{sub} printed a path");
+                }
                 _ => {}
             }
         }
         assert!(commands.iter().any(|(sub, _)| sub == "command-gate"));
         assert!(commands.iter().any(|(sub, _)| sub == "session-brief"));
+        assert!(commands
+            .iter()
+            .any(|(sub, _)| sub == crate::hooks::worktree::CREATE));
 
         // Present: the wrapper hands control to the binary with its arguments.
+        // It answers `--version` as the real one does, so the worktree
+        // launcher sees it serve those events.
         std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
-        std::fs::write(&missing, "#!/bin/sh\necho \"ran $*\"\nexit 0\n").unwrap();
+        std::fs::write(
+            &missing,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 0\\nsubcommands: worktree-create, worktree-remove\\n'; exit 0; fi\necho \"ran $*\"\nexit 0\n",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
         for (sub, command) in generated_commands(missing.to_str().unwrap()) {

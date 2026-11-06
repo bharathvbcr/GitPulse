@@ -138,6 +138,9 @@ pub struct CacheReport {
     /// The volume's free space could not be read, so nothing was skipped on
     /// its account and nothing is known to be plentiful.
     pub disk_unknown: bool,
+    /// The files `.worktreeinclude` named that were copied, relative to the
+    /// worktree root ([`worktree_include`]).
+    pub included: Vec<String>,
 }
 
 impl CacheReport {
@@ -1359,6 +1362,9 @@ pub fn clone_ignored_caches(
                 .push(format!("{dir_name}: {}", stop.into_message())),
         }
     }
+
+    // After the cache directories, which it never reaches into.
+    worktree_include::copy_included(anchor, worktree, selection, &mut report, &mut skipped);
 
     if !skipped.is_empty() {
         report.low_disk = Some(LowDisk {
@@ -2709,6 +2715,8 @@ mod tests {
         assert!(staging_leftovers(parent.path()).is_empty());
     }
 }
+
+pub mod worktree_include;
 
 #[cfg(test)]
 mod adv2;

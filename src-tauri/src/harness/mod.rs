@@ -100,6 +100,31 @@ pub(crate) fn guard_command_allowing(
     argv: &[&str],
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
+    judge_command_allowing(repo_path, argv, allowed).and_then(gated)
+}
+
+/// [`guard_command`] that hands back the recorded verdict instead of turning a
+/// refusal or a gate that could not run into an `Err`.
+///
+/// For the one caller that must degrade differently on the two: the
+/// `WorktreeCreate` hook (`hooks::worktree`), which replaces Claude Code's own
+/// `git worktree add`. A rule that fired is honoured there exactly as here; a
+/// gate that could not run must not cost the agent a worktree plain git would
+/// have made. The ledger row is written either way, before this returns, so
+/// the caller cannot act on a verdict nobody recorded. The caller owns the
+/// rest of [`gated`]'s contract: act on nothing that [`PolicyVerdict::blocks`],
+/// and say so when [`PolicyVerdict::gate_failed`].
+///
+/// `Err` only when there is no checkout to judge the command under.
+pub fn judge_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
+    judge_command_allowing(repo_path, argv, &[])
+}
+
+fn judge_command_allowing(
+    repo_path: &str,
+    argv: &[&str],
+    allowed: &[String],
+) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
     // Resolved once: the scope this action is judged under and the ledger row
     // that records the judgement are addressed by the same answer.
@@ -114,7 +139,7 @@ pub(crate) fn guard_command_allowing(
             serde_json::to_string(argv).ok(),
             &refused,
         );
-        return gated(*refused);
+        return Ok(*refused);
     }
     let verdict = match scope_at(&address) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
@@ -133,7 +158,7 @@ pub(crate) fn guard_command_allowing(
         argv_json,
         &verdict,
     );
-    gated(verdict)
+    Ok(verdict)
 }
 
 /// Judges a command line against this checkout's bound task scope, recording
@@ -859,6 +884,36 @@ mod ledger_seam_tests {
             "unexpected outcome {:?}",
             row.outcome
         );
+    }
+
+    /// The verdict-returning entry the worktree hook uses records exactly as
+    /// the guard does, before it answers: a caller that degrades differently
+    /// on a failed gate still cannot act on an unrecorded judgement.
+    #[test]
+    fn a_judged_command_leaves_a_durable_row_before_it_answers() {
+        let _serial = sidecar::test_serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_buf = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let repo = repo_buf.to_str().expect("utf8 path");
+        let argv = ["git", "worktree", "add", "-b", "worktree-x", "/tmp/x"];
+
+        let before = crate::ledger::latest_cursor(repo).expect("cursor");
+        let verdict = judge_command(repo, &argv).expect("a checkout to judge under");
+        let events = crate::ledger::tail(repo, before, 10).expect("tail");
+        assert_eq!(events.len(), 1, "exactly one row per judged command");
+        let row = &events[0];
+        assert_eq!(row.action, "git.worktree");
+        assert_eq!(
+            row.argv_json.as_deref(),
+            Some(serde_json::to_string(&argv).unwrap().as_str())
+        );
+        // The row and the answer agree on whether the command may run.
+        assert_eq!(row.outcome == "blocked", verdict.blocks(), "{row:?}");
+        // And `guard_command` is still this plus `gated`.
+        assert_eq!(guard_command(repo, &argv).is_ok(), gated(verdict).is_ok());
     }
 
     /// A file write is recorded under its own operation, not a git verb.
