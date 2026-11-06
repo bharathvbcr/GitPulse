@@ -343,7 +343,9 @@ A pointer-only worktree is never refreshed, since that would be the cold build t
 - `isolate_seeds_the_store_and_starts_the_worktrees_own_build` and `isolate_with_the_zero_copy_pointer_starts_no_build` (MCP);
 - `cli_create_seeds_the_worktree_store_and_builds_it_in_place` (CLI).
 
-The lane, MCP and CLI tests each failed with the change removed. The CLI test failed on `devmap_seeded:false` with `cache_shared:true`. Not covered by a test: MCP `gitpulse_worktree_create` and `switch`, because the tool places the worktree beside the repository, outside a test sandbox. They take the same `DevmapOutcome::Provisioned { zero_copy: false }` branch.
+The lane, MCP and CLI tests each failed with the change removed. The CLI test failed on `devmap_seeded:false` with `cache_shared:true`. Not covered by a test: MCP `gitpulse_worktree_create` and `switch`, because the tool places the worktree beside the repository, outside a test sandbox. They take the same `DevmapOutcome::Provisioned { zero_copy: false }` branch. The schema-conformance test that calls them builds no DevMap store, so it seeds nothing and never reaches `devmap`.
+
+**Known cost: background refresh outcomes are never collected for removed worktrees.** A `Background` refresh parks its outcome in `devmap::live`'s `finished_builds` map until the next live-refresh ask for that path, and the map is unbounded. A long-lived app or `gitpulse-mcp` therefore keeps one stdout-capped outcome per seeded worktree that is never asked about again, such as a worktree since removed, for the life of the process. Bounding that map, or evicting a path when its worktree is removed, is the follow-up.
 
 **Owned elsewhere or deferred, named:**
 1. **DevCouncil hook (owner: DevCouncil).** Worktrees made outside GitPulse (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still get a cold build. The fix belongs in `devmap`:
