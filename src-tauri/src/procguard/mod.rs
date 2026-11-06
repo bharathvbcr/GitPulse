@@ -72,7 +72,7 @@ pub mod signal;
 use std::collections::BTreeMap;
 use std::io;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -156,7 +156,17 @@ struct Entry {
     /// `None` once its owner has reaped it. The distinction is the whole
     /// safety argument: a pid we have waited on is no longer ours to signal.
     pid: Mutex<Option<u32>>,
+    /// Sweeps that tried to kill this child's group and got an error, so the
+    /// pid was kept. Bounds the retries: see [`MAX_KILL_ATTEMPTS`].
+    kill_failures: AtomicU32,
 }
+
+/// How many sweeps may fail to kill one child before its pid is abandoned.
+///
+/// A failed kill keeps the pid so a later sweep, or the owner's drop, can try
+/// again. A refusal by the signalling guard will refuse again, so the retries
+/// are capped instead of repeated at sweep cadence for ever.
+const MAX_KILL_ATTEMPTS: u32 = 3;
 
 type Slot = Arc<Entry>;
 
@@ -553,6 +563,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     let slot: Slot = Arc::new(Entry {
         label: label.to_string(),
         pid: Mutex::new(Some(child.id())),
+        kill_failures: AtomicU32::new(0),
     });
     let key = next_key();
     lock(registry()).insert(key, Arc::clone(&slot));
@@ -790,6 +801,10 @@ pub struct Sweep {
     /// Entries whose kill syscall failed for a reason other than "no such
     /// process". Also not swept.
     pub failed: Vec<String>,
+    /// Entries whose kill failed [`MAX_KILL_ATTEMPTS`] times, after which the
+    /// pid was forgotten. The child may still be running; this is the record
+    /// that it is no longer being retried. Each is also listed in `failed`.
+    pub abandoned: Vec<String>,
 }
 
 impl Sweep {
@@ -810,6 +825,12 @@ impl Sweep {
             parts.push(format!(
                 "NOT swept (kill failed): {}",
                 self.failed.join(", ")
+            ));
+        }
+        if !self.abandoned.is_empty() {
+            parts.push(format!(
+                "ABANDONED after {MAX_KILL_ATTEMPTS} failed kills (may still be running): {}",
+                self.abandoned.join(", ")
             ));
         }
         parts.join("; ")
@@ -900,23 +921,53 @@ fn sweep(slots: &[Slot], grace: Duration) -> Sweep {
             continue;
         };
         match sys::force_kill(pid, &slot.label) {
-            Ok(true) => match asked {
-                // Still there after being asked and given the grace window.
-                Ask::Pending(_) => sweep.force_killed += 1,
-                Ask::NotSupported => sweep.force_killed += 1,
-                // The ask pass could not lock it, so this is its first signal.
-                Ask::Busy => sweep.force_killed += 1,
-                Ask::Gone => sweep.already_gone += 1,
-            },
-            Ok(false) => match asked {
-                Ask::Pending(_) => sweep.stopped_when_asked += 1,
-                _ => sweep.already_gone += 1,
-            },
-            Err(e) => sweep.failed.push(format!("{} ({pid}): {e}", slot.label)),
+            Ok(true) => {
+                match asked {
+                    // Still there after being asked and given the grace window.
+                    Ask::Pending(_) => sweep.force_killed += 1,
+                    Ask::NotSupported => sweep.force_killed += 1,
+                    // The ask pass could not lock it, so this is its first signal.
+                    Ask::Busy => sweep.force_killed += 1,
+                    Ask::Gone => sweep.already_gone += 1,
+                }
+                *pid_slot = None;
+            }
+            // Nothing left to signal (ESRCH/EPERM, or the Windows non-zero
+            // status, which cannot tell "not found" from a failure): the group
+            // is gone, so stop treating the pid as ours and a later sweep
+            // cannot signal a recycled one.
+            Ok(false) => {
+                match asked {
+                    Ask::Pending(_) => sweep.stopped_when_asked += 1,
+                    _ => sweep.already_gone += 1,
+                }
+                *pid_slot = None;
+            }
+            // Nothing was signalled, so the group may be running. The pid stays
+            // recorded and the same guard vets it again on the next attempt, so
+            // a pid that has since been reused by an unrelated process is
+            // refused rather than killed. A guard refusal will refuse again;
+            // keeping the pid does not fix that, the cap ends it.
+            Err(e) => {
+                let kind = if e.kind() == io::ErrorKind::InvalidInput {
+                    "refused"
+                } else {
+                    "kill failed"
+                };
+                let entry = format!("{} ({pid}): {kind}: {e}", slot.label);
+                let attempts = slot.kill_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if attempts >= MAX_KILL_ATTEMPTS {
+                    log::error!(
+                        target: "procguard",
+                        "abandoning pid {pid} for {} after {attempts} failed kills: {kind}: {e}",
+                        slot.label
+                    );
+                    sweep.abandoned.push(entry.clone());
+                    *pid_slot = None;
+                }
+                sweep.failed.push(entry);
+            }
         }
-        // The group is gone either way; stop treating the pid as ours so a
-        // later sweep cannot signal a recycled one.
-        *pid_slot = None;
     }
 
     sweep
@@ -1854,6 +1905,7 @@ mod tests {
         assert_eq!(result.force_killed, 1, "{}", result.describe());
         assert_eq!(result.stopped_when_asked, 0, "{}", result.describe());
         assert!(result.is_complete(), "{}", result.describe());
+        assert_eq!(guard.pid(), None, "Ok(true) left the pid recorded");
         assert!(
             elapsed >= CHILD_GRACE,
             "the grace window was skipped: {elapsed:?}"
@@ -1952,6 +2004,106 @@ mod tests {
             std::os::unix::process::ExitStatusExt::signal(&status),
             Some(libc::SIGKILL)
         );
+    }
+
+    #[cfg(unix)]
+    fn slot_holding(label: &str, pid: u32) -> Slot {
+        Arc::new(Entry {
+            label: label.to_string(),
+            pid: Mutex::new(Some(pid)),
+            kill_failures: AtomicU32::new(0),
+        })
+    }
+
+    /// A process this test started outside procguard: it sits in the test's own
+    /// process group, so it is exactly what a reused pid looks like.
+    #[cfg(unix)]
+    fn unrelated_process() -> Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
+        cmd.spawn_locked().expect("bystander")
+    }
+
+    /// A kill that errored signalled nothing, so the child may be running: its
+    /// pid has to stay recorded for a later sweep. The guard refusing a pid that
+    /// is not one of ours is the real error this produces, and the process it
+    /// refused to touch must be untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_kill_keeps_the_pid_and_a_reused_pid_is_refused_not_killed() {
+        let mut bystander = unrelated_process();
+        let slot = slot_holding("reused", bystander.id());
+
+        let first = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert!(!first.is_complete(), "{}", first.describe());
+        assert!(
+            first.failed.iter().any(|f| f.contains("refused")),
+            "a guard refusal was not told apart from a failed syscall: {}",
+            first.describe()
+        );
+        assert_eq!(
+            *lock(&slot.pid),
+            Some(bystander.id()),
+            "a kill that never happened cleared the pid"
+        );
+        assert!(
+            bystander.try_wait().expect("try_wait").is_none(),
+            "the sweep killed a process that is not procguard's child"
+        );
+
+        // The retry goes through the same guard and is refused again.
+        let second = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert!(!second.is_complete(), "{}", second.describe());
+        assert!(
+            bystander.try_wait().expect("try_wait").is_none(),
+            "the retry killed a process that is not procguard's child"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    /// Retries are bounded: after [`MAX_KILL_ATTEMPTS`] failed sweeps the pid is
+    /// forgotten and recorded as abandoned, and a sweep after that does nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_that_keeps_failing_is_abandoned_after_the_cap() {
+        let mut bystander = unrelated_process();
+        let slot = slot_holding("stuck", bystander.id());
+
+        for attempt in 1..MAX_KILL_ATTEMPTS {
+            let result = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+            assert!(result.abandoned.is_empty(), "attempt {attempt}");
+            assert!(lock(&slot.pid).is_some(), "attempt {attempt}");
+        }
+        let last = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert_eq!(last.abandoned.len(), 1, "{}", last.describe());
+        assert!(last.describe().contains("ABANDONED"), "{}", last.describe());
+        assert_eq!(*lock(&slot.pid), None, "an abandoned pid stayed recorded");
+
+        let after = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert!(after.is_complete(), "{}", after.describe());
+        assert_eq!(after.already_gone, 1, "{}", after.describe());
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    /// `Ok(false)` (nothing left to signal) still clears the slot, so a pid the
+    /// owner already reaped is never signalled by a later sweep.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_with_nothing_left_to_signal_clears_the_pid() {
+        let mut cmd = Command::new("true");
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        let (mut child, guard) = spawn(&mut cmd, "gone").expect("spawn");
+        let pid = guard.pid().expect("registered");
+        let _ = child.wait().expect("reap");
+        // Reaped behind the registration's back: its group no longer exists.
+        let slot = guard.slot();
+
+        let result = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert!(result.is_complete(), "{}", result.describe());
+        assert_eq!(result.already_gone, 1, "{}", result.describe());
+        assert_eq!(*lock(&slot.pid), None, "pid {pid} stayed recorded");
     }
 
     #[test]
