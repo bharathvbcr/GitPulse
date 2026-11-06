@@ -1856,13 +1856,56 @@ pub fn decode_compact(compact: &Value) -> anyhow::Result<Value> {
 /// `force` is set. Identity is `meta.map_engine == "devmap-rust"`; missing that
 /// key is the live Python schema, which writes no engine marker at all.
 pub fn write_code_graph_atomically(path: &Path, json: &str, force: bool) -> anyhow::Result<bool> {
+    refuse_foreign_code_graph(path, force)?;
+    Ok(write_atomic(path, json.as_bytes())?)
+}
+
+/// [`write_code_graph_atomically`] for the verbose encoding, laid out so that a
+/// rebuild rewrites only the blocks whose content changed.
+///
+/// The bytes written parse to the same value as `json`; they differ only by
+/// whitespace between top-level elements (see [`crate::block_layout`]). Written
+/// over a clone of the previous file by [`write_atomic`], an unchanged segment
+/// stays on the disk blocks it shared with the file this one was cloned from.
+/// The interned encoding does not use this: its string table renumbers on any
+/// insertion, so there is no unchanged region to keep.
+pub fn write_verbose_code_graph_atomically(
+    path: &Path,
+    json: &str,
+    force: bool,
+) -> anyhow::Result<bool> {
+    refuse_foreign_code_graph(path, force)?;
+    let previous = read_previous_layout(path);
+    let laid_out =
+        crate::block_layout::lay_out(json, previous.as_deref(), CODE_GRAPH_EXPORT_MAX_BYTES);
+    Ok(write_atomic(path, &laid_out)?)
+}
+
+fn refuse_foreign_code_graph(path: &Path, force: bool) -> anyhow::Result<()> {
     if path.exists() && !force && is_foreign_code_graph(path)? {
         anyhow::bail!(
             "refuse to overwrite a non-devmap-rust code graph at {} (pass --force to replace)",
             path.display()
         );
     }
-    Ok(write_atomic(path, json.as_bytes())?)
+    Ok(())
+}
+
+/// The bytes of the file about to be replaced, as a layout hint. Absent, not a
+/// regular file, unreadable or over the export ceiling all mean "no previous
+/// layout": the hint only decides where whitespace goes, never what is written.
+fn read_previous_layout(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > CODE_GRAPH_EXPORT_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(CODE_GRAPH_EXPORT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= CODE_GRAPH_EXPORT_MAX_BYTES).then_some(bytes)
 }
 
 fn is_foreign_code_graph(path: &Path) -> anyhow::Result<bool> {
@@ -2803,6 +2846,60 @@ mod tests {
         for path in [ours, python, no_meta, broken] {
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
+    }
+
+    /// The block-stable layout is invisible to the host loader: the file it
+    /// reads parses to the value the compact serialisation has, whether the
+    /// file was laid out afresh or over a previous one, and an identical
+    /// rebuild writes nothing.
+    #[test]
+    fn a_laid_out_verbose_graph_reads_back_as_the_same_value_through_the_host_loader() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let mut value =
+            build_code_graph_value(&extractions, &analysis, &edges, &freshness(), None).unwrap();
+        let template = value["nodes"][0].clone();
+        for i in 0..9000 {
+            let mut node = template.clone();
+            node["id"] = json!(format!("bulk/file_{}.py::item_{i}", i / 9));
+            node["name"] = json!(format!("item_{i}"));
+            value["nodes"].as_array_mut().unwrap().push(node);
+        }
+        let compact = serde_json::to_string(&value).unwrap();
+        assert!(compact.len() > crate::block_layout::MIN_LAID_OUT_BYTES);
+
+        let path = tmp_graph("");
+        std::fs::remove_file(&path).unwrap();
+        assert!(write_verbose_code_graph_atomically(&path, &compact, false).unwrap());
+        let first = std::fs::read(&path).unwrap();
+        assert!(first.len() > compact.len(), "the file carries gutters");
+        let loaded = crate::host::read_code_graph(&path, crate::host::DEFAULT_ARTIFACT_BYTES)
+            .expect("the host loader reads a laid-out graph");
+        assert_eq!(loaded, value);
+
+        assert!(
+            !write_verbose_code_graph_atomically(&path, &compact, false).unwrap(),
+            "an identical rebuild must not rewrite the file"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        value["nodes"][4000]["name"] = json!("renamed, and longer than before");
+        let edited = serde_json::to_string(&value).unwrap();
+        assert!(write_verbose_code_graph_atomically(&path, &edited, false).unwrap());
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!(second.len(), first.len(), "the edit fit in its gutter");
+        let differing = first
+            .chunks(4096)
+            .zip(second.chunks(4096))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing <= 4,
+            "one renamed node changed {differing} blocks"
+        );
+        let loaded = crate::host::read_code_graph(&path, crate::host::DEFAULT_ARTIFACT_BYTES)
+            .expect("the host loader reads the rewritten graph");
+        assert_eq!(loaded, value);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// An oversized verbose export becomes a stub, not a file hosts refuse.

@@ -70,6 +70,51 @@ const MAX_EXPANDED_ARGS: usize = 65_536;
 /// whose target file is already Blake3-verified in `DirectManifest::deps`.
 const COMPILE_ONLY_OUT_DIR_SENTINEL: &str = "$GITPULSE_COMPILE_ONLY_OUT_DIR";
 
+/// Sentinel recorded in `DirectManifest::env_deps["CARGO_MANIFEST_DIR"]` ONLY when
+/// every proc-macro extern is on [`PURE_AST_PROC_MACRO_ALLOWLIST`] and a lexical token
+/// scan proves the crate's `.rs` files contain zero `CARGO_MANIFEST_DIR` literals and
+/// zero non-`OUT_DIR` `include*!` macros (`F14` / `OQ4`).
+const COMPILE_ONLY_MANIFEST_DIR_SENTINEL: &str = "$GITPULSE_COMPILE_ONLY_MANIFEST_DIR";
+
+/// Strict allowlist of pure-AST proc-macro crates proven not to read files relative to
+/// `std::env::var("CARGO_MANIFEST_DIR")` behind `rustc`'s `.d` dep-info tracker.
+const PURE_AST_PROC_MACRO_ALLOWLIST: &[&str] = &[
+    "serde_derive",
+    "thiserror_impl",
+    "tokio_macros",
+    "async_trait",
+    "clap_derive",
+    "tracing_attributes",
+    "strum_macros",
+    "paste",
+    "bytemuck_derive",
+    "zerocopy_derive",
+    "derive_more",
+    "derive_more_impl",
+    "num_derive",
+    "pin_project_internal",
+    "futures_macro",
+];
+
+/// Facade crates whose re-exported proc-macros read filesystem state relative to
+/// `CARGO_MANIFEST_DIR` (e.g., `.sqlx/`, `tauri.conf.json`, embedded asset trees)
+/// without always emitting `# env-dep:CARGO_MANIFEST_DIR` in `.d` dep-info.
+const IMPURE_MACRO_FACADE_DENYLIST: &[&str] = &[
+    "sqlx",
+    "sqlx_core",
+    "sqlx_macros",
+    "tauri",
+    "tauri_macros",
+    "tauri_codegen",
+    "include_dir",
+    "include_dir_macros",
+    "rust_embed",
+    "rust_embed_impl",
+    "pest_derive",
+    "pest_generator",
+    "dotenvy_macro",
+];
+
 const BUILD_CACHE_SUBDIR: &str = "gitpulse/build-cache";
 const STATS_FILE: &str = "stats.json";
 const STATS_LOCK_FILE: &str = ".stats.lock";
@@ -792,6 +837,9 @@ struct CacheableInvocation {
     input_rs: PathBuf,
     normalized_flags: Vec<String>,
     extern_files: Vec<(String, PathBuf)>,
+    bare_externs: Vec<String>,
+    /// `-L dependency=` / `-L all=` / bare `-L` directories searched for bare `--extern` crates.
+    dep_search_dirs: Vec<PathBuf>,
     /// `-l [KIND[:MODIFIERS]=]NAME[:RENAME]` libraries, in command-line order.
     native_libs: Vec<NativeLib>,
     /// Absolute `-L native=` / `-L all=` / bare `-L` directories searched for them.
@@ -838,6 +886,140 @@ fn parse_native_search_dir(val: &str, cwd: &Path) -> Option<PathBuf> {
     }
     let p = PathBuf::from(path);
     Some(if p.is_absolute() { p } else { cwd.join(p) })
+}
+
+/// A `-L [KIND=]PATH` directory that rustc searches for Rust crates and proc-macros.
+fn parse_dep_search_dir(val: &str, cwd: &Path) -> Option<PathBuf> {
+    let (kind, path) = match val.split_once('=') {
+        Some((k, p)) if matches!(k, "dependency" | "crate" | "native" | "framework" | "all") => {
+            (k, p)
+        }
+        _ => ("all", val),
+    };
+    if !matches!(kind, "dependency" | "crate" | "all") || path.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(path);
+    Some(if p.is_absolute() { p } else { cwd.join(p) })
+}
+
+fn normalize_extern_crate_name(raw_name: &str) -> &str {
+    raw_name.rsplit_once(':').map_or(raw_name, |(_, n)| n)
+}
+
+fn is_proc_macro_dylib_ext(ext: &str) -> bool {
+    matches!(ext, "dylib" | "so" | "dll")
+}
+
+fn extract_crate_stem_from_artifact(path: &Path) -> Option<String> {
+    let file_stem = path.file_stem()?.to_str()?;
+    let without_lib = file_stem.strip_prefix("lib").unwrap_or(file_stem);
+    let crate_part = match without_lib.rsplit_once('-') {
+        Some((stem, suffix))
+            if !stem.is_empty()
+                && !suffix.is_empty()
+                && suffix.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            stem
+        }
+        _ => without_lib,
+    };
+    Some(crate_part.replace('-', "_"))
+}
+
+fn resolve_bare_extern_candidates(crate_name: &str, dep_search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    let lib_exact = format!("lib{crate_name}.");
+    let lib_hashed = format!("lib{crate_name}-");
+    let dll_exact = format!("{crate_name}.dll");
+    let dll_hashed = format!("{crate_name}-");
+    for dir in dep_search_dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if !matches!(ext, "rlib" | "rmeta" | "dylib" | "so" | "dll") {
+                continue;
+            }
+            let hit = fname.starts_with(&lib_exact)
+                || fname.starts_with(&lib_hashed)
+                || fname == dll_exact
+                || (ext == "dll" && fname.starts_with(&dll_hashed));
+            if hit && p.is_file() {
+                matches.push(p);
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn is_allowed_pure_proc_macro(crate_name: &str, path: &Path) -> bool {
+    let norm = crate_name.replace('-', "_");
+    if IMPURE_MACRO_FACADE_DENYLIST.contains(&norm.as_str()) {
+        return false;
+    }
+    if !PURE_AST_PROC_MACRO_ALLOWLIST.contains(&norm.as_str()) {
+        return false;
+    }
+    if let Some(stem) = extract_crate_stem_from_artifact(path) {
+        if IMPURE_MACRO_FACADE_DENYLIST.contains(&stem.as_str())
+            || !PURE_AST_PROC_MACRO_ALLOWLIST.contains(&stem.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// True ONLY when every proc-macro dynamic library (`--extern` or bare `--extern`) is on
+/// [`PURE_AST_PROC_MACRO_ALLOWLIST`] and no known impure macro facade (`sqlx`, `tauri`,
+/// `include_dir`, `rust_embed`, ...) is linked.
+fn has_only_pure_ast_proc_macros(inv: &CacheableInvocation) -> bool {
+    for (raw_name, path) in &inv.extern_files {
+        let crate_name = normalize_extern_crate_name(raw_name).replace('-', "_");
+        if IMPURE_MACRO_FACADE_DENYLIST.contains(&crate_name.as_str()) {
+            return false;
+        }
+        if let Some(stem) = extract_crate_stem_from_artifact(path) {
+            if IMPURE_MACRO_FACADE_DENYLIST.contains(&stem.as_str()) {
+                return false;
+            }
+        }
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if is_proc_macro_dylib_ext(ext) && !is_allowed_pure_proc_macro(&crate_name, path) {
+            return false;
+        }
+    }
+    for raw_name in &inv.bare_externs {
+        let crate_name = normalize_extern_crate_name(raw_name).replace('-', "_");
+        if matches!(
+            crate_name.as_str(),
+            "proc_macro" | "std" | "core" | "alloc" | "test"
+        ) {
+            continue;
+        }
+        if IMPURE_MACRO_FACADE_DENYLIST.contains(&crate_name.as_str()) {
+            return false;
+        }
+        let candidates = resolve_bare_extern_candidates(&crate_name, &inv.dep_search_dirs);
+        if candidates.is_empty() {
+            return false;
+        }
+        for cand in &candidates {
+            let ext = cand.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if is_proc_macro_dylib_ext(ext) && !is_allowed_pure_proc_macro(&crate_name, cand) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// File names rustc may pick for `lib` in a search directory.
@@ -984,6 +1166,8 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
     let mut input_rs: Option<PathBuf> = None;
     let mut emits: Vec<String> = Vec::new();
     let mut extern_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut bare_externs: Vec<String> = Vec::new();
+    let mut dep_search_dirs: Vec<PathBuf> = Vec::new();
     let mut normalized_flags: Vec<String> = Vec::new();
     let mut native_libs: Vec<NativeLib> = Vec::new();
     let mut native_search_dirs: Vec<PathBuf> = Vec::new();
@@ -1076,15 +1260,13 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
             let Some(val) = args.get(i + 1) else {
                 return Classification::Passthrough;
             };
-            // Search paths `-L dependency=...` point into the worktree's `target/`;
-            // actual linked crates are hashed explicitly via `--extern` and `.d` files.
-            // Native search directories are kept only to resolve `-l` libraries, whose
-            // content (not path) enters the key.
+            dep_search_dirs.extend(parse_dep_search_dir(val, cwd));
             native_search_dirs.extend(parse_native_search_dir(val, cwd));
             i += 2;
             continue;
         }
         if let Some(val) = arg.strip_prefix("-L") {
+            dep_search_dirs.extend(parse_dep_search_dir(val, cwd));
             native_search_dirs.extend(parse_native_search_dir(val, cwd));
             i += 1;
             continue;
@@ -1117,6 +1299,7 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
                 let resolved = if p.is_absolute() { p } else { cwd.join(p) };
                 extern_files.push((name.to_string(), resolved));
             } else {
+                bare_externs.push(val.clone());
                 normalized_flags.push("--extern".to_string());
                 normalized_flags.push(val.clone());
             }
@@ -1129,6 +1312,7 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
                 let resolved = if p.is_absolute() { p } else { cwd.join(p) };
                 extern_files.push((name.to_string(), resolved));
             } else {
+                bare_externs.push(val.to_string());
                 normalized_flags.push(arg.clone());
             }
             i += 1;
@@ -1245,6 +1429,8 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
         input_rs,
         normalized_flags,
         extern_files,
+        bare_externs,
+        dep_search_dirs,
         native_libs,
         native_search_dirs,
     })
@@ -1257,11 +1443,32 @@ fn is_uncacheable_codegen_flag(val: &str) -> bool {
         || val.starts_with("instrument-coverage")
 }
 
+fn normalize_manifest_dir_for_stage1(
+    manifest_dir: &str,
+    worktree_root_canon: Option<&Path>,
+    worktree_root_raw: Option<&Path>,
+) -> String {
+    let mpath = Path::new(manifest_dir);
+    let mcanon = fs::canonicalize(mpath).unwrap_or_else(|_| mpath.to_path_buf());
+    for root in [worktree_root_canon, worktree_root_raw].into_iter().flatten() {
+        for cand in [&mcanon, mpath] {
+            if cand == root {
+                return COMPILE_ONLY_MANIFEST_DIR_SENTINEL.to_string();
+            }
+            if let Ok(rel) = cand.strip_prefix(root) {
+                return format!("{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/{}", rel.to_string_lossy());
+            }
+        }
+    }
+    manifest_dir.to_string()
+}
+
 fn compute_stage1_direct_key(
     compiler_vv_blake3: &str,
     inv: &CacheableInvocation,
     worktree_root_canon: Option<&Path>,
     worktree_root_raw: Option<&Path>,
+    cargo_manifest_dir: Option<&str>,
 ) -> Result<String, String> {
     let mut material = Vec::with_capacity(4096);
     material.extend_from_slice(b"gitpulse-rustc-v1\n");
@@ -1305,7 +1512,7 @@ fn compute_stage1_direct_key(
     material.push(b'\n');
 
     let mut extern_hashes: Vec<(String, String, String)> =
-        Vec::with_capacity(inv.extern_files.len());
+        Vec::with_capacity(inv.extern_files.len() + inv.bare_externs.len());
     for (name, path) in &inv.extern_files {
         let ext = path
             .extension()
@@ -1313,9 +1520,32 @@ fn compute_stage1_direct_key(
             .unwrap_or("")
             .to_string();
         let (digest, _) = hash_file_blake3(path)?;
-        extern_hashes.push((name.clone(), ext, digest));
+        let kind_tag = if is_proc_macro_dylib_ext(&ext) {
+            format!("proc-macro:{name}")
+        } else {
+            name.clone()
+        };
+        extern_hashes.push((kind_tag, ext, digest));
+    }
+    for raw_name in &inv.bare_externs {
+        let crate_name = normalize_extern_crate_name(raw_name).replace('-', "_");
+        for cand in resolve_bare_extern_candidates(&crate_name, &inv.dep_search_dirs) {
+            let ext = cand
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let (digest, _) = hash_file_blake3(&cand)?;
+            let kind_tag = if is_proc_macro_dylib_ext(&ext) {
+                format!("proc-macro-bare:{raw_name}")
+            } else {
+                format!("bare:{raw_name}")
+            };
+            extern_hashes.push((kind_tag, ext, digest));
+        }
     }
     extern_hashes.sort();
+    extern_hashes.dedup();
     for (name, ext, digest) in extern_hashes {
         material.extend_from_slice(name.as_bytes());
         material.push(b'.');
@@ -1328,6 +1558,8 @@ fn compute_stage1_direct_key(
     for line in native_lib_key_lines(inv)? {
         material.extend_from_slice(line.as_bytes());
     }
+
+    let pure_proc_macros = has_only_pure_ast_proc_macros(inv);
 
     // Hash Cargo package/cfg/feature/rustflags environment variables deterministically.
     let mut env_pairs: Vec<(String, String)> = std::env::vars()
@@ -1347,6 +1579,14 @@ fn compute_stage1_direct_key(
                 )
         })
         .collect();
+    if let Some(mdir) = cargo_manifest_dir {
+        let keyed_mdir = if pure_proc_macros {
+            normalize_manifest_dir_for_stage1(mdir, worktree_root_canon, worktree_root_raw)
+        } else {
+            mdir.to_string()
+        };
+        env_pairs.push(("CARGO_MANIFEST_DIR".to_string(), keyed_mdir));
+    }
     env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
     for (k, v) in env_pairs {
         material.extend_from_slice(k.as_bytes());
@@ -1843,6 +2083,163 @@ fn is_out_dir_compile_time_include_only(
     total_out_dir_literals >= 1
 }
 
+fn skip_std_core_macro_prefix_forward(tokens: &[RustLexToken], start: usize) -> usize {
+    let mut cur = start;
+    if tokens.get(cur) == Some(&RustLexToken::Punct(':'))
+        && tokens.get(cur + 1) == Some(&RustLexToken::Punct(':'))
+    {
+        cur += 2;
+    }
+    if matches!(
+        tokens.get(cur),
+        Some(RustLexToken::Ident(ns)) if ns == "std" || ns == "core"
+    ) && tokens.get(cur + 1) == Some(&RustLexToken::Punct(':'))
+        && tokens.get(cur + 2) == Some(&RustLexToken::Punct(':'))
+    {
+        cur += 3;
+    } else {
+        return start;
+    }
+    cur
+}
+
+fn check_tokens_manifest_dir_safe(tokens: &[RustLexToken]) -> bool {
+    let mut saw_out_dir_include = false;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if let RustLexToken::StrLit { value, .. } = tok {
+            if value.contains("CARGO_MANIFEST_DIR") {
+                return false;
+            }
+        }
+        if let RustLexToken::Ident(name) = tok {
+            if (name == "env" || name == "option_env")
+                && tokens.get(idx + 1) == Some(&RustLexToken::Punct('!'))
+            {
+                let Some(RustLexToken::Punct(open)) = tokens.get(idx + 2) else {
+                    return false;
+                };
+                if matching_close_delim(*open).is_none() {
+                    return false;
+                }
+                match tokens.get(idx + 3) {
+                    Some(RustLexToken::StrLit {
+                        value,
+                        has_escape: false,
+                        is_raw: false,
+                    }) if !value.contains("CARGO_MANIFEST_DIR") => {}
+                    _ => return false,
+                }
+            }
+            if matches!(name.as_str(), "include" | "include_str" | "include_bytes")
+                && tokens.get(idx + 1) == Some(&RustLexToken::Punct('!'))
+            {
+                // Only `include*!(concat!(env!("OUT_DIR"), "/..."))` is permitted when
+                // normalizing `# env-dep:CARGO_MANIFEST_DIR` to the cross-worktree sentinel.
+                let Some(RustLexToken::Punct(open1)) = tokens.get(idx + 2) else {
+                    return false;
+                };
+                if matching_close_delim(*open1).is_none() {
+                    return false;
+                }
+                let concat_idx = skip_std_core_macro_prefix_forward(tokens, idx + 3);
+                if tokens.get(concat_idx) != Some(&RustLexToken::Ident("concat".to_string()))
+                    || tokens.get(concat_idx + 1) != Some(&RustLexToken::Punct('!'))
+                {
+                    return false;
+                }
+                let Some(RustLexToken::Punct(open2)) = tokens.get(concat_idx + 2) else {
+                    return false;
+                };
+                if matching_close_delim(*open2).is_none() {
+                    return false;
+                }
+                let env_idx = skip_std_core_macro_prefix_forward(tokens, concat_idx + 3);
+                if tokens.get(env_idx) != Some(&RustLexToken::Ident("env".to_string()))
+                    || tokens.get(env_idx + 1) != Some(&RustLexToken::Punct('!'))
+                {
+                    return false;
+                }
+                let Some(RustLexToken::Punct(open3)) = tokens.get(env_idx + 2) else {
+                    return false;
+                };
+                if matching_close_delim(*open3).is_none() {
+                    return false;
+                }
+                match tokens.get(env_idx + 3) {
+                    Some(RustLexToken::StrLit {
+                        value,
+                        has_escape: false,
+                        is_raw: false,
+                    }) if value == "OUT_DIR" => {
+                        saw_out_dir_include = true;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    if saw_out_dir_include {
+        let (cnt, ok) = check_tokens_out_dir_compile_only(tokens);
+        if !ok || cnt == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_crate_manifest_dir_safe(input_rs: &Path, dep_files: &[String], cwd: &Path) -> bool {
+    let mut rs_paths: Vec<PathBuf> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let push_rs = |p: PathBuf, seen: &mut BTreeSet<PathBuf>, rs_paths: &mut Vec<PathBuf>| {
+        if p.extension().and_then(|s| s.to_str()) != Some("rs") {
+            return;
+        }
+        let canon = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if seen.insert(canon.clone()) {
+            rs_paths.push(canon);
+        }
+    };
+
+    push_rs(input_rs.to_path_buf(), &mut seen, &mut rs_paths);
+    for raw in dep_files {
+        let p = PathBuf::from(raw);
+        let abs = if p.is_absolute() { p } else { cwd.join(p) };
+        push_rs(abs, &mut seen, &mut rs_paths);
+    }
+    if rs_paths.is_empty() {
+        return false;
+    }
+    for rs_path in rs_paths {
+        let Ok(src) = fs::read_to_string(&rs_path) else {
+            return false;
+        };
+        let Ok(tokens) = lex_rust_simple_tokens(&src) else {
+            return false;
+        };
+        if !check_tokens_manifest_dir_safe(&tokens) {
+            return false;
+        }
+    }
+    true
+}
+
+fn dep_info_proc_macros_all_pure(dep_files: &[String]) -> bool {
+    for raw in dep_files {
+        let p = Path::new(raw);
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !is_proc_macro_dylib_ext(ext) {
+            continue;
+        }
+        let Some(stem) = extract_crate_stem_from_artifact(p) else {
+            return false;
+        };
+        if !is_allowed_pure_proc_macro(&stem, p) {
+            return false;
+        }
+    }
+    true
+}
+
 fn classify_dep_scope(
     raw_dep: &str,
     cwd: &Path,
@@ -1902,11 +2299,36 @@ fn resolve_dep_scope(
 fn verify_stage2_manifest(
     manifest: &DirectManifest,
     cargo_out_dir: Option<&Path>,
-    worktree_root: Option<&Path>,
+    worktree_root_canon: Option<&Path>,
+    worktree_root_raw: Option<&Path>,
+    cargo_manifest_dir: Option<&str>,
 ) -> bool {
+    let sentinel_prefix = format!("{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/");
     for (k, expected) in &manifest.env_deps {
         if k == "OUT_DIR" && expected.as_deref() == Some(COMPILE_ONLY_OUT_DIR_SENTINEL) {
             if cargo_out_dir.is_none() {
+                return false;
+            }
+            continue;
+        }
+        if k == "CARGO_MANIFEST_DIR" {
+            if let Some(exp) = expected.as_deref() {
+                if exp == COMPILE_ONLY_MANIFEST_DIR_SENTINEL || exp.starts_with(&sentinel_prefix) {
+                    let Some(actual_mdir) = cargo_manifest_dir else {
+                        return false;
+                    };
+                    let norm_actual = normalize_manifest_dir_for_stage1(
+                        actual_mdir,
+                        worktree_root_canon,
+                        worktree_root_raw,
+                    );
+                    if norm_actual != exp {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            if cargo_manifest_dir != expected.as_deref() {
                 return false;
             }
             continue;
@@ -1917,7 +2339,7 @@ fn verify_stage2_manifest(
         }
     }
     for dep in &manifest.deps {
-        let Some(path) = resolve_dep_scope(&dep.scope, cargo_out_dir, worktree_root) else {
+        let Some(path) = resolve_dep_scope(&dep.scope, cargo_out_dir, worktree_root_canon) else {
             return false;
         };
         let Ok((actual_hash, _)) = hash_file_blake3(&path) else {
@@ -2242,6 +2664,9 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from);
+    let cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     let compiler_vv = match compiler_identity_digest(&cache_dir, rustc) {
         Ok(v) => v,
@@ -2256,6 +2681,7 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
         &inv,
         worktree_root_canon.as_deref(),
         worktree_root_raw.as_deref(),
+        cargo_manifest_dir.as_deref(),
     ) {
         Ok(k) => k,
         Err(_) => {
@@ -2275,6 +2701,8 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
                 &manifest,
                 cargo_out_dir.as_deref(),
                 worktree_root_canon.as_deref(),
+                worktree_root_raw.as_deref(),
+                cargo_manifest_dir.as_deref(),
             ) {
                 match try_restore_cached_outputs(
                     &cache_dir,
@@ -2342,6 +2770,7 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
         &inv,
         worktree_root_canon.as_deref(),
         worktree_root_raw.as_deref(),
+        cargo_manifest_dir.as_deref(),
         &direct_key,
     ) {
         Ok(()) => store_successful_compile(
@@ -2352,6 +2781,7 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
             cargo_out_dir.as_deref(),
             worktree_root_canon.as_deref(),
             worktree_root_raw.as_deref(),
+            cargo_manifest_dir.as_deref(),
             &output.stderr,
             compile_started,
         ),
@@ -2397,10 +2827,17 @@ fn recheck_key_unchanged(
     inv: &CacheableInvocation,
     worktree_root_canon: Option<&Path>,
     worktree_root_raw: Option<&Path>,
+    cargo_manifest_dir: Option<&str>,
     key_before: &str,
 ) -> Result<(), String> {
-    let after = compute_stage1_direct_key(compiler_vv, inv, worktree_root_canon, worktree_root_raw)
-        .map_err(|e| format!("cannot re-hash inputs after the compile: {e}"))?;
+    let after = compute_stage1_direct_key(
+        compiler_vv,
+        inv,
+        worktree_root_canon,
+        worktree_root_raw,
+        cargo_manifest_dir,
+    )
+    .map_err(|e| format!("cannot re-hash inputs after the compile: {e}"))?;
     if after == key_before {
         Ok(())
     } else {
@@ -2527,6 +2964,7 @@ fn store_successful_compile(
     cargo_out_dir: Option<&Path>,
     worktree_root_canon: Option<&Path>,
     worktree_root_raw: Option<&Path>,
+    cargo_manifest_dir: Option<&str>,
     stderr_bytes: &[u8],
     compile_started: SystemTime,
 ) -> Result<u64, String> {
@@ -2593,6 +3031,26 @@ fn store_successful_compile(
             "OUT_DIR".to_string(),
             Some(COMPILE_ONLY_OUT_DIR_SENTINEL.to_string()),
         );
+    }
+
+    let pure_proc_macros =
+        has_only_pure_ast_proc_macros(inv) && dep_info_proc_macros_all_pure(&parsed.files);
+    if let Some(mdir) = cargo_manifest_dir {
+        if !pure_proc_macros {
+            // Impure or unknown proc-macros may read `CARGO_MANIFEST_DIR` without emitting
+            // `# env-dep:CARGO_MANIFEST_DIR` in `.d`; pin the raw directory in Stage 2 too.
+            parsed
+                .env_deps
+                .insert("CARGO_MANIFEST_DIR".to_string(), Some(mdir.to_string()));
+        } else if matches!(parsed.env_deps.get("CARGO_MANIFEST_DIR"), Some(Some(_)))
+            && is_crate_manifest_dir_safe(&inv.input_rs, &parsed.files, cwd)
+        {
+            let norm_mdir =
+                normalize_manifest_dir_for_stage1(mdir, worktree_root_canon, worktree_root_raw);
+            parsed
+                .env_deps
+                .insert("CARGO_MANIFEST_DIR".to_string(), Some(norm_mdir));
+        }
     }
 
     let mut recorded_artifacts = Vec::with_capacity(emitted.len());
@@ -2898,5 +3356,240 @@ mod tests {
         );
         assert_eq!(parse_native_search_dir("dependency=/deps", cwd), None);
         assert_eq!(parse_native_search_dir("framework=/f", cwd), None);
+    }
+
+    #[test]
+    fn pure_ast_proc_macros_share_stage1_and_stage2_across_worktrees_and_invalidate_on_dylib_change()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let wt_a = root.join("wt-a");
+        let wt_b = root.join("wt-b");
+        let host_deps = root.join("host-deps");
+        fs::create_dir_all(wt_a.join("crates/demo/src")).unwrap();
+        fs::create_dir_all(wt_b.join("crates/demo/src")).unwrap();
+        fs::create_dir_all(&host_deps).unwrap();
+
+        let src = "pub struct Item { pub id: u64 }\n";
+        fs::write(wt_a.join("crates/demo/src/lib.rs"), src).unwrap();
+        fs::write(wt_b.join("crates/demo/src/lib.rs"), src).unwrap();
+
+        let serde_dylib = host_deps.join("libserde_derive-0123abcd.dylib");
+        let clap_dylib = host_deps.join("libclap_derive-89ef0123.dylib");
+        fs::write(&serde_dylib, b"serde-derive-v1-bytes").unwrap();
+        fs::write(&clap_dylib, b"clap-derive-v1-bytes").unwrap();
+
+        let mk_inv = |wt: &Path| {
+            let args = vec![
+                "--crate-name".to_string(),
+                "demo".to_string(),
+                "--crate-type".to_string(),
+                "rlib".to_string(),
+                "--emit=dep-info,metadata,link".to_string(),
+                "--out-dir".to_string(),
+                wt.join("target/debug/deps").to_string_lossy().into_owned(),
+                "-L".to_string(),
+                format!("dependency={}", host_deps.display()),
+                "--extern".to_string(),
+                format!("serde_derive={}", serde_dylib.display()),
+                "--extern".to_string(),
+                "clap_derive".to_string(),
+                "crates/demo/src/lib.rs".to_string(),
+            ];
+            match classify_rustc_args(&args, wt) {
+                Classification::Cacheable(c) => c,
+                other => panic!("expected Cacheable, got {other:?}"),
+            }
+        };
+
+        let inv_a = mk_inv(&wt_a);
+        let inv_b = mk_inv(&wt_b);
+        assert!(has_only_pure_ast_proc_macros(&inv_a));
+        assert!(has_only_pure_ast_proc_macros(&inv_b));
+
+        let mdir_a = wt_a.join("crates/demo").to_string_lossy().into_owned();
+        let mdir_b = wt_b.join("crates/demo").to_string_lossy().into_owned();
+
+        let key_a = compute_stage1_direct_key(
+            "rustc-test-vv",
+            &inv_a,
+            Some(&wt_a),
+            Some(&wt_a),
+            Some(&mdir_a),
+        )
+        .unwrap();
+        let key_b = compute_stage1_direct_key(
+            "rustc-test-vv",
+            &inv_b,
+            Some(&wt_b),
+            Some(&wt_b),
+            Some(&mdir_b),
+        )
+        .unwrap();
+        assert_eq!(
+            key_a, key_b,
+            "pure-AST proc-macro crates must share Stage 1 key across worktrees"
+        );
+
+        // Mutating `libserde_derive` bytes MUST change Stage 1 key immediately.
+        fs::write(&serde_dylib, b"serde-derive-v2-mutated-bytes").unwrap();
+        let key_a_mut = compute_stage1_direct_key(
+            "rustc-test-vv",
+            &inv_a,
+            Some(&wt_a),
+            Some(&wt_a),
+            Some(&mdir_a),
+        )
+        .unwrap();
+        assert_ne!(
+            key_a, key_a_mut,
+            "mutated proc-macro dylib bytes must invalidate Stage 1 key"
+        );
+
+        // Stage 2 sentinel verification succeeds across sibling worktrees for the same crate path
+        // and rejects mismatched crate subdirectories.
+        let norm_sentinel =
+            normalize_manifest_dir_for_stage1(&mdir_a, Some(&wt_a), Some(&wt_a));
+        assert_eq!(
+            norm_sentinel,
+            format!("{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/crates/demo")
+        );
+        let mut env_deps = BTreeMap::new();
+        env_deps.insert("CARGO_MANIFEST_DIR".to_string(), Some(norm_sentinel));
+        let manifest = DirectManifest {
+            schema_version: 1,
+            crate_name: "demo".to_string(),
+            recorded_out_dir: wt_a.join("target/debug/deps").to_string_lossy().into_owned(),
+            recorded_out_dir_canon: None,
+            recorded_worktree_root: Some(wt_a.to_string_lossy().into_owned()),
+            recorded_worktree_root_raw: Some(wt_a.to_string_lossy().into_owned()),
+            recorded_cargo_out_dir: None,
+            recorded_cargo_out_dir_canon: None,
+            dep_file_name: "demo.d".to_string(),
+            dep_info_text: String::new(),
+            deps: Vec::new(),
+            env_deps,
+            artifacts: Vec::new(),
+            stderr_bytes: Vec::new(),
+        };
+        assert!(verify_stage2_manifest(
+            &manifest,
+            None,
+            Some(&wt_b),
+            Some(&wt_b),
+            Some(&mdir_b)
+        ));
+        let wrong_mdir = wt_b.join("crates/other").to_string_lossy().into_owned();
+        assert!(!verify_stage2_manifest(
+            &manifest,
+            None,
+            Some(&wt_b),
+            Some(&wt_b),
+            Some(&wrong_mdir)
+        ));
+    }
+
+    #[test]
+    fn impure_or_unknown_proc_macros_isolate_stage1_and_stage2_across_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let wt_a = root.join("wt-a");
+        let wt_b = root.join("wt-b");
+        let deps = root.join("deps");
+        fs::create_dir_all(wt_a.join("src")).unwrap();
+        fs::create_dir_all(wt_b.join("src")).unwrap();
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(wt_a.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(wt_b.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let sqlx_dylib = deps.join("libsqlx_macros-deadbeef.dylib");
+        let tauri_rlib = deps.join("libtauri-cafebabe.rlib");
+        let custom_dylib = deps.join("libcustom_embed-11223344.dylib");
+        fs::write(&sqlx_dylib, b"sqlx-macro").unwrap();
+        fs::write(&tauri_rlib, b"tauri-facade").unwrap();
+        fs::write(&custom_dylib, b"custom-macro").unwrap();
+
+        for (label, extern_spec) in [
+            ("sqlx_macros", format!("sqlx_macros={}", sqlx_dylib.display())),
+            ("tauri_facade", format!("tauri={}", tauri_rlib.display())),
+            ("unknown_dylib", format!("custom_embed={}", custom_dylib.display())),
+        ] {
+            let mk_inv = |wt: &Path| {
+                let args = vec![
+                    "--crate-name".to_string(),
+                    "app_lib".to_string(),
+                    "--crate-type".to_string(),
+                    "rlib".to_string(),
+                    "--emit=dep-info,link".to_string(),
+                    "--out-dir".to_string(),
+                    wt.join("target/debug/deps").to_string_lossy().into_owned(),
+                    "--extern".to_string(),
+                    extern_spec.clone(),
+                    "src/lib.rs".to_string(),
+                ];
+                match classify_rustc_args(&args, wt) {
+                    Classification::Cacheable(c) => c,
+                    other => panic!("{label}: expected Cacheable, got {other:?}"),
+                }
+            };
+            let inv_a = mk_inv(&wt_a);
+            let inv_b = mk_inv(&wt_b);
+            assert!(
+                !has_only_pure_ast_proc_macros(&inv_a),
+                "{label}: must NOT be classified as pure-AST proc-macro"
+            );
+
+            let key_a = compute_stage1_direct_key(
+                "rustc-vv",
+                &inv_a,
+                Some(&wt_a),
+                Some(&wt_a),
+                Some(wt_a.to_str().unwrap()),
+            )
+            .unwrap();
+            let key_b = compute_stage1_direct_key(
+                "rustc-vv",
+                &inv_b,
+                Some(&wt_b),
+                Some(&wt_b),
+                Some(wt_b.to_str().unwrap()),
+            )
+            .unwrap();
+            assert_ne!(
+                key_a, key_b,
+                "{label}: impure/unknown proc-macro must pin raw CARGO_MANIFEST_DIR in Stage 1"
+            );
+        }
+
+        assert!(!dep_info_proc_macros_all_pure(&[
+            custom_dylib.to_string_lossy().into_owned()
+        ]));
+    }
+
+    #[test]
+    fn manifest_dir_lexical_scanner_rejects_direct_escaped_and_local_include_uses() {
+        let safe_src = r#"
+            // env!("CARGO_MANIFEST_DIR") inside comment is harmless
+            include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+            pub const PKG_VER: &str = env!("CARGO_PKG_VERSION");
+            pub const OPT_TAG: Option<&str> = option_env!("GIT_SHA");
+        "#;
+        let safe_toks = lex_rust_simple_tokens(safe_src).expect("lex safe_src");
+        assert!(check_tokens_manifest_dir_safe(&safe_toks));
+
+        for bad_src in [
+            r#"pub const DIR: &str = env!("CARGO_MANIFEST_DIR");"#,
+            r#"pub const DIR: Option<&str> = option_env!("CARGO_MANIFEST_DIR");"#,
+            r#"pub const ESC: &str = env!("CARGO\x5fMANIFEST_DIR");"#,
+            r##"pub const RAW: &str = r#"CARGO_MANIFEST_DIR"#;"##,
+            r#"pub const TXT: &str = include_str!("local.txt");"#,
+            r#"pub const BIN: &[u8] = std::include_bytes!("fixture.bin");"#,
+        ] {
+            let toks = lex_rust_simple_tokens(bad_src).expect("lex bad_src");
+            assert!(
+                !check_tokens_manifest_dir_safe(&toks),
+                "expected lexical CARGO_MANIFEST_DIR safety rejection for: {bad_src}"
+            );
+        }
     }
 }

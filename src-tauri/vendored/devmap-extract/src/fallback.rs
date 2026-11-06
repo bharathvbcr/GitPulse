@@ -224,6 +224,12 @@ pub struct FallbackScan {
     /// byte cap that did not say so would turn "read 2,000 rules of 40,000"
     /// into an answer that looks complete.
     pub unread_bytes: usize,
+    /// Call sites the markup or stylesheet reader recognized. Empty for the
+    /// line scanner, which recovers declarations only.
+    pub calls: Vec<crate::model::ExtractedCall>,
+    /// Call sites the reader counted and dropped. Non-zero means [`Self::calls`]
+    /// is a prefix, and the fallback reason says so.
+    pub truncated_calls: usize,
 }
 
 /// Recover top-level declarations from `source` by line pattern.
@@ -364,6 +370,8 @@ pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> Fa
         truncated,
         skipped_long_lines,
         unread_bytes: 0,
+        calls: Vec::new(),
+        truncated_calls: 0,
     }
 }
 
@@ -395,6 +403,8 @@ fn from_markup(scan: crate::markup::MarkupScan, file_path: &str, source: &str) -
         // fact, and the reason string says so.
         skipped_long_lines: 0,
         unread_bytes,
+        calls: scan.calls,
+        truncated_calls: scan.truncated_calls,
     }
 }
 

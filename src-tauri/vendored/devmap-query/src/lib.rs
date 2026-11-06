@@ -8,6 +8,7 @@
 pub mod api_routes;
 pub mod artifacts;
 pub mod ast;
+pub mod block_layout;
 pub mod bounded;
 pub mod cancel;
 pub mod cas;
@@ -33,6 +34,7 @@ pub mod query_match;
 pub mod rung;
 pub mod scope;
 pub mod snapshots;
+pub mod stacked;
 pub mod stat_memo;
 
 pub mod ask;
@@ -57,8 +59,8 @@ pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     build_code_graph_value, build_graph_core_value, decode_compact, encode_compact,
     generate_code_graph_encodings, generate_code_graph_json, write_code_graph_atomically,
-    CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_EXPORT_MAX_BYTES, CODE_GRAPH_SCHEMA_VERSION,
-    CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
+    write_verbose_code_graph_atomically, CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_EXPORT_MAX_BYTES,
+    CODE_GRAPH_SCHEMA_VERSION, CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
 };
 pub use doc_drift::{DocDriftFinding, DocDriftReport, DriftKind};
 pub use engine::{
@@ -81,6 +83,12 @@ pub use map_preview::{
 };
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
+pub use stacked::{
+    base_generation_dir, bases_root_dir, gc_unused_bases, provision_stacked_worktree,
+    publish_base_snapshot, seed_derived_artifacts_and_reuse_caches, BaseManifest, GcBasesReport,
+    StackLease, StackedStatus, StackedStore, StackedSyncReport, DEFAULT_REBASE_DELTA_BYTES,
+    DEFAULT_REBASE_DIRTY_FILES, STACK_FORMAT_VERSION,
+};
 
 pub use cas::{blake3_hash, CasAstStore, CAS_TOMBSTONE};
 pub use overlay::{OverlayEdge, RoaringBitmap, WorktreeOverlay};

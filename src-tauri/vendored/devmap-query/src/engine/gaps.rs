@@ -188,6 +188,32 @@ pub(super) fn analysis_coverage_gap(
     devmap_analyze::combine_reasons(analysis_status_gap(analysis), unresolved)
 }
 
+/// Files that failed to parse, named so an empty caller list is not read as
+/// "nothing calls this".
+///
+/// `None` when nothing failed. The paths are whatever the caller already
+/// bounded; this function does not query. When the total is larger than the
+/// paths shown, the sentence says how many were left out. A positive total
+/// with no paths still says the count and that the paths were not listed —
+/// an empty list must not read as a clean walk.
+pub(super) fn failed_parse_note(total: usize, paths: &[String]) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let listed = if paths.is_empty() {
+        "the paths were not listed".to_string()
+    } else {
+        let mut text = paths.join(", ");
+        if total > paths.len() {
+            text.push_str(&format!(", and {} more", total - paths.len()));
+        }
+        text
+    };
+    Some(format!(
+        "{total} file(s) failed to parse, so a caller in them is missing from this answer: {listed}"
+    ))
+}
+
 /// Unresolved sites include known external targets and are not an edge count.
 /// Use the persisted rate's existing classification, with conservative fallback
 /// for older or inconsistent summaries. These are repository-wide measurements;
@@ -1371,6 +1397,35 @@ pub(super) fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &s
         0.95
     } else {
         0.8
+    }
+}
+
+#[cfg(test)]
+mod failed_parse_note_tests {
+    use super::failed_parse_note;
+
+    #[test]
+    fn nothing_failed_adds_no_sentence() {
+        assert_eq!(failed_parse_note(0, &[]), None);
+        assert_eq!(failed_parse_note(0, &["stale.ps1".into()]), None);
+    }
+
+    #[test]
+    fn the_sentence_names_the_file_and_the_ones_it_did_not_list() {
+        let one = failed_parse_note(1, &["caller.ps1".into()]).expect("one failure");
+        assert!(one.contains("caller.ps1"), "{one}");
+        assert!(one.contains("1 file(s) failed to parse"), "{one}");
+        assert!(!one.contains("more"), "{one}");
+
+        let paths: Vec<String> = (0..8).map(|index| format!("f{index}.ps1")).collect();
+        let more = failed_parse_note(9, &paths).expect("nine failures");
+        assert!(more.contains("f0.ps1"), "{more}");
+        assert!(more.contains("and 1 more"), "{more}");
+        assert!(!more.contains("f8.ps1"), "{more}");
+
+        let unnamed = failed_parse_note(3, &[]).expect("a count with no paths");
+        assert!(unnamed.contains("3 file(s) failed to parse"), "{unnamed}");
+        assert!(unnamed.contains("the paths were not listed"), "{unnamed}");
     }
 }
 

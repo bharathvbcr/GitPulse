@@ -2618,10 +2618,19 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // make a file with one hole indistinguishable from a file with two.
             let capabilities = ext.capabilities();
             if !capabilities.contains(Capability::Calls) {
+                let mut reason = format!("`{}` has no call extractor in this build", ext.language);
+                if let Some(dropped) = ext
+                    .diagnostics
+                    .iter()
+                    .find(|line| line.starts_with(CALLS_DROPPED_PREFIX))
+                {
+                    reason.push_str("; ");
+                    reason.push_str(dropped);
+                }
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
                     gap: ExtractionGap::CallBlind,
-                    reason: format!("`{}` has no call extractor in this build", ext.language),
+                    reason,
                 });
             }
             if !capabilities.contains(Capability::Imports) {
@@ -3786,12 +3795,16 @@ pub fn analyze_liveness_with_coverage(
 
         // One report per graph identity. Two `#[cfg]` variants of one method —
         // `ShutdownSignals::recv` for unix and for windows — are two extracted
-        // symbols sharing one qualified name, which is one node with one set
-        // of callers. Reporting each listed the same finding twice, and a
-        // reader counting rows counted it twice. Every input to the verdict is
-        // keyed by that name except the parse-error overlap, which is a fact
-        // about one variant's span; it is taken over all of them, so the row
-        // is exempt if any variant could hide a caller.
+        // symbols. The later copy's qualified name is `base@<start_byte>` so
+        // each body keeps its own calls; the row is still the base. Reporting
+        // the suffix as well listed the same finding twice. The parse-error
+        // overlap is a fact about one variant's span and is taken over all of
+        // them, so the row is exempt if any variant could hide a caller.
+        let file_names: BTreeSet<&str> = ext
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect();
         let mut overlaps_by_identity: HashMap<&str, bool> = HashMap::new();
         for sym in &ext.symbols {
             let overlaps = match &ext.parse_outcome {
@@ -3803,9 +3816,8 @@ pub fn analyze_liveness_with_coverage(
                 | ParseOutcome::Fallback { .. }
                 | ParseOutcome::Skipped { .. } => false,
             };
-            *overlaps_by_identity
-                .entry(sym.qualified_name.as_str())
-                .or_default() |= overlaps;
+            let identity = cfg_canonical(sym.qualified_name.as_str(), &file_names);
+            *overlaps_by_identity.entry(identity).or_default() |= overlaps;
         }
         let mut reported: HashSet<&str> = HashSet::new();
 
@@ -3815,7 +3827,11 @@ pub fn analyze_liveness_with_coverage(
             if is_never_dead_candidate(sym.kind) || sym.name.starts_with('_') {
                 continue; // See `is_never_dead_candidate`; plus underscore-private
             }
-            if !reported.insert(sym.qualified_name.as_str()) {
+            let identity = cfg_canonical(sym.qualified_name.as_str(), &file_names);
+            if identity != sym.qualified_name.as_str() {
+                continue;
+            }
+            if !reported.insert(identity) {
                 continue;
             }
 

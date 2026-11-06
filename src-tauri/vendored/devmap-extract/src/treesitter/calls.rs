@@ -265,7 +265,23 @@ pub(super) fn split_call_target_inner(
                 }
             });
             match (name, path) {
-                (Some(name), path) if !name.is_empty() => (name, path),
+                (Some(name), path) if !name.is_empty() => {
+                    // `self::helper()` and `self.helper()` are different
+                    // expressions. The field form keeps the receiver `self`,
+                    // which is the value. The path form's path is the module
+                    // keyword; spelling it `self::` keeps it off the value-self
+                    // rung. `self::child::f` already contains `::` and is left
+                    // as written. `rust_absorb_inline_super` still emits a bare
+                    // `self` for an absorbed `super`, and tests pin that.
+                    let path = path.map(|path| {
+                        if path == "self" {
+                            "self::".to_string()
+                        } else {
+                            path
+                        }
+                    });
+                    (name, path)
+                }
                 _ => (get_node_text(function_node, source), None),
             }
         }

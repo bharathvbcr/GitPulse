@@ -64,7 +64,8 @@ SUBCOMMANDS:
       --base <rev>       Starting revision / branch
       --target <dir>     Explicit absolute target directory
       --sparse <p1,p2>   Comma-separated paths for DevMap-guided sparse --cone checkout
-      --zero-copy        Share anchor DevMap SQLite/CSR/CAS via <512B base_store_ref.json
+      --zero-copy        Share anchor DevMap SQLite/CSR/CAS via stack_lease.json + base_store_ref.json
+      --devmap-mode <m>  DevMap provisioning mode: copy, stacked, zero-copy, or none
       --no-cache         Skip Copy-on-Write ignored build cache cloning
       --exec <cmd>       Guard and run a post-create command (60s timeout)
       --agent <id>       Register the lane in <git-common-dir>/gitpulse/lanes/claims.json
@@ -74,11 +75,14 @@ SUBCOMMANDS:
       --branch <name>    Branch name (required)
       --create           Create worktree if missing
       --base <rev>       Base revision when creating
+      --zero-copy        Provision stacked/zero-copy DevMap when creating
+      --devmap-mode <m>  DevMap provisioning mode when creating: copy, stacked, zero-copy, or none
 
     isolate              Provision CoW caches and DevMap state into an existing worktree
       --repo <path>      Repository checkout path (required)
       --worktree <dir>   Target worktree path (required)
-      --zero-copy        Use zero-copy base_store_ref.json instead of CoW SQLite clone
+      --zero-copy        Use stacked/zero-copy DevMap instead of CoW SQLite clone
+      --devmap-mode <m>  DevMap provisioning mode: copy, stacked, zero-copy, or none
       --include-venv     Include .venv / venv in CoW cache cloning
 
     compile-overlay      Compile dirty files into overlay.json + CAS ASTs + RoaringBitmap CSR nodes
@@ -152,6 +156,42 @@ SUBCOMMANDS:
       --max-bytes <n>    Maximum retained blob bytes when --prune is set (default: 4 GiB)
 ";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliDevmapMode {
+    Copy,
+    Stacked,
+    None,
+}
+
+impl CliDevmapMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "copy" => Ok(Self::Copy),
+            "stacked" | "zero-copy" | "zero_copy" => Ok(Self::Stacked),
+            "none" | "off" => Ok(Self::None),
+            other => Err(format!(
+                "invalid --devmap-mode {other:?} (expected copy, stacked, zero-copy, or none)"
+            )),
+        }
+    }
+
+    fn resolve(zero_copy: bool, explicit: Option<Self>) -> Self {
+        match explicit {
+            Some(mode) => mode,
+            None if zero_copy => Self::Stacked,
+            None => Self::Copy,
+        }
+    }
+
+    fn to_engine_mode(self) -> DevmapMode {
+        match self {
+            Self::Copy => DevmapMode::Copy,
+            Self::Stacked => DevmapMode::ZeroCopy,
+            Self::None => DevmapMode::None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Invocation {
     Help,
@@ -168,6 +208,7 @@ enum Subcommand {
         target: Option<String>,
         sparse: Vec<String>,
         zero_copy: bool,
+        devmap_mode: Option<CliDevmapMode>,
         share_cache: bool,
         exec: Option<String>,
         agent: Option<String>,
@@ -177,11 +218,14 @@ enum Subcommand {
         branch: String,
         create: bool,
         base: Option<String>,
+        zero_copy: bool,
+        devmap_mode: Option<CliDevmapMode>,
     },
     Isolate {
         repo: String,
         worktree: String,
         zero_copy: bool,
+        devmap_mode: Option<CliDevmapMode>,
         include_venv: bool,
     },
     CompileOverlay {
@@ -335,6 +379,7 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
             let mut target = None;
             let mut sparse = Vec::new();
             let mut zero_copy = false;
+            let mut devmap_mode = None;
             let mut share_cache = true;
             let mut exec = None;
             let mut agent = None;
@@ -354,6 +399,10 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                         split_csv_into(&v, &mut sparse).map_err(map_err)?;
                     }
                     "--zero-copy" => zero_copy = true,
+                    "--devmap-mode" => {
+                        let v = take_val(rest, &mut i, "--devmap-mode").map_err(map_err)?;
+                        devmap_mode = Some(CliDevmapMode::parse(&v).map_err(map_err)?);
+                    }
                     "--no-cache" => share_cache = false,
                     "--exec" => exec = Some(take_val(rest, &mut i, "--exec").map_err(map_err)?),
                     "--agent" => agent = Some(take_val(rest, &mut i, "--agent").map_err(map_err)?),
@@ -368,6 +417,7 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                 target,
                 sparse,
                 zero_copy,
+                devmap_mode,
                 share_cache,
                 exec,
                 agent,
@@ -378,6 +428,8 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
             let mut branch = None;
             let mut create = false;
             let mut base = None;
+            let mut zero_copy = false;
+            let mut devmap_mode = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -387,6 +439,11 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                     }
                     "--create" => create = true,
                     "--base" => base = Some(take_val(rest, &mut i, "--base").map_err(map_err)?),
+                    "--zero-copy" => zero_copy = true,
+                    "--devmap-mode" => {
+                        let v = take_val(rest, &mut i, "--devmap-mode").map_err(map_err)?;
+                        devmap_mode = Some(CliDevmapMode::parse(&v).map_err(map_err)?);
+                    }
                     other => return Err((json_mode, format!("unknown flag for switch: {other}"))),
                 }
                 i += 1;
@@ -396,12 +453,15 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                 branch: require_flag(branch, "--branch", "switch").map_err(map_err)?,
                 create,
                 base,
+                zero_copy,
+                devmap_mode,
             }
         }
         "isolate" => {
             let mut repo = None;
             let mut worktree = None;
             let mut zero_copy = false;
+            let mut devmap_mode = None;
             let mut include_venv = false;
             let mut i = 0;
             while i < rest.len() {
@@ -411,6 +471,10 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                         worktree = Some(take_val(rest, &mut i, "--worktree").map_err(map_err)?)
                     }
                     "--zero-copy" => zero_copy = true,
+                    "--devmap-mode" => {
+                        let v = take_val(rest, &mut i, "--devmap-mode").map_err(map_err)?;
+                        devmap_mode = Some(CliDevmapMode::parse(&v).map_err(map_err)?);
+                    }
                     "--include-venv" => include_venv = true,
                     other => return Err((json_mode, format!("unknown flag for isolate: {other}"))),
                 }
@@ -420,6 +484,7 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                 repo: require_flag(repo, "--repo", "isolate").map_err(map_err)?,
                 worktree: require_flag(worktree, "--worktree", "isolate").map_err(map_err)?,
                 zero_copy,
+                devmap_mode,
                 include_venv,
             }
         }
@@ -794,6 +859,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             target,
             sparse,
             zero_copy,
+            devmap_mode,
             share_cache,
             exec,
             agent,
@@ -808,6 +874,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let argv = add_worktree_argv(target_str, Some(&branch), base.as_deref(), false);
             let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             gitpulse_lib::harness::guard_command(&repo, &argv_refs)?;
+            let effective_mode = CliDevmapMode::resolve(zero_copy, devmap_mode);
 
             let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse
                 .is_empty()
@@ -837,7 +904,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     created.zero_copy_devmap,
                     Some(created.materialized_cone_dirs),
                 )
-            } else if zero_copy {
+            } else if effective_mode == CliDevmapMode::Stacked {
                 let path = add_worktree(&repo, target_str, Some(&branch), base.as_deref(), false)
                     .map_err(CommandError::into_message)?;
                 let mut zc_seeded = false;
@@ -870,6 +937,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 // (`add_worktree_extended` seeds none, so `--share-cache`
                 // used to leave every such worktree unseeded).
                 let selection = CacheSelection::default();
+                let engine_mode = effective_mode.to_engine_mode();
                 let created = add_worktree_with_devmap(
                     &repo,
                     target_str,
@@ -878,11 +946,11 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     false,
                     share_cache.then_some(&selection),
                     true,
-                    DevmapMode::Copy,
+                    engine_mode,
                 )
                 .map_err(CommandError::into_message)?;
                 let seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
-                if seeded {
+                if seeded && effective_mode == CliDevmapMode::Copy {
                     // This process exits when the command returns, and a
                     // background build would die with it.
                     gitpulse_lib::devmap::live::refresh_seeded_worktree(
@@ -963,6 +1031,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             branch,
             create,
             base,
+            zero_copy,
+            devmap_mode,
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
@@ -971,8 +1041,10 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 .iter()
                 .find(|w| w.branch.as_deref() == Some(branch.as_str()))
             {
-                let devmap_seeded = devmap_query::paths::store_path(Path::new(&wt.path)).is_file()
-                    || zero_copy_base_ref_path(&wt.path).is_file();
+                let wt_path = Path::new(&wt.path);
+                let devmap_seeded = devmap_query::paths::store_path(wt_path).is_file()
+                    || zero_copy_base_ref_path(&wt.path).is_file()
+                    || devmap_query::paths::stack_lease_path(wt_path).is_file();
                 return Ok(json!({
                     "ok": true,
                     "branch": branch,
@@ -991,6 +1063,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 gitpulse_lib::harness::guard_command(&repo, &argv_refs)?;
                 let selection = CacheSelection::default();
+                let effective_mode = CliDevmapMode::resolve(zero_copy, devmap_mode);
                 let created = add_worktree_with_devmap(
                     &repo,
                     target_str,
@@ -999,11 +1072,11 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     false,
                     Some(&selection),
                     true,
-                    DevmapMode::Copy,
+                    effective_mode.to_engine_mode(),
                 )
                 .map_err(CommandError::into_message)?;
                 let devmap_seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
-                if devmap_seeded {
+                if devmap_seeded && effective_mode == CliDevmapMode::Copy {
                     gitpulse_lib::devmap::live::refresh_seeded_worktree(
                         &created.path,
                         gitpulse_lib::devmap::live::SeededRefresh::Inline,
@@ -1023,6 +1096,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             repo,
             worktree,
             zero_copy,
+            devmap_mode,
             include_venv,
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
@@ -1034,16 +1108,17 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 include_virtualenvs: include_venv,
                 ..Default::default()
             };
+            let effective_mode = CliDevmapMode::resolve(zero_copy, devmap_mode);
             let anchor = &family.anchor;
             let target = &family.worktree;
             let (cache_res, devmap_res) = std::thread::scope(|scope| {
                 let c = scope.spawn(|| clone_ignored_caches(anchor, target, &selection));
-                let d = scope.spawn(|| {
-                    if zero_copy {
-                        provision_worktree_devmap_zero_copy(anchor, target)
-                    } else {
-                        provision_worktree_devmap(anchor, target)
+                let d = scope.spawn(|| match effective_mode {
+                    CliDevmapMode::Stacked => {
+                        provision_worktree_devmap_zero_copy(anchor, target).map(Some)
                     }
+                    CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
+                    CliDevmapMode::None => Ok(None),
                 });
                 let cr = c
                     .join()
@@ -1058,14 +1133,17 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 .copied
                 .iter()
                 .filter_map(|r| {
-                    Path::new(&r.destination)
-                        .file_name()?
-                        .to_str()
+                    let dst = Path::new(&r.destination);
+                    dst.strip_prefix(target)
+                        .ok()
+                        .and_then(|rel| rel.to_str())
+                        .or_else(|| dst.file_name().and_then(|n| n.to_str()))
                         .map(str::to_owned)
                 })
                 .collect();
-            let (devmap_seeded, devmap_mode) = match devmap_res {
-                Ok(p) => {
+            let (devmap_seeded, devmap_mode_label) = match devmap_res {
+                Ok(None) => (false, "none".to_string()),
+                Ok(Some(p)) => {
                     let mode = if !p.seeded {
                         p.reason.unwrap_or_else(|| "not_seeded".to_string())
                     } else if p.zero_copy_base_ref {
@@ -1081,24 +1159,28 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 }
                 Err(e) => (false, format!("failed: {}", e.message())),
             };
-            if devmap_seeded && !zero_copy {
+            if devmap_seeded && effective_mode == CliDevmapMode::Copy {
                 gitpulse_lib::devmap::live::refresh_seeded_worktree(
                     &target.to_string_lossy(),
                     gitpulse_lib::devmap::live::SeededRefresh::Inline,
                 );
             }
-            let overlay_dirty = target
-                .to_str()
-                .and_then(|s| sync_worktree_overlay(s).ok())
-                .map(|r| r.modified_files + r.tombstoned_files)
-                .unwrap_or(0);
+            let overlay_dirty = if effective_mode == CliDevmapMode::None {
+                0
+            } else {
+                target
+                    .to_str()
+                    .and_then(|s| sync_worktree_overlay(s).ok())
+                    .map(|r| r.modified_files + r.tombstoned_files)
+                    .unwrap_or(0)
+            };
             Ok(json!({
                 "ok": true,
                 "worktree_path": worktree,
                 "caches_cloned": caches_cloned,
                 "cache_error": report.error(),
                 "devmap_seeded": devmap_seeded,
-                "devmap_mode": devmap_mode,
+                "devmap_mode": devmap_mode_label,
                 "overlay_dirty_files": overlay_dirty,
             }))
         }
@@ -1138,7 +1220,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 let wt_path = Path::new(&wt.path);
                 let has_local_store = devmap_query::paths::store_path(wt_path).is_file();
                 let zc_ref = load_zero_copy_base_ref(&wt.path).ok().flatten();
-                let devmap_mode = if zc_ref.is_some() {
+                let has_stack_lease = devmap_query::paths::stack_lease_path(wt_path).is_file();
+                let devmap_mode = if zc_ref.is_some() || has_stack_lease {
                     "zero_copy_base_ref"
                 } else if has_local_store {
                     "local_store"
@@ -1649,12 +1732,107 @@ mod tests {
                     target: None,
                     sparse: vec!["packages/api".to_string(), "packages/core".to_string()],
                     zero_copy: true,
+                    devmap_mode: None,
                     share_cache: true,
                     exec: None,
                     agent: Some("claude-1".to_string()),
                 }
             }
         );
+    }
+
+    #[test]
+    fn parse_cli_accepts_devmap_mode_across_create_switch_and_isolate() {
+        let create_stacked = parse_cli(&vec_str(&[
+            "create",
+            "--repo",
+            "/tmp/repo",
+            "--branch",
+            "agent/stacked",
+            "--devmap-mode",
+            "stacked",
+        ]))
+        .expect("create --devmap-mode stacked");
+        assert_eq!(
+            create_stacked,
+            Invocation::Command {
+                json: false,
+                cmd: Subcommand::Create {
+                    repo: "/tmp/repo".to_string(),
+                    branch: "agent/stacked".to_string(),
+                    base: None,
+                    target: None,
+                    sparse: Vec::new(),
+                    zero_copy: false,
+                    devmap_mode: Some(CliDevmapMode::Stacked),
+                    share_cache: true,
+                    exec: None,
+                    agent: None,
+                }
+            }
+        );
+
+        let switch_none = parse_cli(&vec_str(&[
+            "switch",
+            "--repo",
+            "/tmp/repo",
+            "--branch",
+            "agent/none",
+            "--create",
+            "--devmap-mode",
+            "none",
+        ]))
+        .expect("switch --devmap-mode none");
+        assert_eq!(
+            switch_none,
+            Invocation::Command {
+                json: false,
+                cmd: Subcommand::Switch {
+                    repo: "/tmp/repo".to_string(),
+                    branch: "agent/none".to_string(),
+                    create: true,
+                    base: None,
+                    zero_copy: false,
+                    devmap_mode: Some(CliDevmapMode::None),
+                }
+            }
+        );
+
+        let isolate_copy = parse_cli(&vec_str(&[
+            "isolate",
+            "--repo",
+            "/tmp/repo",
+            "--worktree",
+            "/tmp/wt",
+            "--devmap-mode",
+            "copy",
+        ]))
+        .expect("isolate --devmap-mode copy");
+        assert_eq!(
+            isolate_copy,
+            Invocation::Command {
+                json: false,
+                cmd: Subcommand::Isolate {
+                    repo: "/tmp/repo".to_string(),
+                    worktree: "/tmp/wt".to_string(),
+                    zero_copy: false,
+                    devmap_mode: Some(CliDevmapMode::Copy),
+                    include_venv: false,
+                }
+            }
+        );
+
+        let bad_mode = parse_cli(&vec_str(&[
+            "create",
+            "--repo",
+            "/tmp/repo",
+            "--branch",
+            "x",
+            "--devmap-mode",
+            "bogus",
+        ]))
+        .expect_err("invalid --devmap-mode must error");
+        assert!(bad_mode.1.contains("invalid --devmap-mode"));
     }
 
     #[test]

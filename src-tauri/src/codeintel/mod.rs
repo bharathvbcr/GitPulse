@@ -24,10 +24,10 @@ pub use suspects::{
 pub mod worktree_overlay;
 pub use worktree_overlay::{
     load_worktree_overlay, load_zero_copy_base_ref, provision_worktree_devmap,
-    provision_worktree_devmap_zero_copy, sync_worktree_overlay, worktree_overlay_path,
-    zero_copy_base_ref_path, DevmapWorktreeProvision, WorktreeOverlayReport, ZeroCopyBaseRef,
-    BASE_STORE_REF_RELPATH, CAS_AST_RELPATH, MAX_OVERLAY_DIRTY_FILES, MAX_OVERLAY_FILE_BYTES,
-    OVERLAY_RELPATH,
+    provision_worktree_devmap_stacked, provision_worktree_devmap_zero_copy, sync_worktree_overlay,
+    worktree_overlay_path, zero_copy_base_ref_path, DevmapWorktreeProvision, WorktreeOverlayReport,
+    ZeroCopyBaseRef, BASE_STORE_REF_RELPATH, CAS_AST_RELPATH, MAX_OVERLAY_DIRTY_FILES,
+    MAX_OVERLAY_FILE_BYTES, OVERLAY_RELPATH,
 };
 
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
@@ -372,10 +372,26 @@ pub(super) fn open_local_indexed_store(repo: &Path) -> Result<Store, String> {
 }
 
 fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
+    let has_zero_copy = worktree_overlay::has_zero_copy_or_stack_lease(repo);
+    let prefer_zero_copy = has_zero_copy && worktree_overlay::is_sparse_worktree(repo);
+    if prefer_zero_copy {
+        match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
+            Ok(Some((store, base_ref))) => {
+                let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
+                return Ok(OpenedRepoStore::ZeroCopy {
+                    store,
+                    base_ref,
+                    anchor_root,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.into_message()),
+        }
+    }
     if map_path(repo).exists() {
         return open_local_store(repo).map(OpenedRepoStore::Local);
     }
-    if zero_copy_base_ref_path(&repo.to_string_lossy()).is_file() {
+    if has_zero_copy {
         match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
             Ok(Some((store, base_ref))) => {
                 let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
@@ -2563,6 +2579,7 @@ pub fn affected_tests(
     // A map with pending paths or unindexed worktree edits is not a complete
     // picture of this checkout. Querying it and treating the answer as "these
     // are the tests to run" is the exact failure mode fail_closed prevents.
+    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let freshness_failure = match &opened {
         OpenedRepoStore::Local(store) => {
             let db_str = map_path(&repo).to_string_lossy().into_owned();
@@ -2581,6 +2598,28 @@ pub fn affected_tests(
             Ok(summary) => {
                 let (wt_fresh, combined_reason) =
                     evaluate_zero_copy_status(&repo, anchor_root, store, &summary);
+                if wt_fresh == Some(false)
+                    && summary.pending_count == 0
+                    && summary.analyzer_freshness == Some(true)
+                {
+                    let candidate = affected_tests_from_store(
+                        store,
+                        targets,
+                        budget,
+                        min_confidence,
+                        max_depth,
+                    );
+                    if worktree_overlay::verify_zero_copy_affected_tests_disjoint_from_deltas(
+                        &repo,
+                        anchor_root,
+                        store,
+                        &summary,
+                        targets,
+                        &candidate,
+                    ) {
+                        return candidate;
+                    }
+                }
                 if let Some(reason) = combined_reason {
                     Some((true, format!("code map is stale or degraded: {reason}")))
                 } else if wt_fresh != Some(true) || summary.analyzer_freshness != Some(true) {
@@ -2612,13 +2651,7 @@ pub fn affected_tests(
             fail_closed_reason: Some(reason),
         };
     }
-    affected_tests_from_store(
-        opened.store(),
-        targets,
-        token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-        min_confidence,
-        max_depth,
-    )
+    affected_tests_from_store(opened.store(), targets, budget, min_confidence, max_depth)
 }
 
 /// A refused affected-tests query: nothing was selected, so the caller must

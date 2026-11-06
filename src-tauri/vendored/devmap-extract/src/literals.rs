@@ -338,7 +338,7 @@ fn resolve_const(
     values
 }
 
-fn dedup_sort(sites: &mut Vec<ExtractedLiteral>) {
+pub(crate) fn dedup_sort(sites: &mut Vec<ExtractedLiteral>) {
     sites.sort_by(|left, right| {
         left.start_byte
             .cmp(&right.start_byte)

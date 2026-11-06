@@ -9,7 +9,8 @@ use crate::schema::{
     MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28,
     MIGRATION_V28_TO_V29, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
     MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
-    MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
+    MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE, SEED_REBIND_TABLE,
+    VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -391,6 +392,53 @@ impl Store {
         Self::backfill_payload_digests(conn)
     }
 
+    fn heal_seed_rebind_table(conn: &Connection) -> Result<()> {
+        if !conn.is_readonly(rusqlite::MAIN_DB)? {
+            conn.execute_batch(SEED_REBIND_TABLE)?;
+        }
+        Ok(())
+    }
+
+    /// Read the seeded worktree `repo_root` override recorded by `rebind_staged`
+    /// (`None` when `seed_rebind` is absent or empty), validating that any
+    /// stored row is a non-empty string (`F6`, `F8`, Critique 3).
+    pub(super) fn seeded_repo_root_in(conn: &Connection) -> Result<Option<String>> {
+        if !Self::relation_is_table(conn, "seed_rebind")? {
+            return Ok(None);
+        }
+        let rows: Vec<rusqlite::types::Value> = {
+            let mut stmt = conn.prepare("SELECT seeded_repo_root FROM seed_rebind")?;
+            let mapped = stmt.query_map([], |row| row.get(0))?;
+            mapped.collect::<Result<_>>()?
+        };
+        match rows.as_slice() {
+            [] => Ok(None),
+            [rusqlite::types::Value::Text(root)] if !root.is_empty() => Ok(Some(root.clone())),
+            _ => Err(refusal(
+                "seed_rebind row is malformed; run `devmap build` or `devmap seed` to repair",
+            )),
+        }
+    }
+
+    /// When a seeded store commits or restamps a generation, normalize any
+    /// retained donor `generations.repo_root` rows to `owner` and clear
+    /// `seed_rebind`.
+    pub(super) fn clear_seed_rebind_and_normalize_generations(
+        tx: &Connection,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        if Self::seeded_repo_root_in(tx)?.is_some() {
+            if let Some(owner) = owner.filter(|s| !s.is_empty()) {
+                tx.execute(
+                    "UPDATE generations SET repo_root = ?1 WHERE repo_root IS NOT ?1",
+                    params![owner],
+                )?;
+            }
+            tx.execute("DELETE FROM seed_rebind", [])?;
+        }
+        Ok(())
+    }
+
     /// Hand every free page back to the filesystem, stepping the pragma to
     /// exhaustion (it frees one page per row stepped, and `execute_batch`
     /// steps once). A store whose `auto_vacuum` is not incremental has nothing
@@ -592,9 +640,11 @@ impl Store {
     /// K3: `Store::open` runs the migration chain under an exclusive
     /// transaction from *every* open, so a read-only command like
     /// `devmap status` silently upgraded the store it was asked to describe.
-    /// Opening read-only makes that impossible rather than merely unlikely: the
-    /// connection cannot write, so no migration, WAL switch or file creation
-    /// can happen behind the question.
+    /// The probe is the owner peek: immutable when no `-wal` exists, because a
+    /// read-only open of a WAL database creates `-wal` and `-shm` beside a
+    /// store this command was only asked to describe. A `-wal` that is already
+    /// there is opened read-only, so a frame that has not been checkpointed is
+    /// still visible, and that open cannot migrate.
     ///
     /// `None` when no store exists at `db_path`. A file that exists but is not
     /// a database is an error, not a `None` — "there is nothing here" and "what
@@ -604,10 +654,7 @@ impl Store {
         if !path.is_file() {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let conn = Self::open_owner_peek(path)?;
         // The same wait every other connection gets. A store locked for a
         // moment — a vacuum, a competing opener — must make `status` and
         // `doctor` wait, not report a failure.
@@ -712,6 +759,7 @@ impl Store {
             // them, so give the pages back before the file is first used.
             Self::release_free_pages(tx)?;
             Self::stamp_reader_compat(tx)?;
+            Self::heal_seed_rebind_table(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -1133,6 +1181,7 @@ impl Store {
         // A store already at the current version can still be missing what a
         // later build of the same version added to the fresh schema.
         Self::heal_payload_digest(conn)?;
+        Self::heal_seed_rebind_table(conn)?;
         // Whatever a same-version writer left unconverted stays so, and the
         // readers refuse it by name; only the migration refuses the store. The
         // list is not dropped: `Store::status` asks the same question of the

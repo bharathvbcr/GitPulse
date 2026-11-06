@@ -1,4 +1,67 @@
+use serde::{Deserialize, Serialize};
+
 use super::*;
+
+/// Cache identity for per-file resolution reuse.
+///
+/// The blobs live in the repository state directory, not in sqlite. A resolver
+/// change that alters a file's edges without changing its content hash bumps
+/// this; a mismatch is a miss, and the file is resolved again.
+pub const RESOLUTION_REUSE_EPOCH: &str = "1";
+
+/// One file's resolution before the whole-tree post-pass.
+///
+/// Package `MemberOf` edges and the inert-value rewrite read every file
+/// together, so a reused file is stored as this tuple and the pass runs again
+/// on the union. `UnresolvedReference::site` is not serialized; a
+/// language-server enrich must not read these blobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReusedFileResolution {
+    pub content_hash: u64,
+    pub edges: Vec<ResolvedEdge>,
+    pub unresolved: Vec<UnresolvedReference>,
+    pub package_groups: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// What the global candidate cache charged during one pass.
+///
+/// A reuse pass does not charge files it returned from the cache. The caller
+/// adds this to the last full resolve's usage and resolves every file when the
+/// sum can exceed the budget a cold resolve would have charged.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionBudgetUsage {
+    pub visits: u64,
+    pub retained_bytes: u64,
+    pub evidence_bytes: u64,
+}
+
+/// Limits and charges of the last full resolve, stored beside the per-file blobs.
+///
+/// A reuse pass does not charge the files it skipped. The next build adds this
+/// receipt's charges to the files it does resolve and, when the sum can exceed
+/// a limit, resolves every file instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReuseBudgetReceipt {
+    pub candidate_visits: u64,
+    pub retained_candidate_bytes: u64,
+    pub ambiguity_evidence_bytes: u64,
+    pub degraded_candidates: usize,
+    pub refuse: bool,
+    pub usage: ResolutionBudgetUsage,
+}
+
+/// A resolution plus the per-file tuples this pass computed itself.
+///
+/// `produced` omits files taken from `reused`, so the caller persists only the
+/// work it just did.
+pub struct ResolveReuse {
+    pub result: ResolutionResult,
+    pub produced: BTreeMap<String, ReusedFileResolution>,
+    pub budget: ResolutionBudgetUsage,
+}
 
 impl Resolver {
     pub fn resolve_all(
@@ -24,7 +87,25 @@ impl Resolver {
         extractions: &[Extraction],
         limits: ResolutionLimits,
     ) -> Result<ResolutionResult, ResolutionLimitError> {
-        match self.resolve_pass(extractions, limits, false) {
+        self.resolve_all_with_limits_reusing(extractions, limits, &BTreeMap::new())
+            .map(|reuse| reuse.result)
+    }
+
+    /// Resolve `extractions`, returning a cached file unchanged when `reused`
+    /// holds that path and the same content hash.
+    ///
+    /// An empty `reused` is [`Self::resolve_all_with_limits`]. A hash mismatch
+    /// is a miss and the file is resolved. The post-pass still runs over every
+    /// file, reused or not, so analysis receives the full edge set. The serial
+    /// retry after a budget refusal sees the same `reused` map: which files
+    /// were cached must not depend on the thread count.
+    pub fn resolve_all_with_limits_reusing(
+        &self,
+        extractions: &[Extraction],
+        limits: ResolutionLimits,
+        reused: &BTreeMap<String, ReusedFileResolution>,
+    ) -> Result<ResolveReuse, ResolutionLimitError> {
+        match self.resolve_pass(extractions, limits, false, reused) {
             Err(refusal) if limits.on_exceed == LimitPolicy::Degrade => {
                 // A pool that cannot be built cannot give the deterministic
                 // order, so the budget's own refusal stands rather than a
@@ -32,7 +113,7 @@ impl Resolver {
                 let Ok(serial) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else {
                     return Err(refusal);
                 };
-                serial.install(|| self.resolve_pass(extractions, limits, true))
+                serial.install(|| self.resolve_pass(extractions, limits, true, reused))
             }
             outcome => outcome,
         }
@@ -43,7 +124,8 @@ impl Resolver {
         extractions: &[Extraction],
         limits: ResolutionLimits,
         degrade: bool,
-    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        reused: &BTreeMap<String, ReusedFileResolution>,
+    ) -> Result<ResolveReuse, ResolutionLimitError> {
         let global_candidates = Mutex::new(GlobalCandidateCache {
             degrade,
             ..Default::default()
@@ -63,12 +145,11 @@ impl Resolver {
         // produced, and `package_groups` is merged into a `BTreeMap` whose
         // ordering is by key.
         //
-        // Worth doing because this phase does not shrink on an incremental
-        // build: resolution deliberately covers the whole tree on every changed
-        // build so that liveness and community detection mean the same thing on
-        // both paths (see the comment in `devmap-cli`'s build command), which
-        // makes it the phase whose cost grows straight-line with repository
-        // size while extraction is cached away.
+        // A changed build used to resolve every file. Analysis still receives
+        // every edge — a subset is the 433-versus-14 dead-code failure — but
+        // a file whose content hash matches a `reused` entry is not walked
+        // again. Indexing still covers the whole tree; this loop is the part
+        // that grew with repository size while extraction was cached.
         type FileResolution = (
             Vec<ResolvedEdge>,
             Vec<UnresolvedReference>,
@@ -77,6 +158,15 @@ impl Resolver {
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
             .map(|ext| -> Result<FileResolution, ResolutionLimitError> {
+                if let Some(cached) = reused.get(&ext.file_path) {
+                    if cached.content_hash == ext.content_hash {
+                        return Ok((
+                            cached.edges.clone(),
+                            cached.unresolved.clone(),
+                            cached.package_groups.clone(),
+                        ));
+                    }
+                }
                 let mut local_candidates: BTreeMap<(&str, bool), Arc<GlobalCandidates>> = BTreeMap::new();
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
@@ -276,11 +366,38 @@ impl Resolver {
 
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
                 let explicit_calls = ext.calls.len();
+                // A language with no call extractor still records the sites it
+                // recognized. They must not enter the ladder: a unique global
+                // named `file` would become a Calls edge. The row says the
+                // language extracts no calls, and the walk stops.
+                let extracts_calls = ext
+                    .capabilities()
+                    .contains(devmap_extract::languages::Capability::Calls);
                 for (call_index, call) in ext.calls.iter().chain(&ext.rust_implicit_calls).enumerate() {
                     // An implicit call is a candidate: when no rung binds it
                     // it is dropped, not recorded (see
                     // `Extraction::rust_implicit_calls`).
                     let implicit_candidate = call_index >= explicit_calls;
+                    if !extracts_calls {
+                        if !implicit_candidate {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: call
+                                    .caller_symbol
+                                    .clone()
+                                    .unwrap_or_else(|| ext.file_path.clone()),
+                                callee_name: call.callee_name.clone(),
+                                kind: UnresolvedKind::Call,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!("`{}` extracts no calls", ext.language),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: call.receiver_expr.clone(),
+                                site: Some(SiteBytes::of(&call.span)),
+                            });
+                        }
+                        continue;
+                    }
                     // The resolution is the *only* record of what was found:
                     // it names the target file and symbol, and
                     // `Resolution::confidence` scores it. A parallel
@@ -783,10 +900,43 @@ impl Resolver {
                     // Whether the receiver is the enclosing object itself.
                     // Several rungs below turn on it, and it was previously
                     // recomputed at each of them.
-                    let implicit_receiver = call
-                        .receiver_expr
-                        .as_deref()
-                        .is_some_and(Self::receiver_is_self);
+                    let implicit_receiver = call.receiver_expr.as_deref().is_some_and(|receiver| {
+                        Self::receiver_is_self(receiver) && !Self::rust_module_self_path(receiver)
+                    });
+
+                    // `self::helper()` names this module's free function, including
+                    // when `helper` is also a method of the enclosing type. The
+                    // value-self rung below would bind that method at
+                    // deterministic confidence. A miss stays unresolved: the
+                    // path does not fall through to the method.
+                    if resolution.is_none()
+                        && family == LangFamily::Rust
+                        && call
+                            .receiver_expr
+                            .as_deref()
+                            .is_some_and(Self::rust_module_self_path)
+                    {
+                        if let Some(target_symbol) =
+                            self.rust_file_level_function(&ext.file_path, &call.callee_name)
+                        {
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol,
+                                target_file: ext.file_path.clone(),
+                            }));
+                        } else if let Some(found) = self.rust_qualified_call(
+                            &ext.file_path,
+                            "self",
+                            &call.callee_name,
+                            true,
+                        ) {
+                            resolution = Some(Arc::new(found));
+                        } else {
+                            resolution = Some(Arc::new(Resolution::Unresolved {
+                                reason: "self:: names a free item of this module, and this module declares none"
+                                    .to_string(),
+                            }));
+                        }
+                    }
 
                     // 1b. X42. An implicit receiver dispatches on the type the
                     // call is written inside, and on that type's supertypes.
@@ -1221,31 +1371,11 @@ impl Resolver {
                         } else if family == LangFamily::Rust
                             && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function)
                             && !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), call.receiver_expr.as_deref()) {
-                            // Rust reaches a **free function** through a `self`
-                            // receiver, which no other family here does.
-                            //
-                            // `self::helper()` is a module path, and so is the
-                            // `super::helper()` that `rust_absorb_inline_super`
-                            // rewrote to it — both name this file's own
-                            // `helper`. The method-only arm above cannot serve
-                            // them: the extractor records a Rust free function
-                            // as `Function`, reserving `Method` for one owned by
-                            // a type, so every path-qualified call to a
-                            // file-level function fell through to the
-                            // superclass guard below and was recorded as having
-                            // no target. That is what reported
-                            // `procguard::run_tree_killer` dead at the confident
-                            // tier while two call sites and a coverage hit
-                            // proved otherwise.
-                            //
-                            // Safe precisely because the two spellings cannot
-                            // collide in this language: `self.helper()` on a
-                            // free function is not valid Rust, so a `self`
-                            // receiver landing on a `Function` can only have
-                            // come from `self::`/absorbed `super::`. The
-                            // `Method` arm keeps every dotted call, and the
-                            // other families keep the bare-name restriction the
-                            // comment above earned.
+                            // A value `self.helper()` whose caller is not inside a
+                            // type. An absorbed `super::helper()` and a written
+                            // `self::helper()` are stored as `self::` and bound
+                            // by the module-path rung above, including inside a
+                            // method. This arm keeps the field spelling.
                             resolution = Some(Arc::new(Resolution::SameFile {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
@@ -1485,7 +1615,9 @@ impl Resolver {
                                     .import_bindings
                                     .get(&ext.file_path)
                                     .is_some_and(|bindings| bindings.contains_key(recv));
-                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv)) {
+                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv))
+                                && !Self::rust_module_self_path(recv)
+                            {
                             if let Some(found) = self.rust_qualified_call(
                                 &ext.file_path,
                                 recv,
@@ -1955,6 +2087,38 @@ impl Resolver {
                         reference.kind,
                         ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                     ) {
+                        // These kinds duplicate `calls` wherever a grammar
+                        // extracted one, and the ladder already recorded that
+                        // edge. A pattern-recovered file has no such edge: the
+                        // markup reader left the site on this reference so a
+                        // Fallback file can name it without publishing a call
+                        // edge. The row is the same one a parsed call-blind
+                        // file gets from `calls`, and the walk stops.
+                        if !extracts_calls
+                            && ext.calls.is_empty()
+                            && matches!(
+                                ext.engine,
+                                devmap_extract::ExtractionEngine::RegexFallback { .. }
+                            )
+                            && reference.kind == ReferenceKind::Call
+                            && !reference.name.is_empty()
+                        {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: reference
+                                    .enclosing_symbol
+                                    .clone()
+                                    .unwrap_or_else(|| ext.file_path.clone()),
+                                callee_name: reference.name.clone(),
+                                kind: UnresolvedKind::Call,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!("`{}` extracts no calls", ext.language),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: reference.receiver_expr.clone(),
+                                site: Some(SiteBytes::of(&reference.span)),
+                            });
+                        }
                         continue;
                     }
                     // A Python base no name denotes is a fact about the MRO,
@@ -2252,10 +2416,40 @@ impl Resolver {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let budget = {
+            let cache = global_candidates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ResolutionBudgetUsage {
+                visits: cache.visits,
+                retained_bytes: cache.retained_bytes,
+                evidence_bytes: cache.evidence_bytes,
+            }
+        };
+
+        // Snapshot freshly resolved files before the post-pass mutates the
+        // merged edge list. `Arc` payloads are shared; the owned strings are
+        // copied. Reused files are not copied into `produced`.
+        let mut produced: BTreeMap<String, ReusedFileResolution> = BTreeMap::new();
         let mut edges: Vec<ResolvedEdge> = Vec::new();
         let mut unresolved: Vec<UnresolvedReference> = Vec::new();
         let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (file_edges, file_unresolved, file_packages) in per_file {
+        for (ext, (file_edges, file_unresolved, file_packages)) in extractions.iter().zip(per_file)
+        {
+            let hit = reused
+                .get(&ext.file_path)
+                .is_some_and(|cached| cached.content_hash == ext.content_hash);
+            if !hit {
+                produced.insert(
+                    ext.file_path.clone(),
+                    ReusedFileResolution {
+                        content_hash: ext.content_hash,
+                        edges: file_edges.clone(),
+                        unresolved: file_unresolved.clone(),
+                        package_groups: file_packages.clone(),
+                    },
+                );
+            }
             edges.extend(file_edges);
             unresolved.extend(file_unresolved);
             for (package, files) in file_packages {
@@ -2322,11 +2516,15 @@ impl Resolver {
             "an edge targets a spelling that is no indexed symbol: {:?}",
             self.dangling_swift_targets(&edges)
         );
-        Ok(ResolutionResult {
-            edges,
-            receiver_types: self.receiver_types.clone(),
-            reexport_chains: self.reexport_chains.clone(),
-            unresolved,
+        Ok(ResolveReuse {
+            result: ResolutionResult {
+                edges,
+                receiver_types: self.receiver_types.clone(),
+                reexport_chains: self.reexport_chains.clone(),
+                unresolved,
+            },
+            produced,
+            budget,
         })
     }
 }

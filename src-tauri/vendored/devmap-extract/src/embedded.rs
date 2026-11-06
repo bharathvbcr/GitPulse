@@ -56,7 +56,10 @@
 //! **Honesty.** A located region that is *not extracted* — an unparseable
 //! script, a language the registry does not permit there, a budget that ran out
 //! — contributes its byte range to [`ParseOutcome::Partial`], so the file can
-//! never report `Clean` over bytes nobody read. The range rides on the outcome
+//! never report `Clean` over bytes nobody read. A template expression is that
+//! same unread text when its inner parse fails, is partial, runs out of budget,
+//! or sits past the cap: the outer grammar keeps the attribute as text, so the
+//! expression walk folds that span itself. The range rides on the outcome
 //! rather than on `diagnostics` because `Extraction::for_durable_store` clears
 //! diagnostics before the payload reaches the store; the human-readable reason
 //! is added there as well, but the durable record is the range. A region that
@@ -360,6 +363,10 @@ pub(crate) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
 /// with the same embedded language the `<script>` block uses, so the inner
 /// call is visible to liveness. Svelte `{#if}` / `{@html}` blocks are not JS
 /// and are skipped.
+///
+/// A `<script>` element's failure is folded before this walk. An expression
+/// failure has to be folded here: the outer grammar treats the attribute as
+/// text, so dropping the inner outcome would leave the file `Clean`.
 fn absorb_template_expressions(
     extraction: &mut Extraction,
     root: Node,
@@ -370,40 +377,67 @@ fn absorb_template_expressions(
     let file_path = extraction.file_path.clone();
     let mut stack: Vec<Node> = vec![root];
     let mut parsed = 0usize;
+    let mut unparsed: Vec<TextRange> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut cap_noted = false;
     while let Some(node) = stack.pop() {
         match node.kind() {
             "script_element" | "style_element" | "frontmatter" => continue,
+            // Svelte `{...}` is `expression` / `svelte_raw_text`. Vue `{{ }}` is
+            // an `interpolation` whose text is `raw_text`, and a directive
+            // value (`@click="..."`) is an `attribute_value` under
+            // `directive_attribute`. A plain attribute is neither, so
+            // `class="not js ("` is not parsed as JavaScript.
             "expression" | "raw_text_expr" | "svelte_raw_text" => {
-                if let Some(expr) = js_expression_body(node, source) {
-                    if let Some(name) = lone_js_identifier(&expr.body) {
-                        let span = span_of(node);
-                        extraction.calls.push(ExtractedCall {
-                            caller_symbol: Some(file_path.clone()),
-                            callee_name: name.clone(),
-                            receiver_expr: None,
-                            span: span.clone(),
-                        });
-                        extraction.references.push(ExtractedReference {
-                            name,
-                            kind: ReferenceKind::Call,
-                            span,
-                            enclosing_symbol: Some(file_path.clone()),
-                            assigned_to: None,
-                            receiver_expr: None,
-                        });
-                    } else if parsed < MAX_EMBEDDED_REGIONS {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        let inner = crate::treesitter::extract_treesitter_with_budget(
-                            &file_path, language, &expr.body, remaining,
-                        );
-                        if !matches!(inner.parse_outcome, ParseOutcome::Failed { .. }) {
-                            absorb(extraction, inner, expr.offset);
-                            parsed += 1;
-                        }
-                    }
+                take_template_expression(
+                    node,
+                    source,
+                    extraction,
+                    &file_path,
+                    language,
+                    deadline,
+                    &mut parsed,
+                    &mut unparsed,
+                    &mut diagnostics,
+                    &mut cap_noted,
+                );
+                continue;
+            }
+            "interpolation" => {
+                let mut cursor = node.walk();
+                if let Some(text) = node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "raw_text")
+                {
+                    take_template_expression(
+                        text,
+                        source,
+                        extraction,
+                        &file_path,
+                        language,
+                        deadline,
+                        &mut parsed,
+                        &mut unparsed,
+                        &mut diagnostics,
+                        &mut cap_noted,
+                    );
+                }
+                continue;
+            }
+            "directive_attribute" => {
+                if let Some(value) = vue_directive_value(node) {
+                    take_template_expression(
+                        value,
+                        source,
+                        extraction,
+                        &file_path,
+                        language,
+                        deadline,
+                        &mut parsed,
+                        &mut unparsed,
+                        &mut diagnostics,
+                        &mut cap_noted,
+                    );
                 }
                 continue;
             }
@@ -412,6 +446,264 @@ fn absorb_template_expressions(
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
+        }
+    }
+    extraction.diagnostics.extend(diagnostics);
+    fold_unparsed_ranges(&mut extraction.parse_outcome, unparsed);
+}
+
+/// One template expression: a lone identifier is a Call, and anything else is
+/// parsed or recorded. `node` is the expression text, not the surrounding
+/// braces or quotes.
+fn take_template_expression(
+    node: Node,
+    source: &str,
+    extraction: &mut Extraction,
+    file_path: &str,
+    language: &str,
+    deadline: Instant,
+    parsed: &mut usize,
+    unparsed: &mut Vec<TextRange>,
+    diagnostics: &mut Vec<String>,
+    cap_noted: &mut bool,
+) {
+    let Some(expr) = js_expression_body(node, source) else {
+        return;
+    };
+    if let Some(name) = lone_js_identifier(&expr.body) {
+        let span = span_of(node);
+        extraction.calls.push(ExtractedCall {
+            caller_symbol: Some(file_path.to_string()),
+            callee_name: name.clone(),
+            receiver_expr: None,
+            span: span.clone(),
+        });
+        extraction.references.push(ExtractedReference {
+            name,
+            kind: ReferenceKind::Call,
+            span,
+            enclosing_symbol: Some(file_path.to_string()),
+            assigned_to: None,
+            receiver_expr: None,
+        });
+        return;
+    }
+    let span = span_of(node);
+    let node_range = TextRange {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+    };
+    if *parsed >= MAX_EMBEDDED_REGIONS {
+        if !*cap_noted {
+            diagnostics.push(format!(
+                "template expressions past {MAX_EMBEDDED_REGIONS} were not parsed"
+            ));
+            *cap_noted = true;
+        }
+        unparsed.push(node_range);
+        return;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        diagnostics.push(format!(
+            "extraction budget was exhausted before the template expression \
+             at bytes {}..{}; the expression was not parsed",
+            node_range.start_byte, node_range.end_byte
+        ));
+        unparsed.push(node_range);
+        return;
+    }
+    // `{` here is an object literal (`:class="{ active: isActive }"`). The
+    // statement grammar reads a leading `{` as a block, and a quoted key
+    // then fails, so the file would be Partial over JavaScript it accepts.
+    // The parentheses are not in the file. Spans are rebased by that byte.
+    let outer_source = source;
+    let parenthesized = expr.body.starts_with('{');
+    let owned;
+    let source: &str = if parenthesized {
+        owned = format!("({})", expr.body);
+        owned.as_str()
+    } else {
+        owned = String::new();
+        expr.body.as_str()
+    };
+    let mut inner =
+        crate::treesitter::extract_treesitter_with_budget(file_path, language, source, remaining);
+    if parenthesized {
+        rebase_parenthesized_expression(&mut inner, expr.body.len());
+    }
+    if record_template_parse(
+        extraction,
+        inner,
+        expr.offset,
+        expr.body.len(),
+        node_range,
+        unparsed,
+        diagnostics,
+        outer_source,
+    ) {
+        *parsed += 1;
+    }
+}
+
+/// Drop the one parenthesis added around an object literal.
+///
+/// Spans in `inner` are relative to `({body})`. Callers shift by the body's
+/// start in the file, so a span must be relative to `body` before that.
+/// A range that lands only on a parenthesis is the wrapper, not the file.
+fn rebase_parenthesized_expression(inner: &mut Extraction, body_len: usize) {
+    const PREFIX: usize = 1;
+    let rebase = |start: usize, end: usize| -> (usize, usize) {
+        let start = start.saturating_sub(PREFIX);
+        let end = end.saturating_sub(PREFIX).min(body_len);
+        (start.min(end), end)
+    };
+    let rebase_span = |span: &mut Span| {
+        let (start, end) = rebase(span.start_byte, span.end_byte);
+        span.start_byte = start;
+        span.end_byte = end;
+    };
+    for symbol in &mut inner.symbols {
+        rebase_span(&mut symbol.span);
+    }
+    for import in &mut inner.imports {
+        rebase_span(&mut import.span);
+    }
+    for call in &mut inner.calls {
+        rebase_span(&mut call.span);
+    }
+    for reference in &mut inner.references {
+        rebase_span(&mut reference.span);
+    }
+    for route in &mut inner.routes {
+        rebase_span(&mut route.span);
+    }
+    for export in &mut inner.exports {
+        rebase_span(&mut export.span);
+    }
+    for fact in &mut inner.js_objects {
+        fact.start_byte = fact.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    for literal in &mut inner.literals {
+        literal.start_byte = literal.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    for binding in &mut inner.local_bindings {
+        binding.start_byte = binding.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    if let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &mut inner.parse_outcome
+    {
+        for ranges in [error_ranges, nameless_ranges] {
+            ranges.retain(|range| {
+                range.end_byte > PREFIX && range.start_byte.saturating_sub(PREFIX) < body_len
+            });
+            for range in ranges.iter_mut() {
+                let (start, end) = rebase(range.start_byte, range.end_byte);
+                range.start_byte = start;
+                range.end_byte = end;
+            }
+            ranges.retain(|range| range.start_byte < range.end_byte);
+        }
+    }
+}
+
+/// The JavaScript text of a Vue directive (`@click="..."`, `:title="..."`),
+/// without the quotes. `None` when the directive has no value.
+fn vue_directive_value(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    for child in &children {
+        if child.kind() == "quoted_attribute_value" {
+            let mut inner = child.walk();
+            return child
+                .children(&mut inner)
+                .find(|grand| grand.kind() == "attribute_value");
+        }
+    }
+    children
+        .into_iter()
+        .find(|child| child.kind() == "attribute_value")
+}
+
+/// Fold one template expression's inner outcome onto the outer extraction.
+///
+/// Returns whether the expression spent a nested parse that produced symbols
+/// worth counting toward [`MAX_EMBEDDED_REGIONS`]. A failure or a skip did not
+/// absorb anything, so a later expression that does parse is still counted.
+fn record_template_parse(
+    extraction: &mut Extraction,
+    inner: Extraction,
+    offset: usize,
+    body_len: usize,
+    node_range: TextRange,
+    unparsed: &mut Vec<TextRange>,
+    diagnostics: &mut Vec<String>,
+    source: &str,
+) -> bool {
+    let body = TextRange {
+        start_byte: offset,
+        end_byte: offset.saturating_add(body_len),
+    };
+    enum Fold {
+        Absorb,
+        Drop,
+        Partial(Vec<TextRange>),
+    }
+    let fold = match &inner.parse_outcome {
+        ParseOutcome::Clean => Fold::Absorb,
+        ParseOutcome::Partial { error_ranges, .. } => {
+            let mut ranges: Vec<TextRange> = error_ranges
+                .iter()
+                .map(|range| TextRange {
+                    start_byte: offset.saturating_add(range.start_byte),
+                    end_byte: offset.saturating_add(range.end_byte),
+                })
+                .collect();
+            let covers_body = ranges
+                .iter()
+                .any(|range| range.start_byte < body.end_byte && range.end_byte > body.start_byte);
+            if ranges.is_empty() || !covers_body {
+                ranges.push(node_range.clone());
+            }
+            Fold::Partial(ranges)
+        }
+        ParseOutcome::Failed { reason } => {
+            diagnostics.push(format!(
+                "template expression at bytes {}..{} failed to parse: {reason}",
+                node_range.start_byte, node_range.end_byte
+            ));
+            Fold::Drop
+        }
+        ParseOutcome::Fallback { reason } => {
+            diagnostics.push(format!(
+                "template expression at bytes {}..{} was recovered by pattern: {reason}",
+                node_range.start_byte, node_range.end_byte
+            ));
+            Fold::Absorb
+        }
+        ParseOutcome::Skipped { reason } => {
+            diagnostics.push(format!(
+                "template expression at bytes {}..{} was not parsed: {reason}",
+                node_range.start_byte, node_range.end_byte
+            ));
+            Fold::Drop
+        }
+    };
+    match fold {
+        Fold::Absorb => {
+            absorb(extraction, inner, offset, source);
+            true
+        }
+        Fold::Drop => {
+            unparsed.push(node_range);
+            false
+        }
+        Fold::Partial(ranges) => {
+            unparsed.extend(ranges);
+            absorb(extraction, inner, offset, source);
+            true
         }
     }
 }
@@ -433,7 +725,13 @@ fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
     while j > i && bytes[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
-    if i < j && bytes[i] == b'{' && bytes[j - 1] == b'}' {
+    // Svelte `{...}` nodes include the delimiter braces. Vue interpolation
+    // text and a directive value do not: their `{` is the object itself.
+    let delimiters = matches!(
+        node.kind(),
+        "expression" | "raw_text_expr" | "svelte_raw_text"
+    );
+    if delimiters && i < j && bytes[i] == b'{' && bytes[j - 1] == b'}' {
         i += 1;
         j -= 1;
         while i < j && bytes[i].is_ascii_whitespace() {
@@ -903,7 +1201,7 @@ pub(crate) fn merge_embedded_scripts(
             }
         }
 
-        absorb(extraction, inner, region.content.start_byte);
+        absorb(extraction, inner, region.content.start_byte, source);
     }
 
     extraction.diagnostics.extend(diagnostics);
@@ -914,7 +1212,7 @@ pub(crate) fn merge_embedded_scripts(
 
 /// Merge one region's extraction into the outer one, shifting every span by
 /// `offset` — the region's start byte in the outer file.
-fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
+fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize, source: &str) {
     let file_path = extraction.file_path.clone();
 
     for mut symbol in inner.symbols {
@@ -982,6 +1280,26 @@ fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
             binding
         }));
     extraction.diagnostics.extend(inner.diagnostics);
+    for mut call in inner.rust_implicit_calls {
+        shift(&mut call.span, offset);
+        extraction.rust_implicit_calls.push(call);
+    }
+    for mut call in inner.rust_try_conversions {
+        shift(&mut call.span, offset);
+        extraction.rust_try_conversions.push(call);
+    }
+    // The outer literal index cannot decode a Vue or Svelte script string.
+    // The inner parse already did, in the region's own coordinates.
+    for mut literal in inner.literals {
+        literal.start_byte = literal.start_byte.saturating_add(offset);
+        literal.line = Span {
+            start_byte: literal.start_byte,
+            end_byte: literal.start_byte,
+        }
+        .line_range(source)
+        .0;
+        extraction.literals.push(literal);
+    }
 }
 
 fn shift(span: &mut Span, offset: usize) {
@@ -1347,6 +1665,174 @@ mod tests {
             },
             "a file already refused whole says nothing new about a region inside it"
         );
+    }
+
+    /// An expired deadline must record every remaining expression and must not
+    /// parse any of them. `extract_file_with_budget(Duration::ZERO)` fails the
+    /// outer parse before this walk, so the deadline is injected here.
+    #[test]
+    fn an_expired_deadline_records_every_template_expression() {
+        use std::time::Duration;
+
+        let source = "<button onclick={() => broken(}>Go</button>\n\
+                       <button onclick={() => also(}>Go</button>\n";
+        let mut extraction =
+            crate::treesitter::extract_treesitter("T.svelte", "svelte", "<p>hi</p>\n");
+        extraction.parse_outcome = ParseOutcome::Clean;
+        extraction.calls.clear();
+        extraction.diagnostics.clear();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
+            .expect("the svelte grammar loads");
+        let tree = parser.parse(source, None).expect("the template parses");
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a deadline already in the past");
+        absorb_template_expressions(
+            &mut extraction,
+            tree.root_node(),
+            source,
+            "typescript",
+            deadline,
+        );
+
+        let ParseOutcome::Partial { error_ranges, .. } = &extraction.parse_outcome else {
+            panic!(
+                "an expired deadline must not leave the file Clean, got {:?} diagnostics {:?}",
+                extraction.parse_outcome, extraction.diagnostics
+            );
+        };
+        for marker in ["broken(", "also("] {
+            let start = source.find(marker).expect(marker);
+            let end = start + marker.len();
+            assert!(
+                error_ranges
+                    .iter()
+                    .any(|range| range.start_byte < end && range.end_byte > start),
+                "{marker} was not recorded: {error_ranges:?} {:?}",
+                extraction.diagnostics
+            );
+        }
+        assert!(
+            extraction.calls.is_empty(),
+            "an expired deadline must not absorb a call: {:?}",
+            extraction.calls
+        );
+        assert!(
+            extraction.diagnostics.len() >= 2,
+            "each skipped expression names why: {:?}",
+            extraction.diagnostics
+        );
+    }
+
+    /// Expressions past the cap are recorded, not dropped, and the ones under
+    /// the cap are still parsed. The deadline is wide so a slow debug build
+    /// records the cap rather than an expired budget.
+    #[test]
+    fn template_expressions_past_the_cap_are_recorded() {
+        use std::time::Duration;
+
+        let mut source = String::new();
+        for index in 0..(MAX_EMBEDDED_REGIONS + 1) {
+            source.push_str(&format!(
+                "<button onclick={{() => f{index}()}}>x</button>\n"
+            ));
+        }
+        let mut extraction =
+            crate::treesitter::extract_treesitter("Cap.svelte", "svelte", "<p>hi</p>\n");
+        extraction.parse_outcome = ParseOutcome::Clean;
+        extraction.calls.clear();
+        extraction.diagnostics.clear();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
+            .expect("the svelte grammar loads");
+        let tree = parser.parse(&source, None).expect("the template parses");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        absorb_template_expressions(
+            &mut extraction,
+            tree.root_node(),
+            &source,
+            "typescript",
+            deadline,
+        );
+
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Partial { .. }),
+            "the expression past the cap must not leave the file Clean: {:?}",
+            extraction.parse_outcome
+        );
+        let recorded = extraction
+            .calls
+            .iter()
+            .filter(|call| call.callee_name.starts_with('f'))
+            .count();
+        assert_eq!(
+            recorded,
+            MAX_EMBEDDED_REGIONS,
+            "one expression is past the cap and the rest are still calls: {:?}",
+            extraction
+                .calls
+                .iter()
+                .map(|call| call.callee_name.as_str())
+                .filter(|name| name.starts_with('f'))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            extraction
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("were not parsed")),
+            "the cap has to say why it stopped: {:?}",
+            extraction.diagnostics
+        );
+    }
+
+    /// A script string is a literal of the outer file. Absorb used to drop
+    /// the list, and the outer walk cannot decode Vue or Svelte text.
+    #[test]
+    fn a_vue_or_svelte_script_literal_is_on_the_outer_file() {
+        for (path, source) in [
+            (
+                "App.vue",
+                "<template><p>hi</p></template>\n<script>\nconst TOKEN = \"session.spawn\"\n</script>\n",
+            ),
+            (
+                "App.svelte",
+                "<p>hi</p>\n<script>\nconst TOKEN = \"session.spawn\"\n</script>\n",
+            ),
+        ] {
+            let extraction = crate::extract_file(path, source);
+            assert!(
+                extraction
+                    .literals
+                    .iter()
+                    .any(|literal| literal.value == "session.spawn"),
+                "{path} literals: {:?} outcome {:?}",
+                extraction
+                    .literals
+                    .iter()
+                    .map(|literal| literal.value.as_str())
+                    .collect::<Vec<_>>(),
+                extraction.parse_outcome
+            );
+            let token = extraction
+                .literals
+                .iter()
+                .find(|literal| literal.value == "session.spawn")
+                .unwrap();
+            let window = source
+                .get(token.start_byte..source.len().min(token.start_byte + 24))
+                .unwrap_or("");
+            assert!(
+                window.contains("session.spawn"),
+                "{path} literal byte {} indexes {window:?}",
+                token.start_byte
+            );
+        }
     }
 
     #[test]

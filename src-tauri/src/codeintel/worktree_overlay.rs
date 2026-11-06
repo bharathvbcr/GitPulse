@@ -30,14 +30,13 @@ use crate::engine::git_cli::{git_captured, validate_repo, BoundedRun};
 use crate::ipc_error::CommandError;
 use devmap_query::{blake3_hash, CasAstStore, WorktreeOverlay, CAS_TOMBSTONE};
 use devmap_store::{IncrementalDigestEngine, Store};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Marker written above `.git/info/exclude` entries when seeding a DevMap state directory.
 const DEVMAP_EXCLUDE_MARKER: &str =
@@ -190,72 +189,97 @@ fn plain_single_dir_component(rel: &Path) -> Option<&str> {
     Some(first)
 }
 
-fn rebind_cloned_sqlite_root(tmp_db: &Path, canonical_worktree: &Path) -> Result<(), CommandError> {
-    let wt_str = canonical_worktree
-        .to_str()
-        .ok_or_else(|| CommandError::from("worktree path is not valid UTF-8"))?;
-    let mut conn = Connection::open(tmp_db).map_err(|e| {
-        CommandError::from(format!(
-            "failed to open staged DevMap store {}: {e}",
-            tmp_db.display()
-        ))
-    })?;
-    conn.pragma_update(None, "trusted_schema", "OFF")
-        .map_err(|e| CommandError::from(format!("failed to harden staged DevMap store: {e}")))?;
-    conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
-        CommandError::from(format!(
-            "failed to set busy_timeout on staged DevMap store: {e}"
-        ))
-    })?;
-    {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| CommandError::from(format!("failed to begin rebind transaction: {e}")))?;
-        tx.execute(
-            "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
-            [wt_str],
-        )
-        .map_err(|e| {
-            CommandError::from(format!("failed to rebind pending_state.repo_root: {e}"))
-        })?;
-        tx.execute("UPDATE generations SET repo_root = ?1", [wt_str])
-            .map_err(|e| {
-                CommandError::from(format!("failed to rebind generations.repo_root: {e}"))
-            })?;
-        tx.commit()
-            .map_err(|e| CommandError::from(format!("failed to commit repo_root rebind: {e}")))?;
-    }
-    // Flush any WAL frames created by the 2-row rebind back into `tmp_db` before
-    // renaming `tmp_db` to `devmap.sqlite`.
-    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-    Ok(())
+/// Relative path inside `<common_git_dir>/devmap/` holding shared fallback
+/// declaration extractions across sibling zero-copy worktrees without writing
+/// `RegexFallback` payloads into the anchor's full tree-sitter `cas/ast/` (`F4`).
+const SHARED_OVERLAY_CAS_RELPATH: &str = "devmap/cas/overlay_ast";
+
+fn shared_overlay_cas_dir(repo: &Path) -> Option<PathBuf> {
+    let common = crate::engine::git_cli::resolve_git_common_dir(repo).ok()?;
+    Some(
+        SHARED_OVERLAY_CAS_RELPATH
+            .split('/')
+            .fold(common, |acc, part| acc.join(part)),
+    )
 }
 
-fn snapshot_sqlite_with_online_backup(src_db: &Path, dst_db: &Path) -> Result<(), CommandError> {
-    let dst_str = dst_db
-        .to_str()
-        .ok_or_else(|| CommandError::from("staged DevMap store path is not valid UTF-8"))?;
-    let src_conn = Connection::open_with_flags(
-        src_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+fn fallback_supports_symbol_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "function" | "class" | "struct" | "interface" | "enum" | "module" | "type"
     )
-    .map_err(|e| {
-        CommandError::from(format!(
-            "failed to open anchor DevMap store {} for online snapshot: {e}",
-            src_db.display()
-        ))
-    })?;
-    src_conn
-        .pragma_update(None, "trusted_schema", "OFF")
-        .map_err(|e| CommandError::from(format!("failed to harden anchor connection: {e}")))?;
-    src_conn
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(|e| CommandError::from(format!("failed to set busy_timeout: {e}")))?;
+}
 
-    src_conn
-        .execute("VACUUM INTO ?1", [dst_str])
-        .map_err(|e| CommandError::from(format!("SQLite VACUUM INTO snapshot failed: {e}")))?;
-    Ok(())
+/// Strips line (`//`, `#`, `--`) and C-style block (`/* ... */`) comments so
+/// deleted symbol names mentioned only in comments do not suppress tombstoning,
+/// while live receiver methods, macros, and multi-line signatures keep their
+/// identifiers intact (`F4`).
+fn strip_comments_preserving_identifiers(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            out.push(' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if i + 1 < bytes.len()
+            && ((bytes[i] == b'/' && bytes[i + 1] == b'/')
+                || (bytes[i] == b'-' && bytes[i + 1] == b'-'))
+        {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'#' {
+            // Preserve Rust attributes `#[...]` / `#![...]`, strip `#` comments.
+            let next = bytes.get(i + 1).copied();
+            if next != Some(b'[') && next != Some(b'!') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn contains_identifier_token(code_without_comments: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+    let mut offset = 0;
+    while let Some(pos) = code_without_comments[offset..].find(ident) {
+        let start = offset + pos;
+        let end = start + ident.len();
+        let before_ok = code_without_comments[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let after_ok = code_without_comments[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = start + ident.chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 fn materialize_csr_from_store(store: &Store, target_csr: &Path) -> bool {
@@ -303,9 +327,10 @@ pub fn provision_worktree_devmap(
     }
 
     // Zero-spawn fast check: if the anchor path holds neither a DevMap SQLite
-    // file nor a zero-copy base ref on disk, skip before spawning `git rev-parse`.
+    // file, a zero-copy base ref, nor a stacked lease on disk, skip before spawning `git rev-parse`.
     if !devmap_query::paths::store_path(anchor_repo).is_file()
         && !zero_copy_base_ref_path(anchor_str).is_file()
+        && !devmap_extract::paths::stack_lease_path(anchor_repo).is_file()
     {
         return Ok(DevmapWorktreeProvision::skipped(
             "anchor repository has no DevMap store",
@@ -324,6 +349,8 @@ pub fn provision_worktree_devmap(
     if !devmap_query::paths::store_path(&anchor).is_file() {
         if let Some(chained) = load_zero_copy_base_ref_internal(&anchor)? {
             anchor = validate_repo(&chained.anchor_repo_root)?;
+        } else if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
+            anchor = donor;
         }
     }
     if anchor == worktree {
@@ -449,22 +476,21 @@ pub fn provision_worktree_devmap(
     ));
     let mut tmp_guard = TempSqliteGuard::new(tmp_db.clone());
 
-    let wal_path = PathBuf::from(format!("{}-wal", anchor_db.display()));
-    let wal_non_empty = fs::symlink_metadata(&wal_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let seed_method = devmap_store::seed::stage_seed_healing_wal(&anchor_db, &tmp_db).map_err(
+        |e| {
+            CommandError::from(format!(
+                "failed to stage DevMap seed from {}: {e}",
+                anchor_db.display()
+            ))
+        },
+    )?;
+    let is_cow = seed_method == devmap_store::seed::SeedMethod::Clone;
+    let used_online_backup = seed_method == devmap_store::seed::SeedMethod::Backup;
 
-    let mut is_cow = false;
-    let mut used_online_backup = false;
-    if wal_non_empty {
-        snapshot_sqlite_with_online_backup(&anchor_db, &tmp_db)?;
-        used_online_backup = true;
-    } else {
-        let cloned = reflink_copy_file(&anchor_db, &tmp_db)?;
-        is_cow = cloned.is_cow;
-    }
-
-    rebind_cloned_sqlite_root(&tmp_db, &worktree)?;
+    devmap_store::seed::rebind_staged(&tmp_db, &worktree)
+        .map_err(|e| CommandError::from(format!("failed to rebind seeded DevMap store: {e}")))?;
+    devmap_store::seed::settle_staged(&tmp_db)
+        .map_err(|e| CommandError::from(format!("failed to settle seeded DevMap store: {e}")))?;
     tmp_guard.clean_sidecars();
 
     // Remove any stale unindexed DB before atomic placement.
@@ -505,7 +531,7 @@ pub fn provision_worktree_devmap(
     let anchor_cas = cas_ast_dir_for_state(&anchor_state);
     let target_cas = cas_ast_dir_for_state(&target_state);
 
-    // Seed CSR sidecar, navigator manifests, and CAS AST cache concurrently.
+    // Seed CSR sidecar, navigator manifests + resolution-reuse caches, and CAS AST cache concurrently.
     let (csr_seeded, repo_map_seeded, cas_seeded) = std::thread::scope(|scope| {
         let csr_task = scope.spawn(|| {
             if anchor_csr.is_file()
@@ -519,26 +545,37 @@ pub fn provision_worktree_devmap(
                 }
                 let _ = fs::remove_file(&target_csr);
             }
+            // Cache CSR on the anchor once when excluded so subsequent worktrees clone in <1 ms (`F6`).
+            if !anchor_csr.is_file()
+                && ensure_dir_excluded(&anchor, anchor_state_name, DEVMAP_EXCLUDE_MARKER).is_clean()
+                && materialize_csr_from_store(&seeded_store, &anchor_csr)
+                && !target_csr.exists()
+                && reflink_copy_file(&anchor_csr, &target_csr).is_ok()
+            {
+                return true;
+            }
             materialize_csr_from_store(&seeded_store, &target_csr)
         });
 
         let manifest_task = scope.spawn(|| {
-            let mut map_ok = false;
-            if anchor_repo_map.is_file() && !target_repo_map.exists() {
-                if let Some(parent) = target_repo_map.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                map_ok = reflink_copy_file(&anchor_repo_map, &target_repo_map).is_ok();
-            }
-            for (src, dst) in [
-                (&anchor_code_graph, &target_code_graph),
-                (&anchor_compact_graph, &target_compact_graph),
-            ] {
-                if src.is_file() && !dst.exists() {
-                    if let Some(parent) = dst.parent() {
-                        let _ = fs::create_dir_all(parent);
+            let map_ok = devmap_store::seed::seed_artifact(&anchor_repo_map, &target_repo_map)
+                .ok()
+                .flatten()
+                .is_some()
+                || target_repo_map.is_file();
+            let _ = devmap_store::seed::seed_artifact(&anchor_code_graph, &target_code_graph);
+            let _ = devmap_store::seed::seed_artifact(&anchor_compact_graph, &target_compact_graph);
+            if let Ok(entries) = fs::read_dir(&anchor_state) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if let Some(s) = name.to_str() {
+                        if s.starts_with("resolution-reuse-") && entry.path().is_dir() {
+                            let _ = devmap_store::seed::seed_directory_cow(
+                                &entry.path(),
+                                &target_state.join(s),
+                            );
+                        }
                     }
-                    let _ = reflink_copy_file(src, dst);
                 }
             }
             map_ok
@@ -582,14 +619,11 @@ pub fn provision_worktree_devmap(
     })
 }
 
-/// Provisions a zero-copy DevMap shared base graph reference (`base_store_ref.json`)
-/// and ephemeral [`WorktreeOverlay`] (`overlay.json`) inside `worktree_repo`
-/// WITHOUT copying `devmap.sqlite`, `.csr`, or `cas/ast/` files.
-///
-/// The worktree reads clean symbol metadata, mmap CSR adjacency, and content-addressed
-/// AST blobs directly from `anchor_repo` (verified to belong to the exact same
-/// Git worktree family via `resolve_git_common_dir`), persisting only dirty-file
-/// Blake3 hashes, tombstones, and `RoaringBitmap` dirty node IDs locally.
+/// Provisions a zero-copy DevMap shared base graph reference (`base_store_ref.json`),
+/// canonical immutable `StackedStore` lease (`stack_lease.json` + `0444` base snapshot
+/// under `<common_git_dir>/devmap/bases/`), and ephemeral [`WorktreeOverlay`]
+/// (`overlay.json`) inside `worktree_repo` WITHOUT copying `devmap.sqlite` or `cas/ast/`
+/// into `worktree_repo` (`F1`, `F2`, `F6`, `F10`).
 pub fn provision_worktree_devmap_zero_copy(
     anchor_repo: &Path,
     worktree_repo: &Path,
@@ -610,6 +644,7 @@ pub fn provision_worktree_devmap_zero_copy(
     }
     if !devmap_query::paths::store_path(anchor_repo).is_file()
         && !zero_copy_base_ref_path(anchor_str).is_file()
+        && !devmap_extract::paths::stack_lease_path(anchor_repo).is_file()
     {
         return Ok(DevmapWorktreeProvision::skipped(
             "anchor repository has no DevMap store",
@@ -628,6 +663,8 @@ pub fn provision_worktree_devmap_zero_copy(
     if !devmap_query::paths::store_path(&anchor).is_file() {
         if let Some(chained) = load_zero_copy_base_ref_internal(&anchor)? {
             anchor = validate_repo(&chained.anchor_repo_root)?;
+        } else if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
+            anchor = donor;
         }
     }
     if anchor == worktree {
@@ -692,7 +729,9 @@ pub fn provision_worktree_devmap_zero_copy(
     };
     let base_head_sha = anchor_store.latest_generation_head_sha().ok().flatten();
     let anchor_csr = Store::csr_sidecar_path(&anchor_db);
-    if !anchor_csr.is_file() {
+    if !anchor_csr.is_file()
+        && ensure_dir_excluded(&anchor, anchor_state_name, DEVMAP_EXCLUDE_MARKER).is_clean()
+    {
         let _ = materialize_csr_from_store(&anchor_store, &anchor_csr);
     }
     drop(anchor_store);
@@ -722,12 +761,38 @@ pub fn provision_worktree_devmap_zero_copy(
     {
         let _ = fs::create_dir_all(&anchor_cas);
     }
+
+    // Create the excluded target state directory BEFORE `acquire_stack_lease` so
+    // `devmap_extract::paths::state_dir(&worktree)` picks `target_state_name` even
+    // when the anchor uses `.devmap` (`LEGACY_STATE_DIR`).
+    let target_state = worktree.join(target_state_name);
+    let ref_path = BASE_STORE_REF_RELPATH
+        .split('/')
+        .fold(target_state.clone(), |acc, part| acc.join(part));
+    if let Some(parent) = ref_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            CommandError::from(format!("failed to create {}: {e}", parent.display()))
+        })?;
+    }
+
+    // Publish sealed 0444 base snapshot under `<common_git_dir>/devmap/bases/gen-<G>/`
+    // and write canonical `stack_lease.json` + `delta.sqlite` so `devmap` CLI, MCP,
+    // and hooks recognize this zero-copy worktree natively (`F1`, `F10`).
+    let stack_lease = devmap_query::stacked::provision_stacked_worktree(&anchor, &worktree)
+        .map_err(|e| CommandError::from(format!("failed to acquire DevMap stack lease: {e}")))?;
+    let base_csr_candidate =
+        devmap_extract::paths::csr_path_for_store(&stack_lease.base_sqlite_path());
+
     let base_ref = ZeroCopyBaseRef {
         anchor_repo_root: anchor.to_string_lossy().into_owned(),
         anchor_db_path: anchor_db.to_string_lossy().into_owned(),
-        anchor_csr_path: anchor_csr
-            .is_file()
-            .then(|| anchor_csr.to_string_lossy().into_owned()),
+        anchor_csr_path: if base_csr_candidate.is_file() {
+            Some(base_csr_candidate.to_string_lossy().into_owned())
+        } else if anchor_csr.is_file() {
+            Some(anchor_csr.to_string_lossy().into_owned())
+        } else {
+            None
+        },
         anchor_cas_dir: anchor_cas
             .is_dir()
             .then(|| anchor_cas.to_string_lossy().into_owned()),
@@ -735,15 +800,6 @@ pub fn provision_worktree_devmap_zero_copy(
         base_head_sha,
     };
 
-    let target_state = worktree.join(target_state_name);
-    let ref_path = BASE_STORE_REF_RELPATH
-        .split('/')
-        .fold(target_state, |acc, part| acc.join(part));
-    if let Some(parent) = ref_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CommandError::from(format!("failed to create {}: {e}", parent.display()))
-        })?;
-    }
     let encoded_ref = serde_json::to_vec_pretty(&base_ref)
         .map_err(|e| CommandError::from(format!("cannot serialize ZeroCopyBaseRef: {e}")))?;
     devmap_query::write_atomic(&ref_path, &encoded_ref)
@@ -757,14 +813,23 @@ pub fn provision_worktree_devmap_zero_copy(
         used_online_backup: false,
         zero_copy_base_ref: true,
         generation_id: Some(generation_id),
-        db_path: Some(anchor_db.to_string_lossy().into_owned()),
+        db_path: Some(stack_lease.base_sqlite_path().to_string_lossy().into_owned()),
         csr_seeded: base_ref.anchor_csr_path.is_some(),
-        repo_map_seeded: false,
+        repo_map_seeded: devmap_query::paths::repo_map_path(&worktree).is_file(),
         cas_seeded: base_ref.anchor_cas_dir.is_some(),
         overlay_path: Some(overlay_report.overlay_path),
         duration_ms: start.elapsed().as_millis() as u64,
         reason: None,
     })
+}
+
+/// Provisions a stacked (`stack_lease.json` + `delta.sqlite` + `base_store_ref.json`)
+/// zero-copy DevMap store for `worktree_repo` from `anchor_repo`.
+pub fn provision_worktree_devmap_stacked(
+    anchor_repo: &Path,
+    worktree_repo: &Path,
+) -> Result<DevmapWorktreeProvision, CommandError> {
+    provision_worktree_devmap_zero_copy(anchor_repo, worktree_repo)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,15 +1111,117 @@ fn load_zero_copy_base_ref_internal(repo: &Path) -> Result<Option<ZeroCopyBaseRe
     Ok(Some(base_ref))
 }
 
+fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandError> {
+    let lease_path = devmap_extract::paths::stack_lease_path(repo);
+    if !lease_path.is_file() {
+        return Ok(None);
+    }
+    let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
+        .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
+    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
+    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
+        CommandError::from(format!(
+            "stacked base manifest {} is missing or oversized",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: devmap_query::stacked::BaseManifest = serde_json::from_slice(&raw).map_err(|e| {
+        CommandError::from(format!(
+            "failed to parse stacked base manifest {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let donor = validate_repo(&manifest.source_repo_root)?;
+    if !devmap_extract::paths::same_registered_repo(repo, &donor) {
+        return Err(CommandError::from(format!(
+            "refusing stack lease {} pointing outside worktree family ({})",
+            lease_path.display(),
+            donor.display()
+        )));
+    }
+    Ok(Some(donor))
+}
+
+fn open_verified_stack_lease_store(
+    repo: &Path,
+) -> Result<Option<(Store, ZeroCopyBaseRef)>, CommandError> {
+    let lease_path = devmap_extract::paths::stack_lease_path(repo);
+    if !lease_path.is_file() {
+        return Ok(None);
+    }
+    let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
+        .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
+    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
+    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
+        CommandError::from(format!(
+            "stacked base manifest {} is missing or oversized",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: devmap_query::stacked::BaseManifest = serde_json::from_slice(&raw).map_err(|e| {
+        CommandError::from(format!(
+            "failed to parse stacked base manifest {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let anchor_root = validate_repo(&manifest.source_repo_root)?;
+    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
+    let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
+    if repo_common != anchor_common {
+        return Err(CommandError::from(format!(
+            "refusing stack lease {} pointing outside worktree family ({})",
+            lease_path.display(),
+            anchor_root.display()
+        )));
+    }
+    let base_sqlite = lease.base_sqlite_path();
+    let store = Store::open_immutable_snapshot(&base_sqlite, None).map_err(|e| {
+        CommandError::from(format!(
+            "failed to open immutable base snapshot {}: {e}",
+            base_sqlite.display()
+        ))
+    })?;
+    let base_csr = devmap_extract::paths::csr_path_for_store(&base_sqlite);
+    let anchor_state = devmap_query::paths::state_dir(&anchor_root);
+    let anchor_cas = cas_ast_dir_for_state(&anchor_state);
+    let base_head_sha = store.latest_generation_head_sha().ok().flatten();
+    let base_ref = ZeroCopyBaseRef {
+        anchor_repo_root: anchor_root.to_string_lossy().into_owned(),
+        anchor_db_path: base_sqlite.to_string_lossy().into_owned(),
+        anchor_csr_path: base_csr
+            .is_file()
+            .then(|| base_csr.to_string_lossy().into_owned()),
+        anchor_cas_dir: anchor_cas
+            .is_dir()
+            .then(|| anchor_cas.to_string_lossy().into_owned()),
+        generation_id: lease.generation_id,
+        base_head_sha,
+    };
+    Ok(Some((store, base_ref)))
+}
+
 pub(super) fn open_verified_zero_copy_anchor_store(
     repo: &Path,
 ) -> Result<Option<(Store, ZeroCopyBaseRef)>, CommandError> {
-    let Some(base_ref) = load_zero_copy_base_ref_internal(repo)? else {
-        return Ok(None);
-    };
-    let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
-    let store = super::open_local_indexed_store(&anchor_root).map_err(CommandError::from)?;
-    Ok(Some((store, base_ref)))
+    if let Some(base_ref) = load_zero_copy_base_ref_internal(repo)? {
+        // When a sealed `0444` immutable base snapshot also exists via `stack_lease.json`,
+        // prefer opening `?immutable=1` so readers create zero `-shm`/`-wal` contention (`OQ1`).
+        if let Ok(Some((immutable_store, mut lease_ref))) = open_verified_stack_lease_store(repo) {
+            if lease_ref.generation_id == base_ref.generation_id {
+                if lease_ref.anchor_csr_path.is_none() {
+                    lease_ref.anchor_csr_path = base_ref.anchor_csr_path;
+                }
+                if lease_ref.anchor_cas_dir.is_none() {
+                    lease_ref.anchor_cas_dir = base_ref.anchor_cas_dir;
+                }
+                return Ok(Some((immutable_store, lease_ref)));
+            }
+        }
+        let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
+        let store = super::open_local_indexed_store(&anchor_root).map_err(CommandError::from)?;
+        return Ok(Some((store, base_ref)));
+    }
+    open_verified_stack_lease_store(repo)
 }
 
 pub(super) fn is_sparse_worktree(repo: &Path) -> bool {
@@ -1233,7 +1400,9 @@ fn extract_fallback_ast(rel_path: &str, source: &str) -> (devmap_extract::Extrac
         devmap_extract::fallback::FallbackScan {
             symbols: Vec::new(),
             references: Vec::new(),
+            calls: Vec::new(),
             truncated: 0,
+            truncated_calls: 0,
             skipped_long_lines: 0,
             unread_bytes: 0,
         }
@@ -1289,7 +1458,7 @@ fn extract_fallback_ast(rel_path: &str, source: &str) -> (devmap_extract::Extrac
         },
         symbols,
         imports: Vec::new(),
-        calls: Vec::new(),
+        calls: scan.calls,
         exports: Vec::new(),
         references: scan.references,
         diagnostics: Vec::new(),
@@ -1325,16 +1494,264 @@ fn extract_fallback_ast(rel_path: &str, source: &str) -> (devmap_extract::Extrac
     (ext.for_durable_store(), declarative)
 }
 
+pub(super) fn has_zero_copy_or_stack_lease(repo: &Path) -> bool {
+    zero_copy_base_ref_path(&repo.to_string_lossy()).is_file()
+        || devmap_extract::paths::stack_lease_path(repo).is_file()
+}
+
+fn insert_cone_symbol_and_identifiers(
+    raw: &str,
+    cone_paths: &mut std::collections::HashSet<String>,
+    cone_symbols: &mut std::collections::HashSet<String>,
+    cone_identifiers: &mut std::collections::HashSet<String>,
+) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    cone_symbols.insert(trimmed.to_string());
+    if let Some((before_colons, after_colons)) = trimmed.split_once("::") {
+        if before_colons.contains('/') || before_colons.contains('.') {
+            cone_paths.insert(before_colons.to_string());
+            if let Some(stem) = Path::new(before_colons)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+            {
+                cone_identifiers.insert(stem.to_string());
+            }
+        }
+        let tail = after_colons.rsplit("::").next().unwrap_or(after_colons);
+        let ident = tail.rsplit('.').next().unwrap_or(tail);
+        if !ident.is_empty() {
+            cone_identifiers.insert(ident.to_string());
+        }
+    } else if trimmed.contains('/') {
+        cone_paths.insert(trimmed.to_string());
+        if let Some(stem) = Path::new(trimmed)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+        {
+            cone_identifiers.insert(stem.to_string());
+        }
+    } else {
+        let ident = trimmed.rsplit('.').next().unwrap_or(trimmed);
+        if !ident.is_empty() {
+            cone_identifiers.insert(ident.to_string());
+        }
+    }
+}
+
+/// Proves whether `candidate` (`affected_tests` computed from `anchor_store`) is
+/// graph-theoretically invariant under `worktree`'s dirty deltas (`F4`).
+///
+/// Returns `true` ONLY when:
+/// 1. `candidate` is available, complete (`!fail_closed`), and has zero omitted
+///    blast-radius layer nodes (`nodes_omitted == 0` on every layer).
+/// 2. Every difference between `worktree` and `anchor_store`'s indexed generation
+///    is a bounded (`<= MAX_OVERLAY_DIRTY_FILES`) set of modified/added files
+///    with zero deleted files and unchanged discovery refusals / over-limit sets.
+/// 3. Every modified/added file is disjoint from `targets`, `seeds`, `layers`,
+///    and `tests` (both by path and by indexed symbols in `anchor_store`), AND
+///    for declarative code files, its UTF-8 comment-stripped source contains
+///    zero wildcard re-exports/imports and zero identifier tokens matching any
+///    target, seed, blast-layer symbol, test symbol, or cone file stem.
+pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
+    worktree: &Path,
+    anchor: &Path,
+    anchor_store: &Store,
+    anchor_summary: &devmap_store::StoreStatus,
+    targets: &[String],
+    candidate: &super::CodeintelAffectedTests,
+) -> bool {
+    if !candidate.available
+        || candidate.fail_closed
+        || candidate.blast_radius.seeds.is_empty()
+        || candidate
+            .blast_radius
+            .layers
+            .items
+            .iter()
+            .any(|layer| layer.nodes_omitted > 0)
+    {
+        return false;
+    }
+
+    let modified_paths: Vec<String> = if is_sparse_worktree(worktree) {
+        let Some(gen_head) = anchor_store.latest_generation_head_sha().ok().flatten() else {
+            return false;
+        };
+        if head_sha_of(worktree).as_deref() != Some(gen_head.as_str()) {
+            return false;
+        }
+        let anchor_matches_gen = anchor_summary.source_freshness == Some(true)
+            && head_sha_of(anchor).as_deref() == Some(gen_head.as_str());
+        if !anchor_matches_gen {
+            return false;
+        }
+        let Ok((deltas, truncated)) = collect_worktree_deltas(worktree, Some(&gen_head)) else {
+            return false;
+        };
+        if truncated || deltas.is_empty() || deltas.len() > MAX_OVERLAY_DIRTY_FILES {
+            return false;
+        }
+        let mut paths = Vec::with_capacity(deltas.len());
+        for (rel_path, kind) in deltas {
+            match kind {
+                DeltaKind::Modified => paths.push(rel_path),
+                DeltaKind::Deleted => return false,
+            }
+        }
+        paths
+    } else {
+        let Ok(hashes) = anchor_store.latest_file_hashes() else {
+            return false;
+        };
+        let Ok(stored) = anchor_store.latest_discovery_inventory() else {
+            return false;
+        };
+        let Ok(scanned) = devmap_extract::scan_tree(worktree) else {
+            return false;
+        };
+        let Ok(manifests) = devmap_extract::collect_project_manifests(worktree) else {
+            return false;
+        };
+        let current = devmap_store::DiscoveryInventory::of(&scanned.report, &manifests);
+        if current.refusals != stored.refusals || current.over_limit != stored.over_limit {
+            return false;
+        }
+        let scanned_hashes: std::collections::HashMap<&str, u64> =
+            scanned.file_hashes().into_iter().collect();
+        for indexed_path in hashes.keys() {
+            if !scanned_hashes.contains_key(indexed_path.as_str()) {
+                // Conservative: any deleted indexed file forces fail_closed.
+                return false;
+            }
+        }
+        let mut changed = Vec::new();
+        for (path, scan_hash) in scanned_hashes {
+            if hashes.get(path) != Some(&scan_hash) {
+                changed.push(path.to_string());
+                if changed.len() > MAX_OVERLAY_DIRTY_FILES {
+                    return false;
+                }
+            }
+        }
+        if changed.is_empty() {
+            return false;
+        }
+        changed
+    };
+
+    let mut cone_paths = std::collections::HashSet::new();
+    let mut cone_symbols = std::collections::HashSet::new();
+    let mut cone_identifiers = std::collections::HashSet::new();
+
+    for t in targets {
+        insert_cone_symbol_and_identifiers(
+            t,
+            &mut cone_paths,
+            &mut cone_symbols,
+            &mut cone_identifiers,
+        );
+    }
+    for seed in &candidate.blast_radius.seeds {
+        insert_cone_symbol_and_identifiers(
+            seed,
+            &mut cone_paths,
+            &mut cone_symbols,
+            &mut cone_identifiers,
+        );
+    }
+    for layer in &candidate.blast_radius.layers.items {
+        for node in &layer.nodes {
+            insert_cone_symbol_and_identifiers(
+                node,
+                &mut cone_paths,
+                &mut cone_symbols,
+                &mut cone_identifiers,
+            );
+        }
+    }
+    for test in &candidate.tests.items {
+        insert_cone_symbol_and_identifiers(
+            &test.path,
+            &mut cone_paths,
+            &mut cone_symbols,
+            &mut cone_identifiers,
+        );
+        for sym in &test.symbols {
+            insert_cone_symbol_and_identifiers(
+                sym,
+                &mut cone_paths,
+                &mut cone_symbols,
+                &mut cone_identifiers,
+            );
+        }
+    }
+    if cone_identifiers.is_empty() {
+        return false;
+    }
+
+    for rel_path in &modified_paths {
+        if cone_paths.contains(rel_path.as_str()) {
+            return false;
+        }
+        match anchor_store.latest_symbols_for_file(rel_path) {
+            Ok(Some(page)) => {
+                if page.rows.iter().any(|row| {
+                    cone_symbols.contains(row.name.as_str())
+                        || cone_symbols.contains(row.qualified_name.as_str())
+                        || cone_identifiers.contains(row.name.as_str())
+                }) {
+                    return false;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        let lang = devmap_extract::detect_language(Path::new(rel_path));
+        if devmap_extract::fallback::applies_to(lang) {
+            let full_path = worktree.join(rel_path);
+            let Ok(Some(bytes)) = read_bounded_file(&full_path, MAX_OVERLAY_FILE_BYTES) else {
+                return false;
+            };
+            let Ok(src) = std::str::from_utf8(&bytes) else {
+                return false;
+            };
+            let cleaned = strip_comments_preserving_identifiers(src);
+            if cleaned.contains("::*")
+                || cleaned.contains("export *")
+                || cleaned.contains("import *")
+            {
+                return false;
+            }
+            if cone_identifiers
+                .iter()
+                .any(|ident| contains_identifier_token(&cleaned, ident))
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Opens the mmap [`devmap_store::CsrGraphReader`] for `repo`, falling back to
 /// a verified zero-copy anchor base ref when `repo` holds `base_store_ref.json`
-/// instead of a local `devmap.sqlite`.
+/// or `stack_lease.json` instead of a full local `devmap.sqlite`.
 pub(crate) fn open_worktree_or_anchor_csr(
     repo: &Path,
 ) -> Option<(devmap_store::CsrGraphReader, u64)> {
-    if let Ok(store) = super::open_local_indexed_store(repo) {
-        if let Ok(Some(reader)) = store.open_latest_csr_sidecar() {
-            let gen = reader.generation();
-            return Some((reader, gen));
+    let prefer_zero_copy = is_sparse_worktree(repo) && has_zero_copy_or_stack_lease(repo);
+    if !prefer_zero_copy {
+        if let Ok(store) = super::open_local_indexed_store(repo) {
+            if let Ok(Some(reader)) = store.open_latest_csr_sidecar() {
+                let gen = reader.generation();
+                return Some((reader, gen));
+            }
         }
     }
     if let Ok(Some((anchor_store, base_ref))) = open_verified_zero_copy_anchor_store(repo) {
@@ -1347,6 +1764,14 @@ pub(crate) fn open_worktree_or_anchor_csr(
         if let Ok(Some(reader)) = anchor_store.open_latest_csr_sidecar() {
             let gen = reader.generation();
             return Some((reader, gen));
+        }
+    }
+    if prefer_zero_copy {
+        if let Ok(store) = super::open_local_indexed_store(repo) {
+            if let Ok(Some(reader)) = store.open_latest_csr_sidecar() {
+                let gen = reader.generation();
+                return Some((reader, gen));
+            }
         }
     }
     None
@@ -1379,15 +1804,26 @@ fn sync_worktree_overlay_internal(
         }
     }
 
-    let local_store = super::open_local_indexed_store(repo).ok();
-    let zero_copy_anchor = if local_store.is_none() {
+    let prefer_zero_copy = is_sparse_worktree(repo) && has_zero_copy_or_stack_lease(repo);
+    let zero_copy_anchor = if prefer_zero_copy {
         open_verified_zero_copy_anchor_store(repo)?
     } else {
         None
     };
-    let active_store: Option<&Store> = local_store
+    let local_store = if zero_copy_anchor.is_none() {
+        super::open_local_indexed_store(repo).ok()
+    } else {
+        None
+    };
+    let zero_copy_anchor = match zero_copy_anchor {
+        Some(zc) => Some(zc),
+        None if local_store.is_none() => open_verified_zero_copy_anchor_store(repo)?,
+        None => None,
+    };
+    let active_store: Option<&Store> = zero_copy_anchor
         .as_ref()
-        .or_else(|| zero_copy_anchor.as_ref().map(|(s, _)| s));
+        .map(|(s, _)| s)
+        .or(local_store.as_ref());
 
     let generation_id = active_store
         .and_then(|s| s.latest_generation_id().ok().flatten())
@@ -1401,10 +1837,6 @@ fn sync_worktree_overlay_internal(
                 .as_ref()
                 .and_then(|(_, r)| r.base_head_sha.clone())
         });
-    let csr_lookup = active_store
-        .and_then(|s| s.open_latest_csr_sidecar().ok().flatten())
-        .map(|reader| CsrDigestLookup::from_reader(&reader));
-
     let worktree_id = repo
         .file_name()
         .and_then(|n| n.to_str())
@@ -1412,12 +1844,22 @@ fn sync_worktree_overlay_internal(
         .to_string();
     let mut overlay = WorktreeOverlay::new(worktree_id, u64::from(generation_id));
     let cas_store = CasAstStore::with_custom_dir(cas_ast_dir_for_state(&state_dir));
+    // `anchor_cas_store` is strictly READ-ONLY so `RegexFallback` overlay extractions
+    // never overwrite or poison full tree-sitter AST blobs in the anchor (`F4`).
     let anchor_cas_store = zero_copy_anchor
         .as_ref()
         .and_then(|(_, r)| r.anchor_cas_dir.as_deref())
         .map(|p| CasAstStore::with_custom_dir(PathBuf::from(p)));
+    let shared_overlay_cas_store = shared_overlay_cas_dir(repo).map(CasAstStore::with_custom_dir);
 
     let (deltas, truncated) = collect_worktree_deltas(repo, base_head_sha.as_deref())?;
+    let csr_lookup = if deltas.is_empty() {
+        None
+    } else {
+        active_store
+            .and_then(|s| s.open_latest_csr_sidecar().ok().flatten())
+            .map(|reader| CsrDigestLookup::from_reader(&reader))
+    };
     let mut skipped_large_files = 0usize;
     let mut reused_cas_asts = 0usize;
 
@@ -1472,18 +1914,27 @@ fn sync_worktree_overlay_internal(
                                     .as_ref()
                                     .and_then(|ac| ac.load_ast(&hash).ok().flatten())
                                     .filter(|ext| ext.language == lang)
+                            })
+                            .or_else(|| {
+                                shared_overlay_cas_store
+                                    .as_ref()
+                                    .and_then(|sc| sc.load_ast(&hash).ok().flatten())
+                                    .filter(|ext| ext.language == lang)
                             });
+                        let source_str_opt = std::str::from_utf8(&bytes).ok();
                         let extracted = if let Some(cached) = cached_ast {
                             reused_cas_asts += 1;
                             Some((
                                 rebase_cached_extraction(cached, &rel_path),
                                 devmap_extract::fallback::applies_to(lang),
                             ))
-                        } else if let Ok(source_str) = std::str::from_utf8(&bytes) {
+                        } else if let Some(source_str) = source_str_opt {
                             let (ext, declarative) = extract_fallback_ast(&rel_path, source_str);
-                            let _ = cas_store.store_ast(&bytes, &ext);
-                            if let Some(ref ac) = anchor_cas_store {
-                                let _ = ac.store_ast(&bytes, &ext);
+                            if local_store.is_some() {
+                                let _ = cas_store.store_ast(&bytes, &ext);
+                            }
+                            if let Some(ref sc) = shared_overlay_cas_store {
+                                let _ = sc.store_ast(&bytes, &ext);
                             }
                             Some((ext, declarative))
                         } else {
@@ -1491,6 +1942,15 @@ fn sync_worktree_overlay_internal(
                         };
                         if let Some((extraction, declarative)) = extracted {
                             if declarative {
+                                let is_full_ast = matches!(
+                                    extraction.engine,
+                                    devmap_extract::ExtractionEngine::TreeSitter { .. }
+                                );
+                                let code_no_comments = if !is_full_ast && !indexed_rows.is_empty() {
+                                    source_str_opt.map(strip_comments_preserving_identifiers)
+                                } else {
+                                    None
+                                };
                                 let declared_names: std::collections::HashSet<&str> = extraction
                                     .symbols
                                     .iter()
@@ -1498,9 +1958,20 @@ fn sync_worktree_overlay_internal(
                                     .map(|s| s.name.as_str())
                                     .collect();
                                 for row in &indexed_rows {
-                                    if !row.kind.eq_ignore_ascii_case("file")
-                                        && !declared_names.contains(row.name.as_str())
+                                    if row.kind.eq_ignore_ascii_case("file")
+                                        || declared_names.contains(row.name.as_str())
                                     {
+                                        continue;
+                                    }
+                                    let safe_to_tombstone = if is_full_ast {
+                                        true
+                                    } else {
+                                        fallback_supports_symbol_kind(&row.kind)
+                                            && code_no_comments.as_deref().is_some_and(|cleaned| {
+                                                !contains_identifier_token(cleaned, &row.name)
+                                            })
+                                    };
+                                    if safe_to_tombstone {
                                         overlay.mark_symbol_tombstone(
                                             file_scoped_symbol_id(&rel_path, &row.name),
                                             None,
@@ -1621,11 +2092,21 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
     fallback_anchor: Option<&Path>,
 ) -> Result<DirtyNodeScan, CommandError> {
     let repo = validate_repo(repo_path)?;
-    let local_store = super::open_local_indexed_store(&repo).ok();
-    let zero_copy_anchor = if local_store.is_none() {
+    let prefer_zero_copy = is_sparse_worktree(&repo) && has_zero_copy_or_stack_lease(&repo);
+    let zero_copy_anchor = if prefer_zero_copy {
         open_verified_zero_copy_anchor_store(&repo)?
     } else {
         None
+    };
+    let local_store = if zero_copy_anchor.is_none() {
+        super::open_local_indexed_store(&repo).ok()
+    } else {
+        None
+    };
+    let zero_copy_anchor = match zero_copy_anchor {
+        Some(zc) => Some(zc),
+        None if local_store.is_none() => open_verified_zero_copy_anchor_store(&repo)?,
+        None => None,
     };
     let fallback_store = if local_store.is_none() && zero_copy_anchor.is_none() {
         fallback_anchor.and_then(|a| super::open_local_indexed_store(a).ok())
@@ -1633,9 +2114,10 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
         None
     };
 
-    let active_store: Option<&Store> = local_store
+    let active_store: Option<&Store> = zero_copy_anchor
         .as_ref()
-        .or_else(|| zero_copy_anchor.as_ref().map(|(s, _)| s))
+        .map(|(s, _)| s)
+        .or(local_store.as_ref())
         .or(fallback_store.as_ref());
 
     // Node IDs are only comparable within one CSR generation; a persisted overlay is
@@ -1685,6 +2167,7 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+    use rusqlite::Connection;
     use std::process::Command;
 
     fn git(repo: &Path, args: &[&str]) {
@@ -1795,12 +2278,18 @@ mod tests {
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
 
-        // Hold an open writer connection with an uncheckpointed WAL transaction on anchor DB.
+        // Hold a pinned reader on the older snapshot AND a subsequent WAL commit so
+        // `wal_checkpoint(TRUNCATE)` cannot truncate the WAL and must fall back to
+        // `VACUUM INTO` online backup.
         let anchor_db = devmap_query::paths::store_path(anchor);
         let writer = Connection::open(&anchor_db).unwrap();
         writer.pragma_update(None, "journal_mode", "WAL").unwrap();
         writer
             .pragma_update(None, "wal_autocheckpoint", 0i64)
+            .unwrap();
+        let reader = Connection::open(&anchor_db).unwrap();
+        reader
+            .execute_batch("BEGIN DEFERRED; SELECT 1 FROM sqlite_master LIMIT 1;")
             .unwrap();
         writer
             .execute(
@@ -1824,12 +2313,60 @@ mod tests {
         );
         crate::test_support::trust_repo(&wt);
 
-        let report = provision_worktree_devmap(anchor, &wt).expect("provision with live WAL");
+        let report = provision_worktree_devmap(anchor, &wt).expect("provision with pinned WAL");
         assert!(report.seeded, "{report:?}");
         assert!(report.used_online_backup, "{report:?}");
 
         let status = crate::codeintel::status(wt.to_str().unwrap());
         assert!(status.available, "{status:?}");
+        drop(reader);
+        drop(writer);
+    }
+
+    #[test]
+    fn provision_worktree_devmap_heals_unpinned_wal_without_online_backup() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path();
+        crate::test_support::trust_repo(anchor);
+
+        let anchor_db = devmap_query::paths::store_path(anchor);
+        let writer = Connection::open(&anchor_db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0i64)
+            .unwrap();
+        writer
+            .execute(
+                "INSERT OR REPLACE INTO pending_paths (path, queued_at, attempts) VALUES ('wal_heal_probe.rs', 1.0, 0)",
+                [],
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", anchor_db.display()));
+        assert!(
+            fs::metadata(&wal_path).map(|m| m.len() > 0).unwrap_or(false),
+            "expected non-empty unpinned WAL before heal"
+        );
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("lane-wal-healed");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/wal-healed",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+
+        let report = provision_worktree_devmap(anchor, &wt).expect("provision healing WAL");
+        assert!(report.seeded, "{report:?}");
+        assert!(
+            !report.used_online_backup,
+            "unpinned WAL must be healed via TRUNCATE + clonefile instead of VACUUM INTO: {report:?}"
+        );
         drop(writer);
     }
 
@@ -2628,6 +3165,366 @@ mod tests {
                 .as_deref()
                 .is_some_and(|r| r.contains("overlay sync failed")),
             "a dropped overlay error must be reported: {second:?}"
+        );
+    }
+
+    #[test]
+    fn provision_worktree_devmap_rebinds_via_seed_rebind_and_clones_resolution_reuse() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path();
+        crate::test_support::trust_repo(anchor);
+
+        let anchor_state = devmap_query::paths::state_dir(anchor);
+        let reuse_dir = anchor_state.join("resolution-reuse-1");
+        fs::create_dir_all(&reuse_dir).unwrap();
+        fs::write(reuse_dir.join("unit.bin"), b"cached-resolution-artifact").unwrap();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("lane-rebind-reuse");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/rebind-reuse",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+
+        let report = provision_worktree_devmap(anchor, &wt).expect("provision");
+        assert!(report.seeded, "{report:?}");
+
+        // 1. `resolution-reuse-1/` must be CoW-cloned into the worktree (`F9`).
+        let wt_reuse_file =
+            devmap_query::paths::state_dir(&wt).join("resolution-reuse-1/unit.bin");
+        assert_eq!(
+            fs::read(&wt_reuse_file).unwrap(),
+            b"cached-resolution-artifact"
+        );
+
+        // 2. Both `seed_rebind` (`F8`) and the latest `generations` row bind `wt`,
+        //    while stacked mode avoids rewriting `base.sqlite` entirely (`0 B`).
+        let wt_db = devmap_query::paths::store_path(&wt);
+        let conn = Connection::open(&wt_db).unwrap();
+        let raw_gen_root: String = conn
+            .query_row(
+                "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let canonical_wt = fs::canonicalize(&wt).unwrap();
+        assert_eq!(
+            fs::canonicalize(&raw_gen_root).unwrap(),
+            canonical_wt,
+            "latest generation repo_root must bind the lane root"
+        );
+        let rebound_root: String = conn
+            .query_row(
+                "SELECT seeded_repo_root FROM seed_rebind WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(rebound_root), canonical_wt);
+    }
+
+    #[test]
+    fn stack_lease_only_worktree_opens_in_codeintel_and_zero_copy_seals_base_snapshot() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-stack-lease-only");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/stack-lease-only",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+
+        let report = provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
+        assert!(report.seeded, "{report:?}");
+
+        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
+        assert!(
+            lease_path.is_file(),
+            "zero-copy provisioning must emit canonical stack_lease.json (`F1`)"
+        );
+        let lease = devmap_query::stacked::StackLease::read_from(&lease_path).unwrap();
+        let base_sqlite = lease.base_sqlite_path();
+        assert!(base_sqlite.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&base_sqlite).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o444, "sealed base snapshot must be read-only 0444");
+        }
+
+        // Remove `base_store_ref.json` so ONLY `stack_lease.json` remains (simulating a
+        // worktree seeded directly via `devmap seed --mode stacked`).
+        let wt_str = wt.to_str().unwrap();
+        fs::remove_file(zero_copy_base_ref_path(wt_str)).unwrap();
+
+        let st = crate::codeintel::status(wt_str);
+        assert!(st.available, "stack_lease-only worktree must open: {st:?}");
+        assert_eq!(st.is_fresh, Some(true), "{st:?}");
+
+        let hits = crate::codeintel::search(wt_str, "probe_caller", None);
+        assert!(hits.available);
+        assert!(hits.items.iter().any(|h| h.symbol_name == "probe_caller"));
+    }
+
+    #[test]
+    fn sparse_worktree_prefers_zero_copy_monorepo_base_over_cone_only_local_store() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-sparse-cone");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                "lane/sparse-cone",
+                wt.to_str().unwrap(),
+            ],
+        );
+        git(&wt, &["sparse-checkout", "init", "--cone"]);
+        git(&wt, &["sparse-checkout", "set", "tests"]);
+        git(&wt, &["checkout"]);
+        crate::test_support::trust_repo(&wt);
+        assert!(
+            is_sparse_worktree(&wt),
+            "expected cone sparse-checkout worktree"
+        );
+        assert!(
+            !wt.join("src/callee.rs").exists(),
+            "out-of-cone src/callee.rs must not be materialized"
+        );
+
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy provision");
+
+        // Simulate a partial cone-only local `devmap.sqlite` created inside the sparse
+        // worktree (`F2`) that contains 0 `probe_callee` rows.
+        let local_db = devmap_query::paths::store_path(&wt);
+        fs::create_dir_all(local_db.parent().unwrap()).unwrap();
+        let partial = Store::open(&local_db).unwrap();
+        partial.bind_repo_root(&wt).unwrap();
+        drop(partial);
+        let conn = Connection::open(&local_db).unwrap();
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, NULL, '{\"total_files\":0,\"total_symbols\":0,\"total_edges\":0,\"dead_symbols\":[],\"communities\":[],\"status\":\"Ok\",\"unresolved_calls\":0}', ?1)",
+            [wt.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // `codeintel::search` MUST prefer the full monorepo zero-copy base over the
+        // partial cone-only local `devmap.sqlite` (`F2`)!
+        let wt_str = wt.to_str().unwrap();
+        let hits = crate::codeintel::search(wt_str, "probe_callee", None);
+        assert!(hits.available, "{hits:?}");
+        assert!(
+            hits.items.iter().any(|h| h.symbol_name == "probe_callee"),
+            "sparse worktree must serve out-of-cone monorepo symbols: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_sync_preserves_live_methods_and_consts_without_poisoning_anchor_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path();
+        git(anchor, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        let rs_src = "pub const MAX_RETRIES: usize = 3;\npub fn keep_me() -> usize { MAX_RETRIES }\n";
+        let go_src = "package srv\ntype Srv struct{}\nfunc (s *Srv) HandleReq() {}\n";
+        let ts_src = "export const API_URL = 'https://example.test';\nexport class Client { fetchAll() { return API_URL; } }\n";
+        fs::write(anchor.join("src/lib.rs"), rs_src).unwrap();
+        fs::write(anchor.join("src/srv.go"), go_src).unwrap();
+        fs::write(anchor.join("src/client.ts"), ts_src).unwrap();
+        git(anchor, &["add", "."]);
+        git(
+            anchor,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "polyglot init",
+            ],
+        );
+        let head_out = {
+            let mut c = Command::new("git");
+            crate::test_support::pin_git(&mut c);
+            c.current_dir(anchor)
+                .args(["rev-parse", "HEAD"])
+                .output_locked()
+                .unwrap()
+        };
+        let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        crate::test_support::trust_repo(anchor);
+        crate::devmap::ensure_state_dir_excluded(anchor);
+
+        let anchor_state = devmap_query::paths::state_dir(anchor);
+        let anchor_cas_dir = cas_ast_dir_for_state(&anchor_state);
+        fs::create_dir_all(&anchor_cas_dir).unwrap();
+
+        let db = devmap_query::paths::store_path(anchor);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = Store::open(&db).unwrap();
+        store.bind_repo_root(anchor).unwrap();
+        drop(store);
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, '{\"total_files\":3,\"total_symbols\":4,\"total_edges\":0,\"dead_symbols\":[],\"communities\":[],\"status\":\"Ok\",\"unresolved_calls\":0}', ?2)",
+            (&head_sha, anchor.to_string_lossy().as_ref()),
+        )
+        .unwrap();
+        let indexed = [
+            (1i64, "src/lib.rs", "rust", "MAX_RETRIES", "Constant"),
+            (2i64, "src/srv.go", "go", "HandleReq", "Method"),
+            (3i64, "src/client.ts", "typescript", "API_URL", "Constant"),
+        ];
+        for (id, path, lang, sym, kind) in indexed {
+            let (gv, av) = devmap_extract::cache::current_payload_identity(lang);
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language, parse_outcome_json,
+                    engine_json, extraction_json, entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, ?3, '\"Clean\"', '{\"TreeSitter\":{\"grammar\":\"x\",\"grammar_version\":1}}', '{}', '[]', ?4, ?5)",
+                (id, id * 100, lang, &gv, &av),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to) VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO payload_nodes (payload_id, ord_in_file, name, qualified_name, kind, span_start, span_end, is_exported)
+                 VALUES (?1, 0, ?2, ?2, ?3, 0, 20, 1)",
+                (id, sym, kind),
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-polyglot");
+        git(
+            anchor,
+            &["worktree", "add", "-b", "lane/polyglot", wt.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
+
+        // Edit 1 comment line in each file while keeping `MAX_RETRIES`, `HandleReq`,
+        // and `API_URL` intact (`F4`).
+        fs::write(wt.join("src/lib.rs"), format!("// edit\n{rs_src}")).unwrap();
+        fs::write(wt.join("src/srv.go"), format!("// edit\n{go_src}")).unwrap();
+        fs::write(wt.join("src/client.ts"), format!("// edit\n{ts_src}")).unwrap();
+
+        let wt_str = wt.to_str().unwrap();
+        let sync = sync_worktree_overlay(wt_str).expect("sync");
+        assert_eq!(sync.modified_files, 3);
+
+        let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
+        assert!(
+            overlay.tombstoned_symbols.is_empty(),
+            "live Rust consts, Go receiver methods, and TS exported consts must NEVER be false-negation tombstoned: {:?}",
+            overlay.tombstoned_symbols
+        );
+
+        // Anchor CAS directory must remain 100% untouched by RegexFallback ASTs (`F4`).
+        let anchor_cas_entries = fs::read_dir(&anchor_cas_dir).unwrap().count();
+        assert_eq!(
+            anchor_cas_entries, 0,
+            "sync_worktree_overlay must never write RegexFallback ASTs into anchor CAS"
+        );
+    }
+
+    #[test]
+    fn zero_copy_affected_tests_passes_on_disjoint_edit_and_fails_closed_on_new_caller() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-disjoint-affected");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/disjoint-affected",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
+        let wt_str = wt.to_str().unwrap();
+
+        // 1. Unrelated prose + unrelated Rust file outside `probe_callee`'s cone MUST
+        //    keep `affected_tests` open (`fail_closed == false`, `F4`)!
+        fs::write(wt.join("README.md"), "# Worktree notes\n").unwrap();
+        fs::write(
+            wt.join("src/unrelated.rs"),
+            "pub fn completely_independent_feature() -> usize { 123 }\n",
+        )
+        .unwrap();
+
+        let disjoint = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        assert!(
+            !disjoint.fail_closed,
+            "unrelated worktree edits disjoint from target cone must NOT force fail_closed: {disjoint:?}"
+        );
+        assert!(disjoint
+            .tests
+            .items
+            .iter()
+            .any(|t| t.path == "tests/caller_test.rs"));
+
+        // 2. Adding a new file that references `probe_callee` in code MUST immediately
+        //    fail closed (`fail_closed == true`)!
+        fs::write(
+            wt.join("src/sneaky_new_caller.rs"),
+            "pub fn sneaky() { crate::callee::probe_callee(); }\n",
+        )
+        .unwrap();
+
+        let overlapping = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        assert!(
+            overlapping.fail_closed,
+            "new caller referencing target cone identifier must fail closed: {overlapping:?}"
         );
     }
 }

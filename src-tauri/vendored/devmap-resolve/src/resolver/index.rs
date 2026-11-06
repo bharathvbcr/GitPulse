@@ -138,6 +138,11 @@ impl Resolver {
                 }
             }
             let mut file_identities: BTreeSet<(&str, Option<&str>)> = BTreeSet::new();
+            let file_names: BTreeSet<&str> = ext
+                .symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.as_str())
+                .collect();
             for sym in &ext.symbols {
                 if family == LangFamily::Rust {
                     if let Some(signature) = &sym.signature {
@@ -154,7 +159,14 @@ impl Resolver {
                     self.unexported_symbols
                         .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
-                let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
+                // A later `#[cfg]` copy is `base@<start>`. Callers of the bare
+                // name still mean the one function, so the lookup identity is
+                // the base when that base is also declared here. Signatures,
+                // parents, and the type-method list keep the real name.
+                let identity: Arc<str> = Arc::from(devmap_extract::model::cfg_canonical(
+                    sym.qualified_name.as_str(),
+                    &file_names,
+                ));
                 // A Python redefinition, a Rust impl of two traits, or a local
                 // function of the same name in two different functions are not
                 // siblings of one id.

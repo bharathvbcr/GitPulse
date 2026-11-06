@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FileId(pub u32);
@@ -857,6 +857,31 @@ pub struct ExtractedSymbol {
     pub return_type: Option<String>,
 }
 
+/// Later `#[cfg]` copy of `base`, spelled `base@<start_byte>`.
+///
+/// The suffix is the marker only when it is a non-empty run of ASCII digits.
+/// Callers still require `base` to be another symbol's full qualified name in
+/// the same file, so a path segment that contains `@` is not stripped.
+pub fn cfg_copy_base(qualified_name: &str) -> Option<&str> {
+    let (base, suffix) = qualified_name.rsplit_once('@')?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(base)
+}
+
+/// The name resolution and the dead-row list use for a cfg copy.
+///
+/// The earliest body keeps `base`. A later body is `base@<digits>`. When `base`
+/// is also a symbol in this file, both are one function. A trailing `@` plus
+/// digits whose base is not in the file is a real name and stays as written.
+pub fn cfg_canonical<'a>(qualified_name: &'a str, names_in_file: &BTreeSet<&str>) -> &'a str {
+    match cfg_copy_base(qualified_name) {
+        Some(base) if names_in_file.contains(base) => base,
+        _ => qualified_name,
+    }
+}
+
 /// The `signature` a Swift member property carries: what separates it from the
 /// other `Field` symbols (enum cases) and says whether it stores a value.
 pub const SWIFT_STORED_PROPERTY: &str = "stored property";
@@ -1144,6 +1169,10 @@ impl ExtractedReference {
                     })
                 });
                 Some(match receiver {
+                    // The module keyword, stored with a trailing `::` so it is
+                    // not the value `self`. `self::new` stays a path, not
+                    // `Type::new`.
+                    Some("self::") => format!("self::{}", self.name),
                     Some(receiver) if self.name == "new" => format!("{receiver}::new"),
                     Some(receiver) => format!("{receiver}.{}", self.name),
                     None => self.name.clone(),
@@ -1603,6 +1632,18 @@ pub const JAVA_RECORD_SIGNATURE: &str = "record";
 /// The leading words of every `ParseOutcome::Failed` reason that records a
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
 pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";
+
+/// Most call sites recorded for one file in a language that has no call
+/// extractor. Past this the list is a prefix and the file says how many were
+/// dropped, in [`CALLS_DROPPED_PREFIX`].
+pub const MAX_CALL_BLIND_SITES: usize = 8_000;
+
+/// Leading words of a diagnostic that names call sites the cap dropped.
+///
+/// `diagnostics` is cleared before the payload is stored. The coverage-gap
+/// inventory still holds the extraction and copies this line into the durable
+/// reason, so a capped file does not look complete.
+pub const CALLS_DROPPED_PREFIX: &str = "call sites dropped at the scan cap: ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
@@ -2336,6 +2377,17 @@ impl Extraction {
         let mut durable = self.clone();
         durable.source_code = None;
         durable.diagnostics.clear();
+        // A pattern-recovered file records a call-shaped site as a Call
+        // reference and leaves `calls` empty, so the fabrication rule holds.
+        // That reference is the only copy. Dropping it here would make a
+        // cached re-resolve forget the ledger row. A language that does
+        // extract calls, and a parsed call-blind file whose sites already
+        // live in `calls`, still drop the duplicate.
+        let call_site_is_the_reference = self.calls.is_empty()
+            && matches!(self.engine, ExtractionEngine::RegexFallback { .. })
+            && !self
+                .capabilities()
+                .contains(crate::languages::Capability::Calls);
         durable.references.retain(|reference| {
             // A call-kind reference duplicates an entry in `calls` and carries
             // no extra information — *unless* it records a receiver binding.
@@ -2348,6 +2400,7 @@ impl Extraction {
             // `Calls` edges than a cold build of the same tree and never
             // converged (SC16).
             reference.assigned_to.is_some()
+                || (call_site_is_the_reference && reference.kind == ReferenceKind::Call)
                 || !matches!(
                     reference.kind,
                     ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag

@@ -1586,6 +1586,31 @@ pub(super) fn extract_node(
         // `variable.region`), which is the identity operators already use and
         // the one `terraform plan` prints.
         "hcl" => {
+            if kind == "function_call" {
+                let mut cursor = node.walk();
+                let callee_name = node.named_children(&mut cursor).find_map(|child| {
+                    (child.kind() == "identifier").then(|| get_node_text(child, source))
+                });
+                if let Some(callee_name) = callee_name.filter(|name| !name.is_empty()) {
+                    let mut caller = file_symbol_name.to_string();
+                    let mut parent = node.parent();
+                    while let Some(current) = parent {
+                        if current.kind() == "block" {
+                            if let Some(address) = hcl_block_address(current, source) {
+                                caller = format!("{file_symbol_name}::{address}");
+                                break;
+                            }
+                        }
+                        parent = current.parent();
+                    }
+                    calls.push(ExtractedCall {
+                        caller_symbol: Some(caller),
+                        callee_name,
+                        receiver_expr: None,
+                        span: span.clone(),
+                    });
+                }
+            }
             if kind == "block" {
                 if let Some(name) = hcl_block_address(node, source) {
                     let block_type = node

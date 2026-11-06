@@ -114,14 +114,15 @@ impl Resolver {
     }
 
     /// Whether a Rust `self` receiver written inside `caller` is the method's
-    /// `self` value rather than the `self::` module path.
+    /// `self` value.
     ///
-    /// The extractor reduces `self.f()` and `self::f()` to the same receiver
-    /// text, so the caller decides: only a function owned by a type can have a
-    /// `self` parameter, and there `self.f()` is a method call on a value, which
-    /// no free function can answer (`self.spawn()` inside
+    /// The path form arrives as [`Self::rust_module_self_path`], not `self`,
+    /// so this is only the field form. A function owned by a type can have a
+    /// `self` parameter, and there `self.f()` is a method call on a value,
+    /// which no free function can answer (`self.spawn()` inside
     /// `impl SpawnExt for Command` is std's `Command::spawn`, not this file's
-    /// `spawn`). A free-function caller can only have written the path.
+    /// `spawn`). A free-function caller can only have written the path, and
+    /// that path is not this receiver.
     pub(super) fn rust_self_is_a_value(
         &self,
         file: &str,
@@ -135,6 +136,41 @@ impl Resolver {
                         .get(&(file.to_string(), caller.to_string()))
                 })
                 .is_some_and(|parent| parent != file)
+    }
+
+    /// The extractor's spelling of the module keyword in `self::name`.
+    ///
+    /// A trailing `::` is not a legal value receiver, and [`receiver_is_self`]
+    /// does not match it. [`rust_qualified_call`] still means the keyword
+    /// `self` when it is handed that keyword; callers map this spelling back
+    /// only on the path rung.
+    pub(super) fn rust_module_self_path(receiver: &str) -> bool {
+        receiver == "self::"
+    }
+
+    /// The one file-level function `file` declares as `name`.
+    ///
+    /// A method of the same bare name is filed under its type, so it is not in
+    /// this list. Two file-level functions with different identities abstain;
+    /// the same identity repeated (one `#[cfg]` pair) is one function.
+    pub(super) fn rust_file_level_function(&self, file: &str, name: &str) -> Option<String> {
+        let hits = self.scope_children.get(&(
+            file.to_string(),
+            file.to_string(),
+            name.to_string(),
+        ))?;
+        let mut found: Option<&str> = None;
+        for (kind, identity) in hits {
+            if *kind != SymbolKind::Function {
+                continue;
+            }
+            match found {
+                None => found = Some(identity.as_ref()),
+                Some(previous) if previous == identity.as_ref() => {}
+                Some(_) => return None,
+            }
+        }
+        found.map(str::to_string)
     }
 
     /// How far the supertype walk may climb.

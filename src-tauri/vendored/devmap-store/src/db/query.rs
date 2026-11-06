@@ -92,7 +92,7 @@ impl Store {
             generation,
             total: u32::try_from(rows.len()).map_err(|_| refusal("symbol count exceeds u32"))?,
             rows,
-            repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+            repo_root: self.generation_repo_root_in(&snapshot, generation)?,
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
             narrowing: None,
         }))
@@ -128,7 +128,7 @@ impl Store {
                 total: u32::try_from(rows.len())
                     .map_err(|_| refusal("symbol count exceeds u32"))?,
                 rows,
-                repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+                repo_root: self.generation_repo_root_in(&snapshot, generation)?,
                 analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
                 narrowing: None,
             },
@@ -206,7 +206,7 @@ impl Store {
             generation,
             total: Self::count_search_symbols_locked(&snapshot, generation, query)?,
             rows: Self::search_symbols_locked(&snapshot, generation, query, limit)?,
-            repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+            repo_root: self.generation_repo_root_in(&snapshot, generation)?,
             // Inside the same snapshot as the rows and the count, through the
             // one reader that strips the summary's two vectors in SQLite. A
             // search that finds nothing is only a completed check if the corpus
@@ -216,7 +216,17 @@ impl Store {
         }))
     }
 
-    fn generation_repo_root_in(snapshot: &Connection, generation: u32) -> Result<Option<String>> {
+    fn generation_repo_root_in(
+        &self,
+        snapshot: &Connection,
+        generation: u32,
+    ) -> Result<Option<String>> {
+        if let Some(ref override_root) = self.repo_root_override {
+            return Ok((!override_root.is_empty()).then(|| override_root.clone()));
+        }
+        if let Some(seeded) = Self::seeded_repo_root_in(snapshot)? {
+            return Ok(Some(seeded));
+        }
         let root: Option<Option<String>> = snapshot
             .query_row(
                 "SELECT repo_root FROM generations WHERE id = ?1",
@@ -342,7 +352,7 @@ impl Store {
             return Ok(None);
         };
         let files = Self::indexed_files_in(&snapshot, generation)?;
-        let root = Self::generation_repo_root_in(&snapshot, generation)?;
+        let root = self.generation_repo_root_in(&snapshot, generation)?;
         Ok(Some((generation, root, files)))
     }
 
@@ -385,7 +395,7 @@ impl Store {
             generation,
             total,
             rows,
-            repo_root: Self::generation_repo_root_in(&conn, generation)?,
+            repo_root: self.generation_repo_root_in(&conn, generation)?,
             analysis: Self::analysis_disclosure_in(&conn, generation)?,
             narrowing: applied,
         }))

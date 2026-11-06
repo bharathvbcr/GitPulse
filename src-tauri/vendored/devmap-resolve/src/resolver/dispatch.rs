@@ -772,10 +772,36 @@ impl Resolver {
             .collect();
         own.sort();
         own.dedup();
-        match own.as_slice() {
-            [only] => Some(*only),
-            _ => None,
+        // Two bodies of one method used to share a qualified name, so dedup
+        // left one pair. The later body is `base@<start>`. That is still one
+        // method: the earliest span kept `base`, and the call targets that.
+        Self::one_cfg_identity(&own)
+    }
+
+    /// One hit, or the unsuffixed name when every hit is a cfg copy of it.
+    ///
+    /// Two different methods in this file stay unresolved. A suffix whose base
+    /// is not itself a hit is a real name, not a copy.
+    pub(super) fn one_cfg_identity<'a>(
+        own: &[&'a (String, String)],
+    ) -> Option<&'a (String, String)> {
+        if own.is_empty() {
+            return None;
         }
+        let names: BTreeSet<&str> = own.iter().map(|(_, qname)| qname.as_str()).collect();
+        let mut base: Option<&str> = None;
+        for (_, qname) in own {
+            let canonical = devmap_extract::model::cfg_canonical(qname, &names);
+            match base {
+                None => base = Some(canonical),
+                Some(previous) if previous == canonical => {}
+                Some(_) => return None,
+            }
+        }
+        let base = base?;
+        own.iter()
+            .find(|(_, qname)| qname.as_str() == base)
+            .copied()
     }
 
     /// Whether this file wrote `receiver`'s type as a bare `class_type`, and

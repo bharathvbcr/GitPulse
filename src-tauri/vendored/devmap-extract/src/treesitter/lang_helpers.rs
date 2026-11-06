@@ -758,7 +758,13 @@ pub(super) fn member_access_receiver(node: Node, source: &str) -> Option<String>
     // X44. The object's *identity*, not its source text: `runner.invoke(app,
     // ["init"]).output` names the call it reads from, and a receiver that is a
     // block copied into a column groups with nothing.
-    let text = receiver_identity(object, source, 0);
+    let mut text = receiver_identity(object, source, 0);
+    // Same distinction as a call: `self::name` is the module, `self.name` is
+    // the value. Only the bare keyword changes; `self::child` already carries
+    // `::`.
+    if text == "self" && matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        text.push_str("::");
+    }
     (!text.is_empty()).then_some(text)
 }
 

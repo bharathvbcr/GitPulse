@@ -20,11 +20,11 @@
 //! migration, naming the task, instead of being skipped or truncated.
 
 use super::{
-    Error, Input, LOCAL_REPOSITORY_ID, Result, backup_profile, ensure_schema,
-    local_repository_request, mutate,
+    backup_profile, ensure_schema, ensure_schema_within, local_repository_request, mutate,
+    work_meta_version, Error, Input, Result, LOCAL_REPOSITORY_ID, WORKBENCH_SCHEMA,
 };
-use crate::{Store, json};
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::{json, Store};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
 /// What a migration did, for a caller that wants to report it.
@@ -236,14 +236,32 @@ pub(crate) fn retire(
         return Ok(Retired::default());
     }
     let held: i64 = conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
-    // Rows need the workbench profile to land in, created or brought current
-    // (and backed up) before the transaction opens: its own steps are
-    // transactions. An empty legacy table — every store before schema 10 had
-    // one — is dropped without touching the profile, so a read does not
+    // Rows need the workbench profile. The backup is taken before the
+    // transaction, because VACUUM INTO cannot run inside one. The migrate
+    // steps run inside the transaction, so a refusal rolls the version back
+    // with the tasks table. An empty legacy table — every store before schema
+    // 10 had one — is dropped without touching the profile, so a read does not
     // upgrade it for hosts that still speak the older one.
     let workbench_ready = held > 0;
     if workbench_ready {
-        ensure_schema(conn, true)?;
+        // Foreign keys and VACUUM INTO are both illegal inside a transaction.
+        // The backup is a copy of the store before the tasks table is dropped.
+        conn.pragma_update(None, "foreign_keys", true)?;
+        let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+        if !foreign_keys {
+            return Err(Error {
+                code: "store_error",
+                message: "foreign key enforcement is unavailable".into(),
+            });
+        }
+        // A profile that does not exist yet is created and committed here. It
+        // holds none of the legacy rows, and a later refusal still leaves that
+        // empty profile. An older profile is not upgraded here: those steps
+        // run inside the retirement transaction, so a colliding id rolls the
+        // version back with the tasks table.
+        if work_meta_version(conn)?.is_none() {
+            ensure_schema(conn, true)?;
+        }
         backup_profile(conn, "pre-tasks-retire", |backup, detail| {
             format!(
                 "the legacy tasks table cannot be retired because its backup {} could not be written: {detail}",
@@ -253,7 +271,17 @@ pub(crate) fn retire(
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let outcome = archive(store, workbench_ready).and_then(|done| {
+    let outcome = (|| {
+        if workbench_ready {
+            if let Some(version) = work_meta_version(conn)? {
+                if version < WORKBENCH_SCHEMA {
+                    ensure_schema_within(conn, true)?;
+                }
+            }
+        }
+        archive(store, workbench_ready)
+    })()
+    .and_then(|done| {
         crate::schema::bring_current(conn, known, stamp_budget)
             .map(|()| done)
             .map_err(|detail| Error {

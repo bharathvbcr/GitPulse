@@ -500,10 +500,13 @@ impl Resolver {
             hits.iter().filter(|(path, _)| path == &type_file).collect();
         matched.sort();
         matched.dedup();
-        if matched.len() != 1 {
+        // Repeated inherent impls of one method used to share a qualified
+        // name, so dedup left one hit. The later body is `base@<start>`. That
+        // is still one method, and the path is one caller of the unsuffixed
+        // name, not a fan-out and not a miss.
+        let Some((target_file, target_symbol)) = Self::one_cfg_identity(&matched) else {
             return None;
-        }
-        let (target_file, target_symbol) = matched[0];
+        };
         Some(Resolution::ReceiverType {
             target_symbol: target_symbol.clone(),
             target_file: target_file.clone(),

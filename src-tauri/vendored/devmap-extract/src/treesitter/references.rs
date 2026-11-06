@@ -71,7 +71,10 @@ pub(super) fn maybe_push_name_reference(
         return;
     }
     let name = get_node_text(node, source);
-    if !is_user_ident(&name) {
+    // `is_user_ident` stays ASCII: other languages, and the test that pins
+    // it, reject non-ASCII text. Rust identifiers are Unicode letters, so
+    // `self::帮助` was dropped here and the binder never saw a Name reference.
+    if !is_user_ident(&name) && !rust_reference_ident(lang, &name) {
         return;
     }
     // X40. `_` in **type position** is the inferred-type placeholder — Rust's
@@ -233,6 +236,26 @@ pub(crate) fn is_user_ident(name: &str) -> bool {
         && name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+}
+
+/// Whether `name` is a Rust identifier the ASCII predicate refused.
+///
+/// Called only after [`is_user_ident`] returned false. Rust accepts Unicode
+/// letters (`帮助`, `_帮助`). Emoji, bidi overrides (U+202E) and U+200B are
+/// not letters or digits, so they stay out. `$` is not a Rust identifier
+/// character. This is `char::is_alphabetic` / `is_alphanumeric`, not the
+/// Unicode XID tables: a combining mark is still refused, and no
+/// `unicode-ident` dependency is added. Other languages stay on the ASCII
+/// predicate.
+pub(crate) fn rust_reference_ident(lang: &str, name: &str) -> bool {
+    if lang != "rust" {
+        return false;
+    }
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    (first.is_alphabetic() || first == '_')
+        && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
 /// Whether `needle` lies inside the first child of `parent` on `field`.

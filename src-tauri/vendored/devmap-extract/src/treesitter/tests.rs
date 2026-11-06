@@ -2436,6 +2436,163 @@ fn a_self_qualified_function_pointer_is_a_name_reference() {
     );
 }
 
+/// `let named = self::帮助` is a use of that function.
+///
+/// The identifier is not ASCII. A missing Name reference is a failure:
+/// the binder never sees a name the extractor dropped.
+#[test]
+fn a_non_ascii_rust_self_path_emits_a_name_reference() {
+    let source = concat!(
+        "fn 帮助() {}\n",
+        "fn helper() {}\n",
+        "fn holder() {\n",
+        "    let named = self::帮助;\n",
+        "    let ascii = self::helper;\n",
+        "}\n",
+    );
+    let extraction = extract_treesitter("weird/名字.rs", "rust", source);
+    assert!(
+        extraction.references.iter().any(|reference| {
+            reference.kind == ReferenceKind::Name
+                && reference.name == "帮助"
+                && reference
+                    .enclosing_symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.contains("holder"))
+        }),
+        "self::帮助 must emit a Name reference from holder: {:?}",
+        extraction
+            .references
+            .iter()
+            .map(|reference| (&reference.name, reference.kind, &reference.enclosing_symbol))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        extraction.references.iter().any(|reference| {
+            reference.kind == ReferenceKind::Name
+                && reference.name == "helper"
+                && reference
+                    .enclosing_symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.contains("holder"))
+        }),
+        "self::helper must still emit a Name reference: {:?}",
+        name_refs(&extraction)
+    );
+}
+
+/// Emoji, bidi overrides, zero-width spaces and other languages stay out.
+///
+/// The positive case is [`a_non_ascii_rust_self_path_emits_a_name_reference`].
+/// These inputs are the ones a letter check must still refuse. A combining
+/// mark is refused too: the gate is `char::is_alphabetic`, not XID_Continue.
+#[test]
+fn a_rust_self_path_refuses_non_identifier_unicode() {
+    for name in ["帮助", "_帮助", "名", "café"] {
+        assert!(
+            rust_reference_ident("rust", name),
+            "{name:?} is a Rust letter identifier"
+        );
+        assert!(
+            !rust_reference_ident("python", name),
+            "the widen is Rust-only: {name:?}"
+        );
+        assert!(
+            !rust_reference_ident("go", name) && !rust_reference_ident("typescript", name),
+            "the widen is Rust-only: {name:?}"
+        );
+    }
+    let long = "帮".repeat(4096);
+    assert_eq!(long.chars().count(), 4096);
+    assert!(rust_reference_ident("rust", &long));
+    assert!(!rust_reference_ident("python", &long));
+
+    for name in [
+        "",
+        "9帮助",
+        "帮-助",
+        "帮 助",
+        "帮.助",
+        "帮()",
+        "$帮助",
+        "🦀",
+        "帮🦀",
+        "\u{202e}",
+        "hel\u{202e}per",
+        "\u{200b}",
+        "帮\u{200b}助",
+        "e\u{0301}",
+        "帮\n助",
+        "帮\u{0}助",
+    ] {
+        assert!(
+            !rust_reference_ident("rust", name),
+            "{name:?} must not become a Rust reference"
+        );
+        assert!(
+            !is_user_ident(name),
+            "{name:?} must stay off the ASCII predicate"
+        );
+    }
+    assert!(!is_user_ident("帮助"));
+    assert!(is_user_ident("helper"));
+    assert!(is_user_ident("$el"));
+    for ch in [
+        '\u{202e}', '\u{200b}', '\u{200d}', '🦀', '\u{0}', '\n', '\\', '"',
+    ] {
+        let mixed = format!("帮{ch}");
+        assert!(
+            !rust_reference_ident("rust", &mixed),
+            "{mixed:?} must not become a Rust reference"
+        );
+    }
+
+    let underscore = extract_treesitter(
+        "weird/名字.rs",
+        "rust",
+        "fn _帮助() {}\nfn holder() {\n    let named = self::_帮助;\n}\n",
+    );
+    assert!(
+        name_refs(&underscore).contains(&"_帮助"),
+        "self::_帮助 must emit a Name reference: {:?}",
+        name_refs(&underscore)
+    );
+
+    for (source, forbidden) in [
+        ("fn holder() { let named = self::🦀; }\n", "🦀"),
+        (
+            "fn holder() { let named = self::\u{202e}helper; }\n",
+            "\u{202e}helper",
+        ),
+        (
+            "fn holder() { let named = self::帮\u{200b}助; }\n",
+            "帮\u{200b}助",
+        ),
+        (
+            "fn holder() { let named = self::e\u{0301}; }\n",
+            "e\u{0301}",
+        ),
+    ] {
+        let extraction = extract_treesitter("weird/名字.rs", "rust", source);
+        assert!(
+            !name_refs(&extraction).contains(&forbidden),
+            "{forbidden:?} must not be a Name reference in {source:?}: {:?}",
+            name_refs(&extraction)
+        );
+    }
+
+    let python = extract_treesitter(
+        "weird/名字.py",
+        "python",
+        "def holder():\n    帮助 = 1\n    return 帮助\n",
+    );
+    assert!(
+        !name_refs(&python).contains(&"帮助"),
+        "Python must not gain a Name reference from the Rust widen: {:?}",
+        name_refs(&python)
+    );
+}
+
 /// An extern fn used as a value is a Function, not a method of a type.
 #[test]
 fn an_extern_fn_is_a_free_function() {

@@ -93,6 +93,10 @@ pub const WORKSPACE_RELPATH: &str = "workspace.json";
 /// different names — `devcouncil-local` and `devmap-local` — so whichever ran
 /// last silently replaced the other's registration.
 pub const PLUGIN_RELPATH: &str = "devmap-plugin";
+/// StackedStore lease metadata, relative to the state directory.
+pub const STACK_LEASE_RELPATH: &str = "codeintel/stack_lease.json";
+/// StackedStore worktree-local delta SQLite database, relative to the state directory.
+pub const STACK_DELTA_RELPATH: &str = "codeintel/delta.sqlite";
 
 /// Resolve the state directory for `root`, reading `$DEVMAP_HOME` and the
 /// filesystem.
@@ -189,6 +193,161 @@ pub fn workspace_path(root: impl AsRef<Path>) -> PathBuf {
 /// Path to the emitted Claude Code plugin bundle for `root`.
 pub fn plugin_dir(root: impl AsRef<Path>) -> PathBuf {
     join_rel(state_dir(root), PLUGIN_RELPATH)
+}
+
+/// Path to `stack_lease.json` for `root`.
+pub fn stack_lease_path(root: impl AsRef<Path>) -> PathBuf {
+    join_rel(state_dir(root), STACK_LEASE_RELPATH)
+}
+
+/// Path to `delta.sqlite` for `root`.
+pub fn stack_delta_path(root: impl AsRef<Path>) -> PathBuf {
+    join_rel(state_dir(root), STACK_DELTA_RELPATH)
+}
+
+/// Path to the `<store>.csr` mmap sidecar accompanying `store`.
+pub fn csr_path_for_store(store: impl AsRef<Path>) -> PathBuf {
+    let mut name = store.as_ref().as_os_str().to_owned();
+    name.push(".csr");
+    PathBuf::from(name)
+}
+
+/// Largest `.git` gitlink or `commondir` / `gitdir` pointer file accepted.
+const MAX_GITLINK_BYTES: u64 = 4096;
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(max_bytes as usize));
+    file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > max_bytes {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Canonical common `.git` directory of `root` when `root` is either a main
+/// checkout (with a real `.git` directory) or a linked worktree bidirectionally
+/// registered under `<common>/worktrees/<name>/gitdir`.
+///
+/// Rejects symlinked `.git` entries and forged `.git` gitlink files whose
+/// target `<common>/worktrees/<name>/gitdir` does not canonicalize back to
+/// `<root>/.git`.
+pub fn registered_common_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        let head = dot_git.join("HEAD");
+        std::fs::symlink_metadata(&head).ok()?;
+        return dot_git.canonicalize().ok();
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    let text = read_bounded_regular_file(&dot_git, MAX_GITLINK_BYTES)?;
+    let gitdir_spec = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty() && !spec.contains('\0'))?;
+    let gitdir_raw = root.join(gitdir_spec);
+    let common_spec = read_bounded_regular_file(&gitdir_raw.join("commondir"), MAX_GITLINK_BYTES)?;
+    let common_spec = common_spec.trim();
+    if common_spec.is_empty() || common_spec.contains('\0') {
+        return None;
+    }
+    let common = gitdir_raw.join(common_spec).canonicalize().ok()?;
+    let gitdir = gitdir_raw.canonicalize().ok()?;
+    let worktrees_dir = gitdir.parent()?;
+    if worktrees_dir.file_name()? != "worktrees" || worktrees_dir.parent()? != common {
+        return None;
+    }
+    let registered_spec = read_bounded_regular_file(&gitdir.join("gitdir"), MAX_GITLINK_BYTES)?;
+    let registered_spec = registered_spec.trim();
+    if registered_spec.is_empty() || registered_spec.contains('\0') {
+        return None;
+    }
+    let registered = gitdir.join(registered_spec).canonicalize().ok()?;
+    let canon_gitlink = dot_git.canonicalize().ok()?;
+    let canon_root = root.canonicalize().ok()?;
+    if registered != canon_gitlink || registered.parent()? != canon_root {
+        return None;
+    }
+    Some(common)
+}
+
+/// The main checkout of the linked worktree at `root`, when git has
+/// bidirectionally registered `root` and the common repository is non-bare.
+pub fn main_checkout_of(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    let common = registered_common_git_dir(root)?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main = common.parent()?.canonicalize().ok()?;
+    let canon_root = root.canonicalize().ok()?;
+    (main != canon_root).then_some(main)
+}
+
+/// True when `a` and `b` are valid, bidirectionally registered checkouts (main
+/// or linked worktrees) of the same Git repository.
+pub fn same_registered_repo(a: &Path, b: &Path) -> bool {
+    match (registered_common_git_dir(a), registered_common_git_dir(b)) {
+        (Some(ca), Some(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// All live, bidirectionally verified worktree roots sharing `common_git_dir`
+/// (including the main checkout when `common_git_dir` is `<main>/.git`).
+pub fn registered_worktrees_of_common_dir(common_git_dir: &Path) -> Vec<PathBuf> {
+    let Ok(common) = common_git_dir.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if common.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        if let Some(main) = common.parent() {
+            if registered_common_git_dir(main).as_deref() == Some(common.as_path()) {
+                if let Ok(canon) = main.canonicalize() {
+                    out.push(canon);
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+        for entry in entries.flatten() {
+            let wt_meta_dir = entry.path();
+            let Some(reg_spec) =
+                read_bounded_regular_file(&wt_meta_dir.join("gitdir"), MAX_GITLINK_BYTES)
+            else {
+                continue;
+            };
+            let reg_spec = reg_spec.trim();
+            if reg_spec.is_empty() || reg_spec.contains('\0') {
+                continue;
+            }
+            let Ok(gitlink) = wt_meta_dir.join(reg_spec).canonicalize() else {
+                continue;
+            };
+            let Some(wt_root) = gitlink.parent() else {
+                continue;
+            };
+            if registered_common_git_dir(wt_root).as_deref() == Some(common.as_path()) {
+                let wt_buf = wt_root.to_path_buf();
+                if !out.contains(&wt_buf) {
+                    out.push(wt_buf);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The repository root a store path belongs to — the inverse of [`store_path`].
@@ -341,6 +500,8 @@ mod tests {
             binary_digest_cache_path(root),
             workspace_path(root),
             plugin_dir(root),
+            stack_lease_path(root),
+            stack_delta_path(root),
         ] {
             assert!(
                 path.starts_with(&dir),
@@ -397,5 +558,91 @@ mod tests {
         // `.claude-plugin/marketplace.json`, and the second writer replaced the
         // first's registration with no warning.
         assert_ne!(PLUGIN_RELPATH, "claude-plugin");
+    }
+
+    #[test]
+    fn same_registered_repo_accepts_linked_worktrees_and_rejects_gitlink_forgery() {
+        let base = std::env::temp_dir().join(format!(
+            "devmap-paths-reg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let main = base.join("main");
+        let wt1 = base.join("wt1");
+        let wt2 = base.join("wt2");
+        let forged_main = base.join("forged-main");
+        let forged_lane = base.join("forged-lane");
+        let unrelated = base.join("unrelated");
+
+        std::fs::create_dir_all(main.join(".git/worktrees/wt1")).unwrap();
+        std::fs::create_dir_all(main.join(".git/worktrees/wt2")).unwrap();
+        std::fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        for (name, dir) in [("wt1", &wt1), ("wt2", &wt2)] {
+            std::fs::create_dir_all(dir).unwrap();
+            let wt_gitdir = main.join(".git/worktrees").join(name);
+            std::fs::write(
+                dir.join(".git"),
+                format!("gitdir: {}\n", wt_gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                wt_gitdir.join("gitdir"),
+                format!("{}\n", dir.join(".git").display()),
+            )
+            .unwrap();
+        }
+
+        std::fs::create_dir_all(&forged_main).unwrap();
+        std::fs::write(
+            forged_main.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").display()),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&forged_lane).unwrap();
+        std::fs::write(
+            forged_lane.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt1").display()),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(unrelated.join(".git")).unwrap();
+        std::fs::write(unrelated.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert!(same_registered_repo(&main, &main));
+        assert!(same_registered_repo(&main, &wt1));
+        assert!(same_registered_repo(&wt1, &main));
+        assert!(same_registered_repo(&wt1, &wt2));
+        assert_eq!(
+            main_checkout_of(&wt1).unwrap(),
+            main.canonicalize().unwrap()
+        );
+        assert_eq!(main_checkout_of(&main), None);
+
+        assert!(!same_registered_repo(&main, &forged_main));
+        assert!(!same_registered_repo(&main, &forged_lane));
+        assert!(!same_registered_repo(&wt1, &forged_lane));
+        assert!(!same_registered_repo(&main, &unrelated));
+        assert_eq!(main_checkout_of(&forged_lane), None);
+
+        #[cfg(unix)]
+        {
+            let symlink_forge = base.join("symlink-forge");
+            std::fs::create_dir_all(&symlink_forge).unwrap();
+            std::os::unix::fs::symlink(wt1.join(".git"), symlink_forge.join(".git")).unwrap();
+            assert!(!same_registered_repo(&main, &symlink_forge));
+            assert_eq!(main_checkout_of(&symlink_forge), None);
+        }
+
+        let common = registered_common_git_dir(&wt1).unwrap();
+        let all = registered_worktrees_of_common_dir(&common);
+        assert_eq!(all.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

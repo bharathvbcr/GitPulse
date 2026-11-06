@@ -14,8 +14,9 @@
 //! is the only way to get real symbols. Each resulting symbol is then
 //! *relocated* through a structural map from decoded cell bytes to raw JSON
 //! bytes. The same map relocates calls, references, imports, exports, lexical
-//! bindings and parser diagnostics; duplicate text in prose or output cells
-//! cannot steal a source location. A mapping failure refuses the extraction.
+//! bindings, string literals, object facts, implicit calls and parser
+//! diagnostics; duplicate text in prose or output cells cannot steal a source
+//! location. A mapping failure refuses the extraction.
 //!
 //! Markdown cells are not scanned, for the reason `fallback` does not scan
 //! Markdown: a type described in prose is not a type the notebook declares.
@@ -619,9 +620,19 @@ fn extract_notebook_with_parser(
         if let ParseOutcome::Failed { reason } = &parsed.parse_outcome {
             return fail(reason.clone());
         }
-        let Some(parsed) = relocate_cell(parsed, &source_map, path, &synthetic) else {
+        let Some(mut parsed) = relocate_cell(parsed, &source_map, path, &synthetic) else {
             return fail("source span falls outside this cell".to_string());
         };
+        // `relocate_cell` moves the byte. The line is counted in the raw
+        // notebook, which this loop has and the relocator does not.
+        for literal in &mut parsed.literals {
+            literal.line = Span {
+                start_byte: literal.start_byte,
+                end_byte: literal.start_byte,
+            }
+            .line_range(raw)
+            .0;
+        }
         match parsed.parse_outcome {
             ParseOutcome::Clean => {}
             ParseOutcome::Partial {
@@ -646,6 +657,14 @@ fn extract_notebook_with_parser(
         extraction.diagnostics.extend(parsed.diagnostics);
         extraction.scope_locals.extend(parsed.scope_locals);
         extraction.local_bindings.extend(parsed.local_bindings);
+        extraction.literals.extend(parsed.literals);
+        extraction.js_objects.extend(parsed.js_objects);
+        extraction
+            .rust_implicit_calls
+            .extend(parsed.rust_implicit_calls);
+        extraction
+            .rust_try_conversions
+            .extend(parsed.rust_try_conversions);
         // These are empty for currently supported kernels, but remain part of
         // the merge contract if a kernel with Go metadata is added later.
         extraction.go_package = parsed.go_package.or(extraction.go_package);
@@ -762,6 +781,35 @@ fn relocate_cell(
         relocate(&mut point);
         binding.start_byte = point.start_byte;
         if let Some(owner) = &mut binding.scope {
+            rewrite_owner(owner);
+        }
+    }
+    for literal in &mut parsed.literals {
+        let mut point = Span {
+            start_byte: literal.start_byte,
+            end_byte: literal.start_byte,
+        };
+        relocate(&mut point);
+        literal.start_byte = point.start_byte;
+        rewrite_owner(&mut literal.enclosing_qualified_name);
+    }
+    for fact in &mut parsed.js_objects {
+        let mut point = Span {
+            start_byte: fact.start_byte,
+            end_byte: fact.start_byte,
+        };
+        relocate(&mut point);
+        fact.start_byte = point.start_byte;
+    }
+    for call in &mut parsed.rust_implicit_calls {
+        relocate(&mut call.span);
+        if let Some(owner) = &mut call.caller_symbol {
+            rewrite_owner(owner);
+        }
+    }
+    for call in &mut parsed.rust_try_conversions {
+        relocate(&mut call.span);
+        if let Some(owner) = &mut call.caller_symbol {
             rewrite_owner(owner);
         }
     }
@@ -966,6 +1014,97 @@ mod tests {
             .collect();
         assert!(names.contains(&"load"), "{names:?}");
         assert!(names.contains(&"Model"), "{names:?}");
+    }
+
+    /// A cell string is a literal of the notebook. The merge used to drop the
+    /// list, so the outer file stayed Clean with nothing a sink scan could see.
+    #[test]
+    fn a_python_cell_literal_is_on_the_notebook() {
+        let raw = notebook(
+            "python",
+            &[
+                ("code", "TOKEN = \"session.spawn\""),
+                ("code", "def load(path):\n    return open(path)"),
+            ],
+        );
+        let extraction = extract(&raw);
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "{:?}",
+            extraction.parse_outcome
+        );
+        assert!(
+            extraction
+                .literals
+                .iter()
+                .any(|literal| literal.value == "session.spawn"),
+            "literals: {:?}",
+            extraction
+                .literals
+                .iter()
+                .map(|literal| literal.value.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            extraction
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "load"),
+            "symbols the merge already copied disappeared"
+        );
+        let token = extraction
+            .literals
+            .iter()
+            .find(|literal| literal.value == "session.spawn")
+            .unwrap();
+        let window = raw
+            .get(token.start_byte..raw.len().min(token.start_byte + 40))
+            .unwrap_or("");
+        assert!(
+            token.start_byte > 40 && window.contains("session.spawn"),
+            "literal byte {} indexes {window:?}, not the raw notebook",
+            token.start_byte
+        );
+    }
+
+    /// `v[0]` is only an implicit call. The cell merge has to keep that list.
+    #[test]
+    fn a_rust_cell_index_survives_the_merge() {
+        let raw = notebook(
+            "rust",
+            &[("code", "fn f(v: Vec<i32>) {\n    let _ = v[0];\n}")],
+        );
+        let extraction = extract(&raw);
+        assert!(
+            extraction.symbols.iter().any(|symbol| symbol.name == "f"),
+            "symbols: {:?}",
+            extraction
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let call = extraction
+            .rust_implicit_calls
+            .iter()
+            .find(|call| call.callee_name == "index" && call.receiver_expr.as_deref() == Some("v"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "implicit: {:?}",
+                    extraction
+                        .rust_implicit_calls
+                        .iter()
+                        .map(|call| (call.callee_name.as_str(), call.receiver_expr.as_deref()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let slice = raw
+            .get(call.span.start_byte..call.span.end_byte)
+            .unwrap_or("");
+        assert!(
+            slice.contains("v[0]"),
+            "index span indexes {slice:?}, not the raw notebook"
+        );
     }
 
     /// **The property this module exists to get right.**

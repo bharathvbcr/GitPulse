@@ -27,6 +27,36 @@ impl Resolver {
         receiver: &str,
         name: &str,
     ) -> Option<ResolvedEdge> {
+        // A `self::name` path is not a value. Resolving it here, and stopping
+        // when this module has no such free item, is what keeps the value-self
+        // rung below from returning on a miss before the path is considered.
+        if family == LangFamily::Rust && Self::rust_module_self_path(receiver) {
+            if let Some(target) = self.rust_file_level_function(&ext.file_path, name) {
+                let shown = target.clone();
+                return Some(self.reference_edge(
+                    ext,
+                    &ext.file_path,
+                    &shown,
+                    reference,
+                    Resolution::SameFile {
+                        target_symbol: target,
+                        target_file: ext.file_path.clone(),
+                    },
+                ));
+            }
+            if let Some(found) = self.rust_qualified_call(&ext.file_path, "self", name, true) {
+                if let Some((target_file, target_symbol)) = found.target() {
+                    return Some(self.reference_edge(
+                        ext,
+                        target_file,
+                        target_symbol,
+                        reference,
+                        found.clone(),
+                    ));
+                }
+            }
+            return None;
+        }
         let binding = {
             let root = Self::path_root(receiver);
             ext.local_binding_at(reference.span.start_byte, root)
@@ -232,7 +262,8 @@ impl Resolver {
         // rung below, for the opposite one — `self.run` cannot mean an imported
         // free function in any language here, so the import rung is refused for
         // an implicit receiver outright.
-        let implicit = Self::receiver_is_self(receiver);
+        let implicit =
+            Self::receiver_is_self(receiver) && !Self::rust_module_self_path(receiver);
         if implicit {
             let answer = reference.enclosing_symbol.as_deref().and_then(|caller| {
                 Self::read_members(family, name)

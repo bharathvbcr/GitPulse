@@ -187,6 +187,60 @@ impl PinnedDir {
         }
     }
 
+    /// Create `to` in this directory as a copy-on-write clone of `source`: the
+    /// new file shares every data block with it until one side is written.
+    ///
+    /// `source` is an already-open, already-validated file, so no path is
+    /// resolved for it; `to` must not exist (the clone never replaces a name).
+    /// macOS uses `fclonefileat`, Linux `FICLONE` on a descriptor created
+    /// exclusively with `O_NOFOLLOW`. Anything else, or a filesystem without
+    /// reflinks, returns an error and leaves no file at `to`, so a caller can
+    /// fall back to a plain write.
+    pub fn clone_file_to_child(&self, source: &File, to: &OsStr) -> io::Result<()> {
+        check_child_name(to)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let parent = self
+                .chain
+                .last()
+                .ok_or_else(|| refused("managed directory is missing"))?;
+            let to = c_name(to)?;
+            // SAFETY: the source descriptor, the pinned directory descriptor and
+            // the name are live for the call; the call fails with EEXIST rather
+            // than replacing an existing name.
+            if unsafe { libc::fclonefileat(source.as_raw_fd(), parent.as_raw_fd(), to.as_ptr(), 0) }
+                != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // _IOW(0x94, 9, int)
+            const FICLONE: u32 = 0x4004_9409;
+            let created = open_regular_child(self, to, Access::ReadWrite, Creation::New)?;
+            // SAFETY: both descriptors are open for the duration of the call.
+            if unsafe { libc::ioctl(created.as_raw_fd(), FICLONE as _, source.as_raw_fd()) } != 0 {
+                let error = io::Error::last_os_error();
+                drop(created);
+                let _ = self.remove_child(to);
+                return Err(error);
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (source, to);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this platform has no copy-on-write file clone",
+            ))
+        }
+    }
+
     pub fn remove_child(&self, name: &OsStr) -> io::Result<()> {
         check_child_name(name)?;
         #[cfg(unix)]

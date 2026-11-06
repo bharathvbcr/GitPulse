@@ -718,17 +718,26 @@ fn clone_tree(
     #[cfg(target_os = "macos")]
     if !byte_copy_forced() {
         let require_clone = rules.require_clone;
-        if !require_clone {
+        let pre_stats = if !require_clone {
             // `copyfile(3)` clones where it can and writes bytes where it
             // cannot (another volume), and does not say which. What it could
-            // write is counted first, against the same cap and floor.
+            // write is counted first, against the same cap and floor, while
+            // recording `(files, logical_bytes)` in a single pass so a successful
+            // clone needs no post-clone directory walk.
             let block = dest_block(caps, staging.parent().unwrap_or(staging));
-            estimate_allocated(src, caps, block)?;
-        }
+            let (_, files, bytes) = estimate_allocated(src, caps, block)?;
+            Some((files, bytes))
+        } else {
+            None
+        };
         let src_c = CString::new(utf8_path(src, "Source")?)
             .map_err(|e| format!("Invalid source path: {e}"))?;
         let dst_c = CString::new(utf8_path(staging, "Destination")?)
             .map_err(|e| format!("Invalid destination path: {e}"))?;
+        let src_is_symlink = src
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true);
         let ret = if require_clone {
             // `copyfile(3)`'s `COPYFILE_CLONE` quietly copies data where it
             // cannot clone, and its `COPYFILE_CLONE_FORCE` refuses
@@ -739,15 +748,30 @@ fn clone_tree(
             // other Rust-owned memory.
             unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) }
         } else {
-            let flags = COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_CLONE;
-            // SAFETY: `src_c` and `dst_c` are NUL-terminated strings that
-            // outlive the call; `copyfile(3)` only reads them. A null `state`
-            // is the documented way to run without a copyfile_state_t. The
-            // call touches no Rust-owned memory besides those two buffers.
-            unsafe { copyfile(src_c.as_ptr(), dst_c.as_ptr(), std::ptr::null_mut(), flags) }
+            // Prefer 1-syscall APFS `clonefile(2)` on real directory roots before
+            // falling back to user-space recursive `copyfile(3)`.
+            let direct = if !src_is_symlink {
+                // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings.
+                unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) }
+            } else {
+                -1
+            };
+            if direct == 0 {
+                0
+            } else {
+                let _ = fs::remove_dir_all(staging);
+                let flags = COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_CLONE;
+                // SAFETY: `src_c` and `dst_c` are NUL-terminated strings that
+                // outlive the call; `copyfile(3)` only reads them. A null `state`
+                // is the documented way to run without a copyfile_state_t.
+                unsafe { copyfile(src_c.as_ptr(), dst_c.as_ptr(), std::ptr::null_mut(), flags) }
+            }
         };
         if ret == 0 {
-            let (files, bytes) = count_dir_stats(staging, 0, caps, &mut 0)?;
+            let (files, bytes) = match pre_stats {
+                Some(stats) => stats,
+                None => count_dir_stats(staging, 0, caps, &mut 0)?,
+            };
             return Ok(Tally {
                 files,
                 bytes,
@@ -772,14 +796,20 @@ fn clone_tree(
     walk_copy(src, staging, caps, rules, recheck)
 }
 
-/// What a byte-copy of `src` would occupy: its files' allocated sizes in
-/// `block`-sized units. Fails with the cap as soon as the total passes
-/// `caps.max_bytes`, so a huge tree is not walked to the end.
-fn estimate_allocated(src: &Path, caps: CowCaps, block: Option<u64>) -> Result<u64, CopyStop> {
+/// What a byte-copy of `src` would occupy: `(allocated_bytes, file_count, logical_bytes)`.
+/// Fails with the cap as soon as `allocated_bytes` passes `caps.max_bytes`, and enforces
+/// `max_entries` and `max_depth` in the same single pass.
+fn estimate_allocated(
+    src: &Path,
+    caps: CowCaps,
+    block: Option<u64>,
+) -> Result<(u64, usize, u64), CopyStop> {
     let mut total = 0u64;
+    let mut files = 0usize;
+    let mut logical_bytes = 0u64;
     let mut entries = 0usize;
-    let mut stack = vec![src.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![(src.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
         let read =
             fs::read_dir(&dir).map_err(|e| format!("Cannot read '{}': {e}", dir.display()))?;
         for entry in read {
@@ -795,19 +825,36 @@ fn estimate_allocated(src: &Path, caps: CowCaps, block: Option<u64>) -> Result<u
             let meta = entry
                 .metadata()
                 .map_err(|e| format!("Cannot read '{}': {e}", entry.path().display()))?;
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else if meta.is_file() {
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                if depth + 1 > caps.max_depth {
+                    return Err(CopyStop::from(format!(
+                        "'{}' is nested more than {} directories deep, so it was not copied",
+                        src.display(),
+                        caps.max_depth
+                    )));
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                files += 1;
+                logical_bytes = logical_bytes.saturating_add(meta.len());
                 total = total.saturating_add(allocated(&meta, block));
                 if total > caps.max_bytes {
                     return Err(CopyStop::CapHit {
                         cap: caps.max_bytes,
                     });
                 }
+            } else if kind.is_symlink() {
+                files += 1;
+            } else {
+                return Err(CopyStop::from(format!(
+                    "'{}' is not a file, directory or link, so the tree was not copied",
+                    entry.path().display()
+                )));
             }
         }
     }
-    Ok(total)
+    Ok((total, files, logical_bytes))
 }
 
 /// One file cloned rather than copied, where this platform can.
@@ -815,11 +862,24 @@ fn try_clone_file(src: &Path, dst: &Path) -> bool {
     if byte_copy_forced() {
         return false;
     }
+    #[cfg(target_os = "macos")]
+    {
+        if let (Some(src_s), Some(dst_s)) = (src.to_str(), dst.to_str()) {
+            if let (Ok(src_c), Ok(dst_c)) = (CString::new(src_s), CString::new(dst_s)) {
+                // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings.
+                if unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) } == 0 {
+                    return true;
+                }
+                let _ = fs::remove_file(dst);
+            }
+        }
+        false
+    }
     #[cfg(target_os = "linux")]
     {
         try_linux_ficlone(src, dst).unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (src, dst);
         false
@@ -1079,16 +1139,13 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, CommandError> 
 }
 
 /// Points a cloned target directory's recorded build-script output at the
-/// clone. Cargo never reruns a registry crate's build script, so its
-/// `output` (`cargo:rustc-link-search=native=<out dir>`) and `root-output`
-/// keep naming the anchor's out directories — and the worktree silently
-/// links against the anchor's target until a `cargo clean` there.
-///
-/// Visits `<target>/<profile>/build/<script>/{output,root-output}`; replaces
-/// `from` (the anchor's target directory) with `to` wherever it is a whole
-/// path prefix. A file that cannot be read as UTF-8, or is oversized, fails
-/// the clone.
-fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), CommandError> {
+/// clone, prunes checkout-bound `<profile>/incremental` caches, and updates
+/// non-binary generated text under `<profile>/build/<script>/out/**` while
+/// preserving file timestamps so Cargo fingerprints stay fresh.
+fn rewrite_build_outputs(
+    staging: &Path,
+    replacements: &[(&str, &str)],
+) -> Result<(), CommandError> {
     let profiles =
         fs::read_dir(staging).map_err(|e| format!("Cannot read '{}': {e}", staging.display()))?;
     for (index, profile) in profiles.enumerate() {
@@ -1099,7 +1156,16 @@ fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), Com
             .into());
         }
         let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", staging.display()))?;
-        let build = profile.path().join("build");
+        let profile_path = profile.path();
+        let incremental = profile_path.join("incremental");
+        if incremental
+            .symlink_metadata()
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_dir_all(&incremental);
+        }
+        let build = profile_path.join("build");
         if !build.is_dir() {
             continue;
         }
@@ -1114,15 +1180,42 @@ fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), Com
                 .into());
             }
             let script = script.map_err(|e| format!("Cannot list '{}': {e}", build.display()))?;
+            let script_path = script.path();
             for name in ["output", "root-output"] {
-                rewrite_one_output(&script.path().join(name), from, to)?;
+                rewrite_one_output(&script_path.join(name), replacements)?;
+            }
+            let out_dir = script_path.join("out");
+            if out_dir
+                .symlink_metadata()
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false)
+            {
+                rewrite_out_tree_text_files(&out_dir, replacements)?;
             }
         }
     }
     Ok(())
 }
 
-fn rewrite_one_output(path: &Path, from: &str, to: &str) -> Result<(), CommandError> {
+fn preserve_file_times(path: &Path, meta: &fs::Metadata) {
+    let mut times = fs::FileTimes::new();
+    let mut any = false;
+    if let Ok(accessed) = meta.accessed() {
+        times = times.set_accessed(accessed);
+        any = true;
+    }
+    if let Ok(modified) = meta.modified() {
+        times = times.set_modified(modified);
+        any = true;
+    }
+    if any {
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+            let _ = file.set_times(times);
+        }
+    }
+}
+
+fn rewrite_one_output(path: &Path, replacements: &[(&str, &str)]) -> Result<(), CommandError> {
     let meta = match path.symlink_metadata() {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1145,17 +1238,105 @@ fn rewrite_one_output(path: &Path, from: &str, to: &str) -> Result<(), CommandEr
             path.display()
         )
     })?;
-    let rewritten = replace_path_prefix(&text, from, to);
+    let rewritten = replace_path_prefixes(&text, replacements);
     if rewritten != text {
         fs::write(path, rewritten)
             .map_err(|e| format!("Cannot rewrite '{}': {e}", path.display()))?;
+        preserve_file_times(path, &meta);
     }
     Ok(())
 }
 
-/// `text` with every occurrence of the path `from` that is a whole path or a
-/// path prefix (followed by a separator, a line end or the end) replaced by
-/// `to`. `/a/target2` is not inside `/a/target`.
+fn looks_like_binary_object(bytes: &[u8]) -> bool {
+    if bytes.contains(&0) {
+        return true;
+    }
+    if bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"!<arch>\n")
+        || bytes.starts_with(b"\0asm")
+    {
+        return true;
+    }
+    if bytes.len() >= 4 {
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if matches!(
+            magic,
+            0xFEED_FACE
+                | 0xCEFA_EDFE
+                | 0xFEED_FACF
+                | 0xCFFAEDFE
+                | 0xCAFE_BABE
+                | 0xBEBA_FECA
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rewrite_out_tree_text_files(
+    out_root: &Path,
+    replacements: &[(&str, &str)],
+) -> Result<(), CommandError> {
+    const MAX_OUT_ENTRIES: usize = 8_192;
+    const MAX_OUT_DEPTH: usize = 16;
+
+    let mut entries = 0usize;
+    let mut stack = vec![(out_root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            entries += 1;
+            if entries > MAX_OUT_ENTRIES {
+                return Ok(());
+            }
+            let path = entry.path();
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                if depth + 1 <= MAX_OUT_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if kind.is_file() && meta.len() <= MAX_BUILD_OUTPUT {
+                let Ok(bytes) = fs::read(&path) else {
+                    continue;
+                };
+                if looks_like_binary_object(&bytes) {
+                    continue;
+                }
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                let rewritten = replace_path_prefixes(&text, replacements);
+                if rewritten != text {
+                    fs::write(&path, rewritten)
+                        .map_err(|e| format!("Cannot rewrite '{}': {e}", path.display()))?;
+                    preserve_file_times(&path, &meta);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_path_prefixes(text: &str, replacements: &[(&str, &str)]) -> String {
+    let mut current = text.to_string();
+    for (from, to) in replacements {
+        if !from.is_empty() && from != to && current.contains(from) {
+            current = replace_path_prefix(&current, from, to);
+        }
+    }
+    current
+}
+
+/// `text` with every occurrence of the path `from` that ends at a path-component
+/// boundary replaced by `to`. `/a/target2` and `/w/lane-10` are not inside
+/// `/a/target` or `/w/lane-1`, whereas `/a/target/debug`, `"/a/target"`, and
+/// `DIR=/a/target:more` are rewritten.
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
     if from.is_empty() {
         return text.to_string();
@@ -1164,13 +1345,122 @@ fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
     let mut rest = text;
     while let Some(at) = rest.find(from) {
         let after = &rest[at + from.len()..];
-        let whole = after.is_empty() || after.starts_with(['/', '\\', '\n', '\r']);
+        let continues_component = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
         out.push_str(&rest[..at]);
-        out.push_str(if whole { to } else { from });
+        out.push_str(if continues_component { from } else { to });
         rest = after;
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(target_os = "macos")]
+fn mark_macos_backup_excluded(path: &Path) {
+    const XATTR_NAME: &[u8] = b"com.apple.metadata:com_apple_backup_excludeItem\0";
+    const BACKUP_PLIST: &[u8; 61] = b"bplist00\x5f\x10\x11com.apple.backupd\x08\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1c";
+    if let Some(s) = path.to_str() {
+        if let Ok(c_path) = CString::new(s) {
+            // SAFETY: `c_path`, `XATTR_NAME`, and `BACKUP_PLIST` are valid in-bounds buffers.
+            unsafe {
+                let _ = libc::setxattr(
+                    c_path.as_ptr(),
+                    XATTR_NAME.as_ptr().cast(),
+                    BACKUP_PLIST.as_ptr().cast(),
+                    BACKUP_PLIST.len(),
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_macos_backup_excluded(_path: &Path) {}
+
+/// Discovers nested Cargo `target/` (adjacent to a `Cargo.toml`) and nested
+/// `node_modules/` (adjacent to a `package.json`) up to depth 3 under `anchor`
+/// whose parent directory already exists in `worktree`.
+fn discover_nested_cache_dirs(anchor: &Path, worktree: &Path) -> Vec<(String, bool)> {
+    const MAX_NESTED_SCAN_DEPTH: usize = 3;
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        ".turbo",
+        "vendored",
+        "vendor",
+        ".claude",
+        ".gitpulse",
+        ".devcouncil",
+        ".devmap",
+        "dist",
+        "build",
+        ".next",
+        ".venv",
+        "venv",
+    ];
+
+    let mut found: Vec<(String, bool)> = Vec::new();
+    let mut stack: Vec<(PathBuf, String, usize)> = vec![(anchor.to_path_buf(), String::new(), 0)];
+
+    while let Some((dir, rel_prefix, depth)) = stack.pop() {
+        if depth >= 1 {
+            if dir.join("Cargo.toml").is_file() {
+                let rel_target = format!("{rel_prefix}/{CARGO_TARGET_DIR}");
+                if anchor.join(&rel_target).is_dir()
+                    && worktree.join(&rel_prefix).is_dir()
+                    && worktree.join(&rel_target).symlink_metadata().is_err()
+                {
+                    found.push((rel_target, true));
+                }
+            }
+            if dir.join("package.json").is_file() {
+                let rel_nm = format!("{rel_prefix}/node_modules");
+                if anchor.join(&rel_nm).is_dir()
+                    && worktree.join(&rel_prefix).is_dir()
+                    && worktree.join(&rel_nm).symlink_metadata().is_err()
+                {
+                    found.push((rel_nm, false));
+                }
+            }
+        }
+        if depth >= MAX_NESTED_SCAN_DEPTH {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<(String, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            children.push((name, entry.path()));
+        }
+        children.sort_by(|a, b| b.0.cmp(&a.0));
+        for (name, child_path) in children {
+            let next_rel = if rel_prefix.is_empty() {
+                name
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
+            stack.push((child_path, next_rel, depth + 1));
+        }
+    }
+    found
 }
 
 /// Whether the worktree's own ignore rules cover `dir_name/`. Exit 0 is
@@ -1243,12 +1533,23 @@ pub fn clone_ignored_caches(
     } else {
         &[]
     };
+    let mut candidates: Vec<(String, bool)> = STANDARD_CACHE_DIRS
+        .iter()
+        .chain(virtualenvs)
+        .map(|name| ((*name).to_string(), *name == CARGO_TARGET_DIR))
+        .collect();
+    for nested in discover_nested_cache_dirs(anchor, worktree) {
+        if !candidates.iter().any(|(existing, _)| existing == &nested.0) {
+            candidates.push(nested);
+        }
+    }
+
     let mut skipped: Vec<String> = Vec::new();
     let mut cause = LowDiskCause::BelowFloor;
     let mut free_seen: Option<u64> = None;
     let mut cap_seen: Option<u64> = None;
 
-    for dir_name in STANDARD_CACHE_DIRS.iter().chain(virtualenvs) {
+    for (dir_name, is_cargo_target) in &candidates {
         let anchor_dir = anchor.join(dir_name);
         let worktree_dir = worktree.join(dir_name);
         if !anchor_dir.is_dir() || worktree_dir.symlink_metadata().is_ok() {
@@ -1277,20 +1578,20 @@ pub fn clone_ignored_caches(
             Reading::Value(free) => {
                 free_seen = Some(free);
                 if free < LOW_DISK_FLOOR {
-                    skipped.push((*dir_name).to_string());
+                    skipped.push(dir_name.clone());
                     continue;
                 }
                 // What the copy may write is what the tree occupies on the
                 // destination volume; a clone-only copy (target/) writes none.
-                let planned = if *dir_name == CARGO_TARGET_DIR {
+                let planned = if *is_cargo_target {
                     0
                 } else {
                     match estimate_allocated(&anchor_dir, caps, dest_block(caps, worktree)) {
-                        Ok(planned) => planned,
+                        Ok((planned, _, _)) => planned,
                         Err(CopyStop::CapHit { .. }) => {
                             cause = LowDiskCause::ByteCap;
                             cap_seen = Some(caps.max_bytes);
-                            skipped.push((*dir_name).to_string());
+                            skipped.push(dir_name.clone());
                             continue;
                         }
                         Err(stop) => {
@@ -1308,7 +1609,7 @@ pub fn clone_ignored_caches(
                     } else {
                         LowDiskCause::BelowFloor
                     };
-                    skipped.push((*dir_name).to_string());
+                    skipped.push(dir_name.clone());
                     continue;
                 }
                 caps.max_bytes = held.bytes;
@@ -1323,8 +1624,8 @@ pub fn clone_ignored_caches(
             }
             reading
         };
-        let copied = if *dir_name == CARGO_TARGET_DIR {
-            clone_cargo_target(&anchor_dir, &worktree_dir, caps)
+        let copied = if *is_cargo_target {
+            clone_cargo_target(anchor, worktree, &anchor_dir, &worktree_dir, caps)
         } else {
             copy_dir_rechecked(
                 &anchor_dir,
@@ -1337,11 +1638,14 @@ pub fn clone_ignored_caches(
         drop(reservation);
         report.disk_unknown |= unknown_mid_copy.get();
         match copied {
-            Ok(res) => report.copied.push(res),
+            Ok(res) => {
+                mark_macos_backup_excluded(&worktree_dir);
+                report.copied.push(res);
+            }
             Err(CopyStop::BelowFloor { free }) => {
                 cause = LowDiskCause::BelowFloor;
                 free_seen = Some(free);
-                skipped.push((*dir_name).to_string());
+                skipped.push(dir_name.clone());
             }
             Err(CopyStop::CapHit { .. }) => {
                 // The cap, or the floor when the volume's headroom was the
@@ -1352,7 +1656,7 @@ pub fn clone_ignored_caches(
                     cause = LowDiskCause::ByteCap;
                     cap_seen = Some(caps.max_bytes);
                 }
-                skipped.push((*dir_name).to_string());
+                skipped.push(dir_name.clone());
             }
             Err(stop) => report
                 .failures
@@ -1376,15 +1680,19 @@ pub fn clone_ignored_caches(
 /// build locks, by clone only, with recorded build-script paths rewritten
 /// to the destination before the copy is renamed into place.
 fn clone_cargo_target(
+    anchor_root: &Path,
+    worktree_root: &Path,
     anchor_dir: &Path,
     worktree_dir: &Path,
     caps: CowCaps,
 ) -> Result<ReflinkResult, CopyStop> {
-    let from = utf8_path(anchor_dir, "Source")?;
-    let to = utf8_path(worktree_dir, "Destination")?;
+    let from_target = utf8_path(anchor_dir, "Source")?.trim_end_matches(['/', '\\']);
+    let to_target = utf8_path(worktree_dir, "Destination")?.trim_end_matches(['/', '\\']);
+    let from_root = utf8_path(anchor_root, "Source")?.trim_end_matches(['/', '\\']);
+    let to_root = utf8_path(worktree_root, "Destination")?.trim_end_matches(['/', '\\']);
     let is_link = anchor_dir
         .symlink_metadata()
-        .map_err(|e| format!("Cannot read '{from}': {e}"))?
+        .map_err(|e| format!("Cannot read '{from_target}': {e}"))?
         .file_type()
         .is_symlink();
     if is_link {
@@ -1395,7 +1703,9 @@ fn clone_cargo_target(
     }
     let _held = hold_cargo_build_locks(anchor_dir)
         .map_err(|reason| reason.wrap(|reason| format!("skipped: {reason}")))?;
-    let rewrite = |staging: &Path| rewrite_build_outputs(staging, from, to);
+    let mut pairs = vec![(from_target, to_target), (from_root, to_root)];
+    pairs.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+    let rewrite = |staging: &Path| rewrite_build_outputs(staging, &pairs);
     copy_dir_staged(
         anchor_dir,
         worktree_dir,
@@ -2707,6 +3017,146 @@ mod tests {
         );
         assert!(!dst.exists());
         assert!(staging_leftovers(parent.path()).is_empty());
+    }
+
+    #[test]
+    fn path_prefix_rewrite_handles_quotes_colons_and_lane_1_vs_lane_10_boundaries() {
+        let from = "/w/lane-1";
+        let to = "/w/lane-2";
+        let input = concat!(
+            "pub const OUT: &str = \"/w/lane-1/src-tauri/target/debug/build/pkg/out/gen.rs\";\n",
+            "pub const SIBLING: &str = \"/w/lane-10/src-tauri/target\";\n",
+            "pub const DASHED: &str = \"/w/lane-1-extra/target\";\n",
+            "pub const DOTTED: &str = \"/w/lane-1.bak/target\";\n",
+            "cargo:rustc-env=DIRS=/w/lane-1/a:/w/lane-10/b:/w/lane-1\n",
+        );
+        let expected = concat!(
+            "pub const OUT: &str = \"/w/lane-2/src-tauri/target/debug/build/pkg/out/gen.rs\";\n",
+            "pub const SIBLING: &str = \"/w/lane-10/src-tauri/target\";\n",
+            "pub const DASHED: &str = \"/w/lane-1-extra/target\";\n",
+            "pub const DOTTED: &str = \"/w/lane-1.bak/target\";\n",
+            "cargo:rustc-env=DIRS=/w/lane-2/a:/w/lane-10/b:/w/lane-2\n",
+        );
+        assert_eq!(replace_path_prefix(input, from, to), expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_cargo_targets_and_node_modules_clone_prune_incremental_rewrite_out_and_preserve_mtime() {
+        let (main, _parent, worktree) =
+            anchor_and_worktree(&["src-tauri/target", "rust/target", "frontend/node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        let wt = worktree.canonicalize().unwrap();
+
+        // Create matching tracked workspace subdirectories in both anchor and worktree.
+        for dir_base in [&anchor, &wt] {
+            fs::create_dir_all(dir_base.join("src-tauri")).unwrap();
+            fs::write(
+                dir_base.join("src-tauri/Cargo.toml"),
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            fs::create_dir_all(dir_base.join("rust")).unwrap();
+            fs::write(
+                dir_base.join("rust/Cargo.toml"),
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            fs::create_dir_all(dir_base.join("frontend")).unwrap();
+            fs::write(dir_base.join("frontend/package.json"), "{}\n").unwrap();
+        }
+
+        let tauri_target = anchor.join("src-tauri/target");
+        let build_pkg = tauri_target.join("debug/build/app-1234abcd");
+        fs::create_dir_all(build_pkg.join("out")).unwrap();
+        fs::create_dir_all(tauri_target.join("debug/incremental/app-sess")).unwrap();
+        fs::write(
+            tauri_target.join("debug/incremental/app-sess/dep-graph.bin"),
+            b"stale-inc",
+        )
+        .unwrap();
+
+        let output_file = build_pkg.join("output");
+        fs::write(
+            &output_file,
+            format!(
+                "cargo:rustc-link-search=native={}/out\ncargo:rerun-if-changed={}/src-tauri/tauri.conf.json\n",
+                build_pkg.display(),
+                anchor.display()
+            ),
+        )
+        .unwrap();
+        let gen_rs = build_pkg.join("out/generated.rs");
+        fs::write(
+            &gen_rs,
+            format!(
+                "pub const CONF: &str = \"{}/src-tauri/tauri.conf.json\";\npub const OUT: &str = \"{}/out\";\n",
+                anchor.display(),
+                build_pkg.display()
+            ),
+        )
+        .unwrap();
+
+        // Backdate `output` and `out/generated.rs` by 120 seconds so mtime preservation is observable.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        for p in [&output_file, &gen_rs] {
+            let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(past)).unwrap();
+        }
+        let expected_mtime = fs::metadata(&gen_rs).unwrap().modified().unwrap();
+
+        // Put a Mach-O 64-bit object inside `out/` containing the anchor path bytes; must NOT be corrupted.
+        let macho_obj = build_pkg.join("out/native.o");
+        let mut macho_bytes = vec![0xCF, 0xFA, 0xED, 0xFE, 0x00, 0x01];
+        macho_bytes.extend_from_slice(anchor.to_string_lossy().as_bytes());
+        fs::write(&macho_obj, &macho_bytes).unwrap();
+
+        // Populate `rust/target` and `frontend/node_modules` as well.
+        fs::create_dir_all(anchor.join("rust/target/debug/deps")).unwrap();
+        fs::write(anchor.join("rust/target/debug/deps/libeng.rlib"), b"rlib").unwrap();
+        fs::create_dir_all(anchor.join("frontend/node_modules/vite")).unwrap();
+        fs::write(anchor.join("frontend/node_modules/vite/index.js"), b"export default 1;\n")
+            .unwrap();
+
+        let report = clone_ignored_caches(&anchor, &wt, &selection(roomy)).unwrap();
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.copied.len(), 3, "{report:?}");
+
+        // 1. `<profile>/incremental` was pruned from cloned target.
+        assert!(!wt.join("src-tauri/target/debug/incremental").exists());
+        assert!(wt.join("rust/target/debug/deps/libeng.rlib").is_file());
+        assert!(wt.join("frontend/node_modules/vite/index.js").is_file());
+
+        // 2. Both `output` and `out/generated.rs` rewrote target + root prefixes cleanly.
+        let wt_build_pkg = wt.join("src-tauri/target/debug/build/app-1234abcd");
+        let rewritten_output = fs::read_to_string(wt_build_pkg.join("output")).unwrap();
+        assert!(!rewritten_output.contains(&*anchor.to_string_lossy()), "{rewritten_output}");
+        assert!(
+            rewritten_output.contains(&format!("{}/src-tauri/tauri.conf.json", wt.display())),
+            "{rewritten_output}"
+        );
+        let rewritten_gen = fs::read_to_string(wt_build_pkg.join("out/generated.rs")).unwrap();
+        assert!(!rewritten_gen.contains(&*anchor.to_string_lossy()), "{rewritten_gen}");
+        assert!(
+            rewritten_gen.contains(&format!("\"{}/out\"", wt_build_pkg.display())),
+            "{rewritten_gen}"
+        );
+
+        // 3. `mtime` on rewritten `out/generated.rs` was preserved rather than bumped to `now()`.
+        let actual_mtime = fs::metadata(wt_build_pkg.join("out/generated.rs"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let diff = actual_mtime
+            .duration_since(expected_mtime)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            diff < std::time::Duration::from_secs(2),
+            "mtime drifted by {diff:?}"
+        );
+
+        // 4. Mach-O object file inside `out/` was left byte-identical.
+        assert_eq!(fs::read(wt_build_pkg.join("out/native.o")).unwrap(), macho_bytes);
     }
 }
 

@@ -73,6 +73,8 @@ pub(crate) use self::budget::*;
 mod scope_locals;
 pub(crate) use self::scope_locals::*;
 
+mod cfg_copies;
+
 #[cfg(test)]
 mod tests;
 

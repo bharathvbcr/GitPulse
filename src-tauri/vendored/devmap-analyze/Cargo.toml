@@ -192,6 +192,10 @@ name = "cfg_variants_are_one_dead_row"
 required-features = ["parse"]
 
 [[test]]
+name = "cfg_copies_keep_their_own_calls"
+required-features = ["parse"]
+
+[[test]]
 name = "swift_attack_corpus"
 required-features = ["parse"]
 

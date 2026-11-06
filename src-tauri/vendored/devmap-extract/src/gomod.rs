@@ -407,6 +407,23 @@ struct Found {
     fatal: Option<ignore::Error>,
 }
 
+/// A file whose bytes change how *other* files resolve.
+///
+/// `tsconfig` `paths`, a `go.mod` replace, a `package.json` workspace, a
+/// Python or Swift or Gradle manifest: none of those show up as a symbol-name
+/// delta in the importers. Discovery and the incremental closure share this
+/// predicate so a config edit cannot be treated as a source edit.
+pub fn is_resolution_input_name(file_name: &str) -> bool {
+    file_name == "go.mod"
+        || file_name == "Cargo.toml"
+        || file_name == "package.json"
+        || file_name == "pyproject.toml"
+        || file_name == "setup.cfg"
+        || crate::swifttargets::is_swift_manifest_name(file_name)
+        || crate::gradle::is_gradle_settings(file_name)
+        || crate::tsconfig::is_ts_config_name(file_name)
+}
+
 /// One walked entry: a manifest is collected, read or refused; anything else
 /// is passed over.
 fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync::Mutex<Found>) {
@@ -418,22 +435,15 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return;
     };
+    if !is_resolution_input_name(file_name) {
+        return;
+    }
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
     let is_package_json = file_name == "package.json";
     let is_python_manifest = file_name == "pyproject.toml" || file_name == "setup.cfg";
     let is_swift_manifest = crate::swifttargets::is_swift_manifest_name(file_name);
     let is_gradle_settings = crate::gradle::is_gradle_settings(file_name);
-    if !is_go_mod
-        && !is_cargo_toml
-        && !is_package_json
-        && !is_python_manifest
-        && !is_swift_manifest
-        && !is_gradle_settings
-        && !crate::tsconfig::is_ts_config_name(file_name)
-    {
-        return;
-    }
     // A link is a candidate whatever it points at. `is_file()` follows it and
     // answered `false` for a dangling one, so a `go.mod` naming nothing was
     // passed over like a directory; `read_manifest` decides what any link is
@@ -900,6 +910,37 @@ pub fn git_worktree_root(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_inputs_are_the_manifests_discovery_reads() {
+        for name in [
+            "go.mod",
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "setup.cfg",
+            "project.yml",
+            "Package.swift",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "tsconfig.json",
+            "jsconfig.json",
+            "tsconfig.base.json",
+            "tsconfig.app.json",
+        ] {
+            assert!(is_resolution_input_name(name), "{name}");
+        }
+        for name in [
+            "main.ts",
+            "main.py",
+            "go.sum",
+            "Cargo.lock",
+            "tsconfig.json.bak",
+            "README.md",
+        ] {
+            assert!(!is_resolution_input_name(name), "{name}");
+        }
+    }
 
     /// A directory whose `.go` files the index holds only in part is reported;
     /// one it holds wholly is not; a directory named `x.go` is not a file; and

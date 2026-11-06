@@ -893,6 +893,10 @@ mod unresolved;
 mod index;
 
 mod resolve_all;
+pub use resolve_all::{
+    ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt, ReusedFileResolution,
+    RESOLUTION_REUSE_EPOCH,
+};
 
 mod candidates;
 

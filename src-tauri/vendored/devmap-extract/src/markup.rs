@@ -78,7 +78,8 @@
 use std::collections::HashSet;
 
 use crate::model::{
-    ExtractedReference, ExtractedSymbol, ReferenceKind, Span, SymbolKind, TextRange,
+    ExtractedCall, ExtractedReference, ExtractedSymbol, ReferenceKind, Span, SymbolKind, TextRange,
+    MAX_CALL_BLIND_SITES,
 };
 
 /// Most declarations one file may contribute here.
@@ -161,6 +162,13 @@ pub struct MarkupScan {
     /// Byte ranges located and *not read*, because a byte cap was reached.
     /// A caller that reports coverage must count these as unread.
     pub unread: Vec<TextRange>,
+    /// Call sites this reader recognized and did not bind. HTML event
+    /// handlers, inline script, and CSS declaration functions. `var(--x)` is
+    /// a selector reference, not one of these.
+    pub calls: Vec<ExtractedCall>,
+    /// Call sites past [`MAX_CALL_BLIND_SITES`] and therefore dropped.
+    /// Non-zero means [`Self::calls`] is a prefix.
+    pub truncated_calls: usize,
 }
 
 impl MarkupScan {
@@ -247,6 +255,36 @@ impl<'a> Collector<'a> {
             receiver_expr: None,
         });
     }
+
+    fn add_call(&mut self, callee: &str, span: Span) {
+        if !is_call_name(callee) {
+            return;
+        }
+        if self.scan.calls.len() >= MAX_CALL_BLIND_SITES {
+            self.scan.truncated_calls = self.scan.truncated_calls.saturating_add(1);
+            return;
+        }
+        self.scan.calls.push(ExtractedCall {
+            caller_symbol: Some(self.file_path.to_string()),
+            callee_name: callee.to_string(),
+            receiver_expr: None,
+            span,
+        });
+    }
+}
+
+fn is_call_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_digit() => return false,
+        Some(_) => {}
+        None => return false,
+    }
+    !name.is_empty()
+        && name.len() <= MAX_NAME_BYTES
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii())
 }
 
 /// Whether `name` is a selector-shaped name worth putting in the graph.
@@ -476,6 +514,7 @@ fn read_declaration(declaration: &str, base: usize, in_rule: bool, collector: &m
         // Still scanned for `var()` — a long declaration is ordinary (a
         // `grid-template-areas`, a `box-shadow` list) and its reads are real.
         read_var_uses(declaration, base, collector);
+        record_code_calls(declaration, base, collector, true);
         return;
     }
     let leading = declaration.len() - declaration.trim_start().len();
@@ -494,6 +533,99 @@ fn read_declaration(declaration: &str, base: usize, in_rule: bool, collector: &m
         }
     }
     read_var_uses(declaration, base, collector);
+    record_code_calls(declaration, base, collector, true);
+}
+
+/// Words that take `(` and are not calls.
+const CALL_KEYWORDS: &[&str] = &["function", "if", "for", "while", "switch", "catch", "with"];
+
+/// Record `name(` call sites in `text`.
+///
+/// `css` skips `var(` (already a selector reference) and `//` comments, which
+/// CSS does not have — a `url(//host/a)` value is a url, not a comment.
+/// Strings and block comments are skipped either way, so a name inside one
+/// is not a call. The scan stops at [`MAX_CALL_BLIND_SITES`] and counts the
+/// rest on [`MarkupScan::truncated_calls`].
+fn record_code_calls(text: &str, base: usize, collector: &mut Collector, css: bool) {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if !text.is_char_boundary(at) {
+            at += 1;
+            continue;
+        }
+        match bytes[at] {
+            quote @ (b'"' | b'\'' | b'`') => {
+                at = skip_string(bytes, at, quote);
+                continue;
+            }
+            b'/' if at + 1 < bytes.len() && bytes[at + 1] == b'*' => {
+                at += 2;
+                while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                    at += 1;
+                }
+                at = (at + 2).min(bytes.len());
+                continue;
+            }
+            b'/' if !css && at + 1 < bytes.len() && bytes[at + 1] == b'/' => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+                continue;
+            }
+            byte if is_ident_start(byte) => {
+                let start = at;
+                at += 1;
+                while at < bytes.len() && is_ident_continue(bytes[at]) {
+                    at += 1;
+                }
+                let name = &text[start..at];
+                let mut look = at;
+                while look < bytes.len() && bytes[look].is_ascii_whitespace() {
+                    look += 1;
+                }
+                if look < bytes.len() && bytes[look] == b'(' {
+                    let skip = CALL_KEYWORDS.contains(&name) || (css && name == "var");
+                    if !skip {
+                        collector.add_call(
+                            name,
+                            Span {
+                                start_byte: base + start,
+                                end_byte: base + look + 1,
+                            },
+                        );
+                    }
+                    at = look + 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$') || !byte.is_ascii()
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || !byte.is_ascii()
+}
+
+fn record_script_calls(source: &str, collector: &mut Collector) {
+    let regions = collector.scan.script_regions.clone();
+    for region in regions {
+        let start = region.start_byte;
+        let end = region.end_byte.min(source.len());
+        if start >= end || end > source.len() {
+            continue;
+        }
+        if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+            continue;
+        }
+        record_code_calls(&source[start..end], start, collector, false);
+    }
 }
 
 /// Every `var(--name)` in `text`, as a use of `--name`.
@@ -688,8 +820,19 @@ fn read_attribute(
                 collector.add_reference(&format!("#{token}"), value_span.clone());
             }
         }
+        other if is_event_handler(other) => {
+            record_code_calls(value, value_span.start_byte, collector, false);
+        }
         _ => {}
     }
+}
+
+/// An HTML event-handler content attribute: `onclick`, `onload`, `ononline`.
+fn is_event_handler(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("on") else {
+        return false;
+    };
+    rest.len() >= 3 && rest.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +845,7 @@ fn read_attribute(
 pub fn scan_markup_text(file_path: &str, source: &str) -> MarkupScan {
     let mut collector = Collector::new(file_path);
     read_markup_text(source, 0, &mut collector);
+    record_script_calls(source, &mut collector);
     collector.scan
 }
 
@@ -1100,6 +1244,7 @@ pub(crate) fn scan_template_tree(
             stack.push((child, depth + 1));
         }
     }
+    record_script_calls(source, &mut collector);
     collector.scan
 }
 

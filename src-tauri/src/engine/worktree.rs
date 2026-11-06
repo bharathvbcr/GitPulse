@@ -2115,6 +2115,14 @@ pub fn add_worktree(
     // `\\?\` path from a canonicalized checkout is not one git can create.
     let target_path = plain_path_text(target_path);
     let target_path = target_path.as_str();
+
+    #[cfg(target_os = "macos")]
+    if let Some(created_path) =
+        try_add_worktree_cow_macos(&repo, target_path, new_branch, start_point, detach)?
+    {
+        return Ok(created_path);
+    }
+
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if let Some(branch) = new_branch {
         args.push("-b");
@@ -2128,6 +2136,282 @@ pub fn add_worktree(
     }
     git_text(&repo, &args)?;
     Ok(target_path.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ls_files_stage0(raw: &[u8]) -> Vec<(String, String, String)> {
+    let mut entries = Vec::new();
+    for rec in raw.split(|&b| b == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let Ok(rec_str) = std::str::from_utf8(rec) else {
+            continue;
+        };
+        let Some((meta, rel_path)) = rec_str.split_once('\t') else {
+            continue;
+        };
+        let mut parts = meta.split_whitespace();
+        let (Some(mode), Some(oid), Some(stage)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if stage == "0" && !rel_path.is_empty() {
+            entries.push((mode.to_string(), oid.to_string(), rel_path.to_string()));
+        }
+    }
+    entries
+}
+
+#[cfg(target_os = "macos")]
+fn parse_porcelain_dirty_paths_z(raw: &[u8]) -> std::collections::HashSet<String> {
+    let mut dirty = std::collections::HashSet::new();
+    let fields: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
+    let mut i = 0usize;
+    while i < fields.len() {
+        let rec = fields[i];
+        if rec.len() < 4 {
+            i += 1;
+            continue;
+        }
+        let x = rec[0];
+        if let Ok(path) = std::str::from_utf8(&rec[3..]) {
+            dirty.insert(path.to_string());
+        }
+        if matches!(x, b'R' | b'C') && i + 1 < fields.len() {
+            if let Ok(orig) = std::str::from_utf8(fields[i + 1]) {
+                if !orig.is_empty() {
+                    dirty.insert(orig.to_string());
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    dirty
+}
+
+#[cfg(target_os = "macos")]
+fn try_apfs_clone_regular_file(src: &Path, dst: &Path) -> bool {
+    let (Some(src_s), Some(dst_s)) = (src.to_str(), dst.to_str()) else {
+        return false;
+    };
+    let (Ok(src_c), Ok(dst_c)) = (std::ffi::CString::new(src_s), std::ffi::CString::new(dst_s))
+    else {
+        return false;
+    };
+    // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings.
+    if unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) } == 0 {
+        true
+    } else {
+        let _ = std::fs::remove_file(dst);
+        false
+    }
+}
+
+/// Zero-copy APFS tracked source materialization (`F15` / `P3.2`):
+/// creates the linked worktree with `--no-checkout`, `clonefile(2)`s clean tracked
+/// regular files whose `(mode, blob_oid)` matches `HEAD`, materializes only dirty,
+/// diverged, or symlink entries via `git checkout-index`, refreshes the index stat
+/// cache, and verifies zero working-tree drift via `git diff-files`.
+#[cfg(target_os = "macos")]
+fn try_add_worktree_cow_macos(
+    repo: &Path,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+) -> Result<Option<String>, CommandError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !repo.join(".git").exists() || (new_branch.is_none() && !detach) {
+        return Ok(None);
+    }
+    let target = Path::new(target_path);
+    if target.symlink_metadata().is_ok() {
+        return Ok(None);
+    }
+    let Some(mut ancestor) = target.parent() else {
+        return Ok(None);
+    };
+    while !ancestor.exists() {
+        let Some(p) = ancestor.parent() else {
+            return Ok(None);
+        };
+        ancestor = p;
+    }
+    let (Ok(repo_meta), Ok(anc_meta)) = (std::fs::metadata(repo), std::fs::metadata(ancestor))
+    else {
+        return Ok(None);
+    };
+    if repo_meta.dev() != anc_meta.dev() {
+        return Ok(None);
+    }
+
+    let Ok(ls_donor) = crate::engine::git_cli::git_captured(repo, &["ls-files", "-s", "-z"]) else {
+        return Ok(None);
+    };
+    if ls_donor.status_code != 0 {
+        return Ok(None);
+    }
+    let donor_entries = parse_ls_files_stage0(&ls_donor.stdout);
+    if donor_entries.is_empty() {
+        return Ok(None);
+    }
+
+    for (_, _, rel) in &donor_entries {
+        if rel == ".gitmodules" || rel.ends_with("/.gitmodules") {
+            return Ok(None);
+        }
+        if rel == ".gitattributes" || rel.ends_with("/.gitattributes") {
+            if let Ok(attr_text) = std::fs::read_to_string(repo.join(rel)) {
+                if attr_text.contains("filter=")
+                    || attr_text.contains("working-tree-encoding")
+                    || attr_text.contains("eol=")
+                    || attr_text.contains("ident")
+                {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    let Ok(status_donor) = crate::engine::git_cli::git_captured(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+    ) else {
+        return Ok(None);
+    };
+    if status_donor.status_code != 0 {
+        return Ok(None);
+    }
+    let dirty_paths = parse_porcelain_dirty_paths_z(&status_donor.stdout);
+
+    let mut donor_clean: HashMap<String, (String, String)> =
+        HashMap::with_capacity(donor_entries.len());
+    let mut probe_src: Option<PathBuf> = None;
+    for (mode, oid, rel) in donor_entries {
+        if dirty_paths.contains(&rel) || !matches!(mode.as_str(), "100644" | "100755") {
+            continue;
+        }
+        if probe_src.is_none() {
+            let cand = repo.join(&rel);
+            if cand.is_file() {
+                probe_src = Some(cand);
+            }
+        }
+        donor_clean.insert(rel, (mode, oid));
+    }
+    let Some(probe_file) = probe_src else {
+        return Ok(None);
+    };
+
+    // Probe APFS `clonefile(2)` once in `ancestor` before running any git write.
+    let probe_dst = ancestor.join(format!(".gp-cow-probe-{}-{}", std::process::id(), donor_clean.len()));
+    if !try_apfs_clone_regular_file(&probe_file, &probe_dst) {
+        return Ok(None);
+    }
+    let _ = std::fs::remove_file(&probe_dst);
+
+    let mut no_checkout_args: Vec<&str> = vec!["worktree", "add", "--no-checkout"];
+    if let Some(branch) = new_branch {
+        no_checkout_args.push("-b");
+        no_checkout_args.push(branch);
+    } else if detach {
+        no_checkout_args.push("--detach");
+    }
+    no_checkout_args.push(target_path);
+    if let Some(start) = start_point {
+        no_checkout_args.push(start);
+    }
+    git_text(repo, &no_checkout_args)?;
+
+    let materialize = (|| -> Result<(), CommandError> {
+        git_text(target, &["read-tree", "HEAD"])?;
+        let ls_target = crate::engine::git_cli::git_captured(target, &["ls-files", "-s", "-z"])?;
+        if ls_target.status_code != 0 {
+            return Err("git ls-files failed in new worktree".to_string().into());
+        }
+        let target_entries = parse_ls_files_stage0(&ls_target.stdout);
+
+        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        created_dirs.insert(target.to_path_buf());
+        let mut need_checkout: Vec<String> = Vec::new();
+
+        for (mode, oid, rel) in target_entries {
+            let can_clone = matches!(mode.as_str(), "100644" | "100755")
+                && donor_clean
+                    .get(&rel)
+                    .is_some_and(|(d_mode, d_oid)| d_mode == &mode && d_oid == &oid);
+            if !can_clone {
+                need_checkout.push(rel);
+                continue;
+            }
+            let dst = target.join(&rel);
+            if let Some(parent) = dst.parent() {
+                if !created_dirs.contains(parent) {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CommandError::from(format!("Cannot create '{}': {e}", parent.display()))
+                    })?;
+                    created_dirs.insert(parent.to_path_buf());
+                }
+            }
+            let src = repo.join(&rel);
+            if !try_apfs_clone_regular_file(&src, &dst) {
+                need_checkout.push(rel);
+            }
+        }
+
+        if need_checkout.len() > 512 {
+            git_text(target, &["checkout", "-f", "-q", "HEAD"])?;
+            return Ok(());
+        }
+        for chunk in need_checkout.chunks(128) {
+            let mut args = Vec::with_capacity(4 + chunk.len());
+            args.extend_from_slice(&["checkout-index", "-f", "-q", "--"]);
+            for rel in chunk {
+                args.push(rel.as_str());
+            }
+            git_text(target, &args)?;
+        }
+
+        let _ = crate::engine::git_cli::git_captured(target, &["update-index", "-q", "--refresh"]);
+        let drifted =
+            crate::engine::git_cli::git_captured(target, &["diff-files", "--name-only", "-z"])?;
+        if drifted.status_code == 0 && !drifted.stdout.is_empty() {
+            let mut heal_paths = Vec::new();
+            for raw in drifted.stdout.split(|&b| b == 0) {
+                if !raw.is_empty() {
+                    if let Ok(rel) = std::str::from_utf8(raw) {
+                        heal_paths.push(rel.to_string());
+                    }
+                }
+            }
+            if !heal_paths.is_empty() {
+                for chunk in heal_paths.chunks(128) {
+                    let mut args = Vec::with_capacity(4 + chunk.len());
+                    args.extend_from_slice(&["checkout-index", "-f", "-q", "--"]);
+                    for rel in chunk {
+                        args.push(rel.as_str());
+                    }
+                    git_text(target, &args)?;
+                }
+                let _ = crate::engine::git_cli::git_captured(
+                    target,
+                    &["update-index", "-q", "--refresh"],
+                );
+            }
+        }
+        Ok(())
+    })();
+
+    if materialize.is_err() {
+        // Self-heal in place via full checkout so a partial CoW materialization never fails worktree creation.
+        git_text(target, &["checkout", "-f", "-q", "HEAD"])?;
+    }
+
+    Ok(Some(target_path.to_string()))
 }
 
 /// A worktree that exists, and what of its optional setup did not happen.
@@ -2173,6 +2457,8 @@ pub enum DevmapMode {
     None,
     /// Copy (or CoW-clone) the anchor's store into the worktree.
     Copy,
+    /// Publish an immutable `0444` shared base snapshot + `stack_lease.json`.
+    Stacked,
     /// Point at the anchor's store (`base_store_ref.json`) instead of copying it.
     ZeroCopy,
 }
@@ -2269,7 +2555,7 @@ pub fn add_worktree_configured(
 ) -> Result<WorktreeCreated, CommandError> {
     // A sparse cone gets DevMap state either way: the pointer when asked for
     // it, otherwise a local CoW store (see `add_sparse_worktree_zero_copy`).
-    let zero_copy_devmap = devmap == DevmapMode::ZeroCopy;
+    let zero_copy_devmap = matches!(devmap, DevmapMode::ZeroCopy | DevmapMode::Stacked);
     let cleaned_sparse: Vec<String> = sparse_paths
         .unwrap_or(&[])
         .iter()
@@ -2394,6 +2680,9 @@ pub fn add_worktree_with_devmap(
         );
     let provision = || match devmap {
         DevmapMode::None => DevmapOutcome::NotRequested,
+        DevmapMode::Stacked => DevmapOutcome::from_provision(
+            crate::codeintel::provision_worktree_devmap_stacked(&anchor, target),
+        ),
         DevmapMode::ZeroCopy => DevmapOutcome::from_provision(
             crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target),
         ),
@@ -12440,5 +12729,109 @@ some-future-field whatever
         );
         assert!(wt2.join("releases/v1.0/notes.txt").is_file());
         assert!(!wt2.join("heavy_unwanted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_worktree_materializes_clean_head_preserves_modes_and_isolates_dirty_donor_edits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let main = sandbox.path().join("main");
+        std::fs::create_dir_all(main.join("src/nested")).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        git_in(&main, &["config", "user.name", "Test"]);
+        git_in(&main, &["config", "user.email", "test@example.com"]);
+        crate::test_support::trust_repo(&main);
+
+        std::fs::write(main.join("src/clean.rs"), "pub fn clean() -> u32 { 42 }\n").unwrap();
+        std::fs::write(
+            main.join("src/nested/dirty.rs"),
+            "pub fn committed() -> &'static str { \"head\" }\n",
+        )
+        .unwrap();
+        let script_path = main.join("run.sh");
+        std::fs::write(&script_path, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("src/clean.rs", main.join("clean-link.rs")).unwrap();
+
+        git_in(&main, &["add", "."]);
+        git_in(&main, &["commit", "-m", "initial"]);
+
+        // Dirty `src/nested/dirty.rs` and add an untracked file in `main`; neither may leak!
+        std::fs::write(
+            main.join("src/nested/dirty.rs"),
+            "pub fn uncommitted_leak() -> &'static str { \"LEAKED\" }\n",
+        )
+        .unwrap();
+        std::fs::write(main.join("untracked.secret"), "do-not-copy\n").unwrap();
+
+        let wt = sandbox.path().join("lane-cow");
+        let created = add_worktree(
+            main.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            Some("feat/cow-checkout"),
+            None,
+            false,
+        )
+        .expect("add_worktree");
+        assert_eq!(created, wt.to_str().unwrap());
+
+        let status = crate::engine::git_cli::git_captured(&wt, &["status", "--porcelain"])
+            .expect("git status in wt");
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).trim(),
+            "",
+            "worktree must have empty git status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/clean.rs")).unwrap(),
+            "pub fn clean() -> u32 { 42 }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/nested/dirty.rs")).unwrap(),
+            "pub fn committed() -> &'static str { \"head\" }\n",
+            "dirty donor working-tree file must NOT leak into new worktree"
+        );
+        assert!(!wt.join("untracked.secret").exists());
+        assert!(wt
+            .join("clean-link.rs")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let mode = std::fs::metadata(wt.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "executable bit must be preserved: {mode:o}");
+    }
+
+    #[test]
+    fn add_worktree_with_stacked_devmap_provisions_sealed_base_lease() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
+        let repo_dir = anchor_fixture.path().to_path_buf();
+        crate::test_support::trust_repo(&repo_dir);
+
+        let wt = sandbox.path().join("wt-stacked");
+        let created = add_worktree_with_devmap(
+            repo_dir.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            Some("feat/stacked"),
+            None,
+            false,
+            None,
+            false,
+            DevmapMode::Stacked,
+        )
+        .expect("add_worktree_with_devmap Stacked");
+
+        assert_eq!(
+            created.devmap,
+            DevmapOutcome::Provisioned { zero_copy: true }
+        );
+        let lease_path = devmap_query::paths::state_dir(&wt).join("codeintel/stack_lease.json");
+        assert!(lease_path.is_file(), "expected stack_lease.json at {lease_path:?}");
     }
 }

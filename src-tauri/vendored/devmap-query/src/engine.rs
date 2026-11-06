@@ -37,9 +37,9 @@ use self::dependencies::{
 };
 use self::gaps::{
     analysis_coverage_gap, analysis_status_gap, attribution_coverage_gap, empty_ask_gap,
-    empty_result_gap, empty_semantic_gap, file_edge_coverage_gap, qualify_response, query_file,
-    rank_symbol_rows, ranking_coverage_gap, search_coverage_gap, CallBlindStarts, RadiusSide,
-    MAX_CALL_BLIND_FILES_CHECKED,
+    empty_result_gap, empty_semantic_gap, failed_parse_note, file_edge_coverage_gap,
+    qualify_response, query_file, rank_symbol_rows, ranking_coverage_gap, search_coverage_gap,
+    CallBlindStarts, RadiusSide, MAX_CALL_BLIND_FILES_CHECKED,
 };
 pub(crate) use self::hits::search_hit_tokens;
 use self::hits::{
@@ -110,6 +110,36 @@ fn pin_verdict(read: Option<u32>, verdict: SourceFreshness) -> SourceFreshness {
             read.map_or_else(|| "none".to_string(), |g| g.to_string())
         )),
         (None, _) => verdict,
+    }
+}
+
+#[cfg(test)]
+mod pin_verdict_tests {
+    use super::pin_verdict;
+    use crate::model::SourceFreshness;
+
+    #[test]
+    fn a_matching_generation_keeps_a_verified_verdict() {
+        let verdict = SourceFreshness::verified(true, 7);
+        let pinned = pin_verdict(Some(7), verdict);
+        assert_eq!(pinned.fresh, Some(true));
+        assert_eq!(pinned.generation_id, Some(7));
+        assert!(pinned.reason.is_none());
+    }
+
+    #[test]
+    fn a_queue_verdict_is_not_rewritten_as_an_index_move() {
+        let verdict = SourceFreshness::unverified(
+            "1 changed path(s) are queued and not yet indexed; the last verified source freshness no longer describes the tree",
+        );
+        let pinned = pin_verdict(Some(7), verdict.clone());
+        assert_eq!(pinned, verdict);
+        let reason = pinned.reason.as_deref().expect("reason");
+        assert!(reason.contains("queued"), "{reason}");
+        assert!(!reason.contains("index moved"), "{reason}");
+        let json = serde_json::to_value(&pinned).expect("json");
+        let keys: Vec<_> = json.as_object().expect("object").keys().cloned().collect();
+        assert_eq!(keys, ["fresh", "reason"]);
     }
 }
 
@@ -667,6 +697,9 @@ impl<'a> StoreQueryEngine<'a> {
             // One answer, two halves: the bands are as incomplete as the edges.
             blast_radius.layers.walk_incomplete =
                 devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), added);
+            let failed = self.note_failed_parses(&mut edges)?;
+            blast_radius.layers.walk_incomplete =
+                devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), failed);
             Ok(LayeredImpact {
                 edges,
                 blast_radius,
@@ -1161,7 +1194,22 @@ impl<'a> StoreQueryEngine<'a> {
             token_budget,
             &mut response,
         )?;
+        // A failed caller file publishes no call, so the walk above cannot
+        // name it. The note is the lower bound. Forward `dependencies` does
+        // not attach it: a parse failure is not an outbound edge.
+        self.note_failed_parses(&mut response)?;
         Ok(response)
+    }
+
+    /// Say which files failed to parse, on an answer whose caller set is
+    /// otherwise a lower bound. The store lock is not held by the caller.
+    /// A failed read stays an error: an empty note would read as a clean walk.
+    fn note_failed_parses<T>(&self, response: &mut Response<T>) -> anyhow::Result<Option<String>> {
+        let (total, paths) = self.store.latest_parse_failures()?;
+        let note = failed_parse_note(total, &paths);
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), note.clone());
+        Ok(note)
     }
 
     /// Attach the ledger's unresolved sites that name `target` to an `impact`
@@ -2249,6 +2297,7 @@ impl<'a> StoreQueryEngine<'a> {
             response.hidden = response.total.saturating_sub(response.shown);
             response.truncated = response.hidden > 0;
             response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            self.note_failed_parses(&mut response)?;
             // The other half of the answer, and until now the half nothing could
             // see. A one-hop inbound-edge join structurally cannot report a
             // subsystem whose functions call each other, so a `dead` answer without

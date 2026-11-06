@@ -546,6 +546,10 @@ pub struct Store {
     /// refused by name ([`Store::refuse_if_read_only`]) instead of by SQLite
     /// error code.
     read_only: bool,
+    /// Worktree root override when this `Store` is an immutable shared base
+    /// snapshot (`?immutable=1`, `chmod 0444`) opened on behalf of a linked
+    /// worktree by `StackedStore`. `None` for every ordinary or seeded store.
+    repo_root_override: Option<String>,
     /// The latest generation's full edge set, kept for the life of that
     /// generation.
     ///
@@ -2177,7 +2181,7 @@ struct StoredPayload<'a> {
 /// Only the relation gate's test reads this list, so it exists only in test
 /// builds; a release build would otherwise warn that it is never used.
 #[cfg(test)]
-pub(crate) const OPTIONAL_RELATIONS: &[&str] = &["reader_compat"];
+pub(crate) const OPTIONAL_RELATIONS: &[&str] = &["reader_compat", "seed_rebind"];
 
 const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ("paths", &["id", "path"]),

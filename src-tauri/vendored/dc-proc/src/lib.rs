@@ -1894,6 +1894,51 @@ pub fn target_is_gone(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(unix)]
+fn group_is_gone(error: &std::io::Error) -> bool {
+    target_is_gone(error) || error.raw_os_error() == Some(libc::EPERM)
+}
+
+/// Terminate a process group with signal escalation:
+/// 1. Deliver SIGTERM to the process group.
+/// 2. Wait up to `grace` for group members to exit cleanly.
+/// 3. If members remain alive after `grace`, escalate to SIGKILL.
+#[cfg(unix)]
+pub fn terminate_group_with_escalation(leader: u32, grace: Duration) -> std::io::Result<()> {
+    match signal_group(leader, Signal::Terminate) {
+        Ok(()) => {}
+        Err(err) if group_is_gone(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    }
+
+    let deadline = Instant::now() + grace;
+    let step = Duration::from_millis(20);
+    while Instant::now() < deadline {
+        match signal_group(leader, Signal::Probe) {
+            Err(err) if group_is_gone(&err) => return Ok(()),
+            _ => thread::sleep(step),
+        }
+    }
+
+    match signal_group(leader, Signal::Kill) {
+        Ok(()) => Ok(()),
+        Err(err) if group_is_gone(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+
+/// Off unix there are no process groups to signal, so this reports that it
+/// did nothing rather than claiming the group was terminated.
+#[cfg(not(unix))]
+pub fn terminate_group_with_escalation(_leader: u32, _grace: Duration) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process groups are not available on this platform",
+    ))
+}
+
+
 /// The one `kill(2)` in the workspace. Every signal goes through here so the
 /// audited surface stays one call.
 #[cfg(unix)]
@@ -3082,4 +3127,22 @@ mod tests {
             ErrorKind::InvalidInput
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_with_escalation_cleanly_terminates_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("sh spawns");
+        let leader = child.id();
+        terminate_group_with_escalation(leader, Duration::from_millis(500))
+            .expect("escalation succeeds");
+        let _ = child.wait();
+        let probe = signal_group(leader, Signal::Probe);
+        assert!(probe.is_err());
+    }
 }
+

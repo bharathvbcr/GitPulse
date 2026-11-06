@@ -111,30 +111,44 @@ fn write_atomic_once(path: &Path, content: &[u8]) -> std::io::Result<bool> {
     if unchanged()? {
         return Ok(false);
     }
+    // A changed artifact is staged as a copy-on-write clone of the file it
+    // replaces with only the differing blocks rewritten, so the new file keeps
+    // sharing disk blocks with the old one (and with whatever the old one was
+    // cloned from). Where that is not possible it is written whole, as before.
     let mut created = None;
+    if let Some(name) = stage_by_patching(&parent, target, content) {
+        #[cfg(all(test, unix))]
+        CLONE_ROUTE_PUBLICATIONS.with(|count| count.set(count.get() + 1));
+        created = Some((name, None));
+    }
     for _ in 0..16 {
+        if created.is_some() {
+            break;
+        }
         let stamp = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut name = target.to_os_string();
         name.push(format!(".{}.{}.tmp", std::process::id(), stamp));
         match parent.open_file(&name, Access::ReadWrite, Creation::New) {
             Ok(file) => {
-                created = Some((name, file));
+                created = Some((name, Some(file)));
                 break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
-    let (temporary, mut file) = created.ok_or_else(|| {
+    let (temporary, plain_file) = created.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "all 16 artifact temporary names already exist",
         )
     })?;
     let result = (|| -> std::io::Result<bool> {
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
+        if let Some(mut file) = plain_file {
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+        }
         if unchanged()? {
             return Ok(false);
         }
@@ -174,6 +188,150 @@ fn write_atomic_once(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         }
     }
     result
+}
+
+/// Granularity of the comparison that decides which bytes are rewritten. Both
+/// APFS and the Linux reflink filesystems share data in 4 KiB units.
+pub const SHARE_BLOCK_BYTES: usize = 4096;
+
+/// A file smaller than this is written whole: cloning it saves nothing worth
+/// the extra open and read-back.
+const MIN_PATCHED_BYTES: u64 = 64 * 1024;
+
+/// Compared and written in strides of this many blocks, so a rewrite touching
+/// scattered blocks does not hold the whole file in memory twice.
+const PATCH_STRIDE_BLOCKS: usize = 256;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Publications on this thread that took the clone route, so a test can
+    /// tell "wrote the right bytes" from "wrote them the cheap way".
+    static CLONE_ROUTE_PUBLICATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Bytes the clone route wrote into clones on this thread; every other byte
+    /// of those files is shared with the file it was cloned from.
+    static CLONE_BYTES_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Stage `content` as a new temporary file that is a copy-on-write clone of the
+/// existing `target`, with only the 4 KiB blocks that differ rewritten.
+///
+/// Returns the temporary's name once it holds exactly `content`, has been
+/// flushed to disk, and has been read back and compared; the caller renames it
+/// over `target`. Returns `None` whenever this route does not apply — no
+/// existing file, a small one, a platform or filesystem without clones, any I/O
+/// error, or a read-back that disagrees — after removing anything it created,
+/// and the caller then writes the whole file as it always did. A route that
+/// could not run is therefore never reported as one that did.
+///
+/// Atomicity is unchanged. `target` is untouched until the caller's rename; a
+/// crash before it leaves the old artifact intact plus one `.tmp` clone that
+/// owns only the blocks it rewrote. After the rename the name points at a new
+/// inode whose unwritten blocks are shared with the old file's, which is the
+/// whole point: a linked worktree's export, cloned from the main checkout's,
+/// keeps sharing every block this build did not change.
+#[cfg(unix)]
+fn stage_by_patching(
+    parent: &devmap_extract::safe_fs::PinnedDir,
+    target: &std::ffi::OsStr,
+    content: &[u8],
+) -> Option<std::ffi::OsString> {
+    use devmap_extract::safe_fs::{Access, Creation};
+    use std::os::unix::fs::FileExt;
+
+    let existing = parent
+        .open_file(target, Access::Read, Creation::Never)
+        .ok()?;
+    existing.require_owned().ok()?;
+    let old_len = existing.metadata().ok()?.len();
+    if old_len < MIN_PATCHED_BYTES {
+        return None;
+    }
+    let mut name = None;
+    for _ in 0..16 {
+        let stamp = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut candidate = target.to_os_string();
+        candidate.push(format!(".{}.{}.tmp", std::process::id(), stamp));
+        match parent.clone_file_to_child(&existing, &candidate) {
+            Ok(()) => {
+                name = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    let name = name?;
+    let patched = (|| -> std::io::Result<bool> {
+        let clone = parent.open_file(&name, Access::ReadWrite, Creation::Never)?;
+        let stride = SHARE_BLOCK_BYTES * PATCH_STRIDE_BLOCKS;
+        let mut old = vec![0u8; stride];
+        let mut offset = 0usize;
+        while offset < content.len() {
+            let want = stride.min(content.len() - offset);
+            let have = (old_len as usize).saturating_sub(offset).min(want);
+            if have > 0 {
+                existing.read_exact_at(&mut old[..have], offset as u64)?;
+            }
+            let new = &content[offset..offset + want];
+            // Coalesce neighbouring differing blocks into one write.
+            let mut run: Option<usize> = None;
+            let mut block = 0usize;
+            while block < want {
+                let end = (block + SHARE_BLOCK_BYTES).min(want);
+                let same = end <= have && old[block..end] == new[block..end];
+                match (same, run) {
+                    (false, None) => run = Some(block),
+                    (true, Some(start)) => {
+                        clone.write_all_at(&new[start..block], (offset + start) as u64)?;
+                        #[cfg(all(test, unix))]
+                        CLONE_BYTES_WRITTEN.with(|n| n.set(n.get() + (block - start) as u64));
+                        run = None;
+                    }
+                    _ => {}
+                }
+                block = end;
+            }
+            if let Some(start) = run {
+                clone.write_all_at(&new[start..want], (offset + start) as u64)?;
+                #[cfg(all(test, unix))]
+                CLONE_BYTES_WRITTEN.with(|n| n.set(n.get() + (want - start) as u64));
+            }
+            offset += want;
+        }
+        clone.set_len(content.len() as u64)?;
+        clone.sync_all()?;
+        // Read back what the clone now holds. The comparison above trusted the
+        // old file's bytes; this one trusts nothing it did.
+        if clone.metadata()?.len() != content.len() as u64 {
+            return Ok(false);
+        }
+        let mut back = vec![0u8; stride];
+        let mut at = 0usize;
+        while at < content.len() {
+            let want = stride.min(content.len() - at);
+            clone.read_exact_at(&mut back[..want], at as u64)?;
+            if back[..want] != content[at..at + want] {
+                return Ok(false);
+            }
+            at += want;
+        }
+        Ok(true)
+    })();
+    if matches!(patched, Ok(true)) {
+        return Some(name);
+    }
+    let _ = parent.remove_child(&name);
+    None
+}
+
+/// No clone route off Unix: the caller writes the whole file.
+#[cfg(not(unix))]
+fn stage_by_patching(
+    _parent: &devmap_extract::safe_fs::PinnedDir,
+    _target: &std::ffi::OsStr,
+    _content: &[u8],
+) -> Option<std::ffi::OsString> {
+    None
 }
 
 // ---- consumer-artifact stamp -------------------------------------------------
@@ -733,5 +891,202 @@ mod concurrency_tests {
         ));
         fs::create_dir_all(&base).expect("temp dir");
         base
+    }
+}
+
+/// The clone-and-patch route of `write_atomic`: copy-on-write staging, bounded
+/// rewrites, and a torn write that leaves the old artifact whole.
+#[cfg(all(test, unix))]
+mod patch_tests {
+    use super::*;
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    use std::ffi::OsStr;
+
+    const BLOCKS: usize = 40;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-patch-{tag}-{}-{}",
+            std::process::id(),
+            WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Bytes that differ from block to block, so a mis-aligned write is seen.
+    fn pattern(blocks: usize) -> Vec<u8> {
+        (0..blocks * SHARE_BLOCK_BYTES)
+            .map(|i| ((i / 7) as u8) ^ ((i / SHARE_BLOCK_BYTES) as u8).wrapping_mul(31))
+            .collect()
+    }
+
+    /// Whether this filesystem can clone at all. Where it cannot, a test does
+    /// not pass vacuously: it takes [`no_clone_arm`], which proves the other
+    /// half of the contract, and says so.
+    fn clones_here(dir: &std::path::Path) -> bool {
+        let probe = dir.join("probe-source");
+        fs::write(&probe, pattern(2)).unwrap();
+        let parent = PinnedDir::open(dir, false).unwrap();
+        let source = parent
+            .open_file(OsStr::new("probe-source"), Access::Read, Creation::Never)
+            .unwrap();
+        let cloned = parent
+            .clone_file_to_child(&source, OsStr::new("probe-clone"))
+            .is_ok();
+        let _ = fs::remove_file(dir.join("probe-clone"));
+        let _ = fs::remove_file(&probe);
+        cloned
+    }
+
+    /// What a filesystem without reflinks must do instead: the clone route
+    /// declines, leaves nothing behind, and the artifact is published whole.
+    fn no_clone_arm(dir: &std::path::Path) {
+        eprintln!(
+            "{} has no copy-on-write clone: asserting the whole-file fallback instead",
+            dir.display()
+        );
+        let path = dir.join("graph.json");
+        let old = pattern(BLOCKS);
+        fs::write(&path, &old).unwrap();
+        let mut new = old.clone();
+        new[9 * SHARE_BLOCK_BYTES] ^= 0x55;
+        assert!(
+            stage(dir, &new).is_none(),
+            "no clone: the route must decline"
+        );
+        assert!(write_atomic(&path, &new).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), new);
+        let names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["graph.json".to_string()]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn stage(dir: &std::path::Path, content: &[u8]) -> Option<std::ffi::OsString> {
+        let parent = PinnedDir::open(dir, false).unwrap();
+        stage_by_patching(&parent, OsStr::new("graph.json"), content)
+    }
+
+    fn bytes_written() -> u64 {
+        CLONE_BYTES_WRITTEN.with(|n| n.get())
+    }
+
+    #[test]
+    fn only_the_blocks_that_differ_are_written_and_the_target_is_untouched() {
+        let dir = scratch("bounded");
+        if !clones_here(&dir) {
+            return no_clone_arm(&dir);
+        }
+        let old = pattern(BLOCKS);
+        fs::write(dir.join("graph.json"), &old).unwrap();
+        let mut new = old.clone();
+        new[5 * SHARE_BLOCK_BYTES + 17] ^= 0xff;
+        new[6 * SHARE_BLOCK_BYTES] ^= 0x01;
+        new[30 * SHARE_BLOCK_BYTES + 4095] ^= 0x80;
+        let written = bytes_written();
+        let staged = stage(&dir, &new).expect("a clone is available, so the route applies");
+        // Blocks 5, 6 and 30: one write for the adjacent pair, one for the other.
+        assert_eq!(bytes_written() - written, 3 * SHARE_BLOCK_BYTES as u64);
+        assert_eq!(fs::read(dir.join(&staged)).unwrap(), new);
+        // Not renamed yet: a crash here leaves the old artifact whole.
+        assert_eq!(fs::read(dir.join("graph.json")).unwrap(), old);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_shorter_and_a_longer_replacement_are_both_exact() {
+        let dir = scratch("resize");
+        if !clones_here(&dir) {
+            return no_clone_arm(&dir);
+        }
+        let old = pattern(BLOCKS);
+        fs::write(dir.join("graph.json"), &old).unwrap();
+        let shorter = old[..old.len() - 3 * SHARE_BLOCK_BYTES - 100].to_vec();
+        let staged = stage(&dir, &shorter).expect("route applies");
+        assert_eq!(fs::read(dir.join(&staged)).unwrap(), shorter);
+        let mut longer = old.clone();
+        longer.extend_from_slice(&pattern(3));
+        longer.extend_from_slice(b"tail");
+        let written = bytes_written();
+        let staged = stage(&dir, &longer).expect("route applies");
+        assert_eq!(fs::read(dir.join(&staged)).unwrap(), longer);
+        // Only the appended region was written; the shared prefix was not.
+        assert_eq!(
+            bytes_written() - written,
+            (longer.len() - old.len()) as u64,
+            "appending must not rewrite the shared prefix"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_publishes_the_new_bytes_through_the_clone_route() {
+        let dir = scratch("publish");
+        if !clones_here(&dir) {
+            return no_clone_arm(&dir);
+        }
+        let path = dir.join("graph.json");
+        let old = pattern(BLOCKS);
+        fs::write(&path, &old).unwrap();
+        let mut new = old.clone();
+        new[9 * SHARE_BLOCK_BYTES] ^= 0x55;
+        let before = CLONE_ROUTE_PUBLICATIONS.with(|count| count.get());
+        assert!(write_atomic(&path, &new).unwrap());
+        assert_eq!(
+            CLONE_ROUTE_PUBLICATIONS.with(|count| count.get()),
+            before + 1,
+            "the publication must have gone through the clone route"
+        );
+        assert_eq!(fs::read(&path).unwrap(), new);
+        assert!(
+            !write_atomic(&path, &new).unwrap(),
+            "unchanged writes nothing"
+        );
+        // No temporary survives a successful publication.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["graph.json".to_string()]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_small_or_missing_target_is_written_whole() {
+        let dir = scratch("whole");
+        // Missing.
+        assert!(stage(&dir, &pattern(BLOCKS)).is_none());
+        // Below the threshold.
+        fs::write(dir.join("graph.json"), b"tiny").unwrap();
+        assert!(stage(&dir, &pattern(BLOCKS)).is_none());
+        let path = dir.join("graph.json");
+        assert!(write_atomic(&path, &pattern(BLOCKS)).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), pattern(BLOCKS));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_target_is_refused_and_leaves_no_temporary() {
+        let dir = scratch("symlink");
+        let old = pattern(BLOCKS);
+        // A symlinked name is refused by the pinned open: the route reports "did
+        // not apply" and creates no temporary.
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("graph.json")).unwrap();
+        assert!(stage(&dir, &old).is_none());
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

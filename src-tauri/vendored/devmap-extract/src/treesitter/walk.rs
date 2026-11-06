@@ -87,6 +87,8 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
             truncated: 0,
             skipped_long_lines: 0,
             unread_bytes: 0,
+            calls: Vec::new(),
+            truncated_calls: 0,
         }
     };
     let recovered_count = scan.symbols.len();
@@ -216,6 +218,13 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
                             scan.unread_bytes
                         ));
                     }
+                    if scan.truncated_calls > 0 {
+                        caveats.push(format!(
+                            "{} call site(s) dropped at the scan cap, so the call list is a \
+                             prefix",
+                            scan.truncated_calls
+                        ));
+                    }
                     // The "X of Y" form is used only when Y is genuinely
                     // known — that is, when every declaration was counted and
                     // some were dropped afterwards. If a line was never
@@ -253,13 +262,31 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
         },
         symbols,
         imports: Vec::new(),
+        // A pattern reader can recognize `onclick="kept()"` or `url(...)`.
+        // That site belongs on the unresolved ledger. It does not belong in
+        // `calls`: this outcome is Fallback, and a Fallback file publishes no
+        // call edges — a consumer cannot tell one from a call a grammar saw.
+        // The reference is the record. `for_durable_store` keeps it when the
+        // language has no call extractor and `calls` is empty.
         calls: Vec::new(),
         exports: Vec::new(),
         // Empty for the line scanner, which recovers declarations only. The
         // markup and stylesheet readers behind this same tier do read uses — a
         // `class` attribute, a `var(--x)` — and dropping them here would index
-        // one half of a contract that only means anything as a pair.
-        references: scan.references,
+        // one half of a contract that only means anything as a pair. Call-shaped
+        // sites from those readers ride along as `ReferenceKind::Call`.
+        references: {
+            let mut references = scan.references;
+            references.extend(scan.calls.into_iter().map(|call| ExtractedReference {
+                name: call.callee_name,
+                kind: ReferenceKind::Call,
+                span: call.span,
+                enclosing_symbol: call.caller_symbol,
+                assigned_to: None,
+                receiver_expr: call.receiver_expr,
+            }));
+            references
+        },
         diagnostics,
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),

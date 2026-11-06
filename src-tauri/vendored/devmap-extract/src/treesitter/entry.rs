@@ -905,6 +905,14 @@ pub(super) fn extract_treesitter_before_deadline(
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
                 diagnostics.extend(semi_note);
+                if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
+                    let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
+                    calls.truncate(crate::model::MAX_CALL_BLIND_SITES);
+                    diagnostics.push(format!(
+                        "{}{dropped} HCL function call(s) were dropped, so the call list is a prefix",
+                        crate::model::CALLS_DROPPED_PREFIX
+                    ));
+                }
 
                 // Body signatures are stamped here, after every language arm
                 // has finished pushing symbols, rather than inside `walk_tree`.
@@ -1094,6 +1102,19 @@ pub(super) fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
+                // After every symbol, call, and local exists, and before
+                // literals are attributed to the qualified name that contains
+                // them. Rust only. A deadline here refuses the file: the split
+                // is pure CPU on the walk's clock, and a partial rename is not
+                // a complete read.
+                if lang == "rust" && !super::cfg_copies::split_rust_cfg_copies(&mut extraction) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("splitting cfg copies"),
+                    );
+                }
                 let (literals, mut notes) = crate::literals::index_literals(
                     root,
                     source,
@@ -1101,7 +1122,11 @@ pub(super) fn extract_treesitter_before_deadline(
                     &extraction.symbols,
                     deadline,
                 );
-                extraction.literals = literals;
+                // Absorb already shifted script literals into this list. The
+                // outer walk cannot decode Vue, Svelte or notebook text, so
+                // replacing the list would drop them again.
+                extraction.literals.extend(literals);
+                crate::literals::dedup_sort(&mut extraction.literals);
                 extraction.diagnostics.append(&mut notes);
                 extraction.diagnostics.extend(take_nesting_cap_notes());
                 extraction

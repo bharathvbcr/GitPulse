@@ -1824,6 +1824,18 @@ CREATE TABLE IF NOT EXISTS reader_compat (
 );
 "#;
 
+/// Where `rebind_staged` records a seeded worktree's `repo_root` override
+/// without rewriting `generations.analysis_json` overflow chains (`F6`, `F8`,
+/// Critique 3). Added without a `user_version` bump for the same reason as
+/// [`READER_COMPAT_TABLE`]: pre-existing schema-29 stores lack the table until
+/// rebound or opened by a writer, and absence means "not rebound".
+pub const SEED_REBIND_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS seed_rebind (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    seeded_repo_root TEXT NOT NULL CHECK (length(seeded_repo_root) > 0)
+);
+"#;
+
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
 /// refusal and the CLI's `status` report the same number for the same file
@@ -1876,6 +1888,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // Not a rung: no `user_version` bump. Every writer open creates it — the
     // fresh path and the ladder alike — so both still land on one schema.
     READER_COMPAT_TABLE,
+    SEED_REBIND_TABLE,
 ];
 
 /// The name in the body of a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ...`

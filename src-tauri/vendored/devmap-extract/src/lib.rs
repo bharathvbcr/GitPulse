@@ -126,8 +126,8 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
-    RustCrateManifest,
+    is_resolution_input_name, parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings,
+    ProjectManifests, RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
@@ -135,8 +135,10 @@ pub use languages::{
 };
 pub use model::*;
 pub use paths::{
-    code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
-    state_dir, store_path, workspace_path,
+    code_graph_path, compact_code_graph_path, content_cache_path, csr_path_for_store,
+    main_checkout_of, plugin_dir, registered_common_git_dir, registered_worktrees_of_common_dir,
+    repo_map_path, same_registered_repo, stack_delta_path, stack_lease_path, state_dir, store_path,
+    workspace_path,
 };
 pub use swifttargets::SwiftTarget;
 #[cfg(feature = "parse")]

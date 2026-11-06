@@ -193,16 +193,18 @@ pub(super) fn collect_rust_use_leaves(
 /// knowable here, while the syntax tree still exists. This is the call half of
 /// the fact [`rust_use_imports`] already resolves for `use`, and it reaches the
 /// same answer by the same rule: once the nesting absorbs the `super`, the
-/// target is this file's own module, spelled `self`.
+/// target is this file's own module, spelled `self::`.
 ///
 /// Leading `super` segments are spent against the inline-module depth, the
 /// same accounting [`rust_use_specifier`] uses. `super::helper()` inside
-/// `mod tests` becomes `self`. `super::Thing::build()` becomes `self::Thing`:
-/// one `super` paid for the inline module, and `Thing` is still this file's
-/// type. A `super` that outlasts the nesting is left in the receiver
-/// (`super::super::helper` at depth one stays `super::helper`) so the resolver
-/// can walk out of the file. Anything that is not a path of plain identifiers
-/// is returned unchanged.
+/// `mod tests` becomes `self::`. The trailing `::` is what keeps this module
+/// path off the value-self rung: a bare `self` is `self.helper()`, including
+/// inside a method nested in the same module. `super::Thing::build()` becomes
+/// `self::Thing`: one `super` paid for the inline module, and `Thing` is still
+/// this file's type. A `super` that outlasts the nesting is left in the
+/// receiver (`super::super::helper` at depth one stays `super::helper`) so the
+/// resolver can walk out of the file. Anything that is not a path of plain
+/// identifiers is returned unchanged.
 ///
 /// Depth beyond one is treated the same way because the extractor flattens
 /// inline modules: a `fn` inside `mod a { mod b { … } }` is extracted with the
@@ -234,7 +236,10 @@ pub(super) fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> 
         return Some(receiver);
     }
     if segments.is_empty() {
-        return Some("self".to_string());
+        // `self::`, not `self`. The bare word is the value (`self.helper()`).
+        // This path names the file's own module after the inline `super`s are
+        // spent, and a method in that module must not receive it as `self`.
+        return Some("self::".to_string());
     }
     if segments.first() == Some(&"super") {
         return Some(segments.join("::"));
