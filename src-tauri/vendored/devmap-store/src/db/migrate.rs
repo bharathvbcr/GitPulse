@@ -420,20 +420,19 @@ impl Store {
         }
     }
 
-    /// When a seeded store commits or restamps a generation, normalize any
-    /// retained donor `generations.repo_root` rows to `owner` and clear
-    /// `seed_rebind`.
-    pub(super) fn clear_seed_rebind_and_normalize_generations(
-        tx: &Connection,
-        owner: Option<&str>,
-    ) -> Result<()> {
-        if Self::seeded_repo_root_in(tx)?.is_some() {
-            if let Some(owner) = owner.filter(|s| !s.is_empty()) {
-                tx.execute(
-                    "UPDATE generations SET repo_root = ?1 WHERE repo_root IS NOT ?1",
-                    params![owner],
-                )?;
-            }
+    /// When a seeded store commits or restamps its own generation during an
+    /// explicit build, retire `seed_rebind` and normalize any inherited
+    /// `generations.repo_root` rows (`rebind_staged` itself never touches
+    /// `generations`, keeping provisioning CoW-zero-overflow).
+    pub(super) fn clear_seed_rebind(tx: &Connection, target_root: Option<&str>) -> Result<()> {
+        if let Some(seeded_root) = Self::seeded_repo_root_in(tx)? {
+            let root = target_root
+                .filter(|r| !r.is_empty())
+                .unwrap_or(seeded_root.as_str());
+            tx.execute(
+                "UPDATE generations SET repo_root = ?1 WHERE repo_root IS NOT ?1",
+                params![root],
+            )?;
             tx.execute("DELETE FROM seed_rebind", [])?;
         }
         Ok(())

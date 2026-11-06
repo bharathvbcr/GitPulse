@@ -1101,7 +1101,7 @@ fn load_zero_copy_base_ref_internal(repo: &Path) -> Result<Option<ZeroCopyBaseRe
     let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common {
+    if repo_common != anchor_common || !devmap_extract::paths::same_registered_repo(repo, &anchor_root) {
         return Err(CommandError::from(format!(
             "refusing zero-copy DevMap base ref {} pointing outside worktree family ({})",
             ref_path.display(),
@@ -1167,7 +1167,7 @@ fn open_verified_stack_lease_store(
     let anchor_root = validate_repo(&manifest.source_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common {
+    if repo_common != anchor_common || !devmap_extract::paths::same_registered_repo(repo, &anchor_root) {
         return Err(CommandError::from(format!(
             "refusing stack lease {} pointing outside worktree family ({})",
             lease_path.display(),
@@ -1557,6 +1557,109 @@ fn insert_cone_symbol_and_identifiers(
 ///    for declarative code files, its UTF-8 comment-stripped source contains
 ///    zero wildcard re-exports/imports and zero identifier tokens matching any
 ///    target, seed, blast-layer symbol, test symbol, or cone file stem.
+/// Verifies that every file divergence between `anchor_store`'s latest generation
+/// and `worktree` on disk is accounted for in `stacked` (`delta.sqlite`) with
+/// matching current blake3 content hashes and file tombstones.
+pub(super) fn is_stacked_delta_fully_synced(
+    worktree: &Path,
+    anchor_store: &Store,
+    stacked: &devmap_query::StackedStore,
+) -> bool {
+    let ov = stacked.overlay();
+    // Every recorded modified file in `delta.sqlite` must still match current disk bytes.
+    for (rel_path, expected_b3) in &ov.modified_files {
+        let Ok(Some(bytes)) = read_bounded_file(&worktree.join(rel_path), MAX_OVERLAY_FILE_BYTES)
+        else {
+            return false;
+        };
+        if devmap_query::blake3_hash(&bytes) != *expected_b3 {
+            return false;
+        }
+    }
+    for tombstoned in &ov.tombstoned_files {
+        if worktree.join(tombstoned).exists() {
+            return false;
+        }
+    }
+
+    if is_sparse_worktree(worktree) {
+        let Some(gen_head) = anchor_store.latest_generation_head_sha().ok().flatten() else {
+            return false;
+        };
+        if head_sha_of(worktree).as_deref() != Some(gen_head.as_str()) {
+            return false;
+        }
+        let Ok((deltas, truncated)) = collect_worktree_deltas(worktree, Some(&gen_head)) else {
+            return false;
+        };
+        if truncated || deltas.len() > MAX_OVERLAY_DIRTY_FILES {
+            return false;
+        }
+        for (rel_path, kind) in deltas {
+            match kind {
+                DeltaKind::Deleted => {
+                    if !ov.is_file_tombstoned(Path::new(&rel_path))
+                        || worktree.join(&rel_path).exists()
+                    {
+                        return false;
+                    }
+                }
+                DeltaKind::Modified => {
+                    let Ok(Some(bytes)) =
+                        read_bounded_file(&worktree.join(&rel_path), MAX_OVERLAY_FILE_BYTES)
+                    else {
+                        return false;
+                    };
+                    if ov.modified_files.get(Path::new(&rel_path))
+                        != Some(&devmap_query::blake3_hash(&bytes))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    let Ok(hashes) = anchor_store.latest_file_hashes() else {
+        return false;
+    };
+    let Ok(stored) = anchor_store.latest_discovery_inventory() else {
+        return false;
+    };
+    let Ok(scanned) = devmap_extract::scan_tree(worktree) else {
+        return false;
+    };
+    let Ok(manifests) = devmap_extract::collect_project_manifests(worktree) else {
+        return false;
+    };
+    let current = devmap_store::DiscoveryInventory::of(&scanned.report, &manifests);
+    if current.refusals != stored.refusals || current.over_limit != stored.over_limit {
+        return false;
+    }
+    let scanned_hashes: std::collections::HashMap<&str, u64> =
+        scanned.file_hashes().into_iter().collect();
+    for indexed_path in hashes.keys() {
+        if !scanned_hashes.contains_key(indexed_path.as_str())
+            && !ov.is_file_tombstoned(Path::new(indexed_path))
+        {
+            return false;
+        }
+    }
+    for (path, scan_hash) in scanned_hashes {
+        if hashes.get(path) != Some(&scan_hash) {
+            let Ok(Some(bytes)) = read_bounded_file(&worktree.join(path), MAX_OVERLAY_FILE_BYTES)
+            else {
+                return false;
+            };
+            if ov.modified_files.get(Path::new(path)) != Some(&devmap_query::blake3_hash(&bytes)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
     worktree: &Path,
     anchor: &Path,
@@ -2053,6 +2156,11 @@ pub fn load_worktree_overlay(repo_path: &str) -> Result<Option<WorktreeOverlay>,
         .split('/')
         .fold(state_dir, |acc, part| acc.join(part));
     if !overlay_path.is_file() {
+        if let Some(stacked) = devmap_query::StackedStore::open_if_leased(&repo)
+            .map_err(|e| CommandError::from(e.to_string()))?
+        {
+            return Ok(Some(stacked.overlay().clone()));
+        }
         return Ok(None);
     }
     let bytes = read_bounded_file(&overlay_path, 32 * 1024 * 1024)?.ok_or_else(|| {
@@ -3204,9 +3312,16 @@ mod tests {
             b"cached-resolution-artifact"
         );
 
-        // 2. Both `seed_rebind` (`F8`) and the latest `generations` row bind `wt`,
-        //    while stacked mode avoids rewriting `base.sqlite` entirely (`0 B`).
+        // 2. `seed_rebind` (`F8`, Critique 3) binds `wt` in <32 KiB so `Store::latest_repo_root`
+        //    resolves `wt` without rewriting `generations.analysis_json` overflow pages (`SC-001`).
         let wt_db = devmap_query::paths::store_path(&wt);
+        let canonical_wt = fs::canonicalize(&wt).unwrap();
+        let canonical_anchor = fs::canonicalize(anchor).unwrap();
+        let reopened = Store::open_read_only(&wt_db).unwrap();
+        let effective_root = reopened.latest_repo_root().unwrap().unwrap();
+        drop(reopened);
+        assert_eq!(fs::canonicalize(&effective_root).unwrap(), canonical_wt);
+
         let conn = Connection::open(&wt_db).unwrap();
         let raw_gen_root: String = conn
             .query_row(
@@ -3215,11 +3330,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let canonical_wt = fs::canonicalize(&wt).unwrap();
         assert_eq!(
             fs::canonicalize(&raw_gen_root).unwrap(),
-            canonical_wt,
-            "latest generation repo_root must bind the lane root"
+            canonical_anchor,
+            "provisioning must not rewrite generations overflow pages"
         );
         let rebound_root: String = conn
             .query_row(
@@ -3525,6 +3639,178 @@ mod tests {
         assert!(
             overlapping.fail_closed,
             "new caller referencing target cone identifier must fail closed: {overlapping:?}"
+        );
+    }
+
+    #[test]
+    fn forged_gitlink_worktree_is_refused_by_zero_copy_and_stack_lease_openers() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let legit_parent = tempfile::tempdir().unwrap();
+        let legit_wt = legit_parent.path().join("legit-lane");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/legit",
+                legit_wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&legit_wt);
+        provision_worktree_devmap_zero_copy(anchor, &legit_wt).expect("legit zero-copy");
+
+        // Create a forged checkout whose `.git` file points at `legit_wt`'s admin dir,
+        // so `git rev-parse --git-common-dir` matches `anchor/.git`, while the reverse
+        // `<common>/worktrees/legit-lane/gitdir` canonicalizes to `legit_wt/.git`, NOT `forged/.git`!
+        let forged_parent = tempfile::tempdir().unwrap();
+        let forged_wt = forged_parent.path().join("forged-lane");
+        fs::create_dir_all(&forged_wt).unwrap();
+        let legit_git_file = fs::read_to_string(legit_wt.join(".git")).unwrap();
+        fs::write(forged_wt.join(".git"), legit_git_file).unwrap();
+        crate::test_support::trust_repo(&forged_wt);
+
+        // Copy both `base_store_ref.json` and `stack_lease.json` into `forged_wt`.
+        let legit_ci = devmap_query::paths::state_dir(&legit_wt).join("codeintel");
+        let forged_ci = forged_wt.join(".devcouncil/codeintel");
+        fs::create_dir_all(&forged_ci).unwrap();
+        for name in ["base_store_ref.json", "stack_lease.json"] {
+            let src = legit_ci.join(name);
+            if src.is_file() {
+                fs::copy(&src, forged_ci.join(name)).unwrap();
+            }
+        }
+
+        let forged_str = forged_wt.to_str().unwrap();
+        let ref_err =
+            load_zero_copy_base_ref(forged_str).expect_err("forged gitlink must be refused");
+        assert!(
+            ref_err.message().contains("outside worktree family"),
+            "unexpected error: {ref_err:?}"
+        );
+
+        // Remove `base_store_ref.json` so `open_verified_stack_lease_store` is tested directly too.
+        let _ = fs::remove_file(forged_ci.join("base_store_ref.json"));
+        let st = crate::codeintel::status(forged_str);
+        assert!(
+            !st.available,
+            "forged gitlink with stack_lease.json must fail closed: {st:?}"
+        );
+    }
+
+    #[test]
+    fn stacked_delta_sqlite_serves_search_impact_and_affected_tests_and_fails_closed_when_unsynced()
+    {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-stacked-delta");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/stacked-delta",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        devmap_query::provision_stacked_worktree(anchor, &wt).expect("provision stacked");
+
+        // Add a new test file in the worktree calling `probe_callee` and record its
+        // Tree-sitter-shaped Extraction in `delta.sqlite` via `StackedStore`.
+        let extra_test_src =
+            "#[test]\nfn delta_added_test_for_callee() { crate::callee::probe_callee(); }\n";
+        fs::write(wt.join("tests/extra_test.rs"), extra_test_src).unwrap();
+
+        let (mut ext, _) = extract_fallback_ast("tests/extra_test.rs", extra_test_src);
+        ext.engine = devmap_extract::ExtractionEngine::TreeSitter {
+            grammar: "rust".to_string(),
+            grammar_version: 14,
+        };
+        ext.parse_outcome = devmap_extract::ParseOutcome::Clean;
+        ext.calls.push(devmap_extract::ExtractedCall {
+            caller_symbol: Some("tests/extra_test.rs::delta_added_test_for_callee".to_string()),
+            callee_name: "probe_callee".to_string(),
+            receiver_expr: None,
+            span: devmap_extract::Span {
+                start_byte: 0,
+                end_byte: extra_test_src.len(),
+            },
+        });
+        let mut stacked = devmap_query::StackedStore::open(&wt).expect("open stacked");
+        stacked
+            .record_extracted_file("tests/extra_test.rs", extra_test_src.as_bytes(), &ext)
+            .expect("record delta extraction");
+        drop(stacked);
+
+        let wt_str = wt.to_str().unwrap();
+
+        // 1. `search` finds the `delta.sqlite` symbol with its live worktree source span!
+        let hits = crate::codeintel::search(wt_str, "delta_added_test_for_callee", None);
+        assert!(hits.available, "{hits:?}");
+        assert!(
+            hits.items.iter().any(|h| {
+                h.file_path == "tests/extra_test.rs"
+                    && h.symbol_name == "delta_added_test_for_callee"
+                    && h.source_span.contains("probe_callee")
+            }),
+            "search must return delta.sqlite symbol with intact source span: {hits:?}"
+        );
+
+        // 2. `impact` on `probe_callee` surfaces the caller edge from `delta.sqlite`!
+        let imp = crate::codeintel::impact(wt_str, "probe_callee", None);
+        assert!(imp.available, "{imp:?}");
+        assert!(
+            imp.items
+                .iter()
+                .any(|e| e.source_file == "tests/extra_test.rs"),
+            "impact must include caller edge from delta.sqlite: {imp:?}"
+        );
+
+        // 3. `affected_tests` stays open (`fail_closed == false`) when `delta.sqlite`
+        //    accounts for every worktree edit, returning BOTH base and delta test files!
+        let aff = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        assert!(
+            !aff.fail_closed,
+            "synced delta.sqlite must answer affected_tests without fail_closed: {aff:?}"
+        );
+        assert!(aff
+            .tests
+            .items
+            .iter()
+            .any(|t| t.path == "tests/caller_test.rs"));
+        assert!(aff
+            .tests
+            .items
+            .iter()
+            .any(|t| t.path == "tests/extra_test.rs"));
+
+        // 4. Writing an UNSYNCED caller to disk without syncing `delta.sqlite` MUST
+        //    immediately flip `affected_tests` back to `fail_closed == true`!
+        fs::write(
+            wt.join("src/unsynced_caller.rs"),
+            "pub fn unsynced() { crate::callee::probe_callee(); }\n",
+        )
+        .unwrap();
+        let unsynced_aff = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        assert!(
+            unsynced_aff.fail_closed,
+            "unsynced disk caller beyond delta.sqlite must fail closed: {unsynced_aff:?}"
         );
     }
 }

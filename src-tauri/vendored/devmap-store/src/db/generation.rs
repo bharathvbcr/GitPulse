@@ -503,7 +503,12 @@ impl Store {
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
         let changed = tx.execute(
-            "UPDATE generations SET head_sha = ?1
+            "UPDATE generations
+             SET head_sha = ?1,
+                 repo_root = COALESCE(
+                     (SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1),
+                     repo_root
+                 )
              WHERE id = (SELECT max(id) FROM generations)",
             params![head_sha],
         )?;
@@ -512,7 +517,7 @@ impl Store {
                 "no generation to restamp: nothing has been indexed yet — run `devmap build`",
             ));
         }
-        let owner: Option<String> = tx
+        let pending_root: Option<String> = tx
             .query_row(
                 "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
                 [],
@@ -520,7 +525,7 @@ impl Store {
             )
             .optional()?
             .flatten();
-        Self::clear_seed_rebind_and_normalize_generations(&tx, owner.as_deref())?;
+        Self::clear_seed_rebind(&tx, pending_root.as_deref())?;
         tx.commit()?;
         Ok(())
     }

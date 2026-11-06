@@ -309,15 +309,15 @@ pub(super) fn indexed_traversal_starts(
 /// list the candidates. Shared so the store-backed and in-memory engines, and
 /// every verb, cannot disagree about when a name is ambiguous.
 pub(super) fn refuse_ambiguous(target: &str, starts: &[(String, String)]) -> anyhow::Result<()> {
-    let unique: BTreeSet<&(String, String)> = starts.iter().collect();
-    if unique.len() > 1 {
-        let candidates: Vec<String> = unique
-            .into_iter()
-            .map(|(symbol, file)| node_id_of(file, symbol))
-            .collect();
+    let candidates: BTreeSet<String> = starts
+        .iter()
+        .map(|(symbol, file)| node_id_of(file, symbol))
+        .collect();
+    if candidates.len() > 1 {
+        let list: Vec<String> = candidates.into_iter().collect();
         anyhow::bail!(
             "ambiguous symbol '{target}'; use an exact ID or file::symbol; candidates: {}",
-            candidates.join(", ")
+            list.join(", ")
         );
     }
     Ok(())

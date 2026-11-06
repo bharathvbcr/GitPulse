@@ -1025,12 +1025,26 @@ mod tests {
         );
         assert_eq!(status.generation_id, Some(1), "{status:?}");
 
-        // Bound to the lane, not the checkout it was cloned from: a store that
-        // still names a live sibling is one DevMap refuses to open.
+        // Bound to the lane via zero-overflow `seed_rebind` (<32 KiB write), not by
+        // rewriting `generations.analysis_json` overflow pages (`F6`, `F8`, `SC-001`).
+        let lane_canon = lane.canonicalize().unwrap();
+        let donor_canon = anchor_dir.path().canonicalize().unwrap();
+        let reopened = devmap_store::Store::open_read_only(&db).unwrap();
+        let effective_root = reopened.latest_repo_root().unwrap().unwrap();
+        drop(reopened);
+        assert_eq!(Path::new(&effective_root).canonicalize().unwrap(), lane_canon);
+
         let conn =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
-        let bound: String = conn
+        let seeded_bound: String = conn
+            .query_row(
+                "SELECT seeded_repo_root FROM seed_rebind WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_gen_root: String = conn
             .query_row(
                 "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
                 [],
@@ -1038,9 +1052,11 @@ mod tests {
             )
             .unwrap();
         drop(conn);
+        assert_eq!(Path::new(&seeded_bound).canonicalize().unwrap(), lane_canon);
         assert_eq!(
-            Path::new(&bound).canonicalize().unwrap(),
-            lane.canonicalize().unwrap()
+            Path::new(&raw_gen_root).canonicalize().unwrap(),
+            donor_canon,
+            "provisioning must not rewrite generations overflow pages"
         );
 
         // Its own inode — two worktrees writing one SQLite file corrupts it.

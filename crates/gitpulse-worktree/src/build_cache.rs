@@ -1559,7 +1559,8 @@ fn compute_stage1_direct_key(
         material.extend_from_slice(line.as_bytes());
     }
 
-    let pure_proc_macros = has_only_pure_ast_proc_macros(inv);
+    let pure_proc_macros = has_only_pure_ast_proc_macros(inv)
+        && is_stage1_manifest_dir_safe(&inv.input_rs, cargo_manifest_dir);
 
     // Hash Cargo package/cfg/feature/rustflags environment variables deterministically.
     let mut env_pairs: Vec<(String, String)> = std::env::vars()
@@ -2210,6 +2211,90 @@ fn is_crate_manifest_dir_safe(input_rs: &Path, dep_files: &[String], cwd: &Path)
         return false;
     }
     for rs_path in rs_paths {
+        let Ok(src) = fs::read_to_string(&rs_path) else {
+            return false;
+        };
+        let Ok(tokens) = lex_rust_simple_tokens(&src) else {
+            return false;
+        };
+        if !check_tokens_manifest_dir_safe(&tokens) {
+            return false;
+        }
+    }
+    true
+}
+
+const MAX_STAGE1_SOURCE_SCAN_FILES: usize = 512;
+const MAX_STAGE1_SOURCE_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bounded pre-compile lexical check for Stage 1 before `.d` dep-info exists.
+/// Scans `input_rs` plus `.rs` files in its module tree (`input_rs.parent()` when
+/// inside `cargo_manifest_dir`) so crates whose `lib.rs` or submodule `src/sub.rs`
+/// references `CARGO_MANIFEST_DIR` or non-`OUT_DIR` `include*!` keep a per-worktree
+/// Stage-1 key instead of colliding and causing cross-worktree Stage-2 thrash.
+fn is_stage1_manifest_dir_safe(input_rs: &Path, cargo_manifest_dir: Option<&str>) -> bool {
+    let mut rs_paths: Vec<PathBuf> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut total_bytes = 0u64;
+
+    let input_canon = fs::canonicalize(input_rs).unwrap_or_else(|_| input_rs.to_path_buf());
+    if input_canon.extension().and_then(|s| s.to_str()) != Some("rs") {
+        return false;
+    }
+    seen.insert(input_canon.clone());
+    rs_paths.push(input_canon.clone());
+
+    if let (Some(mdir_raw), Some(parent_dir)) = (cargo_manifest_dir, input_canon.parent()) {
+        let mdir_canon =
+            fs::canonicalize(mdir_raw).unwrap_or_else(|_| PathBuf::from(mdir_raw));
+        if parent_dir.starts_with(&mdir_canon) {
+            let mut stack = vec![parent_dir.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    return false;
+                };
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    let Ok(ft) = entry.file_type() else {
+                        return false;
+                    };
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    let p = entry.path();
+                    if ft.is_dir() {
+                        let name = entry.file_name();
+                        if matches!(
+                            name.to_str(),
+                            Some("target" | ".git" | "node_modules" | ".devcouncil" | ".devmap")
+                        ) {
+                            continue;
+                        }
+                        stack.push(p);
+                    } else if ft.is_file() && p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                        let canon = fs::canonicalize(&p).unwrap_or(p);
+                        if seen.insert(canon.clone()) {
+                            if rs_paths.len() >= MAX_STAGE1_SOURCE_SCAN_FILES {
+                                return false;
+                            }
+                            rs_paths.push(canon);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for rs_path in rs_paths {
+        let Ok(meta) = fs::metadata(&rs_path) else {
+            return false;
+        };
+        total_bytes = total_bytes.saturating_add(meta.len());
+        if total_bytes > MAX_STAGE1_SOURCE_SCAN_BYTES {
+            return false;
+        }
         let Ok(src) = fs::read_to_string(&rs_path) else {
             return false;
         };
@@ -3591,5 +3676,126 @@ mod tests {
                 "expected lexical CARGO_MANIFEST_DIR safety rejection for: {bad_src}"
             );
         }
+    }
+
+    #[test]
+    fn stage1_direct_key_isolates_crates_referencing_cargo_manifest_dir_or_local_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let wt_a = root.join("wt-a");
+        let wt_b = root.join("wt-b");
+        fs::create_dir_all(wt_a.join("src")).unwrap();
+        fs::create_dir_all(wt_b.join("src")).unwrap();
+
+        for (label, src) in [
+            (
+                "env_manifest_dir",
+                "pub const DIR: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+            ),
+            (
+                "local_include_str",
+                "pub const FIXTURE: &str = include_str!(\"fixture.txt\");\n",
+            ),
+        ] {
+            fs::write(wt_a.join("src/lib.rs"), src).unwrap();
+            fs::write(wt_b.join("src/lib.rs"), src).unwrap();
+
+            let mk_inv = |wt: &Path| {
+                let args = vec![
+                    "--crate-name".to_string(),
+                    "app_lib".to_string(),
+                    "--crate-type".to_string(),
+                    "rlib".to_string(),
+                    "--emit=dep-info,link".to_string(),
+                    "--out-dir".to_string(),
+                    wt.join("target/debug/deps").to_string_lossy().into_owned(),
+                    "src/lib.rs".to_string(),
+                ];
+                match classify_rustc_args(&args, wt) {
+                    Classification::Cacheable(c) => c,
+                    other => panic!("{label}: expected Cacheable, got {other:?}"),
+                }
+            };
+            let inv_a = mk_inv(&wt_a);
+            let inv_b = mk_inv(&wt_b);
+            assert!(
+                has_only_pure_ast_proc_macros(&inv_a),
+                "{label}: crate has zero proc-macros"
+            );
+
+            let key_a = compute_stage1_direct_key(
+                "rustc-vv",
+                &inv_a,
+                Some(&wt_a),
+                Some(&wt_a),
+                Some(wt_a.to_str().unwrap()),
+            )
+            .unwrap();
+            let key_b = compute_stage1_direct_key(
+                "rustc-vv",
+                &inv_b,
+                Some(&wt_b),
+                Some(&wt_b),
+                Some(wt_b.to_str().unwrap()),
+            )
+            .unwrap();
+            assert_ne!(
+                key_a, key_b,
+                "{label}: crate using CARGO_MANIFEST_DIR or local include_str! must isolate Stage-1 key per worktree to prevent cross-worktree Stage-2 thrash and path leakage"
+            );
+        }
+
+        // Submodule `src/sub.rs` referencing CARGO_MANIFEST_DIR while `src/lib.rs` is clean
+        // must ALSO isolate Stage-1 keys per worktree!
+        fs::write(wt_a.join("src/lib.rs"), "pub mod sub;\n").unwrap();
+        fs::write(wt_b.join("src/lib.rs"), "pub mod sub;\n").unwrap();
+        fs::write(
+            wt_a.join("src/sub.rs"),
+            "pub const SUB_DIR: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+        )
+        .unwrap();
+        fs::write(
+            wt_b.join("src/sub.rs"),
+            "pub const SUB_DIR: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+        )
+        .unwrap();
+        let mk_sub_inv = |wt: &Path| {
+            let args = vec![
+                "--crate-name".to_string(),
+                "app_lib".to_string(),
+                "--crate-type".to_string(),
+                "rlib".to_string(),
+                "--emit=dep-info,link".to_string(),
+                "--out-dir".to_string(),
+                wt.join("target/debug/deps").to_string_lossy().into_owned(),
+                "src/lib.rs".to_string(),
+            ];
+            match classify_rustc_args(&args, wt) {
+                Classification::Cacheable(c) => c,
+                other => panic!("submodule: expected Cacheable, got {other:?}"),
+            }
+        };
+        let sub_a = mk_sub_inv(&wt_a);
+        let sub_b = mk_sub_inv(&wt_b);
+        let sub_key_a = compute_stage1_direct_key(
+            "rustc-vv",
+            &sub_a,
+            Some(&wt_a),
+            Some(&wt_a),
+            Some(wt_a.to_str().unwrap()),
+        )
+        .unwrap();
+        let sub_key_b = compute_stage1_direct_key(
+            "rustc-vv",
+            &sub_b,
+            Some(&wt_b),
+            Some(&wt_b),
+            Some(wt_b.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_ne!(
+            sub_key_a, sub_key_b,
+            "submodule referencing CARGO_MANIFEST_DIR must isolate Stage-1 key per worktree"
+        );
     }
 }
