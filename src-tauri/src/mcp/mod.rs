@@ -50,7 +50,8 @@ pub mod prompts;
 pub mod resources;
 pub mod uri;
 pub mod validate;
-#[cfg(test)]
+// Unix-only: its `devmap` stand-in is a shell script.
+#[cfg(all(test, unix))]
 mod worktree_seed_tests;
 
 use crate::ipc_error::CommandError;

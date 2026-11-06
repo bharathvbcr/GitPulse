@@ -115,6 +115,78 @@ fn isolate_seeds_the_store_and_starts_the_worktrees_own_build() {
     assert_build_runs_in(&log, &lane);
 }
 
+/// `codeintel`'s indexed fixture moved to `<sandbox>/repo`, with its store
+/// rebound to the new path. `gitpulse_worktree_create` and `switch` place a
+/// worktree beside the repository (`../<repo>.<branch>`), so the repository
+/// must sit inside a sandbox for that to stay inside the test's own tempdir.
+fn indexed_checkout_in(sandbox: &Path) -> PathBuf {
+    let fixture = indexed_checkout();
+    let repo = sandbox.join("repo");
+    std::fs::rename(fixture.path(), &repo).expect("move the fixture into the sandbox");
+    let repo = repo.canonicalize().unwrap();
+    let db = devmap_query::paths::store_path(&repo);
+    let conn = rusqlite::Connection::open(&db).expect("open the moved store");
+    let root = repo.to_str().unwrap();
+    conn.execute(
+        "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
+        [root],
+    )
+    .unwrap();
+    conn.execute("UPDATE generations SET repo_root = ?1", [root])
+        .unwrap();
+    drop(conn);
+    crate::test_support::trust_repo(&repo);
+    repo
+}
+
+/// `gitpulse_worktree_create` (no pointer) and `gitpulse_worktree_switch`
+/// with `create_if_missing` both seed the new worktree and start its build.
+#[cfg(unix)]
+#[test]
+fn create_and_switch_seed_the_store_and_start_the_worktrees_own_build() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    let (bin, log) = stale_devmap(bin_dir.path());
+    let _devmap = crate::devmap::cli::bind_test_binary(bin.to_string_lossy().into_owned());
+    let sandbox = tempfile::tempdir().unwrap();
+    let repo = indexed_checkout_in(sandbox.path());
+    let sandbox_root = sandbox.path().canonicalize().unwrap();
+
+    let created = handle_tool_call(
+        "gitpulse_worktree_create",
+        &json!({
+            "repo_path": repo.to_str().unwrap(),
+            "branch": "feat/seeded-create",
+            "share_cache": false,
+        }),
+    )
+    .expect("gitpulse_worktree_create succeeds");
+    let made = PathBuf::from(created["worktree_path"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(made.starts_with(&sandbox_root), "{}", made.display());
+    assert!(
+        devmap_query::paths::store_path(&made).is_file(),
+        "{created}"
+    );
+    assert_build_runs_in(&log, &made);
+
+    let switched = handle_tool_call(
+        "gitpulse_worktree_switch",
+        &json!({
+            "repo_path": repo.to_str().unwrap(),
+            "branch": "feat/seeded-switch",
+            "create_if_missing": true,
+        }),
+    )
+    .expect("gitpulse_worktree_switch succeeds");
+    assert_eq!(switched["devmap_seeded"], true, "{switched}");
+    let made = PathBuf::from(switched["worktree_path"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(made.starts_with(&sandbox_root), "{}", made.display());
+    assert_build_runs_in(&log, &made);
+}
+
 /// The zero-copy pointer leaves no local store, so nothing is built there: a
 /// refresh would be a cold full build, the cost the seed exists to avoid.
 #[cfg(unix)]
