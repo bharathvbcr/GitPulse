@@ -350,6 +350,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "git_inprocess_reads"
+harness = false
+test = false
+
+[[bench]]
 name = "live_index"
 harness = false
 test = false

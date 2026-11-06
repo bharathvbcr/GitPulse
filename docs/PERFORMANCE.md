@@ -2202,3 +2202,46 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
 - **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
+
+## 2026-11-06: git spawn profile (ft-bb756f5e, Phase 1)
+
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench git_inprocess_reads`. The question was which git processes GitPulse starts on its hot read paths, so that an in-process reader is built only for reads that are hot.
+
+**Method.** A fixture repository (600 files, 61 commits, 18 worktrees with a dirty file in each linked one, 120 branches, 30 tags) is driven through one *refresh*: `get_status`, `current_branch`, `head_id`, `list_branches`, `list_tags`, `branch_stats`, `read_commit_history_paged`, `list_worktrees` (Full and Listing) and `insights::snapshot`. Git's own trace2 logs every process (`GIT_TRACE2_EVENT` through the hermetic global config), so nothing can escape the count. Each process is reduced to an argv shape (subcommand and flags; refs, paths, oids and the app's `-c` pairs dropped). Wall time is trace2's own start-to-exit figure: it leaves out fork/exec and pipe drain, so it is a floor on what the caller waited. Nested processes (git starting git) are reported separately; there were none.
+
+- **idle**: one uncounted warm-up refresh (counting rewrites the global config the ref cache stamps, so the first read in a counted block is always cold), then 12 refreshes of an unchanged repository.
+- **active**: the same, with one file rewritten, one commit and one branch moved before each refresh (12 times). Fixture git calls are told apart by lacking the app's `-c`; none were mis-attributed (the idle run asserts every process has `-c`).
+- The app's refresh is event-driven, not a timer, so the per-minute figure assumes 12 refreshes a minute and is an assumption; the per-refresh figure is the measurement.
+
+Host load 17.4 on 18 cores for this run (74 for an earlier run with the same counts and shapes, times about 1.4x lower). Times are for ranking, counts are exact. One run each.
+
+### Idle (715 processes, 59.6 per refresh, 29.0 s git wall over 12 refreshes)
+
+| rank | by count | n | total wall | each |
+| --- | --- | --- | --- | --- |
+| 1 | `status --porcelain=v1 -u -z` | 456 | 21,709 ms | 47.6 ms |
+| 2 | `diff --no-ext-diff --shortstat` | 204 | 6,734 ms | 33.0 ms |
+| 3 | `worktree --porcelain -z` | 36 | 414 ms | 11.5 ms |
+| 4 | `symbolic-ref --quiet` | 12 | 60 ms | 5.0 ms |
+| 5 | `for-each-ref --format=%(refname)%00%(objectname)` | 2 | 15 ms | 7.3 ms |
+
+By wall time the order is the same for the first four; the fifth is `for-each-ref --format=%(HEAD)...` (1 x 31 ms).
+
+### Active (1,073 processes, 89.4 per refresh, 35.0 s git wall)
+
+| rank | by count | n | total wall | each |
+| --- | --- | --- | --- | --- |
+| 1 | `status --porcelain=v1 -u -z` | 456 | 24,691 ms | 54.2 ms |
+| 2 | `diff --no-ext-diff --shortstat` | 204 | 6,578 ms | 32.3 ms |
+| 3 | `symbolic-ref --quiet` | 132 | 810 ms | 6.1 ms |
+| 4 | `for-each-ref --format=%(refname)%00%(objectname)` | 73 | 685 ms | 9.4 ms |
+| 5 | `remote` | 60 | 332 ms | 5.5 ms |
+
+By wall time the fifth is `worktree --porcelain -z` (36 x 373 ms total).
+
+### What it says
+
+- `status` and `diff --shortstat` are 92% of idle processes and 98% of idle git wall time (28.4 of 29.0 s). Per refresh that is 38 `status` and 17 `diff --shortstat`: one per worktree, from the worktree listing at Full depth and the insights snapshot, each of which scans the working tree.
+- The reads an in-process reader could answer from refs and the commit graph (`symbolic-ref`, `rev-parse`, `for-each-ref`, `merge-base`, `rev-list`, `show-ref`, `remote`) are **17 processes, 2.4% of idle count and 0.4% of idle wall**. In the active scenario, where every refresh follows a ref move, they are 349 processes (32.5% of count) but 2.9 s of 35.0 s (8.4%) of wall time.
+- Phase 2 was **not started**. The card's gate says to stop when the hot spawns are not reads that can be answered safely in-process. The hot ones here are working-tree scans, which depend on the index and the file system and not on refs or the commit graph, and the ref reads that are left are cheap (2 to 9 ms) after the ref cache. Removing all of them would save at most about 0.4% of idle wall and 8% of active wall.
+- Where the time is: the worktree listing and the snapshot each scan every worktree. Making that scan once per refresh, or skipping worktrees whose index and HEAD stamps have not moved, is the lever; neither is a ref read. Recommended as its own card.
