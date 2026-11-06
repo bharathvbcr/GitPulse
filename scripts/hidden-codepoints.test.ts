@@ -9,15 +9,49 @@ import { TABLE_PATH, generate } from "./hidden-codepoints.mjs";
  * `\p{Cc}` and `\s` classes of the Node running the tests, so a Unicode update
  * fails here and is fixed by `node scripts/hidden-codepoints.mjs`.
  */
+/** `17.0` < `18.0`, compared as numbers per dotted part. */
+function compareUnicode(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+const committedTable = JSON.parse(readFileSync(TABLE_PATH, "utf8")) as { unicode: string };
+const runningUnicode = String(process.versions.unicode);
+/**
+ * A Node older than the table cannot reproduce it: its regex classes predate
+ * the table's code points. That is not drift, so the comparison is skipped,
+ * and reported as skipped (never as passed). CI pins an older Node than the
+ * machines that regenerate the table, which is how this test came to be red
+ * everywhere at once.
+ */
+const nodeIsOlder = compareUnicode(runningUnicode, committedTable.unicode) < 0;
+
 describe("hidden code point table", () => {
-  it("is what this Node's Unicode data generates", () => {
-    const committed = JSON.parse(readFileSync(TABLE_PATH, "utf8")) as { unicode: string };
-    const fresh = generate() as { unicode: string };
-    expect(
-      committed,
-      `committed table is Unicode ${committed.unicode}, this Node has ${fresh.unicode}: run node scripts/hidden-codepoints.mjs and commit the result`,
-    ).toEqual(fresh);
+  it("compares Unicode versions numerically", () => {
+    expect(compareUnicode("17.0", "18.0")).toBeLessThan(0);
+    expect(compareUnicode("18.0", "17.0")).toBeGreaterThan(0);
+    expect(compareUnicode("16.0", "16.0")).toBe(0);
+    expect(compareUnicode("9.0", "10.0")).toBeLessThan(0);
   });
+
+  it.skipIf(nodeIsOlder)(
+    `is what this Node's Unicode data generates (skipped on a Node older than table's Unicode ${committedTable.unicode}; this Node has ${runningUnicode})`,
+    () => {
+      // Same version: the table must be exactly what it generates. Newer: the
+      // table is stale, and regenerating is the fix — a Unicode update still
+      // fails loudly on the first machine that has it.
+      const fresh = generate() as { unicode: string };
+      expect(
+        committedTable,
+        `committed table is Unicode ${committedTable.unicode}, this Node has ${fresh.unicode}: run node scripts/hidden-codepoints.mjs and commit the result`,
+      ).toEqual(fresh);
+    },
+  );
 
   it("is sorted, disjoint and covers the classes the notifier relies on", () => {
     const table = JSON.parse(readFileSync(TABLE_PATH, "utf8")) as { drop: Array<[number, number]>; space: Array<[number, number]> };
