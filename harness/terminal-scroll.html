@@ -14,7 +14,7 @@
       const rounds = Number(params.get("rounds") ?? 5);
       const arms = armsFor({
         renderers: list("renderers", "webgl,dom"),
-        inputs: list("inputs", "wheel,pixel,pixel-int"),
+        inputs: list("inputs", "wheel,wheel-fast,pixel,pixel-int"),
         streams: list("streams", "false,true").map((value) => value === "true"),
         smooths: list("smooths", "0,150").map(Number),
         sens: list("sens", "1").map(Number),
@@ -40,11 +40,12 @@
         try {
           if (arms.some((arm) => arm.renderer === "webgl")) check("this browser can create a WebGL2 context", () => !!document.createElement("canvas").getContext("webgl2"));
           rows = await run(document.querySelector("#host"), arms, rounds);
-          check("every arm ran in every round", () => rows.length === arms.length * rounds);
-          check("every WebGL trial drew through WebGL for the whole gesture", () => rows.filter((row) => row.renderer === "webgl").every((row) => row.state === "webgl"));
+          const trials = rows.filter((row) => row.kind === "trial");
+          check("every arm ran in every round", () => trials.length === arms.length * rounds);
+          check("every WebGL trial drew through WebGL for the whole gesture", () => trials.filter((row) => row.renderer === "webgl").every((row) => row.state === "webgl"));
           // An unguarded smooth arm may lose a gesture to the race in scrollFeel.ts; that is a
           // measurement (the yanks column), not a failure of the run.
-          const sound = rows.filter((row) => row.smooth === 0 || row.guard);
+          const sound = trials.filter((row) => row.smooth === 0 || row.guard);
           check("every gesture moved the viewport toward history", () => sound.every((row) => row.finalY < row.startY));
           // Scrolled back while output streams: the view is not pulled to the bottom.
           check("streaming output did not pull a scrolled-back view to the bottom", () =>
@@ -52,9 +53,10 @@
           // Smoothing changes how the viewport gets there, not where it ends.
           check("a smoothing arm ends within a row of the unsmoothed arm on the same input", () => {
             const key = (row) => [row.round, row.renderer, row.input, row.stream, row.sens].join("/");
-            const base = new Map(rows.filter((row) => row.smooth === 0).map((row) => [key(row), row.finalY]));
+            const base = new Map(trials.filter((row) => row.smooth === 0).map((row) => [key(row), row.finalY]));
             return sound.filter((row) => row.smooth !== 0 && base.has(key(row))).every((row) => Math.abs(row.finalY - base.get(key(row))) <= 1);
           });
+          check("the option-cost probe ran on every renderer", () => [...new Set(arms.map((arm) => arm.renderer))].every((renderer) => rows.some((row) => row.kind === "optcost" && row.renderer === renderer && row.syncMs.length > 0)));
           check("no unhandled runtime errors", () => errors.length === 0);
           checksButton.textContent = "done";
         } catch (error) {

@@ -59,6 +59,9 @@ export interface Trial extends Arm {
   state: string;
 }
 
+/** The duration the option-cost probe toggles from and back to. */
+const SMOOTH_PROBE_MS = 150;
+const OPTION_COST_PAIRS = 30;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const frame = () => new Promise<number>((resolve) => requestAnimationFrame(resolve));
 
@@ -67,13 +70,16 @@ const frame = () => new Promise<number>((resolve) => requestAnimationFrame(resol
  * `WheelEvent` reports `wheelDeltaY` equal to `deltaY` (Chrome 100 for 100,
  * measured here, see `wheelSample`), but xterm reads `wheelDeltaY` before
  * `deltaY` (`mouseEvent.ts`, `StandardWheelEvent`) and a real event carries the
- * opposite sign: 40 pixels are one tick of 120 units (xterm's own fallback for
- * an event without it is `-deltaY / 40`, same file). Set it so the constructed
- * event takes the path a real one does.
+ * opposite sign. Set it so the constructed event takes the path a real one
+ * does. `unitsPerPixel` is the relation between the two, and it is the
+ * platform's, not the page's: 1.2 pairs `deltaY` 100 with `wheelDeltaY` 120,
+ * a wheel notch as Chromium reports it on Windows; 3 is the 40-pixels-a-tick
+ * relation (120 units per 40 px) xterm's own `-deltaY / 40` fallback assumes,
+ * used for the trackpad inputs. Both are inferred, not read from a device.
  */
-export function wheelEvent(deltaY: number): WheelEvent {
+export function wheelEvent(deltaY: number, unitsPerPixel: number): WheelEvent {
   const event = new WheelEvent("wheel", { deltaY, deltaMode: WheelEvent.DOM_DELTA_PIXEL, bubbles: true, cancelable: true, clientX: 400, clientY: 300 });
-  Object.defineProperty(event, "wheelDeltaY", { value: -deltaY * 3 });
+  Object.defineProperty(event, "wheelDeltaY", { value: -Math.round(deltaY * unitsPerPixel * 100) / 100 });
   Object.defineProperty(event, "wheelDeltaX", { value: 0 });
   return event;
 }
@@ -84,7 +90,13 @@ function sampleWheel(): Trial["wheelSample"] {
   return { deltaY: event.deltaY, wheelDeltaY: typeof legacy === "number" ? legacy : null };
 }
 
-export async function runTrial(host: HTMLElement, arm: Arm, round: number): Promise<Trial> {
+interface Opened {
+  term: Terminal;
+  gpu: ReturnType<typeof createGpuRenderer>;
+  close(): void;
+}
+
+function openTerminal(host: HTMLElement, options: { smooth: number; sens: number }): Opened {
   const term = new Terminal({
     cols: COLS,
     rows: ROWS,
@@ -94,19 +106,18 @@ export async function runTrial(host: HTMLElement, arm: Arm, round: number): Prom
     allowProposedApi: true,
     allowTransparency: true,
     scrollback: SCROLLBACK,
-    smoothScrollDuration: arm.smooth,
-    scrollSensitivity: arm.sens,
+    smoothScrollDuration: options.smooth,
+    scrollSensitivity: options.sens,
     theme: { background: "#141a29", foreground: "#e9edf8" },
   });
   term.loadAddon(new Unicode11Addon());
   term.unicode.activeVersion = "11";
   term.open(host);
-  let canvas: HTMLCanvasElement | undefined;
   const gpu = createGpuRenderer({
     attach: () => {
       const created = new WebglAddon();
       term.loadAddon(created);
-      canvas = [...(term.element?.querySelectorAll("canvas") ?? [])].find(
+      const canvas = [...(term.element?.querySelectorAll("canvas") ?? [])].find(
         (node) => ![...node.classList].some((name) => name.endsWith("-layer")),
       );
       return {
@@ -120,6 +131,60 @@ export async function runTrial(host: HTMLElement, arm: Arm, round: number): Prom
     policy: { ...gpuPolicy },
     refresh: () => term.refresh(0, term.rows - 1),
   });
+  return { term, gpu, close: () => { gpu.dispose(); term.dispose(); host.replaceChildren(); } };
+}
+
+/** Fills the terminal with `FILL_ROWS` rows and lets it draw. */
+async function fill(term: Terminal): Promise<void> {
+  const next = rng(11);
+  for (let from = 0; from < FILL_ROWS; from += 500) {
+    let chunk = "";
+    for (let i = from; i < from + 500; i += 1) chunk += line(next, i);
+    await new Promise<void>((resolve) => term.write(chunk, () => resolve()));
+  }
+  await frame(); await frame();
+  await sleep(100);
+}
+
+export interface OptionCost {
+  kind: "optcost";
+  renderer: Renderer;
+  /** Setting `smoothScrollDuration` to 0 and back (what the guard does), synchronously, ms per pair. */
+  syncMs: number[];
+  /** The frame after such a pair, rAF to rAF, ms. */
+  toggledFrameMs: number[];
+  /** The same frame with no write: the control. */
+  controlFrameMs: number[];
+}
+
+/** What two `smoothScrollDuration` writes cost on a full terminal: each fires `onOptionChange`, which refreshes every row. */
+export async function measureOptionCost(host: HTMLElement, renderer: Renderer, pairs: number): Promise<OptionCost> {
+  const { term, gpu, close } = openTerminal(host, { smooth: SMOOTH_PROBE_MS, sens: 1 });
+  try {
+    if (renderer === "webgl" && gpu.sync(true) !== "webgl") throw new Error(`no WebGL context (${gpu.state()})`);
+    await fill(term);
+    const row: OptionCost = { kind: "optcost", renderer, syncMs: [], toggledFrameMs: [], controlFrameMs: [] };
+    const nextFrameMs = async () => { const first = await frame(); return (await frame()) - first; };
+    for (let i = 0; i < pairs; i += 1) {
+      await sleep(30);
+      await frame();
+      row.controlFrameMs.push(await nextFrameMs());
+      await sleep(30);
+      await frame();
+      const start = performance.now();
+      term.options.smoothScrollDuration = 0;
+      term.options.smoothScrollDuration = SMOOTH_PROBE_MS;
+      row.syncMs.push(performance.now() - start);
+      row.toggledFrameMs.push(await nextFrameMs());
+    }
+    return row;
+  } finally {
+    close();
+  }
+}
+
+export async function runTrial(host: HTMLElement, arm: Arm, round: number): Promise<Trial> {
+  const { term, gpu, close } = openTerminal(host, arm);
   const detachGuard = arm.guard ? attachScrollGuard(term) : () => {};
   let streamTimer: ReturnType<typeof setInterval> | undefined;
   try {
@@ -134,14 +199,7 @@ export async function runTrial(host: HTMLElement, arm: Arm, round: number): Prom
       scrollEvents += 1;
     });
 
-    const next = rng(11);
-    for (let from = 0; from < FILL_ROWS; from += 500) {
-      let chunk = "";
-      for (let i = from; i < from + 500; i += 1) chunk += line(next, i);
-      await new Promise<void>((resolve) => term.write(chunk, () => resolve()));
-    }
-    await frame(); await frame();
-    await sleep(100);
+    await fill(term);
     const startY = term.buffer.active.viewportY;
     scrollEvents = 0; handlerMs = 0;
 
@@ -181,7 +239,7 @@ export async function runTrial(host: HTMLElement, arm: Arm, round: number): Prom
         while (cursor < script.length && script[cursor][0] <= elapsed) { due += script[cursor][1]; cursor += 1; any = true; }
         if (any) {
           const began = performance.now();
-          target.dispatchEvent(wheelEvent(due));
+          target.dispatchEvent(wheelEvent(due, arm.input.startsWith("wheel") ? 1.2 : 3));
           dispatchMs.push(performance.now() - began);
         }
         if (elapsed > lastAt + SETTLE_MS) resolve(); else requestAnimationFrame(tick);
@@ -197,19 +255,18 @@ export async function runTrial(host: HTMLElement, arm: Arm, round: number): Prom
   } finally {
     if (streamTimer !== undefined) clearInterval(streamTimer);
     detachGuard();
-    gpu.dispose();
-    term.dispose();
-    host.replaceChildren();
+    close();
   }
 }
 
-export async function run(host: HTMLElement, arms: Arm[], rounds: number): Promise<Trial[]> {
-  const rows: Trial[] = [];
+export async function run(host: HTMLElement, arms: Arm[], rounds: number): Promise<Array<Trial | OptionCost>> {
+  const rows: Array<Trial | OptionCost> = [];
   for (let round = 0; round < rounds; round += 1) {
     for (const arm of roundOrder(arms, round)) {
       rows.push(await runTrial(host, arm, round));
       await sleep(50);
     }
   }
+  for (const renderer of [...new Set(arms.map((arm) => arm.renderer))]) rows.push(await measureOptionCost(host, renderer, OPTION_COST_PAIRS));
   return rows;
 }

@@ -37,6 +37,11 @@ describe("terminal scroll bench metrics", () => {
 });
 
 describe("terminal scroll bench summary", () => {
+  it("prints what two option writes cost next to a frame with none", () => {
+    const lines = summarize([{ kind: "optcost", renderer: "dom", syncMs: [0.1, 0.2, 0.4], toggledFrameMs: [16.7, 16.7, 16.8], controlFrameMs: [16.7, 16.6, 16.8] }]);
+    expect(lines).toContain("option-cost  dom   two smoothScrollDuration writes: sync min/med/max 0.10/0.20/0.40 ms; next frame med/max 16.7/16.8 ms against 16.7/16.8 ms with no write (n=3)");
+  });
+
   it("prints min/median over the rounds, one line per arm", () => {
     const lines = summarize([
       trial([16.7, 30, 16.7], [0, 8, 0], { round: 0 }),
@@ -57,6 +62,10 @@ describe("terminal scroll bench harness", () => {
     const events = gesture("wheel");
     expect(events).toHaveLength(24);
     expect(new Set(events.map(([, dy]) => dy))).toEqual(new Set([-100]));
+  });
+
+  it("scripts wheel-fast as the same 24 events at three notches each", () => {
+    expect(new Set(gesture("wheel-fast").map(([, dy]) => dy))).toEqual(new Set([-300]));
   });
 
   it("scripts a trackpad at 120 Hz that rises, falls and decays, and rounds to whole pixels for pixel-int", () => {

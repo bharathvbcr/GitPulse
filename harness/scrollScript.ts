@@ -4,7 +4,7 @@
  * `scrollBench.ts` so a unit test can import them without a browser.
  */
 export type Renderer = "webgl" | "dom";
-export type Input = "wheel" | "pixel" | "pixel-int";
+export type Input = "wheel" | "wheel-fast" | "pixel" | "pixel-int";
 
 export interface Arm {
   renderer: Renderer;
@@ -57,8 +57,10 @@ export function line(next: () => number, index: number): string {
 /** A scripted gesture: `[ms from start, deltaY in pixels]`, negative scrolls toward history. */
 export function gesture(input: Input): Array<[number, number]> {
   const events: Array<[number, number]> = [];
-  if (input === "wheel") {
-    for (let notch = 0; notch < 24; notch += 1) events.push([notch * 70, -100]);
+  if (input === "wheel" || input === "wheel-fast") {
+    // 100 px is one notch (`wheelDeltaY` 120); `wheel-fast` is three notches at once, a spun or accelerated wheel.
+    const delta = input === "wheel" ? -100 : -300;
+    for (let notch = 0; notch < 24; notch += 1) events.push([notch * 70, delta]);
     return events;
   }
   const period = 1000 / 120;

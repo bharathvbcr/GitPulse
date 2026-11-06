@@ -117,9 +117,11 @@ describe("the wheel guard", () => {
 
 describe("TerminalSession wiring", () => {
   it("builds the terminal with the scroll-feel options and uses the shared scrolled-back test", () => {
-    expect(session).toContain("...scrollFeelOptions()");
+    expect(session).toContain("...scrollFeelOptions(get(interfaceStore).terminalSmoothWheel)");
     expect(session).toContain("scrolledBack = isScrolledBack(created.buffer.active)");
-    expect(session).toContain("attachScrollGuard(t)");
+    expect(session).toContain("createScrollFeel(t,");
+    expect(session).toContain("get(interfaceStore).terminalSmoothWheel");
+    expect(session).toContain("scrollFeel?.refresh()");
   });
 
   it("sets a smooth-scroll duration xterm will animate", () => {

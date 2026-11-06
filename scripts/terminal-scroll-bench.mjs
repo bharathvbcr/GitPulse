@@ -10,7 +10,7 @@
  *
  *   node scripts/terminal-scroll-bench.mjs <chrome|webkit> [rounds] [deadlineSeconds] [extra query]
  *
- * Arms are renderer (webgl, dom) x input (wheel, pixel, pixel-int) x output
+ * Arms are renderer (webgl, dom) x input (wheel, wheel-fast, pixel, pixel-int) x output
  * (idle, streaming) x xterm's smoothScrollDuration (0 = its default, then
  * 150). Narrow or widen them with the query, e.g.
  * `"renderers=dom&inputs=wheel&smooths=0,100,150,250&sens=1,2"`. Every round
@@ -100,6 +100,9 @@ export function summarize(rows) {
       return `${fmt(quantile(values, 0), digits)}/${fmt(quantile(values, 0.5), digits)}`.padStart(11);
     });
     lines.push(`${key.padEnd(50)} ${String(group.length).padEnd(3)} ${cells.join(" ")}  yanked=${group.filter(yanked).length}/${group.length}`);
+  }
+  for (const cost of rows.filter((row) => row.kind === "optcost")) {
+    lines.push(`option-cost  ${cost.renderer.padEnd(5)} two smoothScrollDuration writes: sync min/med/max ${fmt(quantile(cost.syncMs, 0), 2)}/${fmt(quantile(cost.syncMs, 0.5), 2)}/${fmt(quantile(cost.syncMs, 1), 2)} ms; next frame med/max ${fmt(quantile(cost.toggledFrameMs, 0.5))}/${fmt(quantile(cost.toggledFrameMs, 1))} ms against ${fmt(quantile(cost.controlFrameMs, 0.5))}/${fmt(quantile(cost.controlFrameMs, 1))} ms with no write (n=${cost.syncMs.length})`);
   }
   return lines;
 }

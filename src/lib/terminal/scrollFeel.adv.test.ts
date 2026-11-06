@@ -25,7 +25,7 @@ const asGuarded = (term: XtermLike, element: HTMLElement): ScrollGuardTerminal =
   scrollLines: (amount) => term.scrollLines(amount),
 });
 
-function wheel(init: { deltaY: number; deltaX?: number; ctrlKey?: boolean; metaKey?: boolean }): WheelEvent {
+function wheel(init: { deltaY: number; deltaX?: number; ctrlKey?: boolean; metaKey?: boolean; wheelDeltaY?: number }): WheelEvent {
   return Object.assign(new Event("wheel"), { deltaX: 0, ctrlKey: false, metaKey: false, ...init }) as unknown as WheelEvent;
 }
 
@@ -126,7 +126,7 @@ describe("guard edge cases (real xterm)", () => {
     expect(options.smoothScrollDuration).toBe(150);
   });
 
-  it("KNOWN-GAP: sub-pixel trackpad noise (deltaY -0.1) must not jump a whole row", async () => {
+  it("sub-pixel trackpad noise (deltaY -0.1) must not jump a whole row", async () => {
     const { term, send } = await guarded();
     const y = term.buffer.active.viewportY;
     send(wheel({ deltaY: -0.1 }));
@@ -134,17 +134,39 @@ describe("guard edge cases (real xterm)", () => {
     term.dispose();
   });
 
-  it("KNOWN-GAP: the guard must not fire renderer-wide option-change refreshes (each write refreshes every row; DomRenderer also rewrites its CSS)", async () => {
+  it("the guard's option writes are bounded: two on the first notch at the bottom, none for the rest of the gesture, none for a trackpad", async () => {
+    // Was KNOWN-GAP "must not fire option-change refreshes". xterm has no public way to scroll one
+    // row without the smooth viewport (`Terminal.scrollLines`, `scrollToLine`, `scrollPages` all go
+    // through it, and `scrollToBottom()` takes no argument; the instant path, `Viewport.scrollToLine(line, true)`,
+    // is internal), so the guard writes smoothScrollDuration 0 and back around one scrollLines call.
+    // Each write fires onOptionChange (refreshes every row; the DOM renderer also rewrites its CSS).
+    // Measured with `node scripts/terminal-scroll-bench.mjs` (docs/PERFORMANCE.md, 2026-11-06): the pair of
+    // writes costs 0.1-0.4 ms synchronously in Chrome (0-1 ms in WebKit, 1 ms timer) on a full terminal,
+    // and the next frame is the same length as a frame with no write, on both renderers and both
+    // engines. That is far under one frame, so the cost is accepted. What this test now holds is
+    // the bound: at most the one pair, once per gesture that starts at the bottom, never per event.
     const { term, send } = await guarded();
     const fired: string[] = [];
     const sub = term._core.optionsService.onOptionChange((key) => fired.push(key));
     send(wheel({ deltaY: -100 }));
+    expect(fired).toEqual(["smoothScrollDuration", "smoothScrollDuration"]);
+    for (let i = 0; i < 20; i += 1) send(wheel({ deltaY: -100 }));
+    expect(fired).toHaveLength(2);
     sub.dispose();
-    expect(fired).toEqual([]);
     term.dispose();
+
+    const finger = await guarded();
+    const fingerFired: string[] = [];
+    const fingerSub = finger.term._core.optionsService.onOptionChange((key) => fingerFired.push(key));
+    for (let i = 0; i < 20; i += 1) finger.send(wheel({ deltaY: -12.5, wheelDeltaY: 37.5 }));
+    // The first non-notch event takes the glide off once; no row moved, nothing else was written.
+    expect(fingerFired).toEqual(["smoothScrollDuration"]);
+    expect(finger.term.buffer.active.viewportY).toBe(finger.term.buffer.active.baseY);
+    fingerSub.dispose();
+    finger.term.dispose();
   });
 
-  it("KNOWN-GAP: prefers-reduced-motion must turn the glide off", () => {
+  it("prefers-reduced-motion must turn the glide off", () => {
     vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("prefers-reduced-motion"), media: query }));
     expect(scrollFeelOptions().smoothScrollDuration).toBe(0);
   });
