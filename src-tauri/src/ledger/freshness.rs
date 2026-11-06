@@ -300,6 +300,17 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
             }
         },
     };
+    // A row's error is its newest attempt's, and `completed_at` moves only on
+    // a finished pass, so a row that went dormant after an unfinished attempt
+    // still says why (it drops out of the summary, not out of the reason). A
+    // pass that finished with only unlisted transcripts keeps an error too; it
+    // is not a failed attempt.
+    let stale_reason = match unfinished_attempt(&rows, future_after) {
+        Some(why) if stale => {
+            format!("{stale_reason}; the newest catch-up attempt did not finish: {why}")
+        }
+        _ => stale_reason,
+    };
     Freshness {
         as_of,
         last_catch_up,
@@ -311,6 +322,34 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
         freshness_error: String::new(),
         catch_up,
     }
+}
+
+/// The longest an attempt's error runs in a stale reason.
+const MAX_REASON_ERROR_CHARS: usize = 240;
+
+/// The error of the first row whose newest attempt did not finish, bounded.
+/// A row dated in the future is skipped, as everywhere else in `assess`.
+fn unfinished_attempt(rows: &[StateRow], future_after: u64) -> Option<String> {
+    rows.iter()
+        .filter(|row| {
+            well_formed_time(&row.completed_at).is_none_or(|at| at <= future_after)
+                && !row.error.is_empty()
+                && !crate::ingest::is_unlisted_only_error(&row.error)
+        })
+        .map(|row| {
+            let mut why: String = row.error.chars().take(MAX_REASON_ERROR_CHARS).collect();
+            if row.error.chars().count() > MAX_REASON_ERROR_CHARS {
+                why.push_str("...");
+            }
+            why
+        })
+        .next()
+}
+
+fn well_formed_time(ts: &Option<String>) -> Option<u64> {
+    ts.as_deref()
+        .filter(|ts| super::valid_utc_timestamp(ts))
+        .and_then(ids::parse_event_time)
 }
 
 /// [`read`] for a repository, opening the ledger read-only. A ledger that is

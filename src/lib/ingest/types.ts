@@ -40,6 +40,12 @@ export interface CatchUp {
   walk_complete?: boolean | null;
   skipped_lines: number;
   /**
+   * Transcript I/O failures (stat, open, seek, read), also counted in
+   * `skipped_lines`. Unlike a long line or bad UTF-8 the bytes stay owed, so a
+   * non-zero count means the pass is unfinished and `error` names the first.
+   */
+  io_errors?: number;
+  /**
    * Calls whose worktree had no slot in this pass (past the participant cap).
    * The row is still the owner's, carried on another worktree's transaction.
    * Zero for any real family.
