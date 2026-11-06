@@ -50,6 +50,8 @@ pub mod prompts;
 pub mod resources;
 pub mod uri;
 pub mod validate;
+#[cfg(test)]
+mod worktree_seed_tests;
 
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
@@ -2775,6 +2777,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     Err(e) => command_error = Some(e.into_message()),
                 }
             }
+            if matches!(
+                devmap,
+                crate::engine::worktree::DevmapOutcome::Provisioned { zero_copy: false }
+            ) {
+                crate::devmap::live::refresh_seeded_worktree(
+                    &worktree_path,
+                    crate::devmap::live::SeededRefresh::Background,
+                );
+            }
             let mut problems = Vec::new();
             if let Some(e) = &cache_error {
                 problems.push(format!("build caches: {e}"));
@@ -2876,6 +2887,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     created.devmap,
                     crate::engine::worktree::DevmapOutcome::Provisioned { .. }
                 );
+                if devmap_seeded {
+                    crate::devmap::live::refresh_seeded_worktree(
+                        &created.path,
+                        crate::devmap::live::SeededRefresh::Background,
+                    );
+                }
                 let mut problems = Vec::new();
                 if let Some(e) = &created.cache_error {
                     problems.push(format!("build caches: {e}"));
@@ -2973,6 +2990,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 }
                 Err(e) => (false, format!("failed: {}", e.message()), true),
             };
+            if devmap_seeded && !zero_copy {
+                crate::devmap::live::refresh_seeded_worktree(
+                    &target.to_string_lossy(),
+                    crate::devmap::live::SeededRefresh::Background,
+                );
+            }
             // A sync that failed is `null` with its error, never 0: zero means
             // the overlay was read and nothing was dirty.
             let (overlay_dirty, overlay_error) = overlay_dirty_files(target.to_str());

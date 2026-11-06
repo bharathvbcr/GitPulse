@@ -386,12 +386,20 @@ describe("a task state that could not be read is not an unbound worktree", () =>
   });
 });
 
-describe("WorktreesPanel zero-copy DevMap and sparse-cone provisioning", () => {
-  it("exposes zero-copy DevMap pointer toggle and optional sparse-cone paths through repoStore.addWorktree", () => {
-    expect(source).toContain("let zeroCopyDevmap = $state(true);");
+describe("WorktreesPanel DevMap seeding and sparse-cone provisioning", () => {
+  // The default was the zero-copy pointer until 2026-11-06, when it was
+  // measured to be invisible to the `devmap` binary agents run: a pointer-only
+  // worktree answers query_ready:false and DevMap's hook cold-builds a full
+  // index beside it (docs/ZERO_COPY_AGENTIC_WORKTREES.md §7). The default is
+  // now a CoW-cloned store; the pointer stays available, off by default.
+  it("seeds a CoW DevMap store by default, keeps the pointer opt-in, and passes both and sparse paths through repoStore.addWorktree", () => {
+    expect(source).toContain("let seedDevmap = $state(true);");
+    expect(source).toContain("let zeroCopyDevmap = $state(false);");
     expect(source).toContain("let sparsePathsInput = $state(\"\");");
-    expect(source).toContain("Zero-copy DevMap graph (shared base pointer)");
+    expect(source).toContain("Seed DevMap index (copy-on-write clone, then built here)");
+    expect(source).toContain("Zero-copy DevMap pointer instead (GitPulse only)");
     expect(source).toContain('aria-label="Sparse checkout paths"');
+    expect(source).toContain("seedDevmap,");
     expect(source).toContain("zeroCopyDevmap,");
     expect(source).toContain("sparsePaths: sparsePaths.length > 0 ? sparsePaths : null,");
     expect(source).not.toContain("cmd_add_worktree");
@@ -400,7 +408,8 @@ describe("WorktreesPanel zero-copy DevMap and sparse-cone provisioning", () => {
       source.indexOf("const tabScope = repoScope("),
       source.indexOf("\n  );", source.indexOf("const tabScope = repoScope(")),
     );
-    expect(reset).toContain("zeroCopyDevmap = true;");
+    expect(reset).toContain("seedDevmap = true;");
+    expect(reset).toContain("zeroCopyDevmap = false;");
     expect(reset).toContain('sparsePathsInput = "";');
   });
 });

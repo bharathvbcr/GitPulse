@@ -66,7 +66,12 @@
   let newBranch = $state("");
   let startPoint = $state("");
   let cowCaches = $state(true);
-  let zeroCopyDevmap = $state(true);
+  // The new worktree's DevMap index: a copy-on-write clone of the main
+  // checkout's, then built for this worktree's own tree. The zero-copy pointer
+  // is opt-in: only GitPulse reads it; the `devmap` agents run does not, and
+  // DevMap's own hook cold-builds a full index beside it.
+  let seedDevmap = $state(true);
+  let zeroCopyDevmap = $state(false);
   let sparsePathsInput = $state("");
   // Repository hooks run shell commands from a file the working tree
   // controls, so they are off until asked for and, even then, run only when the
@@ -198,7 +203,8 @@
       newBranch = "";
       startPoint = "";
       cowCaches = true;
-      zeroCopyDevmap = true;
+      seedDevmap = true;
+      zeroCopyDevmap = false;
       sparsePathsInput = "";
       // The hooks consent belongs to the repository it was read for: a ticked
       // box and a preview of that repository's `.gitpulse/hooks` must not be
@@ -422,6 +428,7 @@
           detach: !branch,
           cowCaches,
           runHooks,
+          seedDevmap,
           zeroCopyDevmap,
           sparsePaths: sparsePaths.length > 0 ? sparsePaths : null,
         },
@@ -726,8 +733,15 @@
         <span>Share build caches (reflink / clonefile)</span>
       </label>
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+        <input type="checkbox" bind:checked={seedDevmap} class="rounded border-border text-accent focus:ring-accent" />
+        <span>Seed DevMap index (copy-on-write clone, then built here)</span>
+      </label>
+      <label
+        class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none"
+        title="Only GitPulse reads the pointer; the devmap that agents run does not, and builds a full index beside it."
+      >
         <input type="checkbox" bind:checked={zeroCopyDevmap} class="rounded border-border text-accent focus:ring-accent" />
-        <span>Zero-copy DevMap graph (shared base pointer)</span>
+        <span>Zero-copy DevMap pointer instead (GitPulse only)</span>
       </label>
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
         <input

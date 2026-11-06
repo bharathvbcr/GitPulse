@@ -942,6 +942,51 @@ pub fn start_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
     )
 }
 
+/// How a caller that just seeded a worktree's store waits for that worktree's
+/// own build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeededRefresh {
+    /// A long-lived process (the app, `gitpulse-mcp`): the build runs on a
+    /// supervised background thread and this returns at once.
+    Background,
+    /// A short-lived process (the `gitpulse-worktree` CLI), whose background
+    /// thread would die with it: the build runs here, within the build
+    /// deadline.
+    Inline,
+}
+
+/// Bring a worktree whose DevMap store was just seeded (cloned from its main
+/// checkout by `codeintel::provision_worktree_devmap`) to the worktree's own
+/// tree.
+///
+/// A seed is the main checkout's latest generation, which can trail that
+/// checkout's HEAD and carry its uncommitted edits. DevMap reports such a store
+/// honestly (`is_fresh: false`), but its SessionStart hook builds only where
+/// there is no store at all, so nothing else would build it, and the worktree
+/// would answer from the main checkout's working state indefinitely (measured
+/// 2026-11-06: "ready (source moved)", still stale 20 s later). This is the
+/// same gate every open repository gets: it builds only when `devmap status`
+/// says the store is not fresh, incrementally (~2.5 s on GitPulse itself,
+/// against ~7.6 s for the cold build a missing store costs). Every seeding
+/// path calls this rather than its own build.
+pub fn refresh_seeded_worktree(path: &str, run: SeededRefresh) -> LiveRefreshOutcome {
+    let outcome = match run {
+        SeededRefresh::Background => start_refresh(path, false),
+        SeededRefresh::Inline => maybe_refresh(path, false),
+    };
+    log::info!(
+        target: "devmap",
+        "seeded worktree {path}: index refresh {:?}{}",
+        outcome.decision,
+        outcome
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default()
+    );
+    outcome
+}
+
 pub(crate) fn live_refresh(
     repo_path: &str,
     repo_changed: bool,

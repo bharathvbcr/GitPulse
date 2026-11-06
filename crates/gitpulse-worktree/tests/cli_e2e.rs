@@ -61,10 +61,18 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The `devmap` every CLI run here resolves: `<home>/devmap`, which is absent
+/// unless a test writes a stub there. A seeded worktree's store is brought to
+/// its tree by running `devmap`; the real binary must never run from a test.
+fn devmap_stub_path(home: &Path) -> PathBuf {
+    home.join("devmap")
+}
+
 fn run_cli(home: &Path, args: &[&str]) -> Output {
     Command::new(bin_path())
         .args(args)
         .envs(profile_env(home))
+        .env("GITPULSE_DEVMAP_BIN", devmap_stub_path(home))
         .output_locked()
         .expect("spawn gitpulse-worktree")
 }
@@ -264,6 +272,74 @@ fn cli_help_version_invalid_args_and_untrusted_refusal() {
             .unwrap()
             .contains("REPOSITORY_TRUST_REQUIRED"),
         "expected trust refusal, got: {err_json}"
+    );
+}
+
+/// A plain `create` (build caches shared, the default) from an indexed main
+/// checkout seeds the new worktree's DevMap store and, before the command
+/// returns, runs that worktree's own `devmap build`. Before, it seeded nothing
+/// (so DevMap's hook cold-built the worktree), and a seed alone would stay the
+/// main checkout's generation: DevMap's hook builds only where no store
+/// exists.
+#[cfg(unix)]
+#[test]
+fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("monorepo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    seed_monorepo_with_devmap_and_csr(&anchor);
+    approve_in_isolated_home(&anchor, home.path());
+
+    // A `devmap` that reports every store not fresh, logs `<cwd> <argv>`.
+    let log = home.path().join("devmap-argv.log");
+    let stub = devmap_stub_path(home.path());
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s %s\\n' \"$PWD\" \"$*\" >> '{log}'\n\
+             if [ \"$1\" = status ]; then printf '%s\\n' '{{\"is_fresh\":false,\"schema_outdated\":false}}'; exit 0; fi\n\
+             if [ \"$1\" = build ]; then printf '%s\\n' '{{\"ok\":true}}'; exit 0; fi\n\
+             exit 2\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let wt = workspace.path().join("wt-seeded");
+    let created = run_cli_json_ok(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/seeded",
+            "--target",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(created["devmap_seeded"], true, "{created}");
+    let wt = wt.canonicalize().unwrap();
+    assert!(devmap_query::paths::store_path(&wt).is_file());
+
+    let seen = fs::read_to_string(&log).unwrap_or_default();
+    let built_here = seen.lines().any(|line| {
+        line.split_once(' ').is_some_and(|(cwd, argv)| {
+            Path::new(cwd).canonicalize().ok().as_deref() == Some(wt.as_path())
+                && argv.split_whitespace().next() == Some("build")
+        })
+    });
+    assert!(
+        built_here,
+        "no devmap build ran in {} before create returned; devmap saw:\n{seen}",
+        wt.display()
     );
 }
 

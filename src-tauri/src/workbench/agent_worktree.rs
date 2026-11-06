@@ -371,38 +371,16 @@ fn provision_with(
     }) {
         log::warn!(target: "workbench", "agent worktree {} is set up but could not record it: {error}", provisioned.path, error = error.message());
     }
+    // A seed is the main checkout's generation, not this lane's tree; bring it
+    // to the lane. Only now that setup is complete, so no build runs in a tree
+    // a failed setup is about to remove.
     if seeded {
-        refresh_seeded_index(&provisioned.path);
+        crate::devmap::live::refresh_seeded_worktree(
+            &provisioned.path,
+            crate::devmap::live::SeededRefresh::Background,
+        );
     }
     Ok(provisioned)
-}
-
-/// Bring a seeded lane's DevMap store to the lane's own tree.
-///
-/// The seed is the main checkout's latest generation, which can trail its HEAD
-/// and carry its uncommitted edits. DevMap reports that honestly
-/// (`is_fresh: false`), but its SessionStart hook only builds where there is
-/// no store, so a seeded lane would otherwise answer from the main
-/// checkout's working state until something else built it. This is the
-/// GitPulse live refresh every open repository gets: it builds only when
-/// `devmap status` says the store is not fresh, incrementally (measured at
-/// ~2.5 s on this repository, against ~7.6 s cold), on a supervised background
-/// thread holding the lane's writer slot, and it answers without waiting for
-/// the build. Called only once setup is complete, so no build runs in a tree a
-/// failed setup is about to remove.
-fn refresh_seeded_index(path: &str) -> crate::devmap::live::LiveRefreshOutcome {
-    let outcome = crate::devmap::live::start_refresh(path, false);
-    log::info!(
-        target: "workbench",
-        "agent worktree {path}: DevMap index refresh {:?}{}",
-        outcome.decision,
-        outcome
-            .reason
-            .as_deref()
-            .map(|reason| format!(" ({reason})"))
-            .unwrap_or_default()
-    );
-    outcome
 }
 
 /// What a removal left to say beyond "removed": the files that could not be

@@ -3302,6 +3302,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         detach: boolean;
         cowCaches: boolean;
         runHooks: boolean;
+        /** CoW-clone the main checkout's DevMap store, then build it here. */
+        seedDevmap?: boolean;
         zeroCopyDevmap?: boolean;
         sparsePaths?: string[] | null;
       },
@@ -3320,6 +3322,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             detach: request.detach,
             cowCaches: request.cowCaches,
             runHooks: request.runHooks,
+            ...(request.seedDevmap !== undefined
+              ? { seedDevmap: request.seedDevmap }
+              : {}),
             ...(request.zeroCopyDevmap !== undefined
               ? { zeroCopyDevmap: request.zeroCopyDevmap }
               : {}),

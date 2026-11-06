@@ -278,7 +278,7 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 
 ## 5. Desktop UI & Frontend Store Integration
 
-- **Worktrees Panel (`WorktreesPanel.svelte`)**: Exposes checkboxes for **Copy-on-Write dependency caches** (`node_modules`, `target`) and **Zero-copy DevMap base pointer** (`zeroCopyDevmap`, on by default), plus a **Sparse cone paths** field that passes repo-relative directories or files to `cmd_add_worktree` (`add_worktree_configured`). When `sparsePaths` are supplied, the backend runs `add_sparse_worktree_zero_copy` and returns the DevMap-expanded cone alongside CoW cache and `.gitpulse/hooks.toml` execution reports.
+- **Worktrees Panel (`WorktreesPanel.svelte`)**: Exposes checkboxes for **Copy-on-Write dependency caches** (`node_modules`, `target`) and **Seed DevMap index** (`seedDevmap`, on by default: a CoW-cloned store, then built for the worktree, §7), with the **Zero-copy DevMap pointer** opt-in (`zeroCopyDevmap`, off by default; only GitPulse reads it), plus a **Sparse cone paths** field that passes repo-relative directories or files to `cmd_add_worktree` (`add_worktree_configured`). When `sparsePaths` are supplied, the backend runs `add_sparse_worktree_zero_copy` and returns the DevMap-expanded cone alongside CoW cache and `.gitpulse/hooks.toml` execution reports.
 - **Map & Health Status Honesty (`OpenedRepoStore::ZeroCopy`)**: In-process DevMap readers (`src-tauri/src/codeintel/store.rs`) recognize `base_store_ref.json` when a linked worktree has no local `devmap.sqlite`, verify that the worktree and anchor share the exact canonical `<git-common-dir>` (`evaluate_zero_copy_status`), and open the anchor's read-only SQLite snapshot without copying it while preserving explicit `stale` freshness reasons whenever `HEAD`, `overlay.json`, or dirty files diverge from `anchor_head_sha`.
 - **Single-Facet Branch Refresh (`repoStore.ts`)**: `createBranch`, `renameBranch`, and `deleteBranch` call `hydrateFacet(path, "branches")` rather than reloading unrelated status, commit-graph, or stash facets. `withCarriedChurn` carries verified `ahead`/`behind`/`insertions`/`deletions` across matching commit tips (including unshadowed remote-tracking tips), and `sessionBook.statsDrained` short-circuits progressive `fetchBranchStats` sweeps once all eligible branches are verified against the current default base.
 
@@ -329,10 +329,29 @@ Measured 2026-11-06 on this repository (main at `5394f4d3`, 3,193 indexed files,
 
 The lane is therefore queryable at once, and is honestly marked stale until its own build lands, about 2.5 s later on this repository. Like the build caches, a skipped or failed seed is logged and never refuses the lane, because DevMap's hook still covers it. `a_lane_cut_from_an_indexed_checkout_gets_its_own_seeded_devmap_store` fails against the previous code. `a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started` fails with the refresh removed: a stub `devmap` reporting `is_fresh: false` must see a `build` run in the lane. **Not measured:** the seed's cost when the anchor's store trails HEAD by many commits (a larger overlay diff), and when the anchor's `-wal` is live, which takes the `VACUUM INTO` path (284 MB written, above). The 1.2 s figure is for a clean anchor at the same HEAD. The general `add_worktree_cached` API stays opt-in, so `a_worktree_created_without_asking_seeds_no_devmap_store_and_says_so` still holds.
 
-**Not fixed here, named:**
-1. **DevCouncil hook (owner: DevCouncil).** Every host that makes worktrees outside GitPulse (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still gets a cold build. The fix belongs in `devmap`: `devmap build --seed-from <main checkout>` clones the main store when the target store is missing (clonefile/FICLONE, or the pinned clone when `-wal` is non-empty), rebinds `pending_state.repo_root` and `generations.repo_root`, then continues as an incremental build. `unindexed_worktree_notice` passes `--seed-from` in `detach_build` when the main checkout is indexed. This is a hand-off: it needs a DevCouncil commit, a `devmap` reinstall, and `bun run check:schema-parity`. It changes no schema.
-2. **Worktrees panel `zeroCopyDevmap` default.** Hand-made worktrees from the panel still get only the pointer, so the hook cold-builds there too. Once item 1 lands, the pointer becomes redundant for agents. Until then the panel default should be the CoW seed.
-3. **`VACUUM INTO` fallback.** Replace it with the pinned clone, gated by `PRAGMA quick_check` on the clone before placement, with `VACUUM INTO` kept as the fallback when the check fails.
+**Every GitPulse seeding path, one owner.** `devmap::live::refresh_seeded_worktree` is the single "seed, then bring it to this tree" step. Every path that CoW-seeds a store calls it, and none runs a build of its own:
+
+| Path | Seeds | Then |
+| --- | --- | --- |
+| Task lanes (`workbench::agent_worktree`) | always | background refresh after setup |
+| Worktrees panel (`cmd_add_worktree`) | by default: new `seedDevmap`, on. The pointer is now opt-in (`zeroCopyDevmap`, off) | background refresh |
+| MCP `gitpulse_worktree_create` / `switch` / `isolate` | unless `zero_copy` | background refresh (long-lived server) |
+| CLI `gitpulse-worktree create` / `switch --create` / `isolate` | unless `--zero-copy`. `create` used to seed only with `--no-cache`, so the default `--share-cache` left every such worktree unseeded | inline refresh, because the process exits on return |
+
+A pointer-only worktree is never refreshed, since that would be the cold build the seed exists to avoid. Tests:
+- `seed_devmap_clones_the_store_and_starts_the_worktrees_own_build` (panel command);
+- `isolate_seeds_the_store_and_starts_the_worktrees_own_build` and `isolate_with_the_zero_copy_pointer_starts_no_build` (MCP);
+- `cli_create_seeds_the_worktree_store_and_builds_it_in_place` (CLI).
+
+The lane, MCP and CLI tests each failed with the change removed. The CLI test failed on `devmap_seeded:false` with `cache_shared:true`. Not covered by a test: MCP `gitpulse_worktree_create` and `switch`, because the tool places the worktree beside the repository, outside a test sandbox. They take the same `DevmapOutcome::Provisioned { zero_copy: false }` branch.
+
+**Owned elsewhere or deferred, named:**
+1. **DevCouncil hook (owner: DevCouncil).** Worktrees made outside GitPulse (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still get a cold build. The fix belongs in `devmap`:
+   - `devmap build --seed-from <main checkout>` clones the main store when the target store is missing, rebinds `pending_state.repo_root` and `generations.repo_root`, then continues as an incremental build;
+   - `unindexed_worktree_notice` passes `--seed-from` in `detach_build` when the main checkout is indexed.
+   
+   It lands as a DevCouncil branch, then a `devmap` reinstall and `bun run check:schema-parity`. It changes no schema. Once it lands, GitPulse's seed and that hook agree, and the pointer is redundant for agents.
+2. **Pinned live-WAL clone instead of `VACUUM INTO`: measured, deferred.** A clone is a new file, so its `PRAGMA quick_check` is a cold read: 2.18 s on the 363 MB store (0.26–0.27 s warm, n=3). The pinned clone plus its check therefore costs about 2.3 s, against 0.58 s for `VACUUM INTO`, and saves only the 284 MB write. Shipping it unchecked would rest on a 25-run stress result whose negative control also passed. The path is also rare: devmap checkpoints on close, so main's `-wal` is non-empty only mid-build. `VACUUM INTO` stays.
 
 ## 8. Research Notes: Where Others Spend the Bytes (2026-11-06)
 
@@ -361,6 +380,6 @@ Gathered by four research agents from primary sources. Each claim below was chec
 **Ranked next steps:**
 1. `devmap build --seed-from` in DevCouncil (§7 item 1). This makes every host's new worktree query-ready in about 0.1 s.
 2. A content-addressed extraction cache shared across worktrees, keyed by (blob SHA, extractor version), under the git common dir. Today's `extraction_cache` lives inside each store and diverges after the first incremental build.
-3. The pinned live-WAL clone in place of `VACUUM INTO` (§7 item 3).
+3. ~~The pinned live-WAL clone in place of `VACUUM INTO`~~: measured and deferred (§7). Its integrity check on a cold clone costs more than `VACUUM INTO` saves in time.
 4. Lane teardown that reclaims `target/` and the store with the worktree, plus `build.build-dir` under one root, because the 250 GiB incidents were cleanup failures, not creation costs.
 5. A Glean-style base-plus-overlay read path in `devmap` itself. This is only worth doing if seeded stores still diverge expensively after (2).

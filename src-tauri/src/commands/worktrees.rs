@@ -39,6 +39,7 @@ pub async fn cmd_add_worktree(
     cow_caches: Option<bool>,
     run_hooks: Option<bool>,
     zero_copy_devmap: Option<bool>,
+    seed_devmap: Option<bool>,
     sparse_paths: Option<Vec<String>>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, IpcError> {
     off_thread(move || {
@@ -50,12 +51,29 @@ pub async fn cmd_add_worktree(
             detach,
             cow_caches.unwrap_or(false),
             run_hooks.unwrap_or(false),
-            zero_copy_devmap.unwrap_or(false),
+            devmap_mode(zero_copy_devmap, seed_devmap),
             sparse_paths.as_deref(),
             &|repo, argv| guard(repo, argv),
         )
     })
     .await
+}
+
+/// The DevMap state a new worktree is asked for. The zero-copy pointer, when
+/// asked for, wins; otherwise `seed_devmap` asks for a CoW-cloned store; a
+/// caller that names neither gets none, as before either field existed.
+fn devmap_mode(
+    zero_copy_devmap: Option<bool>,
+    seed_devmap: Option<bool>,
+) -> crate::engine::worktree::DevmapMode {
+    use crate::engine::worktree::DevmapMode;
+    if zero_copy_devmap.unwrap_or(false) {
+        DevmapMode::ZeroCopy
+    } else if seed_devmap.unwrap_or(false) {
+        DevmapMode::Copy
+    } else {
+        DevmapMode::None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,7 +85,7 @@ pub(crate) fn add_worktree_guarded(
     detach: bool,
     cow_caches: bool,
     run_hooks: bool,
-    zero_copy_devmap: bool,
+    devmap: crate::engine::worktree::DevmapMode,
     sparse_paths: Option<&[String]>,
     gate: WorktreeGate<'_>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, CommandError> {
@@ -110,10 +128,21 @@ pub(crate) fn add_worktree_guarded(
         // Off unless asked for; and even then only hooks a person
         // approved for this exact file run.
         run_hooks,
-        zero_copy_devmap,
+        devmap,
         sparse_paths,
         &mut judge,
     )?;
+    // A seeded store is the main checkout's generation; bring it to this
+    // worktree's own tree (the pointer leaves no local store to build).
+    if matches!(
+        created.devmap,
+        crate::engine::worktree::DevmapOutcome::Provisioned { zero_copy: false }
+    ) {
+        crate::devmap::live::refresh_seeded_worktree(
+            &created.path,
+            crate::devmap::live::SeededRefresh::Background,
+        );
+    }
     Ok(Guarded {
         policy: policy.ok_or_else(|| {
             CommandError::plain("The worktree was created without being judged by the policy gate.")
@@ -457,7 +486,7 @@ mod tests {
             false,
             false,
             false,
-            true,
+            crate::engine::worktree::DevmapMode::ZeroCopy,
             None,
             &gate,
         );
@@ -474,7 +503,7 @@ mod tests {
             false,
             false,
             false,
-            true,
+            crate::engine::worktree::DevmapMode::ZeroCopy,
             None,
             &gate,
         )
@@ -510,7 +539,7 @@ mod tests {
             false,
             false,
             false,
-            true,
+            crate::engine::worktree::DevmapMode::ZeroCopy,
             Some(&sparse_paths),
             &gate,
         )
@@ -548,7 +577,7 @@ mod tests {
             false,
             false,
             false,
-            false,
+            crate::engine::worktree::DevmapMode::None,
             Some(&sparse_paths),
             &gate,
         )
@@ -567,5 +596,99 @@ mod tests {
             devmap_query::paths::store_path(sp_local_wt).is_file(),
             "zero_copy_devmap=false with sparse_paths must provision local devmap.sqlite"
         );
+    }
+
+    /// What the Worktrees panel asks for by default: a full checkout whose
+    /// DevMap store is CoW-cloned from the main checkout and then built for
+    /// this worktree's own tree. The zero-copy pointer is invisible to the
+    /// `devmap` binary agents run (DevMap's hook cold-builds beside it), so it
+    /// is no longer the default.
+    #[cfg(unix)]
+    #[test]
+    fn seed_devmap_clones_the_store_and_starts_the_worktrees_own_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = tempfile::tempdir().expect("tempdir");
+        let log = bin_dir.path().join("devmap-argv.log");
+        let bin = bin_dir.path().join("devmap");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s %s\\n' \"$PWD\" \"$*\" >> '{log}'\n\
+                 if [ \"$1\" = status ]; then printf '%s\\n' '{{\"is_fresh\":false,\"schema_outdated\":false}}'; exit 0; fi\n\
+                 if [ \"$1\" = build ]; then printf '%s\\n' '{{\"ok\":true}}'; exit 0; fi\n\
+                 exit 2\n",
+                log = log.display()
+            ),
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _devmap = crate::devmap::cli::bind_test_binary(bin.to_string_lossy().into_owned());
+
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
+        let repo_dir = anchor_fixture.path().to_path_buf();
+        crate::test_support::git_in(&repo_dir, &["config", "user.name", "Test"]);
+        crate::test_support::git_in(&repo_dir, &["config", "user.email", "test@example.com"]);
+        crate::test_support::git_in(&repo_dir, &["add", "src"]);
+        crate::test_support::git_in(&repo_dir, &["commit", "-m", "init"]);
+        crate::test_support::trust_repo(&repo_dir);
+
+        assert_eq!(
+            devmap_mode(None, Some(true)),
+            crate::engine::worktree::DevmapMode::Copy
+        );
+        assert_eq!(
+            devmap_mode(Some(true), Some(true)),
+            crate::engine::worktree::DevmapMode::ZeroCopy
+        );
+        assert_eq!(
+            devmap_mode(None, None),
+            crate::engine::worktree::DevmapMode::None
+        );
+
+        let target = sandbox.path().join("wt-seeded");
+        let created = add_worktree_guarded(
+            repo_dir.to_str().expect("repo"),
+            target.to_str().expect("target"),
+            Some("feat/seeded"),
+            None,
+            false,
+            false,
+            false,
+            devmap_mode(None, Some(true)),
+            None,
+            &|repo, argv| crate::harness::guard_command(repo, argv),
+        )
+        .expect("seeded add_worktree_guarded");
+        let wt = std::path::Path::new(&created.output.path)
+            .canonicalize()
+            .expect("canonical worktree");
+        assert!(devmap_query::paths::store_path(&wt).is_file());
+        assert!(
+            crate::codeintel::load_zero_copy_base_ref(&created.output.path)
+                .expect("load base ref")
+                .is_none()
+        );
+
+        let deadline = std::time::Instant::now()
+            + crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(10));
+        loop {
+            let seen = std::fs::read_to_string(&log).unwrap_or_default();
+            if seen.lines().any(|line| {
+                line.split_once(' ').is_some_and(|(cwd, argv)| {
+                    std::path::Path::new(cwd).canonicalize().ok().as_deref() == Some(wt.as_path())
+                        && argv.split_whitespace().next() == Some("build")
+                })
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no devmap build was started in {}; devmap saw:\n{seen}",
+                wt.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }

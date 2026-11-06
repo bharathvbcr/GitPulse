@@ -28,10 +28,11 @@ use gitpulse_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
 use gitpulse_lib::engine::git_cli::capture_command;
 use gitpulse_lib::engine::git_reader::compute_default_base;
 use gitpulse_lib::engine::worktree::{
-    add_sparse_worktree_zero_copy, add_worktree, add_worktree_argv, add_worktree_extended,
+    add_sparse_worktree_zero_copy, add_worktree, add_worktree_argv, add_worktree_with_devmap,
     expand_sparse_cone_with_devmap, list_worktrees, merge_worktree_pipeline, prune_worktree,
     reap_processes_in_dir, remove_worktree, remove_worktree_argv, resolve_worktree_family,
-    resolve_worktree_path_for_branch, user_changed_paths, verify_branch_integration,
+    resolve_worktree_path_for_branch, user_changed_paths, verify_branch_integration, DevmapMode,
+    DevmapOutcome,
 };
 use gitpulse_lib::ipc_error::CommandError;
 use gitpulse_worktree::build_cache::{
@@ -864,22 +865,31 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 }
                 (path, zc_seeded, zc_seeded, None)
             } else {
-                let created = add_worktree_extended(
+                // The store is seeded whether or not build caches are shared:
+                // a worktree without one is cold-built by DevMap's own hook
+                // (`add_worktree_extended` seeds none, so `--share-cache`
+                // used to leave every such worktree unseeded).
+                let selection = CacheSelection::default();
+                let created = add_worktree_with_devmap(
                     &repo,
                     target_str,
                     Some(&branch),
                     base.as_deref(),
                     false,
-                    share_cache,
+                    share_cache.then_some(&selection),
                     true,
+                    DevmapMode::Copy,
                 )
                 .map_err(CommandError::into_message)?;
-                if !share_cache {
-                    if let Ok(family) = resolve_worktree_family(&repo, &created.path) {
-                        let _ = provision_worktree_devmap(&family.anchor, &family.worktree);
-                    }
+                let seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
+                if seeded {
+                    // This process exits when the command returns, and a
+                    // background build would die with it.
+                    gitpulse_lib::devmap::live::refresh_seeded_worktree(
+                        &created.path,
+                        gitpulse_lib::devmap::live::SeededRefresh::Inline,
+                    );
                 }
-                let seeded = devmap_query::paths::store_path(Path::new(&created.path)).is_file();
                 (created.path, seeded, false, None)
             };
 
@@ -980,18 +990,25 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 let argv = add_worktree_argv(target_str, Some(&branch), base.as_deref(), false);
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 gitpulse_lib::harness::guard_command(&repo, &argv_refs)?;
-                let created = add_worktree_extended(
+                let selection = CacheSelection::default();
+                let created = add_worktree_with_devmap(
                     &repo,
                     target_str,
                     Some(&branch),
                     base.as_deref(),
                     false,
+                    Some(&selection),
                     true,
-                    true,
+                    DevmapMode::Copy,
                 )
                 .map_err(CommandError::into_message)?;
-                let devmap_seeded =
-                    devmap_query::paths::store_path(Path::new(&created.path)).is_file();
+                let devmap_seeded = matches!(created.devmap, DevmapOutcome::Provisioned { .. });
+                if devmap_seeded {
+                    gitpulse_lib::devmap::live::refresh_seeded_worktree(
+                        &created.path,
+                        gitpulse_lib::devmap::live::SeededRefresh::Inline,
+                    );
+                }
                 return Ok(json!({
                     "ok": true,
                     "branch": branch,
@@ -1064,6 +1081,12 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 }
                 Err(e) => (false, format!("failed: {}", e.message())),
             };
+            if devmap_seeded && !zero_copy {
+                gitpulse_lib::devmap::live::refresh_seeded_worktree(
+                    &target.to_string_lossy(),
+                    gitpulse_lib::devmap::live::SeededRefresh::Inline,
+                );
+            }
             let overlay_dirty = target
                 .to_str()
                 .and_then(|s| sync_worktree_overlay(s).ok())

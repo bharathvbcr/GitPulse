@@ -24,7 +24,16 @@ before that tag is pushed.
   1.2 s (debug build) instead of about 7.6 s and ~38 CPU-seconds, and costs
   7–20 MB instead of about 366 MB. Its own build then takes about 2.5 s. With
   eight lanes at once, a bare clone plus incremental build took about 9 s,
-  against about 42 s cold. A seed that is skipped (low disk, or no index in the
+  against about 42 s cold. The same seed-then-refresh now covers every
+  GitPulse path that creates a worktree:
+  - The Worktrees panel seeds by default (new `seedDevmap`). The zero-copy
+    pointer is now opt-in, because only GitPulse reads it: the `devmap`
+    agents run cold-builds beside it.
+  - MCP `gitpulse_worktree_create`, `switch` and `isolate`.
+  - The `gitpulse-worktree` CLI, whose plain `create` with shared caches
+    used to seed nothing.
+
+  A seed that is skipped (low disk, or no index in the
   main checkout) or fails is logged, and the lane still starts; DevMap's own
   hook then builds the index as before. Measurements and remaining work are in
   `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.

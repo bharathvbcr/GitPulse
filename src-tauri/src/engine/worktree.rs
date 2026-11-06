@@ -2248,9 +2248,10 @@ pub fn add_worktree_extended(
 /// the sequence; the engine never runs a git write nobody judged.
 pub type GitWriteGate<'a> = &'a mut dyn FnMut(&[&str]) -> Result<(), CommandError>;
 
-/// Creates a linked worktree with optional Copy-on-Write cache cloning,
-/// optional zero-copy DevMap pointer (`base_store_ref.json`), optional
-/// DevMap-guided `--cone` sparse checkout paths, and approved `post_create` hooks.
+/// Creates a linked worktree with optional Copy-on-Write cache cloning, its
+/// DevMap state as `devmap` asks (a CoW-cloned store, the zero-copy pointer
+/// `base_store_ref.json`, or none), optional DevMap-guided `--cone` sparse
+/// checkout paths, and approved `post_create` hooks.
 /// `gate` judges every git write of the sparse sequence (the plain add is
 /// judged by the caller before this is called).
 #[allow(clippy::too_many_arguments)]
@@ -2262,10 +2263,13 @@ pub fn add_worktree_configured(
     detach: bool,
     cow_caches: bool,
     run_hooks: bool,
-    zero_copy_devmap: bool,
+    devmap: DevmapMode,
     sparse_paths: Option<&[String]>,
     gate: GitWriteGate<'_>,
 ) -> Result<WorktreeCreated, CommandError> {
+    // A sparse cone gets DevMap state either way: the pointer when asked for
+    // it, otherwise a local CoW store (see `add_sparse_worktree_zero_copy`).
+    let zero_copy_devmap = devmap == DevmapMode::ZeroCopy;
     let cleaned_sparse: Vec<String> = sparse_paths
         .unwrap_or(&[])
         .iter()
@@ -2321,11 +2325,7 @@ pub fn add_worktree_configured(
         detach,
         cow_caches.then_some(&selection),
         run_hooks,
-        if zero_copy_devmap {
-            DevmapMode::ZeroCopy
-        } else {
-            DevmapMode::None
-        },
+        devmap,
     )
 }
 
