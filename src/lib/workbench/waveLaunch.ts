@@ -122,6 +122,12 @@ function haltingCode(cause: unknown): "conflict" | "squash_parked" | null {
   return code === "conflict" || code === "squash_parked" ? code : null;
 }
 
+/** A git older than 2.38, which the wave refuses rather than merging in the checkout. A candidate the verifier rejected is not this: it names no such flag. */
+function writeTreeUnavailable(cause: unknown): boolean {
+  const text = cause instanceof MergeTeardownFailure ? cause.failure.message : cause instanceof Error ? cause.message : cause !== null && typeof cause === "object" && typeof (cause as { message?: unknown }).message === "string" ? (cause as { message: string }).message : "";
+  return text.includes("merge-tree --write-tree");
+}
+
 export interface WaveDeps {
   /** Ranked suggestions, most important first (Manvi `work.tasks.suggest`). */
   suggest(signal: AbortSignal): Promise<Suggestion>;
@@ -494,6 +500,15 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         );
         return true;
       }
+      if (writeTreeUnavailable(cause)) {
+        await settle(
+          (m) => (m.taskId === next.taskId ? { ...m, phase: "held", detail: `Not merged: ${message(cause)}` } : m.phase === "ready" ? { ...m, phase: "held", detail: "not merged: merge-tree --write-tree is unavailable pending" } : m),
+          "halted",
+          `Merging "${next.title}" was refused because merge-tree --write-tree is unavailable; no further task was launched or merged.`,
+        );
+        return true;
+      }
+      // A rejected candidate (`candidate_failed`) and any other refusal hold this member and continue.
       await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
       return true;
     }

@@ -45,6 +45,12 @@ describe("what a worktree operation left undone", () => {
     expect(worktreeSetupNotices({ sweep_problems: ["x"] }, "create")).toEqual([]);
   });
 
+  it("after a merge, shows why the checkout was left or that the older-git fallback ran", () => {
+    const note = "checkout not advanced: the main checkout was left detached at the previous commit so uncommitted files were kept.";
+    expect(worktreeSetupNotices({ worktree_removed: true, branch_deleted: true, checkout_note: note }, "merge")).toEqual([note]);
+    expect(worktreeSetupNotices({ checkout_note: note }, "create")).toEqual([]);
+  });
+
   it("after a teardown, says the merge happened and the cleanup did not", () => {
     expect(worktreeSetupNotices({ hook_error: "exit 4" }, "merge")).toEqual([
       "The merge and teardown finished, but the post_merge hook did not: exit 4",

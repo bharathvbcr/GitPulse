@@ -9,6 +9,7 @@ const valid: MergeTeardownError[] = [
   { code: "base_mismatch", message: "mismatch", base_branch: "main", target_branch: "dev", base_oid: "abc" },
   { code: "squash_parked", message: "parked" },
   { code: "refused", message: "no" },
+  { code: "candidate_failed", message: "the candidate failed", candidate: "abc" },
 ];
 
 describe("readMergeTeardownError", () => {
@@ -35,6 +36,9 @@ describe("readMergeTeardownError", () => {
       { code: "base_mismatch", message: "m", base_branch: "x" },
       { code: "squash_parked" },
       { code: "squash_parked", message: "   " },
+      { code: "conflict", message: "m", paths: ["a"], total: 1, rolled_back: true, rollback_error: null, candidate: 1 },
+      { code: "candidate_failed", message: "m" },
+      { code: "candidate_failed", message: "m", candidate: 1 },
       { code: "exploded", message: "m" },
       { message: "no code" },
     ]) expect(readMergeTeardownError(bad), JSON.stringify(bad)).toBeNull();

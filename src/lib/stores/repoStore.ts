@@ -3356,7 +3356,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * anywhere else once it holds its lock. Its typed refusal stays on `cause`.
      */
     worktreeMergeTeardown: async (
-      request: { worktreePath: string; targetBranch: string | null; squash: boolean; expectedTip: string },
+      request: { worktreePath: string; targetBranch: string | null; squash: boolean; expectedTip: string; requireWriteTree?: boolean; taskId?: string },
       target?: MutationTarget | null,
       handled: boolean = false,
     ) =>
@@ -3370,6 +3370,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             targetBranch: request.targetBranch,
             squash: request.squash,
             expectedTip: request.expectedTip,
+            // Always a boolean, so an omitted panel call stays on the fallback-capable path.
+            requireWriteTree: request.requireWriteTree === true,
+            ...(request.taskId ? { taskId: request.taskId } : {}),
           }),
         { target, expected: handled ? () => true : undefined },
       ),

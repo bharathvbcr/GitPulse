@@ -53,7 +53,7 @@ pub use preflight::{
 };
 pub(crate) use preflight::{
     git_supports, parse_git_version, supports, COMMIT_GRAPH_CHANGED_PATHS, DIFF_MERGES_OPTION,
-    FORCE_IF_INCLUDES, SINCE_AS_FILTER,
+    FORCE_IF_INCLUDES, MERGE_TREE_WRITE_TREE, SINCE_AS_FILTER,
 };
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished

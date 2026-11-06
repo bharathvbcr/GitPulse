@@ -46,8 +46,14 @@ describe("mergeVerifiedAttempt", () => {
     const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
     expect(result).toEqual({ head: "1234567890abcdef", message: "Merged 1 commit from gitpulse/fix into main. The worktree was removed.", beforeOid: "a", afterOid: "1234567890abcdef" });
     // The head the verdict was reached for is the tip the host holds the merge to.
-    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "1234567890abcdef" });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "1234567890abcdef", requireWriteTree: true });
     expect(invoke.mock.calls.map((c) => String(c[0])).filter((c) => /push|remote/.test(c))).toEqual([]);
+  });
+
+  it("sends the task id when the wave names one", async () => {
+    setup();
+    await mergeVerifiedAttempt(run, "1234567890abcdef", "ft-task");
+    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "1234567890abcdef", requireWriteTree: true, taskId: "ft-task" });
   });
 
   it("adv: carries the target's tip before and after the merge, and a null after-oid as null, never as the head", async () => {

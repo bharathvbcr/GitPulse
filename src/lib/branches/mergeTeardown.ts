@@ -31,11 +31,13 @@ export function readMergeTeardownError(cause: unknown): MergeTeardownError | nul
   const message = v.message;
   if (!isText(message) || message.trim() === "") return null;
   switch (v.code) {
-    case "conflict":
-      if (Array.isArray(v.paths) && v.paths.every(isText) && isCount(v.total) && typeof v.rolled_back === "boolean" && (v.rollback_error === null || isText(v.rollback_error))) {
-        return { code: "conflict", message, paths: v.paths, total: v.total, rolled_back: v.rolled_back, rollback_error: v.rollback_error };
-      }
-      return null;
+    case "conflict": {
+      if (!(Array.isArray(v.paths) && v.paths.every(isText) && isCount(v.total) && typeof v.rolled_back === "boolean" && (v.rollback_error === null || isText(v.rollback_error)))) return null;
+      const error: MergeTeardownError = { code: "conflict", message, paths: v.paths, total: v.total, rolled_back: v.rolled_back, rollback_error: v.rollback_error };
+      if (!("candidate" in v)) return error;
+      if (v.candidate !== null && !isText(v.candidate)) return null;
+      return { ...error, candidate: v.candidate as string | null };
+    }
     case "moved":
       return isText(v.branch) && isText(v.expected) && isText(v.actual)
         ? { code: "moved", message, branch: v.branch, expected: v.expected, actual: v.actual }
@@ -48,6 +50,8 @@ export function readMergeTeardownError(cause: unknown): MergeTeardownError | nul
       return { code: "squash_parked", message };
     case "refused":
       return { code: "refused", message };
+    case "candidate_failed":
+      return isText(v.candidate) ? { code: "candidate_failed", message, candidate: v.candidate } : null;
     default:
       return null;
   }
