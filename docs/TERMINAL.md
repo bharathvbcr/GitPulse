@@ -71,7 +71,12 @@ literal, limited to 256 characters, and searches whatever scrollback the session
 (see **Scrollback** below).
 At 1,000 highlighted results the UI reports **1000+ matches**, not an exact total.
 
-Use **Latest output** to return from scrollback. **Clear scrollback** retains the
+Use **Latest output** to return from scrollback. Scrolling back while a session
+prints keeps your place; the view does not return to the bottom until you press
+**Latest output** or type. A mouse wheel glides about 150 ms per notch instead of
+jumping several rows at once (a trackpad still scrolls directly, and a program
+that has turned on mouse reporting keeps the wheel; see `docs/PERFORMANCE.md`,
+2026-11-06). **Clear scrollback** retains the
 current prompt and session. Text-size controls in the footer change that terminal
 from 10px to 24px; click the size to reset it to 12px. The chosen size becomes the
 default for future sessions. The new-session launcher and dock height are also
