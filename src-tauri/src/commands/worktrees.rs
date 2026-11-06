@@ -566,8 +566,10 @@ mod tests {
                 .is_some()
         );
 
-        // 4. Sparse cone checkout with `zero_copy_devmap = false` honors the caller's choice
-        //    and provisions a local CoW `devmap.sqlite` instead of forcing `base_store_ref.json`.
+        // 4. Sparse cone checkout without the pointer (`DevmapMode::None`; `Copy`
+        //    behaves the same here) still provisions a local CoW `devmap.sqlite`:
+        //    the sparse path seeds either way, and only `ZeroCopy` writes
+        //    `base_store_ref.json` instead.
         let sparse_local_target = sandbox.path().join("wt-sparse-local-devmap");
         let sparse_local_created = add_worktree_guarded(
             repo_str,
