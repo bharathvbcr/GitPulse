@@ -200,12 +200,10 @@ pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, Str
         };
         match found.iter_mut().find(|(_, known)| *known == version) {
             None => found.push((tag.to_string(), version)),
-            // Two spellings of one version: keep the one the release workflow
-            // publishes, whichever `ls-remote` listed first.
+            // Several spellings of one version (`1.5.0`, `v01.5.0`, `v1.5.0`):
+            // keep the best-ranked one, the first listed among equals.
             Some(existing) => {
-                if tag.starts_with(RELEASE_TAG_PREFIX)
-                    && !existing.0.starts_with(RELEASE_TAG_PREFIX)
-                {
+                if spelling_rank(tag, version) > spelling_rank(&existing.0, version) {
                     existing.0 = tag.to_string();
                 }
             }
@@ -226,6 +224,23 @@ pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Versi
 /// only: a bare `1.2.3` tag never gets a release, so when both spellings of a
 /// version exist [`stable_tags`] keeps this one.
 const RELEASE_TAG_PREFIX: char = 'v';
+
+/// How likely the release workflow published `tag`: the canonical
+/// `v<major>.<minor>.<patch>` spelling (2), any other `v` spelling such as
+/// `v01.5.0` (1), a bare spelling (0).
+fn spelling_rank(tag: &str, version: Version) -> u8 {
+    let canonical = format!(
+        "{RELEASE_TAG_PREFIX}{}.{}.{}",
+        version.major, version.minor, version.patch
+    );
+    if tag == canonical {
+        2
+    } else if tag.starts_with(RELEASE_TAG_PREFIX) {
+        1
+    } else {
+        0
+    }
+}
 
 /// How many tags newer than the running build are probed for a published
 /// release. A tag with no release is the exception, not a queue; the bound
