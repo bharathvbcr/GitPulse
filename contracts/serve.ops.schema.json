@@ -87,6 +87,7 @@
       "work.scan.get",
       "work.store.compact",
       "work.store.upgrade",
+      "work.tasks.organize",
       "work.tasks.suggest",
       "work.verify.get",
       "work.verify.task",
@@ -773,6 +774,174 @@
         "lane": {
           "type": "string",
           "required": true
+        }
+      }
+    },
+    "OrganizeParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "repository_id": {
+          "type": "string",
+          "required": false
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "OrganizeResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "changes": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "from": {
+                "type": "integer",
+                "required": true
+              },
+              "id": {
+                "type": "string",
+                "required": true
+              },
+              "reason": {
+                "type": "string",
+                "required": true
+              },
+              "revision": {
+                "type": "integer",
+                "required": true
+              },
+              "rule": {
+                "type": "string",
+                "required": true
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              },
+              "title": {
+                "type": "string",
+                "required": true
+              },
+              "to": {
+                "type": "integer",
+                "required": true
+              }
+            }
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "complete": {
+              "type": "boolean",
+              "required": true
+            },
+            "note": {
+              "type": "string",
+              "required": false
+            },
+            "read": {
+              "type": "integer",
+              "required": true
+            },
+            "unhydrated": {
+              "type": "integer",
+              "required": true
+            },
+            "unread": {
+              "type": "integer",
+              "required": true
+            },
+            "unrevisioned": {
+              "type": "integer",
+              "required": true
+            }
+          }
+        },
+        "differs": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "generated_at": {
+          "type": "integer",
+          "required": true
+        },
+        "groups": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "keep": {
+                "type": "string",
+                "required": true
+              },
+              "kind": {
+                "type": "string",
+                "required": true
+              },
+              "members": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              }
+            }
+          }
+        },
+        "method": {
+          "type": "string",
+          "required": true
+        },
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "order": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "ids": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "order_note": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
         }
       }
     },
