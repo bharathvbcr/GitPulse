@@ -720,11 +720,11 @@ fn discard_changes_removes_the_work_and_the_branch() {
 }
 
 #[test]
-fn a_worktree_made_from_inside_a_lane_nests_there_and_its_branch_is_still_deleted() {
-    // A session inside a linked worktree (here a GitPulse task lane) gets its
-    // worktree under that worktree, as Claude Code itself would. Attribution
-    // reads the outermost layout (the lane); the branch to delete is the
-    // innermost name.
+fn a_session_inside_a_linked_worktree_gets_its_worktree_under_the_main_checkout() {
+    // Where Claude Code 2.1.319 puts it with no hook at all (run live): under
+    // the main checkout, never nested in the linked worktree the session was
+    // started in, here a GitPulse task lane. The hook anchors there whatever
+    // `cwd` the payload carries.
     let fixture = trusted();
     let lane = fixture.root.join(".gitpulse/worktrees/lane-1");
     git_in(
@@ -742,7 +742,13 @@ fn a_worktree_made_from_inside_a_lane_nests_there_and_its_branch_is_still_delete
     let lane = lane.canonicalize().unwrap();
 
     let path = created_from(&lane, "inner");
-    assert_eq!(path, lane.join(".claude/worktrees/inner"));
+    assert_eq!(path, fixture.root.join(".claude/worktrees/inner"));
+    assert!(!lane.join(".claude").exists());
+    let layout = agent_layout(path.to_str().unwrap()).expect("an agent layout");
+    assert_eq!(
+        (layout.kind.as_str(), layout.slug.as_str()),
+        ("claude", "inner")
+    );
 
     let (finished, gate) = removing(&path, false);
     assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
@@ -938,6 +944,39 @@ fn the_launcher_makes_a_plain_worktree_when_the_binary_cannot_serve() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(not_a_worktree.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_launchers_plain_worktree_also_goes_under_the_main_checkout() {
+    // The same placement as GitPulse's own path and Claude Code's.
+    let fixture = fixture_with(|_| {});
+    let lane = fixture.root.join("lane");
+    git_in(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane",
+            lane.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let lane = lane.canonicalize().unwrap();
+    let payload = serde_json::json!({"cwd": lane, "name": "from-a-lane"});
+
+    let out = launch("/no/such/gitpulse-hook", CREATE, &payload, &lane);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let expected = fixture.root.join(".claude/worktrees/from-a-lane");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", expected.display())
+    );
+    assert!(!lane.join(".claude").exists());
 }
 
 #[cfg(unix)]

@@ -28,10 +28,10 @@
 //!   repository root, on a new branch named `worktree-<name>`"
 //!   (<https://code.claude.com/docs/en/worktrees>). That is the path and the
 //!   branch made here, so `engine::worktree::agent_layout` attributes the
-//!   result to Claude exactly as before. The repository root is the working
-//!   tree that holds the session's `cwd`: a session running inside a linked
-//!   worktree gets its worktrees nested under that worktree, as it would
-//!   without the hook.
+//!   result to Claude exactly as before. The repository root is the main
+//!   checkout: run live (Claude Code 2.1.319, 2026-11-06), a session started
+//!   inside a linked worktree gets its worktree under the main checkout, with
+//!   or without this hook, never nested under the linked one.
 //! * With the hook configured, "`.worktreeinclude` is not processed", so
 //!   GitPulse processes it ([`crate::engine::cow_clone::worktree_include`]).
 //! * `WorktreeRemove` carries `worktree_path`. Exit 0 counts as removed;
@@ -315,6 +315,13 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
             )
         }
     };
+    // Claude Code's own `--worktree`, started from inside a linked worktree,
+    // puts the new one under the repository's main checkout, not under that
+    // worktree (Claude Code 2.1.319, run live on 2026-11-06), and sends the
+    // main checkout as `cwd`. Anchoring there ourselves keeps that placement
+    // whatever `cwd` a payload carries. A repository with no main checkout
+    // (a bare one) keeps the working tree the session is in.
+    let root = main_checkout(&root).unwrap_or(root);
     if let Some(unavailable) = untrusted(&root) {
         return Finished::unavailable(notes, unavailable);
     }
@@ -979,10 +986,11 @@ pub(crate) fn work_held(worktree: &Path, branch: Option<&str>) -> Result<Option<
 /// `worktree-<name>`, checked out at a path ending `.claude/worktrees/<name>`.
 ///
 /// Read from the end of the path, not with `agent_layout`, whose outermost
-/// match is the right answer for attribution and the wrong one here: a session
-/// inside a GitPulse lane or another agent's worktree nests its worktree under
-/// it (`<lane>/.claude/worktrees/<name>`), and the branch to delete is named
-/// after the innermost segment.
+/// match is the right answer for attribution and the wrong one here. The hook
+/// never nests a worktree (it anchors at the main checkout), but a removal can
+/// still be asked for one made some other way under another agent's layout
+/// (`<lane>/.claude/worktrees/<name>`), and its branch is named after the
+/// innermost segment.
 pub(crate) fn made_by_claude(worktree: &Path, branch: &str) -> bool {
     let segments: Vec<&str> = worktree.iter().filter_map(|s| s.to_str()).collect();
     match segments.as_slice() {

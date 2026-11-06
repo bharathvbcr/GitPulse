@@ -96,6 +96,13 @@ create() {
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then dir=$PWD; fi
   root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) ||
     { say "refused: $dir is not inside a git working tree"; exit 1; }
+  # Under the main checkout, as Claude Code itself places it, even from a
+  # session started inside a linked worktree; a bare repository keeps the
+  # working tree the session is in.
+  common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
+  if [ "${common##*/}" = .git ] && [ -d "${common%/.git}" ]; then
+    root=${common%/.git}
+  fi
   root=$(cd "$root" && pwd -P) || { say "refused: cannot resolve $root"; exit 1; }
   for container in "$root/.claude" "$root/.claude/worktrees"; do
     if [ -L "$container" ] || { [ -e "$container" ] && [ ! -d "$container" ]; }; then
