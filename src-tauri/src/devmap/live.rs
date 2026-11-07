@@ -3590,6 +3590,8 @@ exit 2
         stub_dir: tempfile::TempDir,
         wt_parent: tempfile::TempDir,
         wt: PathBuf,
+        /// The worktree's slot key, taken while the directory still exists.
+        canon: PathBuf,
         _bound: cli::TestBinaryBinding,
     }
 
@@ -3623,6 +3625,11 @@ exit 2
             &["worktree", "add", "-b", "lane", wt.to_str().unwrap()],
         );
         crate::test_support::trust_repo(&wt);
+        // The index state is generated, not work: it must not make the lane
+        // "dirty" to a merge.
+        let exclude = main.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".devcouncil/\n.devmap/\n").unwrap();
         write_stub_artifacts(&wt);
         let stub_dir = tempfile::tempdir().unwrap();
         let bin = stub_dir.path().join("devmap");
@@ -3652,7 +3659,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
         ));
+        let canon = canonical_repo_path(&wt);
         RemovalFixture {
+            canon,
             main,
             stub_dir,
             wt_parent,
@@ -3662,7 +3671,52 @@ exit 2
     }
 
     #[cfg(unix)]
+    /// A test that fails part-way still stops its stub build before the
+    /// directories it writes into are deleted.
+    #[cfg(unix)]
+    impl Drop for RemovalFixture {
+        fn drop(&mut self) {
+            self.release_and_wait();
+        }
+    }
+
+    #[cfg(unix)]
     impl RemovalFixture {
+        /// Whether no live build still holds this worktree's writer slot.
+        fn slot_free(&self) -> bool {
+            !live_build_slots()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&self.canon)
+        }
+
+        /// Releases the stub build and waits, bounded, for its slot to come
+        /// free. Keyed on the worktree's own slot: the stub's `release` file
+        /// lives in `stub_dir`, whose path is not the slot's key.
+        fn release_and_wait(&self) {
+            let _ = std::fs::write(self.stub_dir.path().join("release"), "");
+            let deadline = Instant::now() + Duration::from_secs(35);
+            while !self.slot_free() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// The end of every test: release, wait, and prove nothing is left
+        /// running to write into a fixture that is about to be deleted.
+        fn finish(&self) {
+            self.release_and_wait();
+            self.assert_idle();
+        }
+
+        /// What every test ends on: the stub build is over and its slot free,
+        /// so nothing outlives the test and writes into a deleted fixture.
+        fn assert_idle(&self) {
+            assert!(
+                self.slot_free(),
+                "a stub build still holds the worktree's slot at the end of the test"
+            );
+        }
+
         fn start_background_refresh(&self) {
             let started =
                 refresh_seeded_worktree(self.wt.to_str().unwrap(), SeededRefresh::Background);
@@ -3707,7 +3761,6 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
         let fixture = removal_fixture(600);
-        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
         fixture.start_background_refresh();
         // The refresh finishes a second after removal begins: well inside the
         // wait's bound, long after an unguarded removal has returned.
@@ -3739,6 +3792,7 @@ exit 2
         assert!(!fixture.wt.exists(), "worktree directory is left behind");
         assert!(!fixture.registered());
         releaser.join().unwrap();
+        fixture.finish();
     }
 
     /// Once removal has begun nothing writes into the path again: no write
@@ -3749,7 +3803,6 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
         let fixture = removal_fixture(600);
-        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
         fixture.start_background_refresh();
         let release_file = fixture.stub_dir.path().join("release");
         let releaser = std::thread::spawn(move || {
@@ -3767,6 +3820,7 @@ exit 2
         }
         releaser.join().unwrap();
         let _ = &fixture.wt_parent;
+        fixture.finish();
     }
 
     /// A refresh that outlives the bound: removal reports why and the
@@ -3779,7 +3833,6 @@ exit 2
         clear_all_live_echo_cooldowns();
         let fixture = removal_fixture(600);
         let path = fixture.wt.to_string_lossy().into_owned();
-        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
         fixture.start_background_refresh();
 
         let started = Instant::now();
@@ -3800,5 +3853,73 @@ exit 2
         );
         assert!(fixture.registered(), "the worktree was deregistered");
         assert!(cli::is_build_in_flight(&path));
+        fixture.finish();
+    }
+
+    impl RemovalFixture {
+        fn merge_and_teardown(
+            &self,
+        ) -> Result<
+            crate::engine::worktree::MergeTeardownResult,
+            crate::engine::worktree::MergeTeardownError,
+        > {
+            crate::engine::worktree::merge_and_teardown_worktree(
+                self.main.path().to_str().unwrap(),
+                self.wt.to_str().unwrap(),
+                Some("main"),
+                false,
+                None,
+                &mut |_args| Ok(()),
+            )
+        }
+    }
+
+    /// The path a lane normally ends by: merge, then teardown. It used to
+    /// return while the seeded refresh was still writing into the lane.
+    #[test]
+    #[cfg(unix)]
+    fn merge_teardown_waits_for_the_seeded_refresh() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        fixture.start_background_refresh();
+        let release_file = fixture.stub_dir.path().join("release");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            std::fs::write(release_file, "").unwrap();
+        });
+
+        let begun = Instant::now();
+        let merged = fixture.merge_and_teardown().expect("merge and teardown");
+        assert!(merged.worktree_removed, "{merged:?}");
+        assert!(
+            begun.elapsed() >= Duration::from_millis(900),
+            "teardown returned after {:?}, before the refresh was released",
+            begun.elapsed()
+        );
+        releaser.join().unwrap();
+        fixture.finish();
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        assert!(!fixture.registered());
+    }
+
+    /// A refresh that outlives the bound refuses before anything lands: the
+    /// lane is neither merged nor removed.
+    #[test]
+    #[cfg(unix)]
+    fn merge_teardown_refuses_before_merging_when_the_refresh_outlives_the_bound() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        fixture.start_background_refresh();
+
+        let err = fixture
+            .merge_and_teardown()
+            .expect_err("a refresh still writing must refuse the teardown");
+        let message = format!("{err:?}");
+        assert!(message.contains("devmap"), "{message}");
+        assert!(fixture.wt.join(".git").exists(), "the lane was touched");
+        assert!(fixture.registered(), "the lane was deregistered");
+        fixture.finish();
     }
 }

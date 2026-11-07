@@ -3040,6 +3040,13 @@ fn merge_and_teardown_with_seams(
     let repo = family.anchor.clone();
     let worktree = family.worktree.clone();
 
+    // A seeded background index refresh may still be writing into the lane.
+    // Held before the first irreversible step and outside the repository lock,
+    // so a refusal leaves the lane unmerged and intact, and a refresh that
+    // needs the lock cannot deadlock with the wait.
+    let _no_refresh =
+        crate::devmap::live::quiesce_for_removal(&plain_path_text(&worktree.to_string_lossy()))?;
+
     // Files an earlier teardown moved aside and did not finish deleting: the
     // sweep is their retry. It takes no lock; it is outside the merge's own.
     let sweep_problems = sweep_teardown_asides(&repo).notes();
