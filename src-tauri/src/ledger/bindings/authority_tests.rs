@@ -439,3 +439,59 @@ fn a_far_future_date_is_flagged_and_cannot_win_a_cross_ledger_comparison_by_time
     let (honest, _) = binding_precedence_key(&soon, "01H00000000000000000000001");
     assert_eq!(honest, soon, "a believable date is kept as written");
 }
+
+/// Replaces the repository's ledger with bytes SQLite cannot open, as a new
+/// file so no live connection to the old one is reused.
+fn corrupt_ledger(repo: &str) {
+    let path = crate::ledger::ledger_path(repo);
+    crate::ledger::tests_support::reset_registry_for(repo);
+    std::fs::remove_file(&path).expect("remove ledger");
+    std::fs::write(&path, b"this is not a sqlite database, not even close.").expect("garbage");
+}
+
+/// A failed binding read is not a count of zero: the read-only status says the
+/// count is unknown rather than printing a 0 a reader would trust.
+#[test]
+fn an_unreadable_ledger_reports_the_history_only_count_as_unknown_read_only() {
+    let (_dir, repo) = repo();
+    note_in(&repo);
+    corrupt_ledger(&repo);
+    let status = repository_status_readonly(&repo).expect("status");
+    assert!(status.history_only_bindings_unknown, "{status:?}");
+}
+
+/// The creating status path holds the same line: a count it could not read is
+/// unknown, never 0.
+#[test]
+fn an_unreadable_ledger_reports_the_history_only_count_as_unknown_creating() {
+    let (_dir, repo) = repo();
+    note_in(&repo);
+    corrupt_ledger(&repo);
+    let status = repository_status(&repo).expect("status");
+    assert!(status.history_only_bindings_unknown, "{status:?}");
+}
+
+/// A ledger that does not exist has no history-only rows: a real zero, not an
+/// unknown.
+#[test]
+fn a_missing_ledger_file_is_a_real_zero_history_only_count() {
+    let (_dir, repo) = repo();
+    assert!(!crate::ledger::ledger_path(&repo).exists());
+    let status = repository_status_readonly(&repo).expect("status");
+    assert_eq!(status.history_only_bindings, 0, "{status:?}");
+    assert!(!status.history_only_bindings_unknown, "{status:?}");
+}
+
+/// An unknown count must not take the `count == 0` early return: the notice
+/// says the sibling history could not be checked, under its own code.
+#[test]
+fn an_unknown_history_only_count_still_emits_a_notice() {
+    let (_dir, repo) = repo();
+    note_in(&repo);
+    let mut status = repository_status_readonly(&repo).expect("status");
+    assert_eq!(status.error_code, "", "{status:?}");
+    status.history_only_bindings_unknown = true;
+    note_history_only_bindings(&mut status);
+    assert_eq!(status.error_code, HISTORY_ONLY_UNKNOWN_CODE, "{status:?}");
+    assert!(status.error.contains("could not be checked"), "{status:?}");
+}
