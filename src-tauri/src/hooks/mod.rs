@@ -2384,6 +2384,16 @@ fn ledger_brief(ledger: &crate::ledger::LedgerStatus) -> String {
             one_bounded_line(&ledger.error, LEDGER_CAVEAT_BYTES)
         ));
     }
+    // Another failure can hold the error slot, so the flag is read on its own:
+    // an unread count is said whatever `error_code` is. The unchecked notice
+    // already says it when it is the caveat just above.
+    let said_as_caveat = ledger.recording_state == crate::ledger::STATE_READABLE
+        && ledger.error_code == crate::ledger::bindings::HISTORY_ONLY_UNKNOWN_CODE;
+    if ledger.history_only_bindings_unknown && !said_as_caveat {
+        line.push_str(
+            "; sibling history-only bind/unbind count unknown (could not be read, not zero)",
+        );
+    }
     line
 }
 

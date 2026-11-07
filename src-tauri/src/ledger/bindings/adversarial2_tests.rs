@@ -513,7 +513,9 @@ fn family_with_one_history_only_row() -> (tempfile::TempDir, String, Vec<tempfil
 fn adv_a_write_locked_ledger_reports_the_count_or_unknown_never_a_quiet_zero_readonly() {
     let (_dir, main, _keep) = family_with_one_history_only_row();
     let holder = raw(&main);
-    holder.execute_batch("BEGIN EXCLUSIVE").expect("hold the lock");
+    holder
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold the lock");
     let (tx, rx) = std::sync::mpsc::channel();
     let repo = main.clone();
     std::thread::spawn(move || {
@@ -535,7 +537,9 @@ fn adv_a_write_locked_ledger_reports_the_count_or_unknown_never_a_quiet_zero_rea
 fn adv_a_write_locked_ledger_reports_the_count_or_unknown_never_a_quiet_zero_creating() {
     let (_dir, main, _keep) = family_with_one_history_only_row();
     let holder = raw(&main);
-    holder.execute_batch("BEGIN EXCLUSIVE").expect("hold the lock");
+    holder
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold the lock");
     let (tx, rx) = std::sync::mpsc::channel();
     let repo = main.clone();
     std::thread::spawn(move || {
@@ -560,10 +564,15 @@ fn adv_a_ledger_without_an_events_table_is_a_real_zero() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE unrelated (x INTEGER)").unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (x INTEGER)")
+            .unwrap();
     }
     let count = crate::ledger::history_only_binding_count(&main);
-    assert_eq!(count, Some(0), "BROKEN: missing events table is not a real 0");
+    assert_eq!(
+        count,
+        Some(0),
+        "BROKEN: missing events table is not a real 0"
+    );
 }
 
 /// Consolidation failure (corrupt legacy sibling) with a readable anchor: the
