@@ -316,6 +316,7 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
             action: "session.command".into(),
             object: Some("git commit -m x".into()),
             outcome: Some(Outcome::Ok),
+            detail_json: Some(r#"{"result":"ok"}"#.into()),
             event_stamp: Some(stamp(*at, "transcript")),
             ..Draft::default()
         })
@@ -388,4 +389,224 @@ fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
     assert_conforms("no ledger", &got, &schema);
     assert_eq!(got["session_basis"], "ledger_not_initialised");
     assert!(got["session_basis"].is_string() && got["session_ambiguous"].is_boolean());
+}
+
+/// One ledger row for the every-basis test: a transcript command or a reflog
+/// entry, stamped (or not) the way the case needs.
+fn put_row(
+    repo: &str,
+    kind: &str,
+    message: &str,
+    commit: &str,
+    stamp: Option<(u64, &str)>,
+    result: Option<&str>,
+) {
+    use crate::ledger::{append, ids, ActorKind, Draft, EventStamp, Outcome};
+    let is_command = kind == "command";
+    append(Draft {
+        repo_path: repo.into(),
+        actor_kind: Some(if is_command {
+            ActorKind::Agent
+        } else {
+            ActorKind::System
+        }),
+        session_id: is_command.then(|| "S1".to_string()),
+        action: if is_command {
+            "session.command".into()
+        } else {
+            "reflog.commit".to_string()
+        },
+        object: Some(if is_command {
+            message.to_string()
+        } else {
+            format!("{commit} {message}")
+        }),
+        outcome: Some(Outcome::Ok),
+        after_ref: (!is_command).then(|| commit.to_string()),
+        detail_json: result.map(|word| format!(r#"{{"result":"{word}"}}"#)),
+        event_stamp: stamp.map(|(at, basis)| EventStamp {
+            occurred_at: ids::iso8601_utc(at),
+            occurred_at_basis: basis.into(),
+            task_basis: "unbound".into(),
+        }),
+        ..Draft::default()
+    })
+    .expect("append row");
+}
+
+/// Every `session_basis` the matcher can give, produced by the live tool from a
+/// real repository and a real ledger, validated against the advertised schema,
+/// with the two session fields present and typed whatever the answer.
+#[test]
+fn every_session_basis_validates_against_the_output_schema() {
+    use crate::ledger::attribution::basis;
+    let schema = schema_of("gitpulse_provenance");
+    let now = crate::ledger::ids::now_millis() / 1000 * 1000;
+    let cmd = "git commit -m x";
+    let ok = Some("ok");
+    // (expected basis, rows to record before asking)
+    type Setup = Box<dyn Fn(&str, &str)>;
+    let cases: Vec<(&str, Setup)> = vec![
+        (
+            basis::INFERRED,
+            Box::new(move |r, c| {
+                put_row(r, "command", cmd, c, Some((now - 3_000, "transcript")), ok);
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::AMBIGUOUS,
+            Box::new(move |r, c| {
+                put_row(r, "command", cmd, c, Some((now - 3_000, "transcript")), ok);
+                // A second session: same text, recorded under another session id.
+                crate::ledger::append(crate::ledger::Draft {
+                    repo_path: r.into(),
+                    actor_kind: Some(crate::ledger::ActorKind::Agent),
+                    session_id: Some("S2".into()),
+                    action: "session.command".into(),
+                    object: Some(cmd.into()),
+                    outcome: Some(crate::ledger::Outcome::Ok),
+                    detail_json: Some(r#"{"result":"ok"}"#.into()),
+                    event_stamp: Some(crate::ledger::EventStamp {
+                        occurred_at: crate::ledger::ids::iso8601_utc(now - 2_000),
+                        occurred_at_basis: "transcript".into(),
+                        task_basis: "unbound".into(),
+                    }),
+                    ..crate::ledger::Draft::default()
+                })
+                .expect("second session");
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::NO_SESSION_COMMAND,
+            Box::new(move |r, c| {
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::COMMAND_OUTSIDE_WINDOW,
+            Box::new(move |r, c| {
+                put_row(
+                    r,
+                    "command",
+                    cmd,
+                    c,
+                    Some((now - 150_000, "transcript")),
+                    ok,
+                );
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::COMMAND_AFTER_REFLOG,
+            Box::new(move |r, c| {
+                put_row(r, "command", cmd, c, Some((now + 5_000, "transcript")), ok);
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::COMMAND_UNTIMED,
+            Box::new(move |r, c| {
+                put_row(r, "command", cmd, c, None, ok);
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::COMMAND_OUTCOME_UNKNOWN,
+            Box::new(move |r, c| {
+                put_row(
+                    r,
+                    "command",
+                    cmd,
+                    c,
+                    Some((now - 3_000, "transcript")),
+                    None,
+                );
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::NO_REFLOG_ENTRY,
+            Box::new(move |r, c| {
+                put_row(r, "command", cmd, c, Some((now - 3_000, "transcript")), ok);
+            }),
+        ),
+        (
+            basis::NO_ORIGIN_ENTRY,
+            Box::new(move |r, c| {
+                put_row(
+                    r,
+                    "reflog",
+                    "merge x: Fast-forward",
+                    c,
+                    Some((now, "reflog")),
+                    None,
+                );
+            }),
+        ),
+        (
+            basis::REFLOG_UNTIMED,
+            Box::new(move |r, c| {
+                put_row(r, "reflog", "commit: x", c, Some((now, "ingest")), None);
+            }),
+        ),
+        (
+            basis::SCAN_CAPPED,
+            Box::new(move |r, c| {
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+                let db =
+                    rusqlite::Connection::open(crate::ledger::ledger_path(r)).expect("open ledger");
+                let tx = db.unchecked_transaction().expect("tx");
+                for n in 0..(crate::ledger::attribution::LINK_SCAN_ROWS + 10) {
+                    tx.execute(
+                        "INSERT INTO events (ulid, ts_utc, repo_path, actor_kind, action, outcome)
+                     VALUES (?1, '2026-01-01T00:00:00.000Z', 'r', 'system', 'noise', 'ok')",
+                        [format!("{n:026}")],
+                    )
+                    .expect("noise");
+                }
+                tx.commit().expect("commit noise");
+            }),
+        ),
+        (basis::LEDGER_ABSENT, Box::new(|_, _| {})),
+        (
+            basis::LEDGER_UNREADABLE,
+            Box::new(|r, _| {
+                let dir = std::path::Path::new(r).join(".devcouncil");
+                std::fs::create_dir_all(&dir).expect("state dir");
+                std::fs::write(dir.join("ledger.sqlite"), vec![0x42u8; 4096]).expect("garbage");
+            }),
+        ),
+    ];
+    let mut produced = std::collections::BTreeSet::new();
+    for (expected, setup) in &cases {
+        let (_keep, repo) = repo_with_root();
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+        setup(&repo, &sha);
+        let args = json!({ "repo_path": repo, "commit_sha": sha, "base_branch": "main" });
+        validate_arguments("gitpulse_provenance", &args).expect("arguments");
+        let got = handle_tool_call("gitpulse_provenance", &args).expect("provenance");
+        assert_conforms(expected, &got, &schema);
+        assert_eq!(got["session_basis"], *expected, "{got}");
+        assert!(got["session_basis"].is_string() && got["session_ambiguous"].is_boolean());
+        assert_eq!(
+            got["session_ambiguous"],
+            *expected == basis::AMBIGUOUS,
+            "{expected}"
+        );
+        assert_eq!(
+            !got["session"].is_null(),
+            *expected == basis::INFERRED,
+            "{expected}"
+        );
+        produced.insert(*expected);
+    }
+    // The one value a single call cannot reach: past the per-call commit bound.
+    produced.insert(basis::NOT_EXAMINED);
+    let listed: std::collections::BTreeSet<&str> = basis::ALL.into_iter().collect();
+    assert_eq!(
+        produced, listed,
+        "a basis value the schema test did not exercise"
+    );
 }
