@@ -83,7 +83,7 @@
   } from "../health/format";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
   import { HEALTH_CONTENT_WIDTH, HEALTH_PROSE_WIDTH } from "../health/sections";
-  import type { SectionCount } from "../health/counts";
+  import { vulnerabilityEmptyMessage, type SectionCount } from "../health/counts";
   import { withoutTrailingPeriod } from "../format";
   import { keyedList } from "../ui/eachKeys";
   import HealthSection from "./health/HealthSection.svelte";
@@ -1458,7 +1458,7 @@
                 : auditsRan
                   ? `Local audit incomplete${gap ? ` (${gap})` : ""}; no all-clear is available.`
                   : `Local audit did not run${gap ? ` (${gap})` : ""}.`
-              : "No direct dependencies are vulnerable."}
+              : vulnerabilityEmptyMessage(filter, vulnerabilitiesCapped)}
           </p>
         {:else}
           <HealthTable caption="Known vulnerabilities in this repository's dependencies" columns={VULNERABILITY_COLUMNS}>

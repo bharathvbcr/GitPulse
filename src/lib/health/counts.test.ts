@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatSectionCount, isBounded, type SectionCount } from "./counts";
+import {
+  formatSectionCount,
+  isBounded,
+  vulnerabilityEmptyMessage,
+  type SectionCount,
+} from "./counts";
 
 /**
  * This replaces a regex that read the panel's `<h3>` text and asserted that a
@@ -39,6 +44,14 @@ describe("formatSectionCount", () => {
     );
   });
 
+  it("never prints a floor of zero when a cap dropped everything that was filtered", () => {
+    expect(
+      formatSectionCount({ shown: 0, total: 0, atLeast: true, qualifier: "direct" }),
+    ).toBe("direct count unknown");
+    expect(formatSectionCount({ shown: 0, total: 0, atLeast: true })).toBe("count unknown");
+    expect(formatSectionCount({ shown: 0, total: 0, qualifier: "direct" })).toBe("0 direct");
+  });
+
   it("never claims fewer items than the table beneath it lists", () => {
     // A backend that reports only what it returned must not be able to make a
     // heading contradict its own rows.
@@ -72,9 +85,11 @@ describe("formatSectionCount", () => {
               expect(text).toContain(`${observed}`);
             }
             if (atLeast) {
-              expect(text, `${JSON.stringify(count)} lost its floor marker`).toContain(
-                "at least",
+              // A floor of zero carries no information, so it reads "unknown".
+              expect(text, `${JSON.stringify(count)} lost its floor marker`).toMatch(
+                observed === 0 ? /^(\w+ )?count unknown$/ : /at least/,
               );
+              expect(text).not.toContain("at least 0");
             }
             // Whatever else it prints, a bounded count is never just a number.
             if (isBounded(count)) {
@@ -96,5 +111,25 @@ describe("isBounded", () => {
   it("is false only for a complete, fully displayed result", () => {
     expect(isBounded({ shown: 3, total: 3 })).toBe(false);
     expect(isBounded({ shown: 0, total: 0 })).toBe(false);
+  });
+});
+
+describe("vulnerabilityEmptyMessage", () => {
+  it("says dropped rows may include direct advisories when the cap fired on Direct", () => {
+    const text = vulnerabilityEmptyMessage("direct", true);
+    expect(text).not.toBe("No direct dependencies are vulnerable.");
+    expect(text).toContain("dropped rows may include direct advisories");
+  });
+
+  it("keeps the direct-specific all-clear only when nothing was dropped", () => {
+    expect(vulnerabilityEmptyMessage("direct", false)).toBe(
+      "No direct dependencies are vulnerable.",
+    );
+  });
+
+  it("is not direct-specific under the All filter", () => {
+    for (const capped of [false, true]) {
+      expect(vulnerabilityEmptyMessage("all", capped)).not.toMatch(/direct/i);
+    }
   });
 });
