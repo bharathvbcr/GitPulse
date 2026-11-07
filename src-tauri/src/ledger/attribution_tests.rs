@@ -2371,3 +2371,50 @@ fn the_no_command_basis_says_ingested() {
         "a basis that reads as 'no agent was involved' is gone"
     );
 }
+
+// ---- W7 attacks: a command whose exit status does not say its commit ran ----
+
+/// A hook rejects the agent's commit, but the line ends in `| tail`, so the
+/// Bash tool reports success. A human commits in the same worktree while the
+/// hook runs. The human's commit is the only `commit` entry in the window.
+#[test]
+fn w7_masked_failed_commit_credits_a_human_commit_made_during_the_hook() {
+    for command in [
+        "git commit -m 'feat: x' 2>&1 | tail -5",
+        "git commit -m 'feat: x'; git status --short",
+        "git commit -m 'feat: x' || true",
+        "git commit -m 'feat: x' ; npm test",
+    ] {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        // 40 s pre-commit hook that rejects; the line still exits 0.
+        command_row_timed(&repo, None, "AGENT", command, at - 25 * SEC, 40_000);
+        // The human's own commit lands 20 s into it.
+        reflog_row(&repo, None, &sha(1), "commit", at);
+        let got = link(&repo, &sha(1));
+        assert_ne!(
+            got.session_id.as_deref(),
+            Some("AGENT"),
+            "WRONG LINK for `{command}`: {got:?}"
+        );
+    }
+}
+
+/// `git commit` with nothing staged exits 1 on its own, but an agent that
+/// chains with `;` and ends on a passing step reports ok.
+#[test]
+fn w7_nothing_to_commit_then_a_passing_step_credits_a_hand_commit() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row_timed(
+        &repo,
+        None,
+        "CODEX",
+        "git add -A; git commit -m 'chore: sync'; cargo check",
+        at - 50 * SEC,
+        90_000,
+    );
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    let got = link(&repo, &sha(1));
+    assert_ne!(got.session_id.as_deref(), Some("CODEX"), "WRONG LINK: {got:?}");
+}

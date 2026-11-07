@@ -621,3 +621,146 @@ fn adv_deleting_an_identical_entry_does_not_swallow_the_next_one() {
         .count();
     assert_eq!(resets, 3, "three resets happened: {second:?}");
 }
+
+// ---- W7 attack: one lane commit on the default branch is recorded twice ----
+
+fn w7_command(repo: &str, wt: Option<&str>, session: &str, text: &str, at_ms: u64, dur: i64) {
+    ledger::append(ledger::Draft {
+        repo_path: repo.into(),
+        worktree_path: wt.map(str::to_string),
+        actor_kind: Some(ledger::ActorKind::Agent),
+        actor_id: Some("claude".into()),
+        session_id: Some(session.into()),
+        action: "session.command".into(),
+        object: Some(text.into()),
+        outcome: Some(ledger::Outcome::Ok),
+        duration_ms: Some(dur),
+        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        event_stamp: Some(ledger::EventStamp {
+            occurred_at: ledger::ids::iso8601_utc(at_ms),
+            occurred_at_basis: "transcript".into(),
+            task_basis: "unbound".into(),
+        }),
+        ..ledger::Draft::default()
+    })
+    .expect("append command");
+}
+
+/// Real git. The anchor checkout sits on `x`; a lane has `main` checked out
+/// and a lane agent (S_LANE) commits on it. The lane's HEAD log and
+/// `refs/heads/main` both record the commit. The ledger files the branch log
+/// under the anchor worktree. An unrelated anchor agent (S_ANCHOR) ran a
+/// `git commit ... | tail` (a masked failure) in the same minute.
+#[test]
+fn w7_lane_commit_on_main_is_not_credited_to_the_anchor_agent() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(dir.path(), &["checkout", "-b", "x"], now - 600);
+    let lane_dir = tempfile::tempdir().expect("lane");
+    let lane = lane_dir.path().join("lane");
+    git_at(
+        dir.path(),
+        &["worktree", "add", lane.to_str().unwrap(), "main"],
+        now - 600,
+    );
+    let lane_s = lane.canonicalize().unwrap().to_string_lossy().into_owned();
+    git_at(&lane, &["commit", "--allow-empty", "-m", "lane work"], now);
+    let sha = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // A pass that reads the anchor's HEAD and the default branch, but not the
+    // lane's HEAD (an 18-worktree cap, a rotation, an expired budget).
+    let budget = flight::Budget::unbounded();
+    ingest_reflogs(&repo, &repo, &Ok(vec![]), 18, &budget);
+    // The lane's own HEAD log is replayed on a later pass.
+    ingest_reflogs(&repo, &lane_s, &Ok(vec![lane_s.clone()]), 1, &budget);
+
+    let at_ms = u64::try_from(now).unwrap() * 1000;
+    w7_command(&repo, Some(&lane_s), "S_LANE", "git commit -m 'lane work'", at_ms - 3_000, 2_500);
+    w7_command(
+        &repo,
+        None,
+        "S_ANCHOR",
+        "git commit -m 'wip' 2>&1 | tail -3",
+        at_ms - 20_000,
+        60_000,
+    );
+
+    for row in reflog_rows(&repo) {
+        eprintln!("{} wt={:?} {:?}", row.id, row.worktree_path, row.object);
+    }
+    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
+    assert_ne!(got.session_id.as_deref(), Some("S_ANCHOR"), "WRONG LINK: {got:?}");
+}
+
+/// What real ingest writes must link: a lane agent commits, replay records the
+/// reflog, the link names the agent. Real git, real replay, only the transcript
+/// row is a fixture.
+#[test]
+fn w7_an_ingested_real_commit_links_to_the_agent_that_ran_it() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(dir.path(), &["commit", "--allow-empty", "-m", "fix: parser"], now);
+    let sha = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    ingest_reflog_into(&repo, &repo, 200);
+    let at_ms = u64::try_from(now).unwrap() * 1000;
+    w7_command(&repo, None, "S_REAL", "git commit -m 'fix: parser'", at_ms - 3_000, 2_500);
+    for row in reflog_rows(&repo) {
+        eprintln!("ROW {} {} {:?}", row.id, row.action, row.object);
+    }
+    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
+    eprintln!("LINK {got:?}");
+    assert_eq!(got.session_id.as_deref(), Some("S_REAL"), "{got:?}");
+}
+
+/// Production-shaped rows only (real git, real replay). The one subject shape
+/// that survives the verb-stripping is a conventional-commit `revert: ...`
+/// subject: the row's object is `<sha> revert: ...`, which the matcher reads as
+/// a `revert` entry. An agent's `git revert ... | tail` that hit a conflict
+/// (exit masked) is then credited with the human's commit.
+#[test]
+fn w7_conventional_revert_subject_is_credited_to_a_masked_failed_git_revert() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "revert: drop flaky test"],
+        now,
+    );
+    let sha = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    ingest_reflog_into(&repo, &repo, 200);
+    let at_ms = u64::try_from(now).unwrap() * 1000;
+    w7_command(&repo, None, "S_AGENT", "git revert --no-edit HEAD~1 2>&1 | tail -3", at_ms - 20_000, 40_000);
+    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
+    eprintln!("LINK {got:?}");
+    assert_ne!(got.session_id.as_deref(), Some("S_AGENT"), "WRONG LINK: {got:?}");
+}
