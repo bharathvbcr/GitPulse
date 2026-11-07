@@ -113,7 +113,7 @@
           </button>
         {/each}
       </div>
-      {#if order === "priority"}<p class="note" data-testid="task-order-note">The List layout puts the most urgent rows first across every status. A search ranked by relevance keeps its own order.</p>{/if}
+      {#if order === "priority"}<p class="note" data-testid="task-order-note">The List layout puts the most urgent rows first across every status. A search ranked by relevance keeps its own order. Priority first is priority, then due date. Suggest next also weighs severity, blockers, age, and verification.</p>{/if}
 
       <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-lanes-label">Lanes</p>
       <div role="radiogroup" aria-labelledby="task-lanes-label" class="flex flex-col gap-0.5">

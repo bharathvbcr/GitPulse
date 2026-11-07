@@ -20,9 +20,9 @@
   import { createLiveLoader } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask, suggestTasks,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, organizeTasks, putTask, registerRepository, restoreDeletedTask, suggestTasks, WorkbenchError,
     NAVIGATOR_PAGE_SIZE, STATUSES, subscribeWorkbenchChanges, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
-    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type TaskSuggestions, type Workspace, type WorkspaceCard,
+    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskOrganization, type TaskStatus, type TaskSuggestions, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
@@ -41,7 +41,7 @@
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
+  import { applyOrganizedPriority, cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, priorityOrderNote, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveControl, archiveRefusal, archiveSkipped, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -49,6 +49,7 @@
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
   import TaskSuggestPanel from "./TaskSuggestPanel.svelte";
+  import TaskOrganizePanel from "./TaskOrganizePanel.svelte";
   import { createSuggestWatch, suggestSignature } from "../workbench/suggestFreshness";
   import WavePanel from "./WavePanel.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
@@ -197,6 +198,15 @@
   let suggestError = $state("");
   let suggestPriority = $state<number | "all">("all");
   let suggestTicket = 0;
+  /** Manvi's reviewable priority proposal (`work.tasks.organize`). Asked for on demand; nothing is written until a row is accepted. */
+  let showOrganize = $state(false);
+  let organization = $state<TaskOrganization | null>(null);
+  let organizeLoading = $state(false);
+  let organizeApplying = $state(false);
+  let organizeError = $state("");
+  let organizeOutcomes = $state<Record<string, string>>({});
+  let organizeTicket = 0;
+  let organizeEpoch = $state(0);
   /** The search's candidates; null while the board browses columns. */
   let candidates = $state.raw<CandidateSet | null>(null);
   /** What a Load all is walking — the search's candidates or one column — and the flag Stop sets for it to check between pages. */
@@ -1214,6 +1224,84 @@
     showSuggest = !showSuggest;
     // Always ask on opening: a kept answer ranks tasks as they were when it was asked.
     if (showSuggest && !suggestLoading) void askSuggest();
+  }
+  /** Ask Manvi for a priority proposal. The newest ask wins. Accepting a row is separate and does not replace the proposal. */
+  async function askOrganize() {
+    const ticket = ++organizeTicket;
+    organizeLoading = true; organizeError = "";
+    try {
+      const answer = await organizeTasks(scope.kind === "repository" ? { repository_id: scope.id } : {});
+      if (disposed || ticket !== organizeTicket) return;
+      organization = answer;
+      organizeOutcomes = {};
+      organizeEpoch++;
+    } catch (cause) {
+      if (disposed || ticket !== organizeTicket) return;
+      organization = null; organizeError = explainError(cause);
+    } finally { if (!disposed && ticket === organizeTicket) organizeLoading = false; }
+  }
+  function toggleOrganize() {
+    showOrganize = !showOrganize;
+    if (showOrganize && !organizeLoading) void askOrganize();
+  }
+  function organizeRowRefusal(error: unknown): boolean {
+    return error instanceof WorkbenchError && (error.code === "revision_conflict" || error.code === "field_locked" || error.code === "not_found");
+  }
+  /**
+   * Write the accepted rows. Each one is read again first. A task edited since
+   * the proposal is shown and skipped; the fresh revision is not reused. A
+   * refusal on one row does not stop the others. An unexpected store error stops
+   * the rest and says how many were already written.
+   */
+  async function acceptOrganized(ids: string[]) {
+    const proposal = organization;
+    if (!proposal || organizeApplying || ids.length === 0) return;
+    organizeApplying = true; organizeError = "";
+    const outcomes = { ...organizeOutcomes };
+    let applied = 0;
+    const refusalText = (reason: "different_task" | "edited" | "priority_moved") =>
+      reason === "edited" ? "This task was edited since the proposal. It was not changed."
+      : reason === "priority_moved" ? "Its priority changed since the proposal. It was not changed."
+      : "The task that was read is not the one in the proposal. It was not changed.";
+    try {
+      for (const id of ids) {
+        const change = proposal.changes.find((row) => row.id === id);
+        if (!change || outcomes[id] !== undefined) continue;
+        let current: Task;
+        try {
+          current = await bounded(getTask(id));
+        } catch (cause) {
+          outcomes[id] = explainError(cause);
+          if (!organizeRowRefusal(cause)) {
+            organizeError = `Stopped after ${applied} accepted. ${explainError(cause)}`;
+            break;
+          }
+          continue;
+        }
+        if (disposed) return;
+        try {
+          const decision = await applyOrganizedPriority(change, current, (priority) =>
+            bounded(putTask(taskWrite(id, change.revision, { ...taskDraft(current), priority }))));
+          if (decision.action === "apply") {
+            outcomes[id] = `Accepted: ${priorityLabel(change.from)} → ${priorityLabel(change.to)}.`;
+            applied++;
+          } else if (decision.action === "unchanged") outcomes[id] = "Already at that priority.";
+          else outcomes[id] = refusalText(decision.reason);
+        } catch (cause) {
+          outcomes[id] = explainError(cause);
+          if (!organizeRowRefusal(cause)) {
+            organizeError = `Stopped after ${applied} accepted. ${explainError(cause)}`;
+            break;
+          }
+        }
+      }
+    } finally {
+      organizeOutcomes = outcomes;
+      organizeApplying = false;
+      if (applied > 0 && !disposed) {
+        try { await refresh(); } catch (cause) { if (!organizeError) organizeError = explainError(cause); }
+      }
+    }
   }
   async function openTask(id: string) {
     if (session?.tabId === id && session.value) return;
@@ -2318,6 +2406,10 @@
   {#if pageOf && (pageOf.next_cursor || pageOf.items.length > TASK_PAGE_SIZE)}
     <div class="paging" data-task-paging={status}>
       <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
+      {#if boardSort === "priority" && !searching && pageOf.next_cursor}
+        {@const note = priorityOrderNote(pageOf.items.length, pageOf.total)}
+        {#if note}<p class="paging-note" data-testid="task-priority-partial">{note} Load all orders the rest.</p>{/if}
+      {/if}
       {#if pageOf.next_cursor}<button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => pageColumn(status, pageOf.next_cursor ?? undefined)} disabled={loading}>Load more</button>{/if}
       {#if pageOf.next_cursor}
         {#if loadingAll === status}<button type="button" class="gp-btn" aria-label={`Stop loading ${STATUS_LABELS[status]} tasks`} onclick={() => { stopLoadingAll = true; }}>Stop</button>
@@ -2452,6 +2544,7 @@
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
         <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
+        <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}>Organise</button>
         <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
         <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
         <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
@@ -2535,6 +2628,15 @@
         onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
       />
       <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} maxPriority={suggestPriority} />
+    {/if}
+    {#if initialized && showOrganize}
+      {#key organizeEpoch}
+        <TaskOrganizePanel
+          result={organization} loading={organizeLoading} applying={organizeApplying} error={organizeError} outcomes={organizeOutcomes}
+          onOpen={(id) => void openTask(id)} onAccept={(id) => void acceptOrganized([id])} onAcceptAll={(ids) => void acceptOrganized(ids)}
+          onRefresh={() => void askOrganize()} onClose={() => { showOrganize = false; }}
+        />
+      {/key}
     {/if}
     {#if initialized && (showFilters || filtering || showSearchHelp)}
       <div class="query-bar" data-testid="task-query-bar">
@@ -3105,6 +3207,7 @@
   .labels span{padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent);color:rgb(var(--c-text-muted))}
   .paging{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:6px}
   .paging-count{font-size:10px;color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
+  .paging-note{flex-basis:100%;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
   .column-empty{margin:10px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}
   .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);display:flex;align-items:center;justify-content:space-between;gap:10px}

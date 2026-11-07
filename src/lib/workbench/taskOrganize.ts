@@ -320,6 +320,65 @@ export function reorderPlan(
 }
 
 /**
+ * What Priority first did not see. Null when every card of the column is
+ * loaded, because the order is then the whole column. The two sentences name
+ * the loaded count and the count still later in the column.
+ */
+export function priorityOrderNote(loaded: number, total: number): string | null {
+  if (!Number.isFinite(loaded) || !Number.isFinite(total) || loaded < 0 || total < 0 || loaded >= total) return null;
+  const rest = total - loaded;
+  const loadedNoun = loaded === 1 ? "card" : "cards";
+  const restVerb = rest === 1 ? "card is" : "cards are";
+  return `Priority first ordered the ${loaded} loaded ${loadedNoun}. ${rest} ${restVerb} later in this column and not in this order.`;
+}
+
+/** A proposed priority change, and the task as it is now. */
+export interface OrganizedPriority {
+  id: string;
+  revision: number;
+  from: number;
+  to: number;
+}
+export interface CurrentPriority {
+  id: string;
+  revision: number;
+  priority: number;
+}
+export type PriorityApplyDecision =
+  | { action: "apply" }
+  | { action: "unchanged" }
+  | { action: "refuse"; reason: "different_task" | "edited" | "priority_moved" };
+
+/**
+ * Whether an accepted proposal row may be written. A different task, or a task
+ * edited since the proposal, is refused; the caller does not retry against the
+ * fresh revision. A task already at the proposed priority is left alone, so a
+ * click does not write a no-op. Any other priority is a move and is refused.
+ */
+export function priorityApplyDecision(proposed: OrganizedPriority, current: CurrentPriority): PriorityApplyDecision {
+  if (current.id !== proposed.id) return { action: "refuse", reason: "different_task" };
+  if (current.revision !== proposed.revision) return { action: "refuse", reason: "edited" };
+  if (current.priority === proposed.to) return { action: "unchanged" };
+  if (current.priority !== proposed.from) return { action: "refuse", reason: "priority_moved" };
+  return { action: "apply" };
+}
+
+/**
+ * Apply one accepted row. `write` is called only when the decision is apply,
+ * and only with the proposed priority. A refusal does not write.
+ */
+export async function applyOrganizedPriority<T>(
+  proposed: OrganizedPriority,
+  current: CurrentPriority,
+  write: (priority: number) => Promise<T>,
+): Promise<PriorityApplyDecision> {
+  const decision = priorityApplyDecision(proposed, current);
+  if (decision.action !== "apply") return decision;
+  await write(proposed.to);
+  return decision;
+}
+
+/**
  * The cards most worth starting first: urgent before low, the earlier due date
  * first among equals, and the board's own order for the rest (the sort is
  * stable). A view over the cards; it never writes a position.

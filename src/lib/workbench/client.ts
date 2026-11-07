@@ -125,7 +125,7 @@ export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id:
  * it is the host watcher's alone: `WorkbenchState::request` refuses it from here with `host_only`, because a CI
  * result is the host's observation of GitHub or of a local run and a renderer must not be able to write one.
  */
-export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
+export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest" | "tasks.organize";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -1224,4 +1224,89 @@ export function taskSuggestions(value: unknown): TaskSuggestions {
     verification: { checked: integer(verification.checked), unchecked: integer(verification.unchecked), failed: integer(verification.failed) },
     candidates: integer(raw.candidates),
   };
+}
+
+/** How many proposed rows one answer may carry. A larger reply is a protocol error, not a partial board. */
+const MAX_ORGANIZE_ROWS = 10_000;
+
+/** One priority Manvi would change. Nothing has been written. */
+export interface TaskOrganizeChange {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  revision: number;
+  from: number;
+  to: number;
+  rule: string;
+  reason: string;
+}
+/** One open column in proposed order: target priority, then due date, then id. */
+export interface TaskOrganizeOrder { status: TaskStatus; ids: string[] }
+/** Open tasks joined by duplicate_of. Keep is the one the duplicate rule says stays. Members includes keep. */
+export interface TaskOrganizeGroup { kind: string; keep: string; members: string[] }
+/**
+ * How much of the board the proposal saw. `unread` is rows not fetched, from
+ * `items.list` total, and it is not filtered by repository. `complete` is
+ * false when a bound cut the read.
+ */
+export interface TaskOrganizeCoverage {
+  read: number;
+  unread: number;
+  unhydrated: number;
+  unrevisioned: number;
+  complete: boolean;
+  note: string;
+}
+/**
+ * Manvi's `work.tasks.organize`: a reviewable priority proposal. `method` is
+ * `deterministic`. Column order uses the proposed priority, then due date.
+ * `differs` names what Suggest next also weighs.
+ */
+export interface TaskOrganization {
+  generated_at: number;
+  method: "deterministic";
+  changes: TaskOrganizeChange[];
+  order: TaskOrganizeOrder[];
+  groups: TaskOrganizeGroup[];
+  coverage: TaskOrganizeCoverage;
+  order_note: string;
+  differs: string[];
+}
+export interface OrganizeParams { repository_id?: string }
+function organizeChange(value: unknown): TaskOrganizeChange {
+  const raw = object(value);
+  const from = integer(raw.from), to = integer(raw.to), revision = integer(raw.revision), status = text(raw.status);
+  if (from > 3 || to > 3 || revision <= 0 || !(STATUSES as readonly string[]).includes(status)) return invalid();
+  return { id: text(raw.id), title: text(raw.title), status: status as TaskStatus, revision, from, to, rule: text(raw.rule), reason: text(raw.reason) };
+}
+function organizeOrder(value: unknown): TaskOrganizeOrder {
+  const raw = object(value), status = text(raw.status);
+  if (!(STATUSES as readonly string[]).includes(status)) return invalid();
+  return { status: status as TaskStatus, ids: strings(raw.ids) };
+}
+/** The decoder `organizeTasks` applies. A reply that is not this shape is a protocol error. */
+export function taskOrganization(value: unknown): TaskOrganization {
+  const raw = object(value);
+  if (raw.ok !== true || raw.method !== "deterministic" || !Array.isArray(raw.changes) || raw.changes.length > MAX_ORGANIZE_ROWS || !Array.isArray(raw.order) || raw.order.length > 32 || !Array.isArray(raw.groups) || raw.groups.length > MAX_ORGANIZE_ROWS || !Array.isArray(raw.differs) || raw.differs.length > 16) return invalid();
+  const coverage = object(raw.coverage);
+  const note = coverage.note === undefined ? "" : text(coverage.note);
+  return {
+    generated_at: integer(raw.generated_at),
+    method: "deterministic",
+    changes: raw.changes.map(organizeChange),
+    order: raw.order.map(organizeOrder),
+    groups: raw.groups.map((entry) => {
+      const group = object(entry);
+      return { kind: text(group.kind), keep: text(group.keep), members: strings(group.members) };
+    }),
+    coverage: {
+      read: integer(coverage.read), unread: integer(coverage.unread), unhydrated: integer(coverage.unhydrated),
+      unrevisioned: integer(coverage.unrevisioned), complete: boolean(coverage.complete), note,
+    },
+    order_note: text(raw.order_note),
+    differs: raw.differs.map(text),
+  };
+}
+export async function organizeTasks(params: OrganizeParams = {}): Promise<TaskOrganization> {
+  return taskOrganization(await request("tasks.organize", { ...params }));
 }
