@@ -402,27 +402,92 @@ export function dirtyCount(row: WorkRow): number {
   return files > 0 || (scanned > 0 && scanned === total) ? files : -1;
 }
 
-/** Latest observed run per workflow and branch; old failures do not imply current failure. */
+/** A usable commit id: at least a short sha, and not git's all-zero "unborn" id. */
+function knownSha(sha: string | null | undefined): string {
+  const value = (sha ?? "").trim().toLowerCase();
+  return value.length >= 7 && /^[0-9a-f]+$/.test(value) && !/^0+$/.test(value) ? value : "";
+}
+
+/** Same commit, allowing either side to be an abbreviated sha. */
+function sameCommit(a: string, b: string): boolean {
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * The HEAD commits of this row's worktrees that hold `branch`.
+ *
+ * Empty means no comparison is possible (no worktree on that branch, or its
+ * HEAD is unborn or unreported), and the caller keeps branch-only behaviour.
+ */
+function headsOnBranch(row: WorkRow, branch: string): string[] {
+  return row.worktrees
+    .filter(({ worktree }) => branchOf(worktree) === branch)
+    .map(({ worktree }) => knownSha(worktree.head))
+    .filter((sha) => sha !== "");
+}
+
+/** True when the run ran on a commit that is one of `heads`. */
+function runOnHead(run: WorkflowRunInfo, heads: readonly string[]): boolean {
+  const sha = knownSha(run.head_sha);
+  return sha !== "" && heads.some((head) => sameCommit(head, sha));
+}
+
+/**
+ * Whether this run is known to have run on an older commit than the HEAD of
+ * the worktree that holds its branch.
+ *
+ * A run with no `head_sha`, or a row with no worktree HEAD on that branch
+ * (branch-only or unbound rows), is not stale: nothing can be compared, so the
+ * branch-only behaviour that predates this check is kept.
+ */
+export function isStaleRun(row: WorkRow, run: WorkflowRunInfo): boolean {
+  const heads = headsOnBranch(row, run.head_branch);
+  return heads.length > 0 && knownSha(run.head_sha) !== "" && !runOnHead(run, heads);
+}
+
+/**
+ * Latest observed run per workflow and branch; old failures do not imply current failure.
+ *
+ * Where the row knows the HEAD of the worktree on the branch, a run on that
+ * commit is preferred over any newer run on an older one, so a result for code
+ * that is no longer checked out never stands in for the current commit. When
+ * no run is on HEAD the newest run is still returned; `isStaleRun` says it is
+ * only history.
+ */
 export function latestRuns(row: WorkRow): WorkflowRunInfo[] {
   const latest = new Map<string, WorkflowRunInfo>();
+  const newer = (run: WorkflowRunInfo, previous: WorkflowRunInfo): boolean => {
+    const time = Date.parse(run.created_at);
+    const previousTime = Date.parse(previous.created_at);
+    return Number.isFinite(time) && Number.isFinite(previousTime)
+      ? time > previousTime || (time === previousTime && run.id > previous.id)
+      : run.id > previous.id;
+  };
   for (const run of row.runs) {
     const key = JSON.stringify([run.head_branch, run.name]);
     const previous = latest.get(key);
-    const time = Date.parse(run.created_at);
-    const previousTime = previous ? Date.parse(previous.created_at) : NaN;
-    if (!previous || (Number.isFinite(time) && Number.isFinite(previousTime)
-      ? time > previousTime || (time === previousTime && run.id > previous.id)
-      : run.id > previous.id)) latest.set(key, run);
+    if (!previous) { latest.set(key, run); continue; }
+    const heads = headsOnBranch(row, run.head_branch);
+    const onHead = runOnHead(run, heads);
+    const previousOnHead = runOnHead(previous, heads);
+    if (onHead !== previousOnHead ? onHead : newer(run, previous)) latest.set(key, run);
   }
   return [...latest.values()];
 }
 
+/**
+ * A stale run (see `isStaleRun`) does not count toward attention. Owner
+ * decision for the Work view: a failure on an older commit says nothing about
+ * the code at HEAD, so raising attention for it would repeat the original
+ * mistake in reverse. A run on HEAD, or one that cannot be compared, counts as
+ * it always did.
+ */
 export function rowNeedsAttention(row: WorkRow): boolean {
   const dirty = dirtySummary(row);
   return row.operation !== null || dirty.files > 0 || dirty.scanned < dirty.total ||
     row.worktrees.some(binding => binding.operationChecked === false) ||
     row.pullRequests.some(pr => pr.ci_status.toLowerCase() === "failure" || pr.review_decision.toUpperCase() === "CHANGES_REQUESTED") ||
-    latestRuns(row).some(run => runNeedsAttention(run));
+    latestRuns(row).some(run => !isStaleRun(row, run) && runNeedsAttention(run));
 }
 
 /**
