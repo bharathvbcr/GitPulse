@@ -28,16 +28,25 @@ use serde::{Deserialize, Serialize};
 /// `core.fsmonitor` slowed `git status` 1.29-1.73x below ~10k tracked files and
 /// was 20-45 percent faster at 40k (spike ft-7450105d). Offered from here.
 pub const FSMONITOR_MIN_TRACKED_FILES: u64 = 40_000;
-/// `feature.manyFiles` (index v4 + skipHash + untracked cache) measured in
-/// `scripts/bench-git-tuning.mjs files`.
+/// `feature.manyFiles` against a plain repository that has had the same one
+/// index-refreshing `git status` (`scripts/bench-git-tuning.mjs files`, with an
+/// identical-arm control): GitPulse-style `status` reads took 0.63 to 0.69x as
+/// long at 20,000, 40,000 and 100,000 files in six of eight runs, not less at
+/// 40,000 in one, and 0.89x in one under heavy load. 20,000 is the smallest size
+/// measured.
+/// The gain is the untracked cache's; see docs/PERFORMANCE.md.
 pub const MANYFILES_MIN_TRACKED_FILES: u64 = 20_000;
 /// Loose objects past which git's own auto-gc should already have acted
 /// (`gc.auto`'s default); a history walk over loose objects measured 2 to 9x
 /// slower than the same history packed already at 5,000.
 pub const MAINTENANCE_MIN_LOOSE_OBJECTS: u64 = 6_700;
 
-/// A boolean `core.fsmonitor` is read as a hook path by git 2.35.1 and older.
-pub const FSMONITOR_BOOLEAN_MIN_GIT: (u32, u32, u32) = (2, 35, 2);
+/// A boolean `core.fsmonitor`, and the built-in daemon it turns on, arrived in
+/// git 2.36.0. Git's own `Documentation/config/core.txt` at v2.35.1 and v2.35.2
+/// describes only a hook command; at v2.36.0 it adds "if `core.fsmonitor` is set
+/// to true" for the built-in daemon and says older git reads `true` as a hook
+/// path. (2.35.2 is a security release of the 2.35 line, not a feature release.)
+pub const FSMONITOR_BOOLEAN_MIN_GIT: (u32, u32, u32) = (2, 36, 0);
 /// `index.skipHash` indexes are reported corrupt by `git fsck` below this.
 pub const SKIPHASH_FSCK_MIN_GIT: (u32, u32, u32) = (2, 40, 0);
 /// Git older than this refuses an index with the v4 / skipHash format at all.
@@ -78,7 +87,7 @@ impl GitEnv {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuningChange {
     /// `git config --local feature.manyFiles true`
@@ -151,6 +160,22 @@ pub fn split_index_conflict(report: &RepoTuningReport, set: &[&str]) -> Option<S
     if split && (many || many_files_on(report)) {
         return Some(reason("core.splitIndex", "feature.manyFiles"));
     }
+    if many {
+        // The index file itself, and every sibling worktree's, say more than
+        // config does: a split index carried by the file crashes `git status`
+        // under manyFiles on git 2.54 (wt-status.c BUG), whatever the config says.
+        if report.index.split_index == Some(true) {
+            return Some(
+                "this worktree's index is a split index (a link extension or a sharedindex file), \
+                 and feature.manyFiles over a split index breaks git status on git 2.54, so \
+                 GitPulse will not turn it on"
+                    .to_string(),
+            );
+        }
+        if let Some(blocker) = report.family.many_files_blocker() {
+            return Some(format!("feature.manyFiles is refused: {blocker}"));
+        }
+    }
     None
 }
 
@@ -169,6 +194,8 @@ fn many_files_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffe
         || entries < MANYFILES_MIN_TRACKED_FILES
         || is_set(report, "feature.manyfiles")
         || report.is_true("core.splitindex")
+        || report.index.split_index != Some(false)
+        || report.family.many_files_blocker().is_some()
         || !env.at_least(INDEX_V4_MIN_GIT)
     {
         return None;
@@ -180,12 +207,10 @@ fn many_files_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffe
     Some(offer(
         TuningChange::ManyFiles,
         format!(
-            "{entries} tracked files (offered from {MANYFILES_MIN_TRACKED_FILES}): a smaller, \
-             cheaper-to-write index (format {}).",
-            report
-                .index
-                .version
-                .map_or("unknown".to_string(), |v| v.to_string())
+            "{entries} tracked files (offered from {MANYFILES_MIN_TRACKED_FILES}): git status \
+             measured about a third faster once git has refreshed the index with the untracked \
+             cache on, which is the first ordinary git status after this. The index format \
+             change was not measured to help."
         ),
     ))
 }
@@ -270,6 +295,18 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
              so GitPulse will not turn manyFiles on here."
                 .to_string(),
         );
+    }
+    if report.index.split_index == Some(true) && !report.is_true("core.splitindex") {
+        out.push(
+            "This worktree's index is a split index, so GitPulse will not turn \
+             feature.manyFiles on here."
+                .to_string(),
+        );
+    }
+    if let Some(blocker) = report.family.many_files_blocker() {
+        out.push(format!(
+            "GitPulse will not turn feature.manyFiles on: {blocker}."
+        ));
     }
     if many_files_on(report) {
         out.push(
@@ -413,16 +450,24 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
                  that rewrite use git's defaults again."
                     .to_string(),
             ),
-            notes: vec![format!(
-                "feature.manyFiles sets index.skipHash=true, index.version=4 and \
+            notes: vec![
+                "Nothing gets faster at the click: the gain needs git to rewrite the index with \
+                 the untracked cache, which happens on the first ordinary git status (or any \
+                 index write) afterwards. In the measurement that untracked cache was the whole \
+                 gain; after such a refresh the index stayed format 2 and was not smaller, so \
+                 the format parts were not shown to help."
+                    .to_string(),
+                format!(
+                    "feature.manyFiles sets index.skipHash=true, index.version=4 and \
                  core.untrackedCache=true. Git older than {}.{} reports a corrupt index when \
                  `git fsck` runs on a skipHash index, and git older than {}.{} refuses the index \
                  format altogether, so anyone using this repository with an older git is affected.",
-                SKIPHASH_FSCK_MIN_GIT.0,
-                SKIPHASH_FSCK_MIN_GIT.1,
-                INDEX_V4_MIN_GIT.0,
-                INDEX_V4_MIN_GIT.1
-            )],
+                    SKIPHASH_FSCK_MIN_GIT.0,
+                    SKIPHASH_FSCK_MIN_GIT.1,
+                    INDEX_V4_MIN_GIT.0,
+                    INDEX_V4_MIN_GIT.1
+                ),
+            ],
             skipped: None,
         },
         TuningChange::Fsmonitor => TuningStep {

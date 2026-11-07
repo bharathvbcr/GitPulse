@@ -34,6 +34,7 @@ fn report(files: u64, packs: u64, loose: u64) -> RepoTuningReport {
             entries: Some(files),
             entries_exact: true,
             skip_hash: Some(false),
+            split_index: Some(false),
             note: None,
         },
         partial_clone: Some(false),
@@ -46,6 +47,7 @@ fn report(files: u64, packs: u64, loose: u64) -> RepoTuningReport {
                 origin: None,
             })
             .collect(),
+        family: WorktreeFamily::default(),
         config_note: None,
         notes: Vec::new(),
     }
@@ -171,14 +173,14 @@ fn many_files_is_not_offered_to_an_index_that_already_has_what_it_adds() {
 }
 
 #[test]
-fn fsmonitor_needs_a_measured_platform_and_git_after_2_35_1() {
+fn fsmonitor_needs_a_measured_platform_and_git_2_36_or_newer() {
     let big = report(100_000, 1, 0);
     let unmeasured = GitEnv {
         fsmonitor_measured: false,
         ..NEW_GIT
     };
     assert!(!offered(&big, unmeasured).contains(&TuningChange::Fsmonitor));
-    for old in [(2, 35, 1), (2, 30, 0), (2, 0, 0)] {
+    for old in [(2, 35, 2), (2, 35, 1), (2, 30, 0), (2, 0, 0)] {
         let env = GitEnv {
             version: Some(old),
             ..NEW_GIT
@@ -189,19 +191,19 @@ fn fsmonitor_needs_a_measured_platform_and_git_after_2_35_1() {
         );
     }
     let env = GitEnv {
-        version: Some((2, 35, 2)),
+        version: Some((2, 36, 0)),
         ..NEW_GIT
     };
     assert!(offered(&big, env).contains(&TuningChange::Fsmonitor));
 }
 
 #[test]
-fn a_boolean_fsmonitor_is_refused_on_git_2_35_1_and_older_at_the_plan() {
+fn a_boolean_fsmonitor_is_refused_before_git_2_36_at_the_plan() {
     let big = report(100_000, 1, 0);
-    for version in [Some((2, 35, 1)), Some((2, 20, 0)), None] {
+    for version in [Some((2, 35, 2)), Some((2, 35, 1)), Some((2, 20, 0)), None] {
         let env = GitEnv { version, ..NEW_GIT };
         let refused = plan_apply(&big, env, "/r/.git", &[TuningChange::Fsmonitor]).unwrap_err();
-        assert!(refused.contains("2.35.2"), "{version:?}: {refused}");
+        assert!(refused.contains("2.36.0"), "{version:?}: {refused}");
         assert!(refused.contains("hook path"), "{refused}");
     }
 }
@@ -502,6 +504,80 @@ fn the_maintenance_preview_discloses_the_background_fetch_and_the_object_databas
     assert!(
         offer.reason.contains("object database lock"),
         "{}",
+        offer.reason
+    );
+}
+
+#[test]
+fn a_split_index_in_the_index_file_or_a_sibling_is_never_offered_many_files() {
+    let mut carried = report(100_000, 1, 0);
+    carried.index.split_index = Some(true);
+    assert!(!offered(&carried, NEW_GIT).contains(&TuningChange::ManyFiles));
+    let refused = plan_apply(&carried, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap_err();
+    assert!(refused.contains("split index"), "{refused}");
+    assert!(warnings(&carried).iter().any(|w| w.contains("split index")));
+
+    let mut unknown = report(100_000, 1, 0);
+    unknown.index.split_index = None;
+    assert!(!offered(&unknown, NEW_GIT).contains(&TuningChange::ManyFiles));
+
+    let mut sibling = report(100_000, 1, 0);
+    sibling.family.split_index_in = vec!["/work/sibling".to_string()];
+    assert!(!offered(&sibling, NEW_GIT).contains(&TuningChange::ManyFiles));
+    let refused = plan_apply(&sibling, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap_err();
+    assert!(refused.contains("/work/sibling"), "{refused}");
+
+    for family in [
+        WorktreeFamily {
+            unverified_indexes: vec!["/work/odd".to_string()],
+            ..WorktreeFamily::default()
+        },
+        WorktreeFamily {
+            truncated: true,
+            ..WorktreeFamily::default()
+        },
+    ] {
+        let mut r = report(100_000, 1, 0);
+        r.family = family;
+        assert!(plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).is_err());
+    }
+    // A sibling that is fine, or has only a config.worktree to be read at plan
+    // time, does not block the offer.
+    let mut fine = report(100_000, 1, 0);
+    fine.family = WorktreeFamily {
+        worktrees: 2,
+        with_worktree_config: vec!["/work/cone".to_string()],
+        ..WorktreeFamily::default()
+    };
+    assert!(offered(&fine, NEW_GIT).contains(&TuningChange::ManyFiles));
+}
+
+#[test]
+fn the_many_files_wording_says_the_gain_needs_git_to_rewrite_the_index_first() {
+    let r = report(100_000, 1, 0);
+    let plan = plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap();
+    let notes = plan.steps[0].notes.join(" ");
+    assert!(
+        notes.contains("Nothing gets faster at the click"),
+        "{notes}"
+    );
+    assert!(notes.contains("first ordinary git status"), "{notes}");
+    assert!(
+        notes.contains("untracked cache was the whole gain"),
+        "{notes}"
+    );
+    let offer = recommend(&r, NEW_GIT)
+        .into_iter()
+        .find(|o| o.change == TuningChange::ManyFiles)
+        .unwrap();
+    assert!(
+        offer.reason.contains("first ordinary git status"),
+        "{}",
+        offer.reason
+    );
+    assert!(
+        !offer.reason.contains("smaller"),
+        "no index-size claim: {}",
         offer.reason
     );
 }

@@ -316,6 +316,27 @@ fn index_file(dir: &Path, version: u32, entries: u32, len: usize) {
     std::fs::write(dir.join("index"), bytes).unwrap();
 }
 
+/// A structurally valid version 2 index of `entries` short paths: the
+/// detector walks the whole body now, so a header over zeros is (rightly) not
+/// an index, and a test about the fsmonitor floor needs a real one.
+fn valid_index_file(dir: &Path, entries: u32) {
+    let mut bytes = b"DIRC".to_vec();
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&entries.to_be_bytes());
+    for i in 0..entries {
+        let mut entry = vec![0u8; 40];
+        entry.extend([0x5A; 20]);
+        let name = format!("f{i:07}");
+        entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        entry.extend_from_slice(name.as_bytes());
+        let total = (entry.len() + 8) & !7;
+        entry.resize(total, 0);
+        bytes.extend(entry);
+    }
+    bytes.extend([1u8; 20]);
+    std::fs::write(dir.join("index"), bytes).unwrap();
+}
+
 fn env_with(version: (u32, u32, u32)) -> GitEnv {
     GitEnv {
         version: Some(version),
@@ -335,7 +356,7 @@ fn report_for(dir: &Path) -> gitpulse_lib::storage::repo_tuning::RepoTuningRepor
 #[test]
 fn adv_fsmonitor_boolean_is_refused_on_git_before_2_36() {
     let dir = tempfile::tempdir().unwrap();
-    index_file(dir.path(), 2, 45_000, 45_000 * 62 + 64);
+    valid_index_file(dir.path(), 45_000);
     let report = report_for(dir.path());
     assert_eq!(report.index.entries, Some(45_000), "{report:?}");
     for version in [(2, 35, 1), (2, 35, 2), (2, 35, 9), (2, 34, 0)] {

@@ -56,6 +56,28 @@ function git(cwd, args, input) {
 }
 
 /**
+ * An ordinary git run: unlike [git], it may refresh and rewrite the index.
+ * @param {string} cwd
+ * @param {string[]} args
+ */
+function gitRefreshing(cwd, args) {
+  /** @type {Record<string, string | undefined>} */
+  const env = { ...GIT_ENV };
+  delete env.GIT_OPTIONAL_LOCKS;
+  const r = spawnSync("git", args, { cwd, env, encoding: "utf8", maxBuffer: 1 << 28 });
+  if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+}
+
+/**
+ * The index format version from its header.
+ * @param {string} dir
+ * @returns {number}
+ */
+function indexVersion(dir) {
+  return readFileSync(join(dir, ".git/index")).readUInt32BE(4);
+}
+
+/**
  * @param {string} cwd
  * @param {string[]} args
  * @returns {number}
@@ -283,33 +305,48 @@ if (mode === "packs") {
     report.runs.push({ loose_objects: looseCount(loose), loose_after_maintenance: looseCount(kept), packs_after_maintenance: packCount(kept), commits, files, result });
   }
 } else if (mode === "files") {
-  const fileTargets = sizes.length ? sizes : [5000, 20000, 40000, 100000];
+  // Arm A is a plain repository, arm B the same repository with
+  // feature.manyFiles, and arm C a second plain copy: the identical-arm control
+  // that gives the noise floor. Every arm gets one ordinary, index-refreshing
+  // `git status` (no GIT_OPTIONAL_LOCKS), which is when git rewrites the index
+  // in the format the config asks for; only then are GitPulse-style reads
+  // (GIT_OPTIONAL_LOCKS=0) timed, so a gain that is just "the index was
+  // refreshed once" shows up in arm A as well and cancels.
+  const fileTargets = sizes.length ? sizes : [20000, 40000, 100000];
   for (const files of fileTargets) {
     const plain = freshRepo(`plain-${files}`);
-    populate(plain, 1, files, 0);
+    const control = freshRepo(`plain-b-${files}`);
     const many = freshRepo(`many-${files}`);
-    populate(many, 1, files, 0);
+    // Attribution arm: only the untracked cache, the one part of
+    // feature.manyFiles that survived the control.
+    const untracked = freshRepo(`untracked-${files}`);
+    for (const dir of [plain, control, many, untracked]) populate(dir, 1, files, 0);
     git(many, ["config", "feature.manyFiles", "true"]);
-    // Rewrite the index so the format applies, then prime the untracked cache.
-    git(many, ["update-index", "--index-version", "4"]);
-    git(many, ["update-index", "--untracked-cache"]);
-    git(many, ["status", "--porcelain"]);
-    git(plain, ["status", "--porcelain"]);
+    git(untracked, ["config", "core.untrackedCache", "true"]);
+    for (const dir of [plain, control, many, untracked]) {
+      writeFileSync(join(dir, "extra.txt"), "x");
+      gitRefreshing(dir, ["status", "--porcelain"]);
+    }
     /** @param {string} d */
     const sizeOf = (d) => statSync(join(d, ".git/index")).size;
     const arms = [
       { name: "default", dir: plain },
+      { name: "default-b (control)", dir: control },
       { name: "manyFiles", dir: many },
+      { name: "untrackedCache only", dir: untracked },
     ];
-    writeFileSync(join(plain, "extra.txt"), "x");
-    writeFileSync(join(many, "extra.txt"), "x");
     const ops = [
       { name: "status", args: ["status", "--porcelain"] },
       { name: "ls-files", args: ["ls-files", "--stage"] },
       { name: "add extra.txt (index rewrite)", args: ["add", "extra.txt"] },
     ];
     const result = race(arms, ops, rounds);
-    report.runs.push({ tracked: files, index_bytes: { default: sizeOf(plain), manyFiles: sizeOf(many) }, result });
+    report.runs.push({
+      tracked: files,
+      index_version: { default: indexVersion(plain), manyFiles: indexVersion(many) },
+      index_bytes: { default: sizeOf(plain), manyFiles: sizeOf(many) },
+      result,
+    });
   }
 } else {
   console.error("usage: bench-git-tuning.mjs <packs|loose|files> [--sizes a,b] [--rounds N] [--json file]");

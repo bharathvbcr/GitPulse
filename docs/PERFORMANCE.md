@@ -2238,29 +2238,44 @@ The same history held as loose objects, against packed.
 
 After one `git maintenance run --task=loose-objects` on the 15,235-object repository the walk was back to the packed figure: 1.09, 1.00, 1.04 and 1.10x for the four operations (one pack made; the loose copies are left for `prune-packed`). That is the action `git maintenance start` schedules, and the one measured benefit that supports an offer.
 
-### Index format (`files`)
+### Index format (`files`), corrected
 
-`feature.manyFiles` (index v4, `index.skipHash`, untracked cache) against git's defaults, one commit of N files spread over 100 directories, an untracked file present, one priming `status` per arm.
+The first version of this table compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. That comparison was not attributable to `feature.manyFiles`: a review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm. It is withdrawn, and so are its index-size figures. This is the re-measurement the review asked for.
 
-| tracked files | index bytes default / manyFiles | status | ls-files | add (index rewrite) |
-| --- | --- | --- | --- | --- |
-| 5,000 | 402,930 / 357,933 | 0.40 | 1.02 | 0.87 |
-| 20,000 | 1,603,030 / 1,421,249 | 0.57 | 0.98 | 0.96 |
-| 40,000 | 3,203,030 / 2,838,869 | 0.28 | 0.99 | 0.99 |
-| 100,000 | 8,003,130 / 7,091,830 | 0.87 | 1.07 | 0.93 |
+**Method.** Three repositories per size from one `fast-import` commit (N files in 100 directories, one untracked `extra.txt`): `default`, `default-b` (a second plain copy, the identical-arm control) and `manyFiles` (`feature.manyFiles=true`). In all three, one ordinary `git status` with `GIT_OPTIONAL_LOCKS` unset, so git may rewrite the index. Then GitPulse-style reads (`GIT_OPTIONAL_LOCKS=0`) are timed, interleaved, 15 rounds, min-of-15. Load average 10 to 17 on 18 cores (the last run, 100,000 files, under about 17 and visibly slower). `scripts/bench-git-tuning.mjs files`.
 
-The index is 11 percent smaller; `ls-files` and a one-file `add` do not change. `status` is faster in every row, but the size of the gain does not rise with the file count, and it contradicts the 2026-10-13 spike below, which saw no effect from `core.untrackedCache` alone. This run was under load, with a fixture of 50 to 100 directories where the untracked cache saves the directory scans, and I did not separate the three parts of `feature.manyFiles`. The threshold is therefore a policy choice, not the smallest size at which a gain appeared: **20,000 tracked files**, where the gain is outside the noise, and where the cost of the change (a git older than 2.40 reports a corrupt skipHash index on `fsck`, a git older than 2.13 refuses the index) is worth paying. A repository with a split index or a sparse index has an unreliable header count and is never offered it.
+Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x on `status` (0.93 to 1.06x on `ls-files`, `add`).
+
+| tracked files | run | status, default-b (control) | status, manyFiles | status, untracked cache only | ls-files, manyFiles | add (index rewrite), manyFiles |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20,000 | 1 | 0.98 | 0.69 | not run | 1.07 | 0.97 |
+| 20,000 | 2 | 0.99 | 0.69 | not run | 0.92 | 0.90 |
+| 20,000 | 3 | 0.97 | 0.69 | 0.74 | not shown | not shown |
+| 40,000 | 1 | 1.02 | 1.00 | not run | 1.00 | 1.00 |
+| 40,000 | 2 | 0.99 | 0.67 | not run | 0.99 | 1.01 |
+| 100,000 | 1 | 0.96 | 0.63 | not run | 1.04 | 0.93 |
+| 100,000 | 2 | 1.06 | 0.66 | not run | 1.07 | 0.97 |
+| 100,000 | 3 (heavy load) | 1.05 | 0.89 | 0.93 | not shown | not shown |
+
+What it shows, and what it does not:
+
+* `status` read GitPulse-style was 0.63 to 0.69x as long under `feature.manyFiles` in six of eight runs, well outside the 0.96 to 1.06x noise floor, with no change to `ls-files` or a one-file `add`. In one run (40,000, the first) there was no gain, and one (100,000, under heavy load) showed 0.89x. So the gain is real but not guaranteed, and 20,000 files is the smallest size measured under this method.
+* **The gain is the untracked cache's, not the index format's.** After the refreshing `status` the `manyFiles` index was still format 2 (read from the header) and about 4.6 KB (4,586 to 4,587 bytes) **larger** than the plain one (the untracked-cache extension), not smaller. An arm with only `core.untrackedCache=true` matched it (0.74x and 0.93x against 0.69x and 0.89x in the same runs). So `index.version=4` and `index.skipHash` were not shown to help anything here, and they are what carry the compatibility costs (git older than 2.40 reports a corrupt skipHash index on `fsck`, git older than 2.13 refuses the index).
+* The gain needs git to write the index once with the untracked cache, which happens at the first ordinary `git status` after the key is set. Nothing is faster at the click, so the preview and the hint say so.
+* This reconciles with the 2026-10-13 spike below, which saw no effect from `core.untrackedCache` alone, only partly: that spike's fixtures and invocation differ, and I did not rerun them.
+
+**Threshold.** The offer stays at 20,000 tracked files, the smallest size where the gain was measured, with the corrected wording. Because the measured gain belongs to `core.untrackedCache` and the compatibility cost to the format keys, offering `core.untrackedCache` alone would give the same measured gain without the cost. That is a different key from the one the owner approved, so it is not done here and is recorded as a decision for the owner. A repository whose index is a split index (the `link` extension, or a `sharedindex.*` file beside an unreadable index) or has one in any other worktree is never offered `feature.manyFiles`: on git 2.54 the two together crash `git status`.
 
 ### fsmonitor
 
-Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,000 tracked files, parity near 6,000, 20 to 45 percent faster at 40,000 and above. **40,000 tracked files**, on macOS only (the only platform measured), and only for git 2.35.2 or newer, where a boolean value is read as a boolean. It was not re-measured today.
+Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,000 tracked files, parity near 6,000, 20 to 45 percent faster at 40,000 and above. **40,000 tracked files**, on macOS only (the only platform measured), and only for git 2.36.0 or newer. The boolean value and the built-in daemon arrived in 2.36.0: git's `Documentation/config/core.txt` at v2.35.1 and v2.35.2 describes only a hook command, and at v2.36.0 it says that if `core.fsmonitor` is set to true git enables the built-in daemon, and that older git reads `true` as a hook path. It was not re-measured today.
 
 ### Thresholds, as shipped
 
 | change | offered when | evidence |
 | --- | --- | --- |
-| `feature.manyFiles` | 20,000 or more tracked files (exact count), key unset, no split index, git 2.13 or newer | the `files` table |
-| `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.35.2 or newer | the 2026-10-13 spike |
+| `feature.manyFiles` | 20,000 or more tracked files (exact count, index walked and valid), key unset, no split index here or in another worktree, git 2.13 or newer | the corrected `files` table (the gain is the untracked cache's) |
+| `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.36.0 or newer | the 2026-10-13 spike |
 | `git maintenance start` | about 6,700 or more loose objects and past `gc.auto`, not registered, `gc.auto` and `maintenance.auto` not turned off | the `loose` table and the `loose-objects` task row |
 | pack count, multi-pack-index | never offered; reported only | the `packs` tables |
 

@@ -217,7 +217,22 @@ export interface IndexInfo {
   /** False under split-index or a sparse index, where the header counts only part. */
   entries_exact: boolean;
   skip_hash: boolean | null;
+  /** A split index is in use (its link extension, a sharedindex file, or config); `null` is unknown. */
+  split_index: boolean | null;
   note: string | null;
+}
+
+/** The repository's other worktrees, read because a shared-config write reaches them all. */
+export interface WorktreeFamily {
+  worktrees: number;
+  /** Checkouts whose index file is a split index. */
+  split_index_in: string[];
+  /** Checkouts whose index could not be read, so a split index there is not ruled out. */
+  unverified_indexes: string[];
+  /** Checkouts with their own config.worktree, read with git at plan time. */
+  with_worktree_config: string[];
+  /** More worktrees than the bound: the rest were not examined. */
+  truncated: boolean;
 }
 
 /** One tuning key's value and the config layer that supplied it. */
@@ -237,6 +252,7 @@ export interface RepoTuningReport {
   partial_clone: boolean | null;
   sparse_checkout: boolean | null;
   keys: TuningKeyValue[];
+  family: WorktreeFamily;
   config_note: string | null;
   notes: string[];
 }

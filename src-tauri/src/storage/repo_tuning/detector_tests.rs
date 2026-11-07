@@ -1,3 +1,4 @@
+use super::index_file_tests::index_bytes;
 use super::*;
 use proptest::prelude::*;
 
@@ -13,14 +14,6 @@ fn header(version: u32, entries: u32) -> Vec<u8> {
     let mut bytes = b"DIRC".to_vec();
     bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&entries.to_be_bytes());
-    bytes
-}
-
-/// A well-formed-looking index: header, `entries` filler entries and a trailer.
-fn index_bytes(version: u32, entries: u32, trailer: &[u8]) -> Vec<u8> {
-    let mut bytes = header(version, entries);
-    bytes.extend(std::iter::repeat_n(0xAB, entries as usize * 64));
-    bytes.extend_from_slice(trailer);
     bytes
 }
 
@@ -114,14 +107,14 @@ fn index_reader_takes_each_version_and_both_trailers() {
             index_bytes(version, 3, &[0x11; 20]),
         )
         .unwrap();
-        let index = read_index(&repo.git(), 20, true);
+        let index = read_index(&repo.git(), 20, false, false);
         assert_eq!(index.state, IndexReadState::Present);
         assert_eq!(index.version, Some(version));
         assert_eq!(index.entries, Some(3));
         assert_eq!(index.skip_hash, Some(false), "a real checksum");
     }
     fs::write(repo.git().join("index"), index_bytes(4, 3, &[0; 20])).unwrap();
-    let zeroed = read_index(&repo.git(), 20, true);
+    let zeroed = read_index(&repo.git(), 20, false, false);
     assert_eq!(
         zeroed.skip_hash,
         Some(true),
@@ -130,13 +123,16 @@ fn index_reader_takes_each_version_and_both_trailers() {
     assert_eq!(zeroed.state, IndexReadState::Present);
     // sha256 is 32 bytes wide
     fs::write(repo.git().join("index"), index_bytes(2, 2, &[0; 32])).unwrap();
-    assert_eq!(read_index(&repo.git(), 32, true).skip_hash, Some(true));
+    assert_eq!(
+        read_index(&repo.git(), 32, false, false).skip_hash,
+        Some(true)
+    );
 }
 
 #[test]
 fn index_reader_is_honest_about_what_it_cannot_read() {
     let repo = Repo::new();
-    let missing = read_index(&repo.git(), 20, true);
+    let missing = read_index(&repo.git(), 20, false, false);
     assert_eq!(missing.state, IndexReadState::Missing);
     assert_eq!(missing.entries, None);
 
@@ -149,7 +145,7 @@ fn index_reader_is_honest_about_what_it_cannot_read() {
         (header(2, 1_000_000), "count the file cannot hold"),
     ] {
         fs::write(&index, bytes).unwrap();
-        let got = read_index(&repo.git(), 20, true);
+        let got = read_index(&repo.git(), 20, false, false);
         assert_eq!(got.state, IndexReadState::Unknown, "{label}");
         assert!(got.note.is_some(), "{label}: unknown must say why");
         assert_eq!(got.entries, None, "{label}");
@@ -158,18 +154,108 @@ fn index_reader_is_honest_about_what_it_cannot_read() {
     fs::remove_file(&index).unwrap();
     fs::create_dir(&index).unwrap();
     assert_eq!(
-        read_index(&repo.git(), 20, true).state,
+        read_index(&repo.git(), 20, false, false).state,
         IndexReadState::Unknown
     );
 }
 
 #[test]
-fn a_header_only_index_has_no_readable_trailer() {
+fn a_header_with_no_checksum_is_not_an_index() {
     let repo = Repo::new();
     fs::write(repo.git().join("index"), header(2, 0)).unwrap();
-    let index = read_index(&repo.git(), 20, true);
-    assert_eq!(index.state, IndexReadState::Present);
+    let index = read_index(&repo.git(), 20, false, false);
+    assert_eq!(index.state, IndexReadState::Unknown);
     assert_eq!(index.skip_hash, None);
+    assert_eq!(index.entries, None);
+}
+
+#[test]
+fn a_split_index_is_found_in_the_file_and_beside_it() {
+    use super::index_file_tests::index_with;
+    let repo = Repo::new();
+    let index = repo.git().join("index");
+    fs::write(
+        &index,
+        index_with(2, 5, &[(b"link", vec![0; 24])], &[1; 20]),
+    )
+    .unwrap();
+    let carried = repo.report(&[]);
+    assert_eq!(carried.index.split_index, Some(true), "{carried:?}");
+    assert!(!carried.index.entries_exact);
+    // A plain index with a stale shared index left beside it is not split.
+    fs::write(&index, index_bytes(2, 5, &[1; 20])).unwrap();
+    fs::write(repo.git().join("sharedindex.0123456789abcdef"), b"DIRC").unwrap();
+    let stale = repo.report(&[]);
+    assert_eq!(stale.index.split_index, Some(false), "{stale:?}");
+    // The same shared index beside an index that cannot be read is a split
+    // index until shown otherwise.
+    fs::write(&index, b"garbage").unwrap();
+    let unreadable = repo.report(&[]);
+    assert_eq!(unreadable.index.split_index, Some(true));
+    assert_eq!(unreadable.index.entries, None);
+    // And config alone says so too.
+    fs::remove_file(repo.git().join("sharedindex.0123456789abcdef")).unwrap();
+    fs::write(&index, index_bytes(2, 5, &[1; 20])).unwrap();
+    let by_config = repo.report(&[entry("core.splitindex", "true", ConfigScope::Global)]);
+    assert_eq!(by_config.index.split_index, Some(true));
+    assert_eq!(repo.report(&[]).index.split_index, Some(false));
+}
+
+#[test]
+fn sibling_worktrees_are_read_without_a_process() {
+    use super::index_file_tests::index_with;
+    let main = Repo::new();
+    let wts = main.git().join("worktrees");
+    for (name, split) in [("a", false), ("b", true)] {
+        let private = wts.join(name);
+        fs::create_dir_all(&private).unwrap();
+        fs::write(private.join("gitdir"), format!("/work/{name}/.git\n")).unwrap();
+        let exts: Vec<(&[u8; 4], Vec<u8>)> = if split {
+            vec![(b"link", vec![0; 24])]
+        } else {
+            vec![]
+        };
+        fs::write(private.join("index"), index_with(2, 3, &exts, &[1; 20])).unwrap();
+    }
+    fs::write(wts.join("a/config.worktree"), "[core]\n").unwrap();
+    // `c`'s index is garbage; `d` has none.
+    fs::create_dir_all(wts.join("c")).unwrap();
+    fs::write(wts.join("c/index"), b"garbage garbage garbage").unwrap();
+    fs::create_dir_all(wts.join("d")).unwrap();
+    // This worktree is `a`: it is not its own sibling.
+    let report = inspect_with(
+        Path::new("/work/a"),
+        &wts.join("a"),
+        &main.git(),
+        None,
+        Ok(&[]),
+    );
+    let family = &report.family;
+    assert_eq!(family.split_index_in, ["/work/b"], "{family:?}");
+    assert_eq!(family.unverified_indexes.len(), 1, "{family:?}");
+    assert!(family.with_worktree_config.is_empty(), "a is this worktree");
+    assert!(family.many_files_blocker().unwrap().contains("/work/b"));
+    // From the main worktree, `a`'s config.worktree is listed for plan time.
+    let from_main = main.report(&[]);
+    assert_eq!(from_main.family.with_worktree_config, ["/work/a"]);
+    assert_eq!(from_main.family.worktrees, 4);
+    assert_eq!(from_main.index.state, IndexReadState::Missing);
+}
+
+#[test]
+fn a_linked_worktree_also_examines_the_main_worktrees_index() {
+    use super::index_file_tests::index_with;
+    let main = Repo::new();
+    fs::write(
+        main.git().join("index"),
+        index_with(2, 3, &[(b"link", vec![0; 24])], &[1; 20]),
+    )
+    .unwrap();
+    let private = main.git().join("worktrees/w");
+    fs::create_dir_all(&private).unwrap();
+    fs::write(private.join("gitdir"), "/work/w/.git\n").unwrap();
+    let report = inspect_with(Path::new("/work/w"), &private, &main.git(), None, Ok(&[]));
+    assert_eq!(report.family.split_index_in.len(), 1, "{:?}", report.family);
 }
 
 #[test]

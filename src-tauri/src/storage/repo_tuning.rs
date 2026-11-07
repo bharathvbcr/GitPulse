@@ -22,12 +22,13 @@
 //! reported as unknown (`None`, with a note), never as absent or as zero.
 
 mod advice;
+mod index_file;
 pub use advice::*;
 
 use crate::engine::git_reader::{ConfigEntry, ConfigScope};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Directory entries read from `objects/pack` or `objects/17` before the count
@@ -40,8 +41,12 @@ pub const GC_AUTO_DEFAULT: u64 = 6700;
 /// The index's fixed leading bytes: `DIRC`, version, entry count.
 pub const INDEX_HEADER_LEN: usize = 12;
 /// Smallest on-disk size of one index entry (the fixed fields of a SHA-1 entry
-/// are 62 bytes); a count the file cannot hold is a corrupt header.
+/// are 62 bytes); a count the file cannot hold is a corrupt header. The cheap
+/// first check, before the body is walked.
 const MIN_INDEX_ENTRY_BYTES: u64 = 62;
+/// Linked worktrees examined for a split index before the family is called
+/// too large to check.
+const MAX_FAMILY_WORKTREES: usize = 256;
 
 /// The tuning keys the detector reports, lowercase as git's config list prints
 /// them, with the spelling a person types.
@@ -113,7 +118,57 @@ pub struct IndexInfo {
     /// The trailing checksum is all zero (`index.skipHash`). `None` when the
     /// trailer could not be read.
     pub skip_hash: Option<bool>,
+    /// A split index is in use: the index file's `link` extension, a
+    /// `sharedindex.*` file beside an index that could not be read, or
+    /// `core.splitIndex`. `None` when that could not be established.
+    pub split_index: Option<bool>,
     pub note: Option<String>,
+}
+
+/// The other worktrees of the repository, whose index files and per-worktree
+/// config are read because `git config --local` writes the config they all
+/// share. Found without a process, from `$GIT_COMMON_DIR/worktrees/*`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeFamily {
+    /// Worktrees other than this one that were examined (the main worktree
+    /// counts when this one is linked).
+    pub worktrees: u32,
+    /// Checkouts whose index file is a split index.
+    pub split_index_in: Vec<String>,
+    /// Checkouts whose index file could not be read, so a split index there is
+    /// neither confirmed nor ruled out.
+    pub unverified_indexes: Vec<String>,
+    /// Checkouts with their own `config.worktree`, whose effective config is
+    /// read with git at plan time (the detector spawns nothing).
+    pub with_worktree_config: Vec<String>,
+    /// More worktrees than [`MAX_FAMILY_WORKTREES`]: the rest were not looked at.
+    pub truncated: bool,
+}
+
+impl WorktreeFamily {
+    /// Why `feature.manyFiles` must not be written for this repository's
+    /// worktrees, when a sibling's index says so or cannot say otherwise.
+    pub fn many_files_blocker(&self) -> Option<String> {
+        if let Some(first) = self.split_index_in.first() {
+            return Some(format!(
+                "the worktree {first} has a split index, and `git config --local` would turn \
+                 feature.manyFiles on there too (with a split index it crashes git status on \
+                 git 2.54)"
+            ));
+        }
+        if self.truncated {
+            return Some(format!(
+                "this repository has more than {MAX_FAMILY_WORKTREES} worktrees, too many to \
+                 check each for a split index"
+            ));
+        }
+        self.unverified_indexes.first().map(|first| {
+            format!(
+                "the index of the worktree {first} could not be read, so a split index there is \
+                 not ruled out"
+            )
+        })
+    }
 }
 
 /// One tuning key's value and the config layer that supplied it.
@@ -137,6 +192,10 @@ pub struct RepoTuningReport {
     pub partial_clone: Option<bool>,
     pub sparse_checkout: Option<bool>,
     pub keys: Vec<TuningKeyValue>,
+    /// The other worktrees of this repository, for facts that a shared-config
+    /// write would reach.
+    #[serde(default)]
+    pub family: WorktreeFamily,
     /// Why every config-derived field is unknown, when the config could not be
     /// read.
     pub config_note: Option<String>,
@@ -213,69 +272,177 @@ pub fn parse_index_header(bytes: &[u8]) -> Result<IndexHeader, String> {
     Ok(IndexHeader { version, entries })
 }
 
-/// Reads the index of `git_dir` without a process. `hash_len` is the
-/// repository's object-id width, which is the trailer's width.
-fn read_index(git_dir: &Path, hash_len: usize, entries_exact: bool) -> IndexInfo {
+/// What one index file turned out to be.
+enum IndexFile {
+    Missing,
+    Unreadable(String),
+    Walked {
+        header: IndexHeader,
+        shape: index_file::IndexShape,
+    },
+}
+
+/// Opens and walks the index of `git_dir` without a process: header, then the
+/// whole body (bounded, cached). `hash_len` is the repository's object-id
+/// width, which is the trailer's width.
+fn open_index(git_dir: &Path, hash_len: usize) -> IndexFile {
     let path = git_dir.join("index");
-    let unknown = |note: String| IndexInfo {
-        state: IndexReadState::Unknown,
-        note: Some(note),
-        ..IndexInfo::default()
-    };
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return IndexInfo {
-                state: IndexReadState::Missing,
-                ..IndexInfo::default()
-            }
-        }
-        Err(e) => return unknown(format!("the index could not be examined: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexFile::Missing,
+        Err(e) => return IndexFile::Unreadable(format!("the index could not be examined: {e}")),
     };
     if !meta.is_file() {
-        return unknown("the index is not a regular file".to_string());
+        return IndexFile::Unreadable("the index is not a regular file".to_string());
     }
-    let len = meta.len();
-    let mut file = match File::open(&path) {
-        Ok(file) => file,
-        Err(e) => return unknown(format!("the index could not be opened: {e}")),
-    };
     let mut head = [0u8; INDEX_HEADER_LEN];
-    if let Err(e) = file.read_exact(&mut head) {
-        return unknown(format!("the index header could not be read: {e}"));
+    let read = File::open(&path).and_then(|mut file| file.read_exact(&mut head));
+    if let Err(e) = read {
+        return IndexFile::Unreadable(format!("the index header could not be read: {e}"));
     }
     let header = match parse_index_header(&head) {
         Ok(header) => header,
-        Err(why) => return unknown(why),
+        Err(why) => return IndexFile::Unreadable(why),
     };
     let entries = u64::from(header.entries);
-    if entries.saturating_mul(MIN_INDEX_ENTRY_BYTES) > len {
-        return unknown(format!(
-            "the index header claims {entries} entries, more than a {len} byte file can hold"
+    if entries.saturating_mul(MIN_INDEX_ENTRY_BYTES) > meta.len() {
+        return IndexFile::Unreadable(format!(
+            "the index header claims {entries} entries, more than a {} byte file can hold",
+            meta.len()
         ));
     }
-    // `index.skipHash` writes an all-zero checksum in place of the hash of the
-    // file; the zero trailer is what tells it apart.
-    let skip_hash = if len >= (INDEX_HEADER_LEN + hash_len) as u64 {
-        let mut trailer = vec![0u8; hash_len];
-        file.seek(SeekFrom::End(-(hash_len as i64)))
-            .and_then(|_| file.read_exact(&mut trailer))
-            .ok()
-            .map(|()| trailer.iter().all(|b| *b == 0))
-    } else {
-        None
-    };
-    IndexInfo {
-        state: IndexReadState::Present,
-        version: Some(header.version),
-        entries: Some(entries),
-        entries_exact,
-        skip_hash,
-        note: (!entries_exact).then(|| {
-            "split-index or a sparse index is in use, so the header counts only part of the tree"
-                .to_string()
-        }),
+    match index_file::walk(&path, &meta, header, hash_len) {
+        Ok(shape) => IndexFile::Walked { header, shape },
+        Err(why) => IndexFile::Unreadable(format!(
+            "the index header claims {entries} entries but the body is not a valid index: {why}"
+        )),
     }
+}
+
+/// Whether `dir` holds a `sharedindex.*` file, which a split index leaves.
+fn has_shared_index(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .take(MAX_DIR_ENTRIES)
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("sharedindex."))
+    })
+}
+
+/// The report for the index of `git_dir`. `config_split` and `config_sparse`
+/// are what the effective config says (`core.splitIndex`, `index.sparse`).
+fn read_index(
+    git_dir: &Path,
+    hash_len: usize,
+    config_split: bool,
+    config_sparse: bool,
+) -> IndexInfo {
+    match open_index(git_dir, hash_len) {
+        IndexFile::Missing => IndexInfo {
+            state: IndexReadState::Missing,
+            split_index: (config_split || has_shared_index(git_dir)).then_some(true),
+            ..IndexInfo::default()
+        },
+        IndexFile::Unreadable(note) => IndexInfo {
+            state: IndexReadState::Unknown,
+            // A shared index beside an index we cannot read is a split index
+            // until shown otherwise; without one the answer is unknown.
+            split_index: (config_split || has_shared_index(git_dir)).then_some(true),
+            note: Some(note),
+            ..IndexInfo::default()
+        },
+        IndexFile::Walked { header, shape } => {
+            // A `sharedindex.*` file is live only if this index's `link`
+            // extension names it; one left from before the split was undone is
+            // not a split index.
+            let split = shape.split || config_split;
+            let exact = !(split || shape.sparse || config_sparse);
+            IndexInfo {
+                state: IndexReadState::Present,
+                version: Some(header.version),
+                entries: Some(u64::from(header.entries)),
+                entries_exact: exact,
+                skip_hash: Some(shape.skip_hash),
+                split_index: Some(split),
+                note: (!exact).then(|| {
+                    "split-index or a sparse index is in use, so the header counts only part of \
+                     the tree"
+                        .to_string()
+                }),
+            }
+        }
+    }
+}
+
+/// A worktree's checkout path as recorded in `<private>/gitdir` (which names
+/// its `.git` file). `None` when it cannot be read.
+fn checkout_of(private: &Path) -> Option<String> {
+    let text = fs::read_to_string(private.join("gitdir")).ok()?;
+    let git_file = Path::new(text.trim());
+    Some(git_file.parent()?.to_string_lossy().into_owned())
+}
+
+/// A path as shown in a message: control characters stripped, bounded.
+fn shown(path: &str) -> String {
+    crate::alerts::text::sanitize(path)
+        .chars()
+        .take(240)
+        .collect()
+}
+
+/// Reads the other worktrees' indexes and notes which have a config of their
+/// own, from `common_dir/worktrees/*` and the main worktree's index.
+fn scan_family(git_dir: &Path, common_dir: &Path, hash_len: usize) -> WorktreeFamily {
+    let mut family = WorktreeFamily::default();
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own = canon(git_dir);
+    let mut privates: Vec<(PathBuf, Option<String>)> = Vec::new();
+    // The main worktree, when this is a linked one: its git dir is the common dir.
+    if own != canon(common_dir) && common_dir.join("index").exists() {
+        let name = common_dir
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned());
+        privates.push((common_dir.to_path_buf(), name));
+    }
+    if let Ok(entries) = fs::read_dir(common_dir.join("worktrees")) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() || canon(&path) == own {
+                continue;
+            }
+            if privates.len() >= MAX_FAMILY_WORKTREES {
+                family.truncated = true;
+                break;
+            }
+            let name = checkout_of(&path);
+            privates.push((path, name));
+        }
+    }
+    for (private, checkout) in privates {
+        family.worktrees += 1;
+        let label = shown(
+            &checkout
+                .clone()
+                .unwrap_or_else(|| private.to_string_lossy().into_owned()),
+        );
+        match open_index(&private, hash_len) {
+            IndexFile::Missing => {}
+            IndexFile::Unreadable(_) => family.unverified_indexes.push(label.clone()),
+            IndexFile::Walked { shape, .. } if shape.split => {
+                family.split_index_in.push(label.clone())
+            }
+            IndexFile::Walked { .. } => {}
+        }
+        if private.join("config.worktree").exists() {
+            match checkout {
+                // The exact path is read back at plan time, so only one that
+                // survives being shown unchanged can be.
+                Some(raw) if shown(&raw) == raw => family.with_worktree_config.push(raw),
+                _ => family.unverified_indexes.push(label),
+            }
+        }
+    }
+    family
 }
 
 // ---------------------------------------------------------------------------
@@ -534,16 +701,21 @@ pub fn inspect_with(
     };
     let (object_pressure, midx) = object_pressure(&objects, hash_len, counts, gc_auto, &mut notes);
 
-    let split_or_sparse = readable
-        && (last(entries, "core.splitindex").is_some_and(|e| config_true(&e.value))
-            || last(entries, "index.sparse").is_some_and(|e| config_true(&e.value)));
-    let mut index = read_index(git_dir, hash_len, !split_or_sparse);
+    let config_flag =
+        |key: &str| readable && last(entries, key).is_some_and(|e| config_true(&e.value));
+    let mut index = read_index(
+        git_dir,
+        hash_len,
+        config_flag("core.splitindex"),
+        config_flag("index.sparse"),
+    );
     if !readable && index.state == IndexReadState::Present {
         // Whether the header counts the whole tree depends on config.
         index.entries_exact = false;
         index.note =
             Some("config unreadable: the entry count may cover only part of the tree".into());
     }
+    let family = scan_family(git_dir, common_dir, hash_len);
 
     let keys = TUNING_KEYS
         .iter()
@@ -569,6 +741,7 @@ pub fn inspect_with(
         partial_clone: readable.then(|| is_partial_clone(entries)),
         sparse_checkout: readable.then(|| is_sparse(git_dir, common_dir, entries)),
         keys,
+        family,
         config_note,
         notes,
     }
@@ -578,3 +751,5 @@ pub fn inspect_with(
 mod advice_tests;
 #[cfg(test)]
 mod detector_tests;
+#[cfg(test)]
+mod index_file_tests;

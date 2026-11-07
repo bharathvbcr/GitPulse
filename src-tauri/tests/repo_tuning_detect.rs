@@ -241,3 +241,51 @@ fn detection_spawns_no_git_process() {
     }
     assert_eq!(warm.len(), cold.len(), "a warm inspect spawned a process");
 }
+
+#[test]
+fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
+    use gitpulse_lib::storage::repo_tuning::{recommend, GitEnv, TuningChange};
+    let _g = serial();
+    let dir = repo_with_files(25_000);
+    run_git(dir.path(), &["update-index", "--split-index"]);
+    let report = detect(dir.path());
+    assert_eq!(report.index.state, IndexReadState::Present, "{report:?}");
+    assert_eq!(report.index.split_index, Some(true), "{report:?}");
+    assert!(!report.index.entries_exact);
+    let env = GitEnv {
+        version: Some((2, 54, 0)),
+        fsmonitor_measured: true,
+    };
+    assert!(recommend(&report, env)
+        .iter()
+        .all(|o| o.change != TuningChange::ManyFiles));
+    // Undoing the split leaves a plain index that walks and counts exactly.
+    run_git(dir.path(), &["update-index", "--no-split-index"]);
+    let plain = detect(dir.path());
+    assert_eq!(plain.index.split_index, Some(false), "{plain:?}");
+    assert_eq!(plain.index.entries, Some(25_000));
+}
+
+#[test]
+fn real_indexes_of_every_shape_git_writes_are_walked() {
+    let _g = serial();
+    for (label, setup) in [
+        ("skipHash v4", &["config", "feature.manyFiles", "true"][..]),
+        ("v4", &["config", "index.version", "4"][..]),
+        ("plain", &["config", "gc.auto", "0"][..]),
+    ] {
+        let dir = repo_with_files(300);
+        run_git(dir.path(), setup);
+        std::fs::write(dir.path().join("new.txt"), "n").unwrap();
+        run_git(dir.path(), &["add", "new.txt"]);
+        run_git(dir.path(), &["status", "--porcelain"]);
+        let report = detect(dir.path());
+        assert_eq!(
+            report.index.state,
+            IndexReadState::Present,
+            "{label}: {report:?}"
+        );
+        assert_eq!(report.index.entries, Some(301), "{label}");
+        assert_eq!(report.index.split_index, Some(false), "{label}");
+    }
+}

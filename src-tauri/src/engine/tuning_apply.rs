@@ -23,8 +23,8 @@ use crate::engine::git_writer::record_clicked_write;
 use crate::ipc_error::CommandError;
 use crate::singleflight::SingleFlight;
 use crate::storage::repo_tuning::{
-    is_apply_argv, plan_apply, GitEnv, TuningChange, TuningOutcome, TuningPlan, TuningStepResult,
-    TuningStepStatus, TUNING_APPLY_TIMEOUT_SECS,
+    config_true, is_apply_argv, plan_apply, GitEnv, RepoTuningReport, TuningChange, TuningOutcome,
+    TuningPlan, TuningStepResult, TuningStepStatus, TUNING_APPLY_TIMEOUT_SECS,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,56 @@ fn cancels() -> &'static Mutex<HashMap<PathBuf, Arc<AtomicBool>>> {
 fn stop_intents() -> &'static Mutex<HashMap<PathBuf, Instant>> {
     static INTENTS: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
     INTENTS.get_or_init(Default::default)
+}
+
+/// The change set of the apply running (or about to run) in each common dir,
+/// with how many callers hold it. A second click may join an apply only when it
+/// asks for the same changes: a different set would be joined and silently
+/// dropped, and the person would believe it had been applied.
+type RunningSets = Mutex<HashMap<PathBuf, (Vec<TuningChange>, usize)>>;
+
+fn running_sets() -> &'static RunningSets {
+    static SETS: OnceLock<RunningSets> = OnceLock::new();
+    SETS.get_or_init(Default::default)
+}
+
+/// Holds a claim on `common`'s running set until dropped.
+struct SetClaim(PathBuf);
+
+impl SetClaim {
+    fn claim(common: &Path, requested: &[TuningChange]) -> Result<Self, CommandError> {
+        let mut set = requested.to_vec();
+        set.sort();
+        set.dedup();
+        let mut sets = locked(running_sets());
+        match sets.get_mut(common) {
+            Some((running, holders)) if *running == set => *holders += 1,
+            Some(_) => {
+                return Err(
+                    "A tuning apply with different changes is already running in this \
+                     repository; stop it from the Storage panel or wait for it to finish"
+                        .to_string()
+                        .into(),
+                )
+            }
+            None => {
+                sets.insert(common.to_path_buf(), (set, 1));
+            }
+        }
+        Ok(Self(common.to_path_buf()))
+    }
+}
+
+impl Drop for SetClaim {
+    fn drop(&mut self) {
+        let mut sets = locked(running_sets());
+        if let Some((_, holders)) = sets.get_mut(&self.0) {
+            *holders -= 1;
+            if *holders == 0 {
+                sets.remove(&self.0);
+            }
+        }
+    }
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -110,7 +160,8 @@ fn plan_now(
     let repo = git_cli::validate_repo(repo_path)?;
     crate::repository_trust::require(&repo)?;
     let (private, common) = crate::repository_trust::git_directories(&repo)?;
-    let advice = crate::storage::tuning_advice_fresh(&repo, &private, &common);
+    let mut advice = crate::storage::tuning_advice_fresh(&repo, &private, &common);
+    read_worktree_configs(&mut advice.report);
     let plan = plan_apply(
         &advice.report,
         GitEnv::current(),
@@ -119,6 +170,38 @@ fn plan_now(
     )
     .map_err(CommandError::from)?;
     Ok((repo, common, plan))
+}
+
+/// Most sibling worktrees whose own config is read with git for a split index.
+const MAX_WORKTREE_CONFIG_READS: usize = 32;
+
+/// `git config --local` writes the config every worktree shares, so a sibling
+/// with `core.splitIndex` in its own `config.worktree` would get
+/// `feature.manyFiles` too. The detector spawns nothing and only notes which
+/// siblings have such a file; here, once per plan, git reads each one's
+/// effective config. A sibling that cannot be read, or more siblings than the
+/// bound, is recorded as unverified, which refuses the change.
+fn read_worktree_configs(report: &mut RepoTuningReport) {
+    let paths = std::mem::take(&mut report.family.with_worktree_config);
+    if paths.len() > MAX_WORKTREE_CONFIG_READS {
+        report.family.truncated = true;
+        return;
+    }
+    for path in paths {
+        match crate::engine::git_reader::config_entries_fresh(Path::new(&path)) {
+            Ok(entries) => {
+                let split = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.key == "core.splitindex")
+                    .is_some_and(|e| config_true(&e.value));
+                if split {
+                    report.family.split_index_in.push(path);
+                }
+            }
+            Err(_) => report.family.unverified_indexes.push(path),
+        }
+    }
 }
 
 /// The preview of applying `requested`: exact argv, scope and undo per change,
@@ -190,6 +273,13 @@ pub(crate) fn tuning_apply_within(
     confirmed: &[Vec<String>],
     budget: Duration,
 ) -> Result<TuningOutcome, CommandError> {
+    // The claim comes first, before anything is planned: a click for a
+    // different set must be refused as "already running", not planned against
+    // a repository the running apply is changing.
+    let repo = git_cli::validate_repo(repo_path)?;
+    crate::repository_trust::require(&repo)?;
+    let (_, common_dir) = crate::repository_trust::git_directories(&repo)?;
+    let _claim = SetClaim::claim(&common_dir, requested)?;
     let (repo, common, plan) = plan_now(repo_path, requested)?;
     let runnable = plan.runnable();
     if confirmed != runnable.as_slice() {
@@ -378,4 +468,50 @@ fn run(
         results,
         advice,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_click_joins_only_the_same_set_of_changes() {
+        let common = PathBuf::from("/claim-test/one/.git");
+        let first = SetClaim::claim(
+            &common,
+            &[TuningChange::ManyFiles, TuningChange::Maintenance],
+        )
+        .expect("the first click claims the repository");
+        // The same set, in another order and with a repeat, joins.
+        let joined = SetClaim::claim(
+            &common,
+            &[
+                TuningChange::Maintenance,
+                TuningChange::ManyFiles,
+                TuningChange::Maintenance,
+            ],
+        )
+        .expect("an identical set joins");
+        // A different set, larger or smaller, is refused rather than dropped.
+        for other in [
+            vec![TuningChange::ManyFiles],
+            vec![TuningChange::Fsmonitor],
+            TuningChange::ALL.to_vec(),
+        ] {
+            let refused = SetClaim::claim(&common, &other).err().expect("refused");
+            assert!(
+                refused.message().contains("already running"),
+                "{other:?}: {}",
+                refused.message()
+            );
+        }
+        // Another repository is unaffected.
+        let elsewhere = PathBuf::from("/claim-test/two/.git");
+        assert!(SetClaim::claim(&elsewhere, &[TuningChange::Fsmonitor]).is_ok());
+        // The claim lasts until every holder is gone.
+        drop(first);
+        assert!(SetClaim::claim(&common, &[TuningChange::Fsmonitor]).is_err());
+        drop(joined);
+        assert!(SetClaim::claim(&common, &[TuningChange::Fsmonitor]).is_ok());
+    }
 }
