@@ -320,8 +320,8 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(15);
-    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest", "work.runs.managed.continue"]));
+    expect(ops).toHaveLength(16);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest", "work.tasks.organize", "work.runs.managed.continue"]));
   });
 
   it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {

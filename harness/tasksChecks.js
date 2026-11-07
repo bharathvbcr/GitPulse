@@ -52,6 +52,9 @@ const listQueries = [];
 /** Every `tasks.suggest` the board sent, in order, and the replies parked while `suggestMode` is "hold". */
 const suggestCalls = [], heldSuggest = [];
 let suggestMode = "ok";
+/** Every `tasks.organize` the board sent. `fail` is a store error the panel must show. */
+const organizeCalls = [];
+let organizeMode = "ok";
 const suggestable = input => tasks.filter(task => task.status !== "done" && !deleted.has(task.id) && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (input.max_priority === undefined || task.priority <= input.max_priority));
 const suggestRanking = input => [...suggestable(input)].sort((a, b) => a.priority - b.priority || (a.id < b.id ? -1 : 1)).slice(0, input.limit ?? 5);
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [], checklist: [], links: [],
@@ -496,6 +499,22 @@ mockIPCWithEvents(async (cmd, args) => {
         suggestions: ranked.map((task, i) => ({rank: i + 1, id: task.id, title: task.title, status: task.status, priority: task.priority, score: 100 - i, reason: `fixture rank ${i + 1}`, signals: []}))});
       if (suggestMode === "hold") return new Promise(resolve => heldSuggest.push(() => resolve(answer)));
       return answer;
+    }
+    // A reviewable priority proposal. The fixture names one change for task-3
+    // from the task as it is now. Accepting it is a separate items.put.
+    case "tasks.organize": {
+      organizeCalls.push(structuredClone(input));
+      if (organizeMode === "fail") throw {code:"store_error", message:"Fixture organise offline"};
+      const task = tasks.find(item => item.id === "task-3");
+      return JSON.stringify({
+        ok: true, generated_at: 1, method: "deterministic",
+        changes: task ? [{ id: task.id, title: task.title, status: task.status, revision: task.revision, from: task.priority, to: 0, rule: "severity_critical", reason: "critical severity" }] : [],
+        order: task ? [{ status: task.status, ids: [task.id] }] : [],
+        groups: [],
+        coverage: { read: 1, unread: 0, unhydrated: 0, unrevisioned: 0, complete: true },
+        order_note: "Column order is priority, then due date, using the proposed priority.",
+        differs: ["severity", "blockers", "age", "verification"],
+      });
     }
     default: unknown.push(args.method); throw Error(`Unconfigured method: ${args.method}`);
   }
@@ -3557,6 +3576,62 @@ if (params.has("check")) {
         await toAll();
       } catch (error) { check(`the Suggest next checks ran to the end (${error.message} at ${step})`, false); }
       finally { suggestMode = "ok"; for (const release of heldSuggest.splice(0)) release(); if (root.querySelector('[data-testid="task-suggest"]')) { button("Close suggestions", root)?.click(); await settle(); } }
+
+      let organizeSnapshot = null;
+      try {
+        step = "organise";
+        const toggle = () => root.querySelector('[data-testid="task-organize-toggle"]');
+        const panel = () => root.querySelector('[data-testid="task-organize"]');
+        const row = () => panel()?.querySelector('[data-testid="task-organize-change"]');
+        const idle = () => panel()?.getAttribute("aria-busy") === "false";
+        const subject = () => tasks.find(task => task.id === "task-3");
+        const snapshot = organizeSnapshot = structuredClone(subject());
+        const labels = ["Urgent", "High", "Normal", "Low"];
+        if (subject().priority === 0) subject().priority = 2;
+        const fromLabel = labels[subject().priority] ?? "Normal";
+        await toAll();
+        organizeCalls.length = 0; organizeMode = "ok";
+        check("Organise asks nothing until it is pressed", organizeCalls.length === 0 && !panel() && toggle().getAttribute("aria-pressed") === "false");
+        toggle().click(); await wait(() => idle() && row());
+        check("pressing it asks once and shows the change, its reason, and that nothing is written yet",
+          organizeCalls.length === 1 && !("repository_id" in organizeCalls[0])
+          && row().dataset.taskId === "task-3" && row().dataset.rule === "severity_critical"
+          && row().textContent.includes("critical severity") && row().textContent.includes(fromLabel) && row().textContent.includes("Urgent")
+          && panel().textContent.includes("Nothing on the board changes until you accept a row"));
+        const held = subject();
+        held.revision = snapshot.revision + 5;
+        const writesBeforeRefusal = writes.length;
+        button("Accept", row()).click();
+        await wait(() => panel().querySelector('[data-testid="task-organize-outcome"]')?.textContent.includes("edited since the proposal"));
+        check("a task edited since the proposal is shown and not written",
+          writes.length === writesBeforeRefusal && panel().querySelector('[data-testid="task-organize-outcome"]').textContent.includes("not changed"));
+        held.revision = snapshot.revision;
+        button("Refresh", panel()).click(); await wait(() => idle() && row() && !panel().querySelector('[data-testid="task-organize-outcome"]'));
+        const writesBeforeAccept = writes.length;
+        button("Accept", row()).click();
+        await wait(() => writes.length > writesBeforeAccept && panel().querySelector('[data-testid="task-organize-outcome"]')?.textContent.includes("Accepted"));
+        const put = writes.at(-1);
+        check("Accept writes only the proposed priority, at the proposal's revision",
+          put.id === "task-3" && put.expected_revision === snapshot.revision && put.priority === 0
+          && put.title === snapshot.title && JSON.stringify(put.acceptance_criteria) === JSON.stringify(snapshot.acceptance_criteria)
+          && panel().querySelector('[data-testid="task-organize-outcome"]').textContent.includes(fromLabel) && panel().querySelector('[data-testid="task-organize-outcome"]').textContent.includes("Urgent"));
+        button("Close the priority proposal", panel()).click(); await settle();
+        check("Close puts the priority proposal away", !panel() && toggle().getAttribute("aria-pressed") === "false");
+        const boardRefresh = () => root.querySelector('button[aria-label="Refresh"]');
+        await wait(() => boardRefresh() && boardRefresh().disabled === false);
+        tasks = tasks.map(task => task.id === "task-3" ? snapshot : task);
+        await click("Refresh");
+        await wait(() => boardRefresh() && boardRefresh().disabled === false && card("task-3"));
+      } catch (error) { check(`the Organise checks ran to the end (${error.message} at ${step})`, false); }
+      finally {
+        organizeMode = "ok";
+        const panel = root.querySelector('[data-testid="task-organize"]');
+        if (panel) button("Close the priority proposal", panel)?.click();
+        const current = tasks.find(task => task.id === "task-3");
+        if (organizeSnapshot && current && (current.priority !== organizeSnapshot.priority || current.revision !== organizeSnapshot.revision || current.title !== organizeSnapshot.title || JSON.stringify(current.acceptance_criteria) !== JSON.stringify(organizeSnapshot.acceptance_criteria))) {
+          tasks = tasks.map(task => task.id === "task-3" ? organizeSnapshot : task);
+        }
+      }
 
       try {
         step = "severity filter";

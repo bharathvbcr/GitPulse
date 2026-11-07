@@ -18,7 +18,9 @@ import {
   parseDueInput,
   partitionLanes,
   priorityLabel,
+  applyOrganizedPriority,
   listRows,
+  priorityOrderNote,
   reorderPlan,
   sortByPriority,
   visibleHiddenDetails,
@@ -243,6 +245,49 @@ describe("sortByPriority", () => {
   });
   it("names priorities for chips and screen readers", () => {
     expect([0, 1, 2, 3, 7, null].map(priorityLabel)).toEqual(["Urgent", "High", "Normal", "Low", "Normal", "Normal"]);
+  });
+  it("sorts an urgent card from a later page ahead of a normal card from the first", () => {
+    const page1 = [card({ id: "normal", priority: 2, due_at: null })];
+    const page2 = [card({ id: "urgent", priority: 0, due_at: null })];
+    expect(sortByPriority([...page1, ...page2]).map((row) => row.id)).toEqual(["urgent", "normal"]);
+    expect(priorityOrderNote(page1.length, page1.length + page2.length)).toBe(
+      "Priority first ordered the 1 loaded card. 1 card is later in this column and not in this order.",
+    );
+    expect(priorityOrderNote(30, 50)).toBe(
+      "Priority first ordered the 30 loaded cards. 20 cards are later in this column and not in this order.",
+    );
+    expect(priorityOrderNote(50, 50)).toBeNull();
+    expect(priorityOrderNote(60, 50)).toBeNull();
+  });
+});
+
+describe("applyOrganizedPriority", () => {
+  const proposed = { id: "t1", revision: 4, from: 2, to: 0 };
+  it("does not write when the task was edited since the proposal", async () => {
+    let writes = 0;
+    const decision = await applyOrganizedPriority(proposed, { id: "t1", revision: 5, priority: 2 }, async () => {
+      writes += 1;
+      return { priority: 0 };
+    });
+    expect(decision).toEqual({ action: "refuse", reason: "edited" });
+    expect(writes).toBe(0);
+  });
+  it("does not write when the priority moved, the id differs, or the priority is already the target", async () => {
+    let writes = 0;
+    const write = async () => { writes += 1; return { priority: 0 }; };
+    expect(await applyOrganizedPriority(proposed, { id: "t1", revision: 4, priority: 1 }, write)).toEqual({ action: "refuse", reason: "priority_moved" });
+    expect(await applyOrganizedPriority(proposed, { id: "other", revision: 4, priority: 2 }, write)).toEqual({ action: "refuse", reason: "different_task" });
+    expect(await applyOrganizedPriority(proposed, { id: "t1", revision: 4, priority: 0 }, write)).toEqual({ action: "unchanged" });
+    expect(writes).toBe(0);
+  });
+  it("writes only the proposed priority when the task is still the one that was read", async () => {
+    const seen: number[] = [];
+    const decision = await applyOrganizedPriority(proposed, { id: "t1", revision: 4, priority: 2 }, async (priority) => {
+      seen.push(priority);
+      return { priority };
+    });
+    expect(decision).toEqual({ action: "apply" });
+    expect(seen).toEqual([0]);
   });
 });
 

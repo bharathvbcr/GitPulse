@@ -2503,6 +2503,7 @@ pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value,
 fn missing_op_message(op: &str) -> String {
     let feature = match op {
         "work.tasks.suggest" => "Suggest next",
+        "work.tasks.organize" => "organising the board",
         "work.verify.task" | "work.verify.get" => "task verification",
         "work.scan.gaps" | "work.scan.get" | "work.scan.cancel" => "the repository gap scan",
         "work.runs.managed.prepare" | "work.runs.managed.activate" | "work.runs.managed.stop" => {
@@ -2704,6 +2705,7 @@ impl ProfileConnection {
                 | "work.scan.get"
                 | "work.scan.cancel"
                 | "work.tasks.suggest"
+                | "work.tasks.organize"
         ) {
             return Err(HarnessError::Protocol(
                 "unsupported profile worker operation".into(),
@@ -4203,6 +4205,7 @@ done
     fn a_missing_op_names_its_own_feature() {
         for (op, feature) in [
             ("work.tasks.suggest", "Suggest next"),
+            ("work.tasks.organize", "organising the board"),
             ("work.verify.task", "task verification"),
             ("work.scan.gaps", "the repository gap scan"),
             ("work.runs.managed.prepare", "managed runs"),

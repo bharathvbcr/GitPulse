@@ -25,6 +25,7 @@ pub(crate) mod intake;
 mod lineage;
 mod managed_run;
 pub(crate) mod notifications;
+mod organize;
 pub(crate) mod process_birth;
 mod receipts;
 mod reconcile;
@@ -708,6 +709,12 @@ impl WorkbenchState {
         if method == "tasks.suggest" {
             let params = suggest::params(input)?;
             return self.worker_call_current("work.tasks.suggest", params);
+        }
+        // A reviewable priority proposal. Manvi reads the board and returns
+        // the diff; this does not write. Accepted rows go through items.put.
+        if method == "tasks.organize" {
+            let params = organize::params(input)?;
+            return self.worker_call_current("work.tasks.organize", params);
         }
         if matches!(
             method,
