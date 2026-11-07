@@ -87,6 +87,10 @@ pub(crate) enum AuditableSection {
     Unreadable(String),
 }
 
+/// Most consecutive-or-total EINTR retries one probe tolerates before the read
+/// is reported as failed.
+const MAX_PROBE_INTERRUPTS: u32 = 64;
+
 /// Probes `path` for the cargo-auditable linker section name `.dep-v0`.
 ///
 /// The scan is capped and looks only for the section name. A `Found` is what
@@ -102,10 +106,20 @@ pub(crate) fn probe_auditable_section(path: &std::path::Path) -> AuditableSectio
     let mut reader = std::io::Read::take(file, 100 * 1024 * 1024);
     let mut pending = Vec::with_capacity(NEEDLE.len());
     let mut buf = [0u8; CHUNK];
+    let mut interrupts = 0u32;
     loop {
         let read = match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) => return AuditableSection::NotFound,
             Ok(n) => n,
+            // EINTR is not a failure to read: retry as `read_to_end` does,
+            // bounded so a signal storm cannot spin here forever.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    && interrupts < MAX_PROBE_INTERRUPTS =>
+            {
+                interrupts += 1;
+                continue;
+            }
             Err(err) => return AuditableSection::Unreadable(format!("read failed: {err}")),
         };
         let mut window = Vec::with_capacity(pending.len() + read);

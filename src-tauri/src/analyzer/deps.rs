@@ -2023,14 +2023,26 @@ fn executables_in(dir: &Path, repo: &Path) -> (Vec<PathBuf>, Vec<AuditableProble
             });
             continue;
         }
-        let Ok(canon) = path.canonicalize() else {
-            continue;
-        };
-        if canon.starts_with(repo) {
-            out.push(canon);
+        match resolve_in_repo(&path, repo) {
+            Ok(Some(canon)) => out.push(canon),
+            Ok(None) => {}
+            Err(err) => problems.push(AuditableProblem {
+                code: "cargo_auditable_unreadable",
+                path: label.clone(),
+                message: format!("{label} could not be resolved: {err}"),
+            }),
         }
     }
     (out, problems)
+}
+
+/// Canonicalizes `path`. `Ok(None)` is the deliberate skip of a path that
+/// resolves OUTSIDE the repository: GitPulse never reads outside the repo, and
+/// that is a privacy boundary, not a failure. A path that cannot be resolved at
+/// all is an `Err` the caller records.
+fn resolve_in_repo(path: &Path, repo: &Path) -> std::io::Result<Option<PathBuf>> {
+    let canon = path.canonicalize()?;
+    Ok(canon.starts_with(repo).then_some(canon))
 }
 
 fn is_candidate_binary_name(name: &str) -> bool {
@@ -7488,6 +7500,26 @@ mod tests {
             .iter()
             .any(|i| i.message.starts_with("and 3 more")));
         assert!(!report.audit_complete);
+    }
+
+    /// A path that vanishes between listing and canonicalize is an error the
+    /// scan records; a path resolving outside the repo is the deliberate skip.
+    /// The race itself is not constructible without a seam, so the resolver is
+    /// tested directly.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_in_repo_distinguishes_unresolvable_from_outside_the_repo() {
+        let (_guard, repo) = canonical_repo();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().canonicalize().unwrap().join("bin");
+        fs::write(&outside_file, "x").unwrap();
+        fs::write(repo.join("inside"), "x").unwrap();
+        assert!(resolve_in_repo(&repo.join("gone"), &repo).is_err());
+        assert_eq!(resolve_in_repo(&outside_file, &repo).unwrap(), None);
+        assert_eq!(
+            resolve_in_repo(&repo.join("inside"), &repo).unwrap(),
+            Some(repo.join("inside"))
+        );
     }
 
     #[cfg(unix)]
