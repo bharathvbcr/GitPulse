@@ -323,6 +323,22 @@ pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) ->
     ingest_transcripts_into_bounded(ledger_repo, worktree_path, &Budget::unbounded())
 }
 
+/// Both paths of one reflog replay in the one spelling the ledger keys on.
+///
+/// Reflog watermarks and recorded `worktree_path`s are keyed on the path's
+/// text, and `ledger_repo == worktree_path` decides who is the anchor. A
+/// checkout reached through a symlink (macOS's `/var` for `/private/var`)
+/// would otherwise be a second worktree to all of them. Transcript passes are
+/// not normalised here: a transcript is found by the spelling the agent ran in.
+/// [`ledger::canonical_repo`] is the ledger's own rule, including its fallback
+/// for a path that cannot be resolved.
+fn canonical_pair(ledger_repo: &str, worktree_path: &str) -> (String, String) {
+    (
+        ledger::canonical_repo(ledger_repo),
+        ledger::canonical_repo(worktree_path),
+    )
+}
+
 fn ingest_transcripts_into_bounded(
     ledger_repo: &str,
     worktree_path: &str,
@@ -1110,6 +1126,8 @@ fn replay_ref(
     window: usize,
     timeout: Option<std::time::Duration>,
 ) -> CatchUp {
+    let (ledger_repo, worktree_path) = canonical_pair(ledger_repo, worktree_path);
+    let (ledger_repo, worktree_path) = (ledger_repo.as_str(), worktree_path.as_str());
     let mut out = CatchUp::default();
     let mark = match ledger::reflog_watermark(ledger_repo, worktree_path, ref_name) {
         Ok(mark) => mark,

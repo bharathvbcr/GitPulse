@@ -291,3 +291,31 @@ fn a_symlinked_spelling_of_the_trigger_is_not_a_second_worktree() {
     );
     assert!(!out.truncated, "{out:?}");
 }
+
+/// The same checkout reached through a symlinked spelling is one checkout to
+/// the ledger: a pass through the alias finds the watermark the canonical pass
+/// left and records nothing again. Keyed on the spelling, it replayed the whole
+/// reflog under a second watermark and stored the rows against a second
+/// `worktree_path`.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_spelling_of_a_linked_worktree_shares_its_watermark() {
+    let (main, _parent, linked) = repo_with_worktrees(1);
+    let anchor = plain(main.path());
+    let canonical = linked[0].to_string_lossy().into_owned();
+    let holder = tempfile::tempdir().expect("symlink dir");
+    let alias = holder.path().join("alias");
+    std::os::unix::fs::symlink(&canonical, &alias).expect("symlink");
+    let alias = alias.to_string_lossy().into_owned();
+
+    let first = ingest_reflog_into(&anchor, &canonical, 200);
+    assert!(first.recorded >= 1, "{first:?}");
+    let rows = reflog_rows(&anchor).len();
+
+    let again = ingest_reflog_into(&anchor, &alias, 200);
+    assert_eq!(
+        again.recorded, 0,
+        "replayed under a second spelling: {again:?}"
+    );
+    assert_eq!(reflog_rows(&anchor).len(), rows);
+}
