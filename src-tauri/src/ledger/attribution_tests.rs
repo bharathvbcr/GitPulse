@@ -48,11 +48,31 @@ fn command_row(repo: &str, worktree: Option<&str>, session: &str, text: &str, at
         action: "session.command".into(),
         object: Some(text.into()),
         outcome: Some(Outcome::Ok),
+        // A call that ran long enough to cover any entry a test puts after it,
+        // and whose result was timed: only a timed end can be credited.
+        duration_ms: Some(i64::try_from(LINK_WINDOW_MS).unwrap() + 10_000),
         detail_json: Some(r#"{"result":"ok"}"#.into()),
         event_stamp: Some(stamp(at, "transcript")),
         ..Draft::default()
     })
     .expect("append command");
+}
+
+/// A command row whose result was read but whose end was never timed.
+fn command_row_untimed(repo: &str, session: &str, text: &str, at: u64) {
+    append(Draft {
+        repo_path: repo.into(),
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("claude".into()),
+        session_id: Some(session.into()),
+        action: "session.command".into(),
+        object: Some(text.into()),
+        outcome: Some(Outcome::Ok),
+        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        event_stamp: Some(stamp(at, "transcript")),
+        ..Draft::default()
+    })
+    .expect("append untimed command");
 }
 
 /// A reflog row: what replay writes for a ref move, git's own second.
@@ -260,14 +280,15 @@ fn a_row_with_no_event_time_cannot_be_matched_and_says_so() {
 fn an_amend_and_a_rebase_each_entry_links_to_the_session_that_ran_them() {
     let (_dir, repo) = repo_dir();
     let at = t0();
-    command_row(&repo, None, "S1", "git commit -m a", at - 2 * SEC);
+    command_row_timed(&repo, None, "S1", "git commit -m a", at - 2 * SEC, 3_000);
     reflog_row(&repo, None, &sha(1), "commit", at);
-    command_row(
+    command_row_timed(
         &repo,
         None,
         "S1",
         "git commit --amend --no-edit",
         at + 18 * SEC,
+        2_000,
     );
     reflog_row(&repo, None, &sha(2), "commit (amend): work", at + 20 * SEC);
 
@@ -531,6 +552,7 @@ fn command_row_full(
         action: "session.command".into(),
         object: Some(text.into()),
         outcome: Some(outcome),
+        duration_ms: Some(i64::try_from(LINK_WINDOW_MS).unwrap() + 10_000),
         detail_json: Some(
             if outcome == Outcome::Failed {
                 r#"{"result":"error"}"#
@@ -1822,7 +1844,7 @@ fn a_vanished_worktree_matches_only_its_own_spelling() {
 fn an_agent_commit_is_credited_with_its_own_commit_and_not_with_a_hand_commit_after_it() {
     let (_d, repo) = repo_dir();
     let at = t0();
-    command_row(&repo, None, "AGENT", "git commit -m a", at - SEC);
+    command_row_timed(&repo, None, "AGENT", "git commit -m a", at - SEC, 2_000);
     reflog_row(&repo, None, &sha(1), "commit", at);
     // A human commits in the same worktree 30 s later, inside the window.
     reflog_row(&repo, None, &sha(2), "commit", at + 30 * SEC);
@@ -1910,9 +1932,16 @@ fn a_rebase_run_ends_at_its_finish_and_at_an_unrelated_commit() {
 fn two_commits_by_one_session_ten_seconds_apart_each_link_to_their_own_command() {
     let (_d, repo) = repo_dir();
     let at = t0();
-    command_row(&repo, None, "S1", "git commit -m first", at - SEC);
+    command_row_timed(&repo, None, "S1", "git commit -m first", at - SEC, 2_000);
     reflog_row(&repo, None, &sha(1), "commit", at);
-    command_row(&repo, None, "S1", "git commit -m second", at + 9 * SEC);
+    command_row_timed(
+        &repo,
+        None,
+        "S1",
+        "git commit -m second",
+        at + 9 * SEC,
+        2_000,
+    );
     reflog_row(&repo, None, &sha(2), "commit", at + 10 * SEC);
 
     let first = link(&repo, &sha(1));
@@ -1936,14 +1965,17 @@ fn two_commits_by_one_session_ten_seconds_apart_each_link_to_their_own_command()
 fn two_different_commits_in_one_second_have_no_order_and_neither_is_credited() {
     let (_d, repo) = repo_dir();
     let at = t0();
-    command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+    command_row_timed(&repo, None, "S1", "git commit -m a", at - SEC, 2_000);
     reflog_row(&repo, None, &sha(1), "commit", at);
     reflog_row(&repo, None, &sha(2), "commit", at);
 
+    // Both are inside the one command's execution, and which of them it made is
+    // not in the timing: neither is credited, and both say so.
     for n in [1, 2] {
         let got = link(&repo, &sha(n));
         assert_eq!(got.session_id, None, "{got:?}");
-        assert_eq!(got.basis, basis::COMMAND_SPENT);
+        assert!(got.ambiguous, "{got:?}");
+        assert_eq!(got.basis, basis::AMBIGUOUS);
     }
 }
 
@@ -2152,7 +2184,7 @@ fn a_merge_that_found_nothing_does_not_make_someone_elses_merge_after_it() {
     // Without the command's end, a merge that made nothing and one that made
     // this entry look the same: no link, and a name for why.
     let (_d, repo) = repo_dir();
-    command_row(&repo, None, "MERGER", "git merge feat", at - 40 * SEC);
+    command_row_untimed(&repo, "MERGER", "git merge feat", at - 40 * SEC);
     reflog_row(
         &repo,
         None,
@@ -2238,22 +2270,50 @@ fn a_hand_commit_during_a_slow_commit_is_ambiguous_when_the_commits_end_is_known
 }
 
 #[test]
-fn a_command_with_no_timed_end_is_credited_with_its_verbs_first_entry_and_that_is_the_residual() {
-    // Documented, not endorsed: without the command's end, a human's commit
-    // that lands during a slow hook, first, is the first entry of the verb after
-    // the command and is credited to it. Only the command's end can tell them
-    // apart, and a row whose result was never timed does not have one.
+fn a_command_with_no_timed_end_is_never_credited() {
+    // A human's commit lands during the agent's slow pre-commit hook, before the
+    // agent's own. With the command's end timed that is two entries inside one
+    // execution (ambiguous); with it untimed the command cannot be credited with
+    // either, because nothing says when it finished or whether it made anything.
     let (_d, repo) = repo_dir();
     let at = t0();
-    command_row(&repo, None, "AGENT", "git commit -m a", at);
+    command_row_untimed(&repo, "AGENT", "git commit -m a", at);
     reflog_row(&repo, None, &sha(1), "commit", at + 10 * SEC);
     reflog_row(&repo, None, &sha(2), "commit", at + 61 * SEC);
 
-    let human_first = link(&repo, &sha(1));
-    let agents_own = link(&repo, &sha(2));
+    for n in [1, 2] {
+        let got = link(&repo, &sha(n));
+        assert_eq!(got.session_id, None, "commit {n}: {got:?}");
+        assert!(
+            !got.ambiguous,
+            "nothing is credited, and nothing is contested: {got:?}"
+        );
+        assert_eq!(got.basis, basis::COMMAND_OUTCOME_UNKNOWN, "commit {n}");
+    }
+}
 
-    assert_eq!(human_first.session_id.as_deref(), Some("AGENT"));
-    assert_eq!(agents_own.session_id, None);
+#[test]
+fn an_untimed_command_beside_another_sessions_credited_one_makes_the_answer_ambiguous() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row_timed(&repo, None, "TIMED", "git commit -m a", at - 3 * SEC, 4_000);
+    command_row_untimed(&repo, "UNTIMED", "git commit -m b", at - 2 * SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    let got = link(&repo, &sha(1));
+
+    assert!(
+        got.ambiguous,
+        "the untimed session may have made it: {got:?}"
+    );
+    assert_eq!(got.session_id, None);
+
+    // The same session's own untimed row beside its timed one is one session.
+    let (_d2, repo2) = repo_dir();
+    command_row_timed(&repo2, None, "SAME", "git commit -m a", at - 3 * SEC, 4_000);
+    command_row_untimed(&repo2, "SAME", "git commit -m b", at - 2 * SEC);
+    reflog_row(&repo2, None, &sha(2), "commit", at);
+    assert_eq!(link(&repo2, &sha(2)).session_id.as_deref(), Some("SAME"));
 }
 
 #[test]

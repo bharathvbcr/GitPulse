@@ -40,21 +40,20 @@
 //! What survives is still an *inference from time*: a command that could have
 //! made the commit, in the same worktree, shortly before it.
 //!
-//! **The residual no rule here can remove.** Two actors who commit in one
-//! worktree inside one command's execution window cannot be told apart by
-//! timing. The transcript times when a command was issued and, when its result
-//! was read, when it finished (`occurred_at` and `duration_ms`); git times each
-//! entry to the second. When the command's end is known, two entries of its
-//! verb inside it are reported as ambiguous. When it is not (a row whose result
-//! was never timed), the first entry of its verb after it is credited, so a
-//! human's commit that lands during a slow `pre-commit` hook, before the
-//! agent's own commit does, is credited to the agent. A command that can
-//! succeed having made nothing (`pull`, `merge`, `rebase`) is credited only when
-//! its end is known, and a no-op merge followed by someone else's real merge
-//! inside its window is then still told apart by that end; without it, no link.
-//! And `no_ingested_session_command` means no *ingested* transcript shows a git
-//! command: a session GitPulse does not read leaves none, so it is not proof that
-//! no agent was involved.
+//! **What remains is irreducible, and it is ambiguous, not a link.** Two actors
+//! who commit in one worktree inside one command's *timed* execution window
+//! cannot be told apart by timing: the transcript times when a command was
+//! issued and when its result came back (`occurred_at` and `duration_ms`), git
+//! times each entry to the second, and two entries of the command's verb inside
+//! that span are reported as `ambiguous_sessions`, never as a link. A command
+//! whose end was never timed is never credited at all: it may have made nothing
+//! (`Already up to date`), or made its commit after a slow hook that a human's
+//! own commit beat it through, and only its end tells either from the entry. If
+//! it is the only command that fits it gives `command_outcome_unknown`, and next
+//! to another session's credited command it makes the answer ambiguous. And
+//! `no_ingested_session_command` means no *ingested* transcript shows a git
+//! command: a session GitPulse does not read leaves none, so it is not proof
+//! that no agent was involved.
 
 use super::{ids, with_access, Access, LedgerError};
 use rusqlite::types::ValueRef;
@@ -127,8 +126,9 @@ pub mod basis {
     /// A git command row with no usable event time could have made the commit
     /// (an old row, or one dated by ingest rather than the transcript).
     pub const COMMAND_UNTIMED: &str = "command_untimed";
-    /// The only command that fits is one whose result was never read, so
-    /// whether it made anything is not known.
+    /// The only command that fits is one whose result or end was never timed
+    /// (or whose result was neither `ok` nor `error`), so whether it made this
+    /// commit is not known. Such a command is never credited.
     pub const COMMAND_OUTCOME_UNKNOWN: &str = "command_outcome_unknown";
     /// The only command that fits did not make this commit: it made an earlier
     /// entry of its verb (a single-commit run is credited with the first entry
@@ -631,8 +631,9 @@ enum Between {
     /// written as well as this one: two actors committed inside one command's
     /// execution, and timing cannot say which entry the command made.
     Contested,
-    /// A command that can succeed having made nothing, whose completion is not
-    /// known: it may have made nothing, and then it made no entry at all.
+    /// The command's end was never timed: it may have made nothing, or been
+    /// beaten to the commit by another actor, and only its end could tell. It is
+    /// never credited.
     NoCompletion,
 }
 
@@ -666,26 +667,27 @@ fn between(
     if !this.as_ref().is_some_and(|this| shape.writes(this.verb)) {
         return Between::Spent;
     }
-    // When the command finished, if the transcript timed its result.
-    let completed = command
+    // When the command finished, as the transcript timed its result. A command
+    // whose end was not timed is never credited: it may have made nothing
+    // (`Already up to date`), or made its commit after a hook that a human's own
+    // commit beat it through, and only its end can tell those from the entry.
+    let Some(done) = command
         .placed
         .row
         .duration_ms
         .and_then(|ms| u64::try_from(ms).ok())
-        .map(|ms| command_at.saturating_add(ms));
-    match completed {
-        // The entry came after the command was done.
-        Some(done) if at > done => return Between::Spent,
-        Some(_) => {}
-        None if shape.may_make_nothing => return Between::NoCompletion,
-        None => {}
-    }
-    // Entries that count against the command: those of a verb it writes (a
-    // run: any origin entry of another verb ends it).
-    let upper = match (shape.run, completed) {
-        (false, Some(done)) => done,
-        _ => at,
+        .map(|ms| command_at.saturating_add(ms))
+    else {
+        return Between::NoCompletion;
     };
+    // The entry came after the command was done.
+    if at > done {
+        return Between::Spent;
+    }
+    // Entries that count against the command: those of a verb it writes inside
+    // its execution; for a run, those up to this one, any origin entry of
+    // another verb ending it.
+    let upper = if shape.run { at } else { done };
     let (mut unordered, mut crowded) = (false, false);
     for other in reflogs {
         let row = &other.row;
@@ -717,14 +719,9 @@ fn between(
                 return Between::Spent;
             }
         } else if origin && ours {
-            // The first entry of its verb after the command is the one it made.
-            // When the command's end is known, every such entry inside it is a
-            // candidate and none can be told from the others.
-            if completed.is_some() {
-                crowded = true;
-            } else {
-                return Between::Spent;
-            }
+            // Another entry of its verb while it ran: every such entry inside
+            // its execution is a candidate and none can be told from the others.
+            crowded = true;
         }
     }
     if crowded {
@@ -1210,17 +1207,12 @@ pub(crate) struct Shape {
     /// entry of another verb. Otherwise one commit, and one entry: the first of
     /// its verb after it.
     run: bool,
-    /// The command can exit 0 having made nothing (`Already up to date`), and
-    /// writes no reflog row when it does. Only a command that can be shown to
-    /// have been running when the entry was written is credited with one.
-    may_make_nothing: bool,
 }
 
 impl Shape {
     const NONE: Shape = Shape {
         verbs: 0,
         run: false,
-        may_make_nothing: false,
     };
 
     /// Whether the command is a run of several commits.
@@ -1236,13 +1228,11 @@ impl Shape {
 
     /// What two commit-making runs in one command line, taken together, are:
     /// a run only when both are the same run, a single commit otherwise (which
-    /// credits fewer entries, never more), able to write either verb and to
-    /// make nothing if either can.
+    /// credits fewer entries, never more), able to write either verb.
     fn and(self, other: Shape) -> Shape {
         Shape {
             verbs: self.verbs | other.verbs,
             run: self.run && other.run && self.verbs == other.verbs,
-            may_make_nothing: self.may_make_nothing || other.may_make_nothing,
         }
     }
 }
@@ -1434,10 +1424,6 @@ fn shape_of(subcommand: &str, args: &[&str]) -> Shape {
     let one = |verbs: &[&str]| Shape {
         verbs: verb_bits(verbs),
         run: false,
-        // Only `git commit` is certain to have made a commit when it exits 0:
-        // a merge, pull, rebase, cherry-pick, revert or am can find nothing to
-        // do and say so.
-        may_make_nothing: subcommand != "commit",
     };
     let run = |verbs: &[&str]| Shape {
         run: true,

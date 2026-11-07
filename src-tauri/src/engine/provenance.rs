@@ -2877,6 +2877,7 @@ mod batch_tests {
                 action: "session.command".into(),
                 object: Some((*text).into()),
                 outcome: Some(Outcome::Ok),
+                duration_ms: Some(10_000),
                 detail_json: Some(r#"{"result":"ok"}"#.into()),
                 event_stamp: Some(stamp(*at, "transcript")),
                 ..Draft::default()

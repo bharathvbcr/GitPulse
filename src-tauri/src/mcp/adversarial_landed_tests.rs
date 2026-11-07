@@ -316,6 +316,7 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
             action: "session.command".into(),
             object: Some("git commit -m x".into()),
             outcome: Some(Outcome::Ok),
+            duration_ms: Some(10_000),
             detail_json: Some(r#"{"result":"ok"}"#.into()),
             event_stamp: Some(stamp(*at, "transcript")),
             ..Draft::default()
@@ -423,6 +424,9 @@ fn put_row(
         }),
         outcome: Some(Outcome::Ok),
         after_ref: (!is_command).then(|| commit.to_string()),
+        // A call whose result was read ok was timed; one whose result was never
+        // read has no end.
+        duration_ms: (result == Some("ok")).then_some(5_000),
         detail_json: result.map(|word| format!(r#"{{"result":"{word}"}}"#)),
         event_stamp: stamp.map(|(at, basis)| EventStamp {
             occurred_at: ids::iso8601_utc(at),
@@ -466,6 +470,7 @@ fn every_session_basis_validates_against_the_output_schema() {
                     action: "session.command".into(),
                     object: Some(cmd.into()),
                     outcome: Some(crate::ledger::Outcome::Ok),
+                    duration_ms: Some(10_000),
                     detail_json: Some(r#"{"result":"ok"}"#.into()),
                     event_stamp: Some(crate::ledger::EventStamp {
                         occurred_at: crate::ledger::ids::iso8601_utc(now - 2_000),
@@ -543,16 +548,15 @@ fn every_session_basis_validates_against_the_output_schema() {
         (
             basis::COMMAND_SPENT,
             Box::new(move |r, c| {
-                // The command made an earlier commit (another sha, before this one).
-                let earlier = "e".repeat(40);
-                put_row(r, "command", cmd, c, Some((now - 5_000, "transcript")), ok);
+                // A `git pull` that found nothing, and a commit of another kind
+                // after it: the command does not write this entry.
                 put_row(
                     r,
-                    "reflog",
-                    "commit: x",
-                    &earlier,
-                    Some((now - 3_000, "reflog")),
-                    None,
+                    "command",
+                    "git pull",
+                    c,
+                    Some((now - 3_000, "transcript")),
+                    ok,
                 );
                 put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
             }),
