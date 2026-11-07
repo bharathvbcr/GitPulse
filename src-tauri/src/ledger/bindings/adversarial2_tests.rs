@@ -487,3 +487,112 @@ fn demotion_notice_reach() {
         "BROKEN(honesty): read-only status hides the demotion"
     );
 }
+
+// ---- adv: history-only binding count unknown vs 0 (card ft-c43eaed2) ----
+
+/// A family whose anchor holds one demoted (history-only) sibling bind row.
+fn family_with_one_history_only_row() -> (tempfile::TempDir, String, Vec<tempfile::TempDir>) {
+    let (dir, main) = canonical_repo();
+    note_in(&main);
+    settle();
+    let (p0, old) = linked(&main, "old");
+    write_row(&old, &old, Some("TASK-OLD"), now_millis());
+    resolve(&main, &old).unwrap();
+    settle();
+    let (p1, late) = linked(&main, "late");
+    write_row(&late, &late, Some("TASK-LATE"), now_millis());
+    assert_eq!(resolve(&main, &late).unwrap(), None);
+    let seen = repository_status_readonly(&main).unwrap();
+    assert!(seen.history_only_bindings >= 1, "fixture: {seen:?}");
+    (dir, main, vec![p0, p1])
+}
+
+/// A reader holding the write lock must never turn a nonzero count into a
+/// quiet 0: the status says the real count or says unknown, and it returns.
+#[test]
+fn adv_a_write_locked_ledger_reports_the_count_or_unknown_never_a_quiet_zero_readonly() {
+    let (_dir, main, _keep) = family_with_one_history_only_row();
+    let holder = raw(&main);
+    holder.execute_batch("BEGIN EXCLUSIVE").expect("hold the lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo = main.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(repository_status_readonly(&repo));
+    });
+    let status = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("BROKEN: read-only status waits on a held write lock")
+        .expect("status");
+    assert!(
+        status.history_only_bindings >= 1 || status.history_only_bindings_unknown,
+        "BROKEN: a locked ledger reads as a real 0: {status:?}"
+    );
+    holder.execute_batch("ROLLBACK").ok();
+}
+
+/// The creating path under the same held lock: bounded, and never a quiet 0.
+#[test]
+fn adv_a_write_locked_ledger_reports_the_count_or_unknown_never_a_quiet_zero_creating() {
+    let (_dir, main, _keep) = family_with_one_history_only_row();
+    let holder = raw(&main);
+    holder.execute_batch("BEGIN EXCLUSIVE").expect("hold the lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo = main.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(repository_status(&repo));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(30));
+    holder.execute_batch("ROLLBACK").ok();
+    let status = got
+        .expect("BROKEN: creating status waits past 30 s on a held write lock")
+        .expect("status");
+    assert!(
+        status.history_only_bindings >= 1 || status.history_only_bindings_unknown,
+        "BROKEN: a locked ledger reads as a real 0: {status:?}"
+    );
+}
+
+/// An older ledger with no events table is a real zero, not unknown.
+#[test]
+fn adv_a_ledger_without_an_events_table_is_a_real_zero() {
+    let (_dir, main) = canonical_repo();
+    let path = crate::ledger::ledger_path(&main);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (x INTEGER)").unwrap();
+    }
+    let count = crate::ledger::history_only_binding_count(&main);
+    assert_eq!(count, Some(0), "BROKEN: missing events table is not a real 0");
+}
+
+/// Consolidation failure (corrupt legacy sibling) with a readable anchor: the
+/// anchor's real history-only count is still reported, not zeroed or unknown.
+#[test]
+fn adv_consolidation_failure_still_reports_the_anchors_real_count() {
+    let (_dir, main, _keep) = family_with_one_history_only_row();
+    let (_p, sibling) = linked(&main, "broken");
+    let state = std::path::Path::new(&sibling).join(".devcouncil");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("ledger.sqlite"), b"not a sqlite database").unwrap();
+    let status = repository_status(&main).expect("status");
+    assert_eq!(status.error_code, "legacy_migration_failed", "{status:?}");
+    assert!(!status.history_only_bindings_unknown, "{status:?}");
+    assert!(status.history_only_bindings >= 1, "{status:?}");
+}
+
+/// A real failure already in error_code: the flag is the only unknown signal,
+/// and it must survive the status being cloned over the wire.
+#[test]
+fn adv_unknown_flag_survives_json_round_trip_beside_another_error() {
+    let (_dir, main) = canonical_repo();
+    note_in(&main);
+    let mut status = repository_status_readonly(&main).unwrap();
+    status.error = "database locked".into();
+    status.error_code = "query_failed".into();
+    status.history_only_bindings_unknown = true;
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["history_only_bindings_unknown"], true);
+    let back: crate::ledger::LedgerStatus = serde_json::from_value(wire).unwrap();
+    assert!(back.history_only_bindings_unknown);
+}
