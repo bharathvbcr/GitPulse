@@ -1161,6 +1161,31 @@ fn store_dbs(root: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// Why a store's writer lock was not taken, said as what happened.
+///
+/// DevMap's contention timeout is the only failure that means another process
+/// is writing; a lock file that could not be opened (a symlink refused, a
+/// read-only directory) or whose `flock` call failed says nothing about other
+/// writers, and naming one would send the person to look for a process that is
+/// not there. Both refuse, and both leave the worktree in place. The two are
+/// told apart by the kernel's own contention wording, so a rewording upstream
+/// degrades to the second message, which still carries the cause.
+fn writer_lock_refusal(path: &str, bound: Duration, error: &dyn std::fmt::Display) -> String {
+    if error.to_string().contains("another devmap writer holds") {
+        format!(
+            "another process is still writing the devmap index of {path} \
+             ({error}) after {:.1}s; the worktree was left in place, retry the removal shortly",
+            bound.as_secs_f32()
+        )
+    } else {
+        format!(
+            "the devmap index writer lock of {path} could not be taken ({error}); \
+             the worktree was left in place. Check that the lock file is a regular \
+             file in a writable directory, then retry the removal"
+        )
+    }
+}
+
 /// Take the writer lock of every store `root` has, waiting no longer than until `deadline`.
 ///
 /// A store counts as present when its db or its lock file exists: a stacked
@@ -1192,13 +1217,7 @@ fn lock_store_writers(
         };
         match taken {
             Ok(lock) => locks.push(lock),
-            Err(error) => {
-                return Err(format!(
-                    "another process is still writing the devmap index of {path} \
-                     ({error}) after {:.1}s; the worktree was left in place, retry the removal shortly",
-                    bound.as_secs_f32()
-                ))
-            }
+            Err(error) => return Err(writer_lock_refusal(path, bound, &error)),
         }
     }
     Ok(locks)
@@ -3696,7 +3715,10 @@ exit 2
             PathBuf::from(std::env::var_os(XPROC_HOLD_RELEASE).expect("helper env: release"));
         let _writer = devmap_query::devmap_store::Store::lock_writer_at(
             Path::new(&db),
-            Duration::from_secs(20),
+            std::env::var("GITPULSE_XPROC_HOLD_WAIT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .map_or(Duration::from_secs(20), Duration::from_millis),
         )
         .expect("helper takes the writer lock");
         std::fs::write(ready, "").expect("helper announces the lock");
@@ -4394,6 +4416,147 @@ exit 2
         );
         assert_eq!(listing(&bare), before, "the guard created files");
         assert!(!bare.join(".devcouncil").exists() && !bare.join(".devmap").exists());
+        fixture.finish();
+    }
+
+    /// The pre-merge hook runs in the lane and may run `devmap build`,
+    /// `seed --sync-delta` or `dev verify` there: each needs the lane's writer
+    /// lock. The teardown's own hold must not exist yet while it runs, or the
+    /// hook's child waits on its parent.
+    #[test]
+    #[cfg(unix)]
+    fn a_pre_merge_hook_can_take_the_lanes_writer_lock() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let scratch = tempfile::tempdir().unwrap();
+        let ready = scratch.path().join("hook-ready");
+        let release = scratch.path().join("hook-release");
+        std::fs::write(&release, "").unwrap();
+        let hook = format!(
+            "{db_env}={db} {ready_env}={ready} {release_env}={release} {wait_env}=3000 {exe} --exact --ignored {filter}",
+            db_env = XPROC_HOLD_DB,
+            db = fixture.store.display(),
+            ready_env = XPROC_HOLD_READY,
+            ready = ready.display(),
+            release_env = XPROC_HOLD_RELEASE,
+            release = release.display(),
+            wait_env = "GITPULSE_XPROC_HOLD_WAIT_MS",
+            exe = fixture._harness.path().display(),
+            filter = XPROC_HOLDER_FILTER,
+        );
+        let hooks = serde_json::json!({ "worktree": { "pre_merge": [hook] } }).to_string();
+        std::fs::create_dir_all(fixture.main.path().join(".gitpulse")).unwrap();
+        std::fs::write(fixture.main.path().join(".gitpulse/hooks.json"), &hooks).unwrap();
+        let exclude = fixture.main.path().join(".git/info/exclude");
+        std::fs::write(&exclude, ".devcouncil/\n.devmap/\n.gitpulse/\n").unwrap();
+        crate::engine::approve_worktree_hooks(fixture.main.path(), &hooks)
+            .expect("approve the fixture hook");
+
+        let merged = fixture
+            .merge_and_teardown()
+            .expect("the hook took the lock and the teardown went on");
+        assert!(merged.worktree_removed, "{merged:?}");
+        assert!(ready.exists(), "the hook never ran");
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        fixture.finish();
+    }
+
+    /// Removing the primary checkout is refused before anything is quiesced:
+    /// no wait on main's index, no slot, no write to main's lock file.
+    #[test]
+    #[cfg(unix)]
+    fn removing_the_primary_checkout_is_refused_before_any_quiesce() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let main_store = devmap_query::paths::store_path(fixture.main.path());
+        std::fs::create_dir_all(main_store.parent().unwrap()).unwrap();
+        std::fs::write(&main_store, "").unwrap();
+        let holder = LockHolder::hold(&main_store);
+        let lock_file = devmap_query::devmap_store::Store::writer_lock_path(&main_store);
+        let before = std::fs::read(&lock_file).unwrap();
+        let main_text = fixture.main.path().to_str().unwrap();
+
+        let begun = Instant::now();
+        let message = crate::engine::worktree::remove_worktree_with(
+            main_text,
+            main_text,
+            true,
+            &mut |aside: &std::path::Path| std::fs::remove_dir_all(aside),
+        )
+        .expect_err("the primary checkout is never removed")
+        .into_message();
+        let waited = begun.elapsed();
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            "the refusal waited on main's index: {waited:?}"
+        );
+        assert!(message.contains("primary checkout"), "{message}");
+        assert!(!message.contains("still writing"), "{message}");
+        assert_eq!(
+            std::fs::read(&lock_file).unwrap(),
+            before,
+            "main's lock file was written"
+        );
+        assert!(fixture.main.path().join(".git").exists());
+        holder.release_and_reap();
+        fixture.finish();
+    }
+
+    /// A lock that cannot be opened is not "another process writing": the
+    /// refusal says what failed, still leaves the worktree, and never follows
+    /// the symlink.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_lock_file_is_refused_as_unopenable_not_as_a_writer() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let outside = fixture.wt_parent.path().join("outside.txt");
+        std::fs::write(&outside, "UNTOUCHED").unwrap();
+        let lock = devmap_query::devmap_store::Store::writer_lock_path(&fixture.store);
+        let _ = std::fs::remove_file(&lock);
+        std::os::unix::fs::symlink(&outside, &lock).unwrap();
+
+        let begun = Instant::now();
+        let message = quiesce_for_removal_within(&path, Duration::from_secs(5))
+            .expect_err("a lock that cannot be opened must refuse");
+        assert!(
+            begun.elapsed() < Duration::from_secs(4),
+            "an open failure waited out the bound: {:?}",
+            begun.elapsed()
+        );
+        assert!(message.contains("could not be taken"), "{message}");
+        assert!(message.contains("left in place"), "{message}");
+        assert!(!message.contains("still writing"), "{message}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "UNTOUCHED");
+        assert!(fixture.slot_free(), "a refused removal kept the slot");
+        fixture.finish();
+    }
+
+    /// Store free, delta held by another process: the refusal must not leave
+    /// the store's lock held.
+    #[test]
+    #[cfg(unix)]
+    fn a_partial_acquisition_releases_the_first_lock() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let delta = devmap_query::paths::stack_delta_path(&fixture.wt);
+        std::fs::write(&delta, "").unwrap();
+        let holder = LockHolder::hold(&delta);
+
+        quiesce_for_removal_within(&path, Duration::from_millis(300))
+            .expect_err("the foreign delta writer must refuse");
+        assert!(fixture.slot_free(), "a refused removal kept the slot");
+        drop(
+            devmap_query::devmap_store::Store::lock_writer_at(&fixture.store, Duration::ZERO)
+                .expect("the refusal leaked the store's lock"),
+        );
+        holder.release_and_reap();
         fixture.finish();
     }
 }

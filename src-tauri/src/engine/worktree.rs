@@ -3040,13 +3040,6 @@ fn merge_and_teardown_with_seams(
     let repo = family.anchor.clone();
     let worktree = family.worktree.clone();
 
-    // A seeded background index refresh may still be writing into the lane.
-    // Held before the first irreversible step and outside the repository lock,
-    // so a refusal leaves the lane unmerged and intact, and a refresh that
-    // needs the lock cannot deadlock with the wait.
-    let _no_refresh =
-        crate::devmap::live::quiesce_for_removal(&plain_path_text(&worktree.to_string_lossy()))?;
-
     // Files an earlier teardown moved aside and did not finish deleting: the
     // sweep is their retry. It takes no lock; it is outside the merge's own.
     let sweep_problems = sweep_teardown_asides(&repo).notes();
@@ -3121,6 +3114,16 @@ fn merge_and_teardown_with_seams(
         )?
         .skipped,
     );
+
+    // A seeded background index refresh may still be writing into the lane.
+    // Held after the pre-merge hooks, which run in the lane and may themselves
+    // run `devmap build`, `seed --sync-delta` or `dev verify`: holding the
+    // index's writer lock across them would make those children wait on their
+    // own parent. Held before the repository lock and the merge, the first
+    // irreversible step, so a refusal leaves the lane unmerged and intact and a
+    // refresh that needs the lock cannot deadlock with the wait.
+    let _no_refresh =
+        crate::devmap::live::quiesce_for_removal(&plain_path_text(&worktree.to_string_lossy()))?;
 
     // Steps 3-6 hold one lock: the checks that the worktree is clean and that
     // the branch is what will be merged, the merge, and the removal and branch
@@ -4375,6 +4378,20 @@ pub fn remove_worktree_with(
     delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<WorktreeRemoval, CommandError> {
     let repo = validate_repo(repo_path)?;
+    // A path the removal refuses outright is refused before anything is
+    // quiesced: waiting on the primary checkout's index, then taking its slot
+    // and lock, would only precede the same refusal. Both checks read nothing
+    // that needs the repository lock, and the lock's own re-check stays.
+    validate_target_path(target_path)?;
+    let target_identity = lane_identity(Path::new(&plain_path_text(target_path)));
+    if read_worktree_entries(&repo)?
+        .first()
+        .is_some_and(|primary| lane_identity(Path::new(&primary.path)) == target_identity)
+    {
+        return Err("Cannot remove the repository's primary checkout"
+            .to_string()
+            .into());
+    }
     // A seeded background index refresh may still be writing into the target;
     // hold its writer slot, bounded, before anything is renamed or deleted.
     let _no_refresh = crate::devmap::live::quiesce_for_removal(&plain_path_text(target_path))?;
