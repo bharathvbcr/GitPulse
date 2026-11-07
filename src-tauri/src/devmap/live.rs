@@ -4521,10 +4521,13 @@ exit 2
         std::os::unix::fs::symlink(&outside, &lock).unwrap();
 
         let begun = Instant::now();
-        let message = quiesce_for_removal_within(&path, Duration::from_secs(5))
+        // The bound is far above the most `coverage_relaxed` can stretch one
+        // second (8x instrumented, then up to 4x for load), so the assertion
+        // below still tells an immediate refusal from a wait-out of the bound.
+        let message = quiesce_for_removal_within(&path, Duration::from_secs(60))
             .expect_err("a lock that cannot be opened must refuse");
         assert!(
-            begun.elapsed() < Duration::from_secs(4),
+            begun.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
             "an open failure waited out the bound: {:?}",
             begun.elapsed()
         );
