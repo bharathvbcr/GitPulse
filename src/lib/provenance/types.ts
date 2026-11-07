@@ -25,6 +25,15 @@ export interface SessionEpisodeNote {
   transcript_path: string | null;
   created_at: number;
   summary: string | null;
+  /**
+   * How the session was tied to the commit: `recorded` (a git note says so) or
+   * `inferred` (a transcript command and the reflog entry after it, within
+   * `window_ms`). `null` on a note written before the field existed, which is
+   * a recorded one.
+   */
+  attribution: string | null;
+  /** The window an `inferred` link was made in; `null` when recorded. */
+  window_ms: number | null;
 }
 
 /** How far the base has moved since a commit was noted. */
@@ -70,6 +79,19 @@ export interface ProvenanceFreshness {
   verified: boolean;
   verification: VerificationNote | null;
   session: SessionEpisodeNote | null;
+  /**
+   * Why `session` is what it is: `recorded_note`, `inferred_from_command`, or,
+   * when `session` is `null`, the reason (`no_session_command`,
+   * `ambiguous_sessions`, `command_outside_window`, `no_reflog_entry`, ...).
+   * A `null` session is not "no agent was involved" unless this says
+   * `no_session_command`. Empty when the commit was not examined at all.
+   */
+  session_basis: string;
+  /**
+   * More than one session had a git command that could have made the commit, so
+   * `session` is `null` rather than a guess.
+   */
+  session_ambiguous: boolean;
   /**
    * Whether the commit is reachable from the base (landed there by fast-forward
    * or merge). `false` is a measured "not reachable": a commit *ahead of* the

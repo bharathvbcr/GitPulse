@@ -298,3 +298,94 @@ fn gitpulse_landed_is_read_only_everywhere_the_server_says_so() {
         "gitpulse_landed missing from the manifest's tools: {manifest}"
     );
 }
+
+/// Ledger rows as catch-up writes them for a commit: transcript commands of the
+/// given sessions, then the commit's reflog entry.
+fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_at: u64) {
+    use crate::ledger::{append, ids, ActorKind, Draft, EventStamp, Outcome};
+    let stamp = |ms: u64, basis: &str| EventStamp {
+        occurred_at: ids::iso8601_utc(ms),
+        occurred_at_basis: basis.into(),
+        task_basis: "unbound".into(),
+    };
+    for (session, at) in commands {
+        append(Draft {
+            repo_path: repo.into(),
+            actor_kind: Some(ActorKind::Agent),
+            session_id: Some((*session).into()),
+            action: "session.command".into(),
+            object: Some("git commit -m x".into()),
+            outcome: Some(Outcome::Ok),
+            event_stamp: Some(stamp(*at, "transcript")),
+            ..Draft::default()
+        })
+        .expect("append command");
+    }
+    append(Draft {
+        repo_path: repo.into(),
+        actor_kind: Some(ActorKind::System),
+        actor_id: Some("reflog".into()),
+        action: "reflog.commit".into(),
+        object: Some(format!("{commit} commit: x")),
+        outcome: Some(Outcome::Ok),
+        after_ref: Some(commit.into()),
+        event_stamp: Some(stamp(reflog_at, "reflog")),
+        ..Draft::default()
+    })
+    .expect("append reflog");
+}
+
+/// `session_basis` and `session_ambiguous` are plain `String` and `bool`
+/// fields, serialized on every row (never null, never omitted). The schema
+/// declares them non-nullable, so each shape of answer must validate: an
+/// inferred session, an ambiguous one, a hand commit, and no ledger at all.
+#[test]
+fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
+    let schema = schema_of("gitpulse_provenance");
+    let now = crate::ledger::ids::now_millis() / 1000 * 1000;
+    let ask = |repo: &str, commit: &str| {
+        let args = json!({ "repo_path": repo, "commit_sha": commit, "base_branch": "main" });
+        validate_arguments("gitpulse_provenance", &args).expect("arguments");
+        handle_tool_call("gitpulse_provenance", &args).expect("provenance")
+    };
+
+    let (_a, attributed) = repo_with_root();
+    let sha = git(&attributed, &["rev-parse", "HEAD"]);
+    record_commit_run(&attributed, &sha, &[("S1", now - 3_000)], now);
+    let got = ask(&attributed, &sha);
+    assert_conforms("attributed", &got, &schema);
+    assert_eq!(got["session_basis"], "inferred_from_command");
+    assert_eq!(got["session_ambiguous"], false);
+    assert_eq!(got["session"]["session_id"], "S1");
+    assert_eq!(got["session"]["attribution"], "inferred");
+
+    let (_b, ambiguous) = repo_with_root();
+    let sha = git(&ambiguous, &["rev-parse", "HEAD"]);
+    record_commit_run(
+        &ambiguous,
+        &sha,
+        &[("S1", now - 9_000), ("S2", now - 2_000)],
+        now,
+    );
+    let got = ask(&ambiguous, &sha);
+    assert_conforms("ambiguous", &got, &schema);
+    assert!(got["session"].is_null());
+    assert_eq!(got["session_ambiguous"], true);
+    assert_eq!(got["session_basis"], "ambiguous_sessions");
+
+    let (_c, hand) = repo_with_root();
+    let sha = git(&hand, &["rev-parse", "HEAD"]);
+    record_commit_run(&hand, &sha, &[], now);
+    let got = ask(&hand, &sha);
+    assert_conforms("hand commit", &got, &schema);
+    assert!(got["session"].is_null());
+    assert_eq!(got["session_basis"], "no_session_command");
+    assert_eq!(got["session_ambiguous"], false);
+
+    let (_d, no_ledger) = repo_with_root();
+    let sha = git(&no_ledger, &["rev-parse", "HEAD"]);
+    let got = ask(&no_ledger, &sha);
+    assert_conforms("no ledger", &got, &schema);
+    assert_eq!(got["session_basis"], "ledger_not_initialised");
+    assert!(got["session_basis"].is_string() && got["session_ambiguous"].is_boolean());
+}
