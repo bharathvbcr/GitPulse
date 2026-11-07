@@ -1120,8 +1120,11 @@ pub fn refresh_seeded_worktree(path: &str, run: SeededRefresh) -> LiveRefreshOut
 }
 
 /// How long a worktree's removal waits for a live index build still writing
-/// into it before refusing.
-const REMOVAL_QUIESCE_BOUND: Duration = Duration::from_secs(3);
+/// into it before refusing. An incremental refresh takes ~2.5 s on GitPulse
+/// itself unloaded, and the refresh this waits on is the one a just-created
+/// worktree starts, so the bound covers that build under load: a refusal costs
+/// the user a manual retry, a longer wait only delays a rare removal.
+const REMOVAL_QUIESCE_BOUND: Duration = Duration::from_secs(8);
 
 /// How often a waiting removal retries the writer slot.
 const REMOVAL_QUIESCE_POLL: Duration = Duration::from_millis(25);
