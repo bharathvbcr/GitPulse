@@ -453,19 +453,91 @@ mod tests {
     #[test]
     fn add_worktree_guarded_supports_zero_copy_devmap_and_sparse_cone() {
         let sandbox = tempfile::tempdir().expect("tempdir");
-        let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
-        let repo_dir = anchor_fixture.path().to_path_buf();
-        std::fs::create_dir_all(repo_dir.join("pkg/api")).expect("mkdir api");
-        std::fs::create_dir_all(repo_dir.join("pkg/other")).expect("mkdir other");
-        std::fs::write(repo_dir.join("pkg/api/lib.rs"), "pub fn api() {}\n").expect("write api");
-        std::fs::write(repo_dir.join("pkg/other/lib.rs"), "pub fn other() {}\n")
+        let raw_anchor = sandbox.path().join("anchor");
+        std::fs::create_dir_all(raw_anchor.join("pkg/api")).expect("mkdir api");
+        std::fs::create_dir_all(raw_anchor.join("pkg/other")).expect("mkdir other");
+        std::fs::write(raw_anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n")
+            .expect("write gitignore");
+        std::fs::write(raw_anchor.join("pkg/api/lib.rs"), "pub fn api() {}\n").expect("write api");
+        std::fs::write(raw_anchor.join("pkg/other/lib.rs"), "pub fn other() {}\n")
             .expect("write other");
 
-        crate::test_support::git_in(&repo_dir, &["config", "user.name", "Test"]);
-        crate::test_support::git_in(&repo_dir, &["config", "user.email", "test@example.com"]);
-        crate::test_support::git_in(&repo_dir, &["add", "pkg"]);
-        crate::test_support::git_in(&repo_dir, &["commit", "-m", "add packages"]);
+        crate::test_support::git_in(&raw_anchor, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&raw_anchor, &["config", "user.name", "Test"]);
+        crate::test_support::git_in(&raw_anchor, &["config", "user.email", "test@example.com"]);
+        crate::test_support::git_in(&raw_anchor, &["add", "."]);
+        crate::test_support::git_in(&raw_anchor, &["commit", "-q", "-m", "add packages"]);
+        let repo_dir = std::fs::canonicalize(&raw_anchor).expect("canonicalize anchor");
         crate::test_support::trust_repo(&repo_dir);
+        crate::devmap::ensure_state_dir_excluded(&repo_dir);
+
+        let head_run =
+            crate::engine::git_cli::git_captured(&repo_dir, &["rev-parse", "HEAD"]).unwrap();
+        let head_sha = String::from_utf8_lossy(&head_run.stdout).trim().to_string();
+        let scanned = devmap_extract::scan_tree(&repo_dir).expect("scan_tree");
+        let db = devmap_query::paths::store_path(&repo_dir);
+        std::fs::create_dir_all(db.parent().unwrap()).expect("mkdir codeintel");
+        let store = devmap_store::Store::open(&db).expect("open store");
+        store.bind_repo_root(&repo_dir).expect("bind repo root");
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).expect("open sqlite");
+        for (idx, (path, raw_hash)) in scanned.file_hashes().into_iter().enumerate() {
+            let id = (idx + 1) as i64;
+            let lang = devmap_extract::detect_language(std::path::Path::new(path));
+            let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity(lang);
+            let engine_json =
+                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+                    grammar: lang.to_string(),
+                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+                })
+                .unwrap();
+            let extraction_json = serde_json::json!({
+                "file_path": path,
+                "language": lang,
+                "content_hash": raw_hash,
+                "parse_outcome": "Clean",
+                "symbols": [],
+                "imports": [],
+                "calls": []
+            })
+            .to_string();
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
+                    parse_outcome_json, engine_json, extraction_json,
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, ?3, '\"Clean\"', ?4, ?5, '[]', ?6, ?7)",
+                (
+                    id,
+                    raw_hash as i64,
+                    lang,
+                    &engine_json,
+                    &extraction_json,
+                    &grammar_ver,
+                    &analyzer_ver,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                &head_sha,
+                r#"{"total_files":2,"total_symbols":0,"total_edges":0,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
+                repo_dir.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        drop(conn);
 
         let repo_str = repo_dir.to_str().expect("repo_str");
         let judged: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
@@ -493,7 +565,7 @@ mod tests {
         assert!(refused.is_err());
         assert!(judged.borrow().is_empty());
 
-        // 2. Full checkout with `zero_copy_devmap = true` writes `base_store_ref.json` without copying `devmap.sqlite`.
+        // 2. Full checkout with `zero_copy_devmap = true` writes `stack_lease.json` without copying `devmap.sqlite`.
         let zc_target = sandbox.path().join("wt-zc");
         let zc_created = add_worktree_guarded(
             repo_str,
@@ -522,11 +594,7 @@ mod tests {
         let zc_wt = std::path::Path::new(&zc_created.output.path);
         crate::test_support::trust_repo(zc_wt);
         assert!(!devmap_query::paths::store_path(zc_wt).exists());
-        assert!(
-            crate::codeintel::load_zero_copy_base_ref(&zc_created.output.path)
-                .expect("load base ref")
-                .is_some()
-        );
+        assert!(devmap_query::paths::stack_lease_path(zc_wt).is_file());
 
         // 3. Sparse cone checkout judges `--no-checkout` and materializes only `pkg/api`.
         let sparse_target = sandbox.path().join("wt-sparse");
@@ -560,16 +628,12 @@ mod tests {
         crate::test_support::trust_repo(sp_wt);
         assert!(sp_wt.join("pkg/api/lib.rs").is_file());
         assert!(!sp_wt.join("pkg/other/lib.rs").exists());
-        assert!(
-            crate::codeintel::load_zero_copy_base_ref(&sparse_created.output.path)
-                .expect("load base ref")
-                .is_some()
-        );
+        assert!(devmap_query::paths::stack_lease_path(sp_wt).is_file());
 
-        // 4. Sparse cone checkout without the pointer (`DevmapMode::None`; `Copy`
+        // 4. Sparse cone checkout without the lease (`DevmapMode::None`; `Copy`
         //    behaves the same here) still provisions a local CoW `devmap.sqlite`:
         //    the sparse path seeds either way, and only `ZeroCopy` writes
-        //    `base_store_ref.json` instead.
+        //    `stack_lease.json` instead.
         let sparse_local_target = sandbox.path().join("wt-sparse-local-devmap");
         let sparse_local_created = add_worktree_guarded(
             repo_str,
@@ -589,10 +653,8 @@ mod tests {
         assert!(sp_local_wt.join("pkg/api/lib.rs").is_file());
         assert!(!sp_local_wt.join("pkg/other/lib.rs").exists());
         assert!(
-            crate::codeintel::load_zero_copy_base_ref(&sparse_local_created.output.path)
-                .expect("load base ref")
-                .is_none(),
-            "zero_copy_devmap=false must not write base_store_ref.json"
+            !devmap_query::paths::stack_lease_path(sp_local_wt).exists(),
+            "zero_copy_devmap=false must not write stack_lease.json"
         );
         assert!(
             devmap_query::paths::store_path(sp_local_wt).is_file(),
@@ -602,9 +664,7 @@ mod tests {
 
     /// What the Worktrees panel asks for by default: a full checkout whose
     /// DevMap store is CoW-cloned from the main checkout and then built for
-    /// this worktree's own tree. The zero-copy pointer is invisible to the
-    /// `devmap` binary agents run (DevMap's hook cold-builds beside it), so it
-    /// is no longer the default.
+    /// this worktree's own tree.
     #[cfg(unix)]
     #[test]
     fn seed_devmap_clones_the_store_and_starts_the_worktrees_own_build() {
@@ -667,11 +727,7 @@ mod tests {
             .canonicalize()
             .expect("canonical worktree");
         assert!(devmap_query::paths::store_path(&wt).is_file());
-        assert!(
-            crate::codeintel::load_zero_copy_base_ref(&created.output.path)
-                .expect("load base ref")
-                .is_none()
-        );
+        assert!(!devmap_query::paths::stack_lease_path(&wt).exists());
 
         let deadline = std::time::Instant::now()
             + crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(10));

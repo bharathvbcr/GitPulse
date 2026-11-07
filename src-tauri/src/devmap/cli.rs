@@ -578,7 +578,7 @@ fn run_devmap(
         .collect::<Vec<_>>();
     let mut diagnostic =
         super::diagnostics::CommandLog::start(binary, repo, &effective_args, deadline);
-    let is_build = args.first() == Some(&"build");
+    let is_build = args.first() == Some(&"build") || args == SYNC_DELTA_ARGS;
     if is_build {
         limit_build_threads(&mut cmd);
     }
@@ -728,6 +728,7 @@ fn spawn_build(repo_path: &str, args: &'static [&'static str]) -> Result<BuildOu
 
 const MANIFEST_BUILD_ARGS: &[&str] = &["build", "--manifest", "--json"];
 const INCREMENTAL_BUILD_ARGS: &[&str] = &["build", "--json"];
+const SYNC_DELTA_ARGS: &[&str] = &["seed", "--sync-delta", "--json"];
 
 /// A build whose writer slot is already claimed and whose child has not run.
 ///
@@ -756,6 +757,12 @@ pub fn prepare(repo_path: &str, manifest: bool) -> Result<PreparedBuild, String>
             INCREMENTAL_BUILD_ARGS
         },
     )
+}
+
+/// Claim the writer slot to sync a stacked worktree's `delta.sqlite`
+/// (`devmap seed --sync-delta --json`) without running a full `devmap build`.
+pub fn prepare_sync_delta(repo_path: &str) -> Result<PreparedBuild, String> {
+    prepare_args(repo_path, SYNC_DELTA_ARGS)
 }
 
 fn prepare_args(repo_path: &str, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
@@ -818,6 +825,12 @@ impl BuildPermit {
         })
     }
 
+    /// [`prepare_sync_delta`] under this permit: keeps the per-repo writer slot
+    /// held across probe -> stacked delta sync (`devmap seed --sync-delta --json`).
+    pub fn prepare_sync_delta(self) -> Result<PreparedBuild, String> {
+        self.prepare_args(SYNC_DELTA_ARGS)
+    }
+
     fn prepare_args(self, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
         let binary = resolve_binary()?;
         Ok(PreparedBuild {
@@ -874,6 +887,12 @@ pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
 /// Incremental rebuild (`devmap build --json` without `--full`).
 pub fn refresh(repo_path: &str) -> Result<BuildOutcome, String> {
     spawn_build(repo_path, INCREMENTAL_BUILD_ARGS)
+}
+
+/// Synchronize dirty/diverged files into an existing stacked worktree's
+/// `delta.sqlite` (`devmap seed --sync-delta --json`) using real Tree-sitter.
+pub fn sync_stacked_delta(repo_path: &str) -> Result<BuildOutcome, String> {
+    spawn_build(repo_path, SYNC_DELTA_ARGS)
 }
 
 /// Installation health `devmap doctor --json` already measures and GitPulse
@@ -2875,5 +2894,30 @@ printf '%s\n' '{"ok":true}'
             .find(|(key, _)| *key == "RAYON_NUM_THREADS")
             .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
         assert_eq!(value.as_deref(), Some("3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_stacked_delta_invokes_seed_sync_delta_json() {
+        let repo = git_repo();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_devmap(bin_dir.path());
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf '%s\n' "$*" > sync_delta.argv
+printf '%s\n' '{"synced_files":2,"deleted_files":0,"cleaned_files":0,"rebased":false}'
+"#,
+        )
+        .unwrap();
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+        let out = sync_stacked_delta(&repo.path().to_string_lossy()).expect("sync_stacked_delta");
+        assert!(out.ok, "{out:?}");
+        let argv = fs::read_to_string(repo.path().join("sync_delta.argv")).expect("argv");
+        let tokens: Vec<&str> = argv.split_whitespace().collect();
+        assert!(
+            tokens.starts_with(&["seed", "--sync-delta", "--json"]),
+            "unexpected argv: {tokens:?}"
+        );
     }
 }

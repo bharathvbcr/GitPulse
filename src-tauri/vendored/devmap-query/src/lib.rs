@@ -84,9 +84,10 @@ pub use map_preview::{
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
 pub use stacked::{
-    base_generation_dir, bases_root_dir, gc_unused_bases, legacy_base_store_anchor_root,
-    provision_stacked_worktree, publish_base_snapshot, seed_derived_artifacts_and_reuse_caches,
-    BaseManifest, GcBasesReport, StackLease, StackedStatus, StackedStore, StackedSyncReport,
+    base_generation_dir, bases_root_dir, gc_unused_bases, gc_unused_bases_waiting,
+    legacy_base_store_anchor_root, provision_stacked_worktree, publish_base_snapshot,
+    refuse_legacy_base_store_ref, seed_derived_artifacts_and_reuse_caches, BaseKey, BaseManifest,
+    FileRecord, GcBasesReport, StackLease, StackedStatus, StackedStore, StackedSyncReport,
     DEFAULT_REBASE_DELTA_BYTES, DEFAULT_REBASE_DIRTY_FILES, STACK_FORMAT_VERSION,
 };
 

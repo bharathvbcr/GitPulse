@@ -1959,7 +1959,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_worktree_overlay_sync",
             "Synchronize ephemeral worktree DevMap overlay",
-            "Recompute <state_dir>/codeintel/overlay.json for a worktree against its base DevMap generation (cloned or zero-copy pointer), updating Blake3 file hashes, tombstones, CAS AST reuse, and RoaringBitmap dirty CSR nodes",
+            "Synchronize <state_dir>/codeintel/delta.sqlite for a stacked DevMap worktree via real Tree-sitter extraction (or compute an in-memory delta summary for standalone checkouts), updating Blake3 file hashes, tombstones, and RoaringBitmap dirty CSR nodes",
             WorktreeOverlaySyncArgs::properties(),
             &WorktreeOverlaySyncArgs::required(),
             json!({
@@ -2839,7 +2839,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             {
                 let devmap_seeded = devmap_query::paths::store_path(std::path::Path::new(&wt.path))
                     .is_file()
-                    || crate::codeintel::zero_copy_base_ref_path(&wt.path).is_file();
+                    || devmap_query::paths::stack_lease_path(std::path::Path::new(&wt.path))
+                        .is_file();
                 return Ok(json!({
                     "ok": true,
                     "branch": a.branch,

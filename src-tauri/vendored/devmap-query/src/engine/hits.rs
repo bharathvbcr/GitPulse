@@ -1,7 +1,6 @@
 use super::{BYTES_PER_TOKEN, SEARCH_HIT_OVERHEAD_TOKENS};
 use crate::model::{LiteralSite, SkeletonSymbol, SymbolHit};
 use devmap_extract::model::Span;
-use devmap_store::Store;
 use std::path::Path;
 
 /// Token cost of one search hit: its source span plus a fixed per-row overhead.
@@ -43,19 +42,19 @@ pub(super) fn skeleton_symbol_tokens(item: &SkeletonSymbol) -> u32 {
 /// `./` all reach the same row; without this a Cursor absolute `file_path`
 /// would answer "not in index" for a file the generation holds under a
 /// relative key.
-pub(super) fn resolve_skeleton_path(store: &Store, path: &str) -> anyhow::Result<String> {
+pub(super) fn resolve_skeleton_path(repo_root: Option<&str>, path: &str) -> String {
     let unified = path.trim().replace('\\', "/");
     let stripped = unified.strip_prefix("./").unwrap_or(&unified);
     let raw = Path::new(stripped);
     if raw.is_absolute() {
-        if let Some(root) = store.latest_repo_root()? {
-            let root = Path::new(&root);
+        if let Some(root) = repo_root {
+            let root = Path::new(root);
             if let Ok(relative) = raw.strip_prefix(root) {
-                return Ok(relative.to_string_lossy().replace('\\', "/"));
+                return relative.to_string_lossy().replace('\\', "/");
             }
         }
     }
-    Ok(stripped.to_string())
+    stripped.to_string()
 }
 
 #[cfg(test)]

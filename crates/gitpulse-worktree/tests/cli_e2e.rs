@@ -95,7 +95,11 @@ fn run_cli_json_ok(home: &Path, args: &[&str]) -> Value {
 }
 
 fn seed_monorepo_with_devmap_and_csr(anchor: &Path) {
-    fs::write(anchor.join(".gitignore"), "node_modules/\n.devmap/\n").unwrap();
+    fs::write(
+        anchor.join(".gitignore"),
+        "node_modules/\n.devmap/\n.devcouncil/\n",
+    )
+    .unwrap();
     fs::create_dir_all(anchor.join("packages/app")).unwrap();
     fs::create_dir_all(anchor.join("packages/shared")).unwrap();
     fs::create_dir_all(anchor.join("packages/unrelated")).unwrap();
@@ -136,6 +140,19 @@ fn seed_monorepo_with_devmap_and_csr(anchor: &Path) {
     .unwrap();
 
     let canonical_anchor = anchor.canonicalize().unwrap();
+    let scanned = devmap_extract::scan_tree(&canonical_anchor).unwrap();
+    let hashes: std::collections::BTreeMap<String, u64> = scanned
+        .file_hashes()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity("rust");
+    let engine_json = serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+        grammar: "rust".to_string(),
+        grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+    })
+    .unwrap();
+
     let db_path = devmap_query::paths::store_path(&canonical_anchor);
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let store = Store::open(&db_path).expect("open devmap store");
@@ -171,14 +188,38 @@ fn seed_monorepo_with_devmap_and_csr(anchor: &Path) {
     for (idx, (path, sym)) in files.iter().enumerate() {
         let id = (idx + 1) as i64;
         let bytes = fs::read(canonical_anchor.join(path)).unwrap();
-        let digest = devmap_store::IncrementalDigestEngine::hash_bytes(&bytes) as i64;
+        let raw_hash = *hashes.get(*path).expect("scanned file hash");
+        let digest = raw_hash as i64;
+        let extraction_json = serde_json::json!({
+            "file_path": *path,
+            "language": "rust",
+            "content_hash": raw_hash,
+            "parse_outcome": "Clean",
+            "symbols": [{
+                "name": *sym,
+                "qualified_name": *sym,
+                "kind": "Function",
+                "span": { "start_byte": 0, "end_byte": bytes.len() },
+                "is_exported": true
+            }],
+            "imports": [],
+            "calls": []
+        })
+        .to_string();
         conn.execute(
             "INSERT INTO file_payloads
                (payload_id, file_id, content_hash, language,
                 parse_outcome_json, engine_json, extraction_json,
                 entry_wiring_json, grammar_version, analyzer_version)
-             VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
-            (id, digest),
+             VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', ?3, ?4, '[]', ?5, ?6)",
+            (
+                id,
+                digest,
+                &engine_json,
+                &extraction_json,
+                &grammar_ver,
+                &analyzer_ver,
+            ),
         )
         .unwrap();
         conn.execute(
@@ -345,7 +386,28 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
 
 #[test]
 fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
+    let real_devmap = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|h| {
+            [".local/bin/devmap", ".cargo/bin/devmap"]
+                .into_iter()
+                .map(|rel| h.join(rel))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                gitpulse_lib::devmap::cli::resolve_binary()
+                    .expect("installed devmap binary")
+                    .path,
+            )
+        });
+
     let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_devmap, devmap_stub_path(home.path())).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(&real_devmap, devmap_stub_path(home.path())).unwrap();
+
     let workspace = tempfile::tempdir().unwrap();
     let anchor = workspace.path().join("monorepo");
     fs::create_dir_all(&anchor).unwrap();
@@ -422,8 +484,12 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
         "zero-copy worktree must NOT duplicate devmap.sqlite"
     );
     assert!(
-        gitpulse_lib::codeintel::zero_copy_base_ref_path(wt_a_target.to_str().unwrap()).is_file(),
-        "zero-copy worktree must write <512B base_store_ref.json"
+        !devmap_query::paths::stack_delta_path(&wt_a_target).exists(),
+        "freshly provisioned stacked worktree must NOT write delta.sqlite before sync"
+    );
+    assert!(
+        devmap_query::paths::stack_lease_path(&wt_a_target).is_file(),
+        "zero-copy worktree must write canonical stack_lease.json"
     );
 
     // 3. Create parallel zero-copy `agent/lane-b` scoped to `packages/shared`

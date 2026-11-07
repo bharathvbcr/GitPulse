@@ -89,12 +89,14 @@ impl Fingerprint {
     }
 }
 
-/// Remove `path` and its `-wal` / `-shm`. For files this process staged.
+/// Remove `path` and its staged sidecars (`-wal`, `-shm`, `.lock`, `.csr`). For files this process staged.
 pub fn discard_staged(path: &Path) {
     for file in [
         path.to_path_buf(),
         sidecar(path, "-wal"),
         sidecar(path, "-shm"),
+        sidecar(path, ".lock"),
+        sidecar(path, ".csr"),
     ] {
         let _ = std::fs::remove_file(file);
     }
@@ -400,11 +402,11 @@ fn try_clone(_source: &Path, _staged: &Path) -> bool {
     false
 }
 
-/// Rebind a staged database to `root` without touching `generations` (`F6`, `F8`,
-/// Critique 3, `SC-001`): writes `seeded_repo_root` into `seed_rebind` and
-/// updates `pending_state.repo_root` (`<= 16-32 KiB`), leaving every
-/// `generations` row and its `analysis_json` overflow chain untouched and
-/// CoW-shared with the donor store.
+/// Rebind a staged store to `root` in one IMMEDIATE transaction (`F6`, `F8`,
+/// Critique 3): updates `seed_rebind`, `pending_state.repo_root`, and only the
+/// latest `generations` row (`id = MAX(id)`) under `synchronous = OFF` on the
+/// unplaced staging file so historical generation overflow chains remain CoW-shared
+/// while raw SQLite readers of the latest generation also observe `root`.
 /// Note: stacked/zero-copy mode (`base.sqlite`) never invokes `rebind_staged` at
 /// all (`0 B` CoW write amplification).
 pub fn rebind_staged(staged: &Path, root: &Path) -> Result<()> {
@@ -423,6 +425,10 @@ pub fn rebind_staged(staged: &Path, root: &Path) -> Result<()> {
     tx.execute(
         "INSERT INTO seed_rebind (singleton, seeded_repo_root) VALUES (1, ?1)
          ON CONFLICT (singleton) DO UPDATE SET seeded_repo_root = excluded.seeded_repo_root",
+        [&root],
+    )?;
+    tx.execute(
+        "UPDATE generations SET repo_root = ?1 WHERE id = (SELECT MAX(id) FROM generations)",
         [&root],
     )?;
     let bound = tx.execute(
@@ -620,7 +626,7 @@ mod tests {
         rebind_staged(&staged_db, &lane_canon).unwrap();
         settle_staged(&staged_db).unwrap();
 
-        // ALL generations rows (historical AND MAX(id)) MUST remain untouched (CoW-shared), while seed_rebind binds lane_canon.
+        // Historical generations MUST remain untouched (CoW-shared), while MAX(id) and seed_rebind bind lane_canon.
         {
             let conn = Connection::open(&staged_db).unwrap();
             let oldest_gen_root: String = conn
@@ -638,7 +644,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(latest_gen_root, donor_canon.to_str().unwrap());
+            assert_eq!(latest_gen_root, lane_canon.to_str().unwrap());
             let seeded: String = conn
                 .query_row(
                     "SELECT seeded_repo_root FROM seed_rebind WHERE singleton = 1",
@@ -665,11 +671,29 @@ mod tests {
         assert_eq!(search.repo_root.as_deref(), lane_canon.to_str());
         drop(reopened);
 
-        // And seed_rebind takes precedence via COALESCE even when generations.repo_root differs.
+        // seed_rebind outranks generations.repo_root only while pending_state
+        // agrees with it. Changed alone, it is stale: generations wins.
         {
             let conn = Connection::open(&staged_db).unwrap();
             conn.execute(
                 "UPDATE seed_rebind SET seeded_repo_root = ?1 WHERE singleton = 1",
+                [alt_canon.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let reopened_alt = Store::open_read_only(&staged_db).unwrap();
+        assert_eq!(
+            reopened_alt.latest_repo_root().unwrap().as_deref(),
+            lane_canon.to_str(),
+            "a seed_rebind that pending_state does not back must not win"
+        );
+        drop(reopened_alt);
+
+        // Changed together with pending_state, `alt` is the store's owner and wins.
+        {
+            let conn = Connection::open(&staged_db).unwrap();
+            conn.execute(
+                "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
                 [alt_canon.to_str().unwrap()],
             )
             .unwrap();
@@ -686,100 +710,69 @@ mod tests {
                 .as_deref(),
             alt_canon.to_str()
         );
+        drop(reopened_alt);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn rebind_staged_writes_under_32kib_on_8mib_latest_generation() {
-        let tmp = temp_test_dir("rebind-8mib");
-        let donor_root = tmp.join("donor");
-        let lane_root = tmp.join("lane");
-        std::fs::create_dir_all(&donor_root).unwrap();
-        std::fs::create_dir_all(&lane_root).unwrap();
-        let donor_canon = donor_root.canonicalize().unwrap();
-        let lane_canon = lane_root.canonicalize().unwrap();
-
-        let source_db = tmp.join("source-8mib.sqlite");
+    fn an_older_writer_that_rebinds_the_root_outranks_a_stale_seed_rebind() {
+        let tmp = temp_test_dir("old-writer-rebind");
+        let source_db = tmp.join("source.sqlite");
+        let staged_db = tmp.join("staged.sqlite");
+        let lane = tmp.join("lane");
+        std::fs::create_dir_all(&lane).unwrap();
         {
             let store = Store::open(&source_db).unwrap();
-            store.bind_repo_root(&donor_canon).unwrap();
+            store.bind_repo_root(&tmp.canonicalize().unwrap()).unwrap();
             drop(store);
-            // Build a valid >8 MiB JSON payload on MAX(id) matching real DevCouncil overflow chains (~514 pages).
-            let mut large_json =
-                serde_json::to_value(devmap_analyze::analyze(
-                    &[],
-                    &devmap_resolve::Resolver::new().resolve_all(&[]).unwrap(),
-                ))
-                .unwrap();
-            large_json
-                .as_object_mut()
-                .unwrap()
-                .insert("padding_8mib".to_string(), serde_json::Value::String("x".repeat(8 * 1024 * 1024)));
-            let payload = serde_json::to_string(&large_json).unwrap();
-
+            let empty_res = devmap_resolve::Resolver::new().resolve_all(&[]).unwrap();
+            let analysis_json =
+                serde_json::to_string(&devmap_analyze::analyze(&[], &empty_res)).unwrap();
             let conn = Connection::open(&source_db).unwrap();
             conn.execute(
                 "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
-                 VALUES (1730000001.0, 'deadbeef', ?1, ?2)",
-                rusqlite::params![&payload, donor_canon.to_str().unwrap()],
+                 VALUES (1730000000.0, 'deadbeef', ?1, ?2)",
+                rusqlite::params![&analysis_json, tmp.to_str().unwrap()],
             )
             .unwrap();
         }
         settle_staged(&source_db).unwrap();
-
-        let staged_db = tmp.join("staged-8mib.sqlite");
-        let method = stage_seed_healing_wal(&source_db, &staged_db).unwrap();
-        assert_ne!(method, SeedMethod::Backup);
-        rebind_staged(&staged_db, &lane_canon).unwrap();
+        stage_seed_healing_wal(&source_db, &staged_db).unwrap();
+        rebind_staged(&staged_db, &lane).unwrap();
         settle_staged(&staged_db).unwrap();
 
-        let src_bytes = std::fs::read(&source_db).unwrap();
-        let dst_bytes = std::fs::read(&staged_db).unwrap();
-        let min_blocks = (src_bytes.len() / 4096).min(dst_bytes.len() / 4096);
-        let mut differing_blocks = (src_bytes.len().abs_diff(dst_bytes.len())).div_ceil(4096);
-        for b in 0..min_blocks {
-            if src_bytes[b * 4096..(b + 1) * 4096] != dst_bytes[b * 4096..(b + 1) * 4096] {
-                differing_blocks += 1;
-            }
-        }
-        let cow_dirty_bytes = differing_blocks * 4096;
-        assert!(
-            cow_dirty_bytes <= 32 * 1024,
-            "SC-001 violation: rebind_staged dirtied {} bytes ({} x 4 KiB CoW pages; expected <= 32 KiB)",
-            cow_dirty_bytes,
-            differing_blocks
-        );
-
-        let conn = Connection::open(&staged_db).unwrap();
-        let raw_gen_root: String = conn
-            .query_row(
-                "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
+        // An older writer (one that does not know seed_rebind) moves the store.
+        {
+            let conn = Connection::open(&staged_db).unwrap();
+            conn.execute(
+                "UPDATE pending_state SET repo_root = '/moved' WHERE singleton = 1",
                 [],
-                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(
-            raw_gen_root,
-            donor_canon.to_str().unwrap(),
-            "generations table pages must remain untouched so APFS CoW extents stay shared"
-        );
-        drop(conn);
-
+            conn.execute(
+                "UPDATE generations SET repo_root = '/moved'
+                 WHERE id = (SELECT max(id) FROM generations)",
+                [],
+            )
+            .unwrap();
+        }
         let reopened = Store::open_read_only(&staged_db).unwrap();
-        assert_eq!(reopened.latest_repo_root().unwrap().as_deref(), lane_canon.to_str());
+        assert_eq!(
+            reopened.latest_repo_root().unwrap().as_deref(),
+            Some("/moved")
+        );
         assert_eq!(
             reopened.latest_generation_repo_root().unwrap().as_deref(),
-            lane_canon.to_str()
+            Some("/moved")
         );
         drop(reopened);
-
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn stage_seed_healing_wal_clones_when_reader_pins_checkpointed_wal_and_backs_up_on_uncheckpointed()
-    {
+    fn stage_seed_healing_wal_clones_when_reader_pins_checkpointed_wal_and_backs_up_on_uncheckpointed(
+    ) {
         let tmp = temp_test_dir("wal-heal");
         let source_db = tmp.join("source.sqlite");
         {

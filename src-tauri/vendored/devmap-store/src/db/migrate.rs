@@ -399,10 +399,9 @@ impl Store {
         Ok(())
     }
 
-    /// Read the seeded worktree `repo_root` override recorded by `rebind_staged`
-    /// (`None` when `seed_rebind` is absent or empty), validating that any
-    /// stored row is a non-empty string (`F6`, `F8`, Critique 3).
-    pub(super) fn seeded_repo_root_in(conn: &Connection) -> Result<Option<String>> {
+    /// The raw, validated `seed_rebind` row (`None` when the table is absent or
+    /// empty), whether or not it still describes the store.
+    fn seed_rebind_row(conn: &Connection) -> Result<Option<String>> {
         if !Self::relation_is_table(conn, "seed_rebind")? {
             return Ok(None);
         }
@@ -420,19 +419,45 @@ impl Store {
         }
     }
 
-    /// When a seeded store commits or restamps its own generation during an
-    /// explicit build, retire `seed_rebind` and normalize any inherited
-    /// `generations.repo_root` rows (`rebind_staged` itself never touches
-    /// `generations`, keeping provisioning CoW-zero-overflow).
-    pub(super) fn clear_seed_rebind(tx: &Connection, target_root: Option<&str>) -> Result<()> {
-        if let Some(seeded_root) = Self::seeded_repo_root_in(tx)? {
-            let root = target_root
-                .filter(|r| !r.is_empty())
-                .unwrap_or(seeded_root.as_str());
-            tx.execute(
-                "UPDATE generations SET repo_root = ?1 WHERE repo_root IS NOT ?1",
-                params![root],
-            )?;
+    /// Read the seeded worktree `repo_root` override recorded by `rebind_staged`
+    /// (`None` when `seed_rebind` is absent or empty), validating that any
+    /// stored row is a non-empty string (`F6`, `F8`, Critique 3).
+    ///
+    /// The override is honoured only while `pending_state.repo_root` agrees with
+    /// it. A writer that predates the table never clears `seed_rebind`, so after
+    /// a `git worktree move` and an old-devmap rebuild the table would otherwise
+    /// outrank every newer root forever; when the two disagree the store has
+    /// been re-bound since, and `generations` is the answer.
+    pub(super) fn seeded_repo_root_in(conn: &Connection) -> Result<Option<String>> {
+        let Some(seeded) = Self::seed_rebind_row(conn)? else {
+            return Ok(None);
+        };
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok((owner.as_deref() == Some(seeded.as_str())).then_some(seeded))
+    }
+
+    /// When a seeded store commits or restamps a generation, normalize any
+    /// retained donor `generations.repo_root` rows to `owner` and clear
+    /// `seed_rebind`.
+    pub(super) fn clear_seed_rebind_and_normalize_generations(
+        tx: &Connection,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        // Presence of the row, not agreement: a stale row must still be cleared.
+        if Self::seed_rebind_row(tx)?.is_some() {
+            if let Some(owner) = owner.filter(|s| !s.is_empty()) {
+                tx.execute(
+                    "UPDATE generations SET repo_root = ?1 WHERE repo_root IS NOT ?1",
+                    params![owner],
+                )?;
+            }
             tx.execute("DELETE FROM seed_rebind", [])?;
         }
         Ok(())

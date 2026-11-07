@@ -3,12 +3,12 @@
 //!
 //! Designed for parallel agentic lanes working concurrently in the same Git
 //! repository family:
-//! - Zero-copy DevMap shared base graph pointers (`base_store_ref.json` ->
-//!   anchor `devmap.sqlite` + mmap `.csr` + `cas/ast/`)
+//! - Zero-copy DevMap shared base graph leases (`stack_lease.json` ->
+//!   sealed `0444` `base.sqlite` + mmap `.csr` + lazy `delta.sqlite`)
 //! - DevMap-guided `--cone` sparse checkouts (`add_sparse_worktree_zero_copy`)
 //!   with selective Copy-on-Write (`clonefile` / `FICLONE`) cache cloning
-//! - Ephemeral Blake3/CAS `WorktreeOverlay` + `RoaringBitmap` dirty CSR node
-//!   compilation (`compile-overlay`)
+//! - Explicit Tree-sitter `delta.sqlite` + `RoaringBitmap` dirty CSR node
+//!   synchronization (`compile-overlay`)
 //! - Lock-free/atomic `<git-common-dir>/gitpulse/lanes/` pre-edit claim bus,
 //!   bounded agent-to-agent message ring, and 3-layer collision `radar`
 //! - Zero-copy content-addressed `gitpulse-rustc` compilation (`build`) and
@@ -17,8 +17,8 @@
 //!   squash/non-squash merge pipeline (`merge`, `prune`).
 
 use gitpulse_lib::codeintel::{
-    load_worktree_overlay, load_zero_copy_base_ref, provision_worktree_devmap,
-    provision_worktree_devmap_zero_copy, sync_worktree_overlay, zero_copy_base_ref_path,
+    load_worktree_overlay, provision_worktree_devmap, provision_worktree_devmap_zero_copy,
+    sync_worktree_overlay,
 };
 use gitpulse_lib::engine::agent_bus::{
     list_lanes, post_message, read_messages, register_or_update_lane,
@@ -1043,7 +1043,6 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             {
                 let wt_path = Path::new(&wt.path);
                 let devmap_seeded = devmap_query::paths::store_path(wt_path).is_file()
-                    || zero_copy_base_ref_path(&wt.path).is_file()
                     || devmap_query::paths::stack_lease_path(wt_path).is_file();
                 return Ok(json!({
                     "ok": true,
@@ -1188,11 +1187,14 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             gitpulse_lib::repository_trust::require(Path::new(&worktree))
                 .map_err(CommandError::into_message)?;
             let report = sync_worktree_overlay(&worktree).map_err(CommandError::into_message)?;
-            let zero_copy_ref = load_zero_copy_base_ref(&worktree).ok().flatten();
+            let stack_lease = devmap_query::stacked::StackLease::read_from(
+                &devmap_query::paths::stack_lease_path(Path::new(&worktree)),
+            )
+            .ok();
             Ok(json!({
                 "ok": true,
                 "worktree_path": worktree,
-                "zero_copy_base_ref": zero_copy_ref,
+                "zero_copy_base_ref": stack_lease,
                 "report": report,
             }))
         }
@@ -1219,9 +1221,18 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             for wt in &worktrees {
                 let wt_path = Path::new(&wt.path);
                 let has_local_store = devmap_query::paths::store_path(wt_path).is_file();
-                let zc_ref = load_zero_copy_base_ref(&wt.path).ok().flatten();
-                let has_stack_lease = devmap_query::paths::stack_lease_path(wt_path).is_file();
-                let devmap_mode = if zc_ref.is_some() || has_stack_lease {
+                let stack_lease = devmap_query::stacked::StackLease::read_from(
+                    &devmap_query::paths::stack_lease_path(wt_path),
+                )
+                .ok();
+                let zero_copy_anchor = stack_lease.as_ref().and_then(|lease| {
+                    let manifest_path = Path::new(&lease.base_dir).join("manifest.json");
+                    let bytes = std::fs::read(&manifest_path).ok()?;
+                    let manifest: devmap_query::stacked::BaseManifest =
+                        serde_json::from_slice(&bytes).ok()?;
+                    Some(manifest.source_repo_root)
+                });
+                let devmap_mode = if stack_lease.is_some() {
                     "zero_copy_base_ref"
                 } else if has_local_store {
                     "local_store"
@@ -1249,7 +1260,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     "head": wt.head,
                     "is_main": wt.is_main,
                     "devmap_mode": devmap_mode,
-                    "zero_copy_anchor": zc_ref.map(|r| r.anchor_repo_root),
+                    "zero_copy_anchor": zero_copy_anchor,
                     "overlay": overlay_summary,
                     "user_dirty_files": user_dirty,
                 }));

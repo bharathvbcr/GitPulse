@@ -23,11 +23,10 @@ pub use suspects::{
 };
 pub mod worktree_overlay;
 pub use worktree_overlay::{
-    load_worktree_overlay, load_zero_copy_base_ref, provision_worktree_devmap,
-    provision_worktree_devmap_stacked, provision_worktree_devmap_zero_copy, sync_worktree_overlay,
-    worktree_overlay_path, zero_copy_base_ref_path, DevmapWorktreeProvision, WorktreeOverlayReport,
-    ZeroCopyBaseRef, BASE_STORE_REF_RELPATH, CAS_AST_RELPATH, MAX_OVERLAY_DIRTY_FILES,
-    MAX_OVERLAY_FILE_BYTES, OVERLAY_RELPATH,
+    load_worktree_overlay, provision_worktree_devmap, provision_worktree_devmap_stacked,
+    provision_worktree_devmap_zero_copy, refuse_legacy_base_store_ref, sync_worktree_overlay,
+    DevmapWorktreeProvision, StackedBaseMeta, WorktreeOverlayReport, MAX_OVERLAY_DIRTY_FILES,
+    MAX_OVERLAY_FILE_BYTES,
 };
 
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
@@ -317,38 +316,37 @@ fn rewrite_schema_mismatch(raw: &str) -> Option<String> {
 
 enum OpenedRepoStore {
     Local(Store),
-    ZeroCopy {
+    Stacked {
         store: Store,
-        base_ref: ZeroCopyBaseRef,
-        anchor_root: PathBuf,
-        stacked: Option<Box<devmap_query::StackedStore>>,
+        meta: StackedBaseMeta,
+        stacked: Box<devmap_query::StackedStore>,
     },
 }
 
 impl OpenedRepoStore {
     fn store(&self) -> &Store {
         match self {
-            Self::Local(store) | Self::ZeroCopy { store, .. } => store,
+            Self::Local(store) | Self::Stacked { store, .. } => store,
         }
     }
 
     fn stacked(&self) -> Option<&devmap_query::StackedStore> {
         match self {
             Self::Local(_) => None,
-            Self::ZeroCopy { stacked, .. } => stacked.as_deref(),
+            Self::Stacked { stacked, .. } => Some(stacked.as_ref()),
         }
     }
 
     fn into_store(self) -> Store {
         match self {
-            Self::Local(store) | Self::ZeroCopy { store, .. } => store,
+            Self::Local(store) | Self::Stacked { store, .. } => store,
         }
     }
 
     fn into_store_and_stacked(self) -> (Store, Option<devmap_query::StackedStore>) {
         match self {
             Self::Local(store) => (store, None),
-            Self::ZeroCopy { store, stacked, .. } => (store, stacked.map(|s| *s)),
+            Self::Stacked { store, stacked, .. } => (store, Some(*stacked)),
         }
     }
 }
@@ -387,19 +385,16 @@ pub(super) fn open_local_indexed_store(repo: &Path) -> Result<Store, String> {
 }
 
 fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
-    let has_zero_copy = worktree_overlay::has_zero_copy_or_stack_lease(repo);
-    let prefer_zero_copy = has_zero_copy && worktree_overlay::is_sparse_worktree(repo);
-    if prefer_zero_copy {
-        match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
-            Ok(Some((store, base_ref))) => {
-                let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
-                let stacked =
-                    devmap_query::StackedStore::open_if_leased(repo).map_err(|e| e.to_string())?;
-                return Ok(OpenedRepoStore::ZeroCopy {
+    worktree_overlay::refuse_legacy_base_store_ref(repo).map_err(CommandError::into_message)?;
+    let has_stacked = worktree_overlay::has_stack_lease_or_legacy_ref(repo);
+    let prefer_stacked = has_stacked && worktree_overlay::is_sparse_worktree(repo);
+    if prefer_stacked {
+        match worktree_overlay::open_verified_stacked_store(repo) {
+            Ok(Some((store, meta, stacked))) => {
+                return Ok(OpenedRepoStore::Stacked {
                     store,
-                    base_ref,
-                    anchor_root,
-                    stacked: stacked.map(Box::new),
+                    meta,
+                    stacked: Box::new(stacked),
                 });
             }
             Ok(None) => {}
@@ -409,17 +404,13 @@ fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
     if map_path(repo).exists() {
         return open_local_store(repo).map(OpenedRepoStore::Local);
     }
-    if has_zero_copy {
-        match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
-            Ok(Some((store, base_ref))) => {
-                let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
-                let stacked =
-                    devmap_query::StackedStore::open_if_leased(repo).map_err(|e| e.to_string())?;
-                return Ok(OpenedRepoStore::ZeroCopy {
+    if has_stacked {
+        match worktree_overlay::open_verified_stacked_store(repo) {
+            Ok(Some((store, meta, stacked))) => {
+                return Ok(OpenedRepoStore::Stacked {
                     store,
-                    base_ref,
-                    anchor_root,
-                    stacked: stacked.map(Box::new),
+                    meta,
+                    stacked: Box::new(stacked),
                 });
             }
             Ok(None) => {}
@@ -1232,13 +1223,12 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
                 reason: None,
             }
         }
-        OpenedRepoStore::ZeroCopy {
+        OpenedRepoStore::Stacked {
             store,
-            base_ref,
-            anchor_root,
+            meta,
             stacked,
         } => {
-            let db_str = base_ref.anchor_db_path;
+            let db_str = meta.base_db_path;
             let summary = match store.status(&db_str) {
                 Ok(summary) => summary,
                 Err(e) => return status_unavailable(db_str, format!("Database error: {e}")),
@@ -1248,10 +1238,10 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
             };
             let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
                 &repo,
-                &anchor_root,
+                &meta.anchor_repo_root,
                 &store,
                 &summary,
-                stacked.as_deref(),
+                Some(stacked.as_ref()),
             );
             let is_fresh = summary.pending_count == 0
                 && summary.analyzer_freshness == Some(true)
@@ -1375,15 +1365,14 @@ fn open_repo_map_checked(
                 unrun,
             })
         }
-        OpenedRepoStore::ZeroCopy {
+        OpenedRepoStore::Stacked {
             store,
-            base_ref,
-            anchor_root,
+            meta,
             stacked,
         } => {
             let gen_id = store.latest_generation_id().ok().flatten();
             let (freshness_override, unrun) = if verify {
-                match store.status(&base_ref.anchor_db_path) {
+                match store.status(&meta.base_db_path) {
                     Err(e) => (
                         Some(SourceFreshness {
                             fresh: None,
@@ -1395,10 +1384,10 @@ fn open_repo_map_checked(
                     Ok(summary) => {
                         let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
                             &repo,
-                            &anchor_root,
+                            &meta.anchor_repo_root,
                             &store,
                             &summary,
-                            stacked.as_deref(),
+                            Some(stacked.as_ref()),
                         );
                         (
                             Some(SourceFreshness {
@@ -1416,8 +1405,8 @@ fn open_repo_map_checked(
             Ok(OpenedCheckedStore {
                 repo,
                 store,
-                anchor_root: Some(anchor_root),
-                stacked: stacked.map(|s| *s),
+                anchor_root: Some(meta.anchor_repo_root),
+                stacked: Some(*stacked),
                 freshness_override,
                 unrun,
             })
@@ -1440,18 +1429,15 @@ fn apply_checked_freshness(
 struct WorktreeHitContext {
     repo: PathBuf,
     anchor_root: Option<PathBuf>,
-    overlay: Option<devmap_query::WorktreeOverlay>,
     synced_stacked_files: std::collections::HashSet<PathBuf>,
     live_deltas: Option<std::collections::HashMap<String, worktree_overlay::DeltaKind>>,
-    /// Why the overlay or the live change list is missing or partial.
+    /// Why the live worktree change list is missing or partial.
     degraded: Vec<String>,
 }
 
 impl WorktreeHitContext {
     fn load(opened: &OpenedCheckedStore) -> Self {
         let mut degraded = Vec::new();
-        let gen_id = opened.store.latest_generation_id().ok().flatten();
-        let repo_str = opened.repo.to_string_lossy();
         let mut synced_stacked_files = std::collections::HashSet::new();
         if let Some(ref st) = opened.stacked {
             for (rel_path, expected_b3) in &st.overlay().modified_files {
@@ -1465,24 +1451,7 @@ impl WorktreeHitContext {
                 }
             }
         }
-        let overlay = if worktree_overlay_path(&repo_str).is_file() {
-            match load_worktree_overlay(&repo_str) {
-                Ok(found) => found.filter(|ov| match gen_id {
-                    Some(g) => ov.generation == u64::from(g),
-                    None => true,
-                }),
-                Err(e) => {
-                    degraded.push(format!(
-                        "worktree overlay unreadable, treated as absent: {}",
-                        e.message()
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let live_deltas = if opened.anchor_root.is_some() || overlay.is_some() {
+        let live_deltas = if opened.anchor_root.is_some() {
             let gen_head = opened.store.latest_generation_head_sha().ok().flatten();
             match worktree_overlay::collect_worktree_deltas(&opened.repo, gen_head.as_deref()) {
                 Ok((rows, truncated)) => {
@@ -1508,7 +1477,6 @@ impl WorktreeHitContext {
         Self {
             repo: opened.repo.clone(),
             anchor_root: opened.anchor_root.clone(),
-            overlay,
             synced_stacked_files,
             live_deltas,
             degraded,
@@ -1527,50 +1495,9 @@ impl WorktreeHitContext {
         });
     }
 
-    fn overlay_file_still_matches(
-        &self,
-        ov: &devmap_query::WorktreeOverlay,
-        rel_path: &str,
-    ) -> bool {
-        let full = self.repo.join(rel_path);
-        // An oversize or non-regular file never carries a recorded hash, so it cannot match.
-        let bytes = match worktree_overlay::read_bounded_file(
-            &full,
-            worktree_overlay::MAX_OVERLAY_FILE_BYTES,
-        ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) | Err(_) => return !full.exists(),
-        };
-        match ov.modified_files.get(Path::new(rel_path)) {
-            Some(expected) => devmap_query::blake3_hash(&bytes) == *expected,
-            None => true,
-        }
-    }
-
-    fn is_tombstoned(&self, file_path: &str, symbol_name: &str) -> bool {
-        if self.live_deltas.as_ref().and_then(|m| m.get(file_path))
+    fn is_tombstoned(&self, file_path: &str) -> bool {
+        self.live_deltas.as_ref().and_then(|m| m.get(file_path))
             == Some(&worktree_overlay::DeltaKind::Deleted)
-        {
-            return true;
-        }
-        if self.synced_stacked_files.contains(Path::new(file_path)) {
-            // `StoreQueryEngine::with_stacked` already masked base symbols and returned
-            // the live `delta.sqlite` declarations for this verified file.
-            return false;
-        }
-        let Some(ref ov) = self.overlay else {
-            return false;
-        };
-        if ov.is_file_tombstoned(Path::new(file_path)) && !self.repo.join(file_path).exists() {
-            return true;
-        }
-        let scoped = format!("{file_path}::{symbol_name}");
-        if (ov.is_symbol_tombstoned(&scoped) || ov.is_symbol_tombstoned(symbol_name))
-            && self.overlay_file_still_matches(ov, file_path)
-        {
-            return true;
-        }
-        false
     }
 
     fn sanitize_span(
@@ -1613,154 +1540,7 @@ impl WorktreeHitContext {
                 Some("file modified in worktree since indexed generation".to_string());
         }
     }
-
-    /// Adds uncommitted overlay symbols matching `query`. Bounded: at most
-    /// [`MAX_OVERLAY_SEARCH_HITS`] hits and the response's remaining source budget;
-    /// symbols are matched before any file is read, and each read is bounded. Hitting a
-    /// bound sets `truncated`. The provenance note goes in `overlay_note`, never
-    /// `walk_incomplete` (which means the walk stopped early).
-    fn append_overlay_search_hits(
-        &self,
-        query: &str,
-        token_budget: u32,
-        filter: Option<&NameQueryFilter>,
-        out: &mut CodeintelResponse<CodeintelSymbolHit>,
-    ) {
-        let Some(ref ov) = self.overlay else {
-            return;
-        };
-        let needle = query.trim().to_ascii_lowercase();
-        if needle.is_empty() {
-            return;
-        }
-        // ~4 bytes of source per budget token, minus what the index hits already spent.
-        let spent: usize = out.items.iter().map(|h| h.source_span.len()).sum();
-        let mut remaining = (token_budget as usize)
-            .saturating_mul(4)
-            .saturating_sub(spent);
-        let mut added = 0u32;
-        'files: for (rel_path, ext) in &ov.added_extractions {
-            if let Some(f) = filter {
-                let path_ok = f.paths().is_empty()
-                    || f.paths()
-                        .iter()
-                        .any(|p| rel_path == p || rel_path.starts_with(&format!("{p}/")));
-                let lang_ok = f.languages().is_empty()
-                    || f.languages()
-                        .iter()
-                        .any(|l| l.eq_ignore_ascii_case(&ext.language));
-                if !path_ok || !lang_ok {
-                    continue;
-                }
-            }
-            let matching: Vec<_> = ext
-                .symbols
-                .iter()
-                .filter(|sym| !matches!(sym.kind, devmap_extract::SymbolKind::File))
-                .filter(|sym| {
-                    filter.is_none_or(|f| {
-                        f.kinds().is_empty()
-                            || f.kinds()
-                                .iter()
-                                .any(|k| k.eq_ignore_ascii_case(sym.kind.as_str()))
-                    })
-                })
-                .filter(|sym| {
-                    sym.name.to_ascii_lowercase().contains(&needle)
-                        || sym.qualified_name.to_ascii_lowercase().contains(&needle)
-                })
-                .collect();
-            if matching.is_empty() {
-                continue;
-            }
-            let full_path = self.repo.join(rel_path);
-            let bytes = match worktree_overlay::read_bounded_file(
-                &full_path,
-                worktree_overlay::MAX_OVERLAY_FILE_BYTES,
-            ) {
-                Ok(Some(bytes)) => bytes,
-                // Missing, oversize or unreadable: its symbols cannot be verified.
-                Ok(None) | Err(_) => continue,
-            };
-            if let Some(expected_hash) = ov.modified_files.get(Path::new(rel_path)) {
-                if devmap_query::blake3_hash(&bytes) != *expected_hash {
-                    continue;
-                }
-            }
-            let source_text = std::str::from_utf8(&bytes).ok();
-            let secret = devmap_extract::secret::is_secret_path(rel_path);
-            for sym in matching {
-                if out
-                    .items
-                    .iter()
-                    .any(|h| h.file_path == *rel_path && h.symbol_name == sym.name)
-                {
-                    continue;
-                }
-                if added as usize >= MAX_OVERLAY_SEARCH_HITS || remaining == 0 {
-                    out.truncated = true;
-                    break 'files;
-                }
-                let (span_start_line, span_end_line) = source_text
-                    .map(|t| sym.span.line_range(t))
-                    .unwrap_or((0, 0));
-                let (source_span, source_unavailable_reason) = if secret {
-                    (
-                        String::new(),
-                        Some("secret file content withheld".to_string()),
-                    )
-                } else if let Some(t) = source_text {
-                    let s = sym.span.start_byte.min(t.len());
-                    let e = sym.span.end_byte.min(t.len()).max(s);
-                    let span = t.get(s..e).unwrap_or("");
-                    if span.len() > remaining {
-                        (
-                            String::new(),
-                            Some("source span omitted: token budget exhausted".to_string()),
-                        )
-                    } else {
-                        remaining -= span.len();
-                        (span.to_string(), None)
-                    }
-                } else {
-                    (
-                        String::new(),
-                        Some("source file is not valid UTF-8".to_string()),
-                    )
-                };
-                out.items.push(CodeintelSymbolHit {
-                    symbol_name: sym.name.clone(),
-                    file_path: rel_path.clone(),
-                    kind: sym.kind.as_str().to_string(),
-                    span_start_line,
-                    span_end_line,
-                    source_span,
-                    source_unavailable_reason,
-                    source_span_omitted_bytes: None,
-                    score: if sym.name.eq_ignore_ascii_case(query.trim()) {
-                        1.0
-                    } else {
-                        0.75
-                    },
-                });
-                added += 1;
-            }
-        }
-        if added > 0 {
-            out.total = out.total.saturating_add(added);
-            out.shown = out.items.len() as u32;
-            const NOTE: &str =
-                "includes uncommitted worktree overlay symbols recovered by fallback declaration scan";
-            out.overlay_note = Some(match out.overlay_note.take() {
-                Some(existing) if !existing.is_empty() => format!("{existing}; {NOTE}"),
-                _ => NOTE.to_string(),
-            });
-        }
-    }
 }
-
-/// Most overlay-only symbols one search adds beyond the index's own hits.
-const MAX_OVERLAY_SEARCH_HITS: usize = 50;
 
 /// Searches symbols using in-process code graph index.
 pub fn search(
@@ -1824,17 +1604,10 @@ pub fn search_with(
                 }
             });
             let before_len = out.items.len();
-            out.items
-                .retain(|h| !hit_ctx.is_tombstoned(&h.file_path, &h.symbol_name));
+            out.items.retain(|h| !hit_ctx.is_tombstoned(&h.file_path));
             let removed = (before_len - out.items.len()) as u32;
             out.total = out.total.saturating_sub(removed);
             out.shown = out.items.len() as u32;
-            hit_ctx.append_overlay_search_hits(
-                query,
-                token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-                filter.as_ref(),
-                &mut out,
-            );
             hit_ctx.annotate(&mut out);
             apply_checked_freshness(
                 &mut out.source_freshness,
@@ -1870,8 +1643,8 @@ pub fn symbols_for_file(repo_path: &str, file_path: &str, head_sha: &str) -> Cod
             "head_sha must be whitespace-free and at most 128 characters",
         );
     }
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
+    let (store, stacked) = match open_repo_map_with_stacked(repo_path) {
+        Ok(pair) => pair,
         Err(e) => return CodeintelFileSymbols::unavailable(file_path, head_sha, e.into_message()),
     };
     let page = match store.latest_symbols_for_file(file_path) {
@@ -1892,59 +1665,76 @@ pub fn symbols_for_file(repo_path: &str, file_path: &str, head_sha: &str) -> Cod
         }
     };
 
-    if page.rows.is_empty() && worktree_overlay_path(repo_path).is_file() {
-        if let Ok(Some(ov)) = load_worktree_overlay(repo_path) {
-            if let Some(ext) = ov.added_extractions.get(file_path) {
-                let full_path = Path::new(repo_path).join(file_path);
-                if let Ok(bytes) = std::fs::read(&full_path) {
-                    let hash_ok = ov
-                        .modified_files
-                        .get(Path::new(file_path))
-                        .is_none_or(|expected| devmap_query::blake3_hash(&bytes) == *expected);
-                    if hash_ok {
-                        let text = std::str::from_utf8(&bytes).ok();
-                        let non_file: Vec<&devmap_extract::ExtractedSymbol> = ext
-                            .symbols
-                            .iter()
-                            .filter(|s| !matches!(s.kind, devmap_extract::SymbolKind::File))
-                            .collect();
-                        if !non_file.is_empty() {
-                            let total = non_file.len() as u32;
-                            let truncated = non_file.len() > MAX_FILE_SYMBOLS;
-                            let items: Vec<CodeintelFileSymbol> = non_file
-                                .into_iter()
-                                .take(MAX_FILE_SYMBOLS)
-                                .map(|sym| {
-                                    let (span_start_line, span_end_line) =
-                                        text.map(|t| sym.span.line_range(t)).unwrap_or((0, 0));
-                                    CodeintelFileSymbol {
-                                        symbol_name: sym.name.clone(),
-                                        qualified_name: sym.qualified_name.clone(),
-                                        kind: sym.kind.as_str().to_string(),
-                                        span_start_line,
-                                        span_end_line,
-                                    }
-                                })
-                                .collect();
-                            let shown = items.len() as u32;
-                            return CodeintelFileSymbols {
-                                available: true,
-                                reason: Some(
-                                    "uncommitted file extracted from worktree overlay (not in indexed HEAD)"
-                                        .to_string(),
-                                ),
-                                file_path: file_path.to_string(),
-                                requested_head_sha: head_sha.to_string(),
-                                generation_id: Some(page.generation),
-                                generation_head_sha: Some(page.head_sha),
-                                head_matches: false,
-                                items,
-                                total,
-                                shown,
-                                truncated,
-                            };
-                        }
-                    }
+    if let Some(ref st) = stacked {
+        let ov = st.overlay();
+        if ov.is_file_tombstoned(Path::new(file_path))
+            && !Path::new(repo_path).join(file_path).exists()
+        {
+            return CodeintelFileSymbols {
+                available: true,
+                reason: Some("file deleted in stacked worktree delta".to_string()),
+                file_path: file_path.to_string(),
+                requested_head_sha: head_sha.to_string(),
+                generation_id: Some(page.generation),
+                generation_head_sha: Some(page.head_sha),
+                head_matches: false,
+                items: Vec::new(),
+                total: 0,
+                shown: 0,
+                truncated: false,
+            };
+        }
+        if let Some(ext) = ov.added_extractions.get(file_path) {
+            let full_path = Path::new(repo_path).join(file_path);
+            if let Ok(Some(bytes)) = worktree_overlay::read_bounded_file(
+                &full_path,
+                worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+            ) {
+                let hash_ok = ov
+                    .modified_files
+                    .get(Path::new(file_path))
+                    .is_none_or(|expected| devmap_query::blake3_hash(&bytes) == *expected);
+                if hash_ok {
+                    let text = std::str::from_utf8(&bytes).ok();
+                    let non_file: Vec<&devmap_extract::ExtractedSymbol> = ext
+                        .symbols
+                        .iter()
+                        .filter(|s| !matches!(s.kind, devmap_extract::SymbolKind::File))
+                        .collect();
+                    let total = non_file.len() as u32;
+                    let truncated = non_file.len() > MAX_FILE_SYMBOLS;
+                    let items: Vec<CodeintelFileSymbol> = non_file
+                        .into_iter()
+                        .take(MAX_FILE_SYMBOLS)
+                        .map(|sym| {
+                            let (span_start_line, span_end_line) =
+                                text.map(|t| sym.span.line_range(t)).unwrap_or((0, 0));
+                            CodeintelFileSymbol {
+                                symbol_name: sym.name.clone(),
+                                qualified_name: sym.qualified_name.clone(),
+                                kind: sym.kind.as_str().to_string(),
+                                span_start_line,
+                                span_end_line,
+                            }
+                        })
+                        .collect();
+                    let shown = items.len() as u32;
+                    return CodeintelFileSymbols {
+                        available: true,
+                        reason: Some(
+                            "uncommitted file extracted from stacked delta.sqlite (not in indexed HEAD)"
+                                .to_string(),
+                        ),
+                        file_path: file_path.to_string(),
+                        requested_head_sha: head_sha.to_string(),
+                        generation_id: Some(page.generation),
+                        generation_head_sha: Some(page.head_sha),
+                        head_matches: false,
+                        items,
+                        total,
+                        shown,
+                        truncated,
+                    };
                 }
             }
         }
@@ -2667,19 +2457,18 @@ pub fn affected_tests(
                 Err(error) => Some((false, format!("code map freshness check failed: {error}"))),
             }
         }
-        OpenedRepoStore::ZeroCopy {
+        OpenedRepoStore::Stacked {
             store,
-            base_ref,
-            anchor_root,
+            meta,
             stacked,
-        } => match store.status(&base_ref.anchor_db_path) {
+        } => match store.status(&meta.base_db_path) {
             Ok(summary) => {
                 let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
                     &repo,
-                    anchor_root,
+                    &meta.anchor_repo_root,
                     store,
                     &summary,
-                    stacked.as_deref(),
+                    Some(stacked.as_ref()),
                 );
                 if wt_fresh == Some(false)
                     && summary.pending_count == 0
@@ -2687,7 +2476,7 @@ pub fn affected_tests(
                 {
                     let candidate = affected_tests_from_store(
                         store,
-                        stacked.as_deref(),
+                        Some(stacked.as_ref()),
                         targets,
                         budget,
                         min_confidence,
@@ -2695,7 +2484,7 @@ pub fn affected_tests(
                     );
                     if worktree_overlay::verify_zero_copy_affected_tests_disjoint_from_deltas(
                         &repo,
-                        anchor_root,
+                        &meta.anchor_repo_root,
                         store,
                         &summary,
                         targets,
@@ -3450,7 +3239,7 @@ pub fn explore_with(
             let before_len = definitions.items.len();
             definitions
                 .items
-                .retain(|d| !hit_ctx.is_tombstoned(&d.file_path, &d.symbol_name));
+                .retain(|d| !hit_ctx.is_tombstoned(&d.file_path));
             let removed = (before_len - definitions.items.len()) as u32;
             definitions.shown = definitions.items.len() as u32;
             definitions.total = definitions.total.saturating_sub(removed);

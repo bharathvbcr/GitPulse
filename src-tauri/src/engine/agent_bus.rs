@@ -1119,22 +1119,35 @@ mod tests {
         assert_eq!(list_lanes(anchor.to_str().unwrap()).unwrap().len(), 1);
     }
 
-    #[test]
-    fn radar_detects_cross_file_1hop_caller_callee_collision_over_zero_copy_csr() {
-        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
-        let anchor = anchor_dir.path();
-        crate::test_support::trust_repo(anchor);
-        crate::devmap::ensure_state_dir_excluded(anchor);
+    fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for rel in [".local/bin/devmap", ".cargo/bin/devmap"] {
+                let candidate = home.join(rel);
+                if candidate.is_file() {
+                    return crate::devmap::cli::bind_test_binary(
+                        candidate.to_string_lossy().into_owned(),
+                    );
+                }
+            }
+        }
+        let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
+        crate::devmap::cli::bind_test_binary(resolved.path)
+    }
 
-        // Commit `src/caller.rs` and `src/callee.rs` so both exist cleanly in sibling worktrees.
+    fn seed_clean_indexed_anchor_with_csr() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path();
+        git(anchor, &["init", "-q", "-b", "main"]);
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
         fs::create_dir_all(anchor.join("src")).unwrap();
-        fs::write(
-            anchor.join("src/caller.rs"),
-            "pub fn probe_caller() { probe_callee(); }\n",
-        )
-        .unwrap();
-        fs::write(anchor.join("src/callee.rs"), "pub fn probe_callee() {}\n").unwrap();
-        git(anchor, &["add", "src/caller.rs", "src/callee.rs"]);
+        let caller_src = "pub fn probe_caller() { probe_callee(); }\n";
+        let callee_src = "pub fn probe_callee() {}\n";
+        fs::write(anchor.join("src/caller.rs"), caller_src).unwrap();
+        fs::write(anchor.join("src/callee.rs"), callee_src).unwrap();
+        git(
+            anchor,
+            &["add", ".gitignore", "src/caller.rs", "src/callee.rs"],
+        );
         git(
             anchor,
             &[
@@ -1149,8 +1162,138 @@ mod tests {
             ],
         );
 
-        // Materialize the anchor's CSR sidecar from its `edge_rows` (`probe_caller -> probe_callee`).
-        let _csr = crate::codeintel::open_repo_csr_graph(anchor.to_str().unwrap()).unwrap();
+        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        crate::test_support::trust_repo(&canon_anchor);
+        crate::devmap::ensure_state_dir_excluded(&canon_anchor);
+
+        let mut head_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut head_cmd);
+        let head_out = head_cmd
+            .current_dir(&canon_anchor)
+            .args(["rev-parse", "HEAD"])
+            .output_locked()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+        let scanned = devmap_extract::scan_tree(&canon_anchor).unwrap();
+        let hashes: std::collections::BTreeMap<String, u64> = scanned
+            .file_hashes()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity("rust");
+        let engine_json = serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+            grammar: "rust".to_string(),
+            grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+        })
+        .unwrap();
+
+        let db = devmap_query::paths::store_path(&canon_anchor);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = devmap_store::Store::open(&db).unwrap();
+        store.bind_repo_root(&canon_anchor).unwrap();
+        drop(store);
+
+        let root_str = canon_anchor.to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                &head_sha,
+                r#"{"total_files":2,"total_symbols":2,"total_edges":1,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
+                &root_str,
+            ),
+        )
+        .unwrap();
+
+        let primary = [
+            ("src/caller.rs", "probe_caller", caller_src.len() as i64),
+            ("src/callee.rs", "probe_callee", callee_src.len() as i64),
+        ];
+        for (idx, (path, sym, span_end)) in primary.iter().enumerate() {
+            let id = (idx + 1) as i64;
+            let raw_hash = *hashes.get(*path).expect("scanned hash");
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, *path))
+                .unwrap();
+            let extraction_json = serde_json::json!({
+                "file_path": *path,
+                "language": "rust",
+                "content_hash": raw_hash,
+                "parse_outcome": "Clean",
+                "symbols": [{
+                    "name": *sym,
+                    "qualified_name": format!("{path}::{sym}"),
+                    "kind": "Function",
+                    "span": { "start_byte": 0, "end_byte": *span_end as usize },
+                    "is_exported": true
+                }],
+                "imports": [],
+                "calls": []
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
+                    parse_outcome_json, engine_json, extraction_json,
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', ?3, ?4, '[]', ?5, ?6)",
+                (
+                    id,
+                    raw_hash as i64,
+                    &engine_json,
+                    &extraction_json,
+                    &grammar_ver,
+                    &analyzer_ver,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+            let qname = format!("{path}::{sym}");
+            conn.execute(
+                "INSERT INTO payload_nodes
+                   (payload_id, ord_in_file, name, qualified_name, kind,
+                    span_start, span_end, is_exported)
+                 VALUES (?1, 0, ?2, ?3, 'Function', 0, ?4, 1)",
+                (id, *sym, &qname, *span_end),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (id << 24, *sym, &qname, *path),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (0, 1, 2, 'probe_caller', 'probe_callee', 'Calls', 0.95, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = devmap_store::Store::open(&db).unwrap();
+        let (_, edge_index) = store.generation_edges_with_id().unwrap().unwrap();
+        let csr_path = devmap_store::Store::csr_sidecar_path(&db);
+        edge_index.to_csr_writer().write_to_file(&csr_path).unwrap();
+        drop(store);
+        dir
+    }
+
+    #[test]
+    fn radar_detects_cross_file_1hop_caller_callee_collision_over_zero_copy_csr() {
+        let _devmap = bind_real_devmap();
+        let anchor_dir = seed_clean_indexed_anchor_with_csr();
+        let anchor = anchor_dir.path();
 
         let wt_parent = tempfile::tempdir().unwrap();
         let wt_a = wt_parent.path().join("lane-caller");
@@ -1178,7 +1321,7 @@ mod tests {
         crate::test_support::trust_repo(&wt_a);
         crate::test_support::trust_repo(&wt_b);
 
-        // Provision BOTH worktrees in Zero-Copy mode (zero SQLite copies!).
+        // Provision BOTH worktrees in Stacked Zero-Copy mode (zero SQLite copies!).
         let pa = provision_worktree_devmap_zero_copy(anchor, &wt_a).unwrap();
         let pb = provision_worktree_devmap_zero_copy(anchor, &wt_b).unwrap();
         assert!(pa.zero_copy_base_ref && pb.zero_copy_base_ref);
@@ -1247,35 +1390,11 @@ mod tests {
             "read-only radar must not mutate .git/info/exclude"
         );
 
-        // 2. Indexed anchor + two zero-copy worktrees with uncommitted edits but NO prior
+        // 2. Indexed anchor + stacked worktree with uncommitted edits and NO prior
         //    `sync_worktree_overlay` call: radar must compute live `dirty_nodes` in memory
-        //    and detect 1-hop caller/callee collisions WITHOUT writing `overlay.json`!
-        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        //    and detect 1-hop caller/callee collisions WITHOUT creating `delta.sqlite`!
+        let anchor_dir = seed_clean_indexed_anchor_with_csr();
         let anchor = anchor_dir.path();
-        crate::test_support::trust_repo(anchor);
-        crate::devmap::ensure_state_dir_excluded(anchor);
-        fs::create_dir_all(anchor.join("src")).unwrap();
-        fs::write(
-            anchor.join("src/caller.rs"),
-            "pub fn probe_caller() { probe_callee(); }\n",
-        )
-        .unwrap();
-        fs::write(anchor.join("src/callee.rs"), "pub fn probe_callee() {}\n").unwrap();
-        git(anchor, &["add", "src/caller.rs", "src/callee.rs"]);
-        git(
-            anchor,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "-m",
-                "seed",
-            ],
-        );
-        let _csr = crate::codeintel::open_repo_csr_graph(anchor.to_str().unwrap()).unwrap();
 
         let wt_parent = tempfile::tempdir().unwrap();
         let wt_a = wt_parent.path().join("ro-caller");
@@ -1291,10 +1410,6 @@ mod tests {
         crate::test_support::trust_repo(&wt_a);
         crate::test_support::trust_repo(&wt_b);
         provision_worktree_devmap_zero_copy(anchor, &wt_a).unwrap();
-        let wt_a_overlay = crate::codeintel::worktree_overlay_path(wt_a.to_str().unwrap());
-        if wt_a_overlay.exists() {
-            fs::remove_file(&wt_a_overlay).unwrap();
-        }
         // Leave `wt_b` completely unprovisioned (no `.devmap` directory at all) to also
         // exercise `fallback_anchor` resolution in `compute_worktree_dirty_nodes_readonly`.
 
@@ -1311,15 +1426,17 @@ mod tests {
 
         let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
         assert!(
-            !wt_a_overlay.exists() && !wt_b.join(".devmap").exists(),
-            "read-only radar must not materialize overlay.json or .devmap onto disk"
+            !devmap_extract::paths::stack_delta_path(&wt_a).exists()
+                && !wt_b.join(".devmap").exists()
+                && !wt_b.join(".devcouncil").exists(),
+            "read-only radar must not materialize delta.sqlite or .devmap onto disk"
         );
         assert!(
             radar
                 .semantic_conflicts
                 .iter()
                 .any(|c| c.relation == "caller_callee_1hop" && c.caller_callee_linked_nodes >= 1),
-            "expected in-memory 1-hop caller/callee collision without overlay.json on disk, got: {radar:?}"
+            "expected in-memory 1-hop caller/callee collision without delta.sqlite on disk, got: {radar:?}"
         );
     }
 
@@ -1398,9 +1515,9 @@ mod tests {
         // Dirty, so the listing carries `dirty_files: Some(_)` -- the old code's
         // reason to count a failed scan as done.
         fs::write(wt.join("dirty.txt"), "x").unwrap();
-        let overlay_path = crate::codeintel::worktree_overlay_path(wt.to_str().unwrap());
-        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
-        fs::write(&overlay_path, b"{ not json").unwrap();
+        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
+        fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+        fs::write(&lease_path, b"{ not json").unwrap();
 
         let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
         let wt_canon = wt.canonicalize().unwrap();

@@ -3306,7 +3306,11 @@ pub fn doc_drift_report_with_stacked(
             _ => None,
         }
     } else {
-        store.all_symbols_page_with_files()?
+        let mut loaded = store.all_symbols_page_with_files()?;
+        if let (Some((page, _)), Some(stacked)) = (loaded.as_mut(), stacked) {
+            page.repo_root = Some(stacked.worktree_root().to_string_lossy().into_owned());
+        }
+        loaded
     };
     let Some((page, files)) = page_and_files else {
         return Ok(unavailable("no persisted generation is available"));

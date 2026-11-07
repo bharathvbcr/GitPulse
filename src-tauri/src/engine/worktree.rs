@@ -12489,18 +12489,52 @@ some-future-field whatever
         drop(store);
 
         let head_sha = rev(&canon_anchor, "HEAD");
+        crate::devmap::ensure_state_dir_excluded(&canon_anchor);
+        let scanned = devmap_extract::scan_tree(&canon_anchor).unwrap();
+        let mut hashes: std::collections::BTreeMap<String, u64> = scanned
+            .file_hashes()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute(
             "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
             [canon_anchor.to_str().unwrap()],
         )
         .unwrap();
-        let files = [
+        let ordered_files = [
             "crates/api/src/lib.rs",
             "crates/shared/src/lib.rs",
             "crates/unrelated_heavy/src/lib.rs",
         ];
-        for (id, path) in (1i64..).zip(files) {
+        let mut all_files: Vec<(String, u64)> = Vec::new();
+        for p in ordered_files {
+            let h = hashes.remove(p).expect("scanned crate file");
+            all_files.push((p.to_string(), h));
+        }
+        for (p, h) in hashes {
+            all_files.push((p, h));
+        }
+        for (idx, (path, raw_hash)) in all_files.iter().enumerate() {
+            let id = (idx + 1) as i64;
+            let lang = devmap_extract::detect_language(Path::new(path));
+            let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity(lang);
+            let engine_json =
+                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+                    grammar: lang.to_string(),
+                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+                })
+                .unwrap();
+            let extraction_json = serde_json::json!({
+                "file_path": path,
+                "language": lang,
+                "content_hash": *raw_hash,
+                "parse_outcome": "Clean",
+                "symbols": [],
+                "imports": [],
+                "calls": []
+            })
+            .to_string();
             conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
                 .unwrap();
             conn.execute(
@@ -12508,8 +12542,16 @@ some-future-field whatever
                    (payload_id, file_id, content_hash, language,
                     parse_outcome_json, engine_json, extraction_json,
                     entry_wiring_json, grammar_version, analyzer_version)
-                 VALUES (?1, ?1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
-                [id],
+                 VALUES (?1, ?1, ?2, ?3, '\"Clean\"', ?4, ?5, '[]', ?6, ?7)",
+                (
+                    id,
+                    *raw_hash as i64,
+                    lang,
+                    &engine_json,
+                    &extraction_json,
+                    &grammar_ver,
+                    &analyzer_ver,
+                ),
             )
             .unwrap();
             conn.execute(
@@ -12596,13 +12638,15 @@ some-future-field whatever
             .join("crates/unrelated_heavy/node_modules")
             .exists());
 
-        // Zero-copy DevMap check: no devmap.sqlite copied, base_store_ref.json + overlay.json exist!
+        // Zero-copy DevMap check: no devmap.sqlite or delta.sqlite copied; stack_lease.json exists!
         assert!(!devmap_query::paths::store_path(&wt_target).exists());
+        assert!(!devmap_query::paths::stack_delta_path(&wt_target).exists());
         crate::test_support::trust_repo(&wt_target);
-        let base_ref = crate::codeintel::load_zero_copy_base_ref(wt_target.to_str().unwrap())
-            .unwrap()
-            .expect("base_store_ref.json present");
-        assert_eq!(base_ref.generation_id, 1);
+        let lease = devmap_query::stacked::StackLease::read_from(
+            &devmap_query::paths::stack_lease_path(&wt_target),
+        )
+        .expect("stack_lease.json present");
+        assert_eq!(lease.generation_id, 1);
 
         let (dirty, truncated) = user_changed_paths(wt_target.to_str().unwrap()).unwrap();
         assert!(dirty.is_empty() && !truncated, "dirty={dirty:?}");
@@ -12654,12 +12698,59 @@ some-future-field whatever
         crate::devmap::ensure_state_dir_excluded(&canon_anchor);
 
         let head_sha = run_git(&canon_anchor, &["rev-parse", "HEAD"]);
+        let scanned = devmap_extract::scan_tree(&canon_anchor).unwrap();
         let db = devmap_query::paths::store_path(&canon_anchor);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = devmap_store::Store::open(&db).unwrap();
         store.bind_repo_root(&canon_anchor).unwrap();
         drop(store);
         let conn = rusqlite::Connection::open(&db).unwrap();
+        for (idx, (path, raw_hash)) in scanned.file_hashes().into_iter().enumerate() {
+            let id = (idx + 1) as i64;
+            let lang = devmap_extract::detect_language(Path::new(path));
+            let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity(lang);
+            let engine_json =
+                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+                    grammar: lang.to_string(),
+                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+                })
+                .unwrap();
+            let extraction_json = serde_json::json!({
+                "file_path": path,
+                "language": lang,
+                "content_hash": raw_hash,
+                "parse_outcome": "Clean",
+                "symbols": [],
+                "imports": [],
+                "calls": []
+            })
+            .to_string();
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
+                    parse_outcome_json, engine_json, extraction_json,
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, ?3, '\"Clean\"', ?4, ?5, '[]', ?6, ?7)",
+                (
+                    id,
+                    raw_hash as i64,
+                    lang,
+                    &engine_json,
+                    &extraction_json,
+                    &grammar_ver,
+                    &analyzer_ver,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
              VALUES (1, 0.0, ?1, ?2, ?3)",

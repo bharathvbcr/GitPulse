@@ -257,11 +257,16 @@ fn safe_relative(path: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Whether the path lies under a directory the cache copy clones whole (or,
-/// for virtualenvs, deliberately does not: they embed their own absolute path).
+/// Whether the path lies under a directory the cache copy clones whole, a
+/// virtualenv (which embeds its own absolute path), or per-worktree DevMap /
+/// GitPulse state (`devmap.sqlite`, `stack_lease.json`, `delta.sqlite` must
+/// never be raw-copied from a sibling worktree).
 fn owned_by_cache_copy(path: &str) -> bool {
     let first = path.split('/').next().unwrap_or_default();
-    STANDARD_CACHE_DIRS.contains(&first) || VIRTUALENV_DIRS.contains(&first)
+    STANDARD_CACHE_DIRS.contains(&first)
+        || VIRTUALENV_DIRS.contains(&first)
+        || devmap_query::paths::STATE_DIR_NAMES.contains(&first)
+        || first == ".gitpulse"
 }
 
 /// The anchor's ignored, untracked entries: files, and wholly ignored

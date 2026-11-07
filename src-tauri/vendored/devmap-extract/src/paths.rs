@@ -97,8 +97,6 @@ pub const PLUGIN_RELPATH: &str = "devmap-plugin";
 pub const STACK_LEASE_RELPATH: &str = "codeintel/stack_lease.json";
 /// StackedStore worktree-local delta SQLite database, relative to the state directory.
 pub const STACK_DELTA_RELPATH: &str = "codeintel/delta.sqlite";
-/// Legacy zero-copy anchor pointer written by pre-StackedStore provisioners (`F1`, `F2`).
-pub const LEGACY_BASE_STORE_REF_RELPATH: &str = "codeintel/base_store_ref.json";
 
 /// Resolve the state directory for `root`, reading `$DEVMAP_HOME` and the
 /// filesystem.
@@ -207,26 +205,19 @@ pub fn stack_delta_path(root: impl AsRef<Path>) -> PathBuf {
     join_rel(state_dir(root), STACK_DELTA_RELPATH)
 }
 
-/// Path to legacy `base_store_ref.json` under the resolved state directory for `root`.
-pub fn legacy_base_store_ref_path(root: impl AsRef<Path>) -> PathBuf {
-    join_rel(state_dir(root), LEGACY_BASE_STORE_REF_RELPATH)
-}
+/// Retired Phase 1 worktree base-store pointer relative to the state directory.
+pub const LEGACY_BASE_STORE_REF_RELPATH: &str = "codeintel/base_store_ref.json";
 
-/// Locate an existing legacy `base_store_ref.json` under `root` across either
-/// the resolved state directory or either known state directory name (`.devmap` / `.devcouncil`).
+/// Locate a retired `base_store_ref.json` pointer file in `root` across either
+/// `.devmap`, `.devcouncil`, or `$DEVMAP_HOME`, if present.
 pub fn find_legacy_base_store_ref(root: impl AsRef<Path>) -> Option<PathBuf> {
     let root = root.as_ref();
-    let resolved = legacy_base_store_ref_path(root);
-    if resolved.is_file() {
-        return Some(resolved);
-    }
-    for dir_name in STATE_DIR_NAMES {
-        let candidate = join_rel(root.join(dir_name), LEGACY_BASE_STORE_REF_RELPATH);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    let candidates = [
+        join_rel(state_dir(root), LEGACY_BASE_STORE_REF_RELPATH),
+        join_rel(root.join(STATE_DIR), LEGACY_BASE_STORE_REF_RELPATH),
+        join_rel(root.join(LEGACY_STATE_DIR), LEGACY_BASE_STORE_REF_RELPATH),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// Path to the `<store>.csr` mmap sidecar accompanying `store`.

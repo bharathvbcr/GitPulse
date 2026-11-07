@@ -184,7 +184,10 @@ impl<'a> StoreQueryEngine<'a> {
         self
     }
 
-    pub(super) fn latest_file(&self, path: &str) -> anyhow::Result<Option<devmap_store::StoredFile>> {
+    pub(super) fn latest_file(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<devmap_store::StoredFile>> {
         if let Some(stacked) = self.stacked {
             stacked.latest_file(path)
         } else {
@@ -192,13 +195,27 @@ impl<'a> StoreQueryEngine<'a> {
         }
     }
 
+    pub(super) fn latest_repo_root(&self) -> anyhow::Result<Option<String>> {
+        if let Some(stacked) = self.stacked {
+            Ok(Some(stacked.worktree_root().to_string_lossy().into_owned()))
+        } else {
+            Ok(self.store.latest_repo_root()?)
+        }
+    }
+
     pub(super) fn latest_scope_inputs(
         &self,
-    ) -> anyhow::Result<Option<(u32, Option<String>, Vec<(String, String)>)>> {
+    ) -> anyhow::Result<Option<crate::stacked::ScopeInputs>> {
         if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
             stacked.all_indexed_files()
         } else {
-            Ok(self.store.latest_scope_inputs()?)
+            let wt_root = self
+                .stacked
+                .map(|s| s.worktree_root().to_string_lossy().into_owned());
+            Ok(self
+                .store
+                .latest_scope_inputs()?
+                .map(|(gen, root, files)| (gen, wt_root.or(root), files)))
         }
     }
 
@@ -416,10 +433,18 @@ impl<'a> StoreQueryEngine<'a> {
         if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
             return stacked.keyword_page(query, pool, filter);
         }
+        let wt_root = self
+            .stacked
+            .map(|s| s.worktree_root().to_string_lossy().into_owned());
         let Some(filter) = filter else {
-            return Ok(self.store.search_page(query, pool)?);
+            return Ok(self.store.search_page(query, pool)?.map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                page
+            }));
         };
-        let Some((generation, root, files)) = self.store.latest_scope_inputs()? else {
+        let Some((generation, root, files)) = self.latest_scope_inputs()? else {
             return Ok(None);
         };
         let (paths, languages) = match filter.symbol_scope()? {
@@ -436,7 +461,13 @@ impl<'a> StoreQueryEngine<'a> {
         };
         Ok(self
             .store
-            .search_page_in(generation, query, pool, Some(&narrowing))?)
+            .search_page_in(generation, query, pool, Some(&narrowing))?
+            .map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                page
+            }))
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -1443,12 +1474,13 @@ impl<'a> StoreQueryEngine<'a> {
             let (rows, truncated) = found.remove(&name).unwrap_or_default();
             namesakes.truncated |= truncated;
             for row in rows {
-                if self.stacked.is_some_and(|st| {
-                    let p = Path::new(&row.source_file);
-                    st.overlay().is_file_tombstoned(p)
-                        || st.overlay().modified_files.contains_key(p)
-                }) {
-                    continue;
+                if let Some(stacked) = self.stacked {
+                    let src = Path::new(&row.source_file);
+                    if stacked.overlay().is_file_tombstoned(src)
+                        || stacked.overlay().modified_files.contains_key(src)
+                    {
+                        continue;
+                    }
                 }
                 if !families.is_empty() && !families.contains(&family_of_path(&row.source_file)) {
                     namesakes.other_language_sites += 1;
@@ -2419,7 +2451,7 @@ impl<'a> StoreQueryEngine<'a> {
         {
             return Ok(());
         }
-        let source_root = self.store.latest_repo_root()?;
+        let source_root = self.latest_repo_root()?;
         let mut indexes: BTreeMap<String, Option<LineIndex>> = BTreeMap::new();
         for evidence in rows.iter_mut().filter_map(|row| row.evidence.as_mut()) {
             let (Some(path), Some(byte)) = (evidence.first_path.as_ref(), evidence.first_byte)
@@ -2481,9 +2513,10 @@ impl<'a> StoreQueryEngine<'a> {
             // Both the candidate read and the grouping cover every signed symbol of
             // the generation before the budget cuts anything.
             self.cancel.check()?;
-            let (candidates, unsigned) = match self.stacked {
-                Some(stacked) => stacked.latest_clone_candidates()?,
-                None => self.store.latest_clone_candidates()?,
+            let (candidates, unsigned) = if let Some(stacked) = self.stacked {
+                stacked.latest_clone_candidates()?
+            } else {
+                self.store.latest_clone_candidates()?
             };
             self.cancel.check()?;
             let summary = group_clones(&candidates, unsigned);
@@ -2509,7 +2542,8 @@ impl<'a> StoreQueryEngine<'a> {
     pub fn skeleton(&self, path: &str, token_budget: u32) -> anyhow::Result<SkeletonReport> {
         self.exit(|| {
             self.cancel.check()?;
-            let path = resolve_skeleton_path(self.store, path)?;
+            let source_root = self.latest_repo_root()?;
+            let path = resolve_skeleton_path(source_root.as_deref(), path);
             let freshness = if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
                 stacked.delta_source_freshness()
             } else {
@@ -2562,7 +2596,6 @@ impl<'a> StoreQueryEngine<'a> {
             // an editor shows. Spans were recorded against the indexed content; a
             // dirty buffer can shift them, which is disclosed via lines_from_bytes
             // only when the file cannot be read at all.
-            let source_root = self.store.latest_repo_root()?;
             let on_disk = devmap_extract::safe_fs::read_repo_source(
                 source_root.as_deref().map(Path::new),
                 &path,
@@ -2783,11 +2816,12 @@ impl<'a> StoreQueryEngine<'a> {
         if query.trim().is_empty() {
             anyhow::bail!("literals requires a non-empty query");
         }
-        let page_opt = match self.stacked {
-            Some(stacked) => stacked.search_literals(query, exact, LITERAL_PAGE_CAP)?,
-            None => self.store.search_literals(query, exact, LITERAL_PAGE_CAP)?,
+        let page = if let Some(stacked) = self.stacked {
+            stacked.search_literals(query, exact, LITERAL_PAGE_CAP)?
+        } else {
+            self.store.search_literals(query, exact, LITERAL_PAGE_CAP)?
         };
-        let Some(page) = page_opt else {
+        let Some(page) = page else {
             return Ok(LiteralReport {
                 query: query.to_string(),
                 exact,
@@ -2895,12 +2929,23 @@ impl<'a> StoreQueryEngine<'a> {
         if let Some(stacked) = self.stacked.filter(|s| s.has_delta_changes()) {
             return stacked.ranking_corpus(scope);
         }
+        let wt_root = self
+            .stacked
+            .map(|s| s.worktree_root().to_string_lossy().into_owned());
         let Some(scope) = scope else {
-            return Ok(self.store.all_symbols_page()?.map(|page| (page, None)));
+            return Ok(self.store.all_symbols_page()?.map(|mut page| {
+                if let Some(root) = wt_root {
+                    page.repo_root = Some(root);
+                }
+                (page, None)
+            }));
         };
         let Some((mut page, files)) = self.store.all_symbols_page_with_files()? else {
             return Ok(None);
         };
+        if let Some(root) = wt_root {
+            page.repo_root = Some(root);
+        }
         let mut resolved = scope.resolve(&files, page.repo_root.as_deref())?;
         let corpus_symbols = page.rows.len();
         page.rows.retain(|row| resolved.contains(&row.path));
@@ -3056,10 +3101,7 @@ impl<'a> StoreQueryEngine<'a> {
             let (edges, test_symbols) = if response.items.is_empty() {
                 (None, std::collections::HashSet::new())
             } else {
-                (
-                    self.generation_edges()?,
-                    self.latest_test_entry_symbols()?,
-                )
+                (self.generation_edges()?, self.latest_test_entry_symbols()?)
             };
             let (related_tests, coverage_gap, outside_scope) = match edges.as_deref() {
                 Some(edges) => self.evidence_related_tests(
@@ -3472,7 +3514,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// than treated as zero bytes: a corpus figure that silently omits what it
     /// could not open understates the alternative and flatters the map.
     pub fn savings(&self, query: Option<&str>, token_budget: u32) -> anyhow::Result<SavingsReport> {
-        let repo_root = self.store.latest_repo_root()?;
+        let repo_root = self.latest_repo_root()?;
         let resolve = |path: &str| -> PathBuf {
             match &repo_root {
                 Some(root) if !Path::new(path).is_absolute() => Path::new(root).join(path),
@@ -3647,7 +3689,7 @@ impl<'a> StoreQueryEngine<'a> {
             // Containment is enforced *before* the read: `path` arrives from an IPC
             // caller, and this is the only query that reads a file the caller
             // names. See `contained_repo_path`.
-            let source_root = self.store.latest_repo_root()?;
+            let source_root = self.latest_repo_root()?;
             contained_repo_path(source_root.as_deref(), path)?;
             // `.ok()` here used to collapse two different facts into one. "There is
             // no such file" and "the file is there and I could not read it"

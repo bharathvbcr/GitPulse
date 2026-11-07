@@ -431,8 +431,12 @@ fn park_bounded<V>(parked: &mut ParkedBuilds<V>, repo_path: &str, value: V, cap:
         return;
     }
     if parked.entries.len() >= cap {
-        parked.entries.retain(|path, _| std::path::Path::new(path).exists());
-        parked.order.retain(|path| parked.entries.contains_key(path));
+        parked
+            .entries
+            .retain(|path, _| std::path::Path::new(path).exists());
+        parked
+            .order
+            .retain(|path| parked.entries.contains_key(path));
         while parked.entries.len() >= cap {
             if let Some(evicted) = parked.order.pop_front() {
                 parked.entries.remove(&evicted);
@@ -971,8 +975,16 @@ impl From<LiveRefreshFacts> for LiveRefreshFactsDto {
 /// Path resolution is delegated to `devmap_query::paths` — the CLI's canonical
 /// owner — so a legacy `.devcouncil` tree is probed exactly where the CLI would
 /// write it, rather than at a hard-coded `.devmap`.
+fn is_stacked_zero_copy_lane(repo: &std::path::Path) -> bool {
+    devmap_query::paths::stack_lease_path(repo).is_file()
+        && !devmap_query::paths::store_path(repo).is_file()
+}
+
 pub fn missing_artifacts(repo_path: impl AsRef<std::path::Path>) -> Vec<&'static str> {
     let repo = repo_path.as_ref();
+    if is_stacked_zero_copy_lane(repo) {
+        return Vec::new();
+    }
     let mut missing = Vec::new();
     if !super::repo_map::repo_map_path(repo).is_file() {
         missing.push("repo_map.json");
@@ -1303,10 +1315,15 @@ pub(crate) fn live_refresh(
         started: now,
     };
     let manifest = rebuild == LiveRebuildKind::Manifest;
-    let prepared = match permit.map_or_else(
-        || cli::prepare(repo_path, manifest),
-        |permit| permit.prepare(manifest),
-    ) {
+    let use_stacked_delta_sync =
+        !manifest && is_stacked_zero_copy_lane(std::path::Path::new(repo_path));
+    let prepared = match permit {
+        Some(permit) if use_stacked_delta_sync => permit.prepare_sync_delta(),
+        Some(permit) => permit.prepare(manifest),
+        None if use_stacked_delta_sync => cli::prepare_sync_delta(repo_path),
+        None => cli::prepare(repo_path, manifest),
+    };
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return settle.record(Err(error), Duration::ZERO),
     };
@@ -3378,5 +3395,75 @@ exit 2
         );
         assert!(healed.artifacts_restored);
         assert!(missing_artifacts(repo.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stacked_zero_copy_lane_skips_manifest_artifacts_and_syncs_delta() {
+        use crate::procguard::LockedSpawn;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status_locked()
+            .unwrap()
+            .success());
+        crate::test_support::trust_repo(repo.path());
+
+        let lease_path = devmap_query::paths::stack_lease_path(repo.path());
+        std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+        std::fs::write(&lease_path, r#"{"format_version":1}"#).unwrap();
+
+        assert!(
+            missing_artifacts(repo.path()).is_empty(),
+            "stacked zero-copy lane must not require local repo_map/code_graph artifacts"
+        );
+
+        let bin = repo.path().join("devmap");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> argv.log
+if [ "$1" = "seed" ]; then
+  printf '%s\n' '{"synced_files":1,"deleted_files":0,"cleaned_files":0,"rebased":false}'
+  exit 0
+fi
+echo "unexpected full build on stacked lane: $*" >&2
+exit 2
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let path = repo.path().to_string_lossy().into_owned();
+
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":true,"schema_outdated":false,"rebuild_required":false}"#,
+        ));
+        let clean = maybe_refresh(&path, false);
+        assert_eq!(clean.decision, LiveRefreshDecision::SkipFresh);
+
+        let dirty = maybe_refresh(&path, true);
+        assert_eq!(dirty.decision, LiveRefreshDecision::Refresh);
+        assert!(dirty.build.as_ref().is_some_and(|b| b.ok), "{dirty:?}");
+        let log = std::fs::read_to_string(repo.path().join("argv.log")).unwrap_or_default();
+        assert!(
+            log.lines().any(|line| {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                tokens.starts_with(&["seed", "--sync-delta", "--json"])
+            }),
+            "expected seed --sync-delta --json on stacked lane, got:\n{log}"
+        );
     }
 }

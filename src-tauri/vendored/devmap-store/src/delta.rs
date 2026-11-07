@@ -121,6 +121,27 @@ impl DeltaStore {
         })
     }
 
+    /// Open an existing `delta.sqlite` for reading: no creation, no schema
+    /// statements, no journal-mode change, and zero `-wal`/`-shm` sidecars.
+    /// `None` when the file does not exist.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("cannot open delta store {} read-only", path.display()))?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Some(Self {
+            conn: Mutex::new(conn),
+            path,
+        }))
+    }
+
     pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
         let path = path.as_ref();
         if !path.is_file() {
@@ -133,7 +154,7 @@ impl DeltaStore {
         conn.execute_batch(
             "PRAGMA trusted_schema = OFF;
              PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
+             PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = NORMAL;",
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -293,9 +314,8 @@ impl DeltaStore {
                 let (path, content_hash, tombstoned, extraction_json, updated_at_ms) = row?;
                 let extraction = match extraction_json {
                     Some(raw) => Some(
-                        serde_json::from_str::<Extraction>(&raw).with_context(|| {
-                            format!("corrupt delta extraction_json for {path}")
-                        })?,
+                        serde_json::from_str::<Extraction>(&raw)
+                            .with_context(|| format!("corrupt delta extraction_json for {path}"))?,
                     ),
                     None => None,
                 };

@@ -275,3 +275,23 @@ fn the_app_add_worktree_path_honours_the_include() {
     assert_eq!(created.output.cache_error, None);
     assert_eq!(fs::read_to_string(target.join(".env")).unwrap(), "SECRET=1");
 }
+
+#[test]
+fn devmap_and_gitpulse_state_dirs_are_never_copied_by_worktreeinclude() {
+    let (_main, _parent, anchor, worktree) = repo(".env\n.devcouncil/\n.devmap/\n.gitpulse/\n");
+    write(&anchor, ".worktreeinclude", "*\n.*\n");
+    write(&anchor, ".env", "OK=1");
+    write(&anchor, ".devcouncil/codeintel/devmap.sqlite", "donor-db");
+    write(&anchor, ".devmap/codeintel/stack_lease.json", "{}");
+    write(&anchor, ".gitpulse/state.json", "{}");
+
+    let report = sync(&anchor, &worktree);
+    assert_eq!(report.failures, Vec::<String>::new());
+    assert_eq!(fs::read_to_string(worktree.join(".env")).unwrap(), "OK=1");
+    assert!(
+        !worktree.join(".devcouncil").exists()
+            && !worktree.join(".devmap").exists()
+            && !worktree.join(".gitpulse").exists(),
+        ".worktreeinclude must never raw-copy sibling DevMap or GitPulse state"
+    );
+}

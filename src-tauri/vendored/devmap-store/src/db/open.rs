@@ -904,10 +904,20 @@ impl Store {
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
         Self::validate_database_file(&db_path)?;
         let lock_path = Self::writer_lock_path(&db_path);
+        Self::lock_file_at(&lock_path, wait)
+    }
+
+    /// The bounded, pid-recording exclusive `flock` behind
+    /// [`Store::lock_writer_at`], for a lock file that is not a database's
+    /// (the shared bases directory's `.lock`). One owner for the poll policy:
+    /// contention waits, a failed check is reported as such, and the timeout
+    /// names the holder's pid.
+    pub fn lock_file_at(lock_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        let lock_path = lock_path.to_path_buf();
         let mut file = SafeFile::open(&lock_path, Access::ReadWrite, Creation::IfMissing).map_err(
             |error| {
                 anyhow::anyhow!(

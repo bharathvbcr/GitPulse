@@ -467,7 +467,7 @@ impl Store {
                 .query_row("SELECT 1 FROM generations LIMIT 1", [], |row| row.get(0))
                 .optional()?;
             return Ok(
-                has_gen.and_then(|_| (!override_root.is_empty()).then(|| override_root.clone())),
+                has_gen.and_then(|_| (!override_root.is_empty()).then(|| override_root.clone()))
             );
         }
         if let Some(seeded) = Self::seeded_repo_root_in(&conn)? {
@@ -503,12 +503,7 @@ impl Store {
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
         let changed = tx.execute(
-            "UPDATE generations
-             SET head_sha = ?1,
-                 repo_root = COALESCE(
-                     (SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1),
-                     repo_root
-                 )
+            "UPDATE generations SET head_sha = ?1
              WHERE id = (SELECT max(id) FROM generations)",
             params![head_sha],
         )?;
@@ -517,7 +512,7 @@ impl Store {
                 "no generation to restamp: nothing has been indexed yet — run `devmap build`",
             ));
         }
-        let pending_root: Option<String> = tx
+        let owner: Option<String> = tx
             .query_row(
                 "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
                 [],
@@ -525,7 +520,7 @@ impl Store {
             )
             .optional()?
             .flatten();
-        Self::clear_seed_rebind(&tx, pending_root.as_deref())?;
+        Self::clear_seed_rebind_and_normalize_generations(&tx, owner.as_deref())?;
         tx.commit()?;
         Ok(())
     }
@@ -538,7 +533,6 @@ impl Store {
     /// once this returns true. `false` means a full rebuild (or a drain that
     /// re-reads the tree) is required; an error means the question could not
     /// be asked, which callers must treat as "do not skip".
-    #[cfg(feature = "parse")]
     pub fn latest_generation_matches_working_tree(&self) -> Result<bool> {
         if !self.latest_generation_payload_is_current()? {
             return Ok(false);

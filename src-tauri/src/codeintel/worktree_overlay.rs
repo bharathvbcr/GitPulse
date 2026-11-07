@@ -1,34 +1,30 @@
-//! Parallel DevMap worktree seeding and ephemeral delta overlays.
+//! Parallel DevMap worktree seeding and canonical `StackedStore` delta overlays.
 //!
 //! When an agent or developer creates a linked Git worktree, starting with no
 //! DevMap state forces either cold multi-second `devmap build` runs or
-//! `available: false` query refusals across every parallel lane. Simply
-//! hard-linking or raw-copying `devmap.sqlite` fails two invariants in
-//! `devmap-store`:
-//! 1. `Store::validate_database_file` refuses any SQLite file with `nlink > 1`.
-//! 2. `Store::validate_repo_root` refuses any store whose `pending_state.repo_root`
-//!    still names a live sibling worktree (`RepoRootOwner::Live`).
+//! `available: false` query refusals across every parallel lane.
 //!
-//! This module implements a Scion/Jujutsu-inspired two-layer worktree code
-//! intelligence engine:
-//! - **Shared physical extents, isolated store ownership**: CoW-clones
-//!   (`clonefile(2)` on macOS, `FICLONE` on Linux, online SQLite backup when an
-//!   active `-wal` has uncheckpointed frames) the anchor's `devmap.sqlite`,
-//!   `<db>.csr` mmap graph sidecar, `repo_map.json`, and `cas/ast/` cache into
-//!   the new worktree's git-excluded state directory, then rebinds
-//!   `pending_state.repo_root` and `generations.repo_root` to the worktree's
-//!   canonical root before atomic placement.
-//! - **Ephemeral delta overlay (`overlay.json` + `CasAstStore`)**: diffs the
-//!   worktree against the base generation's `head_sha` plus untracked files,
-//!   recording `CAS_TOMBSTONE` for deleted files/symbols, `blake3_hash` digests
-//!   for modified/added files, reused `CasAstStore` AST payloads across lanes,
-//!   and `RoaringBitmap` dirty CSR node IDs.
+//! This module delegates all zero-copy / stacked worktree code intelligence to
+//! DevMap's canonical `StackedStore` (`stack_lease.json` + sealed `0444`
+//! `base.sqlite` snapshot under `<common_git_dir>/devmap/bases/gen-<G>-<head12>-<src8>/`
+//! + lazy per-worktree `delta.sqlite` populated by real Tree-sitter extraction):
+//! - **Zero write-on-read**: Every read surface (`open_verified_stacked_store`,
+//!   `load_worktree_overlay`, `compute_worktree_dirty_nodes_readonly`,
+//!   `open_worktree_or_anchor_csr`) opens `StackedStore::open` strictly read-only,
+//!   never creating or mutating `delta.sqlite`, `stack_lease.json`, or `base.sqlite`.
+//! - **No legacy sidecars**: Retired `base_store_ref.json`, `overlay.json`,
+//!   `CasAstStore`, and regex declaration fallbacks are gone; legacy
+//!   `base_store_ref.json` files are refused naming `devmap seed --stacked --from <main>`.
+//! - **CoW standalone seeding (`provision_worktree_devmap`)**: Clones `devmap.sqlite`
+//!   under the target's writer lock, rebinds via `seed_rebind` without rewriting
+//!   `generations` overflow pages, and seeds `.csr`, `repo_map.json`, and
+//!   `resolution-reuse-*` artifacts.
 
 use crate::devmap::init::ensure_dir_excluded;
-use crate::engine::cow_clone::{reflink_copy_dir, reflink_copy_file};
+use crate::engine::cow_clone::reflink_copy_file;
 use crate::engine::git_cli::{git_captured, validate_repo, BoundedRun};
 use crate::ipc_error::CommandError;
-use devmap_query::{blake3_hash, CasAstStore, WorktreeOverlay, CAS_TOMBSTONE};
+use devmap_query::WorktreeOverlay;
 use devmap_store::{IncrementalDigestEngine, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -42,30 +38,21 @@ use std::time::Instant;
 const DEVMAP_EXCLUDE_MARKER: &str =
     "# GitPulse: DevMap index state (machine-generated, never committed)";
 
-/// Maximum size of a dirty source file hashed into a worktree overlay (8 MiB).
+///Retired pointer filename checked only so legacy checkouts fail closed with an explicit upgrade hint.
+const LEGACY_BASE_STORE_REF_RELPATH: &str = "codeintel/base_store_ref.json";
+
+/// Maximum size of a dirty source file hashed into a worktree delta check (8 MiB).
 pub const MAX_OVERLAY_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Maximum number of dirty/untracked paths inspected in one overlay sync pass.
+/// Maximum number of dirty/untracked paths inspected in one delta scan pass.
 pub const MAX_OVERLAY_DIRTY_FILES: usize = 10_000;
 
-/// Relative path of the persisted [`WorktreeOverlay`] inside the DevMap state directory.
-pub const OVERLAY_RELPATH: &str = "codeintel/overlay.json";
-
-/// Relative path of the zero-copy shared base store pointer inside the DevMap state directory.
-pub const BASE_STORE_REF_RELPATH: &str = "codeintel/base_store_ref.json";
-
-/// Relative path of the shared [`CasAstStore`] directory inside the DevMap state directory.
-pub const CAS_AST_RELPATH: &str = "codeintel/cas/ast";
-
-/// Lightweight (<512-byte) pointer linking an ephemeral worktree to its anchor
-/// repository's immutable DevMap base generation, mmap CSR sidecar, and CAS AST
-/// directory without copying `devmap.sqlite`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ZeroCopyBaseRef {
-    pub anchor_repo_root: String,
-    pub anchor_db_path: String,
-    pub anchor_csr_path: Option<String>,
-    pub anchor_cas_dir: Option<String>,
+/// Verified metadata for a worktree opened over a canonical `StackedStore` lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackedBaseMeta {
+    pub anchor_repo_root: PathBuf,
+    pub base_db_path: String,
+    pub base_csr_path: Option<PathBuf>,
     pub generation_id: u32,
     pub base_head_sha: Option<String>,
 }
@@ -107,7 +94,7 @@ impl DevmapWorktreeProvision {
     }
 }
 
-/// Summary of an ephemeral [`WorktreeOverlay`] synchronization pass.
+/// Summary of an explicit stacked `delta.sqlite` synchronization pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeOverlayReport {
     pub overlay_path: String,
@@ -155,26 +142,23 @@ fn next_seed_seq() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Resolves the path to `<state_dir>/codeintel/overlay.json` for `repo`.
-pub fn worktree_overlay_path(repo_path: &str) -> PathBuf {
-    let state = devmap_query::paths::state_dir(Path::new(repo_path));
-    OVERLAY_RELPATH
+fn legacy_base_store_ref_path(repo: &Path) -> PathBuf {
+    let state = devmap_query::paths::state_dir(repo);
+    LEGACY_BASE_STORE_REF_RELPATH
         .split('/')
         .fold(state, |acc, part| acc.join(part))
 }
 
-/// Resolves the path to `<state_dir>/codeintel/base_store_ref.json` for `repo`.
-pub fn zero_copy_base_ref_path(repo_path: &str) -> PathBuf {
-    let state = devmap_query::paths::state_dir(Path::new(repo_path));
-    BASE_STORE_REF_RELPATH
-        .split('/')
-        .fold(state, |acc, part| acc.join(part))
+/// Refuses retired `<state_dir>/codeintel/base_store_ref.json` files without
+/// auto-upgrading or touching disk (`Owner Stop #2`).
+pub fn refuse_legacy_base_store_ref(repo: &Path) -> Result<(), CommandError> {
+    devmap_query::stacked::refuse_legacy_base_store_ref(repo)
+        .map_err(|e| CommandError::from(e.to_string()))
 }
 
-fn cas_ast_dir_for_state(state_dir: &Path) -> PathBuf {
-    CAS_AST_RELPATH
-        .split('/')
-        .fold(state_dir.to_path_buf(), |acc, part| acc.join(part))
+pub(super) fn has_stack_lease_or_legacy_ref(repo: &Path) -> bool {
+    devmap_extract::paths::stack_lease_path(repo).is_file()
+        || legacy_base_store_ref_path(repo).is_file()
 }
 
 fn plain_single_dir_component(rel: &Path) -> Option<&str> {
@@ -189,31 +173,9 @@ fn plain_single_dir_component(rel: &Path) -> Option<&str> {
     Some(first)
 }
 
-/// Relative path inside `<common_git_dir>/devmap/` holding shared fallback
-/// declaration extractions across sibling zero-copy worktrees without writing
-/// `RegexFallback` payloads into the anchor's full tree-sitter `cas/ast/` (`F4`).
-const SHARED_OVERLAY_CAS_RELPATH: &str = "devmap/cas/overlay_ast";
-
-fn shared_overlay_cas_dir(repo: &Path) -> Option<PathBuf> {
-    let common = crate::engine::git_cli::resolve_git_common_dir(repo).ok()?;
-    Some(
-        SHARED_OVERLAY_CAS_RELPATH
-            .split('/')
-            .fold(common, |acc, part| acc.join(part)),
-    )
-}
-
-fn fallback_supports_symbol_kind(kind: &str) -> bool {
-    matches!(
-        kind.to_ascii_lowercase().as_str(),
-        "function" | "class" | "struct" | "interface" | "enum" | "module" | "type"
-    )
-}
-
 /// Strips line (`//`, `#`, `--`) and C-style block (`/* ... */`) comments so
-/// deleted symbol names mentioned only in comments do not suppress tombstoning,
-/// while live receiver methods, macros, and multi-line signatures keep their
-/// identifiers intact (`F4`).
+/// deleted symbol names mentioned only in comments do not trigger false
+/// identifier overlap in `affected_tests` cone checks.
 fn strip_comments_preserving_identifiers(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
@@ -241,7 +203,6 @@ fn strip_comments_preserving_identifiers(source: &str) -> String {
             continue;
         }
         if bytes[i] == b'#' {
-            // Preserve Rust attributes `#[...]` / `#![...]`, strip `#` comments.
             let next = bytes.get(i + 1).copied();
             if next != Some(b'[') && next != Some(b'!') {
                 while i < bytes.len() && bytes[i] != b'\n' {
@@ -300,13 +261,95 @@ fn materialize_csr_from_store(store: &Store, target_csr: &Path) -> bool {
     false
 }
 
-/// Provisions a linked worktree's DevMap store, mmap CSR graph sidecar,
-/// navigator manifests, CAS AST cache, and initial [`WorktreeOverlay`] from
-/// `anchor_repo` using Copy-on-Write cloning where supported.
+fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandError> {
+    refuse_legacy_base_store_ref(repo)?;
+    let lease_path = devmap_extract::paths::stack_lease_path(repo);
+    if !lease_path.is_file() {
+        return Ok(None);
+    }
+    let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
+        .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
+    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
+    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
+        CommandError::from(format!(
+            "stacked base manifest {} is missing or oversized",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: devmap_query::stacked::BaseManifest =
+        serde_json::from_slice(&raw).map_err(|e| {
+            CommandError::from(format!(
+                "failed to parse stacked base manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+    let donor = validate_repo(&manifest.source_repo_root)?;
+    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
+    let donor_common = crate::engine::git_cli::resolve_git_common_dir(&donor)?;
+    if repo_common != donor_common || !devmap_extract::paths::same_registered_repo(repo, &donor) {
+        return Err(CommandError::from(format!(
+            "refusing stack lease {} pointing outside worktree family ({})",
+            lease_path.display(),
+            donor.display()
+        )));
+    }
+    Ok(Some(donor))
+}
+
+/// Opens and authenticates a stacked worktree's immutable base `Store` and
+/// read-only `StackedStore` (`Owner Stop #1` & `#2`).
+pub(super) fn open_verified_stacked_store(
+    repo: &Path,
+) -> Result<Option<(Store, StackedBaseMeta, devmap_query::StackedStore)>, CommandError> {
+    refuse_legacy_base_store_ref(repo)?;
+    let lease_path = devmap_extract::paths::stack_lease_path(repo);
+    if !lease_path.is_file() {
+        return Ok(None);
+    }
+    let stacked = devmap_query::StackedStore::open(repo)
+        .map_err(|e| CommandError::from(format!("failed to open stacked store: {e}")))?;
+    let anchor_root = validate_repo(&stacked.manifest().source_repo_root)?;
+    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
+    let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
+    if repo_common != anchor_common
+        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
+    {
+        return Err(CommandError::from(format!(
+            "refusing stack lease {} pointing outside worktree family ({})",
+            lease_path.display(),
+            anchor_root.display()
+        )));
+    }
+    let base_sqlite = stacked.base_sqlite_path().to_path_buf();
+    let wt_root_str = repo.to_string_lossy().into_owned();
+    let store = Store::open_immutable_snapshot(&base_sqlite, Some(wt_root_str)).map_err(|e| {
+        CommandError::from(format!(
+            "failed to open immutable base snapshot {}: {e}",
+            base_sqlite.display()
+        ))
+    })?;
+    let base_head_sha = store
+        .latest_generation_head_sha()
+        .ok()
+        .flatten()
+        .or_else(|| Some(stacked.manifest().head_sha.clone()));
+    let meta = StackedBaseMeta {
+        anchor_repo_root: anchor_root,
+        base_db_path: base_sqlite.to_string_lossy().into_owned(),
+        base_csr_path: stacked.base_csr_path().map(Path::to_path_buf),
+        generation_id: stacked.lease().generation_id,
+        base_head_sha,
+    };
+    Ok(Some((store, meta, stacked)))
+}
+
+/// Provisions a linked worktree's standalone DevMap store, mmap CSR graph sidecar,
+/// navigator manifests, and `resolution-reuse-*` caches from `anchor_repo` using
+/// Copy-on-Write cloning where supported.
 ///
 /// Safe to run concurrently inside `std::thread::scope` alongside build-cache
-/// CoW cloning. Never modifies tracked files or leaves unignored files in
-/// `worktree_repo`.
+/// CoW cloning. Never modifies tracked files, never writes `overlay.json` or
+/// `CasAstStore`, and acquires the target's writer lock around placement (`F-d`).
 pub fn provision_worktree_devmap(
     anchor_repo: &Path,
     worktree_repo: &Path,
@@ -326,10 +369,10 @@ pub fn provision_worktree_devmap(
         ));
     }
 
-    // Zero-spawn fast check: if the anchor path holds neither a DevMap SQLite
-    // file, a zero-copy base ref, nor a stacked lease on disk, skip before spawning `git rev-parse`.
+    refuse_legacy_base_store_ref(anchor_repo)?;
+    refuse_legacy_base_store_ref(worktree_repo)?;
+
     if !devmap_query::paths::store_path(anchor_repo).is_file()
-        && !zero_copy_base_ref_path(anchor_str).is_file()
         && !devmap_extract::paths::stack_lease_path(anchor_repo).is_file()
     {
         return Ok(DevmapWorktreeProvision::skipped(
@@ -347,9 +390,7 @@ pub fn provision_worktree_devmap(
         ));
     }
     if !devmap_query::paths::store_path(&anchor).is_file() {
-        if let Some(chained) = load_zero_copy_base_ref_internal(&anchor)? {
-            anchor = validate_repo(&chained.anchor_repo_root)?;
-        } else if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
+        if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
             anchor = donor;
         }
     }
@@ -408,7 +449,6 @@ pub fn provision_worktree_devmap(
     };
     drop(anchor_store);
 
-    // Determine which state directory name `worktree` will resolve to.
     let target_state_name = if worktree.join(devmap_query::paths::STATE_DIR).is_dir() {
         devmap_query::paths::STATE_DIR
     } else if worktree
@@ -420,7 +460,6 @@ pub fn provision_worktree_devmap(
         anchor_state_name
     };
 
-    // Fail closed if Git does not confirm the state directory is excluded from `git status`.
     let exclude = ensure_dir_excluded(&worktree, target_state_name, DEVMAP_EXCLUDE_MARKER);
     if !exclude.is_clean() {
         return Err(CommandError::from(format!(
@@ -429,7 +468,6 @@ pub fn provision_worktree_devmap(
         )));
     }
 
-    // Idempotent fast-return when the worktree already holds a valid local indexed store.
     if let Ok(existing_store) = super::open_local_indexed_store(&worktree) {
         let existing_gen = existing_store
             .latest_generation_id()
@@ -438,11 +476,6 @@ pub fn provision_worktree_devmap(
             .unwrap_or(generation_id);
         drop(existing_store);
         let target_db = devmap_query::paths::store_path(&worktree);
-        let (overlay, overlay_error) =
-            match sync_worktree_overlay_internal(&worktree, Some(existing_gen)) {
-                Ok(report) => (Some(report), None),
-                Err(e) => (None, Some(format!("overlay sync failed: {}", e.message()))),
-            };
         return Ok(DevmapWorktreeProvision {
             seeded: true,
             is_cow: false,
@@ -452,10 +485,10 @@ pub fn provision_worktree_devmap(
             db_path: Some(target_db.to_string_lossy().into_owned()),
             csr_seeded: Store::csr_sidecar_path(&target_db).is_file(),
             repo_map_seeded: devmap_query::paths::repo_map_path(&worktree).is_file(),
-            cas_seeded: cas_ast_dir_for_state(&worktree.join(target_state_name)).is_dir(),
-            overlay_path: overlay.map(|r| r.overlay_path),
+            cas_seeded: false,
+            overlay_path: None,
             duration_ms: start.elapsed().as_millis() as u64,
-            reason: overlay_error,
+            reason: None,
         });
     }
 
@@ -469,6 +502,8 @@ pub fn provision_worktree_devmap(
     })?;
 
     let target_db = devmap_query::paths::store_path(&worktree);
+    let _writer_lock = Store::lock_writer_at(&target_db, Store::WRITER_LOCK_WAIT)
+        .map_err(|e| CommandError::from(format!("failed to lock {}: {e}", target_db.display())))?;
     let tmp_db = target_codeintel.join(format!(
         ".devmap.sqlite.seed.{}.{}",
         std::process::id(),
@@ -492,7 +527,6 @@ pub fn provision_worktree_devmap(
         .map_err(|e| CommandError::from(format!("failed to settle seeded DevMap store: {e}")))?;
     tmp_guard.clean_sidecars();
 
-    // Remove any stale unindexed DB before atomic placement.
     if target_db.exists() {
         let _ = fs::remove_file(&target_db);
         for suffix in ["-wal", "-shm", "-journal"] {
@@ -508,7 +542,6 @@ pub fn provision_worktree_devmap(
     })?;
     tmp_guard.armed = false;
 
-    // Immediately verify the placed store passes `nlink == 1` and `validate_repo_root`.
     let seeded_store = match super::open_local_indexed_store(&worktree) {
         Ok(store) => store,
         Err(err) => {
@@ -527,11 +560,8 @@ pub fn provision_worktree_devmap(
     let target_code_graph = devmap_query::paths::code_graph_path(&worktree);
     let anchor_compact_graph = devmap_query::paths::compact_code_graph_path(&anchor);
     let target_compact_graph = devmap_query::paths::compact_code_graph_path(&worktree);
-    let anchor_cas = cas_ast_dir_for_state(&anchor_state);
-    let target_cas = cas_ast_dir_for_state(&target_state);
 
-    // Seed CSR sidecar, navigator manifests + resolution-reuse caches, and CAS AST cache concurrently.
-    let (csr_seeded, repo_map_seeded, cas_seeded) = std::thread::scope(|scope| {
+    let (csr_seeded, repo_map_seeded) = std::thread::scope(|scope| {
         let csr_task = scope.spawn(|| {
             if anchor_csr.is_file()
                 && !target_csr.exists()
@@ -544,7 +574,6 @@ pub fn provision_worktree_devmap(
                 }
                 let _ = fs::remove_file(&target_csr);
             }
-            // Cache CSR on the anchor once when excluded so subsequent worktrees clone in <1 ms (`F6`).
             if !anchor_csr.is_file()
                 && ensure_dir_excluded(&anchor, anchor_state_name, DEVMAP_EXCLUDE_MARKER).is_clean()
                 && materialize_csr_from_store(&seeded_store, &anchor_csr)
@@ -580,27 +609,13 @@ pub fn provision_worktree_devmap(
             map_ok
         });
 
-        let cas_task = scope.spawn(|| {
-            if anchor_cas.is_dir() && !target_cas.exists() {
-                if let Some(parent) = target_cas.parent() {
-                    if fs::create_dir_all(parent).is_err() {
-                        return false;
-                    }
-                }
-                return reflink_copy_dir(&anchor_cas, &target_cas).is_ok();
-            }
-            target_cas.is_dir()
-        });
-
         (
             csr_task.join().unwrap_or(false),
             manifest_task.join().unwrap_or(false),
-            cas_task.join().unwrap_or(false),
         )
     });
 
     drop(seeded_store);
-    let overlay_report = sync_worktree_overlay_internal(&worktree, Some(generation_id))?;
 
     Ok(DevmapWorktreeProvision {
         seeded: true,
@@ -611,18 +626,17 @@ pub fn provision_worktree_devmap(
         db_path: Some(target_db.to_string_lossy().into_owned()),
         csr_seeded,
         repo_map_seeded,
-        cas_seeded,
-        overlay_path: Some(overlay_report.overlay_path),
+        cas_seeded: false,
+        overlay_path: None,
         duration_ms: start.elapsed().as_millis() as u64,
         reason: None,
     })
 }
 
-/// Provisions a zero-copy DevMap shared base graph reference (`base_store_ref.json`),
-/// canonical immutable `StackedStore` lease (`stack_lease.json` + `0444` base snapshot
-/// under `<common_git_dir>/devmap/bases/`), and ephemeral [`WorktreeOverlay`]
-/// (`overlay.json`) inside `worktree_repo` WITHOUT copying `devmap.sqlite` or `cas/ast/`
-/// into `worktree_repo` (`F1`, `F2`, `F6`, `F10`).
+/// Provisions a canonical zero-copy `StackedStore` lease (`stack_lease.json` +
+/// sealed `0444` `base.sqlite` snapshot under `<common_git_dir>/devmap/bases/`)
+/// inside `worktree_repo` WITHOUT copying `devmap.sqlite` or writing any legacy
+/// `base_store_ref.json`, `overlay.json`, or `delta.sqlite` (`P2.3`).
 pub fn provision_worktree_devmap_zero_copy(
     anchor_repo: &Path,
     worktree_repo: &Path,
@@ -641,8 +655,11 @@ pub fn provision_worktree_devmap_zero_copy(
             start,
         ));
     }
+
+    refuse_legacy_base_store_ref(anchor_repo)?;
+    refuse_legacy_base_store_ref(worktree_repo)?;
+
     if !devmap_query::paths::store_path(anchor_repo).is_file()
-        && !zero_copy_base_ref_path(anchor_str).is_file()
         && !devmap_extract::paths::stack_lease_path(anchor_repo).is_file()
     {
         return Ok(DevmapWorktreeProvision::skipped(
@@ -660,9 +677,7 @@ pub fn provision_worktree_devmap_zero_copy(
         ));
     }
     if !devmap_query::paths::store_path(&anchor).is_file() {
-        if let Some(chained) = load_zero_copy_base_ref_internal(&anchor)? {
-            anchor = validate_repo(&chained.anchor_repo_root)?;
-        } else if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
+        if let Some(donor) = resolve_stack_lease_donor(&anchor)? {
             anchor = donor;
         }
     }
@@ -675,9 +690,11 @@ pub fn provision_worktree_devmap_zero_copy(
 
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor)?;
     let worktree_common = crate::engine::git_cli::resolve_git_common_dir(&worktree)?;
-    if anchor_common != worktree_common {
+    if anchor_common != worktree_common
+        || !devmap_extract::paths::same_registered_repo(&anchor, &worktree)
+    {
         return Err(CommandError::from(
-            "refusing zero-copy DevMap base ref across unrelated repositories",
+            "refusing stacked DevMap lease across unrelated repositories",
         ));
     }
 
@@ -726,7 +743,6 @@ pub fn provision_worktree_devmap_zero_copy(
             ));
         }
     };
-    let base_head_sha = anchor_store.latest_generation_head_sha().ok().flatten();
     let anchor_csr = Store::csr_sidecar_path(&anchor_db);
     if !anchor_csr.is_file()
         && ensure_dir_excluded(&anchor, anchor_state_name, DEVMAP_EXCLUDE_MARKER).is_clean()
@@ -749,62 +765,26 @@ pub fn provision_worktree_devmap_zero_copy(
     let exclude = ensure_dir_excluded(&worktree, target_state_name, DEVMAP_EXCLUDE_MARKER);
     if !exclude.is_clean() {
         return Err(CommandError::from(format!(
-            "refusing to write zero-copy DevMap pointer into {} because {target_state_name}/ is not git-ignored: {exclude:?}",
+            "refusing to write DevMap stack lease into {} because {target_state_name}/ is not git-ignored: {exclude:?}",
             worktree.display()
         )));
     }
 
-    let anchor_cas = cas_ast_dir_for_state(&anchor_state);
-    if !anchor_cas.is_dir()
-        && ensure_dir_excluded(&anchor, anchor_state_name, DEVMAP_EXCLUDE_MARKER).is_clean()
-    {
-        let _ = fs::create_dir_all(&anchor_cas);
-    }
-
-    // Create the excluded target state directory BEFORE `acquire_stack_lease` so
-    // `devmap_extract::paths::state_dir(&worktree)` picks `target_state_name` even
+    // Create the excluded target state directory before `provision_stacked_worktree`
+    // so `devmap_extract::paths::state_dir(&worktree)` picks `target_state_name` even
     // when the anchor uses `.devmap` (`LEGACY_STATE_DIR`).
-    let target_state = worktree.join(target_state_name);
-    let ref_path = BASE_STORE_REF_RELPATH
-        .split('/')
-        .fold(target_state.clone(), |acc, part| acc.join(part));
-    if let Some(parent) = ref_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CommandError::from(format!("failed to create {}: {e}", parent.display()))
-        })?;
-    }
+    let target_codeintel = worktree.join(target_state_name).join("codeintel");
+    fs::create_dir_all(&target_codeintel).map_err(|e| {
+        CommandError::from(format!(
+            "failed to create {}: {e}",
+            target_codeintel.display()
+        ))
+    })?;
 
-    // Publish sealed 0444 base snapshot under `<common_git_dir>/devmap/bases/gen-<G>/`
-    // and write canonical `stack_lease.json` + `delta.sqlite` so `devmap` CLI, MCP,
-    // and hooks recognize this zero-copy worktree natively (`F1`, `F10`).
     let stack_lease = devmap_query::stacked::provision_stacked_worktree(&anchor, &worktree)
         .map_err(|e| CommandError::from(format!("failed to acquire DevMap stack lease: {e}")))?;
     let base_csr_candidate =
         devmap_extract::paths::csr_path_for_store(stack_lease.base_sqlite_path());
-
-    let base_ref = ZeroCopyBaseRef {
-        anchor_repo_root: anchor.to_string_lossy().into_owned(),
-        anchor_db_path: anchor_db.to_string_lossy().into_owned(),
-        anchor_csr_path: if base_csr_candidate.is_file() {
-            Some(base_csr_candidate.to_string_lossy().into_owned())
-        } else if anchor_csr.is_file() {
-            Some(anchor_csr.to_string_lossy().into_owned())
-        } else {
-            None
-        },
-        anchor_cas_dir: anchor_cas
-            .is_dir()
-            .then(|| anchor_cas.to_string_lossy().into_owned()),
-        generation_id,
-        base_head_sha,
-    };
-
-    let encoded_ref = serde_json::to_vec_pretty(&base_ref)
-        .map_err(|e| CommandError::from(format!("cannot serialize ZeroCopyBaseRef: {e}")))?;
-    devmap_query::write_atomic(&ref_path, &encoded_ref)
-        .map_err(|e| CommandError::from(format!("cannot write {}: {e}", ref_path.display())))?;
-
-    let overlay_report = sync_worktree_overlay_internal(&worktree, Some(generation_id))?;
 
     Ok(DevmapWorktreeProvision {
         seeded: true,
@@ -818,17 +798,16 @@ pub fn provision_worktree_devmap_zero_copy(
                 .to_string_lossy()
                 .into_owned(),
         ),
-        csr_seeded: base_ref.anchor_csr_path.is_some(),
+        csr_seeded: base_csr_candidate.is_file() || anchor_csr.is_file(),
         repo_map_seeded: devmap_query::paths::repo_map_path(&worktree).is_file(),
-        cas_seeded: base_ref.anchor_cas_dir.is_some(),
-        overlay_path: Some(overlay_report.overlay_path),
+        cas_seeded: false,
+        overlay_path: None,
         duration_ms: start.elapsed().as_millis() as u64,
         reason: None,
     })
 }
 
-/// Provisions a stacked (`stack_lease.json` + `delta.sqlite` + `base_store_ref.json`)
-/// zero-copy DevMap store for `worktree_repo` from `anchor_repo`.
+/// Alias of [`provision_worktree_devmap_zero_copy`] for canonical `StackedStore` provisioning.
 pub fn provision_worktree_devmap_stacked(
     anchor_repo: &Path,
     worktree_repo: &Path,
@@ -902,8 +881,6 @@ fn parse_nul_porcelain_status(bytes: &[u8]) -> Vec<(String, DeltaKind)> {
             continue;
         };
         if matches!(x, 'R' | 'C') {
-            // In `-z` porcelain v1, `R`/`C` puts the destination path in the first
-            // token and the source path in the next NUL-separated token.
             out.push((path.to_string(), DeltaKind::Modified));
             if let Some(orig_raw) = entries.next() {
                 if x == 'R' {
@@ -954,7 +931,6 @@ pub(super) fn collect_worktree_deltas(
     let mut diffed_against_base = false;
     if let Some(sha) = base_head_sha.filter(|s| !s.is_empty()) {
         if let Ok(run) = git_captured(repo, &["diff", "--name-status", "-z", sha, "--"]) {
-            // A cut-short diff would drop deltas; fall through to the full status read instead.
             if run.status_code == 0 && run.incomplete.is_none() {
                 diffed_against_base = true;
                 for (path, kind) in parse_nul_diff_name_status(&run.stdout) {
@@ -982,11 +958,12 @@ pub(super) fn collect_worktree_deltas(
         }
     }
 
-    // Never include DevMap's own state directories in the overlay.
     map.retain(|path, _| {
         !devmap_query::paths::STATE_DIR_NAMES
             .iter()
             .any(|dir| path == *dir || path.starts_with(&format!("{dir}/")))
+            && path != ".gitpulse"
+            && !path.starts_with(".gitpulse/")
     });
 
     let mut sorted: Vec<(String, DeltaKind)> = map.into_iter().collect();
@@ -1073,169 +1050,7 @@ pub(super) fn read_bounded_file(path: &Path, cap: u64) -> Result<Option<Vec<u8>>
     Ok(Some(buf))
 }
 
-/// Reads and verifies the persisted [`ZeroCopyBaseRef`] for `repo_path` when one exists.
-///
-/// Fails closed if `anchor_repo_root` does not share the exact same Git common
-/// directory as `repo_path`, preventing cross-repository pointer spoofing.
-pub fn load_zero_copy_base_ref(repo_path: &str) -> Result<Option<ZeroCopyBaseRef>, CommandError> {
-    let repo = validate_repo(repo_path)?;
-    load_zero_copy_base_ref_internal(&repo)
-}
-
-fn load_zero_copy_base_ref_internal(repo: &Path) -> Result<Option<ZeroCopyBaseRef>, CommandError> {
-    let state_dir = devmap_query::paths::state_dir(repo);
-    let ref_path = BASE_STORE_REF_RELPATH
-        .split('/')
-        .fold(state_dir, |acc, part| acc.join(part));
-    if !ref_path.is_file() {
-        return Ok(None);
-    }
-    let bytes = read_bounded_file(&ref_path, 64 * 1024)?.ok_or_else(|| {
-        CommandError::from(format!(
-            "zero-copy DevMap base ref {} exceeds size bound or is not a regular file",
-            ref_path.display()
-        ))
-    })?;
-    let base_ref: ZeroCopyBaseRef = serde_json::from_slice(&bytes).map_err(|e| {
-        CommandError::from(format!(
-            "failed to parse zero-copy DevMap base ref {}: {e}",
-            ref_path.display()
-        ))
-    })?;
-    let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
-    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
-    let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common
-        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
-    {
-        return Err(CommandError::from(format!(
-            "refusing zero-copy DevMap base ref {} pointing outside worktree family ({})",
-            ref_path.display(),
-            anchor_root.display()
-        )));
-    }
-    Ok(Some(base_ref))
-}
-
-fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandError> {
-    let lease_path = devmap_extract::paths::stack_lease_path(repo);
-    if !lease_path.is_file() {
-        return Ok(None);
-    }
-    let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
-        .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
-    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
-    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
-        CommandError::from(format!(
-            "stacked base manifest {} is missing or oversized",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest: devmap_query::stacked::BaseManifest =
-        serde_json::from_slice(&raw).map_err(|e| {
-            CommandError::from(format!(
-                "failed to parse stacked base manifest {}: {e}",
-                manifest_path.display()
-            ))
-        })?;
-    let donor = validate_repo(&manifest.source_repo_root)?;
-    if !devmap_extract::paths::same_registered_repo(repo, &donor) {
-        return Err(CommandError::from(format!(
-            "refusing stack lease {} pointing outside worktree family ({})",
-            lease_path.display(),
-            donor.display()
-        )));
-    }
-    Ok(Some(donor))
-}
-
-fn open_verified_stack_lease_store(
-    repo: &Path,
-) -> Result<Option<(Store, ZeroCopyBaseRef)>, CommandError> {
-    let lease_path = devmap_extract::paths::stack_lease_path(repo);
-    if !lease_path.is_file() {
-        return Ok(None);
-    }
-    let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
-        .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
-    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
-    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
-        CommandError::from(format!(
-            "stacked base manifest {} is missing or oversized",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest: devmap_query::stacked::BaseManifest =
-        serde_json::from_slice(&raw).map_err(|e| {
-            CommandError::from(format!(
-                "failed to parse stacked base manifest {}: {e}",
-                manifest_path.display()
-            ))
-        })?;
-    let anchor_root = validate_repo(&manifest.source_repo_root)?;
-    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
-    let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common
-        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
-    {
-        return Err(CommandError::from(format!(
-            "refusing stack lease {} pointing outside worktree family ({})",
-            lease_path.display(),
-            anchor_root.display()
-        )));
-    }
-    let base_sqlite = lease.base_sqlite_path();
-    let store = Store::open_immutable_snapshot(&base_sqlite, None).map_err(|e| {
-        CommandError::from(format!(
-            "failed to open immutable base snapshot {}: {e}",
-            base_sqlite.display()
-        ))
-    })?;
-    let base_csr = devmap_extract::paths::csr_path_for_store(&base_sqlite);
-    let anchor_state = devmap_query::paths::state_dir(&anchor_root);
-    let anchor_cas = cas_ast_dir_for_state(&anchor_state);
-    let base_head_sha = store.latest_generation_head_sha().ok().flatten();
-    let base_ref = ZeroCopyBaseRef {
-        anchor_repo_root: anchor_root.to_string_lossy().into_owned(),
-        anchor_db_path: base_sqlite.to_string_lossy().into_owned(),
-        anchor_csr_path: base_csr
-            .is_file()
-            .then(|| base_csr.to_string_lossy().into_owned()),
-        anchor_cas_dir: anchor_cas
-            .is_dir()
-            .then(|| anchor_cas.to_string_lossy().into_owned()),
-        generation_id: lease.generation_id,
-        base_head_sha,
-    };
-    Ok(Some((store, base_ref)))
-}
-
-pub(super) fn open_verified_zero_copy_anchor_store(
-    repo: &Path,
-) -> Result<Option<(Store, ZeroCopyBaseRef)>, CommandError> {
-    if let Some(base_ref) = load_zero_copy_base_ref_internal(repo)? {
-        // When a sealed `0444` immutable base snapshot also exists via `stack_lease.json`,
-        // prefer opening `?immutable=1` so readers create zero `-shm`/`-wal` contention (`OQ1`).
-        if let Ok(Some((immutable_store, mut lease_ref))) = open_verified_stack_lease_store(repo) {
-            if lease_ref.generation_id == base_ref.generation_id {
-                if lease_ref.anchor_csr_path.is_none() {
-                    lease_ref.anchor_csr_path = base_ref.anchor_csr_path;
-                }
-                if lease_ref.anchor_cas_dir.is_none() {
-                    lease_ref.anchor_cas_dir = base_ref.anchor_cas_dir;
-                }
-                return Ok(Some((immutable_store, lease_ref)));
-            }
-        }
-        let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
-        let store = super::open_local_indexed_store(&anchor_root).map_err(CommandError::from)?;
-        return Ok(Some((store, base_ref)));
-    }
-    open_verified_stack_lease_store(repo)
-}
-
 pub(super) fn is_sparse_worktree(repo: &Path) -> bool {
-    // `--get` is a read; an unset key exits 1, which is "not sparse".
     git_captured(repo, &["config", "--get", "core.sparseCheckout"])
         .map(|run| {
             run.status_code == 0
@@ -1258,7 +1073,7 @@ fn head_sha_of(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Evaluates source freshness of a zero-copy `worktree` against `anchor_store`'s
+/// Evaluates source freshness of a stacked `worktree` against `anchor_store`'s
 /// latest generation instead of reporting `anchor`'s own working-tree freshness.
 pub(super) fn verify_zero_copy_worktree_freshness(
     worktree: &Path,
@@ -1277,7 +1092,7 @@ pub(super) fn verify_zero_copy_worktree_freshness(
                 return (
                     Some(false),
                     Some(
-                        "sparse worktree HEAD differs from the indexed anchor generation; rebuild or sync overlay"
+                        "sparse worktree HEAD differs from the indexed anchor generation; rebuild or sync delta"
                             .to_string(),
                     ),
                 );
@@ -1294,7 +1109,7 @@ pub(super) fn verify_zero_copy_worktree_freshness(
                 return (
                     Some(false),
                     Some(
-                        "sparse worktree differs from the indexed anchor generation; rebuild or sync overlay"
+                        "sparse worktree differs from the indexed anchor generation; rebuild or sync delta"
                             .to_string(),
                     ),
                 );
@@ -1311,7 +1126,7 @@ pub(super) fn verify_zero_copy_worktree_freshness(
         return (
             None,
             Some(
-                "source freshness unverified: sparse zero-copy worktree cannot verify unmaterialized paths while anchor checkout differs from indexed generation"
+                "source freshness unverified: sparse stacked worktree cannot verify unmaterialized paths while anchor checkout differs from indexed generation"
                     .to_string(),
             ),
         );
@@ -1335,7 +1150,7 @@ pub(super) fn verify_zero_copy_worktree_freshness(
         return (
             Some(false),
             Some(
-                "worktree source tree differs from the indexed anchor generation; rebuild or sync overlay"
+                "worktree source tree differs from the indexed anchor generation; rebuild or sync delta"
                     .to_string(),
             ),
         );
@@ -1382,131 +1197,102 @@ fn file_scoped_symbol_id(rel_path: &str, sym: &str) -> String {
     }
 }
 
-fn rebase_cached_extraction(
-    mut ext: devmap_extract::Extraction,
-    rel_path: &str,
-) -> devmap_extract::Extraction {
-    let old_path = std::mem::replace(&mut ext.file_path, rel_path.to_string());
-    let old_prefix = format!("{old_path}::");
-    let new_file_name = rel_path.rsplit('/').next().unwrap_or(rel_path).to_string();
-    for sym in &mut ext.symbols {
-        if matches!(sym.kind, devmap_extract::SymbolKind::File) {
-            sym.name = new_file_name.clone();
-            sym.qualified_name = rel_path.to_string();
-        } else if let Some(rest) = sym.qualified_name.strip_prefix(&old_prefix) {
-            sym.qualified_name = format!("{rel_path}::{rest}");
+/// Replaces `StackedStore::overlay().dirty_nodes` (which carries ordinal delta file
+/// indices) with true CSR node IDs from `csr_reader`, and ensures file-scoped
+/// symbol tombstones are populated from `base_store.latest_symbols_for_file`.
+fn enrich_stacked_overlay_with_csr(
+    overlay: &mut WorktreeOverlay,
+    base_store: &Store,
+    csr_reader: Option<&devmap_store::CsrGraphReader>,
+) {
+    overlay.dirty_nodes = devmap_query::RoaringBitmap::new();
+    let csr_lookup = csr_reader
+        .filter(|r| r.generation() == overlay.generation)
+        .map(CsrDigestLookup::from_reader);
+
+    let modified_paths: Vec<String> = overlay
+        .modified_files
+        .keys()
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect();
+    let tombstoned_paths: Vec<String> = overlay
+        .tombstoned_files
+        .iter()
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect();
+
+    for rel_path in &tombstoned_paths {
+        let rows = base_store
+            .latest_symbols_for_file(rel_path)
+            .ok()
+            .flatten()
+            .map(|p| p.rows)
+            .unwrap_or_default();
+        let mut qnames = Vec::with_capacity(rows.len() * 2);
+        for row in &rows {
+            if !row.kind.eq_ignore_ascii_case("file") {
+                overlay.mark_symbol_tombstone(file_scoped_symbol_id(rel_path, &row.name), None);
+                overlay.mark_symbol_tombstone(
+                    file_scoped_symbol_id(rel_path, &row.qualified_name),
+                    None,
+                );
+            }
+            qnames.push(row.name.clone());
+            if row.qualified_name != row.name {
+                qnames.push(row.qualified_name.clone());
+            }
+        }
+        if let Some(ref lookup) = csr_lookup {
+            for nid in lookup.matching_nodes(rel_path, &qnames) {
+                overlay.dirty_nodes.insert(nid);
+            }
         }
     }
-    devmap_extract::secret::withhold_secret_values(&mut ext);
-    ext.for_durable_store()
-}
 
-fn extract_fallback_ast(rel_path: &str, source: &str) -> (devmap_extract::Extraction, bool) {
-    let lang = devmap_extract::detect_language(Path::new(rel_path));
-    let declarative = devmap_extract::fallback::applies_to(lang);
-    let scan = if declarative {
-        devmap_extract::fallback::scan_declarations_in(lang, rel_path, source)
-    } else {
-        devmap_extract::fallback::FallbackScan {
-            symbols: Vec::new(),
-            references: Vec::new(),
-            calls: Vec::new(),
-            truncated: 0,
-            truncated_calls: 0,
-            skipped_long_lines: 0,
-            unread_bytes: 0,
+    for rel_path in &modified_paths {
+        let rows = base_store
+            .latest_symbols_for_file(rel_path)
+            .ok()
+            .flatten()
+            .map(|p| p.rows)
+            .unwrap_or_default();
+        let mut qnames = Vec::with_capacity(rows.len() * 2);
+        let missing_tombstones: Vec<String> = if let Some(ext) =
+            overlay.added_extractions.get(rel_path.as_str())
+        {
+            let live_names: std::collections::HashSet<&str> = ext
+                .symbols
+                .iter()
+                .filter(|s| !matches!(s.kind, devmap_extract::SymbolKind::File))
+                .map(|s| s.name.as_str())
+                .collect();
+            let mut missing = Vec::new();
+            for row in &rows {
+                if !row.kind.eq_ignore_ascii_case("file") && !live_names.contains(row.name.as_str())
+                {
+                    missing.push(file_scoped_symbol_id(rel_path, &row.name));
+                    missing.push(file_scoped_symbol_id(rel_path, &row.qualified_name));
+                }
+            }
+            missing
+        } else {
+            Vec::new()
+        };
+        for tomb in missing_tombstones {
+            overlay.mark_symbol_tombstone(tomb, None);
         }
-    };
-    let recovered_count = scan.symbols.len();
-    let recovered = recovered_count > 0 || devmap_extract::fallback::has_dedicated_reader(lang);
-    let mut symbols = Vec::with_capacity(scan.symbols.len() + 1);
-    symbols.push(devmap_extract::ExtractedSymbol {
-        name: rel_path.rsplit('/').next().unwrap_or(rel_path).to_string(),
-        qualified_name: rel_path.to_string(),
-        kind: devmap_extract::SymbolKind::File,
-        span: devmap_extract::Span {
-            start_byte: 0,
-            end_byte: source.len(),
-        },
-        is_exported: true,
-        docstring: None,
-        signature: None,
-        parent_symbol: None,
-        body_signature: None,
-        declaration_hash: None,
-        return_type: None,
-    });
-    symbols.extend(scan.symbols);
-
-    let mut ext = devmap_extract::Extraction {
-        file_path: rel_path.to_string(),
-        language: lang.to_string(),
-        content_hash: devmap_extract::content_hash(source),
-        engine: match (recovered, declarative) {
-            (true, _) => devmap_extract::ExtractionEngine::RegexFallback {
-                requested_language: lang.to_string(),
-            },
-            (false, true) => devmap_extract::ExtractionEngine::Unavailable {
-                requested_language: lang.to_string(),
-            },
-            (false, false) => devmap_extract::ExtractionEngine::NotApplicable {
-                language: lang.to_string(),
-            },
-        },
-        parse_outcome: match (recovered, declarative) {
-            (true, _) => devmap_extract::ParseOutcome::Fallback {
-                reason: format!(
-                    "worktree overlay declaration scan for {lang}; {recovered_count} declaration(s) recovered"
-                ),
-            },
-            (false, true) => devmap_extract::ParseOutcome::Failed {
-                reason: format!("no declarations recovered in worktree overlay for {lang}"),
-            },
-            (false, false) => devmap_extract::ParseOutcome::Failed {
-                reason: format!("{lang} is a prose/data format; indexed as a File node"),
-            },
-        },
-        symbols,
-        imports: Vec::new(),
-        calls: scan.calls,
-        exports: Vec::new(),
-        references: scan.references,
-        diagnostics: Vec::new(),
-        routes: Vec::new(),
-        wiring: devmap_extract::wiring::extract_wiring_annotations(rel_path, source),
-        go_package: None,
-        jvm_package: None,
-        scope_receivers: Vec::new(),
-        swift_type_aliases: Vec::new(),
-        go_build_constrained: false,
-        go_interface_methods: Vec::new(),
-        go_method_params: Vec::new(),
-        go_member_names: None,
-        go_facts: None,
-        scope_locals: Vec::new(),
-        rust_inline_modules: Vec::new(),
-        rust_deref_targets: Vec::new(),
-        rust_blanket_impl_params: Vec::new(),
-        rust_implicit_calls: Vec::new(),
-        rust_try_conversions: Vec::new(),
-        local_bindings: Vec::new(),
-        source_code: None,
-        literals: Vec::new(),
-        js_objects: Vec::new(),
-        jvm_decls: Vec::new(),
-        package_scopes: Vec::new(),
-        local_extents: Vec::new(),
-        decl_gaps: Vec::new(),
-        recovered_decl_ranges: Vec::new(),
-        dynamic_dispatch: Vec::new(),
-    };
-    devmap_extract::secret::withhold_secret_values(&mut ext);
-    (ext.for_durable_store(), declarative)
-}
-
-pub(super) fn has_zero_copy_or_stack_lease(repo: &Path) -> bool {
-    zero_copy_base_ref_path(&repo.to_string_lossy()).is_file()
-        || devmap_extract::paths::stack_lease_path(repo).is_file()
+        for row in &rows {
+            qnames.push(row.name.clone());
+            if row.qualified_name != row.name {
+                qnames.push(row.qualified_name.clone());
+            }
+        }
+        if let Some(ref lookup) = csr_lookup {
+            for nid in lookup.matching_nodes(rel_path, &qnames) {
+                overlay.dirty_nodes.insert(nid);
+            }
+        }
+    }
 }
 
 fn insert_cone_symbol_and_identifiers(
@@ -1562,7 +1348,6 @@ pub(super) fn is_stacked_delta_fully_synced(
     stacked: &devmap_query::StackedStore,
 ) -> bool {
     let ov = stacked.overlay();
-    // Every recorded modified file in `delta.sqlite` must still match current disk bytes.
     for (rel_path, expected_b3) in &ov.modified_files {
         let Ok(Some(bytes)) = read_bounded_file(&worktree.join(rel_path), MAX_OVERLAY_FILE_BYTES)
         else {
@@ -1601,6 +1386,9 @@ pub(super) fn is_stacked_delta_fully_synced(
                     }
                 }
                 DeltaKind::Modified => {
+                    if !devmap_extract::languages::is_indexable_source(&rel_path) {
+                        continue;
+                    }
                     let Ok(Some(bytes)) =
                         read_bounded_file(&worktree.join(&rel_path), MAX_OVERLAY_FILE_BYTES)
                     else {
@@ -1644,6 +1432,9 @@ pub(super) fn is_stacked_delta_fully_synced(
     }
     for (path, scan_hash) in scanned_hashes {
         if hashes.get(path) != Some(&scan_hash) {
+            if !devmap_extract::languages::is_indexable_source(path) {
+                continue;
+            }
             let Ok(Some(bytes)) = read_bounded_file(&worktree.join(path), MAX_OVERLAY_FILE_BYTES)
             else {
                 return false;
@@ -1658,18 +1449,6 @@ pub(super) fn is_stacked_delta_fully_synced(
 
 /// Proves whether `candidate` (`affected_tests` computed from `anchor_store`) is
 /// graph-theoretically invariant under `worktree`'s dirty deltas (`F4`).
-///
-/// Returns `true` ONLY when:
-/// 1. `candidate` is available, complete (`!fail_closed`), and has zero omitted
-///    blast-radius layer nodes (`nodes_omitted == 0` on every layer).
-/// 2. Every difference between `worktree` and `anchor_store`'s indexed generation
-///    is a bounded (`<= MAX_OVERLAY_DIRTY_FILES`) set of modified/added files
-///    with zero deleted files and unchanged discovery refusals / over-limit sets.
-/// 3. Every modified/added file is disjoint from `targets`, `seeds`, `layers`,
-///    and `tests` (both by path and by indexed symbols in `anchor_store`), AND
-///    for declarative code files, its UTF-8 comment-stripped source contains
-///    zero wildcard re-exports/imports and zero identifier tokens matching any
-///    target, seed, blast-layer symbol, test symbol, or cone file stem.
 pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
     worktree: &Path,
     anchor: &Path,
@@ -1738,7 +1517,6 @@ pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
             scanned.file_hashes().into_iter().collect();
         for indexed_path in hashes.keys() {
             if !scanned_hashes.contains_key(indexed_path.as_str()) {
-                // Conservative: any deleted indexed file forces fail_closed.
                 return false;
             }
         }
@@ -1852,14 +1630,13 @@ pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
     true
 }
 
-/// Opens the mmap [`devmap_store::CsrGraphReader`] for `repo`, falling back to
-/// a verified zero-copy anchor base ref when `repo` holds `base_store_ref.json`
-/// or `stack_lease.json` instead of a full local `devmap.sqlite`.
+/// Opens the mmap [`devmap_store::CsrGraphReader`] for `repo`, preferring the
+/// verified `StackedStore` base snapshot in sparse checkouts (`F2`).
 pub(crate) fn open_worktree_or_anchor_csr(
     repo: &Path,
 ) -> Option<(devmap_store::CsrGraphReader, u64)> {
-    let prefer_zero_copy = is_sparse_worktree(repo) && has_zero_copy_or_stack_lease(repo);
-    if !prefer_zero_copy {
+    let prefer_stacked = is_sparse_worktree(repo) && has_stack_lease_or_legacy_ref(repo);
+    if !prefer_stacked {
         if let Ok(store) = super::open_local_indexed_store(repo) {
             if let Ok(Some(reader)) = store.open_latest_csr_sidecar() {
                 let gen = reader.generation();
@@ -1867,19 +1644,21 @@ pub(crate) fn open_worktree_or_anchor_csr(
             }
         }
     }
-    if let Ok(Some((anchor_store, base_ref))) = open_verified_zero_copy_anchor_store(repo) {
-        if let Some(csr_path) = base_ref.anchor_csr_path.as_deref() {
-            if let Ok(reader) = devmap_store::CsrGraphReader::open_mmap(Path::new(csr_path)) {
-                let gen = reader.generation();
-                return Some((reader, gen));
+    if let Ok(Some((base_store, meta, stacked))) = open_verified_stacked_store(repo) {
+        if let Ok(Some(arc_reader)) = stacked.csr_reader() {
+            let gen = arc_reader.generation();
+            if let Some(ref csr_path) = meta.base_csr_path {
+                if let Ok(reader) = devmap_store::CsrGraphReader::open_mmap(csr_path) {
+                    return Some((reader, gen));
+                }
             }
         }
-        if let Ok(Some(reader)) = anchor_store.open_latest_csr_sidecar() {
+        if let Ok(Some(reader)) = base_store.open_latest_csr_sidecar() {
             let gen = reader.generation();
             return Some((reader, gen));
         }
     }
-    if prefer_zero_copy {
+    if prefer_stacked {
         if let Ok(store) = super::open_local_indexed_store(repo) {
             if let Ok(Some(reader)) = store.open_latest_csr_sidecar() {
                 let gen = reader.generation();
@@ -1890,302 +1669,239 @@ pub(crate) fn open_worktree_or_anchor_csr(
     None
 }
 
-/// Synchronizes and atomically persists `<state_dir>/codeintel/overlay.json`
-/// for `repo_path`, hashing dirty/untracked files with Blake3, marking deleted
-/// files and their indexed symbols with [`CAS_TOMBSTONE`], reusing any matching
-/// [`CasAstStore`] AST blobs, and populating `dirty_nodes` (`RoaringBitmap`).
+/// Explicitly synchronizes a stacked worktree's `delta.sqlite` using real
+/// Tree-sitter extraction (`devmap --root <wt> seed --sync-delta --json` under
+/// `StackedStore`'s writer lock), or computes an in-memory delta summary for
+/// non-stacked checkouts without writing any `overlay.json` or `CasAstStore`.
 pub fn sync_worktree_overlay(repo_path: &str) -> Result<WorktreeOverlayReport, CommandError> {
-    let repo = validate_repo(repo_path)?;
-    sync_worktree_overlay_internal(&repo, None)
-}
-
-fn sync_worktree_overlay_internal(
-    repo: &Path,
-    generation_hint: Option<u32>,
-) -> Result<WorktreeOverlayReport, CommandError> {
     let start = Instant::now();
-    let state_dir = devmap_query::paths::state_dir(repo);
-    if let Ok(rel) = state_dir.strip_prefix(repo) {
-        if let Some(dir_name) = plain_single_dir_component(rel) {
-            let exclude = ensure_dir_excluded(repo, dir_name, DEVMAP_EXCLUDE_MARKER);
-            if !exclude.is_clean() {
-                return Err(CommandError::from(format!(
-                    "refusing to write worktree overlay into {} because {dir_name}/ is not git-ignored: {exclude:?}",
-                    repo.display()
-                )));
+    let repo = validate_repo(repo_path)?;
+    refuse_legacy_base_store_ref(&repo)?;
+
+    if devmap_extract::paths::stack_lease_path(&repo).is_file() {
+        let (base_store, meta, existing_stacked) = open_verified_stacked_store(&repo)?
+            .ok_or_else(|| CommandError::from("stacked lease vanished during sync"))?;
+        let (deltas, truncated) = collect_worktree_deltas(&repo, meta.base_head_sha.as_deref())?;
+        let mut skipped_large_files = 0usize;
+        for (rel_path, kind) in &deltas {
+            if *kind == DeltaKind::Modified {
+                let full_path = repo.join(rel_path);
+                if read_bounded_file(&full_path, MAX_OVERLAY_FILE_BYTES)?.is_none()
+                    && full_path.exists()
+                {
+                    skipped_large_files += 1;
+                }
             }
         }
+
+        let delta_path = devmap_extract::paths::stack_delta_path(&repo);
+        // Clean stacked worktree fast-path: zero files diverged and no prior
+        // `delta.sqlite` to clear -> return in <1 ms without creating `delta.sqlite`.
+        if deltas.is_empty() && !existing_stacked.delta_present() {
+            return Ok(WorktreeOverlayReport {
+                overlay_path: delta_path.to_string_lossy().into_owned(),
+                generation_id: u64::from(meta.generation_id),
+                base_head_sha: meta.base_head_sha,
+                modified_files: 0,
+                tombstoned_files: 0,
+                tombstoned_symbols: 0,
+                dirty_nodes: 0,
+                reused_cas_asts: 0,
+                skipped_large_files: 0,
+                truncated: false,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let state_dir = devmap_query::paths::state_dir(&repo);
+        if let Ok(rel) = state_dir.strip_prefix(&repo) {
+            if let Some(dir_name) = plain_single_dir_component(rel) {
+                let exclude = ensure_dir_excluded(&repo, dir_name, DEVMAP_EXCLUDE_MARKER);
+                if !exclude.is_clean() {
+                    return Err(CommandError::from(format!(
+                        "refusing to sync stacked delta in {} because {dir_name}/ is not git-ignored: {exclude:?}",
+                        repo.display()
+                    )));
+                }
+            }
+        }
+
+        drop(existing_stacked);
+        drop(base_store);
+
+        let repo_canon_str = repo.to_string_lossy();
+        let outcome = crate::devmap::cli::sync_stacked_delta(&repo_canon_str).map_err(|e| {
+            CommandError::from(format!("failed to sync stacked delta via devmap: {e}"))
+        })?;
+        if !outcome.ok {
+            let detail = if outcome.timed_out {
+                "devmap seed --sync-delta timed out".to_string()
+            } else if !outcome.stderr.trim().is_empty() {
+                outcome.stderr.trim().to_string()
+            } else if !outcome.stdout.trim().is_empty() {
+                outcome.stdout.trim().to_string()
+            } else {
+                format!("exit code {:?}", outcome.exit_code)
+            };
+            return Err(CommandError::from(format!(
+                "failed to sync stacked delta via devmap: {detail}"
+            )));
+        }
+
+        // If `StackedStore::sync_worktree` auto-rebased (>250 dirty files or >16 MiB)
+        // into a standalone CoW `devmap.sqlite`, report the standalone DB cleanly.
+        if !devmap_extract::paths::stack_lease_path(&repo).is_file() {
+            let local = super::open_local_indexed_store(&repo).map_err(CommandError::from)?;
+            let gen_id = local.latest_generation_id().ok().flatten().unwrap_or(0);
+            let head_sha = local.latest_generation_head_sha().ok().flatten();
+            return Ok(WorktreeOverlayReport {
+                overlay_path: devmap_query::paths::store_path(&repo)
+                    .to_string_lossy()
+                    .into_owned(),
+                generation_id: u64::from(gen_id),
+                base_head_sha: head_sha,
+                modified_files: 0,
+                tombstoned_files: 0,
+                tombstoned_symbols: 0,
+                dirty_nodes: 0,
+                reused_cas_asts: 0,
+                skipped_large_files,
+                truncated,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let (reopened_base, reopened_meta, reopened_stacked) = open_verified_stacked_store(&repo)?
+            .ok_or_else(|| CommandError::from("stacked store missing after sync"))?;
+        let mut ov = reopened_stacked.overlay().clone();
+        let csr_opt = open_worktree_or_anchor_csr(&repo);
+        enrich_stacked_overlay_with_csr(&mut ov, &reopened_base, csr_opt.as_ref().map(|(r, _)| r));
+
+        return Ok(WorktreeOverlayReport {
+            overlay_path: delta_path.to_string_lossy().into_owned(),
+            generation_id: ov.generation,
+            base_head_sha: reopened_meta.base_head_sha,
+            modified_files: ov.modified_files.len(),
+            tombstoned_files: ov.tombstoned_files.len(),
+            tombstoned_symbols: ov.tombstoned_symbols.len(),
+            dirty_nodes: ov.dirty_nodes.len(),
+            reused_cas_asts: 0,
+            skipped_large_files,
+            truncated,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
     }
 
-    let prefer_zero_copy = is_sparse_worktree(repo) && has_zero_copy_or_stack_lease(repo);
-    let zero_copy_anchor = if prefer_zero_copy {
-        open_verified_zero_copy_anchor_store(repo)?
-    } else {
-        None
-    };
-    let local_store = if zero_copy_anchor.is_none() {
-        super::open_local_indexed_store(repo).ok()
-    } else {
-        None
-    };
-    let zero_copy_anchor = match zero_copy_anchor {
-        Some(zc) => Some(zc),
-        None if local_store.is_none() => open_verified_zero_copy_anchor_store(repo)?,
-        None => None,
-    };
-    let active_store: Option<&Store> = zero_copy_anchor
+    // Non-stacked checkout: compute delta + CSR summary purely in memory without
+    // writing any `overlay.json` or `CasAstStore` sidecars.
+    let local_store = super::open_local_indexed_store(&repo).ok();
+    let generation_id = local_store
         .as_ref()
-        .map(|(s, _)| s)
-        .or(local_store.as_ref());
-
-    let generation_id = active_store
         .and_then(|s| s.latest_generation_id().ok().flatten())
-        .or_else(|| zero_copy_anchor.as_ref().map(|(_, r)| r.generation_id))
-        .or(generation_hint)
         .unwrap_or(0);
-    let base_head_sha = active_store
-        .and_then(|s| s.latest_generation_head_sha().ok().flatten())
-        .or_else(|| {
-            zero_copy_anchor
-                .as_ref()
-                .and_then(|(_, r)| r.base_head_sha.clone())
-        });
-    let worktree_id = repo
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("worktree")
-        .to_string();
-    let mut overlay = WorktreeOverlay::new(worktree_id, u64::from(generation_id));
-    let cas_store = CasAstStore::with_custom_dir(cas_ast_dir_for_state(&state_dir));
-    // `anchor_cas_store` is strictly READ-ONLY so `RegexFallback` overlay extractions
-    // never overwrite or poison full tree-sitter AST blobs in the anchor (`F4`).
-    let anchor_cas_store = zero_copy_anchor
+    let base_head_sha = local_store
         .as_ref()
-        .and_then(|(_, r)| r.anchor_cas_dir.as_deref())
-        .map(|p| CasAstStore::with_custom_dir(PathBuf::from(p)));
-    let shared_overlay_cas_store = shared_overlay_cas_dir(repo).map(CasAstStore::with_custom_dir);
-
-    let (deltas, truncated) = collect_worktree_deltas(repo, base_head_sha.as_deref())?;
+        .and_then(|s| s.latest_generation_head_sha().ok().flatten());
+    let (deltas, truncated) = collect_worktree_deltas(&repo, base_head_sha.as_deref())?;
     let csr_lookup = if deltas.is_empty() {
         None
     } else {
-        active_store
+        local_store
+            .as_ref()
             .and_then(|s| s.open_latest_csr_sidecar().ok().flatten())
             .map(|reader| CsrDigestLookup::from_reader(&reader))
     };
+
+    let mut modified_files = 0usize;
+    let mut tombstoned_files = 0usize;
+    let mut tombstoned_symbols = BTreeSet::new();
+    let mut dirty_nodes = devmap_query::RoaringBitmap::new();
     let mut skipped_large_files = 0usize;
-    let mut reused_cas_asts = 0usize;
 
     for (rel_path, kind) in deltas {
-        let indexed_rows = active_store
-            .and_then(|s| s.latest_symbols_for_file(&rel_path).ok().flatten())
-            .map(|page| page.rows)
-            .unwrap_or_default();
-        let indexed_symbols: Vec<String> = indexed_rows
-            .iter()
-            .map(|r| r.qualified_name.clone())
-            .collect();
-
-        let node_ids = csr_lookup
+        let indexed_rows = local_store
             .as_ref()
-            .map(|lookup| lookup.matching_nodes(&rel_path, &indexed_symbols))
+            .and_then(|s| s.latest_symbols_for_file(&rel_path).ok().flatten())
+            .map(|p| p.rows)
             .unwrap_or_default();
-        let first_node = node_ids.iter().next().copied();
-
+        let mut qnames = Vec::with_capacity(indexed_rows.len() * 2);
+        for r in &indexed_rows {
+            qnames.push(r.name.clone());
+            if r.qualified_name != r.name {
+                qnames.push(r.qualified_name.clone());
+            }
+        }
+        if let Some(ref lookup) = csr_lookup {
+            for nid in lookup.matching_nodes(&rel_path, &qnames) {
+                dirty_nodes.insert(nid);
+            }
+        }
         match kind {
             DeltaKind::Deleted => {
-                overlay.mark_file_tombstone(&rel_path, first_node);
+                tombstoned_files += 1;
                 for row in &indexed_rows {
-                    overlay
-                        .mark_symbol_tombstone(file_scoped_symbol_id(&rel_path, &row.name), None);
-                    overlay.mark_symbol_tombstone(
-                        file_scoped_symbol_id(&rel_path, &row.qualified_name),
-                        None,
-                    );
-                }
-                for nid in node_ids {
-                    overlay.dirty_nodes.insert(nid);
+                    if !row.kind.eq_ignore_ascii_case("file") {
+                        tombstoned_symbols.insert(file_scoped_symbol_id(&rel_path, &row.name));
+                        tombstoned_symbols
+                            .insert(file_scoped_symbol_id(&rel_path, &row.qualified_name));
+                    }
                 }
             }
             DeltaKind::Modified => {
                 let full_path = repo.join(&rel_path);
                 match read_bounded_file(&full_path, MAX_OVERLAY_FILE_BYTES)? {
-                    Some(bytes) => {
-                        let hash = blake3_hash(&bytes);
-                        overlay.record_modified_file(&rel_path, &hash, first_node);
-                        for nid in &node_ids {
-                            overlay.dirty_nodes.insert(*nid);
-                        }
-                        let lang = devmap_extract::detect_language(Path::new(&rel_path));
-                        let cached_ast = cas_store
-                            .load_ast(&hash)
-                            .ok()
-                            .flatten()
-                            .filter(|ext| ext.language == lang)
-                            .or_else(|| {
-                                anchor_cas_store
-                                    .as_ref()
-                                    .and_then(|ac| ac.load_ast(&hash).ok().flatten())
-                                    .filter(|ext| ext.language == lang)
-                            })
-                            .or_else(|| {
-                                shared_overlay_cas_store
-                                    .as_ref()
-                                    .and_then(|sc| sc.load_ast(&hash).ok().flatten())
-                                    .filter(|ext| ext.language == lang)
-                            });
-                        let source_str_opt = std::str::from_utf8(&bytes).ok();
-                        let extracted = if let Some(cached) = cached_ast {
-                            reused_cas_asts += 1;
-                            Some((
-                                rebase_cached_extraction(cached, &rel_path),
-                                devmap_extract::fallback::applies_to(lang),
-                            ))
-                        } else if let Some(source_str) = source_str_opt {
-                            let (ext, declarative) = extract_fallback_ast(&rel_path, source_str);
-                            if local_store.is_some() {
-                                let _ = cas_store.store_ast(&bytes, &ext);
+                    Some(_) => modified_files += 1,
+                    None if !full_path.exists() => {
+                        tombstoned_files += 1;
+                        for row in &indexed_rows {
+                            if !row.kind.eq_ignore_ascii_case("file") {
+                                tombstoned_symbols
+                                    .insert(file_scoped_symbol_id(&rel_path, &row.name));
+                                tombstoned_symbols
+                                    .insert(file_scoped_symbol_id(&rel_path, &row.qualified_name));
                             }
-                            if let Some(ref sc) = shared_overlay_cas_store {
-                                let _ = sc.store_ast(&bytes, &ext);
-                            }
-                            Some((ext, declarative))
-                        } else {
-                            None
-                        };
-                        if let Some((extraction, declarative)) = extracted {
-                            if declarative {
-                                let is_full_ast = matches!(
-                                    extraction.engine,
-                                    devmap_extract::ExtractionEngine::TreeSitter { .. }
-                                );
-                                let code_no_comments = if !is_full_ast && !indexed_rows.is_empty() {
-                                    source_str_opt.map(strip_comments_preserving_identifiers)
-                                } else {
-                                    None
-                                };
-                                let declared_names: std::collections::HashSet<&str> = extraction
-                                    .symbols
-                                    .iter()
-                                    .filter(|s| !matches!(s.kind, devmap_extract::SymbolKind::File))
-                                    .map(|s| s.name.as_str())
-                                    .collect();
-                                for row in &indexed_rows {
-                                    if row.kind.eq_ignore_ascii_case("file")
-                                        || declared_names.contains(row.name.as_str())
-                                    {
-                                        continue;
-                                    }
-                                    let safe_to_tombstone = if is_full_ast {
-                                        true
-                                    } else {
-                                        fallback_supports_symbol_kind(&row.kind)
-                                            && code_no_comments.as_deref().is_some_and(|cleaned| {
-                                                !contains_identifier_token(cleaned, &row.name)
-                                            })
-                                    };
-                                    if safe_to_tombstone {
-                                        overlay.mark_symbol_tombstone(
-                                            file_scoped_symbol_id(&rel_path, &row.name),
-                                            None,
-                                        );
-                                        overlay.mark_symbol_tombstone(
-                                            file_scoped_symbol_id(&rel_path, &row.qualified_name),
-                                            None,
-                                        );
-                                    }
-                                }
-                            }
-                            let anchor_nid = first_node.unwrap_or(0);
-                            overlay.record_extraction(&rel_path, extraction, anchor_nid);
                         }
                     }
-                    None => {
-                        if !full_path.exists() {
-                            overlay.mark_file_tombstone(&rel_path, first_node);
-                            for row in &indexed_rows {
-                                overlay.mark_symbol_tombstone(
-                                    file_scoped_symbol_id(&rel_path, &row.name),
-                                    None,
-                                );
-                                overlay.mark_symbol_tombstone(
-                                    file_scoped_symbol_id(&rel_path, &row.qualified_name),
-                                    None,
-                                );
-                            }
-                        } else {
-                            skipped_large_files += 1;
-                        }
-                        for nid in node_ids {
-                            overlay.dirty_nodes.insert(nid);
-                        }
-                    }
+                    None => skipped_large_files += 1,
                 }
             }
         }
     }
 
-    let overlay_path = OVERLAY_RELPATH
-        .split('/')
-        .fold(state_dir, |acc, part| acc.join(part));
-    if let Some(parent) = overlay_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| CommandError::from(format!("cannot create {}: {e}", parent.display())))?;
-    }
-    let encoded = serde_json::to_vec_pretty(&overlay)
-        .map_err(|e| CommandError::from(format!("cannot serialize WorktreeOverlay: {e}")))?;
-    devmap_query::write_atomic(&overlay_path, &encoded)
-        .map_err(|e| CommandError::from(format!("cannot write {}: {e}", overlay_path.display())))?;
-
-    let modified_count = overlay
-        .modified_files
-        .values()
-        .filter(|v| v.as_str() != CAS_TOMBSTONE)
-        .count();
-
     Ok(WorktreeOverlayReport {
-        overlay_path: overlay_path.to_string_lossy().into_owned(),
-        generation_id: overlay.generation,
+        overlay_path: String::new(),
+        generation_id: u64::from(generation_id),
         base_head_sha,
-        modified_files: modified_count,
-        tombstoned_files: overlay.tombstoned_files.len(),
-        tombstoned_symbols: overlay.tombstoned_symbols.len(),
-        dirty_nodes: overlay.dirty_nodes.len(),
-        reused_cas_asts,
+        modified_files,
+        tombstoned_files,
+        tombstoned_symbols: tombstoned_symbols.len(),
+        dirty_nodes: dirty_nodes.len(),
+        reused_cas_asts: 0,
         skipped_large_files,
         truncated,
         duration_ms: start.elapsed().as_millis() as u64,
     })
 }
 
-/// Reads the persisted [`WorktreeOverlay`] for `repo_path` when one exists.
+/// Reads the canonical [`WorktreeOverlay`] projected from a stacked worktree's
+/// `delta.sqlite` (enriched with CSR `dirty_nodes`), strictly read-only (`Owner Stop #1`).
+///
+/// Returns `Ok(None)` when the checkout has no `stack_lease.json` or when no
+/// `delta.sqlite` exists yet, and returns `Err` when `stack_lease.json`,
+/// `base.sqlite`, or `delta.sqlite` is corrupt or when a retired `base_store_ref.json`
+/// is encountered (`Owner Stop #2`).
 pub fn load_worktree_overlay(repo_path: &str) -> Result<Option<WorktreeOverlay>, CommandError> {
     let repo = validate_repo(repo_path)?;
-    let state_dir = devmap_query::paths::state_dir(&repo);
-    let overlay_path = OVERLAY_RELPATH
-        .split('/')
-        .fold(state_dir, |acc, part| acc.join(part));
-    if !overlay_path.is_file() {
-        if let Some(stacked) = devmap_query::StackedStore::open_if_leased(&repo)
-            .map_err(|e| CommandError::from(e.to_string()))?
-        {
-            return Ok(Some(stacked.overlay().clone()));
-        }
+    let Some((base_store, _meta, stacked)) = open_verified_stacked_store(&repo)? else {
+        return Ok(None);
+    };
+    if !stacked.delta_present() {
         return Ok(None);
     }
-    let bytes = read_bounded_file(&overlay_path, 32 * 1024 * 1024)?.ok_or_else(|| {
-        CommandError::from(format!(
-            "worktree overlay {} exceeds size bound or is not a regular file",
-            overlay_path.display()
-        ))
-    })?;
-    let overlay: WorktreeOverlay = serde_json::from_slice(&bytes).map_err(|e| {
-        CommandError::from(format!(
-            "failed to parse worktree overlay {}: {e}",
-            overlay_path.display()
-        ))
-    })?;
-    Ok(Some(overlay))
+    let mut ov = stacked.overlay().clone();
+    let csr_opt = open_worktree_or_anchor_csr(&repo);
+    enrich_stacked_overlay_with_csr(&mut ov, &base_store, csr_opt.as_ref().map(|(r, _)| r));
+    Ok(Some(ov))
 }
 
 /// What a read-only dirty-node scan found, and whether it is the whole answer.
@@ -2199,48 +1915,41 @@ pub(crate) struct DirtyNodeScan {
 
 /// Computes live [`RoaringBitmap`] CSR `dirty_nodes` for `repo_path` purely in memory
 /// without modifying `.git/info/exclude`, creating `.devmap`/`.devcouncil` directories,
-/// or writing `overlay.json` / CAS AST blobs. Used by read-only radar scans (`readOnlyHint: true`).
-///
-/// The result says whether the delta list was capped ([`DirtyNodeScan::truncated`]); a
-/// persisted overlay that cannot be read, or whose generation differs from the CSR being
-/// intersected, is never merged silently (the first is an error, the second is discarded
-/// because the live delta below supersedes it).
+/// or touching `delta.sqlite` (`Owner Stop #1`, `readOnlyHint: true`).
 pub(crate) fn compute_worktree_dirty_nodes_readonly(
     repo_path: &str,
     fallback_anchor: Option<&Path>,
 ) -> Result<DirtyNodeScan, CommandError> {
     let repo = validate_repo(repo_path)?;
-    let prefer_zero_copy = is_sparse_worktree(&repo) && has_zero_copy_or_stack_lease(&repo);
-    let zero_copy_anchor = if prefer_zero_copy {
-        open_verified_zero_copy_anchor_store(&repo)?
+    refuse_legacy_base_store_ref(&repo)?;
+
+    let prefer_stacked = is_sparse_worktree(&repo) && has_stack_lease_or_legacy_ref(&repo);
+    let stacked_open = if prefer_stacked {
+        open_verified_stacked_store(&repo)?
     } else {
         None
     };
-    let local_store = if zero_copy_anchor.is_none() {
+    let local_store = if stacked_open.is_none() {
         super::open_local_indexed_store(&repo).ok()
     } else {
         None
     };
-    let zero_copy_anchor = match zero_copy_anchor {
-        Some(zc) => Some(zc),
-        None if local_store.is_none() => open_verified_zero_copy_anchor_store(&repo)?,
+    let stacked_open = match stacked_open {
+        Some(st) => Some(st),
+        None if local_store.is_none() => open_verified_stacked_store(&repo)?,
         None => None,
     };
-    let fallback_store = if local_store.is_none() && zero_copy_anchor.is_none() {
+    let fallback_store = if local_store.is_none() && stacked_open.is_none() {
         fallback_anchor.and_then(|a| super::open_local_indexed_store(a).ok())
     } else {
         None
     };
 
-    let active_store: Option<&Store> = zero_copy_anchor
+    let active_store: Option<&Store> = stacked_open
         .as_ref()
-        .map(|(s, _)| s)
+        .map(|(s, _, _)| s)
         .or(local_store.as_ref())
         .or(fallback_store.as_ref());
-
-    // Node IDs are only comparable within one CSR generation; a persisted overlay is
-    // merged below only after its generation is checked against the CSR in hand.
-    let persisted = load_worktree_overlay(repo_path)?;
 
     let Some(store) = active_store else {
         return Ok(DirtyNodeScan::default());
@@ -2248,19 +1957,29 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
     let Some(csr_reader) = store.open_latest_csr_sidecar().ok().flatten() else {
         return Ok(DirtyNodeScan::default());
     };
-    let mut dirty = match persisted {
-        Some(existing) if existing.generation == csr_reader.generation() => existing.dirty_nodes,
-        _ => devmap_query::RoaringBitmap::new(),
-    };
+
+    let mut dirty = devmap_query::RoaringBitmap::new();
+    if let Some((ref base_store, _, ref stacked)) = stacked_open {
+        if stacked.delta_present() {
+            let mut ov = stacked.overlay().clone();
+            enrich_stacked_overlay_with_csr(&mut ov, base_store, Some(&csr_reader));
+            if ov.generation == csr_reader.generation() {
+                for nid in ov.dirty_nodes.to_vec() {
+                    dirty.insert(nid);
+                }
+            }
+        }
+    }
+
     let csr_lookup = CsrDigestLookup::from_reader(&csr_reader);
     let base_head_sha = store
         .latest_generation_head_sha()
         .ok()
         .flatten()
         .or_else(|| {
-            zero_copy_anchor
+            stacked_open
                 .as_ref()
-                .and_then(|(_, r)| r.base_head_sha.clone())
+                .and_then(|(_, m, _)| m.base_head_sha.clone())
         });
 
     let (deltas, truncated) = collect_worktree_deltas(&repo, base_head_sha.as_deref())?;
@@ -2269,7 +1988,16 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
             .latest_symbols_for_file(&rel_path)
             .ok()
             .flatten()
-            .map(|page| page.rows.into_iter().map(|r| r.qualified_name).collect())
+            .map(|page| {
+                let mut names = Vec::with_capacity(page.rows.len() * 2);
+                for r in page.rows {
+                    if r.qualified_name != r.name {
+                        names.push(r.qualified_name);
+                    }
+                    names.push(r.name);
+                }
+                names
+            })
             .unwrap_or_default();
         for nid in csr_lookup.matching_nodes(&rel_path, &indexed_symbols) {
             dirty.insert(nid);
@@ -2303,25 +2031,195 @@ mod tests {
         );
     }
 
+    fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for rel in [".local/bin/devmap", ".cargo/bin/devmap"] {
+                let candidate = home.join(rel);
+                if candidate.is_file() {
+                    return crate::devmap::cli::bind_test_binary(
+                        candidate.to_string_lossy().into_owned(),
+                    );
+                }
+            }
+        }
+        let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
+        crate::devmap::cli::bind_test_binary(resolved.path)
+    }
+
+    fn seed_fresh_anchor_for_zero_copy() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path();
+        git(anchor, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::create_dir_all(anchor.join("tests")).unwrap();
+        let caller_src = "pub fn probe_caller() { probe_callee(); }\n";
+        let callee_src = "pub fn probe_callee() {}\n";
+        let test_src = "#[test]\nfn calls_probe_caller() { probe_caller(); }\n";
+        fs::write(anchor.join("src/caller.rs"), caller_src).unwrap();
+        fs::write(anchor.join("src/callee.rs"), callee_src).unwrap();
+        fs::write(anchor.join("tests/caller_test.rs"), test_src).unwrap();
+        git(anchor, &["add", "."]);
+        git(
+            anchor,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "seed fresh anchor",
+            ],
+        );
+        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let mut head_out_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut head_out_cmd);
+        let head_out = head_out_cmd
+            .current_dir(&canon_anchor)
+            .args(["rev-parse", "HEAD"])
+            .output_locked()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        crate::test_support::trust_repo(&canon_anchor);
+        crate::devmap::ensure_state_dir_excluded(&canon_anchor);
+
+        let scanned = devmap_extract::scan_tree(&canon_anchor).unwrap();
+        let hashes: std::collections::BTreeMap<String, u64> = scanned
+            .file_hashes()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity("rust");
+
+        let db = devmap_query::paths::store_path(&canon_anchor);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = Store::open(&db).unwrap();
+        store.bind_repo_root(&canon_anchor).unwrap();
+        drop(store);
+
+        let root_str = canon_anchor.to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let files = [
+            ("src/caller.rs", "probe_caller", caller_src.len() as i64),
+            ("src/callee.rs", "probe_callee", callee_src.len() as i64),
+            (
+                "tests/caller_test.rs",
+                "calls_probe_caller",
+                test_src.len() as i64,
+            ),
+        ];
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                &head_sha,
+                r#"{"total_files":3,"total_symbols":3,"total_edges":2,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
+                &root_str,
+            ),
+        )
+        .unwrap();
+        for (idx, (path, sym, span_end)) in files.iter().enumerate() {
+            let id = (idx + 1) as i64;
+            let raw_hash = *hashes.get(*path).expect("scanned hash");
+            let content_hash = raw_hash as i64;
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, *path))
+                .unwrap();
+            let engine_json =
+                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+                    grammar: "rust".to_string(),
+                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+                })
+                .unwrap();
+            let extraction_json = serde_json::json!({
+                "file_path": *path,
+                "language": "rust",
+                "content_hash": raw_hash,
+                "parse_outcome": "Clean",
+                "symbols": [{
+                    "name": *sym,
+                    "qualified_name": format!("{path}::{sym}"),
+                    "kind": "Function",
+                    "span": { "start_byte": 0, "end_byte": *span_end as usize },
+                    "is_exported": true
+                }],
+                "imports": [],
+                "calls": []
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
+                    parse_outcome_json, engine_json, extraction_json,
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', ?3, ?4, '[]', ?5, ?6)",
+                (
+                    id,
+                    content_hash,
+                    &engine_json,
+                    &extraction_json,
+                    &grammar_ver,
+                    &analyzer_ver,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+            let qname = format!("{path}::{sym}");
+            conn.execute(
+                "INSERT INTO payload_nodes
+                   (payload_id, ord_in_file, name, qualified_name, kind,
+                    span_start, span_end, is_exported)
+                 VALUES (?1, 0, ?2, ?3, 'Function', 0, ?4, 1)",
+                (id, *sym, &qname, *span_end),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (id << 24, *sym, &qname, *path),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (0, 1, 2, 'probe_caller', 'probe_callee', 'Calls', 0.95, 1, NULL),
+                    (1, 3, 1, 'calls_probe_caller', 'probe_caller', 'Calls', 0.95, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO build_history
+               (generation_id, built_at, head_sha, files, symbols, edges,
+                dead_confident, dead_ambiguous, parse_failed, languages_covered,
+                build_ms, db_bytes)
+             VALUES (1, 0.0, ?1, 3, 3, 2, 0, 0, 0, 1, NULL, 0)",
+            [&head_sha],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Materialize the anchor CSR sidecar once so sealed base snapshots publish `.csr`.
+        let _csr = crate::codeintel::open_repo_csr_graph(canon_anchor.to_str().unwrap()).unwrap();
+
+        (dir, head_sha)
+    }
+
     #[test]
     fn provision_worktree_devmap_clones_and_rebinds_store_keeping_git_status_clean() {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
 
-        // Seed a repo_map.json and CAS AST artifact in the anchor so we prove
-        // sidecar and CAS CoW seeding in the same pass.
         let anchor_map = devmap_query::paths::repo_map_path(anchor);
         fs::write(&anchor_map, r#"{"schema_version":1,"files":[]}"#).unwrap();
-
-        let anchor_state = devmap_query::paths::state_dir(anchor);
-        let anchor_cas = CasAstStore::with_custom_dir(cas_ast_dir_for_state(&anchor_state));
-        let sample_bytes = b"pub fn shared_across_lanes() -> usize { 42 }\n";
-        let sample_ext: devmap_extract::model::Extraction = serde_json::from_str(
-            r#"{"file_path":"src/shared.rs","language":"rust","content_hash":77,"parse_outcome":"Clean","symbols":[],"imports":[],"calls":[]}"#,
-        )
-        .unwrap();
-        let (cas_hash, _, _) = anchor_cas.store_ast(sample_bytes, &sample_ext).unwrap();
 
         let wt_parent = tempfile::tempdir().unwrap();
         let wt = wt_parent.path().join("lane-alpha");
@@ -2335,10 +2233,16 @@ mod tests {
         assert!(report.seeded, "{report:?}");
         assert!(report.csr_seeded, "{report:?}");
         assert!(report.repo_map_seeded, "{report:?}");
-        assert!(report.cas_seeded, "{report:?}");
+        assert!(!report.cas_seeded, "{report:?}");
+        assert!(report.overlay_path.is_none(), "{report:?}");
         assert!(report.generation_id.is_some());
 
-        // `nlink` must be 1 so `Store::validate_database_file` accepts it.
+        // Legacy sidecars must never be written (`P2.3`).
+        let wt_ci = devmap_query::paths::state_dir(&wt).join("codeintel");
+        assert!(!wt_ci.join("overlay.json").exists());
+        assert!(!wt_ci.join("base_store_ref.json").exists());
+        assert!(!wt_ci.join("cas").exists());
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -2350,8 +2254,6 @@ mod tests {
             );
         }
 
-        // Codeintel status and CSR graph must open cleanly in the new worktree
-        // without running `devmap build`!
         let wt_str = wt.to_str().unwrap();
         let status = crate::codeintel::status(wt_str);
         assert!(status.available, "worktree store should open: {status:?}");
@@ -2359,7 +2261,6 @@ mod tests {
         let csr = crate::codeintel::open_repo_csr_graph(wt_str).expect("CSR graph");
         assert_eq!(csr.generation(), u64::from(report.generation_id.unwrap()));
 
-        // Git status in the worktree must be 100% clean (excluded via info/exclude).
         let mut git_status_cmd = Command::new("git");
         crate::test_support::pin_git(&mut git_status_cmd);
         let git_status = git_status_cmd
@@ -2372,22 +2273,6 @@ mod tests {
             "",
             "DevMap seeding must never dirty git status"
         );
-
-        // Now write the CAS-matching file + delete any tracked file and sync overlay.
-        fs::create_dir_all(wt.join("src")).unwrap();
-        fs::write(wt.join("src/shared.rs"), sample_bytes).unwrap();
-        let sync = sync_worktree_overlay(wt_str).expect("sync overlay");
-        assert_eq!(sync.modified_files, 1);
-        assert_eq!(sync.reused_cas_asts, 1);
-
-        let loaded = load_worktree_overlay(wt_str)
-            .expect("load overlay")
-            .expect("overlay exists");
-        assert_eq!(
-            loaded.resolve_file(Path::new("src/shared.rs"), None),
-            Some(cas_hash.as_str())
-        );
-        assert!(loaded.added_extractions.contains_key("src/shared.rs"));
     }
 
     #[test]
@@ -2396,9 +2281,6 @@ mod tests {
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
 
-        // Hold a pinned reader on the older snapshot AND a subsequent WAL commit so
-        // `wal_checkpoint(TRUNCATE)` cannot truncate the WAL and must fall back to
-        // `VACUUM INTO` online backup.
         let anchor_db = devmap_query::paths::store_path(anchor);
         let writer = Connection::open(&anchor_db).unwrap();
         writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -2532,56 +2414,49 @@ mod tests {
 
     #[test]
     fn sync_worktree_overlay_marks_deleted_files_and_symbols_with_tombstone() {
-        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
-        let repo = repo_dir.path();
-        crate::test_support::trust_repo(repo);
-        crate::devmap::ensure_state_dir_excluded(repo);
+        let _devmap = bind_real_devmap();
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
 
-        // Create and commit a tracked file, then delete it so git status sees deletion.
-        fs::write(repo.join(" doomed.rs".trim()), "pub fn vanish() {}\n").unwrap();
-        git(repo, &["add", "doomed.rs"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("lane-tombstone");
         git(
-            repo,
+            anchor,
             &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "-m",
-                "add doomed",
+                "worktree",
+                "add",
+                "-b",
+                "lane/tombstone",
+                wt.to_str().unwrap(),
             ],
         );
-        fs::remove_file(repo.join("doomed.rs")).unwrap();
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("provision stacked");
 
-        let report = sync_worktree_overlay(repo.to_str().unwrap()).expect("sync");
-        assert!(report.tombstoned_files >= 1, "{report:?}");
+        fs::remove_file(wt.join("src/callee.rs")).unwrap();
 
-        let overlay = load_worktree_overlay(repo.to_str().unwrap())
-            .unwrap()
-            .unwrap();
-        assert!(overlay.is_file_tombstoned(Path::new("doomed.rs")));
+        let wt_str = wt.to_str().unwrap();
+        let report = sync_worktree_overlay(wt_str).expect("sync");
+        assert_eq!(report.tombstoned_files, 1, "{report:?}");
+        assert!(report.tombstoned_symbols >= 1, "{report:?}");
+        assert!(report.dirty_nodes >= 1, "{report:?}");
+
+        let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
+        assert!(overlay.is_file_tombstoned(Path::new("src/callee.rs")));
+        assert!(overlay
+            .tombstoned_symbols
+            .contains("src/callee.rs::probe_callee"));
         assert_eq!(
-            overlay.resolve_file(Path::new("doomed.rs"), Some("b3_old")),
+            overlay.resolve_file(Path::new("src/callee.rs"), Some("b3_old")),
             None
         );
     }
 
     #[test]
     fn provision_worktree_devmap_zero_copy_shares_anchor_graph_without_copying_sqlite() {
-        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let _devmap = bind_real_devmap();
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
-        crate::test_support::trust_repo(anchor);
-
-        let anchor_state = devmap_query::paths::state_dir(anchor);
-        let anchor_cas = CasAstStore::with_custom_dir(cas_ast_dir_for_state(&anchor_state));
-        let sample_bytes = b"pub fn zero_copy_ast_shared() -> usize { 99 }\n";
-        let sample_ext: devmap_extract::model::Extraction = serde_json::from_str(
-            r#"{"file_path":"src/zc.rs","language":"rust","content_hash":99,"parse_outcome":"Clean","symbols":[],"imports":[],"calls":[]}"#,
-        )
-        .unwrap();
-        let (cas_hash, _, _) = anchor_cas.store_ast(sample_bytes, &sample_ext).unwrap();
 
         let wt_parent = tempfile::tempdir().unwrap();
         let wt = wt_parent.path().join("lane-zero-copy");
@@ -2602,47 +2477,72 @@ mod tests {
         assert!(report.zero_copy_base_ref, "{report:?}");
         assert!(!report.is_cow);
         assert!(report.csr_seeded);
-        assert!(report.cas_seeded);
+        assert!(!report.cas_seeded);
+        assert!(report.overlay_path.is_none());
 
-        // Zero SQLite bytes copied into the worktree!
-        assert!(
-            !devmap_query::paths::store_path(&wt).exists(),
-            "zero-copy worktree must NOT duplicate devmap.sqlite"
-        );
-        let wt_str = wt.to_str().unwrap();
-        let loaded_ref = load_zero_copy_base_ref(wt_str)
-            .expect("load base ref")
-            .expect("base_store_ref.json exists");
-        assert_eq!(loaded_ref.generation_id, report.generation_id.unwrap());
+        // Zero SQLite bytes, zero legacy `base_store_ref.json`/`overlay.json`/`cas`,
+        // and zero `delta.sqlite` when clean!
+        let wt_ci = devmap_query::paths::state_dir(&wt).join("codeintel");
+        assert!(!devmap_query::paths::store_path(&wt).exists());
+        assert!(!wt_ci.join("base_store_ref.json").exists());
+        assert!(!wt_ci.join("overlay.json").exists());
+        assert!(!wt_ci.join("cas").exists());
+        assert!(!devmap_extract::paths::stack_delta_path(&wt).exists());
 
-        let (csr, gen) = open_worktree_or_anchor_csr(&wt).expect("anchor CSR mmap");
-        assert_eq!(gen, u64::from(loaded_ref.generation_id));
+        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
+        assert!(lease_path.is_file());
+        let lease = devmap_query::stacked::StackLease::read_from(&lease_path).unwrap();
+        assert_eq!(Some(lease.generation_id), report.generation_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(lease.base_sqlite_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o444, "sealed base snapshot must be read-only 0444");
+        }
+
+        let (csr, gen) = open_worktree_or_anchor_csr(&wt).expect("base CSR mmap");
+        assert_eq!(gen, u64::from(lease.generation_id));
         assert!(csr.node_count() > 0);
 
-        // Anchor CAS AST read-through works without copying cas/ast/!
+        let wt_str = wt.to_str().unwrap();
         assert!(
-            !cas_ast_dir_for_state(&devmap_query::paths::state_dir(&wt)).exists(),
-            "zero-copy worktree must NOT duplicate cas/ast directory"
+            load_worktree_overlay(wt_str).unwrap().is_none(),
+            "clean stacked worktree has no delta.sqlite yet"
         );
-        fs::create_dir_all(wt.join("src")).unwrap();
+
+        let sample_bytes = b"pub fn zero_copy_treesitter_symbol() -> usize { 99 }\n";
         fs::write(wt.join("src/zc.rs"), sample_bytes).unwrap();
-        let sync = sync_worktree_overlay(wt_str).expect("sync zero-copy overlay");
+        let sync = sync_worktree_overlay(wt_str).expect("sync stacked delta");
         assert_eq!(sync.modified_files, 1);
-        assert_eq!(sync.reused_cas_asts, 1);
 
         let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
+        let expected_b3 = devmap_query::blake3_hash(sample_bytes);
         assert_eq!(
             overlay.resolve_file(Path::new("src/zc.rs"), None),
-            Some(cas_hash.as_str())
+            Some(expected_b3.as_str())
         );
-        assert!(overlay.added_extractions.contains_key("src/zc.rs"));
+        let ext = overlay
+            .added_extractions
+            .get("src/zc.rs")
+            .expect("Tree-sitter extraction stored in delta.sqlite");
+        assert!(matches!(
+            ext.engine,
+            devmap_extract::ExtractionEngine::TreeSitter { .. }
+        ));
+        assert!(ext
+            .symbols
+            .iter()
+            .any(|s| s.name == "zero_copy_treesitter_symbol"));
     }
 
     #[test]
-    fn load_zero_copy_base_ref_refuses_cross_repository_pointer_spoofing() {
-        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+    fn legacy_base_store_ref_and_cross_repository_stack_lease_are_refused_cleanly() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
-        crate::test_support::trust_repo(anchor);
 
         let stranger_dir = tempfile::tempdir().unwrap();
         let stranger = stranger_dir.path();
@@ -2664,41 +2564,125 @@ mod tests {
         crate::test_support::trust_repo(stranger);
         crate::devmap::ensure_state_dir_excluded(stranger);
 
-        let spoofed = ZeroCopyBaseRef {
-            anchor_repo_root: anchor.to_string_lossy().into_owned(),
-            anchor_db_path: devmap_query::paths::store_path(anchor)
-                .to_string_lossy()
-                .into_owned(),
-            anchor_csr_path: None,
-            anchor_cas_dir: None,
-            generation_id: 1,
-            base_head_sha: None,
-        };
-        let ref_path = zero_copy_base_ref_path(stranger.to_str().unwrap());
-        fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
-        fs::write(&ref_path, serde_json::to_vec(&spoofed).unwrap()).unwrap();
+        // 1. Owner Stop #2: retired `base_store_ref.json` is refused naming `devmap seed --stacked`
+        //    and NEVER auto-provisioned or upgraded on read!
+        let legacy_path = legacy_base_store_ref_path(stranger);
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, br#"{"generation_id":1}"#).unwrap();
 
-        let err = load_zero_copy_base_ref(stranger.to_str().unwrap())
-            .expect_err("must refuse cross-family pointer");
+        let stranger_str = stranger.to_str().unwrap();
+        let err = load_worktree_overlay(stranger_str)
+            .expect_err("retired base_store_ref.json must be refused");
         assert!(
-            err.message().contains("outside worktree family"),
+            err.message().contains("devmap seed --stacked"),
             "unexpected error: {err:?}"
+        );
+        let st = crate::codeintel::status(stranger_str);
+        assert!(!st.available, "{st:?}");
+        assert!(
+            st.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("devmap seed --stacked")),
+            "{st:?}"
+        );
+        assert!(
+            !devmap_extract::paths::stack_lease_path(stranger).exists(),
+            "refusing legacy base_store_ref.json must never write stack_lease.json"
+        );
+        fs::remove_file(&legacy_path).unwrap();
+
+        // 2. Cross-repository `stack_lease.json` spoofing is refused cleanly!
+        let legit_parent = tempfile::tempdir().unwrap();
+        let legit_wt = legit_parent.path().join("legit-wt");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/legit-lease",
+                legit_wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&legit_wt);
+        provision_worktree_devmap_zero_copy(anchor, &legit_wt).unwrap();
+
+        let mut spoofed_lease = devmap_query::stacked::StackLease::read_from(
+            &devmap_extract::paths::stack_lease_path(&legit_wt),
+        )
+        .unwrap();
+        spoofed_lease.worktree_root = fs::canonicalize(stranger)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let stranger_lease_path = devmap_extract::paths::stack_lease_path(stranger);
+        fs::create_dir_all(stranger_lease_path.parent().unwrap()).unwrap();
+        fs::write(
+            &stranger_lease_path,
+            serde_json::to_vec(&spoofed_lease).unwrap(),
+        )
+        .unwrap();
+
+        let spoof_err = load_worktree_overlay(stranger_str)
+            .expect_err("cross-repository stack_lease.json must be refused");
+        assert!(
+            spoof_err.message().contains("belongs to repository")
+                || spoof_err.message().contains("outside worktree family"),
+            "unexpected error: {spoof_err:?}"
         );
     }
 
-    fn seed_fresh_anchor_for_zero_copy() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let anchor = dir.path();
-        git(anchor, &["init", "-q", "-b", "main"]);
-        fs::create_dir_all(anchor.join("src")).unwrap();
-        fs::create_dir_all(anchor.join("tests")).unwrap();
-        let caller_src = "pub fn probe_caller() { probe_callee(); }\n";
-        let callee_src = "pub fn probe_callee() {}\n";
-        let test_src = "#[test]\nfn calls_probe_caller() { probe_caller(); }\n";
-        fs::write(anchor.join("src/caller.rs"), caller_src).unwrap();
-        fs::write(anchor.join("src/callee.rs"), callee_src).unwrap();
-        fs::write(anchor.join("tests/caller_test.rs"), test_src).unwrap();
-        git(anchor, &["add", "."]);
+    #[test]
+    fn dirty_or_ahead_donor_is_refused_by_provision_worktree_devmap_zero_copy() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-dirty-donor");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/dirty-donor",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+
+        // 1. Uncommitted edit in donor checkout -> refused!
+        let orig_callee = fs::read_to_string(anchor.join("src/callee.rs")).unwrap();
+        fs::write(
+            anchor.join("src/callee.rs"),
+            "pub fn probe_callee() { /* uncommitted donor edit */ }\n",
+        )
+        .unwrap();
+        let dirty_err = provision_worktree_devmap_zero_copy(anchor, &wt)
+            .expect_err("dirty donor must be refused");
+        assert!(
+            dirty_err.message().contains("uncommitted")
+                || dirty_err.message().contains("changed since its index"),
+            "unexpected dirty donor error: {dirty_err:?}"
+        );
+        assert!(
+            !devmap_extract::paths::stack_lease_path(&wt).exists(),
+            "failed provisioning must not leave stack_lease.json"
+        );
+        fs::write(anchor.join("src/callee.rs"), &orig_callee).unwrap();
+
+        // 2.Untracked non-tool file in donor checkout -> refused!
+        fs::write(anchor.join("src/untracked_donor.rs"), "pub fn stray() {}\n").unwrap();
+        let untracked_err = provision_worktree_devmap_zero_copy(anchor, &wt)
+            .expect_err("untracked file in donor must be refused");
+        assert!(
+            untracked_err.message().contains("uncommitted")
+                || untracked_err.message().contains("changed since its index"),
+            "unexpected untracked donor error: {untracked_err:?}"
+        );
+        fs::remove_file(anchor.join("src/untracked_donor.rs")).unwrap();
+
+        // 3. Donor HEAD ahead of indexed generation `head_sha` -> refused!
         git(
             anchor,
             &[
@@ -2708,119 +2692,123 @@ mod tests {
                 "user.email=t@t",
                 "commit",
                 "-q",
+                "--allow-empty",
                 "-m",
-                "seed fresh anchor",
+                "advance HEAD past index",
             ],
         );
-        let mut head_out_cmd = Command::new("git");
-        crate::test_support::pin_git(&mut head_out_cmd);
-        let head_out = head_out_cmd
-            .current_dir(anchor)
-            .args(["rev-parse", "HEAD"])
-            .output_locked()
-            .unwrap();
-        let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
-        crate::test_support::trust_repo(anchor);
-        crate::devmap::ensure_state_dir_excluded(anchor);
+        let ahead_err = provision_worktree_devmap_zero_copy(anchor, &wt)
+            .expect_err("ahead donor HEAD must be refused");
+        assert!(
+            ahead_err.message().contains("HEAD") || ahead_err.message().contains("indexed at"),
+            "unexpected ahead donor error: {ahead_err:?}"
+        );
+    }
 
-        let scanned = devmap_extract::scan_tree(anchor).unwrap();
-        let hashes: std::collections::BTreeMap<String, u64> = scanned
-            .file_hashes()
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
-        let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity("rust");
+    #[test]
+    fn zero_write_on_read_across_all_codeintel_and_radar_surfaces() {
+        let _devmap = bind_real_devmap();
+        let (anchor_dir, head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
 
-        let db = devmap_query::paths::store_path(anchor);
-        fs::create_dir_all(db.parent().unwrap()).unwrap();
-        let store = Store::open(&db).unwrap();
-        store.bind_repo_root(anchor).unwrap();
-        drop(store);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-zero-write-on-read");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/zero-write-on-read",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("provision stacked");
 
-        let root_str = anchor.to_string_lossy().into_owned();
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let files = [
-            ("src/caller.rs", "probe_caller", caller_src.len() as i64),
-            ("src/callee.rs", "probe_callee", callee_src.len() as i64),
-            (
-                "tests/caller_test.rs",
-                "calls_probe_caller",
-                test_src.len() as i64,
-            ),
-        ];
-        conn.execute(
-            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
-             VALUES (1, 0.0, ?1, ?2, ?3)",
-            (
-                &head_sha,
-                r#"{"total_files":3,"total_symbols":3,"total_edges":2,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
-                &root_str,
-            ),
+        // Dirty tracked file + add untracked file WITHOUT calling `sync_worktree_overlay`!
+        fs::write(
+            wt.join("src/caller.rs"),
+            "pub fn probe_caller() { probe_callee(); /* dirty */ }\n",
         )
         .unwrap();
-        for (idx, (path, sym, span_end)) in files.iter().enumerate() {
-            let id = (idx + 1) as i64;
-            let content_hash = *hashes.get(*path).expect("scanned hash") as i64;
-            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, *path))
-                .unwrap();
-            let engine_json =
-                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
-                    grammar: "rust".to_string(),
-                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
-                })
-                .unwrap();
-            conn.execute(
-                "INSERT INTO file_payloads
-                   (payload_id, file_id, content_hash, language,
-                    parse_outcome_json, engine_json, extraction_json,
-                    entry_wiring_json, grammar_version, analyzer_version)
-                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', ?3, '{}', '[]', ?4, ?5)",
-                (id, content_hash, &engine_json, &grammar_ver, &analyzer_ver),
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
-                 VALUES (?1, ?1, 1, NULL)",
-                [id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO payload_nodes
-                   (payload_id, ord_in_file, name, qualified_name, kind,
-                    span_start, span_end, is_exported)
-                 VALUES (?1, 0, ?2, ?2, 'Function', 0, ?3, 1)",
-                (id, *sym, *span_end),
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
-                 VALUES (?1, ?2, ?2, ?3)",
-                (id << 24, *sym, *path),
-            )
-            .unwrap();
-        }
-        conn.execute(
-            "INSERT INTO edge_rows
-               (edge_id, source_file_id, target_file_id,
-                source_symbol, target_symbol, edge_kind, confidence,
-                valid_from, valid_to)
-             VALUES (0, 1, 2, 'probe_caller', 'probe_callee', 'Calls', 0.95, 1, NULL),
-                    (1, 3, 1, 'calls_probe_caller', 'probe_caller', 'Calls', 0.95, 1, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO build_history
-               (generation_id, built_at, head_sha, files, symbols, edges,
-                dead_confident, dead_ambiguous, parse_failed, languages_covered,
-                build_ms, db_bytes)
-             VALUES (1, 0.0, ?1, 3, 3, 2, 0, 0, 0, 1, NULL, 0)",
-            [&head_sha],
-        )
-        .unwrap();
-        drop(conn);
+        fs::write(wt.join("src/unsynced.rs"), "pub fn unsynced_fn() {}\n").unwrap();
 
-        (dir, head_sha)
+        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
+        let delta_path = devmap_extract::paths::stack_delta_path(&wt);
+        let lease = devmap_query::stacked::StackLease::read_from(&lease_path).unwrap();
+        let base_sqlite = lease.base_sqlite_path();
+        assert!(!delta_path.exists());
+
+        let snap = |p: &Path| -> (Vec<u8>, std::time::SystemTime) {
+            let bytes = fs::read(p).unwrap();
+            let mtime = fs::metadata(p).unwrap().modified().unwrap();
+            (bytes, mtime)
+        };
+        let lease_before = snap(&lease_path);
+        let base_before = snap(&base_sqlite);
+
+        let wt_str = wt.to_str().unwrap();
+        let _ = crate::codeintel::status(wt_str);
+        let _ = crate::codeintel::search(wt_str, "probe_caller", None);
+        let _ = crate::codeintel::explore(
+            wt_str,
+            "probe_caller",
+            None,
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        let _ = crate::codeintel::impact(wt_str, "probe_callee", None);
+        let _ = crate::codeintel::dependencies(wt_str, "src/caller.rs", None);
+        let _ = crate::codeintel::neighbors(
+            wt_str,
+            &["probe_caller".to_string()],
+            None,
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        let _ = crate::codeintel::dead_symbols(wt_str, None);
+        let _ = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        let _ = crate::codeintel::symbols_for_file(wt_str, "src/caller.rs", &head_sha);
+        let _ = load_worktree_overlay(wt_str).unwrap();
+        let _ = compute_worktree_dirty_nodes_readonly(wt_str, Some(anchor)).unwrap();
+        let _ = crate::engine::agent_bus::scan_parallel_agent_radar(anchor.to_str().unwrap())
+            .expect("radar");
+
+        assert!(
+            !delta_path.exists(),
+            "Owner Stop #1: read surfaces must NEVER create delta.sqlite"
+        );
+        assert_eq!(lease_before, snap(&lease_path), "stack_lease.json mutated");
+        assert_eq!(base_before, snap(&base_sqlite), "base.sqlite mutated");
+
+        // Now explicitly sync `delta.sqlite`, make a SECOND unsynced edit, and prove
+        // read surfaces leave the existing `delta.sqlite` bytes & mtime untouched!
+        sync_worktree_overlay(wt_str).expect("explicit sync");
+        assert!(delta_path.is_file());
+        fs::write(
+            wt.join("src/second_dirty.rs"),
+            "pub fn second_unsynced_fn() {}\n",
+        )
+        .unwrap();
+        let delta_before = snap(&delta_path);
+
+        let _ = crate::codeintel::status(wt_str);
+        let _ = crate::codeintel::search(wt_str, "unsynced_fn", None);
+        let _ = crate::codeintel::impact(wt_str, "probe_callee", None);
+        let _ = load_worktree_overlay(wt_str).unwrap();
+        let _ = compute_worktree_dirty_nodes_readonly(wt_str, Some(anchor)).unwrap();
+
+        assert_eq!(
+            delta_before,
+            snap(&delta_path),
+            "Owner Stop #1: read surfaces must NEVER mutate existing delta.sqlite"
+        );
     }
 
     #[test]
@@ -2848,7 +2836,6 @@ mod tests {
 
         let wt_str = wt.to_str().unwrap();
 
-        // 1. Every CodeIntel surface works against the zero-copy worktree!
         let st = crate::codeintel::status(wt_str);
         assert!(st.available, "zero-copy status failed: {st:?}");
         assert_eq!(st.is_fresh, Some(true), "{st:?}");
@@ -2929,8 +2916,8 @@ mod tests {
             "expected tests/caller_test.rs in {selected:?}"
         );
 
-        // 2. Mutating ONLY the zero-copy worktree (while anchor stays clean!) MUST mark the
-        //    worktree stale, fail-close `affected_tests`, and withhold stale anchor `source_span`!
+        // Mutating ONLY the zero-copy worktree MUST mark it stale, fail-close
+        // `affected_tests`, and withhold stale anchor `source_span`!
         fs::write(
             wt.join("src/caller.rs"),
             "// shifted line 1\n// shifted line 2\npub fn probe_caller() { probe_callee(); }\n",
@@ -2938,11 +2925,7 @@ mod tests {
         .unwrap();
 
         let dirty_st = crate::codeintel::status(wt_str);
-        assert_eq!(
-            dirty_st.source_freshness,
-            Some(false),
-            "dirty zero-copy worktree must NOT launder anchor's clean source_freshness: {dirty_st:?}"
-        );
+        assert_eq!(dirty_st.source_freshness, Some(false), "{dirty_st:?}");
         assert_eq!(dirty_st.is_fresh, Some(false));
 
         let dirty_selected = crate::codeintel::affected_tests(
@@ -2951,10 +2934,7 @@ mod tests {
             None,
             crate::codeintel::WalkBounds::default(),
         );
-        assert!(
-            dirty_selected.fail_closed,
-            "dirty zero-copy worktree MUST fail closed on affected_tests: {dirty_selected:?}"
-        );
+        assert!(dirty_selected.fail_closed, "{dirty_selected:?}");
 
         let dirty_hits = crate::codeintel::search(wt_str, "probe_caller", None);
         let dirty_caller = dirty_hits
@@ -2969,167 +2949,162 @@ mod tests {
     }
 
     #[test]
-    fn search_surfaces_an_unreadable_overlay_instead_of_reading_it_as_absent() {
-        let (anchor_dir, _) = fixture_with_csr();
+    fn sync_worktree_overlay_extracts_treesitter_declarations_and_tombstones_removed_symbols() {
+        let _devmap = bind_real_devmap();
+        let (anchor_dir, head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
-        let overlay_path = OVERLAY_RELPATH
-            .split('/')
-            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
-                acc.join(part)
-            });
-        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
-        fs::write(&overlay_path, b"{ not json").unwrap();
-        let hits = crate::codeintel::search(anchor.to_str().unwrap(), "probe_caller", None);
-        assert!(
-            hits.overlay_note
-                .as_deref()
-                .is_some_and(|n| n.contains("unreadable")),
-            "a corrupt overlay must be reported: {hits:?}"
-        );
-    }
 
-    #[test]
-    fn overlay_search_hits_are_capped_and_the_cap_sets_truncated() {
-        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
-        let anchor = anchor_dir.path();
         let wt_parent = tempfile::tempdir().unwrap();
-        let wt = wt_parent.path().join("wt-cap");
+        let wt = wt_parent.path().join("wt-lane-ts");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/cap", wt.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/extract-ts",
+                wt.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt);
         provision_worktree_devmap_zero_copy(anchor, &wt).unwrap();
-        let src: String = (0..80)
-            .map(|i| format!("pub fn overlay_cap_probe_{i}() -> usize {{ {i} }}\n"))
-            .collect();
-        fs::write(wt.join("src/many.rs"), src).unwrap();
+
         let wt_str = wt.to_str().unwrap();
-        sync_worktree_overlay(wt_str).expect("sync");
-
-        let hits = crate::codeintel::search(wt_str, "overlay_cap_probe_", Some(100_000));
-        let overlay_hits = hits
-            .items
-            .iter()
-            .filter(|h| h.file_path == "src/many.rs")
-            .count();
-        assert!(overlay_hits > 0, "premise: overlay symbols found: {hits:?}");
-        assert!(
-            overlay_hits <= 50,
-            "overlay hits must be bounded, got {overlay_hits}"
-        );
-        assert!(hits.truncated, "a capped overlay search must say truncated");
-        assert!(hits.walk_incomplete.is_none(), "{:?}", hits.walk_incomplete);
-    }
-
-    #[test]
-    fn sync_worktree_overlay_extracts_fallback_declarations_tombstones_removed_symbols_and_shares_cas(
-    ) {
-        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
-        let anchor = anchor_dir.path();
-
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt_a = wt_parent.path().join("wt-lane-a");
-        let wt_b = wt_parent.path().join("wt-lane-b");
-        git(
-            anchor,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "lane/extract-a",
-                wt_a.to_str().unwrap(),
-            ],
-        );
-        git(
-            anchor,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "lane/extract-b",
-                wt_b.to_str().unwrap(),
-            ],
-        );
-        crate::test_support::trust_repo(&wt_a);
-        crate::test_support::trust_repo(&wt_b);
-        provision_worktree_devmap_zero_copy(anchor, &wt_a).unwrap();
-        provision_worktree_devmap_zero_copy(anchor, &wt_b).unwrap();
+        // Clean fast-path creates zero `delta.sqlite`.
+        let clean_sync = sync_worktree_overlay(wt_str).expect("clean sync");
+        assert_eq!(clean_sync.modified_files, 0);
+        assert!(!devmap_extract::paths::stack_delta_path(&wt).exists());
 
         let new_file_src = "pub fn brand_new_lane_helper() -> usize { 42 }\n";
-        fs::write(wt_a.join("src/new_feature.rs"), new_file_src).unwrap();
-        // Replace `probe_caller` with `replacement_caller` in `src/caller.rs`
+        fs::write(wt.join("src/new_feature.rs"), new_file_src).unwrap();
         fs::write(
-            wt_a.join("src/caller.rs"),
+            wt.join("src/caller.rs"),
             "pub fn replacement_caller() { probe_callee(); }\n",
         )
         .unwrap();
 
-        let wt_a_str = wt_a.to_str().unwrap();
-        let sync_a = sync_worktree_overlay(wt_a_str).expect("sync_a");
-        assert_eq!(sync_a.modified_files, 2);
+        let sync = sync_worktree_overlay(wt_str).expect("sync");
+        assert_eq!(sync.modified_files, 2);
+        assert!(sync.dirty_nodes >= 1);
 
-        let overlay_a = load_worktree_overlay(wt_a_str).unwrap().unwrap();
-        let new_ext = overlay_a
+        let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
+        let new_ext = overlay
             .added_extractions
             .get("src/new_feature.rs")
-            .expect("fallback declaration extraction must populate added_extractions");
-        assert!(
-            new_ext
-                .symbols
-                .iter()
-                .any(|s| s.name == "brand_new_lane_helper"),
-            "expected brand_new_lane_helper in {new_ext:?}"
-        );
-        assert!(
-            overlay_a
-                .tombstoned_symbols
-                .contains("src/caller.rs::probe_caller"),
-            "removed symbol probe_caller must be tombstoned: {:?}",
-            overlay_a.tombstoned_symbols
-        );
+            .expect("Tree-sitter extraction must populate added_extractions");
+        assert!(matches!(
+            new_ext.engine,
+            devmap_extract::ExtractionEngine::TreeSitter { .. }
+        ));
+        assert!(new_ext
+            .symbols
+            .iter()
+            .any(|s| s.name == "brand_new_lane_helper"));
+        assert!(overlay
+            .tombstoned_symbols
+            .contains("src/caller.rs::probe_caller"));
 
-        // `codeintel::search` surfaces uncommitted `brand_new_lane_helper` with `walk_incomplete`
-        // and filters out tombstoned `probe_caller`!
-        let new_hits = crate::codeintel::search(wt_a_str, "brand_new_lane_helper", None);
-        assert!(new_hits.available);
-        assert!(
-            new_hits
-                .items
-                .iter()
-                .any(|h| h.symbol_name == "brand_new_lane_helper"
-                    && h.file_path == "src/new_feature.rs"),
-            "expected overlay symbol in search results: {new_hits:?}"
-        );
-        assert!(
-            new_hits
-                .overlay_note
-                .as_deref()
-                .is_some_and(|n| n.contains("overlay symbols")),
-            "fallback overlay symbol search must disclose itself in overlay_note: {new_hits:?}"
-        );
-        assert!(
-            new_hits.walk_incomplete.is_none(),
-            "overlay provenance is not an early stop: {:?}",
-            new_hits.walk_incomplete
-        );
+        let new_hits = crate::codeintel::search(wt_str, "brand_new_lane_helper", None);
+        assert!(new_hits.available, "{new_hits:?}");
+        assert!(new_hits.items.iter().any(|h| {
+            h.symbol_name == "brand_new_lane_helper"
+                && h.file_path == "src/new_feature.rs"
+                && h.source_span.contains("42")
+        }));
 
-        let old_hits = crate::codeintel::search(wt_a_str, "probe_caller", None);
+        let old_hits = crate::codeintel::search(wt_str, "probe_caller", None);
         assert!(
             !old_hits
                 .items
                 .iter()
                 .any(|h| h.symbol_name == "probe_caller"),
-            "tombstoned symbol probe_caller must be filtered from worktree search: {old_hits:?}"
+            "replaced symbol probe_caller must be masked from search: {old_hits:?}"
         );
 
-        // Sibling zero-copy lane `wt_b` writing identical `src/new_feature.rs` hits shared anchor CAS!
-        fs::write(wt_b.join("src/new_feature.rs"), new_file_src).unwrap();
-        let sync_b = sync_worktree_overlay(wt_b.to_str().unwrap()).expect("sync_b");
-        assert_eq!(
-            sync_b.reused_cas_asts, 1,
-            "sibling zero-copy lane must reuse CAS AST written by lane A via anchor CAS"
+        let file_syms = crate::codeintel::symbols_for_file(wt_str, "src/new_feature.rs", &head_sha);
+        assert!(file_syms.available, "{file_syms:?}");
+        assert!(!file_syms.head_matches);
+        assert!(file_syms
+            .items
+            .iter()
+            .any(|s| s.symbol_name == "brand_new_lane_helper"));
+    }
+
+    #[test]
+    fn polyglot_treesitter_sync_preserves_live_methods_and_consts() {
+        let _devmap = bind_real_devmap();
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path();
+        git(anchor, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        let rs_src =
+            "pub const MAX_RETRIES: usize = 3;\npub fn keep_me() -> usize { MAX_RETRIES }\n";
+        let go_src = "package srv\ntype Srv struct{}\nfunc (s *Srv) HandleReq() {}\n";
+        let ts_src = "export const API_URL = 'https://example.test';\nexport class Client { fetchAll() { return API_URL; } }\n";
+        fs::write(anchor.join("src/lib.rs"), rs_src).unwrap();
+        fs::write(anchor.join("src/srv.go"), go_src).unwrap();
+        fs::write(anchor.join("src/client.ts"), ts_src).unwrap();
+        git(anchor, &["add", "."]);
+        git(
+            anchor,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "polyglot init",
+            ],
         );
+        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        crate::test_support::trust_repo(&canon_anchor);
+        crate::devmap::ensure_state_dir_excluded(&canon_anchor);
+        let built = crate::devmap::cli::build(&canon_anchor.to_string_lossy())
+            .expect("build polyglot anchor");
+        assert!(built.ok, "{built:?}");
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-polyglot");
+        git(
+            &canon_anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/polyglot",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(&canon_anchor, &wt).expect("zero-copy");
+
+        fs::write(wt.join("src/lib.rs"), format!("// edit\n{rs_src}")).unwrap();
+        fs::write(wt.join("src/srv.go"), format!("// edit\n{go_src}")).unwrap();
+        fs::write(wt.join("src/client.ts"), format!("// edit\n{ts_src}")).unwrap();
+
+        let wt_str = wt.to_str().unwrap();
+        let sync = sync_worktree_overlay(wt_str).expect("sync");
+        assert_eq!(sync.modified_files, 3);
+
+        let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
+        assert!(
+            overlay.tombstoned_symbols.is_empty(),
+            "live Rust consts, Go receiver methods, and TS exported consts must NEVER be false-negation tombstoned: {:?}",
+            overlay.tombstoned_symbols
+        );
+        for path in ["src/lib.rs", "src/srv.go", "src/client.ts"] {
+            let ext = overlay.added_extractions.get(path).expect(path);
+            assert!(
+                matches!(
+                    ext.engine,
+                    devmap_extract::ExtractionEngine::TreeSitter { .. }
+                ),
+                "expected TreeSitter engine for {path}, got {:?}",
+                ext.engine
+            );
+        }
     }
 
     fn fixture_with_csr() -> (tempfile::TempDir, u64) {
@@ -3155,7 +3130,6 @@ mod tests {
         let anchor = anchor_dir.path();
         let anchor_str = anchor.to_str().unwrap();
 
-        // Pre-existing untracked fixture files count toward the cap; fill to it exactly.
         let (existing, _) = collect_worktree_deltas(anchor, None).unwrap();
         write_bulk_files(anchor, MAX_OVERLAY_DIRTY_FILES - existing.len());
         let at_cap = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
@@ -3174,52 +3148,39 @@ mod tests {
     }
 
     #[test]
-    fn readonly_dirty_scan_ignores_a_persisted_overlay_from_another_csr_generation() {
-        let (anchor_dir, generation) = fixture_with_csr();
+    fn readonly_dirty_scan_fails_loudly_on_corrupt_stack_lease_or_delta_sqlite() {
+        let (anchor_dir, _) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
-        let anchor_str = anchor.to_str().unwrap();
-        let overlay_path = OVERLAY_RELPATH
-            .split('/')
-            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
-                acc.join(part)
-            });
-        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
-        let write_overlay = |overlay_generation: u64| {
-            let mut overlay = WorktreeOverlay::new("fixture".to_string(), overlay_generation);
-            overlay.dirty_nodes.insert(u32::MAX);
-            fs::write(&overlay_path, serde_json::to_vec(&overlay).unwrap()).unwrap();
-        };
 
-        write_overlay(generation);
-        let same = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
-        assert!(
-            same.dirty_nodes.contains(u32::MAX),
-            "an overlay from the CSR's own generation is merged"
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-corrupt-scan");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/corrupt-scan",
+                wt.to_str().unwrap(),
+            ],
         );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).unwrap();
 
-        write_overlay(generation + 7);
-        let stale = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let delta_path = devmap_extract::paths::stack_delta_path(&wt);
+        fs::write(&delta_path, b"not a valid sqlite database").unwrap();
         assert!(
-            !stale.dirty_nodes.contains(u32::MAX),
-            "node IDs from generation {} must not be intersected with generation {generation}",
-            generation + 7
+            compute_worktree_dirty_nodes_readonly(wt_str, Some(anchor)).is_err(),
+            "corrupt delta.sqlite must fail scan loudly"
         );
-    }
+        fs::remove_file(&delta_path).unwrap();
 
-    #[test]
-    fn readonly_dirty_scan_fails_loudly_on_an_unreadable_persisted_overlay() {
-        let (anchor_dir, _) = fixture_with_csr();
-        let anchor = anchor_dir.path();
-        let overlay_path = OVERLAY_RELPATH
-            .split('/')
-            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
-                acc.join(part)
-            });
-        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
-        fs::write(&overlay_path, b"{ not json").unwrap();
+        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
+        fs::write(&lease_path, b"{ not json").unwrap();
         assert!(
-            compute_worktree_dirty_nodes_readonly(anchor.to_str().unwrap(), None).is_err(),
-            "a corrupt overlay is a failed scan, not an empty one"
+            compute_worktree_dirty_nodes_readonly(wt_str, Some(anchor)).is_err(),
+            "corrupt stack_lease.json must fail scan loudly"
         );
     }
 
@@ -3253,46 +3214,21 @@ mod tests {
     }
 
     #[test]
-    fn provisioning_reports_why_an_overlay_sync_failed_on_the_already_seeded_path() {
-        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
-        let anchor = anchor_dir.path();
-        crate::test_support::trust_repo(anchor);
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt = wt_parent.path().join("lane-seeded");
-        git(
-            anchor,
-            &["worktree", "add", "-b", "lane/seeded", wt.to_str().unwrap()],
-        );
-        crate::test_support::trust_repo(&wt);
-        let first = provision_worktree_devmap(anchor, &wt).expect("first provision");
-        assert!(first.seeded, "{first:?}");
-
-        // A directory where overlay.json must be written makes the sync fail.
-        let overlay_path = OVERLAY_RELPATH
-            .split('/')
-            .fold(devmap_query::paths::state_dir(&wt), |acc, part| {
-                acc.join(part)
-            });
-        let _ = fs::remove_file(&overlay_path);
-        fs::create_dir_all(&overlay_path).unwrap();
-
-        let second = provision_worktree_devmap(anchor, &wt).expect("second provision");
-        assert!(second.seeded, "{second:?}");
-        assert!(second.overlay_path.is_none(), "{second:?}");
-        assert!(
-            second
-                .reason
-                .as_deref()
-                .is_some_and(|r| r.contains("overlay sync failed")),
-            "a dropped overlay error must be reported: {second:?}"
-        );
-    }
-
-    #[test]
     fn provision_worktree_devmap_rebinds_via_seed_rebind_and_clones_resolution_reuse() {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
+        let canonical_anchor = fs::canonicalize(anchor).unwrap();
+        {
+            let anchor_conn = Connection::open(devmap_query::paths::store_path(anchor)).unwrap();
+            anchor_conn
+                .execute(
+                    "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+                     VALUES (0, 0.0, NULL, '{}', ?1)",
+                    [canonical_anchor.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+        }
 
         let anchor_state = devmap_query::paths::state_dir(anchor);
         let reuse_dir = anchor_state.join("resolution-reuse-1");
@@ -3316,36 +3252,40 @@ mod tests {
         let report = provision_worktree_devmap(anchor, &wt).expect("provision");
         assert!(report.seeded, "{report:?}");
 
-        // 1. `resolution-reuse-1/` must be CoW-cloned into the worktree (`F9`).
         let wt_reuse_file = devmap_query::paths::state_dir(&wt).join("resolution-reuse-1/unit.bin");
         assert_eq!(
             fs::read(&wt_reuse_file).unwrap(),
             b"cached-resolution-artifact"
         );
 
-        // 2. `seed_rebind` (`F8`, Critique 3) binds `wt` in <32 KiB so `Store::latest_repo_root`
-        //    resolves `wt` without rewriting `generations.analysis_json` overflow pages (`SC-001`).
         let wt_db = devmap_query::paths::store_path(&wt);
         let canonical_wt = fs::canonicalize(&wt).unwrap();
-        let canonical_anchor = fs::canonicalize(anchor).unwrap();
         let reopened = Store::open_read_only(&wt_db).unwrap();
         let effective_root = reopened.latest_repo_root().unwrap().unwrap();
         drop(reopened);
         assert_eq!(fs::canonicalize(&effective_root).unwrap(), canonical_wt);
 
         let conn = Connection::open(&wt_db).unwrap();
-        let raw_gen_root: String = conn
+        let hist_gen_root: String = conn
+            .query_row(
+                "SELECT repo_root FROM generations WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::canonicalize(&hist_gen_root).unwrap(),
+            canonical_anchor,
+            "rebind_staged must preserve historical generation CoW pages"
+        );
+        let latest_gen_root: String = conn
             .query_row(
                 "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            fs::canonicalize(&raw_gen_root).unwrap(),
-            canonical_anchor,
-            "provisioning must not rewrite generations overflow pages"
-        );
+        assert_eq!(PathBuf::from(latest_gen_root), canonical_wt);
         let rebound_root: String = conn
             .query_row(
                 "SELECT seeded_repo_root FROM seed_rebind WHERE singleton = 1",
@@ -3357,58 +3297,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_lease_only_worktree_opens_in_codeintel_and_zero_copy_seals_base_snapshot() {
-        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
-        let anchor = anchor_dir.path();
-
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt = wt_parent.path().join("wt-stack-lease-only");
-        git(
-            anchor,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "lane/stack-lease-only",
-                wt.to_str().unwrap(),
-            ],
-        );
-        crate::test_support::trust_repo(&wt);
-
-        let report = provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
-        assert!(report.seeded, "{report:?}");
-
-        let lease_path = devmap_extract::paths::stack_lease_path(&wt);
-        assert!(
-            lease_path.is_file(),
-            "zero-copy provisioning must emit canonical stack_lease.json (`F1`)"
-        );
-        let lease = devmap_query::stacked::StackLease::read_from(&lease_path).unwrap();
-        let base_sqlite = lease.base_sqlite_path();
-        assert!(base_sqlite.is_file());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&base_sqlite).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o444, "sealed base snapshot must be read-only 0444");
-        }
-
-        // Remove `base_store_ref.json` so ONLY `stack_lease.json` remains (simulating a
-        // worktree seeded directly via `devmap seed --mode stacked`).
-        let wt_str = wt.to_str().unwrap();
-        fs::remove_file(zero_copy_base_ref_path(wt_str)).unwrap();
-
-        let st = crate::codeintel::status(wt_str);
-        assert!(st.available, "stack_lease-only worktree must open: {st:?}");
-        assert_eq!(st.is_fresh, Some(true), "{st:?}");
-
-        let hits = crate::codeintel::search(wt_str, "probe_caller", None);
-        assert!(hits.available);
-        assert!(hits.items.iter().any(|h| h.symbol_name == "probe_caller"));
-    }
-
-    #[test]
-    fn sparse_worktree_prefers_zero_copy_monorepo_base_over_cone_only_local_store() {
+    fn sparse_worktree_prefers_stacked_monorepo_base_over_cone_only_local_store() {
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3429,19 +3318,11 @@ mod tests {
         git(&wt, &["sparse-checkout", "set", "tests"]);
         git(&wt, &["checkout"]);
         crate::test_support::trust_repo(&wt);
-        assert!(
-            is_sparse_worktree(&wt),
-            "expected cone sparse-checkout worktree"
-        );
-        assert!(
-            !wt.join("src/callee.rs").exists(),
-            "out-of-cone src/callee.rs must not be materialized"
-        );
+        assert!(is_sparse_worktree(&wt));
+        assert!(!wt.join("src/callee.rs").exists());
 
         provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy provision");
 
-        // Simulate a partial cone-only local `devmap.sqlite` created inside the sparse
-        // worktree (`F2`) that contains 0 `probe_callee` rows.
         let local_db = devmap_query::paths::store_path(&wt);
         fs::create_dir_all(local_db.parent().unwrap()).unwrap();
         let partial = Store::open(&local_db).unwrap();
@@ -3456,141 +3337,12 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        // `codeintel::search` MUST prefer the full monorepo zero-copy base over the
-        // partial cone-only local `devmap.sqlite` (`F2`)!
         let wt_str = wt.to_str().unwrap();
         let hits = crate::codeintel::search(wt_str, "probe_callee", None);
         assert!(hits.available, "{hits:?}");
         assert!(
             hits.items.iter().any(|h| h.symbol_name == "probe_callee"),
             "sparse worktree must serve out-of-cone monorepo symbols: {hits:?}"
-        );
-    }
-
-    #[test]
-    fn overlay_sync_preserves_live_methods_and_consts_without_poisoning_anchor_cas() {
-        let dir = tempfile::tempdir().unwrap();
-        let anchor = dir.path();
-        git(anchor, &["init", "-q", "-b", "main"]);
-        fs::create_dir_all(anchor.join("src")).unwrap();
-        let rs_src =
-            "pub const MAX_RETRIES: usize = 3;\npub fn keep_me() -> usize { MAX_RETRIES }\n";
-        let go_src = "package srv\ntype Srv struct{}\nfunc (s *Srv) HandleReq() {}\n";
-        let ts_src = "export const API_URL = 'https://example.test';\nexport class Client { fetchAll() { return API_URL; } }\n";
-        fs::write(anchor.join("src/lib.rs"), rs_src).unwrap();
-        fs::write(anchor.join("src/srv.go"), go_src).unwrap();
-        fs::write(anchor.join("src/client.ts"), ts_src).unwrap();
-        git(anchor, &["add", "."]);
-        git(
-            anchor,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "-m",
-                "polyglot init",
-            ],
-        );
-        let head_out = {
-            let mut c = Command::new("git");
-            crate::test_support::pin_git(&mut c);
-            c.current_dir(anchor)
-                .args(["rev-parse", "HEAD"])
-                .output_locked()
-                .unwrap()
-        };
-        let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
-        crate::test_support::trust_repo(anchor);
-        crate::devmap::ensure_state_dir_excluded(anchor);
-
-        let anchor_state = devmap_query::paths::state_dir(anchor);
-        let anchor_cas_dir = cas_ast_dir_for_state(&anchor_state);
-        fs::create_dir_all(&anchor_cas_dir).unwrap();
-
-        let db = devmap_query::paths::store_path(anchor);
-        fs::create_dir_all(db.parent().unwrap()).unwrap();
-        let store = Store::open(&db).unwrap();
-        store.bind_repo_root(anchor).unwrap();
-        drop(store);
-
-        let conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
-             VALUES (1, 0.0, ?1, '{\"total_files\":3,\"total_symbols\":4,\"total_edges\":0,\"dead_symbols\":[],\"communities\":[],\"status\":\"Ok\",\"unresolved_calls\":0}', ?2)",
-            (&head_sha, anchor.to_string_lossy().as_ref()),
-        )
-        .unwrap();
-        let indexed = [
-            (1i64, "src/lib.rs", "rust", "MAX_RETRIES", "Constant"),
-            (2i64, "src/srv.go", "go", "HandleReq", "Method"),
-            (3i64, "src/client.ts", "typescript", "API_URL", "Constant"),
-        ];
-        for (id, path, lang, sym, kind) in indexed {
-            let (gv, av) = devmap_extract::cache::current_payload_identity(lang);
-            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
-                .unwrap();
-            conn.execute(
-                "INSERT INTO file_payloads
-                   (payload_id, file_id, content_hash, language, parse_outcome_json,
-                    engine_json, extraction_json, entry_wiring_json, grammar_version, analyzer_version)
-                 VALUES (?1, ?1, ?2, ?3, '\"Clean\"', '{\"TreeSitter\":{\"grammar\":\"x\",\"grammar_version\":1}}', '{}', '[]', ?4, ?5)",
-                (id, id * 100, lang, &gv, &av),
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to) VALUES (?1, ?1, 1, NULL)",
-                [id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO payload_nodes (payload_id, ord_in_file, name, qualified_name, kind, span_start, span_end, is_exported)
-                 VALUES (?1, 0, ?2, ?2, ?3, 0, 20, 1)",
-                (id, sym, kind),
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt = wt_parent.path().join("wt-polyglot");
-        git(
-            anchor,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "lane/polyglot",
-                wt.to_str().unwrap(),
-            ],
-        );
-        crate::test_support::trust_repo(&wt);
-        provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
-
-        // Edit 1 comment line in each file while keeping `MAX_RETRIES`, `HandleReq`,
-        // and `API_URL` intact (`F4`).
-        fs::write(wt.join("src/lib.rs"), format!("// edit\n{rs_src}")).unwrap();
-        fs::write(wt.join("src/srv.go"), format!("// edit\n{go_src}")).unwrap();
-        fs::write(wt.join("src/client.ts"), format!("// edit\n{ts_src}")).unwrap();
-
-        let wt_str = wt.to_str().unwrap();
-        let sync = sync_worktree_overlay(wt_str).expect("sync");
-        assert_eq!(sync.modified_files, 3);
-
-        let overlay = load_worktree_overlay(wt_str).unwrap().unwrap();
-        assert!(
-            overlay.tombstoned_symbols.is_empty(),
-            "live Rust consts, Go receiver methods, and TS exported consts must NEVER be false-negation tombstoned: {:?}",
-            overlay.tombstoned_symbols
-        );
-
-        // Anchor CAS directory must remain 100% untouched by RegexFallback ASTs (`F4`).
-        let anchor_cas_entries = fs::read_dir(&anchor_cas_dir).unwrap().count();
-        assert_eq!(
-            anchor_cas_entries, 0,
-            "sync_worktree_overlay must never write RegexFallback ASTs into anchor CAS"
         );
     }
 
@@ -3615,8 +3367,6 @@ mod tests {
         provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
         let wt_str = wt.to_str().unwrap();
 
-        // 1. Unrelated prose + unrelated Rust file outside `probe_callee`'s cone MUST
-        //    keep `affected_tests` open (`fail_closed == false`, `F4`)!
         fs::write(wt.join("README.md"), "# Worktree notes\n").unwrap();
         fs::write(
             wt.join("src/unrelated.rs"),
@@ -3640,8 +3390,6 @@ mod tests {
             .iter()
             .any(|t| t.path == "tests/caller_test.rs"));
 
-        // 2. Adding a new file that references `probe_callee` in code MUST immediately
-        //    fail closed (`fail_closed == true`)!
         fs::write(
             wt.join("src/sneaky_new_caller.rs"),
             "pub fn sneaky() { crate::callee::probe_callee(); }\n",
@@ -3661,7 +3409,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_gitlink_worktree_is_refused_by_zero_copy_and_stack_lease_openers() {
+    fn forged_gitlink_worktree_is_refused_by_stacked_store_openers() {
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3680,9 +3428,6 @@ mod tests {
         crate::test_support::trust_repo(&legit_wt);
         provision_worktree_devmap_zero_copy(anchor, &legit_wt).expect("legit zero-copy");
 
-        // Create a forged checkout whose `.git` file points at `legit_wt`'s admin dir,
-        // so `git rev-parse --git-common-dir` matches `anchor/.git`, while the reverse
-        // `<common>/worktrees/legit-lane/gitdir` canonicalizes to `legit_wt/.git`, NOT `forged/.git`!
         let forged_parent = tempfile::tempdir().unwrap();
         let forged_wt = forged_parent.path().join("forged-lane");
         fs::create_dir_all(&forged_wt).unwrap();
@@ -3690,27 +3435,13 @@ mod tests {
         fs::write(forged_wt.join(".git"), legit_git_file).unwrap();
         crate::test_support::trust_repo(&forged_wt);
 
-        // Copy both `base_store_ref.json` and `stack_lease.json` into `forged_wt`.
-        let legit_ci = devmap_query::paths::state_dir(&legit_wt).join("codeintel");
+        let legit_lease = devmap_extract::paths::stack_lease_path(&legit_wt);
         let forged_ci = forged_wt.join(".devcouncil/codeintel");
         fs::create_dir_all(&forged_ci).unwrap();
-        for name in ["base_store_ref.json", "stack_lease.json"] {
-            let src = legit_ci.join(name);
-            if src.is_file() {
-                fs::copy(&src, forged_ci.join(name)).unwrap();
-            }
-        }
+        fs::copy(&legit_lease, forged_ci.join("stack_lease.json")).unwrap();
 
         let forged_str = forged_wt.to_str().unwrap();
-        let ref_err =
-            load_zero_copy_base_ref(forged_str).expect_err("forged gitlink must be refused");
-        assert!(
-            ref_err.message().contains("outside worktree family"),
-            "unexpected error: {ref_err:?}"
-        );
-
-        // Remove `base_store_ref.json` so `open_verified_stack_lease_store` is tested directly too.
-        let _ = fs::remove_file(forged_ci.join("base_store_ref.json"));
+        assert!(load_worktree_overlay(forged_str).is_err());
         let st = crate::codeintel::status(forged_str);
         assert!(
             !st.available,
@@ -3721,6 +3452,7 @@ mod tests {
     #[test]
     fn stacked_delta_sqlite_serves_search_impact_and_affected_tests_and_fails_closed_when_unsynced()
     {
+        let _devmap = bind_real_devmap();
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -3737,38 +3469,15 @@ mod tests {
             ],
         );
         crate::test_support::trust_repo(&wt);
-        devmap_query::provision_stacked_worktree(anchor, &wt).expect("provision stacked");
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("provision stacked");
 
-        // Add a new test file in the worktree calling `probe_callee` and record its
-        // Tree-sitter-shaped Extraction in `delta.sqlite` via `StackedStore`.
         let extra_test_src =
             "#[test]\nfn delta_added_test_for_callee() { crate::callee::probe_callee(); }\n";
         fs::write(wt.join("tests/extra_test.rs"), extra_test_src).unwrap();
 
-        let (mut ext, _) = extract_fallback_ast("tests/extra_test.rs", extra_test_src);
-        ext.engine = devmap_extract::ExtractionEngine::TreeSitter {
-            grammar: "rust".to_string(),
-            grammar_version: 14,
-        };
-        ext.parse_outcome = devmap_extract::ParseOutcome::Clean;
-        ext.calls.push(devmap_extract::ExtractedCall {
-            caller_symbol: Some("tests/extra_test.rs::delta_added_test_for_callee".to_string()),
-            callee_name: "probe_callee".to_string(),
-            receiver_expr: None,
-            span: devmap_extract::Span {
-                start_byte: 0,
-                end_byte: extra_test_src.len(),
-            },
-        });
-        let mut stacked = devmap_query::StackedStore::open(&wt).expect("open stacked");
-        stacked
-            .record_extracted_file("tests/extra_test.rs", extra_test_src.as_bytes(), &ext)
-            .expect("record delta extraction");
-        drop(stacked);
-
         let wt_str = wt.to_str().unwrap();
+        sync_worktree_overlay(wt_str).expect("sync via real Tree-sitter devmap");
 
-        // 1. `search` finds the `delta.sqlite` symbol with its live worktree source span!
         let hits = crate::codeintel::search(wt_str, "delta_added_test_for_callee", None);
         assert!(hits.available, "{hits:?}");
         assert!(
@@ -3780,7 +3489,6 @@ mod tests {
             "search must return delta.sqlite symbol with intact source span: {hits:?}"
         );
 
-        // 2. `impact` on `probe_callee` surfaces the caller edge from `delta.sqlite`!
         let imp = crate::codeintel::impact(wt_str, "probe_callee", None);
         assert!(imp.available, "{imp:?}");
         assert!(
@@ -3790,8 +3498,6 @@ mod tests {
             "impact must include caller edge from delta.sqlite: {imp:?}"
         );
 
-        // 3. `affected_tests` stays open (`fail_closed == false`) when `delta.sqlite`
-        //    accounts for every worktree edit, returning BOTH base and delta test files!
         let aff = crate::codeintel::affected_tests(
             wt_str,
             &["probe_callee".to_string()],
@@ -3813,8 +3519,8 @@ mod tests {
             .iter()
             .any(|t| t.path == "tests/extra_test.rs"));
 
-        // 4. Writing an UNSYNCED caller to disk without syncing `delta.sqlite` MUST
-        //    immediately flip `affected_tests` back to `fail_closed == true`!
+        // Writing an UNSYNCED caller to disk without syncing `delta.sqlite` MUST
+        // immediately flip `affected_tests` back to `fail_closed == true`!
         fs::write(
             wt.join("src/unsynced_caller.rs"),
             "pub fn unsynced() { crate::callee::probe_callee(); }\n",
