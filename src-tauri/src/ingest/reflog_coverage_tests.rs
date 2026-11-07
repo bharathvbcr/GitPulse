@@ -267,3 +267,27 @@ fn adv_a_worktree_past_the_reflog_bound_is_read_within_a_few_passes() {
         "six passes never reached the fifth worktree's HEAD"
     );
 }
+
+/// A checkout reached through a symlinked spelling (macOS's `/var` for
+/// `/private/var`, which is where the command-timings bench's temp dir sits) is
+/// the same worktree as its canonical path, so a family that fits the bound
+/// exactly is read whole and not reported as one reflog short.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_spelling_of_the_trigger_is_not_a_second_worktree() {
+    let (main, _parent, linked) = repo_with_worktrees(1);
+    let anchor = plain(main.path());
+    let holder = tempfile::tempdir().expect("symlink dir");
+    let spelled = holder.path().join("alias");
+    std::os::unix::fs::symlink(&anchor, &spelled).expect("symlink");
+    let spelled = spelled.to_string_lossy().into_owned();
+    assert_eq!(linked.len(), 1);
+
+    let family = family_siblings(&anchor, &spelled);
+    let out = ingest_reflogs(&anchor, &spelled, &family, 2, &Budget::unbounded());
+    assert_eq!(
+        out.reflog_refs_skipped, 0,
+        "two worktrees under a bound of two: {out:?}"
+    );
+    assert!(!out.truncated, "{out:?}");
+}

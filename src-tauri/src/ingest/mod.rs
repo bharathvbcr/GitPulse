@@ -356,11 +356,19 @@ fn ingest_transcripts_until(
 fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Result<Vec<String>, String> {
     crate::engine::worktree::resolve_worktree_family(ledger_repo, worktree_path)
         .map(|family| {
+            // `members` are canonical; the trigger may be spelled through a
+            // symlink (`/var` for `/private/var`), and comparing strings would
+            // list the trigger twice and spend a slot of the per-pass bound.
+            let trigger = std::path::Path::new(worktree_path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(worktree_path));
             family
                 .members
                 .iter()
+                .filter(|member| {
+                    **member != trigger && member.as_path() != std::path::Path::new(worktree_path)
+                })
                 .map(|member| member.to_string_lossy().into_owned())
-                .filter(|member| member != worktree_path)
                 .collect()
         })
         .map_err(CommandError::into_message)
