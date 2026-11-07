@@ -580,30 +580,31 @@ fn clear_record(path: &std::path::Path) {
     }
 }
 
+/// The one `ls-remote` per launch: the listing text, or why it failed.
+type LsRemote = dyn Fn() -> Result<String, String>;
+/// Whether a tag's release is published (see [`release_is_published`]).
+type PublishedProbe = dyn Fn(&str, Version) -> Result<bool, CommandError>;
+
 /// Everything [`run_check`] needs from the outside world. Production fills it
 /// with [`CheckEnv::production`]; tests fill it with fakes, so the wiring
 /// between the real `ls-remote`, clock and record path and
 /// [`evaluate_with_backoff`] is exercised rather than assumed.
 struct CheckEnv {
     current_version: String,
-    /// The one `ls-remote` per launch: the listing text, or why it failed.
-    ls_remote: Box<dyn Fn() -> Result<String, String>>,
-    published: Box<dyn Fn(&str, Version) -> Result<bool, CommandError>>,
+    ls_remote: Box<LsRemote>,
+    published: Box<PublishedProbe>,
     record_path: Option<std::path::PathBuf>,
     now: u64,
 }
 
-const LS_REMOTE_ARGS: [&str; 4] = ["ls-remote", "--tags", "--refs", REPOSITORY_URL];
-
 impl CheckEnv {
-    fn production() -> Self {
+    /// The real version, probe, record path and clock around `ls_remote`.
+    /// The network request itself is spelled out in [`check_for_update`], where
+    /// scripts/update-privacy-contract.test.ts reads it.
+    fn production(ls_remote: Box<LsRemote>) -> Self {
         Self {
             current_version: CURRENT_VERSION.to_string(),
-            ls_remote: Box::new(|| {
-                git_global_with_timeout(&LS_REMOTE_ARGS, CHECK_TIMEOUT)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .map_err(|error| error.into_message())
-            }),
+            ls_remote,
             published: Box::new(release_is_published),
             record_path: record_path(),
             now: now_unix(),
@@ -634,7 +635,14 @@ fn run_check(env: &CheckEnv) -> UpdateCheck {
 /// Exactly one `git ls-remote` per call; the HTTP probes behind it are
 /// subject to the fail-closed back-off of [`evaluate_with_backoff`].
 pub fn check_for_update() -> UpdateCheck {
-    run_check(&CheckEnv::production())
+    run_check(&CheckEnv::production(Box::new(|| {
+        git_global_with_timeout(
+            &["ls-remote", "--tags", "--refs", REPOSITORY_URL],
+            CHECK_TIMEOUT,
+        )
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|error| error.into_message())
+    })))
 }
 
 #[cfg(test)]
@@ -1391,7 +1399,7 @@ mod tests {
     #[test]
     fn the_production_env_uses_the_real_version_record_path_clock_and_one_ls_remote() {
         let before = now_unix();
-        let env = CheckEnv::production();
+        let env = CheckEnv::production(Box::new(|| Ok("listing".to_string())));
         let after = now_unix();
         assert_eq!(env.current_version, CURRENT_VERSION);
         assert_eq!(env.record_path, record_path());
@@ -1404,8 +1412,9 @@ mod tests {
         );
         assert!((before..=after).contains(&env.now), "{}", env.now);
         assert_eq!(
-            LS_REMOTE_ARGS,
-            ["ls-remote", "--tags", "--refs", REPOSITORY_URL]
+            (env.ls_remote)().as_deref(),
+            Ok("listing"),
+            "the given ls-remote is the one the check runs"
         );
     }
 
