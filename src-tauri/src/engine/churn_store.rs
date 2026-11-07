@@ -735,6 +735,22 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Runs `body` with `hook` called on this thread in every `keep`, after the
+/// measurement and before the check that its inputs still hold: the moment a
+/// concurrent neighbour can move them. Removed when `body` returns or unwinds.
+#[cfg(test)]
+pub(crate) fn with_before_keep<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            BEFORE_KEEP.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    BEFORE_KEEP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _clear = Clear;
+    body()
+}
+
 #[cfg(test)]
 fn before_keep_hook() {
     BEFORE_KEEP.with(|hook| {
