@@ -480,5 +480,5 @@ Each option is judged on the five things a new agent worktree needs:
    - `check:schema-parity` is 8/8.
    - GitPulse.app is not yet rebuilt; the owner will do that, and the app's own lane and panel seeding goes live then.
 2. Option 6.
-3. ~~Lane teardown that reclaims `target/` (option 13)~~: measured 2026-11-07, see "Lane build cache" below. Teardown already reclaims an in-tree `target/`; what is left is reclaiming the `target/` of lanes that are kept but idle, which is a new feature and not built.
+3. ~~Lane teardown that reclaims `target/` (option 13)~~: measured 2026-11-07, see "Lane build cache" above. Teardown already reclaims an in-tree `target/`; what is left is reclaiming the `target/` of lanes that are kept but idle, which is a new feature and not built.
 4. Options 7 and 8 only if 2–3 leave a cost worth a cross-app schema change. The owner chose to skip the extraction cache (7) on the measured evidence.
