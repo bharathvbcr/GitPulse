@@ -15,20 +15,25 @@
 //! up on their own clocks) still links. The cost of that choice is that the
 //! answer is recomputed per read, so every scan here is bounded.
 //!
-//! The one outcome this must never give is a confident *wrong* link, so every
-//! rule errs toward null with a named [`basis`]:
+//! The one outcome this must never give is a confident *wrong* link, and
+//! reading a shell command line cannot be made complete, so the rule is to
+//! **fail closed**: a command is a candidate for a link only when everything
+//! about it is determined with certainty, and anything the reader does not
+//! fully understand is not a candidate. At most it makes the answer ambiguous
+//! or earns a named [`basis`]:
 //!
-//! * only a command that is known to have **succeeded** can be credited; one
-//!   that failed, was refused, or whose result was never read cannot (a
-//!   hook-rejected `git commit` made nothing);
-//! * only a command aimed at the commit's own worktree counts (`git -C other`
-//!   and `cd other &&` do not), and only a form that can create a commit
-//!   (`--dry-run`, `--abort`, `-h` do not);
+//! * a command is credited only if it is known to have **succeeded**, and its
+//!   target worktree is **proved** (a plain `git <verb>` in the worktree it
+//!   ran in, or a `-C` / `cd` through plain, existing paths to it). Env
+//!   prefixes, wrappers, nested shells, quoted or escaped or `$`-expanded
+//!   paths, missing paths, `-c` settings that can move the tree, and groupings
+//!   are all "target unknown";
+//! * only a form that can create a commit counts (`--dry-run`, `--abort`, `-h`
+//!   do not);
 //! * only a reflog entry that *created* the commit is its origin: a
-//!   fast-forward, reset or checkout moves a ref onto a commit someone else
-//!   made, and crediting the mover would be crediting the wrong session;
-//! * a read that was cut at its row bound says so (`scan_capped`) whenever a
-//!   hidden row could have changed the answer;
+//!   fast-forward, reset or checkout moves a ref onto someone else's commit;
+//! * a read cut at its row bound says so (`scan_capped`) unless it can show,
+//!   from the unread rows, that none could have changed the answer;
 //! * two sessions that could each have made it give no session and
 //!   `ambiguous: true`.
 //!
@@ -36,9 +41,10 @@
 //! made the commit, in the same worktree, shortly before it.
 
 use super::{ids, with_access, Access, LedgerError};
+use rusqlite::types::ValueRef;
 use rusqlite::{params_from_iter, types::Value, Connection};
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// How long before a reflog entry a command may have started and still be
 /// credited with it: two minutes.
@@ -60,12 +66,15 @@ pub const LINK_WINDOW_MS: u64 = 120_000;
 /// transcript's clock against git's) and does not link.
 pub const REFLOG_GRANULARITY_MS: u64 = 1_000;
 
-/// The newest rows (by id) one call reads: a row older than that is not looked
-/// at. The ledger retains 10 000 events by default, so this reads all of a
-/// default ledger and bounds a larger one to a single indexed range. A
-/// capped read answers only when it can show the rows it did not read cannot
-/// matter ([`HIDDEN_ROW_SKEW_MS`]); otherwise [`basis::SCAN_CAPPED`].
+/// The newest rows (by id) one call reads for commands and reflog entries. The
+/// ledger retains 10 000 events by default, so this reads all of a default
+/// ledger and bounds a larger one to a single indexed range.
 pub const LINK_SCAN_ROWS: i64 = 20_000;
+
+/// How many rows past [`LINK_SCAN_ROWS`] the unread region is examined for
+/// proof that nothing in it matters. A ledger larger than both is not provable
+/// and reads as [`basis::SCAN_CAPPED`].
+pub const HIDDEN_PROBE_ROWS: i64 = 200_000;
 
 /// Most commits one call links; the rest are reported as not examined.
 pub const LINK_MAX_COMMITS: usize = 256;
@@ -75,8 +84,9 @@ pub const LINK_MAX_COMMITS: usize = 256;
 /// An event cannot be recorded before it happened, so a row appended before
 /// the window opened holds nothing in the window. That is read off the append
 /// clock (`ts_utc`), which can disagree with the clock that dated the event
-/// by an NTP step or a laptop that slept; ten minutes covers those, and an
-/// append time inside the slack is treated as possibly in the window.
+/// by an NTP step or a laptop that slept; ten minutes covers those. A row whose
+/// append stamp is malformed, or older than its own event time by more than
+/// this, is not evidence of anything and defeats the proof.
 pub const HIDDEN_ROW_SKEW_MS: u64 = 600_000;
 
 /// Why a commit has, or has no, session. The text is the wire value of
@@ -101,6 +111,10 @@ pub mod basis {
     /// The only command that fits is one whose result was never read, so
     /// whether it made anything is not known.
     pub const COMMAND_OUTCOME_UNKNOWN: &str = "command_outcome_unknown";
+    /// The only command that fits is one whose target worktree could not be
+    /// determined (an env prefix, a nested shell, a quoted or missing path):
+    /// it may have made the commit, and it may have aimed elsewhere.
+    pub const COMMAND_TARGET_UNKNOWN: &str = "command_target_unknown";
     /// The ledger has no reflog row for the commit: it was not made in a
     /// replayed worktree (another machine, a clone) or has not been replayed.
     pub const NO_REFLOG_ENTRY: &str = "no_reflog_entry";
@@ -120,7 +134,7 @@ pub mod basis {
     pub const NOT_EXAMINED: &str = "not_examined_batch_cap";
 
     /// Every value `session_basis` can take, for the schema test.
-    pub const ALL: [&str; 14] = [
+    pub const ALL: [&str; 15] = [
         INFERRED,
         NO_SESSION_COMMAND,
         AMBIGUOUS,
@@ -128,6 +142,7 @@ pub mod basis {
         COMMAND_AFTER_REFLOG,
         COMMAND_UNTIMED,
         COMMAND_OUTCOME_UNKNOWN,
+        COMMAND_TARGET_UNKNOWN,
         NO_REFLOG_ENTRY,
         NO_ORIGIN_ENTRY,
         REFLOG_UNTIMED,
@@ -168,7 +183,10 @@ impl CommitLink {
     }
 }
 
-/// One ledger row, with the columns the match reads.
+/// One ledger row, with the columns the match reads. Every text field is read
+/// as whatever SQLite holds: a column of the wrong type is that field's own
+/// "unknown" (`None`), never a failure of the read, so one malformed row cannot
+/// blind every commit in the batch.
 struct Row {
     id: i64,
     /// `worktree_path` as stored; the anchor checkout's NULL is the empty string.
@@ -178,14 +196,23 @@ struct Row {
     object: Option<String>,
     outcome: String,
     /// `detail_json.result` of a transcript row: `ok` or `error`, absent when
-    /// the call's result was never read.
+    /// the call's result was never read or was not a string.
     result: Option<String>,
     after_ref: Option<String>,
     ts_utc: String,
     /// The event's own time, only when its basis is the one this kind of row's
     /// time can be trusted from: the transcript for a command, git for a reflog
-    /// entry. A row stamped at ingest, or with no stamp, has `None`.
+    /// entry. A row stamped at ingest, with no stamp, or with a stamp that is
+    /// not a text time has `None`.
     at_ms: Option<u64>,
+}
+
+/// A text column as it is, or `None` for NULL or any other type.
+fn text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    })
 }
 
 /// Links each of `commits` to the session whose command most plausibly made it.
@@ -218,23 +245,20 @@ pub fn link_commits(repo_path: &str, commits: &[String]) -> HashMap<String, Comm
     }
     let read = with_access(repo_path, Access::ReadOnly, |conn| {
         let (rows, floor) = read_rows(conn, &examined)?;
+        let hidden = floor.map(|floor| read_hidden(conn, floor, &examined));
         let (reflogs, commands): (Vec<Row>, Vec<Row>) =
             rows.into_iter().partition(|row| !row.is_command);
-        let mut keys = Keys::new(repo_path);
-        let commands = classify(commands, &mut keys);
+        let anchor = canonical(repo_path);
+        let commands = classify(commands, &anchor);
         let mut linked = Vec::with_capacity(examined.len());
         for sha in &examined {
             let mine: Vec<&Row> = reflogs
                 .iter()
                 .filter(|row| row.after_ref.as_deref() == Some(*sha))
                 .collect();
-            let hidden_since = |since_ms: u64| match floor {
-                None => false,
-                Some(floor) => hidden_rows_since(conn, floor, since_ms),
-            };
             linked.push((
                 (*sha).to_string(),
-                link_one(&mine, &commands, &mut keys, floor.is_some(), &hidden_since),
+                link_one(sha, &mine, &commands, &anchor, hidden.as_ref()),
             ));
         }
         Ok(linked)
@@ -293,21 +317,20 @@ fn read_rows(conn: &Connection, commits: &[&str]) -> Result<(Vec<Row>, Option<i6
     let mut stmt = conn.prepare(&sql).map_err(failed)?;
     let rows = stmt
         .query_map(params_from_iter(values), |row| {
-            let action: String = row.get(2)?;
-            let is_command = action == "session.command";
-            let at: Option<String> = row.get(8)?;
-            let stamp_basis: Option<String> = row.get(9)?;
+            let is_command = text(row, 2)?.as_deref() == Some("session.command");
+            let at = text(row, 8)?;
+            let stamp_basis = text(row, 9)?;
             let trusted = if is_command { "transcript" } else { "reflog" };
             Ok(Row {
                 id: row.get(0)?,
-                worktree: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                worktree: text(row, 1)?.unwrap_or_default(),
                 is_command,
-                session_id: row.get(3)?,
-                object: row.get(4)?,
-                outcome: row.get(5)?,
-                after_ref: row.get(6)?,
-                ts_utc: row.get(7)?,
-                result: row.get(10)?,
+                session_id: text(row, 3)?,
+                object: text(row, 4)?,
+                outcome: text(row, 5)?.unwrap_or_default(),
+                after_ref: text(row, 6)?,
+                ts_utc: text(row, 7)?.unwrap_or_default(),
+                result: text(row, 10)?,
                 at_ms: at
                     .filter(|_| stamp_basis.as_deref() == Some(trusted))
                     .and_then(|text| ids::parse_event_time(&text)),
@@ -319,89 +342,155 @@ fn read_rows(conn: &Connection, commits: &[&str]) -> Result<(Vec<Row>, Option<i6
     Ok((rows, capped.then_some(floor)))
 }
 
-/// Whether any row past the scan bound (`id <= floor`) was appended at or after
-/// `since_ms` less [`HIDDEN_ROW_SKEW_MS`]: such a row could hold an event in a
-/// window that opens at `since_ms`, because an event is recorded after it
-/// happens. A probe that cannot run answers yes, never no.
+/// The canonical spelling of a UTC timestamp, as a SQL `GLOB`.
+const CANONICAL_TS: &str =
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
+
+/// What the rows past the scan bound (`id <= floor`) show, enough to say
+/// whether any of them could change an answer.
+struct Hidden {
+    /// The unread region cannot be vouched for: it is larger than
+    /// [`HIDDEN_PROBE_ROWS`], a row in it has a malformed append stamp or an
+    /// event time later than its own append stamp allows, or it could not be
+    /// read. Every capped answer is then [`basis::SCAN_CAPPED`].
+    unprovable: bool,
+    /// The newest well-formed append stamp among them, in milliseconds.
+    newest_append_ms: Option<u64>,
+    /// Commits that a reflog row in the region names.
+    named: BTreeSet<String>,
+}
+
+impl Hidden {
+    /// Whether a row in the region may hold an event at or after `since_ms`.
+    fn may_hold_event_since(&self, since_ms: u64) -> bool {
+        self.unprovable
+            || self
+                .newest_append_ms
+                .is_some_and(|at| at >= since_ms.saturating_sub(HIDDEN_ROW_SKEW_MS))
+    }
+}
+
+/// The first [`HIDDEN_PROBE_ROWS`] rows past the scan bound, summarised.
 ///
-/// Reads through `idx_events_ts`, from the window start forward, and stops at
-/// the first hidden row, so it costs the rows appended since the window and no
-/// more.
-fn hidden_rows_since(conn: &Connection, floor: i64, since_ms: u64) -> bool {
-    let since = ids::iso8601_utc(since_ms.saturating_sub(HIDDEN_ROW_SKEW_MS));
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events INDEXED BY idx_events_ts
-                       WHERE ts_utc >= ?1 AND id <= ?2)",
-        rusqlite::params![since, floor],
+/// An event cannot be recorded before it happens, so a hidden row appended
+/// before a window opened holds nothing in it. That reasoning needs the append
+/// clock to be honest, so a row that shows it is not (a stamp that is empty or
+/// not a timestamp, or an event time more than the skew allowance after it) is
+/// not skipped, it defeats the proof. Whatever cannot be read answers
+/// "unprovable", never "nothing hidden".
+fn read_hidden(conn: &Connection, floor: i64, commits: &[&str]) -> Hidden {
+    let unprovable = || Hidden {
+        unprovable: true,
+        newest_append_ms: None,
+        named: BTreeSet::new(),
+    };
+    let beyond = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE id <= ?1)",
+        [floor.saturating_sub(HIDDEN_PROBE_ROWS)],
         |row| row.get::<_, bool>(0),
-    )
-    .unwrap_or(true)
+    );
+    if beyond.unwrap_or(true) {
+        return unprovable();
+    }
+    let skew_s = HIDDEN_ROW_SKEW_MS / 1000;
+    let summary = format!(
+        "SELECT MAX(CASE WHEN ts_utc GLOB '{CANONICAL_TS}' THEN ts_utc END),
+                MAX(CASE WHEN NOT (ts_utc GLOB '{CANONICAL_TS}') THEN 1
+                         WHEN occ IS NOT NULL
+                          AND (typeof(occ) != 'text'
+                               OR NOT (occ GLOB '{CANONICAL_TS}')
+                               OR occ > strftime('%Y-%m-%dT%H:%M:%fZ', ts_utc, '-{skew_s} seconds'))
+                         THEN 1 ELSE 0 END)
+         FROM (SELECT ts_utc,
+                      CASE WHEN detail_json IS NOT NULL
+                                AND instr(detail_json, 'occurred_at') > 0
+                                AND json_valid(detail_json)
+                           THEN json_extract(detail_json, '$.occurred_at') END AS occ
+               FROM events WHERE id <= ?1 ORDER BY id DESC LIMIT ?2)"
+    );
+    let Ok((newest, flagged)) = conn.query_row(&summary, [floor, HIDDEN_PROBE_ROWS], |row| {
+        Ok((text(row, 0)?, row.get::<_, Option<i64>>(1)?))
+    }) else {
+        return unprovable();
+    };
+    if flagged.unwrap_or(0) != 0 {
+        return unprovable();
+    }
+    let marks = vec!["?"; commits.len()].join(",");
+    let named_sql = format!(
+        "SELECT DISTINCT after_ref
+         FROM (SELECT action, after_ref FROM events WHERE id <= ?1 ORDER BY id DESC LIMIT ?2)
+         WHERE action LIKE 'reflog.%' AND after_ref IN ({marks})"
+    );
+    let mut values = vec![Value::Integer(floor), Value::Integer(HIDDEN_PROBE_ROWS)];
+    values.extend(commits.iter().map(|sha| Value::Text((*sha).to_string())));
+    let named = conn.prepare(&named_sql).and_then(|mut stmt| {
+        stmt.query_map(params_from_iter(values), |row| text(row, 0))?
+            .collect::<Result<Vec<_>, _>>()
+    });
+    let Ok(named) = named else {
+        return unprovable();
+    };
+    Hidden {
+        unprovable: false,
+        newest_append_ms: newest.and_then(|stamp| ids::parse_event_time(&stamp)),
+        named: named.into_iter().flatten().collect(),
+    }
 }
 
-/// Worktree identities, resolved once per call.
+/// A path as the filesystem names it when it exists, and otherwise as written
+/// (trailing slash trimmed): the ledger's own [`super::canonical_repo`], the
+/// one owner of worktree identity.
 ///
-/// Two spellings of one checkout (`/var` against `/private/var`, a symlink, a
-/// trailing slash) are one worktree. The ledger's own [`super::canonical_repo`]
-/// is the owner of that rule for paths that exist; this adds the one case it
-/// leaves open, a path that no longer exists (a removed lane), by resolving its
-/// nearest existing ancestor and re-attaching the rest, so a symlinked parent
-/// does not make one worktree look like two.
-struct Keys {
-    anchor: String,
-    seen: HashMap<String, String>,
+/// A path that no longer exists is never resolved through its ancestors. Doing
+/// so makes a removed lane's directory, replaced since by a link to another
+/// worktree, look like that worktree, and a wrong match is worse than a missed
+/// one. A vanished path matches only its own spelling.
+fn canonical(path: &str) -> String {
+    super::canonical_repo(path)
 }
 
-impl Keys {
-    fn new(repo_path: &str) -> Self {
-        Self {
-            anchor: resolve_path(repo_path),
-            seen: HashMap::new(),
-        }
-    }
-
-    /// The identity of a stored `worktree_path`; the anchor checkout stores
-    /// none and is the repository itself.
-    fn of(&mut self, stored: &str) -> String {
-        if stored.is_empty() {
-            return self.anchor.clone();
-        }
-        self.seen
-            .entry(stored.to_string())
-            .or_insert_with(|| resolve_path(stored))
-            .clone()
-    }
+/// What a command row is to the commit it is being matched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Target {
+    /// Not a run that could make a commit in this worktree, with certainty.
+    Elsewhere,
+    /// May have made a commit here: a form this reader does not fully
+    /// understand. It never links, and it makes another session's link
+    /// ambiguous.
+    Unknown,
+    /// A commit-making git form, proved to run in this worktree.
+    Here,
 }
 
-fn resolve_path(raw: &str) -> String {
-    if let Ok(real) = std::fs::canonicalize(raw) {
-        return real.to_string_lossy().into_owned();
-    }
-    let mut tail = PathBuf::new();
-    let mut at = Path::new(raw);
-    while let (Some(parent), Some(name)) = (at.parent(), at.file_name()) {
-        tail = Path::new(name).join(&tail);
-        if let Ok(real) = std::fs::canonicalize(parent) {
-            return real.join(tail).to_string_lossy().into_owned();
-        }
-        at = parent;
-    }
-    super::canonical_repo(raw)
-}
-
-/// A command row that may have made a commit, with where it ran.
+/// A command row that may have made a commit in the worktree it ran in.
 struct Command {
     row: Row,
     worktree: String,
+    target: Target,
 }
 
-/// The command rows that run a commit-making git form against their own
-/// worktree, with that worktree resolved.
-fn classify(rows: Vec<Row>, keys: &mut Keys) -> Vec<Command> {
+/// The command rows that are, or may be, a commit-making run in their own
+/// worktree, with that worktree resolved. Rows that certainly are not are
+/// dropped.
+fn classify(rows: Vec<Row>, anchor: &str) -> Vec<Command> {
+    let mut seen: HashMap<String, String> = HashMap::new();
     rows.into_iter()
         .filter_map(|row| {
-            let worktree = keys.of(&row.worktree);
+            let worktree = if row.worktree.is_empty() {
+                anchor.to_string()
+            } else {
+                seen.entry(row.worktree.clone())
+                    .or_insert_with(|| canonical(&row.worktree))
+                    .clone()
+            };
             let object = row.object.as_deref()?;
-            runs_git_mutation(object, Path::new(&worktree)).then_some(Command { row, worktree })
+            let target = command_target(object, Path::new(&worktree));
+            (target != Target::Elsewhere).then_some(Command {
+                row,
+                worktree,
+                target,
+            })
         })
         .collect()
 }
@@ -409,15 +498,18 @@ fn classify(rows: Vec<Row>, keys: &mut Keys) -> Vec<Command> {
 /// What a reflog entry did to the ref.
 ///
 /// Only an entry that *created* the commit is its origin. The message is git's
-/// own (`%gs`), the part of the `object` after the commit id, and the forms
-/// that create a commit are listed; every other form (`merge x: Fast-forward`,
-/// `pull: Fast-forward`, `reset`, `checkout`, `clone`, `rebase (start)` /
-/// `(finish)`, `branch`, and any form this list has not heard of) is a move, so
-/// an unknown form can only cost a link, never invent one.
+/// own (`%gs`), the part of the `object` after the commit id, classified on the
+/// whole of it: the verb, the parenthesised step, and what follows the colon.
+/// The forms that create a commit are listed; every other form (`merge x:
+/// Fast-forward`, `pull: Fast-forward`, `cherry-pick: fast-forward`, `reset`,
+/// `checkout`, `clone`, `rebase (start)` / `(finish)`, `branch`, and any form
+/// this list has not heard of) is a move, so an unknown form can only cost a
+/// link, never invent one.
 ///
 /// Forms verified against git's own reflog: `commit: m`, `commit (initial): m`,
-/// `commit (amend): m`, `commit (merge): m`, `cherry-pick: m`, `revert: m`,
-/// `am: m`, `rebase (pick|continue|fixup|squash|reword|edit): m`,
+/// `commit (amend): m`, `commit (merge): m`, `cherry-pick: m` (and
+/// `cherry-pick: fast-forward`, which is a move), `revert: m`, `am: m`,
+/// `rebase (pick|continue|fixup|squash|reword|edit): m`,
 /// `pull --rebase (pick): m`, `merge b: Merge made by the 'ort' strategy.` and
 /// `pull: Merge made by ...`.
 fn creates_commit(object: &str) -> bool {
@@ -431,7 +523,11 @@ fn creates_commit(object: &str) -> bool {
         .and_then(|(_, rest)| rest.strip_suffix(')'));
     match verb {
         "commit" | "revert" | "am" => true,
-        "cherry-pick" => step.is_none_or(|s| s == "continue"),
+        // `git cherry-pick` of a commit whose parent is already HEAD moves the
+        // ref instead of making a commit, and says so.
+        "cherry-pick" => {
+            !tail.eq_ignore_ascii_case("fast-forward") && step.is_none_or(|s| s == "continue")
+        }
         "rebase" | "pull" => {
             matches!(
                 step,
@@ -444,17 +540,16 @@ fn creates_commit(object: &str) -> bool {
 }
 
 /// The matching rule, over rows already read. `reflogs` are the commit's own;
-/// `capped` says the read stopped at the row bound and `hidden_since` whether a
-/// row past it was appended after a given time.
+/// `hidden` is `Some` when the read stopped at the row bound.
 fn link_one(
+    sha: &str,
     reflogs: &[&Row],
     commands: &[Command],
-    keys: &mut Keys,
-    capped: bool,
-    hidden_since: &dyn Fn(u64) -> bool,
+    anchor: &str,
+    hidden: Option<&Hidden>,
 ) -> CommitLink {
     if reflogs.is_empty() {
-        return CommitLink::none(if capped {
+        return CommitLink::none(if hidden.is_some() {
             basis::SCAN_CAPPED
         } else {
             basis::NO_REFLOG_ENTRY
@@ -466,7 +561,7 @@ fn link_one(
         .collect();
     if origins.is_empty() {
         // The entry that made it may be one the read did not reach.
-        return CommitLink::none(if capped {
+        return CommitLink::none(if hidden.is_some() {
             basis::SCAN_CAPPED
         } else {
             basis::NO_ORIGIN_ENTRY
@@ -486,14 +581,21 @@ fn link_one(
     };
     let earliest = at.saturating_sub(LINK_WINDOW_MS);
     let latest = at.saturating_add(REFLOG_GRANULARITY_MS - 1);
-    if capped && hidden_since(earliest) {
+    // An earlier origin entry for this very commit, or a command in the window,
+    // may sit in rows the read did not reach.
+    if hidden.is_some_and(|h| h.named.contains(sha) || h.may_hold_event_since(earliest)) {
         return CommitLink::none(basis::SCAN_CAPPED);
     }
-    let worktree = keys.of(&entry.worktree);
+    let worktree = if entry.worktree.is_empty() {
+        anchor.to_string()
+    } else {
+        canonical(&entry.worktree)
+    };
 
     // Commands of the commit's own worktree, by what is known of them.
     let mut ok: Vec<(&Row, u64)> = Vec::new();
     let mut unobserved: Vec<&Row> = Vec::new();
+    let mut target_unknown: Vec<&Row> = Vec::new();
     let (mut untimed, mut before, mut after) = (false, false, false);
     for command in commands.iter().filter(|c| {
         c.worktree == worktree
@@ -504,7 +606,9 @@ fn link_one(
         let row = &command.row;
         match row.at_ms {
             Some(t) if (earliest..=latest).contains(&t) => {
-                if row.result.as_deref() == Some("ok") {
+                if command.target == Target::Unknown {
+                    target_unknown.push(row);
+                } else if row.result.as_deref() == Some("ok") {
                     ok.push((row, t));
                 } else {
                     unobserved.push(row);
@@ -519,12 +623,14 @@ fn link_one(
         }
     }
 
-    // A command whose result was never read may have made it, so it counts
-    // toward ambiguity but never toward a link.
+    // A command that may have made it but is not known to have (its result was
+    // never read, or its target is not known) counts toward ambiguity and never
+    // toward a link.
     let sessions: BTreeSet<&str> = ok
         .iter()
         .map(|(row, _)| row)
         .chain(unobserved.iter())
+        .chain(target_unknown.iter())
         .filter_map(|row| row.session_id.as_deref())
         .collect();
     match (sessions.len(), ok.is_empty()) {
@@ -537,7 +643,11 @@ fn link_one(
         } else {
             basis::NO_SESSION_COMMAND
         }),
-        (1, true) => CommitLink::none(basis::COMMAND_OUTCOME_UNKNOWN),
+        (1, true) => CommitLink::none(if target_unknown.is_empty() {
+            basis::COMMAND_OUTCOME_UNKNOWN
+        } else {
+            basis::COMMAND_TARGET_UNKNOWN
+        }),
         (1, false) => {
             // Several commands of one session (a commit, then its amend):
             // the nearest one is the one named.
@@ -577,151 +687,336 @@ const NO_OP_ARGUMENTS: [&str; 7] = [
     "--edit-todo",
 ];
 
-/// Global options that take their value as the next word.
-const GIT_OPTIONS_WITH_VALUE: [&str; 3] = ["-c", "--exec-path", "--namespace"];
+/// Global options with no bearing on where git runs.
+const HARMLESS_GLOBAL_OPTIONS: [&str; 8] = [
+    "--no-pager",
+    "-p",
+    "--paginate",
+    "--no-optional-locks",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+];
 
-/// Whether `command`, run in `worktree`, runs a git form that can create a
-/// commit *in that worktree*: `commit`, `merge`, `rebase`, `cherry-pick` or
-/// `pull`, anywhere in a compound line, and not a dry run, a help page or an
-/// abort. `git -C other`, `--work-tree`, `--git-dir` and an earlier
-/// `cd other &&` move the target, and a run aimed at another checkout is not
-/// this one's. A target that cannot be resolved (`~`, `$VAR`, a subshell)
-/// counts as elsewhere.
-///
-/// Words are split on whitespace and shell separators, so a quoted message
-/// that says `--dry-run` hides a real commit (a missed link), and one that says
-/// "git commit" counts (one more candidate, which can only make a link
-/// ambiguous). Both are the safe direction.
-pub(crate) fn runs_git_mutation(command: &str, worktree: &Path) -> bool {
-    let mut dir: Option<PathBuf> = Some(worktree.to_path_buf());
-    for segment in command.split([';', '&', '|', '(', ')', '`', '\n']) {
-        let words: Vec<&str> = segment
-            .split_whitespace()
-            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
-            .filter(|word| !word.is_empty())
-            .collect();
-        if let Some("cd" | "pushd") = words.first().copied() {
-            dir = words
-                .iter()
-                .skip(1)
-                .find(|word| !word.starts_with('-') || **word == "-")
-                .and_then(|target| step_into(dir.as_deref(), target));
-            continue;
-        }
-        let Some(at) = words
-            .iter()
-            .position(|word| *word == "git" || word.ends_with("/git"))
-        else {
-            continue;
+/// `git -c key=value` settings that cannot move the work tree or the git
+/// directory. The list is closed: any other key (`core.worktree`,
+/// `include.path`, `includeIf.*`, an alias, a `safe.*` or `gc.*` setting...) is
+/// not understood.
+const HARMLESS_CONFIG_PREFIXES: [&str; 9] = [
+    "user.", "commit.", "gpg.", "advice.", "color.", "init.", "pull.", "merge.", "rebase.",
+];
+
+/// One shell word, and whether it is a plain literal: no quoting, no escape,
+/// no expansion (`$`, backtick, `~`, glob characters, braces).
+struct Word {
+    text: String,
+    plain: bool,
+}
+
+/// A command line split into words and statement separators. `None` for an
+/// unterminated quote. The flag says the line groups or substitutes
+/// (`(...)`, `{ ...; }`, backticks, `$(`, here-documents), which this reader
+/// does not follow.
+fn tokenize(command: &str) -> Option<(Vec<Vec<Word>>, bool)> {
+    let mut segments: Vec<Vec<Word>> = vec![Vec::new()];
+    let (mut text, mut plain, mut open, mut grouped) = (String::new(), true, false, false);
+    let mut chars = command.chars().peekable();
+    macro_rules! end_word {
+        () => {
+            if open {
+                let word = Word {
+                    text: std::mem::take(&mut text),
+                    plain: std::mem::replace(&mut plain, true),
+                };
+                open = false;
+                if let Some(segment) = segments.last_mut() {
+                    segment.push(word);
+                }
+            }
         };
-        if git_run_creates_commit(&words[at + 1..], dir.as_deref(), worktree) {
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() && c != '\n' => end_word!(),
+            ';' | '&' | '|' | '\n' => {
+                end_word!();
+                segments.push(Vec::new());
+            }
+            '(' | ')' | '{' | '}' | '`' => {
+                grouped = true;
+                end_word!();
+            }
+            '\'' => {
+                open = true;
+                plain = false;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        other => text.push(other),
+                    }
+                }
+            }
+            '"' => {
+                open = true;
+                plain = false;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => text.push(chars.next()?),
+                        '$' => {
+                            grouped |= chars.peek() == Some(&'(');
+                            text.push('$');
+                        }
+                        '`' => grouped = true,
+                        other => text.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                open = true;
+                plain = false;
+                text.push(chars.next()?);
+            }
+            '<' if chars.peek() == Some(&'<') => {
+                grouped = true;
+                text.push(c);
+                open = true;
+            }
+            '#' if !open => break,
+            other => {
+                open = true;
+                if matches!(other, '$' | '~' | '*' | '?' | '[' | ']' | '!') {
+                    plain = false;
+                    grouped |= other == '$' && chars.peek() == Some(&'(');
+                }
+                text.push(other);
+            }
+        }
+    }
+    if open {
+        if let Some(segment) = segments.last_mut() {
+            segment.push(Word { text, plain });
+        }
+    }
+    Some((segments, grouped))
+}
+
+/// Whether any of `words` is `git` and a commit-making subcommand follows it
+/// anywhere after: how a command this reader does not understand is told from
+/// one that has nothing to do with git. Words are split on whitespace, shell
+/// separators and quotes, so the text of a quoted `sh -c '...'` is looked into
+/// and `git status;git commit` is not missed.
+fn mentions_git_mutation<'a>(words: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen_git = false;
+    let boundary = |c: char| c.is_whitespace() || ";&|(){}`\"'".contains(c);
+    for word in words
+        .into_iter()
+        .flat_map(|text| text.split(boundary))
+        .filter(|word| !word.is_empty())
+    {
+        if seen_git && MUTATING_SUBCOMMANDS.contains(&word) {
             return true;
         }
+        seen_git |= word == "git" || word.ends_with("/git");
     }
     false
 }
 
-/// One git invocation's words after `git`, aimed from `dir`.
-fn git_run_creates_commit(words: &[&str], dir: Option<&Path>, worktree: &Path) -> bool {
-    let mut target = dir.map(Path::to_path_buf);
+/// Where a command line aims its commit-making git runs, relative to
+/// `worktree`, the checkout it ran in.
+///
+/// Fails closed. [`Target::Here`] needs proof: a plain `git <verb>`, or `-C`,
+/// `cd` or `--work-tree` / `--git-dir` through plain paths that exist and lead
+/// back to `worktree`. Everything else that mentions a commit-making git is
+/// [`Target::Unknown`], not a guess in either direction: an env prefix
+/// (`GIT_DIR=x git ...`, `env ...`), a wrapper or nested shell (`sh -c`,
+/// `eval`, `xargs`, `time`), a quoted, escaped, `~`/`$`-expanded or globbed
+/// path, a path that does not exist, `..` (resolved by the filesystem, never
+/// lexically), a `-c` that can move the tree, `--config-env`, groupings and
+/// substitutions. Only a run that is provably elsewhere, or not a commit-making
+/// form, is [`Target::Elsewhere`].
+pub(crate) fn command_target(command: &str, worktree: &Path) -> Target {
+    if !mentions_git_mutation(std::iter::once(command)) {
+        return Target::Elsewhere;
+    }
+    let Some((segments, grouped)) = tokenize(command) else {
+        return Target::Unknown;
+    };
+    if grouped {
+        return Target::Unknown;
+    }
+    let mut dir: Option<PathBuf> = Some(worktree.to_path_buf());
+    let mut best = Target::Elsewhere;
+    for words in segments.iter().filter(|words| !words.is_empty()) {
+        let leading = words[0].text.as_str();
+        let target = match (leading, words[0].plain) {
+            ("cd" | "pushd", true) => {
+                dir = words
+                    .iter()
+                    .skip(1)
+                    .find(|word| !word.text.starts_with('-') || word.text == "-")
+                    .and_then(|word| enter(dir.as_deref(), word));
+                continue;
+            }
+            ("popd", true) => {
+                dir = None;
+                continue;
+            }
+            (leading, true) if leading == "git" || leading.ends_with("/git") => {
+                git_target(&words[1..], dir.as_deref(), worktree)
+            }
+            _ if mentions_git_mutation(words.iter().map(|word| word.text.as_str())) => {
+                Target::Unknown
+            }
+            _ => Target::Elsewhere,
+        };
+        best = best.max(target);
+    }
+    best
+}
+
+/// The directory `word` names from `base`, through the filesystem: a plain
+/// path that exists and is a directory, with symlinks and `..` resolved by the
+/// kernel. `None` for anything else.
+fn enter(base: Option<&Path>, word: &Word) -> Option<PathBuf> {
+    if !word.plain || word.text.is_empty() || word.text == "-" {
+        return None;
+    }
+    let path = Path::new(&word.text);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base?.join(path)
+    };
+    std::fs::canonicalize(joined)
+        .ok()
+        .filter(|dir| dir.is_dir())
+}
+
+/// Whether a git run at the existing directory `dir` takes effect in
+/// `worktree`: the same checkout, or one whose nearest enclosing checkout (the
+/// closest ancestor holding a `.git`) is it. The second keeps a subdirectory in
+/// and a lane nested under the worktree out.
+fn lands_in(dir: &Path, worktree: &Path) -> bool {
+    let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
+    dir == there
+        || dir
+            .ancestors()
+            .find(|candidate| candidate.join(".git").exists())
+            .is_some_and(|root| root == there)
+}
+
+/// One git invocation's words after `git`, run from `dir`.
+fn git_target(words: &[Word], dir: Option<&Path>, worktree: &Path) -> Target {
+    let mut here = dir.map(Path::to_path_buf);
     let mut work_tree: Option<Option<PathBuf>> = None;
     let mut git_dir: Option<Option<PathBuf>> = None;
     let mut rest = words.iter();
     let subcommand = loop {
-        let Some(&word) = rest.next() else {
-            return false;
+        let Some(word) = rest.next() else {
+            return Target::Elsewhere;
         };
-        if word == "-C" {
-            target = rest
-                .next()
-                .and_then(|path| step_into(target.as_deref(), path));
-        } else if let Some(path) = word.strip_prefix("--work-tree=") {
-            work_tree = Some(step_into(target.as_deref(), path));
-        } else if word == "--work-tree" {
-            work_tree = Some(
-                rest.next()
-                    .and_then(|path| step_into(target.as_deref(), path)),
-            );
-        } else if let Some(path) = word.strip_prefix("--git-dir=") {
-            git_dir = Some(step_into(target.as_deref(), path));
-        } else if word == "--git-dir" {
-            git_dir = Some(
-                rest.next()
-                    .and_then(|path| step_into(target.as_deref(), path)),
-            );
-        } else if GIT_OPTIONS_WITH_VALUE.contains(&word) {
-            rest.next();
-        } else if !word.starts_with('-') {
-            break word;
+        let option = word.text.as_str();
+        if !word.plain {
+            return Target::Unknown;
+        }
+        if option == "-C" {
+            here = rest.next().and_then(|path| enter(here.as_deref(), path));
+        } else if option == "-c" {
+            let Some(setting) = rest.next() else {
+                return Target::Unknown;
+            };
+            if !setting.plain
+                || !HARMLESS_CONFIG_PREFIXES
+                    .iter()
+                    .any(|prefix| setting.text.to_ascii_lowercase().starts_with(prefix))
+            {
+                return Target::Unknown;
+            }
+        } else if let Some(path) = option.strip_prefix("--work-tree=") {
+            work_tree = Some(enter(
+                here.as_deref(),
+                &Word {
+                    text: path.to_string(),
+                    plain: true,
+                },
+            ));
+        } else if option == "--work-tree" {
+            work_tree = Some(rest.next().and_then(|path| enter(here.as_deref(), path)));
+        } else if let Some(path) = option.strip_prefix("--git-dir=") {
+            git_dir = Some(enter(
+                here.as_deref(),
+                &Word {
+                    text: path.to_string(),
+                    plain: true,
+                },
+            ));
+        } else if option == "--git-dir" {
+            git_dir = Some(rest.next().and_then(|path| enter(here.as_deref(), path)));
+        } else if HARMLESS_GLOBAL_OPTIONS.contains(&option) {
+        } else if option.starts_with('-') {
+            return Target::Unknown;
+        } else {
+            break option;
         }
     };
     if !MUTATING_SUBCOMMANDS.contains(&subcommand) {
-        return false;
+        return Target::Elsewhere;
     }
-    let mut args = rest.copied();
+    let mut args = rest.map(|word| word.text.as_str());
     while let Some(arg) = args.next() {
         if NO_OP_ARGUMENTS.contains(&arg) {
-            return false;
+            return Target::Elsewhere;
         }
         // A message's text is not a flag of the command.
         if matches!(arg, "-m" | "--message" | "-F" | "--file") {
             args.next();
         }
     }
-    // Where the run takes effect: the work tree when one is named, else the
-    // directory the git dir sits in, else where -C and cd led.
-    let aimed = match (work_tree, git_dir) {
-        (Some(tree), _) => tree,
-        (None, Some(Some(dir))) if dir.file_name().is_some_and(|name| name == ".git") => {
-            dir.parent().map(Path::to_path_buf)
-        }
-        (None, Some(_)) => None,
-        (None, None) => target,
-    };
-    aimed.is_some_and(|path| aims_at(&path, worktree))
-}
-
-/// `path` as seen from `base`: absolute as written, relative joined, cleaned of
-/// `.` and `..`. `None` for a place the text cannot name (`~`, `$VAR`, a glob,
-/// the previous directory, no base for a relative path).
-fn step_into(base: Option<&Path>, path: &str) -> Option<PathBuf> {
-    if path.is_empty()
-        || path == "-"
-        || path.starts_with(['~', '$'])
-        || path.contains(['$', '*', '?', '`'])
-    {
-        return None;
-    }
-    let joined = match base {
-        _ if Path::new(path).is_absolute() => PathBuf::from(path),
-        Some(base) => base.join(path),
-        None => return None,
-    };
-    let mut clean = PathBuf::new();
-    for part in joined.components() {
-        match part {
-            Component::ParentDir => {
-                clean.pop();
+    let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
+    match (work_tree, git_dir) {
+        (None, None) => match here {
+            Some(dir) if lands_in(&dir, worktree) => Target::Here,
+            Some(_) => Target::Elsewhere,
+            None => Target::Unknown,
+        },
+        // A named git dir without a work tree is that repository's own: it is
+        // this one only when it is this worktree's `.git`.
+        (None, Some(Some(git))) => {
+            if git == there.join(".git") {
+                Target::Here
+            } else {
+                Target::Elsewhere
             }
-            Component::CurDir => {}
-            other => clean.push(other),
         }
+        (Some(Some(tree)), None) => {
+            let (in_tree, in_dir) = (
+                lands_in(&tree, worktree),
+                here.as_deref().is_some_and(|dir| lands_in(dir, worktree)),
+            );
+            match (in_tree, in_dir) {
+                (true, true) => Target::Here,
+                (false, false) => Target::Elsewhere,
+                _ => Target::Unknown,
+            }
+        }
+        (Some(Some(tree)), Some(Some(git))) => {
+            match (lands_in(&tree, worktree), git == there.join(".git")) {
+                (true, true) => Target::Here,
+                (false, false) => Target::Elsewhere,
+                _ => Target::Unknown,
+            }
+        }
+        // A path that does not resolve is not a place.
+        _ => Target::Unknown,
     }
-    Some(clean)
 }
 
-/// Whether a git run at `path` takes effect in `worktree`: the same place, or
-/// a place whose nearest enclosing checkout (the closest ancestor holding a
-/// `.git`) is it. The second is what keeps a subdirectory of the worktree in
-/// and a lane nested under it out.
-fn aims_at(path: &Path, worktree: &Path) -> bool {
-    let here = resolve_path(&path.to_string_lossy());
-    let there = resolve_path(&worktree.to_string_lossy());
-    if here == there {
-        return true;
-    }
-    Path::new(&here)
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .is_some_and(|root| root.to_string_lossy() == there)
+/// Whether `command`, run in `worktree`, is a commit-making git form proved to
+/// run there: the only kind of command a link is made from. See
+/// [`command_target`] for what is proved and what is not.
+#[cfg(test)]
+pub(crate) fn runs_git_mutation(command: &str, worktree: &Path) -> bool {
+    command_target(command, worktree) == Target::Here
 }

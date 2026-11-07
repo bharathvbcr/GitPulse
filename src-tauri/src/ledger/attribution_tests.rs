@@ -4,8 +4,8 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, link_commits, runs_git_mutation, CommitLink, LINK_MAX_COMMITS, LINK_SCAN_ROWS,
-    LINK_WINDOW_MS,
+    basis, link_commits, runs_git_mutation, CommitLink, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS,
+    LINK_SCAN_ROWS, LINK_WINDOW_MS,
 };
 use super::*;
 use std::path::Path;
@@ -477,17 +477,18 @@ fn a_batch_answers_every_commit_and_bounds_how_many_it_examines() {
 
 #[test]
 fn only_git_commands_that_move_head_onto_a_commit_count() {
+    let tree = tree();
+    let wt = tree.w.as_path();
     for yes in [
         "git commit -m x",
         "git add -A && git commit -m x",
-        "cd /wt; git -C . commit --amend",
+        "cd . ; git -C . commit --amend",
         "git -c user.name=x merge main",
         "/usr/bin/git rebase main",
         "git cherry-pick abc",
         "git pull --rebase",
-        "(git commit -m x)",
     ] {
-        assert!(runs_git_mutation(yes, Path::new("/wt")), "{yes}");
+        assert!(runs_git_mutation(yes, wt), "{yes}");
     }
     for no in [
         "git status",
@@ -500,7 +501,7 @@ fn only_git_commands_that_move_head_onto_a_commit_count() {
         "git --version",
         "",
     ] {
-        assert!(!runs_git_mutation(no, Path::new("/wt")), "{no}");
+        assert!(!runs_git_mutation(no, wt), "{no}");
     }
 }
 
@@ -598,6 +599,7 @@ fn adv_git_dash_c_other_repo_is_not_cwd_worktree() {
 
 #[test]
 fn adv_non_commit_forms_do_not_match() {
+    let wt = Path::new("/wt");
     for no in [
         "git commit --dry-run",
         "git rebase --abort",
@@ -608,10 +610,7 @@ fn adv_non_commit_forms_do_not_match() {
         "git pull --help",
         "git rebase --quit",
     ] {
-        assert!(
-            !runs_git_mutation(no, Path::new("/wt")),
-            "falsely matches: {no}"
-        );
+        assert!(!runs_git_mutation(no, wt), "falsely matches: {no}");
     }
 }
 
@@ -717,18 +716,20 @@ fn adv_cap_hides_command_but_reports_no_session_command() {
 fn adv_worktree_spelling() {
     let (_d, repo) = repo_dir();
     let at = t0();
-    // Only a machine where /var is a symlink (macOS) has two spellings of it.
-    if std::fs::canonicalize("/var").is_ok_and(|real| real == Path::new("/private/var")) {
-        command_row(
-            &repo,
-            Some("/private/var/x/lane"),
-            "S1",
-            "git commit -m a",
-            at - SEC,
-        );
-        reflog_row(&repo, Some("/var/x/lane"), &sha(1), "commit", at);
-        assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("S1"));
-    }
+    // An existing checkout under a symlinked parent (macOS: /var is
+    // /private/var) is one worktree however it is spelled. A vanished one is
+    // not resolved through its ancestors; see `a_vanished_worktree_matches_...`.
+    let (_lane, lane_path) = repo_dir();
+    let canonical = std::fs::canonicalize(&lane_path).unwrap();
+    command_row(&repo, Some(&lane_path), "S1", "git commit -m a", at - SEC);
+    reflog_row(
+        &repo,
+        Some(canonical.to_str().unwrap()),
+        &sha(1),
+        "commit",
+        at,
+    );
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("S1"));
     let (_d, repo) = repo_dir();
     command_row(&repo, Some("/x/lane/"), "S1", "git commit -m a", at - SEC);
     reflog_row(&repo, Some("/x/lane"), &sha(1), "commit", at);
@@ -856,7 +857,9 @@ fn a_git_run_aimed_at_this_worktree_still_links_and_one_aimed_elsewhere_does_not
 
 #[test]
 fn a_run_that_cannot_create_a_commit_is_not_a_candidate_and_continue_is() {
-    let wt = Path::new("/wt");
+    let tree = tree();
+    let wt = tree.w.as_path();
+    let (w, l) = (tree.w.display(), tree.lane.display());
     for no in [
         "git commit --dry-run -m a",
         "git commit -h",
@@ -865,7 +868,7 @@ fn a_run_that_cannot_create_a_commit_is_not_a_candidate_and_continue_is() {
         "git merge --abort",
         "git cherry-pick --abort",
         "git pull --help",
-        "git -C /wt rebase --show-current-patch",
+        "git -C . rebase --show-current-patch",
     ] {
         assert!(!runs_git_mutation(no, wt), "{no}");
     }
@@ -875,12 +878,17 @@ fn a_run_that_cannot_create_a_commit_is_not_a_candidate_and_continue_is() {
         "git merge --continue",
         "git cherry-pick --continue",
         "git commit --squash abc",
-        "git -C /wt commit -m a",
-        "cd /wt && git commit -m a",
-        "cd /elsewhere && cd /wt && git commit -m a",
+        "git -C . commit -m a",
         "git commit -m 'it is not a --dry-run of anything' && git commit -m b",
     ] {
         assert!(runs_git_mutation(yes, wt), "{yes}");
+    }
+    for yes in [
+        format!("git -C {w} commit -m a"),
+        format!("cd {w} && git commit -m a"),
+        format!("cd {l} && cd {w} && git commit -m a"),
+    ] {
+        assert!(runs_git_mutation(&yes, wt), "{yes}");
     }
 }
 
@@ -1038,4 +1046,767 @@ fn every_basis_the_matcher_can_give_is_listed() {
     for link in got.values() {
         assert!(basis::ALL.contains(&link.basis), "{}", link.basis);
     }
+}
+
+// ---- round-2 adversarial additions (reviewer, uncommitted) ----
+
+static R2_SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn r2_raw(
+    repo: &str,
+    ts: &str,
+    action: &str,
+    session: Option<&str>,
+    object: Option<&str>,
+    outcome: &str,
+    detail: Option<&str>,
+    wt: Option<&str>,
+    after_ref: Option<&str>,
+) {
+    let n = R2_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    with_conn(repo, |conn| {
+        conn.execute(
+            "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, session_id, action, object, outcome, after_ref, detail_json)
+             VALUES (?1, ?2, 'r', ?3, 'system', ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![format!("{:026}", 9_000_000 + n), ts, wt, session, action, object, outcome, after_ref, detail],
+        )
+        .map_err(|e| LedgerError::new("t", e.to_string()))?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn r2_cmd_detail(at: u64) -> String {
+    format!(
+        r#"{{"result":"ok","occurred_at":"{}","occurred_at_basis":"transcript"}}"#,
+        ids::iso8601_utc(at)
+    )
+}
+
+#[test]
+fn r2_cherry_pick_fast_forward_is_not_an_origin() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    // Session B cherry-picks (fast-forwards onto) a commit session A made.
+    command_row(&repo, None, "B", "git cherry-pick abc123", at - SEC);
+    reflog_row(&repo, None, &sha(1), "cherry-pick: fast-forward", at);
+    let got = link(&repo, &sha(1));
+    assert_eq!(got.session_id, None, "BROKEN: mover credited: {got:?}");
+}
+
+#[test]
+fn r2_reflog_message_table() {
+    // (message, is_origin) -- real forms from git 2.54 first, then variants.
+    let table: &[(&str, bool)] = &[
+        ("commit: m", true),
+        ("commit (initial): m", true),
+        ("commit (amend): m", true),
+        ("commit (merge): m", true),
+        ("commit (cherry-pick): m", true),
+        ("cherry-pick: m", true),
+        ("cherry-pick: fast-forward", false),
+        ("revert: Revert \"x\"", true),
+        ("am: m", true),
+        ("rebase (pick): m", true),
+        ("rebase (continue): m", true),
+        ("rebase (start): checkout main", false),
+        ("rebase (finish): returning to refs/heads/x", false),
+        (
+            "rebase (continue) (finish): returning to refs/heads/x",
+            false,
+        ),
+        ("pull --rebase (pick): m", true),
+        ("pull --rebase (start): checkout abc", false),
+        (
+            "pull --rebase (finish): returning to refs/heads/main",
+            false,
+        ),
+        ("pull --rebase: Fast-forward", false),
+        ("pull --ff-only: Fast-forward", false),
+        ("pull: Fast-forward", false),
+        ("pull: Merge made by the 'ort' strategy.", true),
+        ("merge feat: Merge made by the 'ort' strategy.", true),
+        ("merge feat: Fast-forward", false),
+        ("merge feat: Already up to date", false),
+        ("reset: moving to HEAD~1", false),
+        ("checkout: moving from a to b", false),
+        ("branch: Created from HEAD", false),
+        ("clone: from /x", false),
+        ("update by push", false),
+        ("fetch origin: fast-forward", false),
+        ("stash: pop", false),
+        ("commit: Fast-forward", true),
+        ("merge: Merge made by the 'ort' strategy.", true),
+        ("reset: moving to commit: x", false),
+        ("checkout: moving from commit: x to y", false),
+        ("revert (continue): m", true),
+        ("cherry-pick (continue): m", true),
+        ("rebase: fast-forward", false),
+        ("rebase (fast-forward): m", false),
+        ("pull (fast-forward): m", false),
+    ];
+    let mut wrong = vec![];
+    for (i, (msg, origin)) in table.iter().enumerate() {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row(&repo, None, "S1", "git commit -m x", at - SEC);
+        reflog_row(&repo, None, &sha(i + 1), msg, at);
+        let got = link(&repo, &sha(i + 1));
+        let credited = got.session_id.is_some();
+        if credited != *origin {
+            wrong.push(format!("{msg:?}: expected origin={origin}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "misclassified:\n{}", wrong.join("\n"));
+}
+
+struct Tree {
+    _base: tempfile::TempDir,
+    w: PathBuf,
+    lane: PathBuf,
+    deep: PathBuf,
+}
+use std::path::PathBuf;
+fn tree() -> Tree {
+    let base = tempfile::tempdir().unwrap();
+    let p = base.path().canonicalize().unwrap();
+    let w = p.join("w");
+    let lane = p.join("lane");
+    let deep = p.join("deep");
+    for d in [&w, &lane, &deep, &w.join("sub"), &w.join("lane one")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    for d in [&w, &lane, &deep, &w.join("lane one")] {
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+    }
+    std::os::unix::fs::symlink(&deep, w.join("link")).unwrap();
+    std::os::unix::fs::symlink(w.join("loop"), w.join("loop")).unwrap();
+    Tree {
+        _base: base,
+        w,
+        lane,
+        deep,
+    }
+}
+
+fn r2_aimed_elsewhere(cmds: Vec<String>, t: &Tree) -> Vec<String> {
+    cmds.into_iter()
+        .filter(|c| runs_git_mutation(c, &t.w))
+        .collect()
+}
+
+#[test]
+fn r2_commands_aimed_at_another_worktree_are_not_credited() {
+    let t = tree();
+    let (w, l, d) = (t.w.display(), t.lane.display(), t.deep.display());
+    let cmds: Vec<String> = vec![
+        // cd chains
+        "cd .. && cd lane && git commit -m x".into(),
+        format!("pushd {l} && git commit -m x"),
+        format!("git -C . -C {l} commit -m x"),
+        format!("git -C {l} -C . commit -m x"),
+        // quoted path with spaces (nested checkout)
+        format!("git -C \"{w}/lane one\" commit -m x"),
+        format!("cd \"{w}/lane one\" && git commit -m x"),
+        // env prefixes
+        format!("GIT_DIR={l}/.git GIT_WORK_TREE={l} git commit -m x"),
+        format!("GIT_DIR={l}/.git git commit -m x"),
+        format!("GIT_WORK_TREE={l} git commit -m x"),
+        format!("env GIT_DIR={l}/.git git commit -m x"),
+        // config worktree
+        format!("git -c core.worktree={l} commit -m x"),
+        "git --config-env=core.worktree=X commit -m x".to_string(),
+        // nested shells
+        format!("sh -c 'cd {l} && git commit -m x'"),
+        format!("bash -lc \"cd {l} && git commit -m x\""),
+        // `..` after a symlink
+        format!("git -C {w}/link/.. commit -m x"),
+        format!("cd {w}/link/.. && git commit -m x"),
+        // wrappers
+        format!("env -C {l} git commit -m x"),
+        format!("xargs -I{{}} git -C {l} commit"),
+        format!("git --git-dir {l}/.git commit -m x"),
+        format!("git --git-dir={d}/.git commit -m x"),
+    ];
+    let wrong = r2_aimed_elsewhere(cmds, &t);
+    assert!(
+        wrong.is_empty(),
+        "credited to w but aimed elsewhere:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn r2_commands_aimed_here_still_count_controls() {
+    let t = tree();
+    let w = t.w.display();
+    for c in [
+        "git commit -m x".to_string(),
+        "git -C . -C sub commit -m x".to_string(),
+        format!("git -C {w}/sub commit -m x"),
+        "cd sub && git commit -m x".to_string(),
+        format!("git --git-dir={w}/.git --work-tree={w} commit -m x"),
+    ] {
+        assert!(runs_git_mutation(&c, &t.w), "control missed: {c}");
+    }
+}
+
+#[test]
+fn r2_symlink_loop_does_not_hang() {
+    let t = tree();
+    let c = format!("git -C {}/loop/x commit -m x", t.w.display());
+    let _ = runs_git_mutation(&c, &t.w);
+}
+
+#[test]
+fn r2_removed_lane_replaced_by_symlink_must_not_match_another_worktree() {
+    let (_d, repo) = repo_dir();
+    let base = tempfile::tempdir().unwrap();
+    let p = base.path().canonicalize().unwrap();
+    let other = p.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    // `gone` was a lane directory, now removed and replaced by a link to `other`.
+    std::os::unix::fs::symlink(&other, p.join("gone")).unwrap();
+    let at = t0();
+    // The command ran in `other/lane` (a different worktree); the commit is
+    // reflogged for the old lane `gone/lane`. Neither exists on disk now.
+    command_row(
+        &repo,
+        Some(other.join("lane").to_str().unwrap()),
+        "S1",
+        "git commit -m a",
+        at - SEC,
+    );
+    reflog_row(
+        &repo,
+        Some(p.join("gone/lane").to_str().unwrap()),
+        &sha(1),
+        "commit",
+        at,
+    );
+    let got = link(&repo, &sha(1));
+    assert_eq!(
+        got.session_id, None,
+        "resolved into another worktree: {got:?}"
+    );
+}
+
+#[test]
+fn r2_case_insensitive_spelling_probe() {
+    let base = tempfile::tempdir().unwrap();
+    let p = base.path().canonicalize().unwrap();
+    std::fs::create_dir_all(p.join("Repo")).unwrap();
+    let ci = std::fs::canonicalize(p.join("repo")).is_ok();
+    eprintln!(
+        "fs case-insensitive: {ci}; canonical(repo)={:?}",
+        std::fs::canonicalize(p.join("repo"))
+    );
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(
+        &repo,
+        Some(p.join("repo").to_str().unwrap()),
+        "S1",
+        "git commit -m a",
+        at - SEC,
+    );
+    reflog_row(
+        &repo,
+        Some(p.join("Repo").to_str().unwrap()),
+        &sha(1),
+        "commit",
+        at,
+    );
+    let got = link(&repo, &sha(1));
+    eprintln!("case-variant spellings link: {got:?}");
+    // Both are the same directory on a case-insensitive volume.
+    if ci {
+        assert_eq!(got.session_id.as_deref(), Some("S1"), "false miss: {got:?}");
+    }
+    // And a vanished one, spelled two ways, on the same volume.
+    let (_d2, repo2) = repo_dir();
+    command_row(
+        &repo2,
+        Some(p.join("Gone/x").to_str().unwrap()),
+        "S1",
+        "git commit -m a",
+        at - SEC,
+    );
+    reflog_row(
+        &repo2,
+        Some(p.join("gone/x").to_str().unwrap()),
+        &sha(2),
+        "commit",
+        at,
+    );
+    eprintln!("vanished case-variants: {:?}", link(&repo2, &sha(2)));
+}
+
+#[test]
+fn r2_outcome_only_ok_links() {
+    let at = t0();
+    let details: Vec<(&str, String)> = vec![
+        ("error", r#"{"result":"error"}"#.into()),
+        ("cancelled", r#"{"result":"cancelled"}"#.into()),
+        ("interrupted", r#"{"result":"interrupted"}"#.into()),
+        ("null", r#"{"result":null}"#.into()),
+        ("OK upper", r#"{"result":"OK"}"#.into()),
+        ("padded", r#"{"result":" ok"}"#.into()),
+        ("badjson", r#"{"result":"ok""#.into()),
+        ("empty", "".into()),
+        ("missing", "{}".into()),
+    ];
+    let mut wrong = vec![];
+    for (name, detail) in details {
+        let (_d, repo) = repo_dir();
+        let det = if detail.starts_with('{') && detail.ends_with('}') {
+            detail.trim_end_matches('}').to_string()
+                + &format!(
+                    r#","occurred_at":"{}","occurred_at_basis":"transcript"}}"#,
+                    ids::iso8601_utc(at - SEC)
+                )
+                .replacen("{,", "{", 1)
+        } else {
+            detail.clone()
+        };
+        let det = det.replace("{,", "{");
+        r2_raw(
+            &repo,
+            &ids::iso8601_utc(at),
+            "session.command",
+            Some("S1"),
+            Some("git commit -m a"),
+            "ok",
+            Some(&det),
+            None,
+            None,
+        );
+        reflog_row(&repo, None, &sha(1), "commit", at);
+        let got = link(&repo, &sha(1));
+        if got.basis == basis::INFERRED {
+            wrong.push(format!("{name} ({det}) -> {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "linked without ok:\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn r2_result_ok_but_column_failed_does_not_link() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    r2_raw(
+        &repo,
+        &ids::iso8601_utc(at),
+        "session.command",
+        Some("S1"),
+        Some("git commit -m a"),
+        "failed",
+        Some(&r2_cmd_detail(at - SEC)),
+        None,
+        None,
+    );
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    assert_ne!(link(&repo, &sha(1)).basis, basis::INFERRED);
+}
+
+#[test]
+fn r2_one_malformed_typed_row_does_not_blind_every_commit() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    // A non-string result (transcripts are arbitrary JSON).
+    let bad = format!(
+        r#"{{"result":1,"occurred_at":"{}","occurred_at_basis":"transcript"}}"#,
+        ids::iso8601_utc(at)
+    );
+    r2_raw(
+        &repo,
+        &ids::iso8601_utc(at),
+        "session.command",
+        Some("X"),
+        Some("git status"),
+        "ok",
+        Some(&bad),
+        None,
+        None,
+    );
+    command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    let got = link(&repo, &sha(1));
+    assert_eq!(
+        got.session_id.as_deref(),
+        Some("S1"),
+        "poisoned read: {got:?}"
+    );
+}
+
+#[test]
+fn r2_numeric_occurred_at_does_not_blind_every_commit() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    r2_raw(
+        &repo,
+        &ids::iso8601_utc(at),
+        "session.command",
+        Some("X"),
+        Some("git status"),
+        "ok",
+        Some(r#"{"result":"ok","occurred_at":1762500000,"occurred_at_basis":"transcript"}"#),
+        None,
+        None,
+    );
+    command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    let got = link(&repo, &sha(1));
+    assert_eq!(
+        got.session_id.as_deref(),
+        Some("S1"),
+        "poisoned read: {got:?}"
+    );
+}
+
+#[test]
+fn r2_ambiguity_shapes() {
+    let at = t0();
+    // two unread from the SAME session only
+    let (_d, repo) = repo_dir();
+    unobserved_command_row(&repo, "B", "git commit -m a", at - 3 * SEC);
+    unobserved_command_row(&repo, "B", "git commit -m b", at - 2 * SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    assert_eq!(link(&repo, &sha(1)).basis, basis::COMMAND_OUTCOME_UNKNOWN);
+    // unread B beside ok A
+    let (_d, repo) = repo_dir();
+    command_row(&repo, None, "A", "git commit -m a", at - 3 * SEC);
+    unobserved_command_row(&repo, "B", "git commit -m b", at - 2 * SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    assert!(link(&repo, &sha(1)).ambiguous);
+    // unread A beside ok A: same session
+    let (_d, repo) = repo_dir();
+    command_row(&repo, None, "A", "git commit -m a", at - 3 * SEC);
+    unobserved_command_row(&repo, "A", "git commit -m b", at - 2 * SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("A"));
+}
+
+// ---- cap probe ----
+
+fn r2_capped_world(hidden: impl FnOnce(&str, u64)) -> (tempfile::TempDir, String, u64) {
+    let (d, repo) = repo_dir();
+    let at = t0();
+    hidden(&repo, at);
+    noise(&repo, LINK_SCAN_ROWS + 10);
+    command_row(&repo, None, "A", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    (d, repo, at)
+}
+
+#[test]
+fn r2_cap_hidden_future_ts_is_scan_capped() {
+    let (_d, repo, _) = r2_capped_world(|repo, _| {
+        r2_raw(
+            repo,
+            "2099-01-01T00:00:00.000Z",
+            "noise",
+            None,
+            None,
+            "ok",
+            None,
+            None,
+            None,
+        );
+    });
+    assert_eq!(link(&repo, &sha(1)).basis, basis::SCAN_CAPPED);
+}
+
+#[test]
+fn r2_cap_boundary_inclusive() {
+    let at0 = t0();
+    let since = at0.saturating_sub(LINK_WINDOW_MS).saturating_sub(600_000);
+    let (_d, repo, _) = r2_capped_world(|repo, at| {
+        let since = at - LINK_WINDOW_MS - 600_000;
+        r2_raw(
+            repo,
+            &ids::iso8601_utc(since),
+            "noise",
+            None,
+            None,
+            "ok",
+            None,
+            None,
+            None,
+        );
+    });
+    assert_eq!(
+        link(&repo, &sha(1)).basis,
+        basis::SCAN_CAPPED,
+        "since={since}"
+    );
+    let (_d, repo, _) = r2_capped_world(|repo, at| {
+        let since = at - LINK_WINDOW_MS - 600_000 - 1;
+        r2_raw(
+            repo,
+            &ids::iso8601_utc(since),
+            "noise",
+            None,
+            None,
+            "ok",
+            None,
+            None,
+            None,
+        );
+    });
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("A"));
+}
+
+#[test]
+fn r2_cap_hidden_row_with_empty_ts_but_in_window_event() {
+    // The hidden row was appended with a bad append stamp but its event time
+    // is inside the window: session B ran a commit, then A's is credited alone.
+    for ts in ["", "not-a-time", "2026-01-01T00:00:00.000Z"] {
+        let (_d, repo, _) = r2_capped_world(|repo, at| {
+            r2_raw(
+                repo,
+                ts,
+                "session.command",
+                Some("B"),
+                Some("git commit -m b"),
+                "ok",
+                Some(&r2_cmd_detail(at - 2 * SEC)),
+                None,
+                None,
+            );
+        });
+        let got = link(&repo, &sha(1));
+        eprintln!("hidden-B ts={ts:?}: {:?} {:?}", got.basis, got.session_id);
+    }
+}
+
+#[test]
+fn r2_cap_non_monotonic_ids_newest_by_ts_hidden() {
+    // The newest-by-ts rows have the LOWEST ids (a replayed batch).
+    let (_d, repo, _) = r2_capped_world(|repo, at| {
+        r2_raw(
+            repo,
+            &ids::iso8601_utc(at),
+            "session.command",
+            Some("B"),
+            Some("git commit -m b"),
+            "ok",
+            Some(&r2_cmd_detail(at - 2 * SEC)),
+            None,
+            None,
+        );
+    });
+    assert_eq!(link(&repo, &sha(1)).basis, basis::SCAN_CAPPED);
+}
+
+#[test]
+fn r2_cap_hidden_earlier_origin_of_same_commit() {
+    // The commit's first origin entry (session B's) is hidden and old; a later
+    // origin entry for the same sha (cherry-pick of identical tree) is visible.
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    r2_raw(
+        &repo,
+        "2026-01-01T00:00:00.000Z",
+        "reflog.commit",
+        None,
+        Some(&format!("{} commit: m", sha(1))),
+        "ok",
+        None,
+        None,
+        Some(&sha(1)),
+    );
+    noise(&repo, LINK_SCAN_ROWS + 10);
+    command_row(&repo, None, "A", "git cherry-pick x", at - SEC);
+    reflog_row(&repo, None, &sha(1), "cherry-pick: m", at);
+    let got = link(&repo, &sha(1));
+    eprintln!("hidden-earlier-origin: {got:?}");
+}
+
+// ---- fail closed: what a command line does not prove, it does not credit ----
+
+#[test]
+fn a_command_whose_target_is_not_known_never_links_and_is_named() {
+    let at = t0();
+    for (n, text) in [
+        "GIT_DIR=/x/.git git commit -m a",
+        "env GIT_WORK_TREE=/x git commit -m a",
+        "sh -c 'git commit -m a'",
+        "bash -lc \"git commit -m a\"",
+        "eval git commit -m a",
+        "git -c core.worktree=/x commit -m a",
+        "git --config-env=core.worktree=X commit -m a",
+        "time git commit -m a",
+        "git -C \"/some where\" commit -m a",
+        "git -C ../nowhere commit -m a",
+        "cd /does/not/exist && git commit -m a",
+        "(cd /x && git commit -m a)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_d, repo) = repo_dir();
+        command_row(&repo, None, "S1", text, at - SEC);
+        reflog_row(&repo, None, &sha(n), "commit", at);
+        let got = link(&repo, &sha(n));
+        assert_eq!(got.session_id, None, "{text}: {got:?}");
+        assert_eq!(got.basis, basis::COMMAND_TARGET_UNKNOWN, "{text}");
+    }
+}
+
+#[test]
+fn a_command_of_unknown_target_from_another_session_makes_a_proved_one_ambiguous() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "A", "git commit -m a", at - 5 * SEC);
+    command_row(&repo, None, "B", "env GIT_DIR=/x git commit -m b", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    let got = link(&repo, &sha(1));
+
+    assert!(got.ambiguous, "B may have made it: {got:?}");
+    assert_eq!(got.session_id, None);
+}
+
+#[test]
+fn a_command_proved_to_aim_elsewhere_is_not_a_candidate_and_does_not_make_anyone_ambiguous() {
+    let t = tree();
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "A", "git commit -m a", at - 5 * SEC);
+    command_row(
+        &repo,
+        None,
+        "B",
+        &format!("git -C {} commit -m b", t.lane.display()),
+        at - SEC,
+    );
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("A"));
+}
+
+#[test]
+fn a_hidden_row_that_cannot_vouch_for_its_own_time_defeats_the_cap_proof() {
+    for (ts, event) in [
+        ("", true),
+        ("not-a-time", true),
+        ("2026-01-01T00:00:00.000Z", true),
+    ] {
+        let (_d, repo, _) = r2_capped_world(|repo, at| {
+            let detail = r2_cmd_detail(at - 2 * SEC);
+            r2_raw(
+                repo,
+                ts,
+                "session.command",
+                Some("B"),
+                Some("git commit -m b"),
+                "ok",
+                event.then_some(detail.as_str()),
+                None,
+                None,
+            );
+        });
+        let got = link(&repo, &sha(1));
+        assert_eq!(got.session_id, None, "ts={ts:?}: {got:?}");
+        assert_eq!(got.basis, basis::SCAN_CAPPED, "ts={ts:?}");
+    }
+}
+
+#[test]
+fn a_hidden_origin_entry_of_the_same_commit_defeats_the_cap_proof() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    r2_raw(
+        &repo,
+        "2026-01-01T00:00:00.000Z",
+        "reflog.commit",
+        None,
+        Some(&format!("{} commit: m", sha(1))),
+        "ok",
+        None,
+        None,
+        Some(&sha(1)),
+    );
+    noise(&repo, LINK_SCAN_ROWS + 10);
+    command_row(&repo, None, "A", "git cherry-pick x", at - SEC);
+    reflog_row(&repo, None, &sha(1), "cherry-pick: m", at);
+
+    assert_eq!(link(&repo, &sha(1)).basis, basis::SCAN_CAPPED);
+}
+
+#[test]
+fn a_ledger_larger_than_the_probe_bound_is_not_provable() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    noise(&repo, LINK_SCAN_ROWS + HIDDEN_PROBE_ROWS + 10);
+    command_row(&repo, None, "A", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    assert_eq!(link(&repo, &sha(1)).basis, basis::SCAN_CAPPED);
+}
+
+#[test]
+fn a_row_of_the_wrong_type_is_that_rows_own_unknown_and_the_batch_still_answers() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    for detail in [
+        r#"{"result":1,"occurred_at":1762500000,"occurred_at_basis":"transcript"}"#,
+        r#"{"result":{"x":1},"occurred_at":["a"],"occurred_at_basis":7}"#,
+        r#"{"result":true,"occurred_at":null}"#,
+    ] {
+        r2_raw(
+            &repo,
+            &ids::iso8601_utc(at),
+            "session.command",
+            Some("X"),
+            Some("git status"),
+            "ok",
+            Some(detail),
+            None,
+            None,
+        );
+    }
+    // A column of the wrong type altogether.
+    with_conn(&repo, |conn| {
+        conn.execute(
+            "INSERT INTO events (ulid, ts_utc, repo_path, actor_kind, session_id, action, object, outcome)
+             VALUES ('9999999999999999999999ZZZZ', ?1, 'r', 'system', 12345, 'session.command', X'67697420636f6d6d6974', 'ok')",
+            [ids::iso8601_utc(at)],
+        )
+        .map_err(|e| LedgerError::new("t", e.to_string()))?;
+        Ok(())
+    })
+    .unwrap();
+    command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("S1"));
+}
+
+#[test]
+fn a_vanished_worktree_matches_only_its_own_spelling() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(
+        &repo,
+        Some("/gone/lane/"),
+        "S1",
+        "git commit -m a",
+        at - SEC,
+    );
+    reflog_row(&repo, Some("/gone/lane"), &sha(1), "commit", at);
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("S1"));
+
+    let (_d2, repo2) = repo_dir();
+    command_row(
+        &repo2,
+        Some("/gone/lane-b"),
+        "S1",
+        "git commit -m a",
+        at - SEC,
+    );
+    reflog_row(&repo2, Some("/gone/lane"), &sha(2), "commit", at);
+    assert_eq!(link(&repo2, &sha(2)).session_id, None);
 }

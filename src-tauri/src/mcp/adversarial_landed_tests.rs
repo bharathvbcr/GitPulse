@@ -527,6 +527,20 @@ fn every_session_basis_validates_against_the_output_schema() {
             }),
         ),
         (
+            basis::COMMAND_TARGET_UNKNOWN,
+            Box::new(move |r, c| {
+                put_row(
+                    r,
+                    "command",
+                    "env GIT_DIR=/x/.git git commit -m x",
+                    c,
+                    Some((now - 3_000, "transcript")),
+                    ok,
+                );
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
             basis::NO_REFLOG_ENTRY,
             Box::new(move |r, c| {
                 put_row(r, "command", cmd, c, Some((now - 3_000, "transcript")), ok);
