@@ -111,6 +111,14 @@ pub mod basis {
     /// The only command that fits is one whose result was never read, so
     /// whether it made anything is not known.
     pub const COMMAND_OUTCOME_UNKNOWN: &str = "command_outcome_unknown";
+    /// The only command that fits made, or may have made, an earlier commit:
+    /// a single-commit run is credited with the first entry after it, a rebase
+    /// with its own run, and this entry is neither.
+    pub const COMMAND_SPENT: &str = "command_made_another_commit";
+    /// What lies between the command and the commit cannot be ordered in time
+    /// (a reflog entry with no event time), so which entry the command made is
+    /// not certain.
+    pub const COMMAND_ORDER_UNKNOWN: &str = "command_order_unknown";
     /// The only command that fits is one whose target worktree could not be
     /// determined (an env prefix, a nested shell, a quoted or missing path):
     /// it may have made the commit, and it may have aimed elsewhere.
@@ -134,7 +142,7 @@ pub mod basis {
     pub const NOT_EXAMINED: &str = "not_examined_batch_cap";
 
     /// Every value `session_basis` can take, for the schema test.
-    pub const ALL: [&str; 15] = [
+    pub const ALL: [&str; 17] = [
         INFERRED,
         NO_SESSION_COMMAND,
         AMBIGUOUS,
@@ -143,6 +151,8 @@ pub mod basis {
         COMMAND_UNTIMED,
         COMMAND_OUTCOME_UNKNOWN,
         COMMAND_TARGET_UNKNOWN,
+        COMMAND_SPENT,
+        COMMAND_ORDER_UNKNOWN,
         NO_REFLOG_ENTRY,
         NO_ORIGIN_ENTRY,
         REFLOG_UNTIMED,
@@ -244,21 +254,22 @@ pub fn link_commits(repo_path: &str, commits: &[String]) -> HashMap<String, Comm
         return answers;
     }
     let read = with_access(repo_path, Access::ReadOnly, |conn| {
-        let (rows, floor) = read_rows(conn, &examined)?;
+        let (rows, floor) = read_rows(conn)?;
         let hidden = floor.map(|floor| read_hidden(conn, floor, &examined));
         let (reflogs, commands): (Vec<Row>, Vec<Row>) =
             rows.into_iter().partition(|row| !row.is_command);
         let anchor = canonical(repo_path);
-        let commands = classify(commands, &anchor);
+        let mut seen = HashMap::new();
+        let reflogs: Vec<Placed> = reflogs
+            .into_iter()
+            .map(|row| place(row, &anchor, &mut seen))
+            .collect();
+        let commands = classify(commands, &anchor, &mut seen);
         let mut linked = Vec::with_capacity(examined.len());
         for sha in &examined {
-            let mine: Vec<&Row> = reflogs
-                .iter()
-                .filter(|row| row.after_ref.as_deref() == Some(*sha))
-                .collect();
             linked.push((
                 (*sha).to_string(),
-                link_one(sha, &mine, &commands, &anchor, hidden.as_ref()),
+                link_one(sha, &reflogs, &commands, hidden.as_ref()),
             ));
         }
         Ok(linked)
@@ -274,15 +285,17 @@ pub fn link_commits(repo_path: &str, commits: &[String]) -> HashMap<String, Comm
     answers
 }
 
-/// The reflog rows of `commits` and every git-looking `session.command` row,
-/// among the newest [`LINK_SCAN_ROWS`] events, and the id at the bound when
-/// older rows exist (`None` when the read covered the whole ledger).
+/// Every reflog row and every git-looking `session.command` row among the
+/// newest [`LINK_SCAN_ROWS`] events, and the id at the bound when older rows
+/// exist (`None` when the read covered the whole ledger). The reflog rows are
+/// all of them, not only the asked commits': what lies between a command and a
+/// commit decides whether the command made it.
 ///
 /// The range is on the primary key, so the read touches at most that many rows
 /// however large the ledger is. Event time comes from `detail_json` rather than
 /// the typed `occurred_at` column so a ledger a generation-1 writer last opened
 /// reads the same as a migrated one.
-fn read_rows(conn: &Connection, commits: &[&str]) -> Result<(Vec<Row>, Option<i64>), LedgerError> {
+fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> {
     let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
     let newest: Option<i64> = conn
         .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
@@ -298,25 +311,23 @@ fn read_rows(conn: &Connection, commits: &[&str]) -> Result<(Vec<Row>, Option<i6
             |row| row.get::<_, bool>(0),
         )
         .map_err(failed)?;
-    let marks = vec!["?"; commits.len()].join(",");
-    let sql = format!(
-        "SELECT id, worktree_path, action, session_id, object, outcome, after_ref, ts_utc,
-                CASE WHEN json_valid(detail_json)
-                     THEN json_extract(detail_json, '$.occurred_at') END,
-                CASE WHEN json_valid(detail_json)
-                     THEN json_extract(detail_json, '$.occurred_at_basis') END,
-                CASE WHEN json_valid(detail_json)
-                     THEN json_extract(detail_json, '$.result') END
-         FROM events
-         WHERE id > ?1
-           AND ((action = 'session.command' AND object LIKE '%git%')
-                OR (action LIKE 'reflog.%' AND after_ref IN ({marks})))"
-    );
-    let mut values = vec![Value::Integer(floor)];
-    values.extend(commits.iter().map(|sha| Value::Text((*sha).to_string())));
-    let mut stmt = conn.prepare(&sql).map_err(failed)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, worktree_path, action, session_id, object, outcome, after_ref, ts_utc,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.occurred_at') END,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.occurred_at_basis') END,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.result') END
+             FROM events
+             WHERE id > ?1
+               AND ((action = 'session.command' AND object LIKE '%git%')
+                    OR action LIKE 'reflog.%')",
+        )
+        .map_err(failed)?;
     let rows = stmt
-        .query_map(params_from_iter(values), |row| {
+        .query_map([floor], |row| {
             let is_command = text(row, 2)?.as_deref() == Some("session.command");
             let at = text(row, 8)?;
             let stamp_basis = text(row, 9)?;
@@ -463,48 +474,83 @@ pub(crate) enum Target {
     Here,
 }
 
-/// A command row that may have made a commit in the worktree it ran in.
-struct Command {
+/// A ledger row with the worktree it belongs to, resolved.
+struct Placed {
     row: Row,
     worktree: String,
+}
+
+/// `row`'s worktree: the anchor checkout stores none and is the repository
+/// itself; any other is resolved once per call.
+fn place(row: Row, anchor: &str, seen: &mut HashMap<String, String>) -> Placed {
+    let worktree = if row.worktree.is_empty() {
+        anchor.to_string()
+    } else {
+        seen.entry(row.worktree.clone())
+            .or_insert_with(|| canonical(&row.worktree))
+            .clone()
+    };
+    Placed { row, worktree }
+}
+
+/// A command row that is, or may be, a commit-making run in its own worktree.
+struct Command {
+    placed: Placed,
     target: Target,
+    shape: Shape,
 }
 
 /// The command rows that are, or may be, a commit-making run in their own
 /// worktree, with that worktree resolved. Rows that certainly are not are
 /// dropped.
-fn classify(rows: Vec<Row>, anchor: &str) -> Vec<Command> {
-    let mut seen: HashMap<String, String> = HashMap::new();
+fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) -> Vec<Command> {
     rows.into_iter()
         .filter_map(|row| {
-            let worktree = if row.worktree.is_empty() {
-                anchor.to_string()
-            } else {
-                seen.entry(row.worktree.clone())
-                    .or_insert_with(|| canonical(&row.worktree))
-                    .clone()
-            };
-            let object = row.object.as_deref()?;
-            let target = command_target(object, Path::new(&worktree));
+            let placed = place(row, anchor, seen);
+            let object = placed.row.object.as_deref()?;
+            let (target, shape) = read_command(object, Path::new(&placed.worktree));
             (target != Target::Elsewhere).then_some(Command {
-                row,
-                worktree,
+                placed,
                 target,
+                shape,
             })
         })
         .collect()
 }
 
+/// A reflog entry's message, split the way git writes it: `verb (step): tail`.
+struct Entry<'a> {
+    verb: &'a str,
+    /// The text of a trailing `(...)`, as in `rebase (pick)`.
+    step: Option<&'a str>,
+    /// Whether the entry closes an operation: `(finish)` or `(abort)`.
+    closes: bool,
+    tail: &'a str,
+}
+
+/// The message of a reflog row's `object` (`"<commit> <message>"`), parsed.
+fn parse_entry(object: &str) -> Option<Entry<'_>> {
+    let message = object.split_once(' ').map_or("", |(_, rest)| rest);
+    let (head, tail) = message.split_once(": ")?;
+    Some(Entry {
+        verb: head.split([' ', '(']).next().unwrap_or(""),
+        step: head
+            .split_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')')),
+        closes: head.ends_with("(finish)") || head.ends_with("(abort)"),
+        tail,
+    })
+}
+
 /// What a reflog entry did to the ref.
 ///
 /// Only an entry that *created* the commit is its origin. The message is git's
-/// own (`%gs`), the part of the `object` after the commit id, classified on the
-/// whole of it: the verb, the parenthesised step, and what follows the colon.
-/// The forms that create a commit are listed; every other form (`merge x:
-/// Fast-forward`, `pull: Fast-forward`, `cherry-pick: fast-forward`, `reset`,
-/// `checkout`, `clone`, `rebase (start)` / `(finish)`, `branch`, and any form
-/// this list has not heard of) is a move, so an unknown form can only cost a
-/// link, never invent one.
+/// own (`%gs`), classified on the whole of it: the verb, the parenthesised step,
+/// and what follows the colon. The forms that create a commit are listed; every
+/// other form (`merge x: Fast-forward`, `pull: Fast-forward`, `cherry-pick:
+/// fast-forward`, `reset`, `checkout`, `clone`, `rebase (start)` / `(finish)`,
+/// `branch`, and any form this list has not heard of) is a move, so an unknown
+/// form can only cost a link, never invent one.
 ///
 /// Forms verified against git's own reflog: `commit: m`, `commit (initial): m`,
 /// `commit (amend): m`, `commit (merge): m`, `cherry-pick: m` (and
@@ -512,52 +558,141 @@ fn classify(rows: Vec<Row>, anchor: &str) -> Vec<Command> {
 /// `rebase (pick|continue|fixup|squash|reword|edit): m`,
 /// `pull --rebase (pick): m`, `merge b: Merge made by the 'ort' strategy.` and
 /// `pull: Merge made by ...`.
-fn creates_commit(object: &str) -> bool {
-    let message = object.split_once(' ').map_or("", |(_, rest)| rest);
-    let Some((head, tail)) = message.split_once(": ") else {
-        return false;
-    };
-    let verb = head.split([' ', '(']).next().unwrap_or("");
-    let step = head
-        .split_once('(')
-        .and_then(|(_, rest)| rest.strip_suffix(')'));
-    match verb {
+fn creates_commit(entry: &Entry<'_>) -> bool {
+    match entry.verb {
         "commit" | "revert" | "am" => true,
         // `git cherry-pick` of a commit whose parent is already HEAD moves the
         // ref instead of making a commit, and says so.
         "cherry-pick" => {
-            !tail.eq_ignore_ascii_case("fast-forward") && step.is_none_or(|s| s == "continue")
+            !entry.tail.eq_ignore_ascii_case("fast-forward")
+                && entry.step.is_none_or(|s| s == "continue")
         }
         "rebase" | "pull" => {
             matches!(
-                step,
+                entry.step,
                 Some("pick" | "continue" | "fixup" | "squash" | "reword" | "edit")
-            ) || (verb == "pull" && tail.starts_with("Merge made by"))
+            ) || (entry.verb == "pull" && entry.tail.starts_with("Merge made by"))
         }
-        "merge" => tail.starts_with("Merge made by"),
+        "merge" => entry.tail.starts_with("Merge made by"),
         _ => false,
     }
 }
 
-/// The matching rule, over rows already read. `reflogs` are the commit's own;
-/// `hidden` is `Some` when the read stopped at the row bound.
+/// Whether a reflog row is an origin entry (it made its commit).
+fn is_origin(row: &Row) -> bool {
+    row.object
+        .as_deref()
+        .and_then(parse_entry)
+        .is_some_and(|entry| creates_commit(&entry))
+}
+
+/// What came between a command and a commit's origin entry.
+#[derive(Debug, PartialEq, Eq)]
+enum Between {
+    /// Nothing that takes the command from this commit: it may have made it.
+    Clear,
+    /// The command made an earlier entry (or a run that ended), or is not the
+    /// kind of run that makes this one: it did not make this commit.
+    Spent,
+    /// An entry that cannot be placed in time could lie between them: the
+    /// order is not known, so there is no certain answer.
+    Unordered,
+}
+
+/// Whether `command` can be the maker of the origin entry `entry` (at `at`),
+/// given every reflog row of the worktree.
+///
+/// A command is credited with the *next* entry, not with every entry in its
+/// window. A single-commit run (`commit`, `merge`, `revert`, one `cherry-pick`)
+/// makes exactly one: any other commit's origin entry between the command and
+/// this one means the command made that, and not this. A run (a rebase's picks,
+/// a cherry-pick range) is credited with the entries of its own verbs: this
+/// entry must be one, and the run must not have ended before it, at its
+/// `(finish)` / `(abort)` entry or at an origin entry of another verb.
+///
+/// "Between" is by reflog second, and ties count as between: two entries of one
+/// second have no order, and a command's credit may not rest on one.
+fn between(
+    command: &Command,
+    command_at: u64,
+    entry: &Placed,
+    at: u64,
+    sha: &str,
+    reflogs: &[Placed],
+) -> Between {
+    let started = command_at.saturating_sub(REFLOG_GRANULARITY_MS - 1);
+    let run = match command.shape {
+        Shape::Single => None,
+        Shape::Run(verbs) => Some(verbs),
+    };
+    if let Some(verbs) = run {
+        let this = entry.row.object.as_deref().and_then(parse_entry);
+        if !this.is_some_and(|this| verbs.contains(&this.verb)) {
+            return Between::Spent;
+        }
+    }
+    let mut unordered = false;
+    for other in reflogs {
+        let row = &other.row;
+        if other.worktree != entry.worktree
+            || row.after_ref.as_deref() == Some(sha)
+            || row.id == entry.row.id
+        {
+            continue;
+        }
+        let parsed = row.object.as_deref().and_then(parse_entry);
+        let origin = parsed.as_ref().is_some_and(creates_commit);
+        let Some(t) = row.at_ms else {
+            // Appended before the window opened, it cannot be inside it.
+            let possible = ids::parse_event_time(&row.ts_utc)
+                .is_none_or(|ts| ts >= at.saturating_sub(LINK_WINDOW_MS));
+            unordered |= origin && possible;
+            continue;
+        };
+        if t < started || t > at {
+            continue;
+        }
+        match (&parsed, run) {
+            (Some(parsed), Some(verbs)) => {
+                let closes = parsed.closes && verbs.contains(&parsed.verb);
+                let ended_before = closes && (t < at || row.id < entry.row.id);
+                if ended_before || (origin && !verbs.contains(&parsed.verb)) {
+                    return Between::Spent;
+                }
+            }
+            (Some(_), None) if origin => return Between::Spent,
+            _ => {}
+        }
+    }
+    if unordered {
+        Between::Unordered
+    } else {
+        Between::Clear
+    }
+}
+
+/// The matching rule, over rows already read. `reflogs` are every reflog row
+/// read; `hidden` is `Some` when the read stopped at the row bound.
 fn link_one(
     sha: &str,
-    reflogs: &[&Row],
+    reflogs: &[Placed],
     commands: &[Command],
-    anchor: &str,
     hidden: Option<&Hidden>,
 ) -> CommitLink {
-    if reflogs.is_empty() {
+    let mine: Vec<&Placed> = reflogs
+        .iter()
+        .filter(|placed| placed.row.after_ref.as_deref() == Some(sha))
+        .collect();
+    if mine.is_empty() {
         return CommitLink::none(if hidden.is_some() {
             basis::SCAN_CAPPED
         } else {
             basis::NO_REFLOG_ENTRY
         });
     }
-    let origins: Vec<&&Row> = reflogs
+    let origins: Vec<&&Placed> = mine
         .iter()
-        .filter(|row| row.object.as_deref().is_some_and(creates_commit))
+        .filter(|placed| is_origin(&placed.row))
         .collect();
     if origins.is_empty() {
         // The entry that made it may be one the read did not reach.
@@ -571,47 +706,51 @@ fn link_one(
     // again, an amend that changed nothing) is the same link.
     let Some(entry) = origins
         .iter()
-        .filter(|row| row.at_ms.is_some())
-        .min_by_key(|row| (row.at_ms, row.id))
+        .filter(|placed| placed.row.at_ms.is_some())
+        .min_by_key(|placed| (placed.row.at_ms, placed.row.id))
     else {
         return CommitLink::none(basis::REFLOG_UNTIMED);
     };
-    let Some(at) = entry.at_ms else {
+    let Some(at) = entry.row.at_ms else {
         return CommitLink::none(basis::REFLOG_UNTIMED);
     };
     let earliest = at.saturating_sub(LINK_WINDOW_MS);
     let latest = at.saturating_add(REFLOG_GRANULARITY_MS - 1);
-    // An earlier origin entry for this very commit, or a command in the window,
-    // may sit in rows the read did not reach.
+    // An earlier origin entry for this very commit, or a command or entry in
+    // the window, may sit in rows the read did not reach.
     if hidden.is_some_and(|h| h.named.contains(sha) || h.may_hold_event_since(earliest)) {
         return CommitLink::none(basis::SCAN_CAPPED);
     }
-    let worktree = if entry.worktree.is_empty() {
-        anchor.to_string()
-    } else {
-        canonical(&entry.worktree)
-    };
 
     // Commands of the commit's own worktree, by what is known of them.
     let mut ok: Vec<(&Row, u64)> = Vec::new();
     let mut unobserved: Vec<&Row> = Vec::new();
     let mut target_unknown: Vec<&Row> = Vec::new();
     let (mut untimed, mut before, mut after) = (false, false, false);
+    let mut unordered: Vec<&Row> = Vec::new();
+    let mut spent = false;
     for command in commands.iter().filter(|c| {
-        c.worktree == worktree
-            && c.row.outcome == "ok"
-            && c.row.result.as_deref() != Some("error")
-            && c.row.session_id.as_deref().is_some_and(|s| !s.is_empty())
+        c.placed.worktree == entry.worktree
+            && c.placed.row.outcome == "ok"
+            && c.placed.row.result.as_deref() != Some("error")
+            && c.placed
+                .row
+                .session_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
     }) {
-        let row = &command.row;
+        let row = &command.placed.row;
         match row.at_ms {
             Some(t) if (earliest..=latest).contains(&t) => {
                 if command.target == Target::Unknown {
                     target_unknown.push(row);
-                } else if row.result.as_deref() == Some("ok") {
-                    ok.push((row, t));
-                } else {
-                    unobserved.push(row);
+                    continue;
+                }
+                match between(command, t, entry, at, sha, reflogs) {
+                    Between::Spent => spent = true,
+                    Between::Unordered => unordered.push(row),
+                    Between::Clear if row.result.as_deref() == Some("ok") => ok.push((row, t)),
+                    Between::Clear => unobserved.push(row),
                 }
             }
             Some(t) if t > latest => after |= t <= latest.saturating_add(LINK_WINDOW_MS),
@@ -624,18 +763,21 @@ fn link_one(
     }
 
     // A command that may have made it but is not known to have (its result was
-    // never read, or its target is not known) counts toward ambiguity and never
-    // toward a link.
+    // never read, its target is not known, or what lies between it and the
+    // commit cannot be ordered) counts toward ambiguity and never toward a link.
     let sessions: BTreeSet<&str> = ok
         .iter()
         .map(|(row, _)| row)
         .chain(unobserved.iter())
         .chain(target_unknown.iter())
+        .chain(unordered.iter())
         .filter_map(|row| row.session_id.as_deref())
         .collect();
     match (sessions.len(), ok.is_empty()) {
         (0, _) => CommitLink::none(if untimed {
             basis::COMMAND_UNTIMED
+        } else if spent {
+            basis::COMMAND_SPENT
         } else if after {
             basis::COMMAND_AFTER_REFLOG
         } else if before {
@@ -643,10 +785,12 @@ fn link_one(
         } else {
             basis::NO_SESSION_COMMAND
         }),
-        (1, true) => CommitLink::none(if target_unknown.is_empty() {
-            basis::COMMAND_OUTCOME_UNKNOWN
-        } else {
+        (1, true) => CommitLink::none(if !unordered.is_empty() {
+            basis::COMMAND_ORDER_UNKNOWN
+        } else if !target_unknown.is_empty() {
             basis::COMMAND_TARGET_UNKNOWN
+        } else {
+            basis::COMMAND_OUTCOME_UNKNOWN
         }),
         (1, false) => {
             // Several commands of one session (a commit, then its amend):
@@ -672,7 +816,99 @@ fn link_one(
 }
 
 /// The git subcommands whose run moves HEAD onto a commit.
-const MUTATING_SUBCOMMANDS: [&str; 5] = ["commit", "merge", "rebase", "cherry-pick", "pull"];
+const MUTATING_SUBCOMMANDS: [&str; 7] = [
+    "commit",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "pull",
+    "revert",
+    "am",
+];
+
+/// Git subcommands known to make no commit on a branch: they read, stage,
+/// move a ref or the tree onto an existing commit, or touch only remotes. The
+/// list is closed. A verb that is on neither it nor [`MUTATING_SUBCOMMANDS`]
+/// (an alias such as `ci`, a verb this list has not heard of) may be a
+/// commit-making run of a shape not understood, so it never links and makes
+/// another session's link ambiguous.
+const READ_ONLY_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "ls-remote",
+    "cat-file",
+    "blame",
+    "grep",
+    "describe",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "show-ref",
+    "show-branch",
+    "shortlog",
+    "whatchanged",
+    "reflog",
+    "remote",
+    "config",
+    "fetch",
+    "add",
+    "rm",
+    "mv",
+    "restore",
+    "clean",
+    "checkout",
+    "switch",
+    "reset",
+    "branch",
+    "tag",
+    "push",
+    "stash",
+    "worktree",
+    "merge-base",
+    "symbolic-ref",
+    "update-ref",
+    "for-each-ref",
+    "name-rev",
+    "check-ignore",
+    "check-attr",
+    "count-objects",
+    "fsck",
+    "gc",
+    "prune",
+    "repack",
+    "maintenance",
+    "help",
+    "version",
+    "init",
+    "clone",
+    "apply",
+    "format-patch",
+    "archive",
+    "bundle",
+    "sparse-checkout",
+    "var",
+    "difftool",
+    "range-diff",
+    "cherry",
+    "request-pull",
+    "verify-commit",
+    "verify-tag",
+    "hash-object",
+    "write-tree",
+    "read-tree",
+    "mktree",
+    "pack-refs",
+    "commit-tree",
+    "merge-file",
+    "submodule",
+    "notes",
+];
 
 /// Arguments that make a run create nothing: a dry run, a help page, or the
 /// end of an operation (`rebase --abort`). `--continue` and `--skip` stay out:
@@ -808,19 +1044,41 @@ fn tokenize(command: &str) -> Option<(Vec<Vec<Word>>, bool)> {
 /// separators and quotes, so the text of a quoted `sh -c '...'` is looked into
 /// and `git status;git commit` is not missed.
 fn mentions_git_mutation<'a>(words: impl IntoIterator<Item = &'a str>) -> bool {
-    let mut seen_git = false;
-    let boundary = |c: char| c.is_whitespace() || ";&|(){}`\"'".contains(c);
+    let (mut seen_git, mut verb_seen) = (false, false);
     for word in words
         .into_iter()
-        .flat_map(|text| text.split(boundary))
+        .flat_map(|text| text.split(is_boundary))
         .filter(|word| !word.is_empty())
     {
-        if seen_git && MUTATING_SUBCOMMANDS.contains(&word) {
-            return true;
+        if word == "git" || word.ends_with("/git") {
+            (seen_git, verb_seen) = (true, false);
+        } else if seen_git {
+            if MUTATING_SUBCOMMANDS.contains(&word) {
+                return true;
+            }
+            // The first word that is not an option is the verb, or the value
+            // of an option: either way, one not known to be harmless counts.
+            if !verb_seen && !word.starts_with('-') {
+                verb_seen = true;
+                if !READ_ONLY_SUBCOMMANDS.contains(&word) {
+                    return true;
+                }
+            }
         }
-        seen_git |= word == "git" || word.ends_with("/git");
     }
     false
+}
+
+/// Where a command line's words end: whitespace, shell separators, quotes.
+fn is_boundary(c: char) -> bool {
+    c.is_whitespace() || ";&|(){}`\"'".contains(c)
+}
+
+/// Whether any word of `command` is `git` at all.
+fn mentions_git(command: &str) -> bool {
+    command
+        .split(is_boundary)
+        .any(|word| word == "git" || word.ends_with("/git"))
 }
 
 /// Where a command line aims its commit-making git runs, relative to
@@ -836,8 +1094,53 @@ fn mentions_git_mutation<'a>(words: impl IntoIterator<Item = &'a str>) -> bool {
 /// lexically), a `-c` that can move the tree, `--config-env`, groupings and
 /// substitutions. Only a run that is provably elsewhere, or not a commit-making
 /// form, is [`Target::Elsewhere`].
+#[cfg(test)]
 pub(crate) fn command_target(command: &str, worktree: &Path) -> Target {
-    if !mentions_git_mutation(std::iter::once(command)) {
+    read_command(command, worktree).0
+}
+
+/// How many commits a command makes, which decides how many reflog entries it
+/// can be credited with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// One commit, so one entry: the first origin entry after it in its
+    /// worktree. The default, and the rule for every verb whose count is not
+    /// known.
+    Single,
+    /// A run of commits written by one operation (a rebase's picks, a
+    /// cherry-pick range), credited to the origin entries of these verbs and
+    /// no further: the run ends at its `(finish)` / `(abort)` entry or at the
+    /// next origin entry of any other verb.
+    Run(&'static [&'static str]),
+}
+
+impl Shape {
+    /// What two commit-making runs in one command line, taken together, are:
+    /// a run only when both are the same run, a single commit otherwise (which
+    /// credits fewer entries, never more).
+    fn and(self, other: Shape) -> Shape {
+        if self == other {
+            self
+        } else {
+            Shape::Single
+        }
+    }
+}
+
+/// The entries a rebase writes: `rebase (pick)`, or `pull --rebase (pick)`.
+const REBASE_VERBS: &[&str] = &["rebase", "pull"];
+const CHERRY_PICK_VERBS: &[&str] = &["cherry-pick"];
+
+/// [`command_target`], and the shape of the commit-making runs proved to be
+/// here (`Single` when there are none).
+pub(crate) fn read_command(command: &str, worktree: &Path) -> (Target, Shape) {
+    let mut shape: Option<Shape> = None;
+    let target = read_command_into(command, worktree, &mut shape);
+    (target, shape.unwrap_or(Shape::Single))
+}
+
+fn read_command_into(command: &str, worktree: &Path, shape: &mut Option<Shape>) -> Target {
+    if !mentions_git(command) {
         return Target::Elsewhere;
     }
     let Some((segments, grouped)) = tokenize(command) else {
@@ -864,7 +1167,12 @@ pub(crate) fn command_target(command: &str, worktree: &Path) -> Target {
                 continue;
             }
             (leading, true) if leading == "git" || leading.ends_with("/git") => {
-                git_target(&words[1..], dir.as_deref(), worktree)
+                let mut run = None;
+                let target = git_target(&words[1..], dir.as_deref(), worktree, &mut run);
+                if let (Target::Here, Some(run)) = (target, run) {
+                    *shape = Some(shape.map_or(run, |seen| seen.and(run)));
+                }
+                target
             }
             _ if mentions_git_mutation(words.iter().map(|word| word.text.as_str())) => {
                 Target::Unknown
@@ -908,7 +1216,12 @@ fn lands_in(dir: &Path, worktree: &Path) -> bool {
 }
 
 /// One git invocation's words after `git`, run from `dir`.
-fn git_target(words: &[Word], dir: Option<&Path>, worktree: &Path) -> Target {
+fn git_target(
+    words: &[Word],
+    dir: Option<&Path>,
+    worktree: &Path,
+    run: &mut Option<Shape>,
+) -> Target {
     let mut here = dir.map(Path::to_path_buf);
     let mut work_tree: Option<Option<PathBuf>> = None;
     let mut git_dir: Option<Option<PathBuf>> = None;
@@ -962,19 +1275,72 @@ fn git_target(words: &[Word], dir: Option<&Path>, worktree: &Path) -> Target {
         }
     };
     if !MUTATING_SUBCOMMANDS.contains(&subcommand) {
-        return Target::Elsewhere;
+        // Known not to make a commit, or not known at all: an alias, a verb
+        // this reader has not heard of.
+        return if READ_ONLY_SUBCOMMANDS.contains(&subcommand) {
+            Target::Elsewhere
+        } else {
+            Target::Unknown
+        };
     }
-    let mut args = rest.map(|word| word.text.as_str());
-    while let Some(arg) = args.next() {
+    let all_args: Vec<&str> = rest.map(|word| word.text.as_str()).collect();
+    // The words that are the command's own, not a message's text.
+    let mut args = Vec::new();
+    let mut remaining = all_args.iter().copied();
+    while let Some(arg) = remaining.next() {
         if NO_OP_ARGUMENTS.contains(&arg) {
             return Target::Elsewhere;
         }
-        // A message's text is not a flag of the command.
         if matches!(arg, "-m" | "--message" | "-F" | "--file") {
-            args.next();
+            remaining.next();
+        } else {
+            args.push(arg);
         }
     }
     let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
+    let target = aimed_at(work_tree, git_dir, here, worktree, &there);
+    if target == Target::Here {
+        *run = Some(shape_of(subcommand, &args));
+    }
+    target
+}
+
+/// How many commits `git <subcommand> <args>` makes, as far as the words say.
+/// A rebase is a run; so is a `pull` that says it rebases and a cherry-pick of
+/// a range or of several commits. Everything else is one commit, including the
+/// verbs whose count the words do not give (`am`, `revert` of several): a
+/// single commit credits fewer entries, never more.
+fn shape_of(subcommand: &str, args: &[&str]) -> Shape {
+    let flag = |name: &str| args.contains(&name);
+    match subcommand {
+        "rebase" => Shape::Run(REBASE_VERBS),
+        "pull"
+            if flag("--rebase")
+                || flag("-r")
+                || args.iter().any(|a| a.starts_with("--rebase=")) =>
+        {
+            Shape::Run(REBASE_VERBS)
+        }
+        "cherry-pick" => {
+            let commits = args.iter().filter(|arg| !arg.starts_with('-')).count();
+            if commits > 1 || args.iter().any(|arg| arg.contains("..")) {
+                Shape::Run(CHERRY_PICK_VERBS)
+            } else {
+                Shape::Single
+            }
+        }
+        _ => Shape::Single,
+    }
+}
+
+/// Where a run lands, given the work tree and git dir it named and where it ran.
+fn aimed_at(
+    work_tree: Option<Option<PathBuf>>,
+    git_dir: Option<Option<PathBuf>>,
+    here: Option<PathBuf>,
+    worktree: &Path,
+    there: &Path,
+) -> Target {
     match (work_tree, git_dir) {
         (None, None) => match here {
             Some(dir) if lands_in(&dir, worktree) => Target::Here,

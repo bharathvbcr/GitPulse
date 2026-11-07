@@ -541,6 +541,40 @@ fn every_session_basis_validates_against_the_output_schema() {
             }),
         ),
         (
+            basis::COMMAND_SPENT,
+            Box::new(move |r, c| {
+                // The command made an earlier commit (another sha, before this one).
+                let earlier = "e".repeat(40);
+                put_row(r, "command", cmd, c, Some((now - 5_000, "transcript")), ok);
+                put_row(
+                    r,
+                    "reflog",
+                    "commit: x",
+                    &earlier,
+                    Some((now - 3_000, "reflog")),
+                    None,
+                );
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
+            basis::COMMAND_ORDER_UNKNOWN,
+            Box::new(move |r, c| {
+                // Another commit's origin entry that git could not date.
+                let other = "d".repeat(40);
+                put_row(r, "command", cmd, c, Some((now - 5_000, "transcript")), ok);
+                put_row(
+                    r,
+                    "reflog",
+                    "commit: x",
+                    &other,
+                    Some((now - 3_000, "ingest")),
+                    None,
+                );
+                put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
+            }),
+        ),
+        (
             basis::NO_REFLOG_ENTRY,
             Box::new(move |r, c| {
                 put_row(r, "command", cmd, c, Some((now - 3_000, "transcript")), ok);

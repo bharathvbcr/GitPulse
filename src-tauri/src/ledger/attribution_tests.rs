@@ -4,8 +4,8 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, link_commits, runs_git_mutation, CommitLink, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS,
-    LINK_SCAN_ROWS, LINK_WINDOW_MS,
+    basis, command_target, link_commits, read_command, runs_git_mutation, CommitLink, Shape,
+    Target, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
 };
 use super::*;
 use std::path::Path;
@@ -1809,4 +1809,268 @@ fn a_vanished_worktree_matches_only_its_own_spelling() {
     );
     reflog_row(&repo2, Some("/gone/lane"), &sha(2), "commit", at);
     assert_eq!(link(&repo2, &sha(2)).session_id, None);
+}
+
+// ---- round 3: a command is credited with the next entry, and an unknown verb
+// is not a known read ----
+
+#[test]
+fn an_agent_commit_is_credited_with_its_own_commit_and_not_with_a_hand_commit_after_it() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "AGENT", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    // A human commits in the same worktree 30 s later, inside the window.
+    reflog_row(&repo, None, &sha(2), "commit", at + 30 * SEC);
+
+    let agent = link(&repo, &sha(1));
+    let human = link(&repo, &sha(2));
+
+    assert_eq!(agent.session_id.as_deref(), Some("AGENT"), "{agent:?}");
+    assert_eq!(
+        human.session_id, None,
+        "the command made X, not Y: {human:?}"
+    );
+    assert_eq!(human.basis, basis::COMMAND_SPENT);
+}
+
+#[test]
+fn a_rebase_is_credited_with_its_picks_and_nothing_after_them() {
+    let at = t0();
+    for with_finish in [true, false] {
+        let (_d, repo) = repo_dir();
+        command_row(&repo, None, "AGENT", "git rebase main", at);
+        for n in 1..=3 {
+            reflog_row(
+                &repo,
+                None,
+                &sha(n),
+                "rebase (pick): work",
+                at + n as u64 * SEC,
+            );
+        }
+        if with_finish {
+            reflog_row(
+                &repo,
+                None,
+                &sha(3),
+                "rebase (finish): returning to refs/heads/x",
+                at + 4 * SEC,
+            );
+        }
+        reflog_row(&repo, None, &sha(9), "commit", at + 30 * SEC);
+
+        for n in 1..=3 {
+            let got = link(&repo, &sha(n));
+            assert_eq!(
+                got.session_id.as_deref(),
+                Some("AGENT"),
+                "pick {n}: {got:?}"
+            );
+        }
+        let hand = link(&repo, &sha(9));
+        assert_eq!(hand.session_id, None, "finish={with_finish}: {hand:?}");
+        assert_eq!(hand.basis, basis::COMMAND_SPENT);
+    }
+}
+
+#[test]
+fn a_rebase_run_ends_at_its_finish_and_at_an_unrelated_commit() {
+    let at = t0();
+    // A human's own rebase after the agent's finished.
+    let (_d, repo) = repo_dir();
+    command_row(&repo, None, "AGENT", "git rebase main", at);
+    reflog_row(&repo, None, &sha(1), "rebase (pick): work", at + SEC);
+    reflog_row(
+        &repo,
+        None,
+        &sha(1),
+        "rebase (finish): returning to refs/heads/x",
+        at + 2 * SEC,
+    );
+    reflog_row(&repo, None, &sha(2), "rebase (pick): work", at + 20 * SEC);
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("AGENT"));
+    assert_eq!(link(&repo, &sha(2)).session_id, None);
+
+    // A hand commit in the middle of the run ends it.
+    let (_d2, repo2) = repo_dir();
+    command_row(&repo2, None, "AGENT", "git rebase main", at);
+    reflog_row(&repo2, None, &sha(1), "rebase (pick): work", at + SEC);
+    reflog_row(&repo2, None, &sha(2), "commit", at + 2 * SEC);
+    reflog_row(&repo2, None, &sha(3), "rebase (pick): work", at + 3 * SEC);
+    assert_eq!(link(&repo2, &sha(1)).session_id.as_deref(), Some("AGENT"));
+    assert_eq!(link(&repo2, &sha(3)).session_id, None);
+}
+
+#[test]
+fn two_commits_by_one_session_ten_seconds_apart_each_link_to_their_own_command() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "S1", "git commit -m first", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    command_row(&repo, None, "S1", "git commit -m second", at + 9 * SEC);
+    reflog_row(&repo, None, &sha(2), "commit", at + 10 * SEC);
+
+    let first = link(&repo, &sha(1));
+    let second = link(&repo, &sha(2));
+
+    assert_eq!(
+        first.command.as_deref(),
+        Some("git commit -m first"),
+        "{first:?}"
+    );
+    assert_eq!(
+        second.command.as_deref(),
+        Some("git commit -m second"),
+        "{second:?}"
+    );
+    assert_eq!(first.session_id.as_deref(), Some("S1"));
+    assert_eq!(second.session_id.as_deref(), Some("S1"));
+}
+
+#[test]
+fn two_different_commits_in_one_second_have_no_order_and_neither_is_credited() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    reflog_row(&repo, None, &sha(2), "commit", at);
+
+    for n in [1, 2] {
+        let got = link(&repo, &sha(n));
+        assert_eq!(got.session_id, None, "{got:?}");
+        assert_eq!(got.basis, basis::COMMAND_SPENT);
+    }
+}
+
+#[test]
+fn an_entry_with_no_event_time_between_them_leaves_the_order_unknown() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "S1", "git commit -m a", at - 5 * SEC);
+    // Another commit's origin entry that git could not date: it may lie
+    // between the command and this commit.
+    append(Draft {
+        repo_path: repo.clone(),
+        actor_kind: Some(ActorKind::System),
+        action: "reflog.commit".into(),
+        object: Some(format!("{} commit: other", sha(8))),
+        outcome: Some(Outcome::Ok),
+        after_ref: Some(sha(8)),
+        event_stamp: Some(stamp(at - 2 * SEC, "ingest")),
+        ..Draft::default()
+    })
+    .unwrap();
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    let got = link(&repo, &sha(1));
+
+    assert_eq!(got.session_id, None, "{got:?}");
+    assert_eq!(got.basis, basis::COMMAND_ORDER_UNKNOWN);
+}
+
+#[test]
+fn an_unknown_git_verb_never_links_and_makes_another_sessions_link_ambiguous() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    // A alias nobody here can read: `git ci` may be `git commit`.
+    command_row(&repo, None, "A", "git ci -m x", at - 3 * SEC);
+    command_row(&repo, None, "B", "git commit -m y", at - SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    let got = link(&repo, &sha(1));
+
+    assert_ne!(got.session_id.as_deref(), Some("B"), "{got:?}");
+    assert!(got.ambiguous, "A may have made it: {got:?}");
+
+    // Alone, it is named, and nothing is credited.
+    let (_d2, repo2) = repo_dir();
+    command_row(&repo2, None, "A", "git ci -m x", at - SEC);
+    reflog_row(&repo2, None, &sha(2), "commit", at);
+    let alone = link(&repo2, &sha(2));
+    assert_eq!(alone.session_id, None);
+    assert_eq!(alone.basis, basis::COMMAND_TARGET_UNKNOWN);
+}
+
+#[test]
+fn only_verbs_known_to_make_no_commit_are_read_only() {
+    let t = tree();
+    let w = t.w.as_path();
+    for read_only in [
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD",
+        "git show abc",
+        "git rev-parse HEAD",
+        "git branch --list",
+        "git ls-files",
+        "git fetch origin",
+        "git push origin main",
+        "git add -A",
+        "git checkout main",
+        "git reset --hard",
+        "git stash",
+        "git -C . status",
+        "git --no-pager log",
+        "git status && git diff && git log",
+    ] {
+        assert_eq!(
+            command_target(read_only, w),
+            Target::Elsewhere,
+            "{read_only}"
+        );
+    }
+    for unknown in [
+        "git ci -m x",
+        "git co main",
+        "git c",
+        "git foo",
+        "git bisect run make",
+        "git amend",
+    ] {
+        assert_eq!(command_target(unknown, w), Target::Unknown, "{unknown}");
+    }
+    // The commit-making verbs git itself has, `revert` and `am` among them.
+    for here in [
+        "git commit -m x",
+        "git merge x",
+        "git rebase x",
+        "git cherry-pick x",
+        "git pull",
+        "git revert x",
+        "git am p.patch",
+    ] {
+        assert_eq!(command_target(here, w), Target::Here, "{here}");
+    }
+}
+
+#[test]
+fn how_many_commits_a_command_makes_is_a_single_commit_unless_the_words_say_a_run() {
+    let t = tree();
+    let w = t.w.as_path();
+    let shape = |command: &str| read_command(command, w).1;
+    for single in [
+        "git commit -m x",
+        "git merge x",
+        "git revert x",
+        "git am p.patch",
+        "git pull",
+        "git pull --ff-only",
+        "git cherry-pick abc",
+        "git cherry-pick --continue",
+        "git commit -m a && git rebase main",
+    ] {
+        assert_eq!(shape(single), Shape::Single, "{single}");
+    }
+    for run in [
+        "git rebase main",
+        "git rebase -i HEAD~3",
+        "git pull --rebase",
+        "git pull -r",
+        "git cherry-pick a..b",
+        "git cherry-pick a b",
+        "git rebase main && git rebase main",
+    ] {
+        assert!(matches!(shape(run), Shape::Run(_)), "{run}");
+    }
 }
