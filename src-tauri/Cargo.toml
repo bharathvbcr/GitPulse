@@ -449,3 +449,8 @@ wry = { path = "framework/wry" }
 tauri = { path = "framework/tauri" }
 tauri-runtime = { path = "framework/tauri-runtime" }
 tauri-runtime-wry = { path = "framework/tauri-runtime-wry" }
+
+[[bench]]
+name = "worktree_create"
+harness = false
+test = false

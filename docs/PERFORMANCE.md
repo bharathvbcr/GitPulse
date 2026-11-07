@@ -2202,3 +2202,22 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
 - **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
+
+## 2026-11-07: worktree create critical path, BEFORE (ft-8de63fe1c732adcc2fecf7da50053f4f, branch `b1106/worktree-create-fast`)
+
+`cargo bench --manifest-path src-tauri/Cargo.toml --bench worktree_create` drives `engine::worktree::add_worktree_with_devmap` with the arguments `gitpulse_worktree_create` passes (default `CacheSelection`, `DevmapMode::Copy`, hooks on) on a trusted synthetic fixture: 3 000 tracked files plus 400 Rust files, an ignored `node_modules` of 25 000 small files, and a nested `sub/Cargo.toml` with a 300-file `sub/target`. `GITPULSE_BENCH_REPO=<path>` runs it on a real checkout instead. Rows are interleaved with a rotating start; `t_*` are milliseconds after `.git` appeared, polled every 2 ms.
+
+Smoke run, n=3 (1 warmup), release profile, load 12.4 on 18 cores, current source (main 064839f0), APFS. This is the only BEFORE reading so far. It is n=3 and the phase poller in that run mis-named two paths (checkout, nested target) and the fixture has no `cas/`, so only four phases were seen; the poller is fixed in the committed bench but not re-run, see below.
+
+| row | min | p50 | max | notes |
+| --- | --- | --- | --- | --- |
+| create e2e (share_cache) | 1.32 s | 1.43 s | 2.64 s | t_store 817 ms, t_csr 820 ms, t_overlay 955 ms, t_node_modules 1331 ms (medians) |
+| `cp -c -R node_modules` (baseline) | 2.99 s | 3.22 s | 3.92 s | the fixture's 25k files |
+| `clone_ignored_caches` (node_modules + sub/target) | 515 ms | 587 ms | 712 ms | 2 caches |
+| `sync_worktree_overlay` alone | 53 ms | 74 ms | 126 ms | clean worktree, no deltas |
+
+What this says, and what it does not:
+
+- On current source the node_modules clone is already faster than one `cp -c -R` (0.59 s against 3.2 s for the whole cache clone, both caches). `clone_tree` (`engine/cow_clone.rs`) takes `clonefile(2)` on the directory root for a non-`require_clone` copy, and only falls back to `copyfile` recursion. So per-file walking is not what the create path does on macOS today. The 15-17 s on the card was measured on the installed binary, which predates 29a61881 (per the card); it is not reproduced here.
+- The overlay sync is not a 9 s gap on this fixture (the whole alone-call is 74 ms, the create reaches overlay.json at about 0.96 s, concurrent with the cache clone). A real repository's gap is not reproduced by this fixture; it needs a run on the real shape (`GITPULSE_BENCH_REPO`), which was not completed (below).
+- The fixture's `sub/target` is 300 files. A real `src-tauri/target` is about 10 GB and goes through `rewrite_build_outputs`; that is the likely remaining cost and is not measured here.
