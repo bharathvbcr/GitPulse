@@ -28,14 +28,15 @@ use serde::{Deserialize, Serialize};
 /// `core.fsmonitor` slowed `git status` 1.29-1.73x below ~10k tracked files and
 /// was 20-45 percent faster at 40k (spike ft-7450105d). Offered from here.
 pub const FSMONITOR_MIN_TRACKED_FILES: u64 = 40_000;
-/// `feature.manyFiles` against a plain repository that has had the same one
-/// index-refreshing `git status` (`scripts/bench-git-tuning.mjs files`, with an
-/// identical-arm control): GitPulse-style `status` reads took 0.63 to 0.69x as
-/// long at 20,000, 40,000 and 100,000 files in six of eight runs, not less at
-/// 40,000 in one, and 0.89x in one under heavy load. 20,000 is the smallest size
-/// measured.
-/// The gain is the untracked cache's; see docs/PERFORMANCE.md.
-pub const MANYFILES_MIN_TRACKED_FILES: u64 = 20_000;
+/// `core.untrackedCache` (`scripts/bench-git-tuning.mjs files`, which gives a
+/// plain control the same one index-refreshing `git status`): an ordinary
+/// `git status` took 0.65 to 0.77x as long with only the untracked cache at
+/// 20,000 and 40,000 files (0.93x at 100,000 under heavy load), and
+/// `feature.manyFiles`, whose gain is that cache's, 0.63 to 0.74x in most runs.
+/// `git status -u`, which is what GitPulse's own status reads run, showed no
+/// gain (0.97 to 1.04x). 20,000 is the smallest size measured. See
+/// docs/PERFORMANCE.md.
+pub const UNTRACKED_CACHE_MIN_TRACKED_FILES: u64 = 20_000;
 /// Loose objects past which git's own auto-gc should already have acted
 /// (`gc.auto`'s default); a history walk over loose objects measured 2 to 9x
 /// slower than the same history packed already at 5,000.
@@ -47,18 +48,15 @@ pub const MAINTENANCE_MIN_LOOSE_OBJECTS: u64 = 6_700;
 /// to true" for the built-in daemon and says older git reads `true` as a hook
 /// path. (2.35.2 is a security release of the 2.35 line, not a feature release.)
 pub const FSMONITOR_BOOLEAN_MIN_GIT: (u32, u32, u32) = (2, 36, 0);
-/// `index.skipHash` indexes are reported corrupt by `git fsck` below this.
-pub const SKIPHASH_FSCK_MIN_GIT: (u32, u32, u32) = (2, 40, 0);
-/// Git older than this refuses an index with the v4 / skipHash format at all.
-pub const INDEX_V4_MIN_GIT: (u32, u32, u32) = (2, 13, 0);
-
 /// The apply is killed, and the rest not run, after this many seconds.
 pub const TUNING_APPLY_TIMEOUT_SECS: u64 = 120;
 
-/// The only config keys GitPulse may write. `core.splitIndex` is deliberately
-/// absent: with `feature.manyFiles` it breaks git's own add-then-commit (git
-/// 2.54 / Apple Git-157; `watcher/mod.rs`, "never share a repository").
-pub const CONFIG_WRITE_KEYS: [&str; 2] = ["feature.manyFiles", "core.fsmonitor"];
+/// The only config keys GitPulse may write. `feature.manyFiles` is detected and
+/// never written: its measured gain is the untracked cache's, and its other
+/// parts (`index.skipHash`, `index.version=4`) carry compatibility costs with no
+/// measured win. `core.splitIndex` is never written either.
+pub const CONFIG_WRITE_KEYS: [&str; 2] = ["core.untrackedCache", "core.fsmonitor"];
+
 /// The git this app drives, as the advisor needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GitEnv {
@@ -90,8 +88,8 @@ impl GitEnv {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuningChange {
-    /// `git config --local feature.manyFiles true`
-    ManyFiles,
+    /// `git config --local core.untrackedCache true`
+    UntrackedCache,
     /// `git config --local core.fsmonitor true`
     Fsmonitor,
     /// `git maintenance start`
@@ -99,11 +97,11 @@ pub enum TuningChange {
 }
 
 impl TuningChange {
-    pub const ALL: [Self; 3] = [Self::ManyFiles, Self::Fsmonitor, Self::Maintenance];
+    pub const ALL: [Self; 3] = [Self::UntrackedCache, Self::Fsmonitor, Self::Maintenance];
 
     fn title(self) -> &'static str {
         match self {
-            Self::ManyFiles => "Turn on feature.manyFiles",
+            Self::UntrackedCache => "Turn on the untracked cache",
             Self::Fsmonitor => "Turn on the file system monitor",
             Self::Maintenance => "Start background maintenance",
         }
@@ -123,7 +121,7 @@ pub struct TuningAdvice {
     pub report: RepoTuningReport,
     pub offers: Vec<TuningOffer>,
     /// Things the person should know even though nothing is offered for them,
-    /// such as a `core.splitIndex` / `feature.manyFiles` conflict.
+    /// such as a split index that keeps the untracked cache from being offered.
     pub warnings: Vec<String>,
     /// An apply is running in this repository's common directory right now.
     #[serde(default)]
@@ -134,46 +132,55 @@ fn is_set(report: &RepoTuningReport, lower: &str) -> bool {
     report.key(lower).is_some_and(|k| k.value.is_some())
 }
 
-/// Whether `feature.manyFiles` is enabled (any scope).
-fn many_files_on(report: &RepoTuningReport) -> bool {
-    report.is_true("feature.manyfiles")
+/// Whether the untracked cache is already on: `core.untrackedCache`, or
+/// `feature.manyFiles`, which turns it on (any scope).
+fn untracked_cache_on(report: &RepoTuningReport) -> bool {
+    report.is_true("core.untrackedcache") || report.is_true("feature.manyfiles")
 }
 
-/// The reason `feature.manyFiles` and `core.splitIndex` must not meet, when
-/// writing `set` (lowercase key names that would become true) would bring them
-/// together with each other or with what the repository already has. Refused
-/// in both orders: manyFiles requested over a split index, and a split index
-/// requested over manyFiles. `None` when there is no conflict.
+/// What was run and what was not, said in every split-index refusal.
+const SPLIT_INDEX_EVIDENCE: &str = "On git 2.54 (Apple Git-157), `feature.manyFiles` over a split \
+     index was reproduced breaking git's own add-then-commit (staged files read as deleted, then \
+     as untracked) and crashing `git status`. `core.untrackedCache` alone over a split index, set \
+     in config or carried as the index's own extension, including a delta past \
+     `splitIndex.maxPercentChange`, was run for several add, commit and status rounds at 5,000 \
+     and 30,000 files and did not reproduce it. `feature.manyFiles` includes the untracked cache \
+     and which of its parts breaks the split index was not isolated, so GitPulse refuses the \
+     untracked cache over a split index instead of inferring it is safe";
+
+/// The reason the untracked cache (or `feature.manyFiles`, which includes it)
+/// and a split index must not meet, when writing `set` (lowercase key names
+/// that would become true) would bring them together with each other or with
+/// what the repository already has: its config, its index file, and every
+/// other worktree's. Refused in both orders, and failing closed where a split
+/// index cannot be ruled out. `None` when there is no conflict.
 pub fn split_index_conflict(report: &RepoTuningReport, set: &[&str]) -> Option<String> {
     let sets = |key: &str| set.contains(&key);
-    let many = sets("feature.manyfiles");
+    let cache = sets("core.untrackedcache") || sets("feature.manyfiles");
     let split = sets("core.splitindex");
     let reason = |first: &str, second: &str| {
-        format!(
-            "{first} together with {second} breaks git's own add-then-commit (a staged file reads \
-             as untracked; verified on git 2.54 / Apple Git-157), so GitPulse never sets both"
-        )
+        format!("{first} together with {second} is refused. {SPLIT_INDEX_EVIDENCE}")
     };
-    if many && (split || report.is_true("core.splitindex")) {
-        return Some(reason("feature.manyFiles", "core.splitIndex"));
+    if cache && (split || report.is_true("core.splitindex")) {
+        return Some(reason("core.untrackedCache", "core.splitIndex"));
     }
-    if split && (many || many_files_on(report)) {
-        return Some(reason("core.splitIndex", "feature.manyFiles"));
+    if split && (cache || untracked_cache_on(report)) {
+        return Some(reason("core.splitIndex", "the untracked cache"));
     }
-    if many {
+    if cache {
         // The index file itself, and every sibling worktree's, say more than
-        // config does: a split index carried by the file crashes `git status`
-        // under manyFiles on git 2.54 (wt-status.c BUG), whatever the config says.
+        // config does: a split index carried by the file is one whatever the
+        // config says.
         if report.index.split_index == Some(true) {
-            return Some(
-                "this worktree's index is a split index (a link extension or a sharedindex file), \
-                 and feature.manyFiles over a split index breaks git status on git 2.54, so \
-                 GitPulse will not turn it on"
-                    .to_string(),
-            );
+            return Some(format!(
+                "this worktree's index is a split index (a link extension or a sharedindex \
+                 file), so the untracked cache is refused. {SPLIT_INDEX_EVIDENCE}"
+            ));
         }
-        if let Some(blocker) = report.family.many_files_blocker() {
-            return Some(format!("feature.manyFiles is refused: {blocker}"));
+        if let Some(blocker) = report.family.split_index_blocker() {
+            return Some(format!(
+                "core.untrackedCache is refused: {blocker}. {SPLIT_INDEX_EVIDENCE}"
+            ));
         }
     }
     None
@@ -187,30 +194,30 @@ fn offer(change: TuningChange, reason: String) -> TuningOffer {
     }
 }
 
-fn many_files_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffer> {
+fn untracked_cache_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffer> {
     let entries = report.index.entries?;
     if report.index.state != IndexReadState::Present
         || !report.index.entries_exact
-        || entries < MANYFILES_MIN_TRACKED_FILES
-        || is_set(report, "feature.manyfiles")
+        || entries < UNTRACKED_CACHE_MIN_TRACKED_FILES
+        // Any value the person set is their choice, and `feature.manyFiles`
+        // already turns the cache on.
+        || is_set(report, "core.untrackedcache")
+        || untracked_cache_on(report)
         || report.is_true("core.splitindex")
         || report.index.split_index != Some(false)
-        || report.family.many_files_blocker().is_some()
-        || !env.at_least(INDEX_V4_MIN_GIT)
+        || report.family.split_index_blocker().is_some()
+        || env.version.is_none()
     {
         return None;
     }
-    // An index that already is v4 with a zero trailer has what the key adds.
-    if report.index.version == Some(4) && report.index.skip_hash == Some(true) {
-        return None;
-    }
     Some(offer(
-        TuningChange::ManyFiles,
+        TuningChange::UntrackedCache,
         format!(
-            "{entries} tracked files (offered from {MANYFILES_MIN_TRACKED_FILES}): git status \
-             measured about a third faster once git has refreshed the index with the untracked \
-             cache on, which is the first ordinary git status after this. The index format \
-             change was not measured to help."
+            "{entries} tracked files (offered from {UNTRACKED_CACHE_MIN_TRACKED_FILES}): an \
+             ordinary `git status` measured about a quarter faster at 20,000 files once git has \
+             written the untracked cache into the index, which your next ordinary git status \
+             does. It does not speed `git status -u` (all untracked files), which GitPulse's own \
+             status reads use: no change was measured there."
         ),
     ))
 }
@@ -277,7 +284,7 @@ pub fn recommend(report: &RepoTuningReport, env: GitEnv) -> Vec<TuningOffer> {
         return Vec::new();
     }
     [
-        many_files_offer(report, env),
+        untracked_cache_offer(report, env),
         fsmonitor_offer(report, env),
         maintenance_offer(report, env),
     ]
@@ -291,26 +298,28 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
     let mut out = Vec::new();
     if report.is_true("core.splitindex") {
         out.push(
-            "core.splitIndex is on. With feature.manyFiles it breaks git's own add-then-commit, \
-             so GitPulse will not turn manyFiles on here."
+            "core.splitIndex is on, so GitPulse will not turn the untracked cache on here (it \
+             breaks git's own add-then-commit when combined with feature.manyFiles, which \
+             includes it)."
                 .to_string(),
         );
     }
     if report.index.split_index == Some(true) && !report.is_true("core.splitindex") {
         out.push(
-            "This worktree's index is a split index, so GitPulse will not turn \
-             feature.manyFiles on here."
+            "This worktree's index is a split index, so GitPulse will not turn the untracked \
+             cache on here."
                 .to_string(),
         );
     }
-    if let Some(blocker) = report.family.many_files_blocker() {
+    if let Some(blocker) = report.family.split_index_blocker() {
         out.push(format!(
-            "GitPulse will not turn feature.manyFiles on: {blocker}."
+            "GitPulse will not turn the untracked cache on: {blocker}."
         ));
     }
-    if many_files_on(report) {
+    if untracked_cache_on(report) {
         out.push(
-            "feature.manyFiles is on; GitPulse will not turn core.splitIndex on beside it."
+            "The untracked cache is already on; GitPulse will not turn core.splitIndex on \
+             beside it."
                 .to_string(),
         );
     }
@@ -392,8 +401,8 @@ pub(super) fn strings(parts: &[&str]) -> Vec<String> {
 /// the application.
 pub fn change_argv(change: TuningChange) -> Vec<String> {
     match change {
-        TuningChange::ManyFiles => {
-            strings(&["git", "config", "--local", "feature.manyFiles", "true"])
+        TuningChange::UntrackedCache => {
+            strings(&["git", "config", "--local", "core.untrackedCache", "true"])
         }
         TuningChange::Fsmonitor => strings(&["git", "config", "--local", "core.fsmonitor", "true"]),
         TuningChange::Maintenance => strings(&["git", "maintenance", "start"]),
@@ -410,7 +419,7 @@ pub fn is_apply_argv(argv: &[String]) -> bool {
 /// A key an undo may unset. A closed set, so no undo can name another key.
 #[derive(Clone, Copy)]
 pub(super) enum UnsetKey {
-    ManyFiles,
+    UntrackedCache,
     Fsmonitor,
     MaintenanceAuto,
     MaintenanceStrategy,
@@ -418,8 +427,8 @@ pub(super) enum UnsetKey {
 
 pub(super) fn unset_argv(key: UnsetKey) -> Vec<String> {
     match key {
-        UnsetKey::ManyFiles => {
-            strings(&["git", "config", "--local", "--unset", "feature.manyFiles"])
+        UnsetKey::UntrackedCache => {
+            strings(&["git", "config", "--local", "--unset", "core.untrackedCache"])
         }
         UnsetKey::Fsmonitor => strings(&["git", "config", "--local", "--unset", "core.fsmonitor"]),
         UnsetKey::MaintenanceAuto => {
@@ -435,38 +444,44 @@ pub(super) fn unset_argv(key: UnsetKey) -> Vec<String> {
     }
 }
 
+/// Removes the untracked cache from the index now. Shown in the undo list, never
+/// run: unsetting the key alone leaves the `UNTR` extension in the index (git
+/// keeps what the index has when the key is unset; run against git 2.54).
+pub(super) fn no_untracked_cache_argv() -> Vec<String> {
+    strings(&["git", "update-index", "--no-untracked-cache"])
+}
+
 fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
     match change {
-        TuningChange::ManyFiles => TuningStep {
+        TuningChange::UntrackedCache => TuningStep {
             change,
             argv: change_argv(change),
             writes: vec![TuningWrite {
                 scope: TuningScope::RepoConfig,
-                what: "feature.manyFiles = true".to_string(),
+                what: "core.untrackedCache = true".to_string(),
             }],
-            undo: vec![unset_argv(UnsetKey::ManyFiles)],
+            // In this order: with the key unset, `update-index
+            // --no-untracked-cache` removes the cache without a warning.
+            undo: vec![
+                unset_argv(UnsetKey::UntrackedCache),
+                no_untracked_cache_argv(),
+            ],
             undo_note: Some(
-                "The index keeps its format until git next rewrites it; unsetting the key makes \
-                 that rewrite use git's defaults again."
+                "Unsetting the key alone leaves the untracked cache in the index: git keeps what \
+                 the index has when the key is unset. `git update-index --no-untracked-cache` \
+                 removes it now, with the key already unset (run it second)."
                     .to_string(),
             ),
             notes: vec![
-                "Nothing gets faster at the click: the gain needs git to rewrite the index with \
-                 the untracked cache, which happens on the first ordinary git status (or any \
-                 index write) afterwards. In the measurement that untracked cache was the whole \
-                 gain; after such a refresh the index stayed format 2 and was not smaller, so \
-                 the format parts were not shown to help."
+                "Nothing changes at the click. The untracked cache is added to the index the \
+                 next time git rewrites it, and your next ordinary `git status` in this \
+                 repository does that. GitPulse's own reads cannot: they run with \
+                 GIT_OPTIONAL_LOCKS=0, which never lets status write the index. Until then \
+                 nothing is faster."
                     .to_string(),
-                format!(
-                    "feature.manyFiles sets index.skipHash=true, index.version=4 and \
-                 core.untrackedCache=true. Git older than {}.{} reports a corrupt index when \
-                 `git fsck` runs on a skipHash index, and git older than {}.{} refuses the index \
-                 format altogether, so anyone using this repository with an older git is affected.",
-                    SKIPHASH_FSCK_MIN_GIT.0,
-                    SKIPHASH_FSCK_MIN_GIT.1,
-                    INDEX_V4_MIN_GIT.0,
-                    INDEX_V4_MIN_GIT.1
-                ),
+                "It trusts the file system's directory timestamps. On a network or unusual file \
+                 system, `git update-index --test-untracked-cache` checks that it can be used."
+                    .to_string(),
             ],
             skipped: None,
         },
@@ -562,8 +577,8 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
 /// Why `change` is already in place, when it is.
 fn already_in_place(change: TuningChange, report: &RepoTuningReport) -> Option<String> {
     match change {
-        TuningChange::ManyFiles if report.is_true("feature.manyfiles") => {
-            Some("feature.manyFiles is already on".to_string())
+        TuningChange::UntrackedCache if untracked_cache_on(report) => {
+            Some("the untracked cache is already on".to_string())
         }
         TuningChange::Fsmonitor if report.is_true("core.fsmonitor") => {
             Some("core.fsmonitor is already on".to_string())
@@ -577,8 +592,8 @@ fn already_in_place(change: TuningChange, report: &RepoTuningReport) -> Option<S
 
 /// The preview of applying `requested`: exact argv, scope and undo for each
 /// change, or the reason it may not be applied. Refuses a change that is not
-/// offered (below its threshold, or an input unknown), `feature.manyFiles`
-/// against `core.splitIndex`, and a boolean `core.fsmonitor` on git 2.35.1 or
+/// offered (below its threshold, or an input unknown), the untracked cache
+/// against a split index, and a boolean `core.fsmonitor` on git 2.35.1 or
 /// older. A change already in place is a step that will not run, and says so.
 pub fn plan_apply(
     report: &RepoTuningReport,
@@ -607,7 +622,7 @@ pub fn plan_apply(
             continue;
         }
         match change {
-            TuningChange::ManyFiles => would_set.push("feature.manyfiles"),
+            TuningChange::UntrackedCache => would_set.push("core.untrackedcache"),
             TuningChange::Fsmonitor => {
                 if !env.at_least(FSMONITOR_BOOLEAN_MIN_GIT) {
                     return Err(format!(

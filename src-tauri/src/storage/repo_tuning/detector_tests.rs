@@ -234,7 +234,7 @@ fn sibling_worktrees_are_read_without_a_process() {
     assert_eq!(family.split_index_in, ["/work/b"], "{family:?}");
     assert_eq!(family.unverified_indexes.len(), 1, "{family:?}");
     assert!(family.with_worktree_config.is_empty(), "a is this worktree");
-    assert!(family.many_files_blocker().unwrap().contains("/work/b"));
+    assert!(family.split_index_blocker().unwrap().contains("/work/b"));
     // From the main worktree, `a`'s config.worktree is listed for plan time.
     let from_main = main.report(&[]);
     assert_eq!(from_main.family.with_worktree_config, ["/work/a"]);

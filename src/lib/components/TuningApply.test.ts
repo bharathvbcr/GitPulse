@@ -41,7 +41,7 @@ describe("TuningApply", () => {
       props: props(
         advice({
           offers: [
-            { change: "many_files", title: "Turn on feature.manyFiles", reason: "50000 tracked files" },
+            { change: "untracked_cache", title: "Turn on the untracked cache", reason: "50000 tracked files" },
             { change: "maintenance", title: "Start background maintenance", reason: "40 packs" },
           ],
         }),
@@ -49,7 +49,7 @@ describe("TuningApply", () => {
     });
     expect(body).toContain('data-testid="tuning-apply"');
     expect(body).toContain('data-phase="idle"');
-    expect(body).toContain("Turn on feature.manyFiles");
+    expect(body).toContain("Turn on the untracked cache");
     expect(body).toContain("50000 tracked files");
     expect(body).toContain("Start background maintenance");
     expect(body).toContain('data-testid="tuning-apply-open"');
@@ -57,12 +57,12 @@ describe("TuningApply", () => {
     expect(body.match(/data-testid="tuning-offer"/g)).toHaveLength(2);
   });
 
-  it("calls out the splitIndex / manyFiles conflict even when nothing is offered", () => {
+  it("calls out the split index even when nothing is offered", () => {
     const { body } = render(TuningApply, {
       props: props(
         advice({
           warnings: [
-            "core.splitIndex is on. With feature.manyFiles it breaks git's own add-then-commit, so GitPulse will not turn manyFiles on here.",
+            "core.splitIndex is on, so GitPulse will not turn the untracked cache on here (it breaks git's own add-then-commit when combined with feature.manyFiles, which includes it).",
           ],
         }),
       ),
@@ -74,7 +74,7 @@ describe("TuningApply", () => {
 
   it("shows a running apply found by the scan as stoppable, with no new preview offered", () => {
     const a = advice({
-      offers: [{ change: "many_files", title: "Turn on feature.manyFiles", reason: "x" }],
+      offers: [{ change: "untracked_cache", title: "Turn on the untracked cache", reason: "x" }],
       apply_in_flight: true,
     });
     const { body } = render(TuningApply, { props: props(a) });

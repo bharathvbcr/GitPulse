@@ -27,19 +27,22 @@ function advice(over: Partial<TuningAdvice> = {}): TuningAdvice {
       config_note: null,
       notes: [],
     },
-    offers: [{ change: "many_files", title: "Turn on feature.manyFiles", reason: "50000 tracked files" }],
+    offers: [{ change: "untracked_cache", title: "Turn on the untracked cache", reason: "50000 tracked files" }],
     warnings: [],
     ...over,
   };
 }
 
 const MANY: TuningStep = {
-  change: "many_files",
-  argv: ["git", "config", "--local", "feature.manyFiles", "true"],
-  writes: [{ scope: "repo_config", what: "feature.manyFiles = true" }],
-  undo: [["git", "config", "--local", "--unset", "feature.manyFiles"]],
+  change: "untracked_cache",
+  argv: ["git", "config", "--local", "core.untrackedCache", "true"],
+  writes: [{ scope: "repo_config", what: "core.untrackedCache = true" }],
+  undo: [
+    ["git", "config", "--local", "--unset", "core.untrackedCache"],
+    ["git", "update-index", "--no-untracked-cache"],
+  ],
   undo_note: null,
-  notes: ["feature.manyFiles sets index.skipHash=true"],
+  notes: ["the untracked cache is added to the index"],
   skipped: null,
 };
 const SKIPPED: TuningStep = {
@@ -57,7 +60,7 @@ const OUTCOME: TuningOutcome = {
   cancelled: false,
   joined: false,
   elapsed_ms: 9,
-  results: [{ change: "many_files", argv: MANY.argv, status: "applied", detail: null }],
+  results: [{ change: "untracked_cache", argv: MANY.argv, status: "applied", detail: null }],
   advice: advice({ offers: [] }),
 };
 
@@ -80,7 +83,7 @@ function harness(overrides: Partial<Record<string, (args: Record<string, unknown
   return { flow, calls, onApplied, step: () => step, setPath: (next: string) => (path = next) };
 }
 
-const ONE: TuningChange[] = ["many_files"];
+const ONE: TuningChange[] = ["untracked_cache"];
 
 describe("offersTuning", () => {
   it("offers the card only when something clears its threshold", () => {
@@ -106,12 +109,12 @@ describe("the apply flow", () => {
 
   it("confirm echoes exactly the previewed runnable argv and skips what will not run", async () => {
     const h = harness();
-    await h.flow.open(["many_files", "maintenance"]);
+    await h.flow.open(["untracked_cache", "maintenance"]);
     await h.flow.confirm();
     const apply = h.calls.find((c) => c.command === "cmd_tuning_apply");
     expect(apply?.args).toEqual({
       repoPath: "/repo",
-      changes: ["many_files", "maintenance"],
+      changes: ["untracked_cache", "maintenance"],
       confirmedArgv: [MANY.argv],
     });
     expect(runnableArgv(PLAN)).toEqual([MANY.argv]);
@@ -140,13 +143,13 @@ describe("the apply flow", () => {
   it("a refused preview is a failure, with the backend's words, and nothing was applied", async () => {
     const h = harness({
       cmd_tuning_plan: () => {
-        throw new Error("feature.manyFiles together with core.splitIndex breaks add-then-commit");
+        throw new Error("core.untrackedCache together with core.splitIndex is refused");
       },
     });
     await h.flow.open(ONE);
     expect(h.step()).toEqual({
       phase: "failed",
-      message: "feature.manyFiles together with core.splitIndex breaks add-then-commit",
+      message: "core.untrackedCache together with core.splitIndex is refused",
     });
     expect(h.calls.map((c) => c.command)).toEqual(["cmd_tuning_plan"]);
   });

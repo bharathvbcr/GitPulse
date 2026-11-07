@@ -63,7 +63,7 @@ fn offered(report: &RepoTuningReport, env: GitEnv) -> Vec<TuningChange> {
 #[test]
 fn nothing_is_offered_below_any_threshold() {
     let below = report(
-        FSMONITOR_MIN_TRACKED_FILES.min(MANYFILES_MIN_TRACKED_FILES) - 1,
+        FSMONITOR_MIN_TRACKED_FILES.min(UNTRACKED_CACHE_MIN_TRACKED_FILES) - 1,
         5_000,
         MAINTENANCE_MIN_LOOSE_OBJECTS - 1,
     );
@@ -83,8 +83,10 @@ fn each_offer_starts_exactly_at_its_threshold() {
     let at = |files, packs, loose| offered(&report(files, packs, loose), NEW_GIT);
     assert!(!at(FSMONITOR_MIN_TRACKED_FILES - 1, 1, 0).contains(&TuningChange::Fsmonitor));
     assert!(at(FSMONITOR_MIN_TRACKED_FILES, 1, 0).contains(&TuningChange::Fsmonitor));
-    assert!(!at(MANYFILES_MIN_TRACKED_FILES - 1, 1, 0).contains(&TuningChange::ManyFiles));
-    assert!(at(MANYFILES_MIN_TRACKED_FILES, 1, 0).contains(&TuningChange::ManyFiles));
+    assert!(
+        !at(UNTRACKED_CACHE_MIN_TRACKED_FILES - 1, 1, 0).contains(&TuningChange::UntrackedCache)
+    );
+    assert!(at(UNTRACKED_CACHE_MIN_TRACKED_FILES, 1, 0).contains(&TuningChange::UntrackedCache));
     // A pile of packs alone is never offered for (one incremental repack did
     // not consolidate them).
     assert!(!at(10, 5_000, 0).contains(&TuningChange::Maintenance));
@@ -109,7 +111,7 @@ fn an_unknown_input_offers_nothing_rather_than_guessing() {
     index.index.state = IndexReadState::Unknown;
     index.index.entries = None;
     assert!(!offered(&index, NEW_GIT).contains(&TuningChange::Fsmonitor));
-    assert!(!offered(&index, NEW_GIT).contains(&TuningChange::ManyFiles));
+    assert!(!offered(&index, NEW_GIT).contains(&TuningChange::UntrackedCache));
 
     let mut inexact = report(200_000, 1, 0);
     inexact.index.entries_exact = false;
@@ -147,11 +149,11 @@ fn a_value_the_person_set_is_respected_whatever_it_is() {
     let mut r = report(200_000, 1, 0);
     key(
         &mut r,
-        "feature.manyfiles",
+        "core.untrackedcache",
         Some("false"),
         ConfigScope::Local,
     );
-    assert!(!offered(&r, NEW_GIT).contains(&TuningChange::ManyFiles));
+    assert!(!offered(&r, NEW_GIT).contains(&TuningChange::UntrackedCache));
     // gc turned off, or maintenance turned off: the person runs their own.
     let mut gc_off = report(10, 1, 50_000);
     gc_off.objects.gc_auto = Some(0);
@@ -165,11 +167,28 @@ fn a_value_the_person_set_is_respected_whatever_it_is() {
 }
 
 #[test]
-fn many_files_is_not_offered_to_an_index_that_already_has_what_it_adds() {
+fn feature_many_files_already_turns_the_untracked_cache_on() {
+    // manyFiles includes the cache, so offering it again would be a no-op write.
     let mut r = report(100_000, 1, 0);
-    r.index.version = Some(4);
-    r.index.skip_hash = Some(true);
-    assert!(!offered(&r, NEW_GIT).contains(&TuningChange::ManyFiles));
+    key(
+        &mut r,
+        "feature.manyfiles",
+        Some("true"),
+        ConfigScope::Global,
+    );
+    assert!(!offered(&r, NEW_GIT).contains(&TuningChange::UntrackedCache));
+    let plan = plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::UntrackedCache]).unwrap();
+    assert!(plan.runnable().is_empty());
+    assert!(plan.steps[0]
+        .skipped
+        .as_deref()
+        .unwrap()
+        .contains("already on"));
+    // manyFiles is detected and never offered or written, at any size.
+    let small = report(100_000, 1, 0);
+    assert!(recommend(&small, NEW_GIT)
+        .iter()
+        .all(|o| !o.title.contains("manyFiles")));
 }
 
 #[test]
@@ -218,24 +237,25 @@ fn split_index_and_many_files_are_refused_in_both_orders() {
         Some("true"),
         ConfigScope::Global,
     );
-    let refused = plan_apply(&split, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap_err();
+    let refused =
+        plan_apply(&split, NEW_GIT, "/r/.git", &[TuningChange::UntrackedCache]).unwrap_err();
     assert!(refused.contains("add-then-commit"), "{refused}");
-    assert!(!offered(&split, NEW_GIT).contains(&TuningChange::ManyFiles));
-    assert!(split_index_conflict(&split, &["feature.manyfiles"]).is_some());
+    assert!(!offered(&split, NEW_GIT).contains(&TuningChange::UntrackedCache));
+    assert!(split_index_conflict(&split, &["core.untrackedcache"]).is_some());
     // a split index requested over manyFiles already on
     let mut many = report(100_000, 1, 0);
     key(
         &mut many,
-        "feature.manyfiles",
+        "core.untrackedcache",
         Some("true"),
         ConfigScope::Local,
     );
     assert!(split_index_conflict(&many, &["core.splitindex"]).is_some());
     // both requested at once
     let clean = report(100_000, 1, 0);
-    assert!(split_index_conflict(&clean, &["feature.manyfiles", "core.splitindex"]).is_some());
+    assert!(split_index_conflict(&clean, &["core.untrackedcache", "core.splitindex"]).is_some());
     // each alone, with the other absent, is not a conflict
-    assert!(split_index_conflict(&clean, &["feature.manyfiles"]).is_none());
+    assert!(split_index_conflict(&clean, &["core.untrackedcache"]).is_none());
     assert!(split_index_conflict(&clean, &["core.splitindex"]).is_none());
     assert!(split_index_conflict(&clean, &[]).is_none());
     // false is not on
@@ -246,14 +266,14 @@ fn split_index_and_many_files_are_refused_in_both_orders() {
         Some("false"),
         ConfigScope::Global,
     );
-    assert!(split_index_conflict(&off, &["feature.manyfiles"]).is_none());
+    assert!(split_index_conflict(&off, &["core.untrackedcache"]).is_none());
     // The UI says so while nothing is offered.
     assert!(warnings(&split)
         .iter()
         .any(|w| w.contains("core.splitIndex")));
     assert!(warnings(&many)
         .iter()
-        .any(|w| w.contains("feature.manyFiles")));
+        .any(|w| w.contains("untracked cache is already on")));
 }
 
 #[test]
@@ -268,10 +288,11 @@ fn no_apply_argv_can_set_core_split_index() {
             .any(|a| a.to_ascii_lowercase().contains("splitindex")));
         assert!(is_apply_argv(&argv));
     }
-    let hostile: [&[&str]; 8] = [
+    let hostile: [&[&str]; 9] = [
         &["git", "config", "--local", "core.splitIndex", "true"],
-        &["git", "config", "--global", "feature.manyFiles", "true"],
-        &["git", "config", "--local", "feature.manyFiles", "false"],
+        &["git", "config", "--local", "feature.manyFiles", "true"],
+        &["git", "config", "--global", "core.untrackedCache", "true"],
+        &["git", "config", "--local", "core.untrackedCache", "false"],
         &["git", "config", "--local", "core.fsmonitor", "/evil/hook"],
         &["git", "config", "--local", "core.hooksPath", "/evil"],
         &["git", "maintenance", "stop"],
@@ -279,7 +300,7 @@ fn no_apply_argv_can_set_core_split_index() {
             "git",
             "config",
             "--local",
-            "feature.manyFiles",
+            "core.untrackedCache",
             "true",
             "extra",
         ],
@@ -311,14 +332,26 @@ fn the_preview_names_argv_scope_undo_and_the_hazards() {
     let r = report(100_000, 1, 50_000);
     let plan = plan_apply(&r, NEW_GIT, "/r/.git", &TuningChange::ALL).unwrap();
     assert_eq!(plan.steps.len(), 3);
-    let many = &plan.steps[0];
-    assert_eq!(many.argv, change_argv(TuningChange::ManyFiles));
-    assert_eq!(many.writes[0].scope, TuningScope::RepoConfig);
-    assert_eq!(many.undo, vec![unset_argv(UnsetKey::ManyFiles)]);
-    let note = many.notes.join(" ");
-    assert!(note.contains("skipHash"), "{note}");
-    assert!(note.contains("2.40"), "fsck floor: {note}");
-    assert!(note.contains("2.13"), "refusal floor: {note}");
+    let cache = &plan.steps[0];
+    assert_eq!(cache.argv, change_argv(TuningChange::UntrackedCache));
+    assert_eq!(cache.writes[0].scope, TuningScope::RepoConfig);
+    // The undo list: unset the key, then take the extension out of the index.
+    assert_eq!(
+        cache.undo,
+        vec![
+            unset_argv(UnsetKey::UntrackedCache),
+            strings(&["git", "update-index", "--no-untracked-cache"]),
+        ]
+    );
+    assert!(cache
+        .undo_note
+        .as_deref()
+        .unwrap()
+        .contains("leaves the untracked cache in the index"));
+    let note = cache.notes.join(" ");
+    assert!(note.contains("Nothing changes at the click"), "{note}");
+    assert!(note.contains("next ordinary `git status`"), "{note}");
+    assert!(note.contains("GIT_OPTIONAL_LOCKS=0"), "{note}");
 
     let fs = &plan.steps[1];
     assert_eq!(fs.undo[0], strings(&["git", "fsmonitor--daemon", "stop"]));
@@ -366,7 +399,7 @@ fn a_change_already_in_place_is_skipped_and_reported() {
     let mut r = report(100_000, 1, 50_000);
     key(
         &mut r,
-        "feature.manyfiles",
+        "core.untrackedcache",
         Some("true"),
         ConfigScope::Global,
     );
@@ -376,7 +409,7 @@ fn a_change_already_in_place_is_skipped_and_reported() {
         NEW_GIT,
         "/r/.git",
         &[
-            TuningChange::ManyFiles,
+            TuningChange::UntrackedCache,
             TuningChange::Fsmonitor,
             TuningChange::Maintenance,
         ],
@@ -400,7 +433,7 @@ fn a_change_already_in_place_is_skipped_and_reported() {
         &r,
         NEW_GIT,
         "/r/.git",
-        &[TuningChange::ManyFiles, TuningChange::Maintenance],
+        &[TuningChange::UntrackedCache, TuningChange::Maintenance],
     )
     .unwrap();
     assert!(all.runnable().is_empty());
@@ -416,7 +449,13 @@ fn a_change_below_its_threshold_cannot_be_planned() {
     assert!(plan_apply(&small, NEW_GIT, "/r/.git", &[]).is_err());
     let mut unreadable = report(100_000, 1, 50_000);
     unreadable.config_note = Some("x".into());
-    assert!(plan_apply(&unreadable, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).is_err());
+    assert!(plan_apply(
+        &unreadable,
+        NEW_GIT,
+        "/r/.git",
+        &[TuningChange::UntrackedCache]
+    )
+    .is_err());
 }
 
 #[test]
@@ -426,7 +465,7 @@ fn duplicate_requests_make_one_step() {
         &r,
         NEW_GIT,
         "/r/.git",
-        &[TuningChange::ManyFiles, TuningChange::ManyFiles],
+        &[TuningChange::UntrackedCache, TuningChange::UntrackedCache],
     )
     .unwrap();
     assert_eq!(plan.steps.len(), 1);
@@ -512,19 +551,31 @@ fn the_maintenance_preview_discloses_the_background_fetch_and_the_object_databas
 fn a_split_index_in_the_index_file_or_a_sibling_is_never_offered_many_files() {
     let mut carried = report(100_000, 1, 0);
     carried.index.split_index = Some(true);
-    assert!(!offered(&carried, NEW_GIT).contains(&TuningChange::ManyFiles));
-    let refused = plan_apply(&carried, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap_err();
+    assert!(!offered(&carried, NEW_GIT).contains(&TuningChange::UntrackedCache));
+    let refused = plan_apply(
+        &carried,
+        NEW_GIT,
+        "/r/.git",
+        &[TuningChange::UntrackedCache],
+    )
+    .unwrap_err();
     assert!(refused.contains("split index"), "{refused}");
     assert!(warnings(&carried).iter().any(|w| w.contains("split index")));
 
     let mut unknown = report(100_000, 1, 0);
     unknown.index.split_index = None;
-    assert!(!offered(&unknown, NEW_GIT).contains(&TuningChange::ManyFiles));
+    assert!(!offered(&unknown, NEW_GIT).contains(&TuningChange::UntrackedCache));
 
     let mut sibling = report(100_000, 1, 0);
     sibling.family.split_index_in = vec!["/work/sibling".to_string()];
-    assert!(!offered(&sibling, NEW_GIT).contains(&TuningChange::ManyFiles));
-    let refused = plan_apply(&sibling, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap_err();
+    assert!(!offered(&sibling, NEW_GIT).contains(&TuningChange::UntrackedCache));
+    let refused = plan_apply(
+        &sibling,
+        NEW_GIT,
+        "/r/.git",
+        &[TuningChange::UntrackedCache],
+    )
+    .unwrap_err();
     assert!(refused.contains("/work/sibling"), "{refused}");
 
     for family in [
@@ -539,7 +590,7 @@ fn a_split_index_in_the_index_file_or_a_sibling_is_never_offered_many_files() {
     ] {
         let mut r = report(100_000, 1, 0);
         r.family = family;
-        assert!(plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).is_err());
+        assert!(plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::UntrackedCache]).is_err());
     }
     // A sibling that is fine, or has only a config.worktree to be read at plan
     // time, does not block the offer.
@@ -549,29 +600,26 @@ fn a_split_index_in_the_index_file_or_a_sibling_is_never_offered_many_files() {
         with_worktree_config: vec!["/work/cone".to_string()],
         ..WorktreeFamily::default()
     };
-    assert!(offered(&fine, NEW_GIT).contains(&TuningChange::ManyFiles));
+    assert!(offered(&fine, NEW_GIT).contains(&TuningChange::UntrackedCache));
 }
 
 #[test]
-fn the_many_files_wording_says_the_gain_needs_git_to_rewrite_the_index_first() {
+fn the_wording_says_the_next_ordinary_git_status_writes_the_cache() {
     let r = report(100_000, 1, 0);
-    let plan = plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::ManyFiles]).unwrap();
+    let plan = plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::UntrackedCache]).unwrap();
     let notes = plan.steps[0].notes.join(" ");
+    assert!(notes.contains("Nothing changes at the click"), "{notes}");
+    assert!(notes.contains("next ordinary `git status`"), "{notes}");
     assert!(
-        notes.contains("Nothing gets faster at the click"),
-        "{notes}"
-    );
-    assert!(notes.contains("first ordinary git status"), "{notes}");
-    assert!(
-        notes.contains("untracked cache was the whole gain"),
+        notes.contains("trusts the file system's directory timestamps"),
         "{notes}"
     );
     let offer = recommend(&r, NEW_GIT)
         .into_iter()
-        .find(|o| o.change == TuningChange::ManyFiles)
+        .find(|o| o.change == TuningChange::UntrackedCache)
         .unwrap();
     assert!(
-        offer.reason.contains("first ordinary git status"),
+        offer.reason.contains("next ordinary git status"),
         "{}",
         offer.reason
     );
@@ -579,5 +627,56 @@ fn the_many_files_wording_says_the_gain_needs_git_to_rewrite_the_index_first() {
         !offer.reason.contains("smaller"),
         "no index-size claim: {}",
         offer.reason
+    );
+    // It does not claim to speed GitPulse's own reads.
+    assert!(
+        offer.reason.contains("does not speed `git status -u`"),
+        "{}",
+        offer.reason
+    );
+    assert!(offer.reason.contains("GitPulse's own"), "{}", offer.reason);
+}
+
+#[test]
+fn a_split_index_refusal_says_what_was_reproduced_and_what_is_inferred() {
+    let mut split = report(100_000, 1, 0);
+    key(
+        &mut split,
+        "core.splitindex",
+        Some("true"),
+        ConfigScope::Global,
+    );
+    let refused =
+        plan_apply(&split, NEW_GIT, "/r/.git", &[TuningChange::UntrackedCache]).unwrap_err();
+    assert!(refused.contains("was reproduced breaking"), "{refused}");
+    assert!(refused.contains("did not reproduce it"), "{refused}");
+    assert!(refused.contains("was not isolated"), "{refused}");
+    assert!(
+        refused.contains("instead of inferring it is safe"),
+        "{refused}"
+    );
+    // The index-file and sibling refusals carry the same account.
+    let mut carried = report(100_000, 1, 0);
+    carried.index.split_index = Some(true);
+    let refused = plan_apply(
+        &carried,
+        NEW_GIT,
+        "/r/.git",
+        &[TuningChange::UntrackedCache],
+    )
+    .unwrap_err();
+    assert!(refused.contains("did not reproduce it"), "{refused}");
+    let mut sibling = report(100_000, 1, 0);
+    sibling.family.split_index_in = vec!["/w/s".to_string()];
+    let refused = plan_apply(
+        &sibling,
+        NEW_GIT,
+        "/r/.git",
+        &[TuningChange::UntrackedCache],
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("/w/s") && refused.contains("was not isolated"),
+        "{refused}"
     );
 }

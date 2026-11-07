@@ -18,15 +18,15 @@
 //! rule for that action alone, and this test is narrowed to exactly it, not
 //! removed:
 //!
-//! - the one file that may build a config-writing argv, or name
-//!   `feature.manyFiles`, is `storage/repo_tuning/advice.rs`, and the one file
+//! - the one file that may build a config-writing argv is `storage/repo_tuning/advice.rs`, and the one file
 //!   besides it that may name the tuning keys (to read them) is
 //!   `storage/repo_tuning.rs`;
 //! - in that file every `git config` argv is `git config --local <key> true`
-//!   for `feature.manyFiles` or `core.fsmonitor` (never `core.splitIndex`,
+//!   for `core.untrackedCache` or `core.fsmonitor` (never `core.splitIndex`,
 //!   never `--global` or `--system`, never another value) or the undo
 //!   `git config --local --unset <key>`; the only other commands are
-//!   `git maintenance start|unregister` and `git fsmonitor--daemon stop`;
+//!   `git maintenance start|unregister`, `git fsmonitor--daemon stop` and the
+//!   undo `git update-index --no-untracked-cache`;
 //! - every other production file still builds no `git config` write and sets
 //!   neither key to anything but `false` (`storage/mod.rs` passes
 //!   `core.fsmonitor=false` so a read cannot start the daemon).
@@ -55,9 +55,9 @@ const TUNING_READ_FILE: &str = "storage/repo_tuning.rs";
 
 /// The keys the apply may write, and the two `git maintenance start` writes
 /// that its undo removes.
-const WRITE_KEYS: [&str; 2] = ["feature.manyFiles", "core.fsmonitor"];
+const WRITE_KEYS: [&str; 2] = ["core.untrackedCache", "core.fsmonitor"];
 const UNSET_KEYS: [&str; 4] = [
-    "feature.manyFiles",
+    "core.untrackedCache",
     "core.fsmonitor",
     "maintenance.auto",
     "maintenance.strategy",
@@ -201,6 +201,9 @@ fn tuning_violations(production: &str) -> Vec<String> {
             ["git", "config", "--local", "--unset", key] if UNSET_KEYS.contains(key) => {}
             ["git", "maintenance", "start" | "unregister"] => {}
             ["git", "fsmonitor--daemon", "stop"] => {}
+            // The undo that takes the untracked cache out of the index; shown
+            // in the preview, never run.
+            ["git", "update-index", "--no-untracked-cache"] => {}
             other => found.push(format!("argv outside the narrowed set: {other:?}")),
         }
     }
@@ -331,13 +334,17 @@ fn the_scan_stops_at_the_test_module() {
 fn the_tuning_check_flags_each_way_of_widening_the_apply() {
     let flagged = [
         r#"strings(&["git", "config", "--local", "core.splitIndex", "true"])"#,
-        r#"strings(&["git", "config", "--global", "feature.manyFiles", "true"])"#,
-        r#"strings(&["git", "config", "--local", "feature.manyFiles", "false"])"#,
+        r#"strings(&["git", "config", "--global", "core.untrackedCache", "true"])"#,
+        r#"strings(&["git", "config", "--local", "core.untrackedCache", "false"])"#,
+        // feature.manyFiles is detected, never written.
+        r#"strings(&["git", "config", "--local", "feature.manyFiles", "true"])"#,
+        r#"strings(&["git", "update-index", "--untracked-cache"])"#,
+        r#"strings(&["git", "update-index", "--split-index"])"#,
         r#"strings(&["git", "config", "--local", "core.fsmonitor", "/evil/hook"])"#,
         r#"strings(&["git", "config", "--local", "core.hooksPath", "/evil"])"#,
         r#"strings(&["git", "config", "--local", "--unset", "core.hooksPath"])"#,
         r#"strings(&["git", "maintenance", "stop"])"#,
-        r#"strings(&["git", "config", "--local", "feature.manyFiles", "true", "x"])"#,
+        r#"strings(&["git", "config", "--local", "core.untrackedCache", "true", "x"])"#,
         r#"let args = ["--add"];"#,
         r#"git(&["config", "--local", "core.fsmonitor", "true"]);"#,
     ];
@@ -352,8 +359,9 @@ fn the_tuning_check_flags_each_way_of_widening_the_apply() {
 #[test]
 fn the_tuning_check_allows_exactly_the_apply_and_its_undo() {
     for source in [
-        r#"strings(&["git", "config", "--local", "feature.manyFiles", "true"])"#,
+        r#"strings(&["git", "config", "--local", "core.untrackedCache", "true"])"#,
         r#"strings(&["git", "config", "--local", "core.fsmonitor", "true"])"#,
+        r#"strings(&["git", "update-index", "--no-untracked-cache"])"#,
         r#"strings(&["git", "maintenance", "start"])"#,
         r#"strings(&["git", "maintenance", "unregister"])"#,
         r#"strings(&["git", "fsmonitor--daemon", "stop"])"#,

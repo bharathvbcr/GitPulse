@@ -146,14 +146,13 @@ pub struct WorktreeFamily {
 }
 
 impl WorktreeFamily {
-    /// Why `feature.manyFiles` must not be written for this repository's
+    /// Why the untracked cache must not be written for this repository's
     /// worktrees, when a sibling's index says so or cannot say otherwise.
-    pub fn many_files_blocker(&self) -> Option<String> {
+    pub fn split_index_blocker(&self) -> Option<String> {
         if let Some(first) = self.split_index_in.first() {
             return Some(format!(
                 "the worktree {first} has a split index, and `git config --local` would turn \
-                 feature.manyFiles on there too (with a split index it crashes git status on \
-                 git 2.54)"
+                 core.untrackedCache on there too"
             ));
         }
         if self.truncated {

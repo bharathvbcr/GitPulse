@@ -258,7 +258,7 @@ fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
     };
     assert!(recommend(&report, env)
         .iter()
-        .all(|o| o.change != TuningChange::ManyFiles));
+        .all(|o| o.change != TuningChange::UntrackedCache));
     // Undoing the split leaves a plain index that walks and counts exactly.
     run_git(dir.path(), &["update-index", "--no-split-index"]);
     let plain = detect(dir.path());

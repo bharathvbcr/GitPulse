@@ -1345,6 +1345,12 @@ invocation gives the same picture: fsmonitor 1.29x slower at 977 files, 1.73x at
 was verified to be in effect (the `UNTR` extension is present in the index of
 the two variants that enable it) and made no measurable difference at any size
 here, with or without 3,000 untracked files, in either invocation.
+**Both invocations passed `-u` (all untracked files).** The 2026-11-06 section
+below ("Untracked cache, corrected twice") measured the same cache with the
+default untracked mode and found it about a quarter to a third faster there, and
+found that `-u` is what removes the gain; a re-run of this script on 2026-11-06
+reproduced the 1.00x here. The two agree: the cache does not help the
+invocation GitPulse itself uses.
 
 Daemon cost, per repository with the daemon on: **one extra process, about 8 MB
 resident, about 0.02 s of CPU over the whole run, 0.0 idle wakeups per second
@@ -1359,7 +1365,7 @@ continuously costs the daemon one event per write).
   100k), and it **costs 20 to 40 percent more** on the 1k to 3k-file repositories
   that are the common case, because every status then waits on a round trip to the
   daemon. The absolute saving at the top of the range, 20 to 50 ms per status,
-  is on a background read. `core.untrackedCache` showed no effect, and under
+  is on a background read. `core.untrackedCache` showed no effect on these `-u` invocations, and under
   `GIT_OPTIONAL_LOCKS=0` GitPulse's own status cannot refresh it.
 * **If a hint is ever added**, it is for `core.fsmonitor` only, shown only when
   the repository has at least 40,000 tracked files, `core.fsmonitor` is unset,
@@ -2205,7 +2211,7 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 
 ## 2026-11-06: repository tuning thresholds (ft-6b68be32)
 
-The Storage panel may offer, and on a click apply, three changes: `feature.manyFiles`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
+The Storage panel may offer, and on a click apply, three changes: `core.untrackedCache`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
 
 **Method.** `scripts/bench-git-tuning.mjs <packs|loose|files>`: throwaway repositories under a scratch directory built with `git fast-import` (4,000 commits, 4 changed files each, 2,000 files, for `packs`; 500 files for `loose`), git 2.54.0 (Apple Git-157), `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_OPTIONAL_LOCKS=0`, `core.commitGraph=false` so object lookups are what is timed. Arms are interleaved (every round runs each arm once, order rotated), 9 rounds (7 for `files`), min of N reported. The machine was loaded the whole time (load average 17 to 40 on 18 cores, M5 Pro, macOS 27), so the noise floor is wide: at `packs=1` the three arms are the same repository content and differed by up to 1.21x on a history walk and 0.63 to 1.96x on `status`. **`status` figures from `packs` and `loose` are therefore not used**; a history-walk ratio is read only when it is clearly outside about 1.2x. The tables give min-of-9 ratios against the baseline arm (below 1 is faster); raw logs were kept in the lane scratch directory, not committed.
 
@@ -2238,33 +2244,39 @@ The same history held as loose objects, against packed.
 
 After one `git maintenance run --task=loose-objects` on the 15,235-object repository the walk was back to the packed figure: 1.09, 1.00, 1.04 and 1.10x for the four operations (one pack made; the loose copies are left for `prune-packed`). That is the action `git maintenance start` schedules, and the one measured benefit that supports an offer.
 
-### Index format (`files`), corrected
+### Untracked cache (`files`), corrected twice
 
-The first version of this table compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. That comparison was not attributable to `feature.manyFiles`: a review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm. It is withdrawn, and so are its index-size figures. This is the re-measurement the review asked for.
+The first version of this section compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. A review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm, so that comparison is withdrawn, with its index-size figures. The re-measurement below replaced it, and a second pass then found that its headline number did not apply to GitPulse's own status reads.
 
-**Method.** Three repositories per size from one `fast-import` commit (N files in 100 directories, one untracked `extra.txt`): `default`, `default-b` (a second plain copy, the identical-arm control) and `manyFiles` (`feature.manyFiles=true`). In all three, one ordinary `git status` with `GIT_OPTIONAL_LOCKS` unset, so git may rewrite the index. Then GitPulse-style reads (`GIT_OPTIONAL_LOCKS=0`) are timed, interleaved, 15 rounds, min-of-15. Load average 10 to 17 on 18 cores (the last run, 100,000 files, under about 17 and visibly slower). `scripts/bench-git-tuning.mjs files`.
+**Method.** Four repositories per size from one `fast-import` commit (N files in 100 directories, one untracked `extra.txt`): `default`, `default-b` (a second plain copy, the identical-arm control), `manyFiles` (`feature.manyFiles=true`) and `untracked cache only` (`core.untrackedCache=true`). In all four, one ordinary `git status` with `GIT_OPTIONAL_LOCKS` unset, so git may write the index. Then reads with `GIT_OPTIONAL_LOCKS=0` are timed, interleaved, min of 11 to 15 rounds. Load average 10 to 30 on 18 cores. `scripts/bench-git-tuning.mjs files`.
 
-Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x on `status` (0.93 to 1.06x on `ls-files`, `add`).
+Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x on every operation.
 
-| tracked files | run | status, default-b (control) | status, manyFiles | status, untracked cache only | ls-files, manyFiles | add (index rewrite), manyFiles |
-| --- | --- | --- | --- | --- | --- | --- |
-| 20,000 | 1 | 0.98 | 0.69 | not run | 1.07 | 0.97 |
-| 20,000 | 2 | 0.99 | 0.69 | not run | 0.92 | 0.90 |
-| 20,000 | 3 | 0.97 | 0.69 | 0.74 | not shown | not shown |
-| 40,000 | 1 | 1.02 | 1.00 | not run | 1.00 | 1.00 |
-| 40,000 | 2 | 0.99 | 0.67 | not run | 0.99 | 1.01 |
-| 100,000 | 1 | 0.96 | 0.63 | not run | 1.04 | 0.93 |
-| 100,000 | 2 | 1.06 | 0.66 | not run | 1.07 | 0.97 |
-| 100,000 | 3 (heavy load) | 1.05 | 0.89 | 0.93 | not shown | not shown |
+| invocation | files | manyFiles | untracked cache only |
+| --- | --- | --- | --- |
+| `git status --porcelain` (default untracked mode) | 20,000 | 0.69, 0.69, 0.69, 0.71, 0.74 | 0.74, 0.72, 0.77 |
+| | 40,000 | 1.00, 0.67, 0.68 | 0.65 |
+| | 100,000 | 0.63, 0.66, 0.89 (heavy load) | 0.93 (heavy load) |
+| `git status --porcelain -z` | 20,000 | 0.68 | 0.74 |
+| **`git status --porcelain -u`** (all untracked files) | 20,000 | 0.97 | 1.01 |
+| **GitPulse's argv** (`-c core.quotepath=off status --porcelain=v1 -u -z`) | 20,000 | 0.98, 1.04 | 0.98, 1.04 |
+| | 40,000 | 1.00 | 0.97 |
+
+(Each cell is one run; the control, `ls-files` and one-file `add` stayed 0.90 to 1.07x throughout.)
 
 What it shows, and what it does not:
 
-* `status` read GitPulse-style was 0.63 to 0.69x as long under `feature.manyFiles` in six of eight runs, well outside the 0.96 to 1.06x noise floor, with no change to `ls-files` or a one-file `add`. In one run (40,000, the first) there was no gain, and one (100,000, under heavy load) showed 0.89x. So the gain is real but not guaranteed, and 20,000 files is the smallest size measured under this method.
-* **The gain is the untracked cache's, not the index format's.** After the refreshing `status` the `manyFiles` index was still format 2 (read from the header) and about 4.6 KB (4,586 to 4,587 bytes) **larger** than the plain one (the untracked-cache extension), not smaller. An arm with only `core.untrackedCache=true` matched it (0.74x and 0.93x against 0.69x and 0.89x in the same runs). So `index.version=4` and `index.skipHash` were not shown to help anything here, and they are what carry the compatibility costs (git older than 2.40 reports a corrupt skipHash index on `fsck`, git older than 2.13 refuses the index).
-* The gain needs git to write the index once with the untracked cache, which happens at the first ordinary `git status` after the key is set. Nothing is faster at the click, so the preview and the hint say so.
-* This reconciles with the 2026-10-13 spike below, which saw no effect from `core.untrackedCache` alone, only partly: that spike's fixtures and invocation differ, and I did not rerun them.
+* **An ordinary `git status` is about a quarter to a third faster** with the untracked cache, in nearly every run at 20,000 and 40,000 files, well outside the noise floor. One 40,000-file run showed no gain and one 100,000-file run under heavy load showed 0.89 to 0.93x.
+* **`-u` is what removes the gain, not `-z`.** With `--untracked-files=all` the cache did nothing measurable (0.97 to 1.04x). GitPulse's own status reads (`GitReader::STATUS_ARGV`) pass `-u`, so **this change does not speed up GitPulse's own reads**. It speeds up a person's own `git status` in a terminal, and any tool that runs it in the default mode. The earlier table was labelled "GitPulse-style" because it set `GIT_OPTIONAL_LOCKS=0`, but it used the default untracked mode; that label was wrong.
+* **The gain is the untracked cache's, not the index format's.** After the refreshing `status` the `manyFiles` index was still format 2 (read from the header) and about 4.6 KB (4,586 to 4,587 bytes) **larger** than the plain one (the untracked-cache extension), not smaller. The cache-only arm matched `manyFiles`. `index.version=4` and `index.skipHash` were not shown to help, and they carry the compatibility costs (git older than 2.40 reports a corrupt skipHash index on `fsck`, git older than 2.13 refuses the index). So the offer is `core.untrackedCache`, not `feature.manyFiles`; the latter is detected and reported, never offered or written.
+* **The gain needs git to write the index once with the cache**, which is the next ordinary `git status` (with locks) after the key is set. Nothing changes at the click, and GitPulse's own reads cannot do it, because `GIT_OPTIONAL_LOCKS=0` never lets `status` write the index. The preview says so.
+* Direct evidence for the cache alone is the `untracked cache only` column (five runs). The `manyFiles` cells attribute to it by inference.
 
-**Threshold.** The offer stays at 20,000 tracked files, the smallest size where the gain was measured, with the corrected wording. Because the measured gain belongs to `core.untrackedCache` and the compatibility cost to the format keys, offering `core.untrackedCache` alone would give the same measured gain without the cost. That is a different key from the one the owner approved, so it is not done here and is recorded as a decision for the owner. A repository whose index is a split index (the `link` extension, or a `sharedindex.*` file beside an unreadable index) or has one in any other worktree is never offered `feature.manyFiles`: on git 2.54 the two together crash `git status`.
+**Reconciliation with the 2026-10-13 spike below.** That spike's "`core.untrackedCache` showed no effect" does not contradict this; both are right for the invocation they measured. The spike timed GitPulse's argv in `gitpulse` mode and `status --porcelain=v1 -u -z` in `plain` mode, both with `-u`; it did let git write the index (two ordinary priming runs) and checked the `UNTR` extension was present. I re-ran that script today on a synthetic 40,000-file repository: `untrackedCache` 1.00x (gitpulse argv) and 0.95x (plain argv, which still has `-u`) with `UNTR` present, and `fsmonitor` 0.71x and 0.75x, the same picture as its table. The difference is the untracked-files mode, `-u` against the default, shown directly in the table above. The spike's table stands for the invocation it measured, and that note is added under it.
+
+**Threshold.** 20,000 tracked files, the smallest size measured. The offer is a strict subset of what the owner approved (one of the two config keys, `core.untrackedCache`, in place of `feature.manyFiles`). A repository whose index is a split index (the `link` extension, or a `sharedindex.*` file beside an unreadable index), with `core.splitIndex` set, or with a split index in another worktree, is never offered it. On git 2.54, `feature.manyFiles` over a split index was reproduced breaking add-then-commit and crashing `git status`; `core.untrackedCache` alone over a split index (in config, as the index's own extension, and with a delta past `splitIndex.maxPercentChange`) was run for several add, commit and status rounds at 5,000 and 30,000 files and did not reproduce it. It is refused anyway, because which part of `feature.manyFiles` breaks the split index was not isolated.
+
+**Undo.** `git config --local --unset core.untrackedCache` alone leaves the untracked cache in the index: git keeps what the index has when the key is unset, and it stayed after a further index write (run on git 2.54, `UNTR` present before and after). `git update-index --no-untracked-cache` removes it, with no warning when run after the unset; `git help update-index` says it takes effect immediately, whatever the key. The preview lists both, in that order, and runs neither.
 
 ### fsmonitor
 
@@ -2274,7 +2286,7 @@ Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,0
 
 | change | offered when | evidence |
 | --- | --- | --- |
-| `feature.manyFiles` | 20,000 or more tracked files (exact count, index walked and valid), key unset, no split index here or in another worktree, git 2.13 or newer | the corrected `files` table (the gain is the untracked cache's) |
+| `core.untrackedCache` | 20,000 or more tracked files (exact count, index walked and valid), key unset, `feature.manyFiles` not on, no split index here or in another worktree | the corrected `files` table; speeds an ordinary `git status`, not GitPulse's own `-u` reads. `feature.manyFiles` is detected, never offered |
 | `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.36.0 or newer | the 2026-10-13 spike |
 | `git maintenance start` | about 6,700 or more loose objects and past `gc.auto`, not registered, `gc.auto` and `maintenance.auto` not turned off | the `loose` table and the `loose-objects` task row |
 | pack count, multi-pack-index | never offered; reported only | the `packs` tables |

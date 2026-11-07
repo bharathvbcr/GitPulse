@@ -1,6 +1,6 @@
 //! The tuning apply, run for real against repositories git wrote.
 //!
-//! `feature.manyFiles` is the change exercised end to end (a repository above
+//! `core.untrackedCache` is the change exercised end to end (a repository above
 //! its threshold, built with `git fast-import`): the preview, the write, the
 //! idempotent second run, the refusals that must leave the config untouched,
 //! and a stop. `git maintenance start` is deliberately NOT run here: it installs
@@ -84,7 +84,7 @@ fn a_repository_below_every_threshold_is_offered_and_applied_nothing() {
     let dir = repo_with_files(50);
     let path = dir.path().to_str().unwrap();
     for change in [
-        TuningChange::ManyFiles,
+        TuningChange::UntrackedCache,
         TuningChange::Fsmonitor,
         TuningChange::Maintenance,
     ] {
@@ -96,7 +96,7 @@ fn a_repository_below_every_threshold_is_offered_and_applied_nothing() {
         );
         assert!(tuning_apply(path, &[change], &[]).is_err());
     }
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn an_untrusted_repository_is_refused_before_anything_is_read_or_run() {
         .unwrap();
     assert!(init.status.success());
     let path = dir.path().to_str().unwrap();
-    let plan = tuning_plan(path, &[TuningChange::ManyFiles]).unwrap_err();
+    let plan = tuning_plan(path, &[TuningChange::UntrackedCache]).unwrap_err();
     assert!(
         plan.message().to_lowercase().contains("trust"),
         "{}",
@@ -119,12 +119,12 @@ fn an_untrusted_repository_is_refused_before_anything_is_read_or_run() {
     );
     let apply = tuning_apply(
         path,
-        &[TuningChange::ManyFiles],
+        &[TuningChange::UntrackedCache],
         &[vec![
             "git".into(),
             "config".into(),
             "--local".into(),
-            "feature.manyFiles".into(),
+            "core.untrackedCache".into(),
             "true".into(),
         ]],
     )
@@ -134,36 +134,35 @@ fn an_untrusted_repository_is_refused_before_anything_is_read_or_run() {
         "{}",
         apply.message()
     );
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
 }
 
 #[test]
-fn many_files_is_previewed_applied_once_and_skipped_the_second_time() {
+fn untracked_cache_is_previewed_applied_once_and_skipped_the_second_time() {
     let _g = serial();
     let dir = repo_with_files(ABOVE);
     let path = dir.path().to_str().unwrap();
 
-    let plan = tuning_plan(path, &[TuningChange::ManyFiles]).expect("offered above its threshold");
+    let plan =
+        tuning_plan(path, &[TuningChange::UntrackedCache]).expect("offered above its threshold");
     assert_eq!(plan.steps.len(), 1);
     let step = &plan.steps[0];
     assert_eq!(
         step.argv,
-        ["git", "config", "--local", "feature.manyFiles", "true"]
+        ["git", "config", "--local", "core.untrackedCache", "true"]
     );
     assert_eq!(
         step.undo,
-        [vec![
-            "git",
-            "config",
-            "--local",
-            "--unset",
-            "feature.manyFiles"
-        ]]
+        [
+            vec!["git", "config", "--local", "--unset", "core.untrackedCache"],
+            vec!["git", "update-index", "--no-untracked-cache"],
+        ]
     );
     // Previewing writes nothing.
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
 
-    let outcome = tuning_apply(path, &[TuningChange::ManyFiles], &plan.runnable()).expect("apply");
+    let outcome =
+        tuning_apply(path, &[TuningChange::UntrackedCache], &plan.runnable()).expect("apply");
     assert_eq!(outcome.results.len(), 1);
     assert_eq!(
         outcome.results[0].status,
@@ -172,7 +171,7 @@ fn many_files_is_previewed_applied_once_and_skipped_the_second_time() {
     );
     assert!(!outcome.cancelled && !outcome.joined);
     assert_eq!(
-        local_value(dir.path(), "feature.manyFiles").as_deref(),
+        local_value(dir.path(), "core.untrackedCache").as_deref(),
         Some("true")
     );
     // The report that comes back is read fresh: it already sees the key.
@@ -180,7 +179,7 @@ fn many_files_is_previewed_applied_once_and_skipped_the_second_time() {
         outcome
             .advice
             .report
-            .key("feature.manyfiles")
+            .key("core.untrackedcache")
             .unwrap()
             .value
             .as_deref(),
@@ -193,22 +192,38 @@ fn many_files_is_previewed_applied_once_and_skipped_the_second_time() {
     );
 
     // Idempotent: the second plan skips it, runs nothing, and says why.
-    let again = tuning_plan(path, &[TuningChange::ManyFiles]).expect("a plan, not an error");
+    let again = tuning_plan(path, &[TuningChange::UntrackedCache]).expect("a plan, not an error");
     assert!(again.runnable().is_empty());
     assert!(again.steps[0]
         .skipped
         .as_deref()
         .unwrap()
         .contains("already on"));
-    let second = tuning_apply(path, &[TuningChange::ManyFiles], &[]).expect("apply");
+    let second = tuning_apply(path, &[TuningChange::UntrackedCache], &[]).expect("apply");
     assert_eq!(second.results[0].status, TuningStepStatus::Skipped);
 
-    // And the undo the preview named restores the repository.
-    run_git(
-        dir.path(),
-        &["config", "--local", "--unset", "feature.manyFiles"],
-    );
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    // The extension is written by the user's next ordinary status, not by the
+    // click and not by GitPulse; then the undo the preview named, run in its
+    // order, takes both the key and the extension away.
+    let has_cache = |dir: &Path| {
+        std::fs::read(dir.join(".git/index"))
+            .unwrap()
+            .windows(4)
+            .any(|w| w == b"UNTR")
+    };
+    assert!(!has_cache(dir.path()), "nothing is written at the click");
+    std::fs::write(dir.path().join("new.txt"), "n").unwrap();
+    run_git(dir.path(), &["status", "--porcelain"]);
+    assert!(has_cache(dir.path()), "the next ordinary status writes it");
+    for undo in &plan.steps[0].undo {
+        run_git(
+            dir.path(),
+            &undo.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
+    assert!(!has_cache(dir.path()), "the undo removes the extension too");
+    // Unsetting the key alone would have left it (git keeps what the index has).
 }
 
 #[test]
@@ -221,11 +236,11 @@ fn a_confirmed_list_that_is_not_the_preview_runs_nothing() {
         vec![["git", "config", "--local", "core.hooksPath", "/evil"]
             .map(String::from)
             .to_vec()],
-        vec![["git", "config", "--global", "feature.manyFiles", "true"]
+        vec![["git", "config", "--global", "core.untrackedCache", "true"]
             .map(String::from)
             .to_vec()],
         vec![
-            ["git", "config", "--local", "feature.manyFiles", "true"]
+            ["git", "config", "--local", "core.untrackedCache", "true"]
                 .map(String::from)
                 .to_vec(),
             ["git", "config", "--local", "core.hooksPath", "/evil"]
@@ -234,19 +249,19 @@ fn a_confirmed_list_that_is_not_the_preview_runs_nothing() {
         ],
     ];
     for confirmed in hostile {
-        let refused = tuning_apply(path, &[TuningChange::ManyFiles], &confirmed).unwrap_err();
+        let refused = tuning_apply(path, &[TuningChange::UntrackedCache], &confirmed).unwrap_err();
         assert!(
             refused.message().contains("not the previewed"),
             "{}",
             refused.message()
         );
     }
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
     assert_eq!(local_value(dir.path(), "core.hooksPath"), None);
 }
 
 #[test]
-fn many_files_over_a_split_index_is_refused_and_nothing_is_written() {
+fn untracked_cache_over_a_split_index_is_refused_and_nothing_is_written() {
     let _g = serial();
     let dir = repo_with_files(ABOVE);
     run_git(
@@ -254,14 +269,14 @@ fn many_files_over_a_split_index_is_refused_and_nothing_is_written() {
         &["config", "--local", "core.splitIndex", "true"],
     );
     let path = dir.path().to_str().unwrap();
-    let refused = tuning_plan(path, &[TuningChange::ManyFiles]).unwrap_err();
+    let refused = tuning_plan(path, &[TuningChange::UntrackedCache]).unwrap_err();
     assert!(
         refused.message().contains("add-then-commit"),
         "{}",
         refused.message()
     );
-    assert!(tuning_apply(path, &[TuningChange::ManyFiles], &[]).is_err());
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert!(tuning_apply(path, &[TuningChange::UntrackedCache], &[]).is_err());
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
 }
 
 #[test]
@@ -269,15 +284,15 @@ fn a_stop_that_arrives_first_leaves_the_step_unrun() {
     let _g = serial();
     let dir = repo_with_files(ABOVE);
     let path = dir.path().to_str().unwrap();
-    let plan = tuning_plan(path, &[TuningChange::ManyFiles]).unwrap();
+    let plan = tuning_plan(path, &[TuningChange::UntrackedCache]).unwrap();
     // No apply is registered yet: the stop is remembered and honoured by the
     // one that registers next.
     assert!(!tuning_apply_cancel(path).unwrap());
-    let outcome = tuning_apply(path, &[TuningChange::ManyFiles], &plan.runnable()).unwrap();
+    let outcome = tuning_apply(path, &[TuningChange::UntrackedCache], &plan.runnable()).unwrap();
     assert!(outcome.cancelled, "{outcome:?}");
     assert_eq!(outcome.results[0].status, TuningStepStatus::NotRun);
-    assert_eq!(local_value(dir.path(), "feature.manyFiles"), None);
+    assert_eq!(local_value(dir.path(), "core.untrackedCache"), None);
     // The stop was consumed: the next apply runs.
-    let outcome = tuning_apply(path, &[TuningChange::ManyFiles], &plan.runnable()).unwrap();
+    let outcome = tuning_apply(path, &[TuningChange::UntrackedCache], &plan.runnable()).unwrap();
     assert_eq!(outcome.results[0].status, TuningStepStatus::Applied);
 }

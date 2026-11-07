@@ -337,6 +337,10 @@ if (mode === "packs") {
     ];
     const ops = [
       { name: "status", args: ["status", "--porcelain"] },
+      // GitPulse's own invocation (`GitReader::STATUS_ARGV`): all untracked files, NUL-separated.
+      { name: "status (GitPulse argv)", args: ["-c", "core.quotepath=off", "status", "--porcelain=v1", "-u", "-z"] },
+      { name: "status -u (all untracked)", args: ["status", "--porcelain", "-u"] },
+      { name: "status -z", args: ["status", "--porcelain", "-z"] },
       { name: "ls-files", args: ["ls-files", "--stage"] },
       { name: "add extra.txt (index rewrite)", args: ["add", "extra.txt"] },
     ];

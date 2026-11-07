@@ -479,7 +479,7 @@ mod tests {
         let common = PathBuf::from("/claim-test/one/.git");
         let first = SetClaim::claim(
             &common,
-            &[TuningChange::ManyFiles, TuningChange::Maintenance],
+            &[TuningChange::UntrackedCache, TuningChange::Maintenance],
         )
         .expect("the first click claims the repository");
         // The same set, in another order and with a repeat, joins.
@@ -487,14 +487,14 @@ mod tests {
             &common,
             &[
                 TuningChange::Maintenance,
-                TuningChange::ManyFiles,
+                TuningChange::UntrackedCache,
                 TuningChange::Maintenance,
             ],
         )
         .expect("an identical set joins");
         // A different set, larger or smaller, is refused rather than dropped.
         for other in [
-            vec![TuningChange::ManyFiles],
+            vec![TuningChange::UntrackedCache],
             vec![TuningChange::Fsmonitor],
             TuningChange::ALL.to_vec(),
         ] {

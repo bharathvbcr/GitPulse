@@ -186,7 +186,7 @@ export interface CommitGraphWriteOutcome {
 export type ConfigScope = "system" | "global" | "local" | "worktree" | "command" | "unknown";
 
 /** Mirrors the Rust `TuningChange`: the three changes the apply may make. */
-export type TuningChange = "many_files" | "fsmonitor" | "maintenance";
+export type TuningChange = "untracked_cache" | "fsmonitor" | "maintenance";
 
 /** Mirrors the Rust `IndexReadState`; `unknown` is "could not read", never "missing". */
 export type IndexReadState = "present" | "missing" | "unknown";
@@ -268,7 +268,7 @@ export interface TuningOffer {
 export interface TuningAdvice {
   report: RepoTuningReport;
   offers: TuningOffer[];
-  /** Said on their own, e.g. a `core.splitIndex` / `feature.manyFiles` conflict. */
+  /** Said on their own, e.g. a split index that keeps the untracked cache from being offered. */
   warnings: string[];
   /** An apply is running in this repository right now (set by the storage scan). */
   apply_in_flight?: boolean;

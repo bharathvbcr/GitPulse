@@ -3,7 +3,7 @@
 //! ones marked BREAKS fail on the lane as reviewed.
 //!
 //! Nothing here runs `git maintenance start` (it installs a per-user scheduler
-//! job) and nothing starts a file system monitor daemon: only `feature.manyFiles`
+//! job) and nothing starts a file system monitor daemon: only `core.untrackedCache`
 //! is ever applied, and every other change is attacked at the plan.
 
 mod common;
@@ -74,7 +74,7 @@ fn local_value(dir: &Path, key: &str) -> Option<String> {
 }
 
 fn many_files_argv() -> Vec<String> {
-    ["git", "config", "--local", "feature.manyFiles", "true"]
+    ["git", "config", "--local", "core.untrackedCache", "true"]
         .map(String::from)
         .to_vec()
 }
@@ -107,7 +107,7 @@ fn adv_crafted_confirmed_argv_variants_run_nothing() {
     dashed_c.insert(1, "-C".into());
     dashed_c.insert(2, "/tmp".into());
     let mut upper = ok.clone();
-    upper[3] = "feature.manyfiles ".into();
+    upper[3] = "core.untrackedcache ".into();
     let hostile: Vec<Vec<Vec<String>>> = vec![
         vec![with_c],
         vec![trailing],
@@ -117,14 +117,14 @@ fn adv_crafted_confirmed_argv_variants_run_nothing() {
         vec![vec![]],
     ];
     for confirmed in hostile {
-        let refused = tuning_apply(path, &[TuningChange::ManyFiles], &confirmed).unwrap_err();
+        let refused = tuning_apply(path, &[TuningChange::UntrackedCache], &confirmed).unwrap_err();
         assert!(
             refused.message().contains("not the previewed"),
             "{confirmed:?}: {}",
             refused.message()
         );
     }
-    assert_eq!(local_value(&main, "feature.manyFiles"), None);
+    assert_eq!(local_value(&main, "core.untrackedCache"), None);
     assert_eq!(local_value(&main, "core.hooksPath"), None);
 }
 
@@ -148,7 +148,7 @@ fn adv_symlink_to_an_untrusted_repository_is_refused() {
     return;
     let refused = tuning_apply(
         str_of(&link),
-        &[TuningChange::ManyFiles],
+        &[TuningChange::UntrackedCache],
         &[many_files_argv()],
     )
     .unwrap_err();
@@ -157,7 +157,7 @@ fn adv_symlink_to_an_untrusted_repository_is_refused() {
         "{}",
         refused.message()
     );
-    assert_eq!(local_value(&target, "feature.manyFiles"), None);
+    assert_eq!(local_value(&target, "core.untrackedCache"), None);
 }
 
 #[test]
@@ -167,25 +167,28 @@ fn adv_config_changed_between_preview_and_confirm_is_refused() {
     let main = parent.path().join("main");
     init_with_files(&main, ABOVE);
     let path = str_of(&main);
-    let previewed = tuning_plan(path, &[TuningChange::ManyFiles])
+    let previewed = tuning_plan(path, &[TuningChange::UntrackedCache])
         .unwrap()
         .runnable();
     // The person (or another tool) turns split index on after the preview.
     run_git(&main, &["config", "--local", "core.splitIndex", "true"]);
-    let refused = tuning_apply(path, &[TuningChange::ManyFiles], &previewed).unwrap_err();
+    let refused = tuning_apply(path, &[TuningChange::UntrackedCache], &previewed).unwrap_err();
     assert!(
         refused.message().contains("add-then-commit"),
         "{}",
         refused.message()
     );
-    assert_eq!(local_value(&main, "feature.manyFiles"), None);
+    assert_eq!(local_value(&main, "core.untrackedCache"), None);
     // Or sets the key themselves: the stale confirm must not overwrite it.
     run_git(&main, &["config", "--local", "--unset", "core.splitIndex"]);
-    run_git(&main, &["config", "--local", "feature.manyFiles", "false"]);
-    let refused = tuning_apply(path, &[TuningChange::ManyFiles], &previewed);
+    run_git(
+        &main,
+        &["config", "--local", "core.untrackedCache", "false"],
+    );
+    let refused = tuning_apply(path, &[TuningChange::UntrackedCache], &previewed);
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(
-        local_value(&main, "feature.manyFiles").as_deref(),
+        local_value(&main, "core.untrackedCache").as_deref(),
         Some("false")
     );
 }
@@ -219,7 +222,9 @@ fn adv_split_index_carried_by_the_index_file_is_not_offered_manyfiles() {
     let report = report_for(dir.path());
     let offers = recommend(&report, env_with((2, 54, 0)));
     assert!(
-        offers.iter().all(|o| o.change != TuningChange::ManyFiles),
+        offers
+            .iter()
+            .all(|o| o.change != TuningChange::UntrackedCache),
         "feature.manyFiles offered over an index with a shared index beside it: {offers:?}"
     );
 }
@@ -247,7 +252,7 @@ fn adv_split_index_in_a_sibling_worktree_is_refused() {
         &sibling,
         &["config", "--worktree", "core.splitIndex", "true"],
     );
-    let plan = tuning_plan(str_of(&main), &[TuningChange::ManyFiles]);
+    let plan = tuning_plan(str_of(&main), &[TuningChange::UntrackedCache]);
     assert!(
         plan.is_err(),
         "the plan would write the shared config over a sibling worktree's split index: {plan:?}"
@@ -280,13 +285,13 @@ fn adv_global_split_index_is_refused() {
     let mut text = before.unwrap_or_default();
     text.extend_from_slice(b"\n[core]\n\tsplitIndex = true\n");
     std::fs::write(&global, text).unwrap();
-    let refused = tuning_plan(str_of(&main), &[TuningChange::ManyFiles]).unwrap_err();
+    let refused = tuning_plan(str_of(&main), &[TuningChange::UntrackedCache]).unwrap_err();
     assert!(
         refused.message().contains("add-then-commit"),
         "{}",
         refused.message()
     );
-    assert_eq!(local_value(&main, "feature.manyFiles"), None);
+    assert_eq!(local_value(&main, "core.untrackedCache"), None);
 }
 
 #[test]
@@ -417,7 +422,7 @@ fn adv_unreadable_indexes_are_never_offered() {
         assert!(
             recommend(&report, env)
                 .iter()
-                .all(|o| o.change != TuningChange::ManyFiles),
+                .all(|o| o.change != TuningChange::UntrackedCache),
             "{name}: offered over an unreadable index"
         );
     }
@@ -435,7 +440,9 @@ fn adv_a_header_over_a_garbage_body_is_not_offered() {
     let report = report_for(dir.path());
     let offers = recommend(&report, env_with((2, 54, 0)));
     assert!(
-        offers.iter().all(|o| o.change != TuningChange::ManyFiles),
+        offers
+            .iter()
+            .all(|o| o.change != TuningChange::UntrackedCache),
         "offered over a body that is not an index: {offers:?}"
     );
 }
@@ -466,10 +473,10 @@ fn adv_apply_from_a_linked_worktree_writes_the_common_config() {
             &["worktree", "add", "-q", "-b", "lnk", str_of(&linked)],
         );
         trust_repo(&linked);
-        let plan = tuning_plan(str_of(&linked), &[TuningChange::ManyFiles]).unwrap();
+        let plan = tuning_plan(str_of(&linked), &[TuningChange::UntrackedCache]).unwrap();
         let outcome = tuning_apply(
             str_of(&linked),
-            &[TuningChange::ManyFiles],
+            &[TuningChange::UntrackedCache],
             &plan.runnable(),
         )
         .unwrap();
@@ -479,14 +486,14 @@ fn adv_apply_from_a_linked_worktree_writes_the_common_config() {
             "{outcome:?}"
         );
         assert_eq!(
-            local_value(&main, "feature.manyFiles").as_deref(),
+            local_value(&main, "core.untrackedCache").as_deref(),
             Some("true"),
             "worktreeConfig={worktree_config}"
         );
         let own = linked.join(".git");
         assert!(own.is_file(), "a linked worktree's .git is a gitfile");
         let worktree_file = Command::new("git")
-            .args(["config", "--worktree", "--get", "feature.manyFiles"])
+            .args(["config", "--worktree", "--get", "core.untrackedCache"])
             .current_dir(&linked)
             .output_locked()
             .unwrap();
