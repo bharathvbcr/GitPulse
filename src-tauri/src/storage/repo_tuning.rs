@@ -233,11 +233,14 @@ pub fn config_true(value: &str) -> bool {
 /// or `g` suffix. `None` for anything else (including a negative or overflow).
 fn parse_git_unsigned(value: &str) -> Option<u64> {
     let value = value.trim();
-    let (digits, factor) = match value.chars().last()? {
-        'k' | 'K' => (&value[..value.len() - 1], 1u64 << 10),
-        'm' | 'M' => (&value[..value.len() - 1], 1 << 20),
-        'g' | 'G' => (&value[..value.len() - 1], 1 << 30),
-        _ => (value, 1),
+    let (digits, factor) = if let Some(digits) = value.strip_suffix(['k', 'K']) {
+        (digits, 1u64 << 10)
+    } else if let Some(digits) = value.strip_suffix(['m', 'M']) {
+        (digits, 1 << 20)
+    } else if let Some(digits) = value.strip_suffix(['g', 'G']) {
+        (digits, 1 << 30)
+    } else {
+        (value, 1)
     };
     digits.trim().parse::<u64>().ok()?.checked_mul(factor)
 }
