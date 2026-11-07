@@ -117,7 +117,13 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     if base == "codex" {
         return Some(AgentKind::Codex);
     }
-    if base == "antigravity" || base.starts_with("antigravity-") {
+    // The app bundle's binary is `Antigravity` (capitalised); the CLI is
+    // `antigravity`. Helpers (`Antigravity Helper`) are neither.
+    if base.eq_ignore_ascii_case("antigravity")
+        || base
+            .get(..12)
+            .is_some_and(|head| head.eq_ignore_ascii_case("antigravity-"))
+    {
         return Some(AgentKind::Antigravity);
     }
     // Not `dev`: that name is also Jarvis's CLI. DevCouncil's own binary is
@@ -147,6 +153,41 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     None
 }
 
+/// Longest argument list searched for an identifying flag.
+const MAX_CLASSIFY_ARGS: usize = 256;
+
+/// [`classify`] with the whole argument list, for the binaries that are only
+/// identified by a flag: Antigravity's `language_server` runs as
+/// `language_server --override_ide_name antigravity`, and the same generic
+/// binary name is shipped by other IDEs (`--override_ide_name windsurf`),
+/// which are not Antigravity.
+pub(crate) fn classify_argv(exec: &str, argv: &[String]) -> Option<AgentKind> {
+    if let Some(kind) = classify(exec, argv.get(1).map(String::as_str)) {
+        return Some(kind);
+    }
+    let is_language_server = Path::new(exec)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "language_server");
+    if !is_language_server {
+        return None;
+    }
+    let mut args = argv.iter().take(MAX_CLASSIFY_ARGS).map(String::as_str);
+    while let Some(arg) = args.next() {
+        let value = if arg == "--override_ide_name" {
+            args.next()
+        } else {
+            arg.strip_prefix("--override_ide_name=")
+        };
+        if let Some(value) = value {
+            return value
+                .eq_ignore_ascii_case("antigravity")
+                .then_some(AgentKind::Antigravity);
+        }
+    }
+    None
+}
+
 /// Whether the short process name is one whose arguments can name an agent.
 ///
 /// Exact for `claude` and `codex`, so `Claude` and `codex-code-mode-host` are
@@ -155,7 +196,8 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
 pub(crate) fn name_selects_procargs(name: &str) -> bool {
     name == "claude"
         || name == "codex"
-        || name == "antigravity"
+        || name.eq_ignore_ascii_case("antigravity")
+        || name == "language_server"
         || name == "devcouncil"
         || name == "manvi"
         || name == "bun"
@@ -188,7 +230,7 @@ pub(crate) fn path_selects_procargs(path: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    base == "bun" || base.starts_with("node")
+    base == "bun" || base == "language_server" || base.starts_with("node")
 }
 
 /// What the sessions scan still has to read for one process.
@@ -239,6 +281,11 @@ pub(crate) struct ProcLink {
 pub(crate) struct SessionTable {
     pub rows: Vec<SessionRow>,
     pub links: HashMap<i32, ProcLink>,
+    /// For a session whose own working directory is in no repository (an app
+    /// started from `/`), the repository its descendants work in. Absent when
+    /// the session's own directory is in a repository or no descendant names
+    /// one: the session's cwd then stays what the OS said.
+    pub hints: HashMap<i32, PathBuf>,
 }
 
 impl From<Vec<SessionRow>> for SessionTable {
@@ -257,8 +304,139 @@ impl From<Vec<SessionRow>> for SessionTable {
                 )
             })
             .collect();
-        Self { rows, links }
+        Self {
+            rows,
+            links,
+            hints: HashMap::new(),
+        }
     }
+}
+
+/// Descendant depth, descendant count, arguments per descendant and length of
+/// one argument that a repository hint reads.
+const MAX_HINT_DEPTH: usize = 6;
+const MAX_HINT_DESCENDANTS: usize = 64;
+const MAX_HINT_ARGS: usize = 64;
+const MAX_HINT_ARG_CHARS: usize = 4096;
+/// Flags whose value is a path inside the repository the process works on.
+const HINT_FLAGS: [&str; 7] = [
+    "--manifest-path",
+    "--root",
+    "--repo-path",
+    "--repo_path",
+    "--repo",
+    "--workspace",
+    "--cwd",
+];
+
+/// The checkout containing `path`: the nearest ancestor with a `.git` entry
+/// (a directory, or the file a linked worktree has). `/` is never one.
+fn repo_root_of(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    path.ancestors()
+        .take(MAX_DEPTH)
+        .filter(|dir| dir.parent().is_some())
+        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+}
+
+/// The paths a command line names with one of [`HINT_FLAGS`], as `--flag value`
+/// or `--flag=value`. Bounded in argument count and argument length.
+fn hint_paths(argv: &[String]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut args = argv
+        .iter()
+        .take(MAX_HINT_ARGS)
+        .filter(|a| a.chars().count() <= MAX_HINT_ARG_CHARS)
+        .map(String::as_str);
+    while let Some(arg) = args.next() {
+        let value = match arg.split_once('=') {
+            Some((flag, value)) if HINT_FLAGS.contains(&flag) => Some(value),
+            _ if HINT_FLAGS.contains(&arg) => args.next(),
+            _ => None,
+        };
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            paths.push(PathBuf::from(value));
+        }
+    }
+    paths
+}
+
+/// Descendants of `root` in breadth-first order, to [`MAX_HINT_DEPTH`] levels
+/// and [`MAX_HINT_DESCENDANTS`] processes.
+fn descendants_of(root: i32, children: &HashMap<i32, Vec<i32>>) -> Vec<i32> {
+    let mut found: Vec<i32> = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut level = vec![root];
+    for _ in 0..MAX_HINT_DEPTH {
+        let mut next = Vec::new();
+        for pid in &level {
+            for child in children.get(pid).into_iter().flatten() {
+                if found.len() >= MAX_HINT_DESCENDANTS {
+                    return found;
+                }
+                if seen.insert(*child) {
+                    found.push(*child);
+                    next.push(*child);
+                }
+            }
+        }
+        level = next;
+    }
+    found
+}
+
+/// Attributes each session whose own working directory is outside every
+/// repository to the repository its descendants work in: the one most of them
+/// name (a flag from [`HINT_FLAGS`] or their own cwd), the most recently
+/// started breaking a tie, then the path. Reads arguments only, spawns nothing.
+fn repo_hints(
+    rows: &[SessionRow],
+    links: &HashMap<i32, ProcLink>,
+    cwd_of: &dyn Fn(i32) -> Option<PathBuf>,
+    argv_of: &mut dyn FnMut(i32) -> Option<Vec<String>>,
+) -> HashMap<i32, PathBuf> {
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    let mut hints = HashMap::new();
+    for row in rows.iter().take(MAX_SESSIONS) {
+        if cwd_of(row.pid).and_then(|cwd| repo_root_of(&cwd)).is_some() {
+            continue;
+        }
+        if children.is_empty() {
+            for (pid, link) in links {
+                if *pid != link.ppid {
+                    children.entry(link.ppid).or_default().push(*pid);
+                }
+            }
+        }
+        // root -> (processes naming it, newest of them)
+        let mut tally: HashMap<PathBuf, (u32, u64)> = HashMap::new();
+        for pid in descendants_of(row.pid, &children) {
+            let mut named: Vec<PathBuf> = argv_of(pid).map(|a| hint_paths(&a)).unwrap_or_default();
+            named.extend(cwd_of(pid));
+            let roots: std::collections::HashSet<PathBuf> =
+                named.iter().filter_map(|p| repo_root_of(p)).collect();
+            let started = links.get(&pid).map_or(0, |l| l.start_us);
+            for root in roots {
+                let entry = tally.entry(root).or_default();
+                entry.0 += 1;
+                entry.1 = entry.1.max(started);
+            }
+        }
+        let best = tally.into_iter().max_by(|a, b| {
+            (a.1 .0, a.1 .1, std::cmp::Reverse(&a.0)).cmp(&(
+                b.1 .0,
+                b.1 .1,
+                std::cmp::Reverse(&b.0),
+            ))
+        });
+        if let Some((root, _)) = best {
+            hints.insert(row.pid, root);
+        }
+    }
+    hints
 }
 
 /// The nearest agent session above the process `pid` (parent `ppid`, started
@@ -307,7 +485,7 @@ pub(crate) fn session_row(
     resolve: impl FnOnce() -> Option<String>,
 ) -> Option<SessionRow> {
     if let Some((exec, argv, launch)) = args {
-        let kind = classify(&exec, argv.get(1).map(String::as_str))?;
+        let kind = classify_argv(&exec, &argv)?;
         return Some(SessionRow {
             pid,
             ppid,
@@ -395,9 +573,7 @@ impl Identity {
         argv: Vec<String>,
         launch: Option<LaunchKey>,
     ) -> Self {
-        let kind = exec
-            .as_deref()
-            .and_then(|e| classify(e, argv.get(1).map(String::as_str)));
+        let kind = exec.as_deref().and_then(|e| classify_argv(e, &argv));
         let memguard = name == "memguard"
             || exec
                 .as_deref()
@@ -1374,7 +1550,11 @@ fn assemble_sessions(
     table: SessionTable,
     mut cwd_of: impl FnMut(i32) -> Option<PathBuf>,
 ) -> Result<Vec<AgentSession>, String> {
-    let SessionTable { rows, links } = table;
+    let SessionTable {
+        rows,
+        links,
+        mut hints,
+    } = table;
     let by_pid: HashMap<i32, AgentKind> = rows.iter().map(|row| (row.pid, row.kind)).collect();
     let kept: Vec<&SessionRow> = rows
         .iter()
@@ -1392,7 +1572,10 @@ fn assemble_sessions(
             kind: row.kind,
             pid: row.pid,
             start_us: row.start_us,
-            cwd: cwd_of(row.pid).map(|path| path.to_string_lossy().into_owned()),
+            cwd: hints
+                .remove(&row.pid)
+                .or_else(|| cwd_of(row.pid))
+                .map(|path| path.to_string_lossy().into_owned()),
             tree: row.launch.as_ref().and_then(LaunchKey::tree),
             run_id: row.launch.as_ref().and_then(|key| key.run_id.clone()),
             parent_pid: nearest_agent_ancestor(
@@ -1647,12 +1830,9 @@ impl Scanner {
                 // under another `argv[0]` is still that: the kernel's path is
                 // the one it cannot change.
                 let agent = f.ident.kind.or_else(|| {
-                    real_exe.as_deref().and_then(|exe| {
-                        classify(
-                            exe,
-                            argv.as_ref().and_then(|a| a.get(1)).map(String::as_str),
-                        )
-                    })
+                    real_exe
+                        .as_deref()
+                        .and_then(|exe| classify_argv(exe, argv.as_deref().unwrap_or(&[])))
                 });
                 TableRow {
                     pid: f.pid,
@@ -2212,7 +2392,8 @@ mod os {
                 rows.push(row);
             }
         }
-        Ok(super::SessionTable { rows, links })
+        let hints = super::repo_hints(&rows, &links, &cwd, &mut |pid| argv_of(pid, &mut args_buf));
+        Ok(super::SessionTable { rows, links, hints })
     }
 }
 
@@ -2597,7 +2778,10 @@ mod os {
                 rows.push(row);
             }
         }
-        Ok(super::SessionTable { rows, links })
+        let hints = super::repo_hints(&rows, &links, &cwd, &mut |pid| {
+            argv_of(pid, &mut Vec::new())
+        });
+        Ok(super::SessionTable { rows, links, hints })
     }
 }
 
@@ -3051,6 +3235,206 @@ pub(crate) mod tests {
         ] {
             assert_eq!(classify(exec, arg1), want, "{exec} {arg1:?}");
         }
+    }
+
+    const AG_APP: &str = "/Applications/Antigravity.app/Contents/MacOS/Antigravity";
+    const AG_LS: &str = "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    /// Rows read from a live Antigravity (`ps -axo pid,ppid,comm,args`,
+    /// 2026-11-06; the csrf token is dropped).
+    fn ag_language_server_argv() -> Vec<String> {
+        args(&[
+            AG_LS,
+            "--standalone",
+            "--override_ide_name",
+            "antigravity",
+            "--subclient_type",
+            "hub",
+            "--override_ide_version",
+            "2.29.0",
+            "--override_user_agent_name",
+            "antigravity",
+            "--https_server_port",
+            "0",
+            "--app_data_dir",
+            "antigravity",
+            "--api_server_url",
+            "https://generativelanguage.googleapis.com",
+        ])
+    }
+
+    #[test]
+    fn antigravity_app_and_its_language_server_are_recognised_without_false_positives() {
+        let cases: Vec<(&str, Vec<String>, Option<AgentKind>)> = vec![
+            (AG_APP, args(&[AG_APP]), Some(AgentKind::Antigravity)),
+            (AG_LS, ag_language_server_argv(), Some(AgentKind::Antigravity)),
+            (
+                AG_LS,
+                args(&[AG_LS, "--override_ide_name=Antigravity"]),
+                Some(AgentKind::Antigravity),
+            ),
+            // Another IDE's language server, or one that does not say.
+            (
+                "/Applications/Windsurf.app/Contents/Resources/bin/language_server",
+                args(&["language_server", "--override_ide_name", "windsurf"]),
+                None,
+            ),
+            (AG_LS, args(&[AG_LS, "--standalone"]), None),
+            (AG_LS, args(&[AG_LS, "--override_ide_name"]), None),
+            (AG_LS, args(&[AG_LS, "--override_ide_name", "antigravity-not"]), None),
+            // The Electron helper is not a session.
+            (
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper",
+                args(&["Antigravity Helper", "--import=file:///x/register_loader.js"]),
+                None,
+            ),
+        ];
+        for (exec, argv, want) in cases {
+            assert_eq!(classify_argv(exec, &argv), want, "{exec} {argv:?}");
+        }
+        assert!(name_selects_procargs("Antigravity"));
+        assert!(name_selects_procargs("language_server"));
+        assert!(!name_selects_procargs("Antigravity Helper"));
+        assert!(path_selects_procargs(AG_LS));
+        // Without readable arguments the flag cannot be checked.
+        let row = session_row(7, 1, 4, SessionProbe::ArgsOf(AG_LS.into()), None, || None);
+        assert!(row.is_none());
+    }
+
+    /// A checkout fixture: `<tmp>/<name>/.git`.
+    fn checkout(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        root
+    }
+
+    /// The live process table: the app (cwd `/`) over its language server,
+    /// MCP servers and a cargo build naming a manifest in a checkout.
+    #[test]
+    fn a_session_started_from_root_is_attributed_to_the_repo_its_descendants_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = checkout(tmp.path(), "GitPulse");
+        let other = checkout(tmp.path(), "DevCouncil");
+        let manifest = repo
+            .join("src-tauri/Cargo.toml")
+            .to_string_lossy()
+            .into_owned();
+        let other_root = other.to_string_lossy().into_owned();
+        let rows = vec![
+            agent_row(60496, 1, 100, AgentKind::Antigravity),
+            // Direct child of the same kind: the app's wrapper target.
+            agent_row(60567, 60496, 101, AgentKind::Antigravity),
+        ];
+        let mut table = SessionTable::from(rows);
+        for (pid, ppid, start) in [
+            (60582, 60567, 102),
+            (30881, 60567, 103),
+            (61000, 60582, 200),
+        ] {
+            table.links.insert(
+                pid,
+                ProcLink {
+                    ppid,
+                    start_us: start,
+                },
+            );
+        }
+        let mut argvs: HashMap<i32, Vec<String>> = HashMap::new();
+        argvs.insert(30881, args(&["devmap", "--root", &other_root, "mcp"]));
+        argvs.insert(
+            61000,
+            args(&["cargo", "build", "--release", "--manifest-path", &manifest]),
+        );
+        let cwd = |pid: i32| (pid == 60496 || pid == 60567).then(|| PathBuf::from("/"));
+        table.hints = repo_hints(&table.rows, &table.links, &cwd, &mut |pid| {
+            argvs.get(&pid).cloned()
+        });
+        // One process names each repo; the newer (the build) wins the tie.
+        let sessions = sessions_from_read(Ok(table), cwd).unwrap();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].kind, AgentKind::Antigravity);
+        assert_eq!(sessions[0].pid, 60496);
+        assert_eq!(sessions[0].cwd.as_deref(), repo.to_str());
+
+        // The insights facet counts it.
+        let kinds = crate::insights::live_sessions::from_scan(&sessions, &[]);
+        let antigravity = kinds.iter().find(|k| k.kind == "antigravity").unwrap();
+        assert!(antigravity.ok);
+        assert_eq!(antigravity.live.len(), 1);
+    }
+
+    #[test]
+    fn a_session_with_no_repository_evidence_keeps_its_own_directory_and_is_never_dropped() {
+        let table = SessionTable::from(vec![agent_row(5, 1, 1, AgentKind::Antigravity)]);
+        let hints = repo_hints(
+            &table.rows,
+            &table.links,
+            &|_| Some(PathBuf::from("/")),
+            &mut |_| Some(args(&["x", "--root", "/nonexistent/nowhere"])),
+        );
+        assert!(hints.is_empty());
+        let sessions = sessions_from_read(Ok(table), |_| Some(PathBuf::from("/"))).unwrap();
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn a_session_already_in_a_repository_is_not_reattributed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = checkout(tmp.path(), "own");
+        let named = checkout(tmp.path(), "named");
+        let named_root = named.to_string_lossy().into_owned();
+        let mut table = SessionTable::from(vec![agent_row(5, 1, 1, AgentKind::Antigravity)]);
+        table.links.insert(
+            6,
+            ProcLink {
+                ppid: 5,
+                start_us: 2,
+            },
+        );
+        let own_cwd = own.clone();
+        let hints = repo_hints(
+            &table.rows,
+            &table.links,
+            &move |pid| (pid == 5).then(|| own_cwd.clone()),
+            &mut |_| Some(args(&["x", "--root", &named_root])),
+        );
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn repository_hints_are_bounded() {
+        let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+        // A chain deeper than the bound, and a fan-out wider than it.
+        for pid in 1..40 {
+            children.entry(pid).or_default().push(pid + 1);
+        }
+        assert_eq!(descendants_of(1, &children).len(), MAX_HINT_DEPTH);
+        children.insert(1000, (2000..2500).collect());
+        assert_eq!(descendants_of(1000, &children).len(), MAX_HINT_DESCENDANTS);
+        // A cycle terminates.
+        children.insert(7000, vec![7001]);
+        children.insert(7001, vec![7000, 7001]);
+        assert_eq!(descendants_of(7000, &children), [7001]);
+        // Oversized arguments are ignored; past the argument cap nothing is read.
+        let huge = "a".repeat(MAX_HINT_ARG_CHARS + 1);
+        assert!(hint_paths(&args(&["--root", &huge])).is_empty());
+        let mut many = vec!["x"; MAX_HINT_ARGS];
+        many.extend(["--root", "/late"]);
+        assert!(hint_paths(&args(&many)).is_empty());
+        assert_eq!(
+            hint_paths(&args(&[
+                "--root=/a",
+                "--manifest-path",
+                "/b/Cargo.toml",
+                "--root"
+            ])),
+            [PathBuf::from("/a"), PathBuf::from("/b/Cargo.toml")]
+        );
     }
 
     #[test]
