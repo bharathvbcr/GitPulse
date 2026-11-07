@@ -7384,6 +7384,12 @@ mod tests {
     /// and never leaks to another bound.
     #[test]
     fn a_test_replaces_each_wall_clock_bound_on_its_own_thread_only() {
+        // The whole test reads git config through the process environment: a
+        // neighbour that binds `HOME` writes its `.gitconfig` under this lock,
+        // and a call outside it can read the file half written ("bad config
+        // line 1") or the answer it kept under another home. Reentrant, so
+        // `unhurried` and `capped_then_rest` below take it again.
+        let _stable_env = crate::test_support::env::env_serial();
         // The shipped values, as literals: changing one is a product decision,
         // not a test edit, and comparing a constant with itself would pass.
         assert_eq!(LANG_STATS_DEADLINE, Duration::from_secs(10));
@@ -7429,16 +7435,111 @@ mod tests {
         }
         git_in(&root, &["checkout", "-q", "main"]);
         let path = root.to_str().unwrap();
-        let capped = with_deadline(Bound::BranchStats, Duration::ZERO, || {
-            GitReader::branch_stats(path).expect("capped")
-        });
+        let (capped, rest) = capped_then_rest(path, || {});
         assert_eq!(
             (capped.computed, capped.capped),
             (1, true),
             "a spent bound reaches branch_stats, which still makes progress"
         );
-        let rest = unhurried(|| GitReader::branch_stats(path).expect("rest"));
         assert_eq!((rest.computed, rest.cached, rest.capped), (1, 1, false));
+    }
+
+    /// `branch_stats` once with its time bound spent (it still measures the
+    /// first branch and keeps that answer), then once without a bound, which
+    /// must find the kept answer. `between` runs after the first call.
+    ///
+    /// Both calls run under one hold of the environment lock: a kept answer is
+    /// stamped with the git config and home it was measured under, and the
+    /// capped call reads that stamp before and after measuring. A neighbour
+    /// that rebinds `HOME` or `XDG_CONFIG_HOME` during the capped call makes
+    /// the two reads differ, `keep` correctly stores nothing, and the second
+    /// call measures again.
+    fn capped_then_rest(
+        path: &str,
+        between: impl FnOnce(),
+    ) -> (BranchStatsReport, BranchStatsReport) {
+        let _stable_env = crate::test_support::env::env_serial();
+        let capped = with_deadline(Bound::BranchStats, Duration::ZERO, || {
+            GitReader::branch_stats(path).expect("capped")
+        });
+        between();
+        let rest = unhurried(|| GitReader::branch_stats(path).expect("rest"));
+        (capped, rest)
+    }
+
+    /// A neighbour that rebinds `HOME` and `XDG_CONFIG_HOME` to a directory
+    /// holding a real global attributes file (the inputs the churn fingerprint
+    /// reads from the process environment; the config itself is read through
+    /// a cache and does not move at once), at the moment the capped call is between measuring and
+    /// keeping, cannot do it: the call holds the environment lock, so the
+    /// neighbour waits and the kept answer is found. Without the lock the
+    /// rebind lands in that window, `keep` stores nothing, and `rest` measures
+    /// the branch again.
+    #[test]
+    fn a_neighbour_rebinding_the_home_cannot_unkeep_the_capped_calls_answer() {
+        use crate::test_support::env::{bind_env, env_serial};
+        use std::sync::mpsc;
+
+        let repo = init_repo_with_remotes(&[], "main");
+        let root = repo.path().canonicalize().unwrap();
+        for n in 0..2 {
+            git_in(
+                &root,
+                &["checkout", "-q", "-b", &format!("topic-{n}"), "main"],
+            );
+            git_in(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", &format!("t{n}")],
+            );
+        }
+        git_in(&root, &["checkout", "-q", "main"]);
+        let path = root.to_str().unwrap();
+
+        let rebound = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(rebound.path().join("git")).unwrap();
+        std::fs::write(rebound.path().join("git").join("attributes"), "* -diff\n").unwrap();
+        let xdg = rebound.path().to_path_buf();
+
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (rebound_tx, rebound_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let neighbour = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            let serial = env_serial();
+            let _binding = bind_env(&serial)
+                .set("XDG_CONFIG_HOME", &xdg)
+                .set("HOME", &xdg);
+            let _ = rebound_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        let mut fired = false;
+        let (capped, rest) = churn_store::with_before_keep(
+            move || {
+                // Only the capped call's `keep` is the window under test.
+                if std::mem::replace(&mut fired, true) {
+                    return;
+                }
+                go_tx.send(()).unwrap();
+                // Returns at once when the neighbour got in; with the lock held
+                // it never does, so this wait only ends by running out. It
+                // bounds how long the test waits for a neighbour that cannot
+                // move; it is not a claim about how fast anything is.
+                let _ = rebound_rx.recv_timeout(Duration::from_millis(1500));
+            },
+            || {
+                capped_then_rest(path, || {
+                    let _ = release_tx.send(());
+                })
+            },
+        );
+        neighbour.join().unwrap();
+        assert_eq!((capped.computed, capped.capped), (1, true));
+        assert_eq!(
+            (rest.computed, rest.cached, rest.capped),
+            (1, 1, false),
+            "the capped call's answer was not kept: its inputs moved under it"
+        );
     }
 
     #[test]
