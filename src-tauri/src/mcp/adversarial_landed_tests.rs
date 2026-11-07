@@ -380,7 +380,7 @@ fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
     let got = ask(&hand, &sha);
     assert_conforms("hand commit", &got, &schema);
     assert!(got["session"].is_null());
-    assert_eq!(got["session_basis"], "no_session_command");
+    assert_eq!(got["session_basis"], "no_ingested_session_command");
     assert_eq!(got["session_ambiguous"], false);
 
     let (_d, no_ledger) = repo_with_root();
@@ -479,7 +479,7 @@ fn every_session_basis_validates_against_the_output_schema() {
             }),
         ),
         (
-            basis::NO_SESSION_COMMAND,
+            basis::NO_INGESTED_SESSION_COMMAND,
             Box::new(move |r, c| {
                 put_row(r, "reflog", "commit: x", c, Some((now, "reflog")), None);
             }),

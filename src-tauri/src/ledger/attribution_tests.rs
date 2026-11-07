@@ -4,8 +4,8 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, command_target, link_commits, read_command, runs_git_mutation, CommitLink, Shape,
-    Target, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
+    basis, command_target, link_commits, read_command, runs_git_mutation, CommitLink, Target,
+    HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
 };
 use super::*;
 use std::path::Path;
@@ -107,7 +107,7 @@ fn a_bash_git_commit_and_its_reflog_entry_are_linked_as_inferred() {
 }
 
 #[test]
-fn a_hand_commit_with_no_session_command_stays_unattributed() {
+fn a_hand_commit_with_no_ingested_session_command_stays_unattributed() {
     let (_dir, repo) = repo_dir();
     let at = t0();
     // Other commands in the window are not git commits.
@@ -118,7 +118,7 @@ fn a_hand_commit_with_no_session_command_stays_unattributed() {
     let got = link(&repo, &sha(1));
 
     assert_eq!(got.session_id, None, "{got:?}");
-    assert_eq!(got.basis, basis::NO_SESSION_COMMAND);
+    assert_eq!(got.basis, basis::NO_INGESTED_SESSION_COMMAND);
     assert!(!got.ambiguous, "nothing was ambiguous: nothing fit");
 }
 
@@ -179,7 +179,7 @@ fn a_command_in_a_different_worktree_does_not_link() {
     let got = link(&repo, &sha(1));
 
     assert_eq!(got.session_id, None, "{got:?}");
-    assert_eq!(got.basis, basis::NO_SESSION_COMMAND);
+    assert_eq!(got.basis, basis::NO_INGESTED_SESSION_COMMAND);
 }
 
 #[test]
@@ -250,7 +250,10 @@ fn a_row_with_no_event_time_cannot_be_matched_and_says_so() {
         .map_err(|e| LedgerError::new("t", e.to_string()))
     })
     .unwrap();
-    assert_eq!(link(&repo, &sha(1)).basis, basis::NO_SESSION_COMMAND);
+    assert_eq!(
+        link(&repo, &sha(1)).basis,
+        basis::NO_INGESTED_SESSION_COMMAND
+    );
 }
 
 #[test]
@@ -281,12 +284,13 @@ fn an_amend_and_a_rebase_each_entry_links_to_the_session_that_ran_them() {
 
     // One rebase command, then a reflog entry per pick and one for the finish.
     let (_dir2, repo2) = repo_dir();
-    command_row(
+    command_row_timed(
         &repo2,
         None,
         "S9",
         &format!("cd {repo2} && git -C {repo2} rebase main"),
         at,
+        10_000,
     );
     for n in 0..6 {
         reflog_row(
@@ -355,7 +359,7 @@ fn a_blocked_command_and_a_command_with_no_session_are_not_candidates() {
     let got = link(&repo, &sha(1));
 
     assert_eq!(got.session_id, None, "{got:?}");
-    assert_eq!(got.basis, basis::NO_SESSION_COMMAND);
+    assert_eq!(got.basis, basis::NO_INGESTED_SESSION_COMMAND);
 }
 
 #[test]
@@ -702,7 +706,7 @@ fn adv_cap_hides_earliest_reflog_entry_so_ff_is_credited() {
 }
 
 #[test]
-fn adv_cap_hides_command_but_reports_no_session_command() {
+fn adv_cap_hides_command_but_reports_no_ingested_session_command() {
     let (_d, repo) = repo_dir();
     let at = t0();
     command_row(&repo, None, "S1", "git commit -m a", at - SEC);
@@ -916,7 +920,7 @@ fn only_an_entry_that_made_the_commit_is_its_origin() {
     .enumerate()
     {
         let (_d, repo) = repo_dir();
-        command_row(&repo, None, "S1", "git commit -m a", at - SEC);
+        command_row_for(&repo, "S1", message, at);
         reflog_row(&repo, None, &sha(n), message, at);
         let got = link(&repo, &sha(n));
         assert_eq!(got.session_id.as_deref(), Some("S1"), "{message}: {got:?}");
@@ -1150,7 +1154,7 @@ fn r2_reflog_message_table() {
     for (i, (msg, origin)) in table.iter().enumerate() {
         let (_d, repo) = repo_dir();
         let at = t0();
-        command_row(&repo, None, "S1", "git commit -m x", at - SEC);
+        command_row_for(&repo, "S1", msg, at);
         reflog_row(&repo, None, &sha(i + 1), msg, at);
         let got = link(&repo, &sha(i + 1));
         let credited = got.session_id.is_some();
@@ -1839,7 +1843,7 @@ fn a_rebase_is_credited_with_its_picks_and_nothing_after_them() {
     let at = t0();
     for with_finish in [true, false] {
         let (_d, repo) = repo_dir();
-        command_row(&repo, None, "AGENT", "git rebase main", at);
+        command_row_timed(&repo, None, "AGENT", "git rebase main", at, 10_000);
         for n in 1..=3 {
             reflog_row(
                 &repo,
@@ -1879,7 +1883,7 @@ fn a_rebase_run_ends_at_its_finish_and_at_an_unrelated_commit() {
     let at = t0();
     // A human's own rebase after the agent's finished.
     let (_d, repo) = repo_dir();
-    command_row(&repo, None, "AGENT", "git rebase main", at);
+    command_row_timed(&repo, None, "AGENT", "git rebase main", at, 10_000);
     reflog_row(&repo, None, &sha(1), "rebase (pick): work", at + SEC);
     reflog_row(
         &repo,
@@ -1894,7 +1898,7 @@ fn a_rebase_run_ends_at_its_finish_and_at_an_unrelated_commit() {
 
     // A hand commit in the middle of the run ends it.
     let (_d2, repo2) = repo_dir();
-    command_row(&repo2, None, "AGENT", "git rebase main", at);
+    command_row_timed(&repo2, None, "AGENT", "git rebase main", at, 10_000);
     reflog_row(&repo2, None, &sha(1), "rebase (pick): work", at + SEC);
     reflog_row(&repo2, None, &sha(2), "commit", at + 2 * SEC);
     reflog_row(&repo2, None, &sha(3), "rebase (pick): work", at + 3 * SEC);
@@ -2060,7 +2064,7 @@ fn how_many_commits_a_command_makes_is_a_single_commit_unless_the_words_say_a_ru
         "git cherry-pick --continue",
         "git commit -m a && git rebase main",
     ] {
-        assert_eq!(shape(single), Shape::Single, "{single}");
+        assert!(!shape(single).is_run(), "{single}");
     }
     for run in [
         "git rebase main",
@@ -2071,6 +2075,239 @@ fn how_many_commits_a_command_makes_is_a_single_commit_unless_the_words_say_a_ru
         "git cherry-pick a b",
         "git rebase main && git rebase main",
     ] {
-        assert!(matches!(shape(run), Shape::Run(_)), "{run}");
+        assert!(shape(run).is_run(), "{run}");
     }
+}
+
+// ---- round 4: an entry is credited only to a command that writes its verb,
+// and a command's end bounds the entries it can have made ----
+
+/// A transcript command row that ran for `duration_ms`: the call's result was
+/// read and timed, so its completion is known.
+fn command_row_timed(
+    repo: &str,
+    worktree: Option<&str>,
+    session: &str,
+    text: &str,
+    at: u64,
+    duration_ms: i64,
+) {
+    append(Draft {
+        repo_path: repo.into(),
+        worktree_path: worktree.map(str::to_string),
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("claude".into()),
+        session_id: Some(session.into()),
+        action: "session.command".into(),
+        object: Some(text.into()),
+        outcome: Some(Outcome::Ok),
+        duration_ms: Some(duration_ms),
+        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        event_stamp: Some(stamp(at, "transcript")),
+        ..Draft::default()
+    })
+    .expect("append timed command");
+}
+
+/// The command that writes a reflog `message`'s verb, run so that it covers an
+/// entry written at `at`: what a table of entry forms is read against.
+fn command_row_for(repo: &str, session: &str, message: &str, at: u64) {
+    let verb = message.split([' ', ':', '(']).next().unwrap_or("");
+    let text = match verb {
+        "cherry-pick" => "git cherry-pick abc",
+        "revert" => "git revert abc",
+        "am" => "git am p.patch",
+        "rebase" => "git rebase main",
+        "pull" => "git pull",
+        "merge" => "git merge feat",
+        _ => "git commit -m x",
+    };
+    command_row_timed(repo, None, session, text, at - SEC, 2_000);
+}
+
+#[test]
+fn a_pull_that_found_nothing_does_not_make_a_hand_commit_after_it() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    // `git pull` exited 0 with "Already up to date": no reflog row. A human
+    // commits 40 s later, inside the window.
+    command_row(&repo, None, "PULLER", "git pull", at - 40 * SEC);
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    let got = link(&repo, &sha(1));
+
+    assert_eq!(got.session_id, None, "{got:?}");
+    assert_eq!(got.basis, basis::COMMAND_SPENT);
+
+    // The same, whatever the pull's completion was timed as.
+    let (_d2, repo2) = repo_dir();
+    command_row_timed(&repo2, None, "PULLER", "git pull", at - 40 * SEC, 2_000);
+    reflog_row(&repo2, None, &sha(2), "commit", at);
+    assert_eq!(link(&repo2, &sha(2)).session_id, None);
+}
+
+#[test]
+fn a_merge_that_found_nothing_does_not_make_someone_elses_merge_after_it() {
+    let at = t0();
+    // Without the command's end, a merge that made nothing and one that made
+    // this entry look the same: no link, and a name for why.
+    let (_d, repo) = repo_dir();
+    command_row(&repo, None, "MERGER", "git merge feat", at - 40 * SEC);
+    reflog_row(
+        &repo,
+        None,
+        &sha(1),
+        "merge other: Merge made by the 'ort' strategy.",
+        at,
+    );
+    let untimed = link(&repo, &sha(1));
+    assert_eq!(untimed.session_id, None, "{untimed:?}");
+    assert_eq!(untimed.basis, basis::COMMAND_OUTCOME_UNKNOWN);
+
+    // With it, the entry is after the command finished: not its entry.
+    let (_d2, repo2) = repo_dir();
+    command_row_timed(
+        &repo2,
+        None,
+        "MERGER",
+        "git merge feat",
+        at - 40 * SEC,
+        2_000,
+    );
+    reflog_row(
+        &repo2,
+        None,
+        &sha(2),
+        "merge other: Merge made by the 'ort' strategy.",
+        at,
+    );
+    let timed = link(&repo2, &sha(2));
+    assert_eq!(timed.session_id, None, "{timed:?}");
+    assert_eq!(timed.basis, basis::COMMAND_SPENT);
+
+    // And a merge that did make its entry, timed, links.
+    let (_d3, repo3) = repo_dir();
+    command_row_timed(
+        &repo3,
+        None,
+        "MERGER",
+        "git merge feat",
+        at - 2 * SEC,
+        4_000,
+    );
+    reflog_row(
+        &repo3,
+        None,
+        &sha(3),
+        "merge feat: Merge made by the 'ort' strategy.",
+        at,
+    );
+    assert_eq!(link(&repo3, &sha(3)).session_id.as_deref(), Some("MERGER"));
+}
+
+#[test]
+fn a_hand_commit_during_a_slow_commit_is_ambiguous_when_the_commits_end_is_known() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    // The agent's `git commit` starts at `at`; its pre-commit hooks take 60 s;
+    // a human commits at +10; the agent's commit lands at +61.
+    command_row_timed(&repo, None, "AGENT", "git commit -m a", at, 62_000);
+    reflog_row(&repo, None, &sha(1), "commit", at + 10 * SEC);
+    reflog_row(&repo, None, &sha(2), "commit", at + 61 * SEC);
+
+    for n in [1, 2] {
+        let got = link(&repo, &sha(n));
+        assert_eq!(got.session_id, None, "commit {n}: {got:?}");
+        assert!(
+            got.ambiguous,
+            "two actors committed inside one command: {got:?}"
+        );
+    }
+
+    // With only its own entry inside, the end makes the link certain.
+    let (_d2, repo2) = repo_dir();
+    command_row_timed(&repo2, None, "AGENT", "git commit -m a", at, 62_000);
+    reflog_row(&repo2, None, &sha(3), "commit", at + 61 * SEC);
+    reflog_row(&repo2, None, &sha(4), "commit", at + 90 * SEC);
+    assert_eq!(link(&repo2, &sha(3)).session_id.as_deref(), Some("AGENT"));
+    let after = link(&repo2, &sha(4));
+    assert_eq!(
+        after.session_id, None,
+        "after the command finished: {after:?}"
+    );
+}
+
+#[test]
+fn a_command_with_no_timed_end_is_credited_with_its_verbs_first_entry_and_that_is_the_residual() {
+    // Documented, not endorsed: without the command's end, a human's commit
+    // that lands during a slow hook, first, is the first entry of the verb after
+    // the command and is credited to it. Only the command's end can tell them
+    // apart, and a row whose result was never timed does not have one.
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "AGENT", "git commit -m a", at);
+    reflog_row(&repo, None, &sha(1), "commit", at + 10 * SEC);
+    reflog_row(&repo, None, &sha(2), "commit", at + 61 * SEC);
+
+    let human_first = link(&repo, &sha(1));
+    let agents_own = link(&repo, &sha(2));
+
+    assert_eq!(human_first.session_id.as_deref(), Some("AGENT"));
+    assert_eq!(agents_own.session_id, None);
+}
+
+#[test]
+fn a_verb_the_command_does_not_write_is_not_credited() {
+    let at = t0();
+    for (command, message) in [
+        (
+            "git commit -m a",
+            "merge x: Merge made by the 'ort' strategy.",
+        ),
+        ("git commit -m a", "cherry-pick: picked"),
+        ("git merge feat", "commit: hand"),
+        ("git pull", "commit: hand"),
+        ("git revert abc", "commit: hand"),
+        ("git cherry-pick abc", "revert: hand"),
+    ] {
+        let (_d, repo) = repo_dir();
+        command_row_timed(&repo, None, "S1", command, at - SEC, 4_000);
+        reflog_row(&repo, None, &sha(1), message, at);
+        let got = link(&repo, &sha(1));
+        assert_eq!(got.session_id, None, "{command} / {message}: {got:?}");
+        assert_eq!(got.basis, basis::COMMAND_SPENT, "{command} / {message}");
+    }
+}
+
+#[test]
+fn an_intervening_entry_of_another_verb_does_not_spend_a_commit() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row(&repo, None, "S1", "git commit -m a", at - 5 * SEC);
+    // A human's merge lands between the command and its commit: not a commit
+    // of the verb the command writes.
+    reflog_row(
+        &repo,
+        None,
+        &sha(8),
+        "merge x: Merge made by the 'ort' strategy.",
+        at - 2 * SEC,
+    );
+    reflog_row(&repo, None, &sha(1), "commit", at);
+
+    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("S1"));
+}
+
+#[test]
+fn the_no_command_basis_says_ingested() {
+    let (_d, repo) = repo_dir();
+    reflog_row(&repo, None, &sha(1), "commit", t0());
+
+    let got = link(&repo, &sha(1));
+
+    assert_eq!(got.basis, "no_ingested_session_command");
+    assert!(
+        !basis::ALL.contains(&"no_session_command"),
+        "a basis that reads as 'no agent was involved' is gone"
+    );
 }

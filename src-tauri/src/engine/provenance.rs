@@ -120,11 +120,13 @@ pub struct ProvenanceFreshness {
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
     /// Why `session` is what it is: `recorded_note`, `inferred_from_command`,
-    /// or, when it is `None`, the reason (`no_session_command`,
+    /// or, when it is `None`, the reason (`no_ingested_session_command`,
     /// `ambiguous_sessions`, `command_outside_window`, ...; the full list is
     /// [`crate::ledger::attribution::basis`]). `None` session with
-    /// `notes_readable: true` does not mean no agent was involved: only
-    /// `no_session_command` says no transcript shows a git command for it.
+    /// `notes_readable: true` does not mean no agent was involved: even
+    /// `no_ingested_session_command` says only that no *ingested* transcript
+    /// shows a git command for it (a session under another Claude config
+    /// directory is not ingested).
     /// Empty when the commit was not examined at all.
     #[serde(default)]
     pub session_basis: String,
@@ -2939,7 +2941,7 @@ mod batch_tests {
             f.notes_readable,
             "the notes were read: this is about sessions"
         );
-        assert_eq!(f.session_basis, "no_session_command");
+        assert_eq!(f.session_basis, "no_ingested_session_command");
         assert!(!f.session_ambiguous);
     }
 

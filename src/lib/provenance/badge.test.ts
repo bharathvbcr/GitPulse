@@ -59,7 +59,7 @@ function fresh(over: Partial<ProvenanceFreshness> = {}): ProvenanceFreshness {
     verified: false,
     verification: null,
     session: null,
-    session_basis: "no_session_command",
+    session_basis: "no_ingested_session_command",
     session_ambiguous: false,
     landed_on_base: null,
     on_base: null,
@@ -242,11 +242,12 @@ describe("freshnessBadge", () => {
   });
 
   it("only says no agent's command matches when that is the basis", () => {
-    const hand = freshnessBadge(fresh({ session_basis: "no_session_command" }));
-    expect(hand.detail).toContain("no agent session's git command matches");
+    const hand = freshnessBadge(fresh({ session_basis: "no_ingested_session_command" }));
+    expect(hand.detail).toContain("no ingested agent session's git command matches");
+    expect(hand.detail).toContain("GitPulse does not ingest");
     const unknown = freshnessBadge(fresh({ session_basis: "scan_capped" }));
     expect(unknown.detail).toContain("could not be determined (scan capped)");
-    expect(unknown.detail).not.toContain("no agent session's git command matches");
+    expect(unknown.detail).not.toContain("no ingested agent session's git command matches");
   });
 
   it("renders an answer from a build that predates the session fields", () => {

@@ -39,6 +39,22 @@
 //!
 //! What survives is still an *inference from time*: a command that could have
 //! made the commit, in the same worktree, shortly before it.
+//!
+//! **The residual no rule here can remove.** Two actors who commit in one
+//! worktree inside one command's execution window cannot be told apart by
+//! timing. The transcript times when a command was issued and, when its result
+//! was read, when it finished (`occurred_at` and `duration_ms`); git times each
+//! entry to the second. When the command's end is known, two entries of its
+//! verb inside it are reported as ambiguous. When it is not (a row whose result
+//! was never timed), the first entry of its verb after it is credited, so a
+//! human's commit that lands during a slow `pre-commit` hook, before the
+//! agent's own commit does, is credited to the agent. A command that can
+//! succeed having made nothing (`pull`, `merge`, `rebase`) is credited only when
+//! its end is known, and a no-op merge followed by someone else's real merge
+//! inside its window is then still told apart by that end; without it, no link.
+//! And `no_ingested_session_command` means no *ingested* transcript shows a git
+//! command: a session GitPulse does not read leaves none, so it is not proof that
+//! no agent was involved.
 
 use super::{ids, with_access, Access, LedgerError};
 use rusqlite::types::ValueRef;
@@ -94,9 +110,12 @@ pub const HIDDEN_ROW_SKEW_MS: u64 = 600_000;
 pub mod basis {
     /// A command in the window, from one session.
     pub const INFERRED: &str = "inferred_from_command";
-    /// A commit nobody's transcript shows a git command for: made by hand, or
-    /// by a tool whose transcript GitPulse does not read.
-    pub const NO_SESSION_COMMAND: &str = "no_session_command";
+    /// No transcript GitPulse *ingested* shows a git command for this commit.
+    /// That is not "no agent was involved": a session under another Claude
+    /// config directory, or a tool whose transcripts GitPulse does not read,
+    /// leaves no command row, so a commit made there reads exactly like a hand
+    /// commit.
+    pub const NO_INGESTED_SESSION_COMMAND: &str = "no_ingested_session_command";
     /// Commands from two or more sessions fit the window.
     pub const AMBIGUOUS: &str = "ambiguous_sessions";
     /// A git command in the worktree came before the window, so it cannot have
@@ -111,10 +130,12 @@ pub mod basis {
     /// The only command that fits is one whose result was never read, so
     /// whether it made anything is not known.
     pub const COMMAND_OUTCOME_UNKNOWN: &str = "command_outcome_unknown";
-    /// The only command that fits made, or may have made, an earlier commit:
-    /// a single-commit run is credited with the first entry after it, a rebase
-    /// with its own run, and this entry is neither.
-    pub const COMMAND_SPENT: &str = "command_made_another_commit";
+    /// The only command that fits did not make this commit: it made an earlier
+    /// entry of its verb (a single-commit run is credited with the first entry
+    /// of its verb after it), its run ended, it had finished, or it is not a
+    /// command that writes this kind of entry (a `git pull` that found nothing
+    /// to pull cannot have made a hand commit).
+    pub const COMMAND_SPENT: &str = "command_did_not_make_this_commit";
     /// What lies between the command and the commit cannot be ordered in time
     /// (a reflog entry with no event time), so which entry the command made is
     /// not certain.
@@ -144,7 +165,7 @@ pub mod basis {
     /// Every value `session_basis` can take, for the schema test.
     pub const ALL: [&str; 17] = [
         INFERRED,
-        NO_SESSION_COMMAND,
+        NO_INGESTED_SESSION_COMMAND,
         AMBIGUOUS,
         COMMAND_OUTSIDE_WINDOW,
         COMMAND_AFTER_REFLOG,
@@ -208,6 +229,10 @@ struct Row {
     /// `detail_json.result` of a transcript row: `ok` or `error`, absent when
     /// the call's result was never read or was not a string.
     result: Option<String>,
+    /// How long the call ran, in milliseconds, from the call's record to its
+    /// result's (the `duration_ms` column). Present only when both were timed:
+    /// the call's completion is then `at_ms + duration_ms`.
+    duration_ms: Option<i64>,
     after_ref: Option<String>,
     ts_utc: String,
     /// The event's own time, only when its basis is the one this kind of row's
@@ -319,7 +344,8 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                     CASE WHEN json_valid(detail_json)
                          THEN json_extract(detail_json, '$.occurred_at_basis') END,
                     CASE WHEN json_valid(detail_json)
-                         THEN json_extract(detail_json, '$.result') END
+                         THEN json_extract(detail_json, '$.result') END,
+                    duration_ms
              FROM events
              WHERE id > ?1
                AND ((action = 'session.command' AND object LIKE '%git%')
@@ -342,6 +368,10 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                 after_ref: text(row, 6)?,
                 ts_utc: text(row, 7)?.unwrap_or_default(),
                 result: text(row, 10)?,
+                duration_ms: match row.get_ref(11)? {
+                    ValueRef::Integer(ms) => Some(ms),
+                    _ => None,
+                },
                 at_ms: at
                     .filter(|_| stamp_basis.as_deref() == Some(trusted))
                     .and_then(|text| ids::parse_event_time(&text)),
@@ -597,6 +627,13 @@ enum Between {
     /// An entry that cannot be placed in time could lie between them: the
     /// order is not known, so there is no certain answer.
     Unordered,
+    /// The command was running when another entry of the same verb was
+    /// written as well as this one: two actors committed inside one command's
+    /// execution, and timing cannot say which entry the command made.
+    Contested,
+    /// A command that can succeed having made nothing, whose completion is not
+    /// known: it may have made nothing, and then it made no entry at all.
+    NoCompletion,
 }
 
 /// Whether `command` can be the maker of the origin entry `entry` (at `at`),
@@ -621,17 +658,35 @@ fn between(
     reflogs: &[Placed],
 ) -> Between {
     let started = command_at.saturating_sub(REFLOG_GRANULARITY_MS - 1);
-    let run = match command.shape {
-        Shape::Single => None,
-        Shape::Run(verbs) => Some(verbs),
-    };
-    if let Some(verbs) = run {
-        let this = entry.row.object.as_deref().and_then(parse_entry);
-        if !this.is_some_and(|this| verbs.contains(&this.verb)) {
-            return Between::Spent;
-        }
+    let shape = command.shape;
+    // A command can only have made an entry of a verb it writes: a `git pull`
+    // that found nothing to pull made no entry, and a hand commit after it is
+    // not its commit.
+    let this = entry.row.object.as_deref().and_then(parse_entry);
+    if !this.as_ref().is_some_and(|this| shape.writes(this.verb)) {
+        return Between::Spent;
     }
-    let mut unordered = false;
+    // When the command finished, if the transcript timed its result.
+    let completed = command
+        .placed
+        .row
+        .duration_ms
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(|ms| command_at.saturating_add(ms));
+    match completed {
+        // The entry came after the command was done.
+        Some(done) if at > done => return Between::Spent,
+        Some(_) => {}
+        None if shape.may_make_nothing => return Between::NoCompletion,
+        None => {}
+    }
+    // Entries that count against the command: those of a verb it writes (a
+    // run: any origin entry of another verb ends it).
+    let upper = match (shape.run, completed) {
+        (false, Some(done)) => done,
+        _ => at,
+    };
+    let (mut unordered, mut crowded) = (false, false);
     for other in reflogs {
         let row = &other.row;
         if other.worktree != entry.worktree
@@ -642,29 +697,39 @@ fn between(
         }
         let parsed = row.object.as_deref().and_then(parse_entry);
         let origin = parsed.as_ref().is_some_and(creates_commit);
+        let ours = parsed
+            .as_ref()
+            .is_some_and(|parsed| shape.writes(parsed.verb));
         let Some(t) = row.at_ms else {
             // Appended before the window opened, it cannot be inside it.
             let possible = ids::parse_event_time(&row.ts_utc)
                 .is_none_or(|ts| ts >= at.saturating_sub(LINK_WINDOW_MS));
-            unordered |= origin && possible;
+            unordered |= origin && possible && (ours || shape.run);
             continue;
         };
-        if t < started || t > at {
+        if t < started || t > upper {
             continue;
         }
-        match (&parsed, run) {
-            (Some(parsed), Some(verbs)) => {
-                let closes = parsed.closes && verbs.contains(&parsed.verb);
-                let ended_before = closes && (t < at || row.id < entry.row.id);
-                if ended_before || (origin && !verbs.contains(&parsed.verb)) {
-                    return Between::Spent;
-                }
+        let Some(parsed) = &parsed else { continue };
+        if shape.run {
+            let ended_before = parsed.closes && ours && (t < at || row.id < entry.row.id);
+            if ended_before || (origin && !ours) {
+                return Between::Spent;
             }
-            (Some(_), None) if origin => return Between::Spent,
-            _ => {}
+        } else if origin && ours {
+            // The first entry of its verb after the command is the one it made.
+            // When the command's end is known, every such entry inside it is a
+            // candidate and none can be told from the others.
+            if completed.is_some() {
+                crowded = true;
+            } else {
+                return Between::Spent;
+            }
         }
     }
-    if unordered {
+    if crowded {
+        Between::Contested
+    } else if unordered {
         Between::Unordered
     } else {
         Between::Clear
@@ -728,6 +793,7 @@ fn link_one(
     let mut target_unknown: Vec<&Row> = Vec::new();
     let (mut untimed, mut before, mut after) = (false, false, false);
     let mut unordered: Vec<&Row> = Vec::new();
+    let mut contested: Vec<&Row> = Vec::new();
     let mut spent = false;
     for command in commands.iter().filter(|c| {
         c.placed.worktree == entry.worktree
@@ -749,6 +815,8 @@ fn link_one(
                 match between(command, t, entry, at, sha, reflogs) {
                     Between::Spent => spent = true,
                     Between::Unordered => unordered.push(row),
+                    Between::Contested => contested.push(row),
+                    Between::NoCompletion => unobserved.push(row),
                     Between::Clear if row.result.as_deref() == Some("ok") => ok.push((row, t)),
                     Between::Clear => unobserved.push(row),
                 }
@@ -771,8 +839,17 @@ fn link_one(
         .chain(unobserved.iter())
         .chain(target_unknown.iter())
         .chain(unordered.iter())
+        .chain(contested.iter())
         .filter_map(|row| row.session_id.as_deref())
         .collect();
+    // Two actors committed while one command ran: whichever of them it was, the
+    // other is a second candidate, and timing cannot choose.
+    if !contested.is_empty() && ok.is_empty() {
+        return CommitLink {
+            ambiguous: true,
+            ..CommitLink::none(basis::AMBIGUOUS)
+        };
+    }
     match (sessions.len(), ok.is_empty()) {
         (0, _) => CommitLink::none(if untimed {
             basis::COMMAND_UNTIMED
@@ -783,7 +860,7 @@ fn link_one(
         } else if before {
             basis::COMMAND_OUTSIDE_WINDOW
         } else {
-            basis::NO_SESSION_COMMAND
+            basis::NO_INGESTED_SESSION_COMMAND
         }),
         (1, true) => CommitLink::none(if !unordered.is_empty() {
             basis::COMMAND_ORDER_UNKNOWN
@@ -1099,44 +1176,86 @@ pub(crate) fn command_target(command: &str, worktree: &Path) -> Target {
     read_command(command, worktree).0
 }
 
-/// How many commits a command makes, which decides how many reflog entries it
-/// can be credited with.
+/// The reflog verbs a commit-making run can write, as a bit set.
+const VERBS: [&str; 7] = [
+    "commit",
+    "merge",
+    "revert",
+    "cherry-pick",
+    "pull",
+    "am",
+    "rebase",
+];
+
+fn verb_bits(verbs: &[&str]) -> u8 {
+    verbs
+        .iter()
+        .filter_map(|verb| VERBS.iter().position(|known| known == verb))
+        .fold(0, |bits, at| bits | (1 << at))
+}
+
+/// What a commit-making command can have written to the reflog, which decides
+/// which entries it can be credited with.
+///
+/// A run is credited only with an entry **of its own verb** (`git pull` with a
+/// `pull...` entry, `git commit` with a `commit...` entry), so a command that
+/// made nothing cannot be credited with a commit of another kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Shape {
-    /// One commit, so one entry: the first origin entry after it in its
-    /// worktree. The default, and the rule for every verb whose count is not
-    /// known.
-    Single,
+pub(crate) struct Shape {
+    /// The entry verbs this run writes ([`VERBS`] bits).
+    verbs: u8,
     /// A run of commits written by one operation (a rebase's picks, a
-    /// cherry-pick range), credited to the origin entries of these verbs and
-    /// no further: the run ends at its `(finish)` / `(abort)` entry or at the
-    /// next origin entry of any other verb.
-    Run(&'static [&'static str]),
+    /// cherry-pick range): credited with the origin entries of its verbs and no
+    /// further, ending at its `(finish)` / `(abort)` entry or at the next origin
+    /// entry of another verb. Otherwise one commit, and one entry: the first of
+    /// its verb after it.
+    run: bool,
+    /// The command can exit 0 having made nothing (`Already up to date`), and
+    /// writes no reflog row when it does. Only a command that can be shown to
+    /// have been running when the entry was written is credited with one.
+    may_make_nothing: bool,
 }
 
 impl Shape {
+    const NONE: Shape = Shape {
+        verbs: 0,
+        run: false,
+        may_make_nothing: false,
+    };
+
+    /// Whether the command is a run of several commits.
+    #[cfg(test)]
+    pub(crate) fn is_run(self) -> bool {
+        self.run
+    }
+
+    /// Whether the command can have written an entry of `verb`.
+    fn writes(self, verb: &str) -> bool {
+        self.verbs & verb_bits(&[verb]) != 0
+    }
+
     /// What two commit-making runs in one command line, taken together, are:
     /// a run only when both are the same run, a single commit otherwise (which
-    /// credits fewer entries, never more).
+    /// credits fewer entries, never more), able to write either verb and to
+    /// make nothing if either can.
     fn and(self, other: Shape) -> Shape {
-        if self == other {
-            self
-        } else {
-            Shape::Single
+        Shape {
+            verbs: self.verbs | other.verbs,
+            run: self.run && other.run && self.verbs == other.verbs,
+            may_make_nothing: self.may_make_nothing || other.may_make_nothing,
         }
     }
 }
 
 /// The entries a rebase writes: `rebase (pick)`, or `pull --rebase (pick)`.
 const REBASE_VERBS: &[&str] = &["rebase", "pull"];
-const CHERRY_PICK_VERBS: &[&str] = &["cherry-pick"];
 
 /// [`command_target`], and the shape of the commit-making runs proved to be
-/// here (`Single` when there are none).
+/// here ([`Shape::NONE`] when there are none).
 pub(crate) fn read_command(command: &str, worktree: &Path) -> (Target, Shape) {
     let mut shape: Option<Shape> = None;
     let target = read_command_into(command, worktree, &mut shape);
-    (target, shape.unwrap_or(Shape::Single))
+    (target, shape.unwrap_or(Shape::NONE))
 }
 
 fn read_command_into(command: &str, worktree: &Path, shape: &mut Option<Shape>) -> Target {
@@ -1312,24 +1431,38 @@ fn git_target(
 /// single commit credits fewer entries, never more.
 fn shape_of(subcommand: &str, args: &[&str]) -> Shape {
     let flag = |name: &str| args.contains(&name);
+    let one = |verbs: &[&str]| Shape {
+        verbs: verb_bits(verbs),
+        run: false,
+        // Only `git commit` is certain to have made a commit when it exits 0:
+        // a merge, pull, rebase, cherry-pick, revert or am can find nothing to
+        // do and say so.
+        may_make_nothing: subcommand != "commit",
+    };
+    let run = |verbs: &[&str]| Shape {
+        run: true,
+        ..one(verbs)
+    };
     match subcommand {
-        "rebase" => Shape::Run(REBASE_VERBS),
+        "rebase" => run(REBASE_VERBS),
         "pull"
             if flag("--rebase")
                 || flag("-r")
                 || args.iter().any(|a| a.starts_with("--rebase=")) =>
         {
-            Shape::Run(REBASE_VERBS)
+            run(REBASE_VERBS)
         }
         "cherry-pick" => {
             let commits = args.iter().filter(|arg| !arg.starts_with('-')).count();
             if commits > 1 || args.iter().any(|arg| arg.contains("..")) {
-                Shape::Run(CHERRY_PICK_VERBS)
+                run(&["cherry-pick"])
             } else {
-                Shape::Single
+                one(&["cherry-pick"])
             }
         }
-        _ => Shape::Single,
+        // The count of an `am` or a multi-commit `revert` is not in the words:
+        // one commit, which credits fewer entries, never more.
+        other => one(&[other]),
     }
 }
 

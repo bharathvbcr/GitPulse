@@ -14,7 +14,7 @@ function row(sha: string, over: Partial<ProvenanceFreshness> = {}): ProvenanceFr
     verified: false,
     verification: null,
     session: null,
-    session_basis: "no_session_command",
+    session_basis: "no_ingested_session_command",
     session_ambiguous: false,
     landed_on_base: null,
     on_base: null,

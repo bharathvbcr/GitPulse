@@ -81,10 +81,12 @@ export interface ProvenanceFreshness {
   session: SessionEpisodeNote | null;
   /**
    * Why `session` is what it is: `recorded_note`, `inferred_from_command`, or,
-   * when `session` is `null`, the reason (`no_session_command`,
+   * when `session` is `null`, the reason (`no_ingested_session_command`,
    * `ambiguous_sessions`, `command_outside_window`, `no_reflog_entry`, ...).
-   * A `null` session is not "no agent was involved" unless this says
-   * `no_session_command`. Empty when the commit was not examined at all.
+   * A `null` session is never "no agent was involved": even
+   * `no_ingested_session_command` says only that no *ingested* transcript shows a
+   * git command for it (sessions GitPulse does not ingest leave none). Empty when
+   * the commit was not examined at all.
    */
   session_basis: string;
   /**

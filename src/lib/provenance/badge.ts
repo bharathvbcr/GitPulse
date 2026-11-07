@@ -85,8 +85,10 @@ function sessionNote(f: ProvenanceFreshness): string {
   switch (basis) {
     case "":
       return "";
-    case "no_session_command":
-      return "; no agent session's git command matches it";
+    case "no_ingested_session_command":
+      // Not "no agent was involved": a session this machine does not ingest
+      // (another Claude config directory, another tool) leaves no command row.
+      return "; no ingested agent session's git command matches it (sessions GitPulse does not ingest are not seen)";
     default:
       return `; which session made it could not be determined (${basis.replace(/_/g, " ")})`;
   }
@@ -200,7 +202,7 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
 
   // 8. Nothing recorded, and we know that for a fact. No session is named, and
   //    the detail says why rather than leaving "no session" to read as "no
-  //    agent": only `no_session_command` means no transcript shows a git
+  //    agent": only `no_ingested_session_command` means no transcript shows a git
   //    command for it.
   return {
     kind: "unverified",
