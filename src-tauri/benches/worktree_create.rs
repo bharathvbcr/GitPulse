@@ -37,6 +37,7 @@ use common::fixture::{build_repo, git, trust_repo, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
 use gitpulse_lib::engine::worktree::{add_worktree, add_worktree_with_devmap, DevmapMode};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,7 +114,7 @@ fn build_fixture(root: &Path) -> Repo {
     let built = std::process::Command::new(&devmap)
         .args(["build", "--manifest"])
         .current_dir(main)
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("cannot run `{devmap} build --manifest`: {e}"));
     assert!(
         built.status.success(),
@@ -347,7 +348,7 @@ fn main() {
             .args(["-c", "-R"])
             .arg(repo.main.join("node_modules"))
             .arg(dst.join("node_modules"))
-            .status()
+            .status_locked()
             .expect("spawn cp");
         let elapsed = started.elapsed();
         assert!(status.success(), "cp -c -R failed");
