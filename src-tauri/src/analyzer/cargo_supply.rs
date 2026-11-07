@@ -544,4 +544,58 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// adv: an `EINTR` from `read(2)` is not a failure to read the file; the
+    /// std contract (`Read::read_to_end`, `BufReader`) is to retry it. A FIFO
+    /// holds the reader inside `read` so a signal handler installed without
+    /// `SA_RESTART` can interrupt it, then data arrives.
+    #[cfg(unix)]
+    #[test]
+    fn adv_probe_retries_an_interrupted_read() {
+        extern "C" fn noop(_: libc::c_int) {}
+        let dir = std::env::temp_dir().join(format!(
+            "gitpulse-adv-eintr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = 0; // no SA_RESTART
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            std::io::Write::write_all(&mut file, b"xx.dep-v0xx").ok();
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = fifo.clone();
+        let prober = std::thread::spawn(move || {
+            tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            probe_auditable_section(&probe_path)
+        });
+        let tid = rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1) };
+        let outcome = prober.join().unwrap();
+        writer.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(outcome, AuditableSection::Found);
+    }
 }

@@ -7491,6 +7491,132 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn make_sparse_oversized(path: &Path) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(MAX_AUDITABLE_BIN_BYTES + 1)
+            .unwrap();
+    }
+
+    /// adv: without a cargo-auditable config the user has not opted in, so an
+    /// unreadable or oversized binary must not clear `audit_complete`.
+    #[cfg(unix)]
+    #[test]
+    fn adv_unconfigured_auditable_problems_do_not_block_completion() {
+        let (repo, release, stubs) = auditable_fixture();
+        fs::remove_file(repo.path().join(".cargo/config.toml")).unwrap();
+        let bad = write_exec(&release, "bad", "#!/bin/sh\n# .dep-v0\n");
+        let huge = write_exec(&release, "huge", "x");
+        make_sparse_oversized(&huge);
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let codes = issue_codes(&report);
+        assert!(
+            !codes.contains(&"cargo_auditable_unreadable"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !codes.contains(&"cargo_auditable_oversized"),
+            "{:?}",
+            report.issues
+        );
+        assert!(report.audit_complete, "{:?}", report.issues);
+    }
+
+    /// adv: 8 oversized + 1 unreadable. The overflow line carries the code of
+    /// the first problem past the cap (unreadable) and completion is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn adv_overflow_line_carries_the_first_overflowed_code() {
+        let (repo, release, stubs) = auditable_fixture();
+        for i in 0..MAX_AUDITABLE_PROBLEM_ISSUES {
+            let big = write_exec(&release, &format!("big{i:02}"), "x");
+            make_sparse_oversized(&big);
+        }
+        let bad = write_exec(&release, "zz-bad", "#!/bin/sh\n# .dep-v0\n");
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let oversized = report
+            .issues
+            .iter()
+            .filter(|i| i.code == "cargo_auditable_oversized")
+            .count();
+        assert_eq!(
+            oversized, MAX_AUDITABLE_PROBLEM_ISSUES,
+            "{:?}",
+            report.issues
+        );
+        let overflow = report
+            .issues
+            .iter()
+            .find(|i| i.message.starts_with("and 1 more"))
+            .expect("overflow line");
+        assert_eq!(overflow.code, "cargo_auditable_unreadable");
+        assert!(!report.audit_complete);
+    }
+
+    /// adv: symlinks named like binaries (to a binary outside the repo, a
+    /// loop, a dangling target) are never opened and never counted.
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlinked_binaries_are_never_read_or_counted() {
+        let (repo, release, stubs) = auditable_fixture();
+        std::os::unix::fs::symlink("/bin/sh", release.join("outside")).unwrap();
+        std::os::unix::fs::symlink("loop-b", release.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", release.join("loop-b")).unwrap();
+        std::os::unix::fs::symlink("nowhere", release.join("dangling")).unwrap();
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let codes = issue_codes(&report);
+        assert!(
+            !codes.contains(&"cargo_auditable_unreadable"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !codes.contains(&"cargo_auditable_missing"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            codes.contains(&"cargo_auditable_unbuilt"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// adv: release holds only an unreadable binary, debug holds a good one.
+    /// Debug is skipped, the unreadable one is reported, completion blocked.
+    #[cfg(unix)]
+    #[test]
+    fn adv_debug_fallback_is_skipped_when_release_has_problems() {
+        let (repo, release, stubs) = auditable_fixture();
+        let bad = write_exec(&release, "bad", "#!/bin/sh\n# .dep-v0\n");
+        let debug = repo.path().join("target").join("debug");
+        fs::create_dir_all(&debug).unwrap();
+        write_exec(&debug, "good", "#!/bin/sh\n# .dep-v0\n");
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(issue_codes(&report).contains(&"cargo_auditable_unreadable"));
+        assert!(!report.audit_complete, "{:?}", report.issues);
+        // release holds only an oversized file: same decision.
+        fs::remove_file(&bad).unwrap();
+        let huge = write_exec(&release, "huge", "x");
+        make_sparse_oversized(&huge);
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(issue_codes(&report).contains(&"cargo_auditable_oversized"));
+        assert!(!report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn deny_toml_without_cargo_deny_is_not_a_complete_audit() {
         let repo = git_repo();
