@@ -474,11 +474,33 @@ fn open_repo_map_with_stacked(
 /// DevMap generation (using `<db_path>.csr` via `mmap` when present and matching,
 /// or materialising from `generation_edges`).
 pub fn open_repo_csr_graph(repo_path: &str) -> Result<devmap_store::CsrGraphReader, CommandError> {
-    let store = open_repo_map(repo_path)?;
-    match store
-        .open_latest_csr_sidecar()
-        .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))?
-    {
+    let opened = open_indexed_store_any(&resolve_repo(repo_path)?).map_err(CommandError::from)?;
+    let reader_opt = match opened {
+        OpenedRepoStore::Local(store) => store
+            .open_latest_csr_sidecar()
+            .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))?,
+        OpenedRepoStore::Stacked {
+            store,
+            meta,
+            stacked,
+        } => match stacked
+            .csr_reader()
+            .map_err(|e| CommandError::from(format!("Failed to verify stacked CSR graph: {e}")))?
+        {
+            Some(_) => match meta.base_csr_path {
+                Some(ref csr_path) => Some(
+                    devmap_store::CsrGraphReader::open_mmap(csr_path).map_err(|e| {
+                        CommandError::from(format!("Failed to open CSR graph: {e}"))
+                    })?,
+                ),
+                None => None,
+            },
+            None => store
+                .open_latest_csr_sidecar()
+                .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))?,
+        },
+    };
+    match reader_opt {
         Some(reader) => Ok(reader),
         None => Err(CommandError::from(format!(
             "No generation indexed in {}; the code map has not been built yet",
@@ -1144,20 +1166,24 @@ fn evaluate_zero_copy_status(
     summary: &devmap_store::StoreStatus,
     stacked: Option<&devmap_query::StackedStore>,
 ) -> (Option<bool>, Option<String>) {
-    let (mut wt_fresh, mut wt_reason) = worktree_overlay::verify_zero_copy_worktree_freshness(
+    let (wt_fresh, mut wt_reason) = worktree_overlay::verify_zero_copy_worktree_freshness(
         worktree,
         anchor_root,
         store,
         summary,
     );
-    if wt_fresh == Some(false)
-        && stacked.is_some_and(|st| {
+    if wt_fresh == Some(false) {
+        if let Some(st) = stacked.filter(|st| {
             st.has_delta_changes()
                 && worktree_overlay::is_stacked_delta_fully_synced(worktree, store, st)
-        })
-    {
-        wt_fresh = Some(true);
-        wt_reason = None;
+        }) {
+            let ov = st.overlay();
+            wt_reason = Some(format!(
+                "worktree has synced stacked delta changes ({} modified, {} deleted); base generation awaits full rebuild",
+                ov.modified_files.len(),
+                ov.tombstoned_files.len(),
+            ));
+        }
     }
     let non_source_reason = if summary.analyzer_freshness == Some(false) {
         Some("stored extraction payload is obsolete; rebuild with the current analyzer".to_string())
@@ -2474,7 +2500,7 @@ pub fn affected_tests(
                     && summary.pending_count == 0
                     && summary.analyzer_freshness == Some(true)
                 {
-                    let candidate = affected_tests_from_store(
+                    let mut candidate = affected_tests_from_store(
                         store,
                         Some(stacked.as_ref()),
                         targets,
@@ -2482,14 +2508,24 @@ pub fn affected_tests(
                         min_confidence,
                         max_depth,
                     );
-                    if worktree_overlay::verify_zero_copy_affected_tests_disjoint_from_deltas(
-                        &repo,
-                        &meta.anchor_repo_root,
-                        store,
-                        &summary,
-                        targets,
-                        &candidate,
-                    ) {
+                    let sf = SourceFreshness {
+                        fresh: wt_fresh,
+                        generation_id: summary.latest_generation,
+                        reason: combined_reason.clone(),
+                    };
+                    candidate.tests.source_freshness = sf.clone();
+                    candidate.blast_radius.layers.source_freshness = sf;
+                    if (stacked.has_delta_changes()
+                        && worktree_overlay::is_stacked_delta_fully_synced(&repo, store, stacked))
+                        || worktree_overlay::verify_zero_copy_affected_tests_disjoint_from_deltas(
+                            &repo,
+                            &meta.anchor_repo_root,
+                            store,
+                            &summary,
+                            targets,
+                            &candidate,
+                        )
+                    {
                         return candidate;
                     }
                 }

@@ -1645,17 +1645,23 @@ pub(crate) fn open_worktree_or_anchor_csr(
         }
     }
     if let Ok(Some((base_store, meta, stacked))) = open_verified_stacked_store(repo) {
-        if let Ok(Some(arc_reader)) = stacked.csr_reader() {
-            let gen = arc_reader.generation();
-            if let Some(ref csr_path) = meta.base_csr_path {
-                if let Ok(reader) = devmap_store::CsrGraphReader::open_mmap(csr_path) {
+        match stacked.csr_reader() {
+            Ok(Some(arc_reader)) => {
+                let gen = arc_reader.generation();
+                if let Some(ref csr_path) = meta.base_csr_path {
+                    if let Ok(reader) = devmap_store::CsrGraphReader::open_mmap(csr_path) {
+                        return Some((reader, gen));
+                    }
+                }
+                return None;
+            }
+            Ok(None) => {
+                if let Ok(Some(reader)) = base_store.open_latest_csr_sidecar() {
+                    let gen = reader.generation();
                     return Some((reader, gen));
                 }
             }
-        }
-        if let Ok(Some(reader)) = base_store.open_latest_csr_sidecar() {
-            let gen = reader.generation();
-            return Some((reader, gen));
+            Err(_) => return None,
         }
     }
     if prefer_stacked {
@@ -3535,6 +3541,137 @@ mod tests {
         assert!(
             unsynced_aff.fail_closed,
             "unsynced disk caller beyond delta.sqlite must fail closed: {unsynced_aff:?}"
+        );
+    }
+
+    #[test]
+    fn stacked_synced_delta_keeps_status_not_fresh_resolves_import_aliases_and_refuses_tampered_csr(
+    ) {
+        let _devmap = bind_real_devmap();
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-block3-alias-csr");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/block3-alias-csr",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).expect("provision stacked");
+        let wt_str = wt.to_str().unwrap();
+
+        // 1. Write a test using an aliased Rust `use ... as ...` import and sync delta.sqlite.
+        let alias_test_src = concat!(
+            "use crate::callee::probe_callee as aliased_probe_callee;\n",
+            "#[test]\n",
+            "fn aliased_caller_test() { aliased_probe_callee(); }\n",
+        );
+        fs::write(wt.join("tests/alias_caller_test.rs"), alias_test_src).unwrap();
+        sync_worktree_overlay(wt_str).expect("sync aliased caller into delta.sqlite");
+
+        // 2. BLOCK 3: a stacked worktree with dirty/delta files must NEVER report `is_fresh: true`!
+        let st = crate::codeintel::status(wt_str);
+        assert!(st.available, "status must remain available: {st:?}");
+        assert_eq!(
+            st.is_fresh,
+            Some(false),
+            "BLOCK 3: synced stacked delta changes must NEVER force status.is_fresh = true: {st:?}"
+        );
+        assert_eq!(st.source_freshness, Some(false), "{st:?}");
+        assert!(
+            st.freshness_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("stacked delta")),
+            "expected stacked delta freshness_reason, got: {st:?}"
+        );
+
+        // 3. `affected_tests` must traverse the aliased import edge from `delta.sqlite`,
+        //    answer without `fail_closed`, AND stamp `source_freshness.fresh = Some(false)`.
+        let aff = crate::codeintel::affected_tests(
+            wt_str,
+            &["probe_callee".to_string()],
+            None,
+            crate::codeintel::WalkBounds::default(),
+        );
+        assert!(
+            !aff.fail_closed,
+            "fully synced delta.sqlite must answer affected_tests without fail_closed: {aff:?}"
+        );
+        assert!(
+            aff.tests
+                .items
+                .iter()
+                .any(|t| t.path == "tests/alias_caller_test.rs"),
+            "aliased import call in delta.sqlite must resolve to probe_callee: {aff:?}"
+        );
+        assert_eq!(
+            aff.tests.source_freshness.fresh,
+            Some(false),
+            "affected_tests on synced delta must honestly report source_freshness.fresh == Some(false): {aff:?}"
+        );
+
+        // 4. Writer lock contention on `delta.sqlite.writer.lock` must preserve inode and block concurrent writers.
+        let delta_path = devmap_extract::paths::stack_delta_path(&wt);
+        let lock_path = devmap_store::Store::writer_lock_path(&delta_path);
+        assert!(
+            lock_path.is_file(),
+            "stable writer lock file must remain on disk after sync: {}",
+            lock_path.display()
+        );
+        {
+            let _held = devmap_store::Store::lock_writer_at(
+                &delta_path,
+                std::time::Duration::from_millis(200),
+            )
+            .expect("acquire delta writer lock");
+            let contended = devmap_store::Store::lock_writer_at(
+                &delta_path,
+                std::time::Duration::from_millis(50),
+            );
+            assert!(
+                contended.is_err(),
+                "concurrent writer on delta.sqlite.writer.lock must be refused"
+            );
+        }
+
+        // 5. Corrupting `base.sqlite.csr` bytes without updating `manifest.csr` SHA-256 MUST fail closed
+        //    in BOTH `open_worktree_or_anchor_csr` and `codeintel::open_repo_csr_graph` (never falling back
+        //    to an unverified `Store::open_latest_csr_sidecar` mmap!).
+        let lease = devmap_query::stacked::StackLease::read_from(
+            &devmap_extract::paths::stack_lease_path(&wt),
+        )
+        .unwrap();
+        let csr_path = devmap_store::Store::csr_sidecar_path(&lease.base_sqlite_path());
+        assert!(csr_path.is_file(), "expected base.sqlite.csr");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&csr_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&csr_path, perms).unwrap();
+        }
+        let mut csr_bytes = fs::read(&csr_path).unwrap();
+        let last = csr_bytes.len() - 1;
+        csr_bytes[last] ^= 0xFF;
+        fs::write(&csr_path, &csr_bytes).unwrap();
+
+        assert!(
+            open_worktree_or_anchor_csr(&wt).is_none(),
+            "tampered base.sqlite.csr must NOT fall back to unverified Store::open_latest_csr_sidecar"
+        );
+        let csr_err = crate::codeintel::open_repo_csr_graph(wt_str)
+            .err()
+            .expect("open_repo_csr_graph must refuse tampered stacked base.sqlite.csr");
+        assert!(
+            csr_err.message().contains("CSR") || csr_err.message().contains("sha256"),
+            "unexpected CSR verification error: {csr_err:?}"
         );
     }
 }

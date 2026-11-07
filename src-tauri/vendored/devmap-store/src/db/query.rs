@@ -1215,9 +1215,10 @@ impl Store {
     }
 
     /// Materialize and atomically write the `<db_path>.csr` zero-copy mmap sidecar
-    /// for the store's latest generation. Returns `Ok(None)` for an in-memory store,
-    /// a read-only store, or a store with no generations.
-    pub fn write_latest_csr_sidecar(&self) -> Result<Option<std::path::PathBuf>> {
+    /// for the store's latest generation, propagating filesystem/serialization errors.
+    /// Returns `Ok(None)` for an in-memory store, a read-only store, or a store with
+    /// no generations.
+    pub fn write_latest_csr_sidecar_strict(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
         if self.read_only {
             return Ok(None);
         }
@@ -1234,13 +1235,32 @@ impl Store {
         );
         tmp_name.push(format!(".tmp.{}", std::process::id()));
         let tmp_path = csr_path.with_file_name(tmp_name);
-        if index.to_csr_writer().write_to_file(&tmp_path).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &csr_path);
+        if let Err(err) = index.to_csr_writer().write_to_file(&tmp_path) {
             let _ = std::fs::remove_file(&tmp_path);
-            return Ok(Some(csr_path));
+            return Err(anyhow::anyhow!(
+                "cannot write CSR sidecar {}: {err}",
+                tmp_path.display()
+            ));
         }
-        let _ = std::fs::remove_file(&tmp_path);
-        Ok(None)
+        if let Err(err) = std::fs::rename(&tmp_path, &csr_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(anyhow::anyhow!(
+                "cannot place CSR sidecar {}: {err}",
+                csr_path.display()
+            ));
+        }
+        Ok(Some(csr_path))
+    }
+
+    /// Best-effort wrapper around [`Self::write_latest_csr_sidecar_strict`] for
+    /// opportunistic read-time caching where a read-only directory is non-fatal,
+    /// while still surfacing SQLite errors from reading the generation edges.
+    pub fn write_latest_csr_sidecar(&self) -> Result<Option<std::path::PathBuf>> {
+        if self.read_only || self.db_path.is_none() {
+            return Ok(None);
+        }
+        let _ = self.generation_edges_with_id()?;
+        Ok(self.write_latest_csr_sidecar_strict().ok().flatten())
     }
 
     /// Open a zero-copy [`crate::csr::CsrGraphReader`] for the store's latest generation.
