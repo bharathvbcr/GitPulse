@@ -57,6 +57,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_set_git_identity: "shares GitWriter::identity_argv with set_identity, so the two judged `git config` lines are the lines that run",
   cmd_auto_fetch: "judges git_writer::AUTO_FETCH_ARGV, the same constant GitWriter::auto_fetch runs",
   cmd_commit_graph_write: "GitWriter::commit_graph_write_argv builds the line the gate judges; commit_graph_write refuses any confirmed argv that is not that line and runs it; commands/parity_tests.rs asserts previewed == judged == spawned",
+  cmd_tuning_apply: "storage::repo_tuning::change_argv builds each line the gate judges (cmd_tuning_apply judges every previewed argv before any runs); engine::tuning_apply re-plans, refuses any confirmed list that is not what a fresh plan runs, and spawns only lines is_apply_argv accepts",
   cmd_remote_change: "argv varies by RemoteChange variant",
   cmd_submodule_change: "argv varies by SubmoduleChange variant",
   cmd_repo_operation_action: "argv varies by OperationAction variant",

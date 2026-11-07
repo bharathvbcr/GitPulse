@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse terminal scroll measurement</title></head>
+  <body style="margin:0;background:#141a29">
+    <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run scroll measurement</button>
+    <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <div id="host" style="position:absolute;left:0;top:0;width:1100px;height:720px"></div>
+    <script type="module">
+      import { createChecks, CheckFailed } from "./checks.ts";
+      import { armsFor, run } from "./scrollBench.ts";
+
+      const params = new URL(location.href).searchParams;
+      const list = (name, fallback) => (params.get(name) ?? fallback).split(",").filter(Boolean);
+      const rounds = Number(params.get("rounds") ?? 5);
+      const arms = armsFor({
+        renderers: list("renderers", "webgl,dom"),
+        inputs: list("inputs", "wheel,wheel-fast,pixel,pixel-int"),
+        streams: list("streams", "false,true").map((value) => value === "true"),
+        smooths: list("smooths", "0,150").map(Number),
+        sens: list("sens", "1").map(Number),
+        guards: list("guards", "false").map((value) => value === "true"),
+      });
+      const errors = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const checksButton = document.querySelector("#checks");
+      checksButton.disabled = false;
+      checksButton.onclick = async () => {
+        checksButton.disabled = true;
+        const { results, check, stopped } = createChecks();
+        let rows = [];
+        const finish = () => {
+          const payload = { results, errors, diagnostics: JSON.stringify(rows) };
+          document.querySelector("#result").textContent = `${rows.length} trials`;
+          document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+          const reportPath = params.get("report");
+          if (reportPath?.startsWith("/__gp_result/")) return fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        };
+        try {
+          if (arms.some((arm) => arm.renderer === "webgl")) check("this browser can create a WebGL2 context", () => !!document.createElement("canvas").getContext("webgl2"));
+          rows = await run(document.querySelector("#host"), arms, rounds);
+          const trials = rows.filter((row) => row.kind === "trial");
+          check("every arm ran in every round", () => trials.length === arms.length * rounds);
+          check("every WebGL trial drew through WebGL for the whole gesture", () => trials.filter((row) => row.renderer === "webgl").every((row) => row.state === "webgl"));
+          // An unguarded smooth arm may lose a gesture to the race in scrollFeel.ts; that is a
+          // measurement (the yanks column), not a failure of the run.
+          const sound = trials.filter((row) => row.smooth === 0 || row.guard);
+          check("every gesture moved the viewport toward history", () => sound.every((row) => row.finalY < row.startY));
+          // Scrolled back while output streams: the view is not pulled to the bottom.
+          check("streaming output did not pull a scrolled-back view to the bottom", () =>
+            sound.filter((row) => row.stream).every((row) => row.linesStreamed > 0 && row.finalY < row.endBaseY && row.endBaseY > row.startY));
+          // Smoothing changes how the viewport gets there, not where it ends.
+          check("a smoothing arm ends within a row of the unsmoothed arm on the same input", () => {
+            const key = (row) => [row.round, row.renderer, row.input, row.stream, row.sens].join("/");
+            const base = new Map(trials.filter((row) => row.smooth === 0).map((row) => [key(row), row.finalY]));
+            return sound.filter((row) => row.smooth !== 0 && base.has(key(row))).every((row) => Math.abs(row.finalY - base.get(key(row))) <= 1);
+          });
+          check("the option-cost probe ran on every renderer", () => [...new Set(arms.map((arm) => arm.renderer))].every((renderer) => rows.some((row) => row.kind === "optcost" && row.renderer === renderer && row.syncMs.length > 0)));
+          check("no unhandled runtime errors", () => errors.length === 0);
+          checksButton.textContent = "done";
+        } catch (error) {
+          stopped(error);
+          if (!(error instanceof CheckFailed)) console.error(error);
+        } finally {
+          await finish();
+        }
+      };
+      if (params.get("check") === "1") checksButton.click();
+    </script>
+  </body>
+</html>

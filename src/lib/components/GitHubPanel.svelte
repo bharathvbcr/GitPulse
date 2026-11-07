@@ -383,6 +383,7 @@
       html_url: "",
       pull_requests: [],
       prs_truncated: false,
+      prs_error: null,
       issues: [],
       issues_truncated: false,
       issues_error: null,
@@ -1015,7 +1016,11 @@
               onCancel={() => (creatingPr = false)}
             />
           {/if}
-          {#if ctx.pull_requests.length === 0 && !ctx.prs_truncated}
+          {#if ctx.prs_error && ctx.pull_requests.length === 0}
+            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+              Pull request listing unavailable: {ctx.prs_error}
+            </div>
+          {:else if ctx.pull_requests.length === 0 && !ctx.prs_truncated}
             <EmptyState icon={GitPullRequest} title="No open pull requests" compact />
           {:else if ctx.pull_requests.length === 0}
             <EmptyState icon={GitPullRequest} title="No open pull requests shown" compact />

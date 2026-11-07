@@ -197,8 +197,10 @@ pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, 
     match super::consolidate_worktree_ledgers(&family.address.anchor, &family.members) {
         Ok(_) => {
             let mut status = super::status(&family.address.anchor);
-            status.history_only_bindings =
-                super::history_only_binding_count(&family.address.anchor).unwrap_or(0);
+            super::set_history_only_bindings(
+                &mut status,
+                super::history_only_binding_count(&family.address.anchor),
+            );
             note_history_only_bindings(&mut status);
             Ok(status)
         }
@@ -208,6 +210,10 @@ pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, 
             status.recording_state = super::STATE_UNKNOWN.to_string();
             status.error = format!("legacy worktree ledger could not be consolidated: {error}");
             status.error_code = "legacy_migration_failed".to_string();
+            super::set_history_only_bindings(
+                &mut status,
+                super::history_only_binding_count(&family.address.anchor),
+            );
             Ok(status)
         }
     }
@@ -257,6 +263,9 @@ fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
 /// The `error_code` of a ledger holding sibling bind/unbind rows as history only.
 pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
 
+/// The `error_code` of a ledger whose history-only binding count could not be read.
+pub(crate) const HISTORY_ONLY_UNKNOWN_CODE: &str = "binding_rows_unchecked";
+
 /// Says how many sibling bind/unbind rows were imported as history only: a
 /// binding that did not take effect must not do so silently.
 ///
@@ -267,22 +276,36 @@ pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
 /// every surface next to a failure.
 fn note_history_only_bindings(status: &mut super::LedgerStatus) {
     let count = status.history_only_bindings;
-    if count == 0 {
+    // A count that could not be read is not a zero: say the check failed rather
+    // than staying quiet as if there were nothing to report.
+    let (notice, code) = if status.history_only_bindings_unknown {
+        (
+            "the count of bind/unbind rows written by sibling worktrees and kept as history \
+             only could not be checked: the ledger could not be read for it. Do not read its \
+             0 as none."
+                .to_string(),
+            HISTORY_ONLY_UNKNOWN_CODE,
+        )
+    } else if count == 0 {
         return;
-    }
-    let notice = format!(
-        "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
-         only GitPulse and the bind/unbind commands writing the primary ledger can set a \
-         binding, so those rows set none. Rebind the worktree in GitPulse if one was meant."
-    );
+    } else {
+        (
+            format!(
+                "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
+                 only GitPulse and the bind/unbind commands writing the primary ledger can set a \
+                 binding, so those rows set none. Rebind the worktree in GitPulse if one was meant."
+            ),
+            HISTORY_ONLY_BINDINGS_CODE,
+        )
+    };
     match status.error_code.as_str() {
         "" => {
             status.error = notice;
-            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+            status.error_code = code.to_string();
         }
         LEGACY_UNCONSOLIDATED_CODE => {
             status.error = format!("{notice} {}", status.error);
-            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+            status.error_code = code.to_string();
         }
         _ => {}
     }

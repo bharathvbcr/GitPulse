@@ -103,6 +103,13 @@ pub struct CatchUp {
     /// the transcript format is known to move — 17 distinct schema versions
     /// appear across the real corpus.
     pub skipped_lines: i64,
+    /// Transcript I/O failures (stat, open, seek or read): a file or a tail
+    /// this pass could not read. Each is also counted in `skipped_lines`, but
+    /// unlike an over-long line or bad UTF-8 (which advance the cursor) the
+    /// bytes stay owed to the next pass, so any non-zero count leaves the pass
+    /// unfinished and `error` names the first failure.
+    #[serde(default)]
+    pub io_errors: i64,
     /// Calls whose worktree had no slot in this pass (more worktrees than one
     /// pass serves) or was removed, and which another worktree's transaction
     /// carried. The row is the owner's either way (its path, its task); this
@@ -1400,12 +1407,19 @@ impl CatchUp {
         self.duplicates_refused += transcripts.duplicates_refused;
         self.walk_complete = transcripts.walk_complete;
         self.skipped_lines = transcripts.skipped_lines;
+        self.io_errors = transcripts.io_errors;
         self.rehosted_calls = transcripts.rehosted_calls;
         self.departed_overflow = transcripts.departed_overflow;
         self.family_unresolved = transcripts.family_unresolved;
         self.family_unresolved_cycles = transcripts.family_unresolved_cycles;
         self.truncated = self.truncated || transcripts.truncated;
-        if self.error.is_empty() {
+        if !self.error.is_empty() {
+            // The reflog's own error stands, and the transcript pass's is named
+            // beside it: an unreadable transcript is never lost behind it.
+            if !transcripts.error.is_empty() {
+                self.add_error(transcripts.error.clone());
+            }
+        } else {
             self.error = if transcripts.truncated && transcripts.error.is_empty() {
                 // Both numbers, so a cut pass cannot pass for a finished one.
                 format!(
@@ -1421,7 +1435,52 @@ impl CatchUp {
     }
 }
 
+/// How the pass's error opens when the only thing it left unread is
+/// transcripts the corpus walk did not list. The producer (`pass.rs`) and every
+/// reader of that error (`CatchUp::is_unlisted_only_truncation`, the ledger's
+/// freshness) go through this, so they cannot drift apart.
+pub(crate) const UNLISTED_TRUNCATION_PREFIX: &str = "catch-up truncated: the transcript walk left";
+
+/// Whether `error` (a pass's `"; "`-joined error text) says nothing but that
+/// the walk left transcripts unlisted.
+pub(crate) fn is_unlisted_only_error(error: &str) -> bool {
+    error
+        .split("; ")
+        .all(|part| part.starts_with(UNLISTED_TRUNCATION_PREFIX))
+}
+
 impl CatchUp {
+    /// Records a transcript this pass could not read (`stage`: stat, open,
+    /// seek or read). It is counted in `skipped_lines` (it is unread) and in
+    /// `io_errors`, and the first one is named in `error`, so the pass is
+    /// never a finished catch-up while that tail is owed.
+    pub(super) fn note_io_failure(
+        &mut self,
+        path: &std::path::Path,
+        stage: &str,
+        error: &std::io::Error,
+    ) {
+        self.skipped_lines += 1;
+        self.io_errors += 1;
+        if self.io_errors == 1 {
+            self.add_error(format!(
+                "catch-up incomplete: transcript {stage} failed for {} ({:?}); it is retried next pass",
+                path.display(),
+                error.kind()
+            ));
+        }
+    }
+
+    /// Adds `note` to `error`, after any earlier one: a later failure never
+    /// erases the account of an earlier one.
+    pub(super) fn add_error(&mut self, note: String) {
+        self.error = if self.error.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", self.error)
+        };
+    }
+
     /// True when the only thing that cut this pass short is transcripts the
     /// walk left unlisted: every other part of it finished (no deadline, no
     /// failed write, no reflog backlog, no other error). The unlisted counts
@@ -1434,10 +1493,7 @@ impl CatchUp {
             && !self.reflog_unreached
             && self.reflog_refs_skipped == 0
             && !self.family_unresolved
-            && self
-                .error
-                .split("; ")
-                .all(|part| part.starts_with("catch-up truncated: the transcript walk left"))
+            && is_unlisted_only_error(&self.error)
     }
 
     /// Whether this pass finished the work it set out to do, for the ledger's
@@ -1446,7 +1502,7 @@ impl CatchUp {
     /// transcripts alone do not undo a completion (see
     /// [`CatchUp::is_unlisted_only_truncation`]).
     pub fn finished(&self) -> bool {
-        if self.family_unresolved || self.failed_records > 0 {
+        if self.family_unresolved || self.failed_records > 0 || self.io_errors > 0 {
             return false;
         }
         if self.truncated {

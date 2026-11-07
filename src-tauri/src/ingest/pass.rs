@@ -51,6 +51,23 @@ thread_local! {
     pub(super) static BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// A budget for resume replays that stands in for `RESUME_PASS_BYTES` on this
+// thread, so a test can run one out without a quarter-gigabyte rollout.
+#[cfg(test)]
+thread_local! {
+    pub(super) static RESUME_BUDGET: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The bytes of resume replay one pass may spend.
+fn resume_pass_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(budget) = RESUME_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    source::RESUME_PASS_BYTES
+}
+
 /// One worktree being served by the pass.
 struct Participant {
     path: String,
@@ -310,7 +327,9 @@ fn ingest_family(
     match ledger::settle_identity(ledger_repo) {
         Ok(reanchored) => out.reanchored_from = reanchored.unwrap_or_default(),
         Err(e) => {
-            out.error = format!("the ledger's repository could not be confirmed: {e}");
+            out.add_error(format!(
+                "the ledger's repository could not be confirmed: {e}"
+            ));
             return out;
         }
     }
@@ -473,7 +492,8 @@ fn ingest_family(
     out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
     let mut listed = markers;
-    let mut resume_budget = source::RESUME_PASS_BYTES;
+    let mut resume_budget = resume_pass_budget();
+    let mut deferred_resumes = 0i64;
     for (source, path) in files {
         if expired(&out) {
             out.truncated = true;
@@ -481,9 +501,12 @@ fn ingest_family(
         }
         let file_key = ledger::transcript_key(&path);
         listed.insert(file_key.clone());
-        let Ok(meta) = std::fs::metadata(&path) else {
-            out.skipped_lines += 1;
-            continue;
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                out.note_io_failure(&path, "stat", &e);
+                continue;
+            }
         };
         let len = meta.len();
         let modified_ms = super::modified_ms(&meta);
@@ -508,25 +531,28 @@ fn ingest_family(
         };
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
-            Err(_) => {
-                // A transcript being written right now can fail a read; the
-                // next pass picks it up. Counted so the gap is visible.
-                out.skipped_lines += 1;
+            Err(e) => {
+                // The next pass retries it (no cursor moves), but this pass did
+                // not read it, so it is unfinished, not a completed catch-up.
+                out.note_io_failure(&path, "open", &e);
                 continue;
             }
         };
         let mut reader = match LineReader::seek(file, start, len) {
             Ok(reader) => reader,
-            Err(_) => {
-                out.skipped_lines += 1;
+            Err(e) => {
+                out.note_io_failure(&path, "seek", &e);
                 continue;
             }
         };
         out.transcripts += 1;
         let Some(mut parser) = source.open(&path, start, &mut resume_budget) else {
             // Its start cannot be replayed within this pass's budget: nothing is
-            // read and no cursor moves, so the next pass tries again. Counted.
+            // read and no cursor moves, so the next pass tries again. Counted,
+            // and the pass is cut short (truncated, with the reason) rather
+            // than finished, as a deadline would leave it.
             out.skipped_lines += 1;
+            deferred_resumes += 1;
             continue;
         };
 
@@ -573,9 +599,10 @@ fn ingest_family(
                     (parser.finish(still), start + consumed, 0)
                 }
                 Ok(None) => break,
-                Err(_) => {
-                    // What was read stays read; the rest is owed to the next pass.
-                    out.skipped_lines += 1;
+                Err(e) => {
+                    // What was read stays read; the rest is owed to the next
+                    // pass, and this one is unfinished.
+                    out.note_io_failure(&path, "read", &e);
                     break;
                 }
             };
@@ -782,6 +809,13 @@ fn ingest_family(
             break;
         }
     }
+    if deferred_resumes > 0 {
+        out.truncated = true;
+        out.add_error(format!(
+            "catch-up truncated: {deferred_resumes} transcript(s) deferred to the next pass, \
+             their resume replay is past this pass's byte budget"
+        ));
+    }
     if !commit(ledger_repo, &mut participants, &mut owners.hosted, &mut out) {
         return out;
     }
@@ -799,7 +833,7 @@ fn ingest_family(
                 .filter(|key| !listed.contains(key))
                 .collect();
             if let Err(e) = ledger::forget_transcripts(ledger_repo, &participant.path, &gone) {
-                out.error = format!("vanished transcripts could not be forgotten: {e}");
+                out.add_error(format!("vanished transcripts could not be forgotten: {e}"));
                 stale += gone.len();
             }
         }
@@ -823,9 +857,13 @@ fn ingest_family(
             ""
         };
         let note = format!(
-            "catch-up truncated: the transcript walk left {at_least}{} file(s) unlisted and unread \
+            "{} {at_least}{} file(s) unlisted and unread \
              ({} below the depth bound, {} past the file cap), {} listed",
-            out.transcripts_unlisted, out.unlisted_depth, out.unlisted_cap, out.transcripts_listed
+            super::UNLISTED_TRUNCATION_PREFIX,
+            out.transcripts_unlisted,
+            out.unlisted_depth,
+            out.unlisted_cap,
+            out.transcripts_listed
         );
         out.error = if out.error.is_empty() {
             note
@@ -1146,7 +1184,9 @@ fn hosted_owner(
             .map(|p| (p.offsets, p.fingerprints))
             .unwrap_or_default(),
         Err(e) => {
-            out.error = format!("an owner's transcript progress could not be read: {e}");
+            out.add_error(format!(
+                "an owner's transcript progress could not be read: {e}"
+            ));
             (HashMap::new(), HashMap::new())
         }
     };
@@ -1175,7 +1215,9 @@ fn load_history(ledger_repo: &str, worktree: &str, out: &mut CatchUp) -> Binding
     match BindingHistory::load(ledger_repo, worktree) {
         Ok(history) => history,
         Err(e) => {
-            out.error = format!("a worktree's task binding history could not be read: {e}");
+            out.add_error(format!(
+                "a worktree's task binding history could not be read: {e}"
+            ));
             BindingHistory::unreadable()
         }
     }
@@ -1217,7 +1259,7 @@ fn participants(
     let progress = match ledger::transcript_progress_many(ledger_repo, paths) {
         Ok(progress) => progress,
         Err(e) => {
-            out.error = format!("transcript progress could not be read: {e}");
+            out.add_error(format!("transcript progress could not be read: {e}"));
             return None;
         }
     };
@@ -1238,7 +1280,7 @@ fn participants(
                 return None;
             }
             Err(e) => {
-                out.error = format!("transcript baseline could not be set: {e}");
+                out.add_error(format!("transcript baseline could not be set: {e}"));
                 return None;
             }
         };
@@ -1248,7 +1290,7 @@ fn participants(
                     frozen.insert(*path, baseline);
                 }
                 Err(e) => {
-                    out.error = format!("transcript baseline could not be set: {e}");
+                    out.add_error(format!("transcript baseline could not be set: {e}"));
                     return None;
                 }
             }
@@ -1379,7 +1421,7 @@ fn commit(
             true
         }
         Err(e) => {
-            out.error = format!("transcript events could not be recorded: {e}");
+            out.add_error(format!("transcript events could not be recorded: {e}"));
             false
         }
     }

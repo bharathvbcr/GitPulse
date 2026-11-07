@@ -918,6 +918,11 @@ pub struct LedgerStatus {
     /// Its own field, so it reaches every surface whatever `error_code` says.
     #[serde(default)]
     pub history_only_bindings: u64,
+    /// True when the count above could not be read (locked, malformed, I/O), so
+    /// its 0 is a placeholder and not a count. A missing ledger is a real 0 and
+    /// leaves this false. Omitted from the wire while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_only_bindings_unknown: bool,
     /// Empty when the ledger is usable; otherwise why not.
     pub error: String,
     pub error_code: String,
@@ -3437,6 +3442,13 @@ pub(crate) fn history_only_binding_count(anchor: &str) -> Option<u64> {
     })
 }
 
+/// Records a [`history_only_binding_count`] answer on `status`: the count when
+/// it was read, the unknown flag (and a 0 placeholder) when it was not.
+pub(crate) fn set_history_only_bindings(status: &mut LedgerStatus, count: Option<u64>) {
+    status.history_only_bindings = count.unwrap_or(0);
+    status.history_only_bindings_unknown = count.is_none();
+}
+
 /// The `source_label` prefix of a sibling enumerated before the initial pass
 /// completed: `legacy@<max>|<path>`, `<max>` being that sibling's highest row id
 /// when it was first seen.
@@ -4640,7 +4652,7 @@ pub fn status_readonly_at(repo_path: &str, now_ms: u64) -> LedgerStatus {
             Err(e) => (false, e.message, e.code.to_string()),
         }
     };
-    LedgerStatus {
+    let mut status = LedgerStatus {
         recording: false,
         recording_state: if readable {
             STATE_READABLE
@@ -4660,11 +4672,14 @@ pub fn status_readonly_at(repo_path: &str, now_ms: u64) -> LedgerStatus {
         } else {
             0
         },
-        history_only_bindings: history_only_binding_count(repo_path).unwrap_or(0),
+        history_only_bindings: 0,
+        history_only_bindings_unknown: false,
         error,
         error_code,
         freshness: freshness_readonly_at(repo_path, now_ms),
-    }
+    };
+    set_history_only_bindings(&mut status, history_only_binding_count(repo_path));
+    status
 }
 
 /// [`tail`] for a caller that must not create anything.
@@ -4746,6 +4761,7 @@ pub fn status(repo_path: &str) -> LedgerStatus {
         dropped_scope: DROPPED_SCOPE.to_string(),
         catch_up_failures,
         history_only_bindings: 0,
+        history_only_bindings_unknown: false,
         error,
         error_code,
         freshness: Freshness::default(),

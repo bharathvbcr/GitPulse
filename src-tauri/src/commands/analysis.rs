@@ -144,6 +144,59 @@ pub async fn cmd_commit_graph_write_cancel(repo_path: String) -> Result<bool, Ip
     off_thread(move || GitWriter::commit_graph_write_cancel(&repo_path)).await
 }
 
+/// What the Storage panel's tuning apply would run for `changes`: each exact
+/// argv with its scope, its undo and what the person must know first. Reads
+/// files and the cached config only; refused on an untrusted repository and for
+/// any change that is not currently offered.
+#[tauri::command(async)]
+pub async fn cmd_tuning_plan(
+    repo_path: String,
+    changes: Vec<crate::storage::repo_tuning::TuningChange>,
+) -> Result<crate::storage::repo_tuning::TuningPlan, IpcError> {
+    off_thread(move || crate::engine::tuning_apply::tuning_plan(&repo_path, &changes)).await
+}
+
+/// Applies recommended git tuning (owner decision 2026-11-06). Reachable only
+/// from the Storage panel's confirm click: `confirmed_argv` is the previewed
+/// list echoed back, refused unless it is exactly what a fresh plan runs, and
+/// the command gate judges every one of those lines before any is spawned.
+#[tauri::command(async)]
+pub async fn cmd_tuning_apply(
+    repo_path: String,
+    changes: Vec<crate::storage::repo_tuning::TuningChange>,
+    confirmed_argv: Vec<Vec<String>>,
+) -> Result<Guarded<crate::storage::repo_tuning::TuningOutcome>, IpcError> {
+    off_thread(move || {
+        // Trust, and that these changes are still offered, before the gate.
+        let runnable = crate::engine::tuning_apply::tuning_runnable(&repo_path, &changes)?;
+        if confirmed_argv != runnable {
+            return Err(format!(
+                "The confirmed commands are not the previewed ones; nothing ran. Previewed: {}",
+                runnable
+                    .iter()
+                    .map(|argv| argv.join(" "))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+            .into());
+        }
+        let mut policy = no_git_verdict();
+        for argv in &runnable {
+            policy = guard(&repo_path, &GitWriter::argv_refs(argv))?;
+        }
+        let output = crate::engine::tuning_apply::tuning_apply(&repo_path, &changes, &runnable)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Stops the tuning apply running in this repository's common directory.
+/// `false` when none is running.
+#[tauri::command(async)]
+pub async fn cmd_tuning_apply_cancel(repo_path: String) -> Result<bool, IpcError> {
+    off_thread(move || crate::engine::tuning_apply::tuning_apply_cancel(&repo_path)).await
+}
+
 #[tauri::command]
 pub async fn cmd_cache_inventory() -> Result<crate::storage::hygiene::CacheInventory, IpcError> {
     off_thread(crate::storage::hygiene::cache_inventory).await

@@ -248,6 +248,8 @@ export interface GitHubContext extends GitHubContextBase {
   pull_requests: PullRequestInfo[];
   /** True when more open PRs exist than the display cap kept. */
   prs_truncated?: boolean;
+  /** Set when the pull-request listing could not run or be parsed. */
+  prs_error?: string | null;
   issues: IssueInfo[];
   /** True when more open issues exist than the display cap kept. */
   issues_truncated: boolean;

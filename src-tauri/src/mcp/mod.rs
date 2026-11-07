@@ -1412,7 +1412,8 @@ fn build_tools() -> Vec<Value> {
                     "dropped": { "type": "integer", "description": "Appends dropped by THIS process; see `dropped_scope`." },
                     "dropped_scope": { "type": "string", "enum": ["this_process"] },
                     "catch_up_failures": { "type": "integer" },
-                    "history_only_bindings": { "type": "integer", "description": "Bind/unbind rows written by sibling worktrees that the ledger keeps as history only: they set no binding. Only GitPulse and the bind/unbind commands writing the primary ledger can." }
+                    "history_only_bindings": { "type": "integer", "description": "Bind/unbind rows written by sibling worktrees that the ledger keeps as history only: they set no binding. Only GitPulse and the bind/unbind commands writing the primary ledger can." },
+                    "history_only_bindings_unknown": { "type": "boolean", "description": "Present and true when `history_only_bindings` could not be read (its 0 is then a placeholder, not a count). Absent when the count was read." }
                 },
                 "required": ["ok", "events", "returned", "truncated"]
             }),
