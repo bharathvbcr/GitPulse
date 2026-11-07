@@ -1129,52 +1129,147 @@ const REMOVAL_QUIESCE_BOUND: Duration = Duration::from_secs(8);
 /// How often a waiting removal retries the writer slot.
 const REMOVAL_QUIESCE_POLL: Duration = Duration::from_millis(25);
 
-/// The writer slot of a worktree that is being removed, held until the value
-/// drops. While it lives, every refresh of that path (probe or build) is turned
-/// away as `skip_building`, so nothing starts writing `.devcouncil/` into a
-/// directory that is about to be renamed aside and deleted.
+/// What a worktree's removal holds from the moment it quiesces index work
+/// until the value drops: the in-process writer slot and DevMap's own on-disk
+/// writer lock(s) for the worktree's store.
+///
+/// While it lives, every refresh of that path in this process (probe or build)
+/// is turned away as `skip_building`, and every other process's `devmap build`,
+/// `seed --sync-delta` or daemon drain queues behind the lock, so nothing
+/// starts writing `.devcouncil/` into a directory that is about to be renamed
+/// aside and deleted.
+///
+/// The on-disk lock is held across the removal on unix, where deleting a file
+/// another descriptor has open is fine. On every other platform an open handle
+/// blocks the delete (Windows), so there the lock is taken only to prove that
+/// no writer is active and is released before this value is returned: a build
+/// that starts in the instant between that release and the delete is not
+/// excluded. That is the weaker guarantee, stated rather than hidden.
 #[derive(Debug)]
 pub struct RemovalHold {
     _permit: Option<cli::BuildPermit>,
+    _writer_locks: Vec<devmap_query::devmap_store::WriterLock>,
+}
+
+/// The stores a build or delta sync in `root` writes, each with its own
+/// `<db>.writer.lock`: a full or cloned store, and a stacked lane's delta.
+/// Resolved through DevMap's own path owner, never spelled here.
+fn store_dbs(root: &Path) -> [PathBuf; 2] {
+    [
+        devmap_query::paths::store_path(root),
+        devmap_query::paths::stack_delta_path(root),
+    ]
+}
+
+/// Why a store's writer lock was not taken, said as what happened.
+///
+/// DevMap's contention timeout is the only failure that means another process
+/// is writing; a lock file that could not be opened (a symlink refused, a
+/// read-only directory) or whose `flock` call failed says nothing about other
+/// writers, and naming one would send the person to look for a process that is
+/// not there. Both refuse, and both leave the worktree in place. The two are
+/// told apart by the kernel's own contention wording, so a rewording upstream
+/// degrades to the second message, which still carries the cause.
+fn writer_lock_refusal(path: &str, bound: Duration, error: &dyn std::fmt::Display) -> String {
+    if error.to_string().contains("another devmap writer holds") {
+        format!(
+            "another process is still writing the devmap index of {path} \
+             ({error}) after {:.1}s; the worktree was left in place, retry the removal shortly",
+            bound.as_secs_f32()
+        )
+    } else {
+        format!(
+            "the devmap index writer lock of {path} could not be taken ({error}); \
+             the worktree was left in place. Check that the lock file is a regular \
+             file in a writable directory, then retry the removal"
+        )
+    }
+}
+
+/// Take the writer lock of every store `root` has, waiting no longer than until `deadline`.
+///
+/// A store counts as present when its db or its lock file exists: a stacked
+/// lane has the lock before its first delta. A tree with neither gets nothing
+/// taken and nothing created (the lock file would otherwise be made, and its
+/// directory with it): a build that starts later in such a tree is the
+/// in-process slot's job, not this lock's.
+fn lock_store_writers(
+    root: &Path,
+    deadline: Instant,
+    bound: Duration,
+    path: &str,
+) -> Result<Vec<devmap_query::devmap_store::WriterLock>, String> {
+    use devmap_query::devmap_store::Store;
+    let mut locks = Vec::new();
+    for db in store_dbs(root) {
+        let lock_file = Store::writer_lock_path(&db);
+        let (has_db, has_lock) = (db.exists(), lock_file.exists());
+        if !has_db && !has_lock {
+            continue;
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        // The db when there is one, exactly as the writers resolve it; the
+        // bare lock file for a stacked lane that has not made its delta yet.
+        let taken = if has_db {
+            Store::lock_writer_at(&db, wait)
+        } else {
+            Store::lock_file_at(&lock_file, wait)
+        };
+        match taken {
+            Ok(lock) => locks.push(lock),
+            Err(error) => return Err(writer_lock_refusal(path, bound, &error)),
+        }
+    }
+    Ok(locks)
 }
 
 /// Quiesce live index work in `path` before its worktree is removed.
 ///
-/// Claims the repository's writer slot, the same one a probe and a build hold
-/// for their whole run ([`cli::claim_build`]). A claim that succeeds means no
-/// refresh is in flight and none can start; a claim that is refused waits for
-/// the build in flight, polling, for at most `bound`. There is no cancel: the
-/// build child is owned by procguard's run, which exposes no handle to stop
-/// it, so waiting it out is the only stop that leaves its files consistent.
-/// Past the bound this returns an error and the caller must leave the
-/// worktree exactly as it was.
+/// Two claims, one deadline of `bound` for both. First the repository's
+/// in-process writer slot, the one a probe and a build hold for their whole run
+/// ([`cli::claim_build`]): a refused claim waits for the build in flight,
+/// polling. Then DevMap's own on-disk writer lock for each store the worktree
+/// has ([`lock_store_writers`]), which the `devmap` CLI takes for the whole of a
+/// build (measured, not assumed) and so is the only thing that sees a build
+/// from another GitPulse process, `gitpulse-mcp`, a hook, or Claude Code's own
+/// SessionStart. The lock waits only what is left of the bound.
 ///
-/// A path that is not a valid, trusted repository cannot have a build keyed
-/// to it, so it has nothing to quiesce and holds nothing.
+/// There is no cancel: the build child is owned by procguard's run, which
+/// exposes no handle to stop it, so waiting it out is the only stop that leaves
+/// its files consistent. Past the bound this returns an error, the slot is
+/// given back, and the caller must leave the worktree exactly as it was.
+///
+/// A path that is not a valid, trusted repository cannot have a build keyed to
+/// it in this process, so it holds no slot; its stores, if it has any, are
+/// still locked.
 fn quiesce_for_removal_within(path: &str, bound: Duration) -> Result<RemovalHold, String> {
     let deadline = Instant::now() + bound;
-    loop {
+    let permit = loop {
         match cli::claim_build(path) {
             Ok(permit) => {
                 // An outcome parked for a worktree that is going away is
                 // never collected.
                 lock_finished_builds().remove(path);
-                return Ok(RemovalHold {
-                    _permit: Some(permit),
-                });
+                break Some(permit);
             }
-            Err(cli::ClaimRefusal::Invalid(_)) => return Ok(RemovalHold { _permit: None }),
+            Err(cli::ClaimRefusal::Invalid(_)) => break None,
             Err(cli::ClaimRefusal::Busy(_)) => {
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "a devmap index build is still writing into {path} after {}s; the worktree was left in place, retry the removal shortly",
-                        bound.as_secs()
+                        "a devmap index build is still writing into {path} after {:.1}s; the worktree was left in place, retry the removal shortly",
+                        bound.as_secs_f32()
                     ));
                 }
                 std::thread::sleep(REMOVAL_QUIESCE_POLL);
             }
         }
-    }
+    };
+    let locks = lock_store_writers(Path::new(path), deadline, bound, path)?;
+    Ok(RemovalHold {
+        _permit: permit,
+        // Released here, before the delete, where an open handle would block it.
+        _writer_locks: if cfg!(unix) { locks } else { Vec::new() },
+    })
 }
 
 /// [`quiesce_for_removal_within`] with the standard bound
@@ -3592,7 +3687,127 @@ exit 2
         wt: PathBuf,
         /// The worktree's slot key, taken while the directory still exists.
         canon: PathBuf,
+        /// The lane's DevMap store, which exists (empty) the way a seeded
+        /// lane's does, so the writer lock a real build takes has a file.
+        store: PathBuf,
         _bound: cli::TestBinaryBinding,
+        _harness: crate::test_support::IsolatedHarnessGuard,
+    }
+
+    /// Env that turns [`xproc_writer_lock_holder`] from a no-op into a process
+    /// that takes `lock_writer_at(db)`, announces it by creating `ready`, and
+    /// keeps it until `release` exists.
+    const XPROC_HOLD_DB: &str = "GITPULSE_XPROC_HOLD_DB";
+    const XPROC_HOLD_READY: &str = "GITPULSE_XPROC_HOLD_READY";
+    const XPROC_HOLD_RELEASE: &str = "GITPULSE_XPROC_HOLD_RELEASE";
+    const XPROC_HOLDER_FILTER: &str = "devmap::live::tests::xproc_writer_lock_holder";
+
+    /// The helper a separate process runs: the store's writer lock, held the
+    /// way `devmap build` holds it. Ignored, so it only ever runs when a test
+    /// re-executes this binary with `--ignored --exact`. It gives up on its own
+    /// after a minute, so an orphan cannot hold a lock for good.
+    #[test]
+    #[ignore = "helper process for the cross-process removal tests"]
+    fn xproc_writer_lock_holder() {
+        let db = std::env::var_os(XPROC_HOLD_DB).expect("helper env: db");
+        let ready = std::env::var_os(XPROC_HOLD_READY).expect("helper env: ready");
+        let release =
+            PathBuf::from(std::env::var_os(XPROC_HOLD_RELEASE).expect("helper env: release"));
+        let _writer = devmap_query::devmap_store::Store::lock_writer_at(
+            Path::new(&db),
+            std::env::var("GITPULSE_XPROC_HOLD_WAIT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .map_or(Duration::from_secs(20), Duration::from_millis),
+        )
+        .expect("helper takes the writer lock");
+        std::fs::write(ready, "").expect("helper announces the lock");
+        let give_up = Instant::now() + Duration::from_secs(60);
+        while !release.exists() && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A separate process holding a store's writer lock, as a `devmap build`
+    /// from another GitPulse process or a Claude Code hook would.
+    #[cfg(unix)]
+    struct LockHolder {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+        _dir: tempfile::TempDir,
+        _harness: crate::test_support::IsolatedHarnessGuard,
+    }
+
+    #[cfg(unix)]
+    impl LockHolder {
+        /// Starts the helper and returns once it holds the lock.
+        fn hold(db: &Path) -> LockHolder {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let release = dir.path().join("release");
+            let (mut command, harness) =
+                crate::test_support::isolated_libtest_command(XPROC_HOLDER_FILTER);
+            let child = command
+                .arg("--ignored")
+                .env(XPROC_HOLD_DB, db)
+                .env(XPROC_HOLD_READY, &ready)
+                .env(XPROC_HOLD_RELEASE, &release)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn_locked()
+                .expect("spawn the lock holder");
+            let mut holder = LockHolder {
+                child: Some(child),
+                release,
+                _dir: dir,
+                _harness: harness,
+            };
+            let give_up =
+                Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(30));
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < give_up,
+                    "the lock holder never took the lock"
+                );
+                let exited = holder.child.as_mut().unwrap().try_wait().unwrap();
+                assert!(exited.is_none(), "the lock holder exited early: {exited:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            holder
+        }
+
+        /// Path whose creation lets the holder go.
+        fn release_path(&self) -> PathBuf {
+            self.release.clone()
+        }
+
+        /// Releases the lock, then reaps the process and asserts it exited
+        /// cleanly: no helper outlives its test.
+        fn release_and_reap(mut self) {
+            let _ = std::fs::write(&self.release, "");
+            let mut child = self.child.take().expect("holder child");
+            let give_up =
+                Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(30));
+            loop {
+                if let Some(status) = child.try_wait().expect("wait for the lock holder") {
+                    assert!(status.success(), "the lock holder failed: {status:?}");
+                    return;
+                }
+                assert!(Instant::now() < give_up, "the lock holder never exited");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// A test that fails part-way still reaps its helper.
+    #[cfg(unix)]
+    impl Drop for LockHolder {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -3631,11 +3846,25 @@ exit 2
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         std::fs::write(&exclude, ".devcouncil/\n.devmap/\n").unwrap();
         write_stub_artifacts(&wt);
+        let store = devmap_query::paths::store_path(&wt);
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, "").unwrap();
         let stub_dir = tempfile::tempdir().unwrap();
         let bin = stub_dir.path().join("devmap");
+        // The stub holds the store's writer lock for the whole build, as the
+        // real `devmap build` does (measured: held from its first 100 ms to its
+        // exit), by running the lock-holder helper beside it.
+        let (holder_command, harness) =
+            crate::test_support::isolated_libtest_command(XPROC_HOLDER_FILTER);
+        let holder_exe = holder_command.get_program().to_string_lossy().into_owned();
         let script = format!(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
+  {db_env}="{db}" {ready_env}="{stub}/hold-ready" {release_env}="{stub}/hold-release" \
+    "{holder}" --exact --ignored {filter} >/dev/null 2>&1 &
+  holder=$!
+  n=0
+  while [ ! -f "{stub}/hold-ready" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done
   i=0
   while [ $i -lt {iterations} ] && [ ! -f "{stub}/release" ]; do
     mkdir -p "{wt}/.devcouncil/codeintel/d$i"
@@ -3643,6 +3872,8 @@ if [ "$1" = "build" ]; then
     sleep 0.1
     i=$((i+1))
   done
+  : > "{stub}/hold-release"
+  wait $holder
   printf '%s\n' '{{"ok":true,"unchanged":false}}'
   exit 0
 fi
@@ -3650,6 +3881,12 @@ exit 2
 "#,
             stub = stub_dir.path().display(),
             wt = wt.display(),
+            db = store.display(),
+            holder = holder_exe,
+            filter = XPROC_HOLDER_FILTER,
+            db_env = XPROC_HOLD_DB,
+            ready_env = XPROC_HOLD_READY,
+            release_env = XPROC_HOLD_RELEASE,
         );
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -3662,11 +3899,13 @@ exit 2
         let canon = canonical_repo_path(&wt);
         RemovalFixture {
             canon,
+            store,
             main,
             stub_dir,
             wt_parent,
             wt,
             _bound: bound,
+            _harness: harness,
         }
     }
 
@@ -3920,6 +4159,404 @@ exit 2
         assert!(message.contains("devmap"), "{message}");
         assert!(fixture.wt.join(".git").exists(), "the lane was touched");
         assert!(fixture.registered(), "the lane was deregistered");
+        fixture.finish();
+    }
+
+    /// Another PROCESS (the MCP server, a hook, a `devmap build` from Claude
+    /// Code's SessionStart) is writing the index: the in-process slot cannot
+    /// see it, DevMap's own writer lock can. Removal waits it out.
+    #[test]
+    #[cfg(unix)]
+    fn removal_waits_for_a_writer_lock_held_by_another_process() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let holder = LockHolder::hold(&fixture.store);
+        let release = holder.release_path();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            std::fs::write(release, "").unwrap();
+        });
+
+        let begun = Instant::now();
+        let removal = fixture.remove().expect("removal succeeds");
+        assert_eq!(removal.cleanup_error, None);
+        assert!(
+            begun.elapsed() >= Duration::from_millis(900),
+            "removal returned after {:?}, while another process held the writer lock",
+            begun.elapsed()
+        );
+        releaser.join().unwrap();
+        holder.release_and_reap();
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        assert!(!fixture.registered());
+        fixture.finish();
+    }
+
+    /// The normal end of a lane, with another process writing its index.
+    #[test]
+    #[cfg(unix)]
+    fn merge_teardown_waits_for_a_writer_lock_held_by_another_process() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let holder = LockHolder::hold(&fixture.store);
+        let release = holder.release_path();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            std::fs::write(release, "").unwrap();
+        });
+
+        let begun = Instant::now();
+        let merged = fixture.merge_and_teardown().expect("merge and teardown");
+        assert!(merged.worktree_removed, "{merged:?}");
+        assert!(
+            begun.elapsed() >= Duration::from_millis(900),
+            "teardown returned after {:?}, while another process held the writer lock",
+            begun.elapsed()
+        );
+        releaser.join().unwrap();
+        holder.release_and_reap();
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        assert!(!fixture.registered());
+        fixture.finish();
+    }
+
+    /// A writer in another process that outlives the bound: both removal
+    /// paths refuse with the worktree intact and registered, the lane unmerged.
+    #[test]
+    #[cfg(unix)]
+    fn removal_and_teardown_refuse_while_another_process_outlives_the_bound() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let holder = LockHolder::hold(&fixture.store);
+
+        let started = Instant::now();
+        let message = fixture
+            .remove()
+            .expect_err("a foreign writer must refuse the removal")
+            .into_message();
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
+            "the wait is unbounded: {:?}",
+            started.elapsed()
+        );
+        assert!(message.contains("devmap"), "{message}");
+        assert!(message.contains("retry"), "{message}");
+        assert!(fixture.wt.join(".git").exists(), "the worktree was touched");
+        assert!(fixture.registered(), "the worktree was deregistered");
+
+        let torn = format!(
+            "{:?}",
+            fixture
+                .merge_and_teardown()
+                .expect_err("a foreign writer must refuse the teardown")
+        );
+        assert!(torn.contains("devmap"), "{torn}");
+        assert!(fixture.wt.join(".git").exists(), "the lane was touched");
+        assert!(fixture.registered(), "the lane was deregistered");
+        holder.release_and_reap();
+        fixture.finish();
+    }
+
+    /// A short bound, so the refusal's shape is cheap to pin: it names the
+    /// path and the wait, says the tree was left, and costs about the bound.
+    #[test]
+    #[cfg(unix)]
+    fn writer_lock_refusal_names_the_path_and_costs_one_bound() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let holder = LockHolder::hold(&fixture.store);
+
+        let begun = Instant::now();
+        let message = quiesce_for_removal_within(&path, Duration::from_millis(400))
+            .expect_err("a foreign writer must refuse");
+        let waited = begun.elapsed();
+        assert!(waited >= Duration::from_millis(350), "{waited:?}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+            "{waited:?}"
+        );
+        assert!(message.contains(&path), "{message}");
+        assert!(message.contains("0.4s"), "{message}");
+        assert!(message.contains("left in place"), "{message}");
+        // The slot taken first was given back with the refusal.
+        assert!(fixture.slot_free(), "a refused removal kept the slot");
+        holder.release_and_reap();
+        let hold = quiesce_for_removal_within(&path, Duration::from_secs(5))
+            .expect("the writer is gone: the guard is taken");
+        drop(hold);
+        fixture.finish();
+    }
+
+    /// One deadline for both waits. The in-process slot is busy for 0.8 s of a
+    /// 1 s bound and a foreign process holds the lock throughout: the lock wait
+    /// gets the remaining 0.2 s, so the refusal lands at ~1 s, not at 0.8 + 1.
+    #[test]
+    #[cfg(unix)]
+    fn the_slot_wait_and_the_lock_wait_share_one_deadline() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let holder = LockHolder::hold(&fixture.store);
+        let permit = cli::claim_build(&path).expect("the slot is free");
+        let waiting = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let begun = Instant::now();
+                let outcome =
+                    quiesce_for_removal_within(&path, Duration::from_millis(1000)).map(|_| ());
+                (outcome, begun.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(800));
+        drop(permit);
+        let (outcome, waited) = waiting.join().unwrap();
+        assert!(outcome.is_err(), "the foreign writer still holds the lock");
+        assert!(waited >= Duration::from_millis(950), "{waited:?}");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(1500)),
+            "the two waits did not share a deadline: {waited:?}"
+        );
+        holder.release_and_reap();
+        fixture.finish();
+    }
+
+    /// A stacked lane has no `devmap.sqlite`: its builds write `delta.sqlite`
+    /// under `delta.sqlite.writer.lock`, so that is the lock the guard takes.
+    #[test]
+    #[cfg(unix)]
+    fn a_stacked_lane_is_guarded_by_its_delta_writer_lock() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        std::fs::remove_file(&fixture.store).unwrap();
+        std::fs::write(devmap_query::paths::stack_lease_path(&fixture.wt), "{}").unwrap();
+        let delta = devmap_query::paths::stack_delta_path(&fixture.wt);
+        let holder = LockHolder::hold(&delta);
+
+        let message = quiesce_for_removal_within(&path, Duration::from_millis(300))
+            .expect_err("a foreign delta writer must refuse");
+        assert!(message.contains("delta.sqlite"), "{message}");
+        holder.release_and_reap();
+        drop(quiesce_for_removal_within(&path, Duration::from_secs(5)).expect("delta writer gone"));
+        fixture.finish();
+    }
+
+    /// While the removal holds the guard, no other process can take the
+    /// store's writer lock: a build that starts mid-removal queues behind it.
+    #[test]
+    #[cfg(unix)]
+    fn the_guard_holds_the_writer_lock_until_it_drops() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let hold = quiesce_for_removal_within(&path, Duration::from_secs(5)).expect("guard");
+        assert!(
+            devmap_query::devmap_store::Store::lock_writer_at(&fixture.store, Duration::ZERO)
+                .is_err(),
+            "the guard does not hold the writer lock"
+        );
+        drop(hold);
+        drop(
+            devmap_query::devmap_store::Store::lock_writer_at(&fixture.store, Duration::ZERO)
+                .expect("the lock is free once the guard drops"),
+        );
+        fixture.finish();
+    }
+
+    /// A tree with no DevMap store gets no lock and nothing created: no
+    /// `.devcouncil/`, no db, no lock file.
+    #[test]
+    #[cfg(unix)]
+    fn a_tree_without_a_store_takes_no_lock_and_creates_nothing() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let listing = |root: &Path| {
+            let mut found = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry.file_name() == ".git" {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path.clone());
+                    }
+                    found.push(path);
+                }
+            }
+            found.sort();
+            found
+        };
+
+        // A real worktree whose store was never made.
+        let fixture = removal_fixture(0);
+        std::fs::remove_file(&fixture.store).unwrap();
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let before = listing(&fixture.wt);
+        drop(quiesce_for_removal_within(&path, Duration::from_secs(5)).expect("no store"));
+        assert_eq!(listing(&fixture.wt), before, "the guard created files");
+
+        // And one with no state directory at all.
+        let bare = fixture.wt_parent.path().join("bare");
+        std::fs::create_dir_all(bare.join("src")).unwrap();
+        std::fs::write(bare.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let before = listing(&bare);
+        drop(
+            quiesce_for_removal_within(&bare.to_string_lossy(), Duration::from_secs(5))
+                .expect("nothing to guard"),
+        );
+        assert_eq!(listing(&bare), before, "the guard created files");
+        assert!(!bare.join(".devcouncil").exists() && !bare.join(".devmap").exists());
+        fixture.finish();
+    }
+
+    /// The pre-merge hook runs in the lane and may run `devmap build`,
+    /// `seed --sync-delta` or `dev verify` there: each needs the lane's writer
+    /// lock. The teardown's own hold must not exist yet while it runs, or the
+    /// hook's child waits on its parent.
+    #[test]
+    #[cfg(unix)]
+    fn a_pre_merge_hook_can_take_the_lanes_writer_lock() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let scratch = tempfile::tempdir().unwrap();
+        let ready = scratch.path().join("hook-ready");
+        let release = scratch.path().join("hook-release");
+        std::fs::write(&release, "").unwrap();
+        let hook = format!(
+            "{db_env}={db} {ready_env}={ready} {release_env}={release} {wait_env}=3000 {exe} --exact --ignored {filter}",
+            db_env = XPROC_HOLD_DB,
+            db = fixture.store.display(),
+            ready_env = XPROC_HOLD_READY,
+            ready = ready.display(),
+            release_env = XPROC_HOLD_RELEASE,
+            release = release.display(),
+            wait_env = "GITPULSE_XPROC_HOLD_WAIT_MS",
+            exe = fixture._harness.path().display(),
+            filter = XPROC_HOLDER_FILTER,
+        );
+        let hooks = serde_json::json!({ "worktree": { "pre_merge": [hook] } }).to_string();
+        std::fs::create_dir_all(fixture.main.path().join(".gitpulse")).unwrap();
+        std::fs::write(fixture.main.path().join(".gitpulse/hooks.json"), &hooks).unwrap();
+        let exclude = fixture.main.path().join(".git/info/exclude");
+        std::fs::write(&exclude, ".devcouncil/\n.devmap/\n.gitpulse/\n").unwrap();
+        crate::engine::approve_worktree_hooks(fixture.main.path(), &hooks)
+            .expect("approve the fixture hook");
+
+        let merged = fixture
+            .merge_and_teardown()
+            .expect("the hook took the lock and the teardown went on");
+        assert!(merged.worktree_removed, "{merged:?}");
+        assert!(ready.exists(), "the hook never ran");
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        fixture.finish();
+    }
+
+    /// Removing the primary checkout is refused before anything is quiesced:
+    /// no wait on main's index, no slot, no write to main's lock file.
+    #[test]
+    #[cfg(unix)]
+    fn removing_the_primary_checkout_is_refused_before_any_quiesce() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let main_store = devmap_query::paths::store_path(fixture.main.path());
+        std::fs::create_dir_all(main_store.parent().unwrap()).unwrap();
+        std::fs::write(&main_store, "").unwrap();
+        let holder = LockHolder::hold(&main_store);
+        let lock_file = devmap_query::devmap_store::Store::writer_lock_path(&main_store);
+        let before = std::fs::read(&lock_file).unwrap();
+        let main_text = fixture.main.path().to_str().unwrap();
+
+        let begun = Instant::now();
+        let message = crate::engine::worktree::remove_worktree_with(
+            main_text,
+            main_text,
+            true,
+            &mut |aside: &std::path::Path| std::fs::remove_dir_all(aside),
+        )
+        .expect_err("the primary checkout is never removed")
+        .into_message();
+        let waited = begun.elapsed();
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            "the refusal waited on main's index: {waited:?}"
+        );
+        assert!(message.contains("primary checkout"), "{message}");
+        assert!(!message.contains("still writing"), "{message}");
+        assert_eq!(
+            std::fs::read(&lock_file).unwrap(),
+            before,
+            "main's lock file was written"
+        );
+        assert!(fixture.main.path().join(".git").exists());
+        holder.release_and_reap();
+        fixture.finish();
+    }
+
+    /// A lock that cannot be opened is not "another process writing": the
+    /// refusal says what failed, still leaves the worktree, and never follows
+    /// the symlink.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_lock_file_is_refused_as_unopenable_not_as_a_writer() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let outside = fixture.wt_parent.path().join("outside.txt");
+        std::fs::write(&outside, "UNTOUCHED").unwrap();
+        let lock = devmap_query::devmap_store::Store::writer_lock_path(&fixture.store);
+        let _ = std::fs::remove_file(&lock);
+        std::os::unix::fs::symlink(&outside, &lock).unwrap();
+
+        let begun = Instant::now();
+        let message = quiesce_for_removal_within(&path, Duration::from_secs(5))
+            .expect_err("a lock that cannot be opened must refuse");
+        assert!(
+            begun.elapsed() < Duration::from_secs(4),
+            "an open failure waited out the bound: {:?}",
+            begun.elapsed()
+        );
+        assert!(message.contains("could not be taken"), "{message}");
+        assert!(message.contains("left in place"), "{message}");
+        assert!(!message.contains("still writing"), "{message}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "UNTOUCHED");
+        assert!(fixture.slot_free(), "a refused removal kept the slot");
+        fixture.finish();
+    }
+
+    /// Store free, delta held by another process: the refusal must not leave
+    /// the store's lock held.
+    #[test]
+    #[cfg(unix)]
+    fn a_partial_acquisition_releases_the_first_lock() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(0);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let delta = devmap_query::paths::stack_delta_path(&fixture.wt);
+        std::fs::write(&delta, "").unwrap();
+        let holder = LockHolder::hold(&delta);
+
+        quiesce_for_removal_within(&path, Duration::from_millis(300))
+            .expect_err("the foreign delta writer must refuse");
+        assert!(fixture.slot_free(), "a refused removal kept the slot");
+        drop(
+            devmap_query::devmap_store::Store::lock_writer_at(&fixture.store, Duration::ZERO)
+                .expect("the refusal leaked the store's lock"),
+        );
+        holder.release_and_reap();
         fixture.finish();
     }
 }
