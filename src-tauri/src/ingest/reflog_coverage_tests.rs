@@ -267,3 +267,55 @@ fn adv_a_worktree_past_the_reflog_bound_is_read_within_a_few_passes() {
         "six passes never reached the fifth worktree's HEAD"
     );
 }
+
+/// A checkout reached through a symlinked spelling (macOS's `/var` for
+/// `/private/var`, which is where the command-timings bench's temp dir sits) is
+/// the same worktree as its canonical path, so a family that fits the bound
+/// exactly is read whole and not reported as one reflog short.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_spelling_of_the_trigger_is_not_a_second_worktree() {
+    let (main, _parent, linked) = repo_with_worktrees(1);
+    let anchor = plain(main.path());
+    let holder = tempfile::tempdir().expect("symlink dir");
+    let spelled = holder.path().join("alias");
+    std::os::unix::fs::symlink(&anchor, &spelled).expect("symlink");
+    let spelled = spelled.to_string_lossy().into_owned();
+    assert_eq!(linked.len(), 1);
+
+    let family = family_siblings(&anchor, &spelled);
+    let out = ingest_reflogs(&anchor, &spelled, &family, 2, &Budget::unbounded());
+    assert_eq!(
+        out.reflog_refs_skipped, 0,
+        "two worktrees under a bound of two: {out:?}"
+    );
+    assert!(!out.truncated, "{out:?}");
+}
+
+/// The same checkout reached through a symlinked spelling is one checkout to
+/// the ledger: a pass through the alias finds the watermark the canonical pass
+/// left and records nothing again. Keyed on the spelling, it replayed the whole
+/// reflog under a second watermark and stored the rows against a second
+/// `worktree_path`.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_spelling_of_a_linked_worktree_shares_its_watermark() {
+    let (main, _parent, linked) = repo_with_worktrees(1);
+    let anchor = plain(main.path());
+    let canonical = linked[0].to_string_lossy().into_owned();
+    let holder = tempfile::tempdir().expect("symlink dir");
+    let alias = holder.path().join("alias");
+    std::os::unix::fs::symlink(&canonical, &alias).expect("symlink");
+    let alias = alias.to_string_lossy().into_owned();
+
+    let first = ingest_reflog_into(&anchor, &canonical, 200);
+    assert!(first.recorded >= 1, "{first:?}");
+    let rows = reflog_rows(&anchor).len();
+
+    let again = ingest_reflog_into(&anchor, &alias, 200);
+    assert_eq!(
+        again.recorded, 0,
+        "replayed under a second spelling: {again:?}"
+    );
+    assert_eq!(reflog_rows(&anchor).len(), rows);
+}
