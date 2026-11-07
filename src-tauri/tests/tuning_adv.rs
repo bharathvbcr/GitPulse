@@ -386,11 +386,14 @@ fn adv_fsmonitor_boolean_is_refused_on_git_before_2_36() {
 // Detector honesty
 // ---------------------------------------------------------------------------
 
+/// A named broken-index fixture: what it is, and how to write it into a dir.
+type IndexCase<'a> = (&'a str, Box<dyn Fn(&Path)>);
+
 #[test]
 fn adv_unreadable_indexes_are_never_offered() {
     let env = env_with((2, 54, 0));
     let big = 30_000u32 as usize * 62 + 64;
-    let cases: [(&str, Box<dyn Fn(&Path)>); 5] = [
+    let cases: [IndexCase; 5] = [
         (
             "version 5",
             Box::new(move |d: &Path| index_file(d, 5, 30_000, big)),
