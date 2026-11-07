@@ -302,6 +302,18 @@ pub fn evaluate(
     evaluate_detailed(current_version, ls_remote_output, published).check
 }
 
+/// The answer for a tag whose release is confirmed published.
+fn announce(current_version: &str, tag: &str, version: Version) -> UpdateCheck {
+    UpdateCheck {
+        current_version: current_version.to_string(),
+        latest_version: format!("{}.{}.{}", version.major, version.minor, version.patch),
+        update_available: true,
+        release_url: release_tag_url(tag),
+        checked: true,
+        error: None,
+    }
+}
+
 /// [`evaluate`]'s answer plus whether it is the *deterministic* fail-closed
 /// state: the probe budget was spent with newer tags unasked. Only that state
 /// is a function of the listing alone, so only it may be remembered; a probe
@@ -355,17 +367,7 @@ fn evaluate_detailed(
     for (tag, version) in newer.iter().copied().take(MAX_RELEASE_PROBES) {
         match published(tag, *version) {
             Ok(true) => {
-                return plain(UpdateCheck {
-                    current_version: current_version.to_string(),
-                    latest_version: format!(
-                        "{}.{}.{}",
-                        version.major, version.minor, version.patch
-                    ),
-                    update_available: true,
-                    release_url: release_tag_url(tag),
-                    checked: true,
-                    error: None,
-                })
+                return plain(announce(current_version, tag, *version));
             }
             Ok(false) => {}
             Err(error) => {
@@ -467,9 +469,23 @@ fn now_unix() -> u64 {
 /// record": the caller then probes normally. The failure direction is always
 /// toward probing, never toward a stale answer.
 fn read_record(path: &std::path::Path) -> Option<FailClosedRecord> {
-    let text = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    let mut text = String::new();
+    // One byte past the cap tells "exactly the cap" from "more than the cap".
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_RECORD_BYTES {
+        return None;
+    }
     serde_json::from_str(&text).ok()
 }
+
+/// A real record is a few hundred bytes. A file past this is not one, so it is
+/// never read whole: it counts as "no record" and the check probes.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// [`evaluate`] with the fail-closed back-off.
 ///
@@ -499,7 +515,34 @@ pub fn evaluate_with_backoff(
         let fresh =
             record.recorded_at <= now && now - record.recorded_at < FAIL_CLOSED_BACKOFF_SECS;
         if fresh && record.version == current_version && record.tip == tip {
-            return UpdateCheck::failed(record.error);
+            // The tag list cannot show a release that finishes uploading
+            // under an unchanged tag, so one probe of the newest newer tag
+            // stands in for the five: published ends the back-off, an error
+            // fails the check without touching the record, and unpublished
+            // replays the recorded failure.
+            let newest = parse_version(current_version).and_then(|current| {
+                stable_tags(ls_remote_output)
+                    .ok()?
+                    .into_iter()
+                    .find(|(_, version)| *version > current)
+            });
+            if let Some((tag, version)) = newest {
+                match published(&tag, version) {
+                    Ok(true) => {
+                        if let Some(path) = record_path {
+                            clear_record(path);
+                        }
+                        return announce(current_version, &tag, version);
+                    }
+                    Ok(false) => return UpdateCheck::failed(record.error),
+                    Err(error) => {
+                        return UpdateCheck::failed(format!(
+                            "could not confirm that {tag} is a published release: {error}",
+                            error = error.message()
+                        ))
+                    }
+                }
+            }
         }
     }
     let evaluation = evaluate_detailed(current_version, ls_remote_output, published);
@@ -522,13 +565,64 @@ pub fn evaluate_with_backoff(
             if let Err(error) = written {
                 log::warn!(target: "updates", "could not record the fail-closed update check: {error}");
             }
-        } else if let Err(error) = std::fs::remove_file(path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!(target: "updates", "could not clear the fail-closed update record: {error}");
-            }
+        } else {
+            clear_record(path);
         }
     }
     evaluation.check
+}
+
+fn clear_record(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(target: "updates", "could not clear the fail-closed update record: {error}");
+        }
+    }
+}
+
+/// Everything [`run_check`] needs from the outside world. Production fills it
+/// with [`CheckEnv::production`]; tests fill it with fakes, so the wiring
+/// between the real `ls-remote`, clock and record path and
+/// [`evaluate_with_backoff`] is exercised rather than assumed.
+struct CheckEnv {
+    current_version: String,
+    /// The one `ls-remote` per launch: the listing text, or why it failed.
+    ls_remote: Box<dyn Fn() -> Result<String, String>>,
+    published: Box<dyn Fn(&str, Version) -> Result<bool, CommandError>>,
+    record_path: Option<std::path::PathBuf>,
+    now: u64,
+}
+
+const LS_REMOTE_ARGS: [&str; 4] = ["ls-remote", "--tags", "--refs", REPOSITORY_URL];
+
+impl CheckEnv {
+    fn production() -> Self {
+        Self {
+            current_version: CURRENT_VERSION.to_string(),
+            ls_remote: Box::new(|| {
+                git_global_with_timeout(&LS_REMOTE_ARGS, CHECK_TIMEOUT)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .map_err(|error| error.into_message())
+            }),
+            published: Box::new(release_is_published),
+            record_path: record_path(),
+            now: now_unix(),
+        }
+    }
+}
+
+/// One launch's check: a single `ls-remote`, then the back-off evaluation.
+fn run_check(env: &CheckEnv) -> UpdateCheck {
+    match (env.ls_remote)() {
+        Ok(listing) => evaluate_with_backoff(
+            &env.current_version,
+            &listing,
+            &*env.published,
+            env.record_path.as_deref(),
+            env.now,
+        ),
+        Err(error) => UpdateCheck::failed(error),
+    }
 }
 
 /// Runs the check against the upstream repository.
@@ -540,17 +634,7 @@ pub fn evaluate_with_backoff(
 /// Exactly one `git ls-remote` per call; the HTTP probes behind it are
 /// subject to the fail-closed back-off of [`evaluate_with_backoff`].
 pub fn check_for_update() -> UpdateCheck {
-    let args = ["ls-remote", "--tags", "--refs", REPOSITORY_URL];
-    match git_global_with_timeout(&args, CHECK_TIMEOUT) {
-        Ok(bytes) => evaluate_with_backoff(
-            CURRENT_VERSION,
-            &String::from_utf8_lossy(&bytes),
-            &release_is_published,
-            record_path().as_deref(),
-            now_unix(),
-        ),
-        Err(error) => UpdateCheck::failed(error.into_message()),
-    }
+    run_check(&CheckEnv::production())
 }
 
 #[cfg(test)]
@@ -1086,14 +1170,14 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_launch_with_the_same_tip_makes_no_http_probes() {
+    fn a_repeat_launch_with_the_same_tip_makes_one_http_probe_not_five() {
         let (_dir, path) = record_file();
         let listing = exhausted_listing("1");
         let (first, probes) = launch("1.4.0", &listing, &path, T0);
         assert_eq!(probes, MAX_RELEASE_PROBES);
         assert!(!first.checked, "{first:?}");
         let (second, probes) = launch("1.4.0", &listing, &path, T0 + 60);
-        assert_eq!(probes, 0, "the repeat launch must not probe");
+        assert_eq!(probes, 1, "a replay asks about the newest newer tag only");
         assert_eq!(second, first, "the recorded fail-closed state is replayed");
     }
 
@@ -1103,7 +1187,7 @@ mod tests {
         let listing = exhausted_listing("1");
         launch("1.4.0", &listing, &path, T0);
         let (skipped, probes) = launch("1.4.0", &listing, &path, T0 + 1);
-        assert_eq!(probes, 0);
+        assert_eq!(probes, 1);
         assert!(!skipped.checked && !skipped.update_available, "{skipped:?}");
         assert!(skipped.latest_version.is_empty(), "{skipped:?}");
         assert!(skipped.error.unwrap().contains("1 newer tag"));
@@ -1133,7 +1217,7 @@ mod tests {
         let listing = exhausted_listing("1");
         launch("1.4.0", &listing, &path, T0);
         let (_, probes) = launch("1.4.0", &listing, &path, T0 + FAIL_CLOSED_BACKOFF_SECS - 1);
-        assert_eq!(probes, 0, "still inside the window");
+        assert_eq!(probes, 1, "inside the window: the newest tag only");
         let (_, probes) = launch("1.4.0", &listing, &path, T0 + FAIL_CLOSED_BACKOFF_SECS);
         assert_eq!(probes, MAX_RELEASE_PROBES);
     }
@@ -1191,6 +1275,138 @@ mod tests {
         );
         assert!(!result.checked);
         assert!(!path.exists(), "an Err is never recorded");
+    }
+
+    #[test]
+    fn a_release_published_under_an_unchanged_tag_list_ends_the_back_off() {
+        let (_dir, path) = record_file();
+        let listing = exhausted_listing("1");
+        launch("1.4.0", &listing, &path, T0);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = evaluate_with_backoff(
+            "1.4.0",
+            &listing,
+            &|tag, _| {
+                asked.borrow_mut().push(tag.to_string());
+                Ok(tag == "v1.6.5")
+            },
+            Some(&path),
+            T0 + 60,
+        );
+        assert!(result.checked && result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "1.6.5");
+        assert_eq!(*asked.borrow(), ["v1.6.5"], "one probe, the newest tag");
+        assert!(!path.exists(), "a published release clears the record");
+    }
+
+    #[test]
+    fn a_failing_replay_probe_fails_the_check_and_keeps_the_record() {
+        let (_dir, path) = record_file();
+        let listing = exhausted_listing("1");
+        launch("1.4.0", &listing, &path, T0);
+        let before = std::fs::read(&path).unwrap();
+        let result = evaluate_with_backoff(
+            "1.4.0",
+            &listing,
+            &|_, _| Err("curl is not installed".into()),
+            Some(&path),
+            T0 + 60,
+        );
+        assert!(!result.checked && !result.update_available, "{result:?}");
+        assert!(result.error.unwrap().contains("curl is not installed"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "record untouched");
+    }
+
+    #[test]
+    fn a_record_past_the_size_cap_is_no_record() {
+        let (_dir, path) = record_file();
+        let listing = exhausted_listing("1");
+        launch("1.4.0", &listing, &path, T0);
+        let mut padded = std::fs::read_to_string(&path).unwrap();
+        padded.push_str(&" ".repeat(MAX_RECORD_BYTES as usize));
+        std::fs::write(&path, padded).unwrap();
+        assert!(read_record(&path).is_none());
+        let (_, probes) = launch("1.4.0", &listing, &path, T0 + 60);
+        assert_eq!(probes, MAX_RELEASE_PROBES, "an oversized file probes");
+    }
+
+    /// A fake environment whose `ls-remote` counts its calls.
+    fn fake_env(
+        listing: &str,
+        path: &std::path::Path,
+        now: u64,
+        ls_calls: &std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> CheckEnv {
+        let listing = listing.to_string();
+        let calls = ls_calls.clone();
+        CheckEnv {
+            current_version: "1.4.0".to_string(),
+            ls_remote: Box::new(move || {
+                calls.set(calls.get() + 1);
+                Ok(listing.clone())
+            }),
+            published: Box::new(|_, _| Ok(false)),
+            record_path: Some(path.to_path_buf()),
+            now,
+        }
+    }
+
+    #[test]
+    fn run_check_makes_one_ls_remote_and_passes_the_record_path_and_clock_through() {
+        let (_dir, path) = record_file();
+        let listing = exhausted_listing("1");
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let first = run_check(&fake_env(&listing, &path, T0, &calls));
+        assert_eq!(calls.get(), 1, "exactly one ls-remote per launch");
+        assert!(!first.checked);
+        let record = read_record(&path).expect("the record landed at the env's path");
+        assert_eq!(record.recorded_at, T0, "the env's clock reached the record");
+        let second = run_check(&fake_env(&listing, &path, T0 + 60, &calls));
+        assert_eq!(calls.get(), 2, "still one ls-remote for the second launch");
+        assert_eq!(second, first);
+        // Past the window the same listing is probed again and re-recorded.
+        run_check(&fake_env(
+            &listing,
+            &path,
+            T0 + FAIL_CLOSED_BACKOFF_SECS,
+            &calls,
+        ));
+        assert_eq!(
+            read_record(&path).unwrap().recorded_at,
+            T0 + FAIL_CLOSED_BACKOFF_SECS
+        );
+    }
+
+    #[test]
+    fn run_check_reports_an_ls_remote_failure_without_probing() {
+        let (_dir, path) = record_file();
+        let mut env = fake_env("", &path, T0, &std::rc::Rc::new(std::cell::Cell::new(0)));
+        env.ls_remote = Box::new(|| Err("network unreachable".into()));
+        env.published = Box::new(|_, _| panic!("no probe without a listing"));
+        let result = run_check(&env);
+        assert!(!result.checked, "{result:?}");
+        assert_eq!(result.error.as_deref(), Some("network unreachable"));
+    }
+
+    #[test]
+    fn the_production_env_uses_the_real_version_record_path_clock_and_one_ls_remote() {
+        let before = now_unix();
+        let env = CheckEnv::production();
+        let after = now_unix();
+        assert_eq!(env.current_version, CURRENT_VERSION);
+        assert_eq!(env.record_path, record_path());
+        assert!(
+            env.record_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("update-check.json")),
+            "{:?}",
+            env.record_path
+        );
+        assert!((before..=after).contains(&env.now), "{}", env.now);
+        assert_eq!(
+            LS_REMOTE_ARGS,
+            ["ls-remote", "--tags", "--refs", REPOSITORY_URL]
+        );
     }
 
     #[test]
