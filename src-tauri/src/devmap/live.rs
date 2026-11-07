@@ -1119,6 +1119,67 @@ pub fn refresh_seeded_worktree(path: &str, run: SeededRefresh) -> LiveRefreshOut
     outcome
 }
 
+/// How long a worktree's removal waits for a live index build still writing
+/// into it before refusing.
+const REMOVAL_QUIESCE_BOUND: Duration = Duration::from_secs(3);
+
+/// How often a waiting removal retries the writer slot.
+const REMOVAL_QUIESCE_POLL: Duration = Duration::from_millis(25);
+
+/// The writer slot of a worktree that is being removed, held until the value
+/// drops. While it lives, every refresh of that path (probe or build) is turned
+/// away as `skip_building`, so nothing starts writing `.devcouncil/` into a
+/// directory that is about to be renamed aside and deleted.
+#[derive(Debug)]
+pub struct RemovalHold {
+    _permit: Option<cli::BuildPermit>,
+}
+
+/// Quiesce live index work in `path` before its worktree is removed.
+///
+/// Claims the repository's writer slot, the same one a probe and a build hold
+/// for their whole run ([`cli::claim_build`]). A claim that succeeds means no
+/// refresh is in flight and none can start; a claim that is refused waits for
+/// the build in flight, polling, for at most `bound`. There is no cancel: the
+/// build child is owned by procguard's run, which exposes no handle to stop
+/// it, so waiting it out is the only stop that leaves its files consistent.
+/// Past the bound this returns an error and the caller must leave the
+/// worktree exactly as it was.
+///
+/// A path that is not a valid, trusted repository cannot have a build keyed
+/// to it, so it has nothing to quiesce and holds nothing.
+fn quiesce_for_removal_within(path: &str, bound: Duration) -> Result<RemovalHold, String> {
+    let deadline = Instant::now() + bound;
+    loop {
+        match cli::claim_build(path) {
+            Ok(permit) => {
+                // An outcome parked for a worktree that is going away is
+                // never collected.
+                lock_finished_builds().remove(path);
+                return Ok(RemovalHold {
+                    _permit: Some(permit),
+                });
+            }
+            Err(cli::ClaimRefusal::Invalid(_)) => return Ok(RemovalHold { _permit: None }),
+            Err(cli::ClaimRefusal::Busy(_)) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "a devmap index build is still writing into {path} after {}s; the worktree was left in place, retry the removal shortly",
+                        bound.as_secs()
+                    ));
+                }
+                std::thread::sleep(REMOVAL_QUIESCE_POLL);
+            }
+        }
+    }
+}
+
+/// [`quiesce_for_removal_within`] with the standard bound
+/// ([`REMOVAL_QUIESCE_BOUND`]).
+pub fn quiesce_for_removal(path: &str) -> Result<RemovalHold, String> {
+    quiesce_for_removal_within(path, REMOVAL_QUIESCE_BOUND)
+}
+
 pub(crate) fn live_refresh(
     repo_path: &str,
     repo_changed: bool,
@@ -3516,5 +3577,225 @@ exit 2
             }),
             "expected seed --sync-delta --json on stacked lane, got:\n{log}"
         );
+    }
+    /// A just-created worktree whose seeded background refresh is still
+    /// writing into it, with a stub `devmap` that keeps writing new files
+    /// under the worktree until `release` appears (or `iterations` pass).
+    #[cfg(unix)]
+    struct RemovalFixture {
+        main: tempfile::TempDir,
+        stub_dir: tempfile::TempDir,
+        wt_parent: tempfile::TempDir,
+        wt: PathBuf,
+        _bound: cli::TestBinaryBinding,
+    }
+
+    #[cfg(unix)]
+    fn removal_fixture(iterations: u32) -> RemovalFixture {
+        use std::os::unix::fs::PermissionsExt;
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output_locked()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let main = tempfile::tempdir().unwrap();
+        git(main.path(), &["init", "-b", "main", "."]);
+        git(main.path(), &["config", "user.email", "t@gitpulse.local"]);
+        git(main.path(), &["config", "user.name", "Tester"]);
+        std::fs::write(main.path().join("README.md"), "hi\n").unwrap();
+        git(main.path(), &["add", "."]);
+        git(main.path(), &["commit", "-m", "init"]);
+        crate::test_support::trust_repo(main.path());
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("lane");
+        git(
+            main.path(),
+            &["worktree", "add", "-b", "lane", wt.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt);
+        write_stub_artifacts(&wt);
+        let stub_dir = tempfile::tempdir().unwrap();
+        let bin = stub_dir.path().join("devmap");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  i=0
+  while [ $i -lt {iterations} ] && [ ! -f "{stub}/release" ]; do
+    mkdir -p "{wt}/.devcouncil/codeintel/d$i"
+    echo x > "{wt}/.devcouncil/codeintel/d$i/f"
+    sleep 0.1
+    i=$((i+1))
+  done
+  printf '%s\n' '{{"ok":true,"unchanged":false}}'
+  exit 0
+fi
+exit 2
+"#,
+            stub = stub_dir.path().display(),
+            wt = wt.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
+        RemovalFixture {
+            main,
+            stub_dir,
+            wt_parent,
+            wt,
+            _bound: bound,
+        }
+    }
+
+    #[cfg(unix)]
+    impl RemovalFixture {
+        fn start_background_refresh(&self) {
+            let started =
+                refresh_seeded_worktree(self.wt.to_str().unwrap(), SeededRefresh::Background);
+            assert_eq!(
+                started.decision,
+                LiveRefreshDecision::Started,
+                "{started:?}"
+            );
+            // Let the child begin writing, as it does moments after create.
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        fn remove(
+            &self,
+        ) -> Result<crate::engine::worktree::WorktreeRemoval, crate::ipc_error::CommandError>
+        {
+            crate::engine::worktree::remove_worktree_with(
+                self.main.path().to_str().unwrap(),
+                self.wt.to_str().unwrap(),
+                true,
+                &mut |aside: &std::path::Path| std::fs::remove_dir_all(aside),
+            )
+        }
+
+        fn registered(&self) -> bool {
+            let out = std::process::Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(self.main.path())
+                .output_locked()
+                .expect("git worktree list");
+            String::from_utf8_lossy(&out.stdout).contains("/lane")
+        }
+    }
+
+    /// Removing a worktree moments after it was created used to race the
+    /// seeded background refresh: the build kept writing `.devcouncil/` into
+    /// the directory being deleted, and the delete failed "Directory not
+    /// empty" after the worktree was already deregistered.
+    #[test]
+    #[cfg(unix)]
+    fn removal_waits_for_the_seeded_refresh_and_leaves_no_directory() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
+        fixture.start_background_refresh();
+        // The refresh finishes a second after removal begins: well inside the
+        // wait's bound, long after an unguarded removal has returned.
+        let release_file = fixture.stub_dir.path().join("release");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            std::fs::write(release_file, "").unwrap();
+        });
+
+        let canon = canonical_repo_path(&fixture.wt);
+        let begun = Instant::now();
+        let removal = fixture.remove().expect("removal succeeds");
+        assert_eq!(removal.cleanup_error, None);
+        assert!(
+            begun.elapsed() >= Duration::from_millis(900),
+            "removal returned after {:?}, before the refresh was released",
+            begun.elapsed()
+        );
+        // Whatever the refresh still has to write, it writes before this.
+        let settled = Instant::now() + Duration::from_secs(30);
+        while live_build_slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&canon)
+        {
+            assert!(Instant::now() < settled, "the refresh never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!fixture.wt.exists(), "worktree directory is left behind");
+        assert!(!fixture.registered());
+        releaser.join().unwrap();
+    }
+
+    /// Once removal has begun nothing writes into the path again: no write
+    /// from the refresh in flight and no new refresh may recreate it.
+    #[test]
+    #[cfg(unix)]
+    fn no_refresh_writes_into_the_path_after_removal_starts() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
+        fixture.start_background_refresh();
+        let release_file = fixture.stub_dir.path().join("release");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::write(release_file, "").unwrap();
+        });
+
+        fixture.remove().expect("removal succeeds");
+        for _ in 0..20 {
+            assert!(
+                !fixture.wt.exists(),
+                "a refresh wrote into the removed worktree path"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        releaser.join().unwrap();
+        let _ = &fixture.wt_parent;
+    }
+
+    /// A refresh that outlives the bound: removal reports why and the
+    /// worktree stays registered and intact. It never deregisters and then
+    /// fails half-way.
+    #[test]
+    #[cfg(unix)]
+    fn removal_refuses_when_the_refresh_outlives_the_bound() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        let path = fixture.wt.to_string_lossy().into_owned();
+        let _release = ReleaseStub(fixture.stub_dir.path().to_path_buf());
+        fixture.start_background_refresh();
+
+        let started = Instant::now();
+        let err = fixture
+            .remove()
+            .expect_err("a refresh still writing must refuse the removal");
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
+            "the wait is unbounded: {:?}",
+            started.elapsed()
+        );
+        let message = err.into_message();
+        assert!(message.contains("devmap"), "{message}");
+        assert!(fixture.wt.exists(), "the worktree was touched");
+        assert!(
+            fixture.wt.join(".git").exists(),
+            "the worktree lost its .git link"
+        );
+        assert!(fixture.registered(), "the worktree was deregistered");
+        assert!(cli::is_build_in_flight(&path));
     }
 }

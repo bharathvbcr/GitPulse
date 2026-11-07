@@ -4368,6 +4368,9 @@ pub fn remove_worktree_with(
     delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<WorktreeRemoval, CommandError> {
     let repo = validate_repo(repo_path)?;
+    // A seeded background index refresh may still be writing into the target;
+    // hold its writer slot, bounded, before anything is renamed or deleted.
+    let _no_refresh = crate::devmap::live::quiesce_for_removal(&plain_path_text(target_path))?;
     let sweep_problems = sweep_teardown_asides(&repo).notes();
     let aside = {
         let _repo_lock = repo_mutation_lock(&repo);
