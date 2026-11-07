@@ -197,3 +197,33 @@ fn the_creating_status_of_a_healthy_ledger_carries_the_not_read_default() {
         "freshness was not read for this answer"
     );
 }
+
+/// A real failure already holds error_code, so `note_history_only_bindings`
+/// cannot replace it: the unknown flag is the only signal, and the brief reads
+/// only `error`. The brief must still not let a reader take the 0 as none.
+#[test]
+fn adv_brief_names_an_unknown_binding_count_when_another_error_holds_the_code() {
+    let (_dir, mut snapshot) = real_snapshot_with_one_event();
+    snapshot.ledger.error = "freshness could not be read".to_string();
+    snapshot.ledger.error_code = "freshness_failed".to_string();
+    snapshot.ledger.history_only_bindings = 0;
+    snapshot.ledger.history_only_bindings_unknown = true;
+    let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
+    assert!(
+        line.contains("bind") && (line.contains("unknown") || line.contains("could not")),
+        "BROKEN: the brief never reads history_only_bindings_unknown: {line}"
+    );
+}
+
+/// The tool's declared output schema must list every field the wire can carry.
+#[test]
+fn adv_ledger_events_schema_declares_history_only_bindings_unknown() {
+    let tool = crate::mcp::tools()
+        .into_iter()
+        .find(|t| t["name"] == "gitpulse_ledger_events")
+        .expect("tool");
+    assert!(
+        tool["outputSchema"]["properties"]["history_only_bindings_unknown"].is_object(),
+        "BROKEN: schema omits history_only_bindings_unknown, which the wire carries when true"
+    );
+}

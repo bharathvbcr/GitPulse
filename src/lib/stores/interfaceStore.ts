@@ -298,6 +298,13 @@ export interface InterfacePrefs {
    */
   terminalOptionAsMeta: boolean;
   /**
+   * Glide a mouse-wheel notch over about 150 ms instead of moving several rows
+   * at once (`terminal/scrollFeel.ts`). On by default; a trackpad always
+   * scrolls directly, and the system's reduced-motion preference turns the
+   * glide off whatever this says. Applied to live terminals.
+   */
+  terminalSmoothWheel: boolean;
+  /**
    * Draw terminals on screen through WebGL rather than the DOM (see
    * `terminal/gpuRenderer.ts`). On by default; turning it off returns every
    * live session to the DOM renderer at once, for a GPU or driver that draws
@@ -398,6 +405,7 @@ const DEFAULTS: InterfacePrefs = {
   terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
   terminalScreenReader: false,
   terminalOptionAsMeta: true,
+  terminalSmoothWheel: true,
   terminalGpu: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
@@ -560,6 +568,7 @@ function readPrefs(): InterfacePrefs {
       ),
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
       terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
+      terminalSmoothWheel: bool(parsed.terminalSmoothWheel, DEFAULTS.terminalSmoothWheel),
       terminalGpu: bool(parsed.terminalGpu, DEFAULTS.terminalGpu),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
@@ -825,6 +834,7 @@ function createInterfaceStore() {
       patch({ terminalAgentScrollback: clampTerminalScrollback(rows, TERMINAL_AGENT_SCROLLBACK_DEFAULT) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
     setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
+    setTerminalSmoothWheel: (on: boolean) => patch({ terminalSmoothWheel: on }),
     setTerminalGpu: (on: boolean) => patch({ terminalGpu: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>

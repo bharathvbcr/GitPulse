@@ -1345,6 +1345,12 @@ invocation gives the same picture: fsmonitor 1.29x slower at 977 files, 1.73x at
 was verified to be in effect (the `UNTR` extension is present in the index of
 the two variants that enable it) and made no measurable difference at any size
 here, with or without 3,000 untracked files, in either invocation.
+**Both invocations passed `-u` (all untracked files).** The 2026-11-06 section
+below ("Untracked cache, corrected twice") measured the same cache with the
+default untracked mode and found it about a quarter to a third faster there, and
+found that `-u` is what removes the gain; a re-run of this script on 2026-11-06
+reproduced the 1.00x here. The two agree: the cache does not help the
+invocation GitPulse itself uses.
 
 Daemon cost, per repository with the daemon on: **one extra process, about 8 MB
 resident, about 0.02 s of CPU over the whole run, 0.0 idle wakeups per second
@@ -1359,7 +1365,7 @@ continuously costs the daemon one event per write).
   100k), and it **costs 20 to 40 percent more** on the 1k to 3k-file repositories
   that are the common case, because every status then waits on a round trip to the
   daemon. The absolute saving at the top of the range, 20 to 50 ms per status,
-  is on a background read. `core.untrackedCache` showed no effect, and under
+  is on a background read. `core.untrackedCache` showed no effect on these `-u` invocations, and under
   `GIT_OPTIONAL_LOCKS=0` GitPulse's own status cannot refresh it.
 * **If a hint is ever added**, it is for `core.fsmonitor` only, shown only when
   the repository has at least 40,000 tracked files, `core.fsmonitor` is unset,
@@ -2202,3 +2208,283 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
 - **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
+
+
+## 2026-11-06: terminal scroll smoothness (ft-d779b65338ff15967e69baf8fa5fea7f)
+
+Owner report: flicker is fixed, scrolling could be smoother. This section is the bench, what it showed, the change it supports, and what it says about the framework. Figures are browser-harness figures from one M-series Mac (macOS 27, 60 Hz display, load not controlled), not the installed app.
+
+### What xterm 6.1.0-beta.317 does (source read, not remembered)
+
+- Defaults: `smoothScrollDuration` 0, `scrollSensitivity` 1, `fastScrollSensitivity` 5 (`node_modules/@xterm/xterm/src/common/services/OptionsService.ts:23,38,40`). GitPulse set none of them.
+- A wheel event's distance comes from `wheelDeltaY / 120` when the event has it, else `-deltaY / 40`, times 50 px (`browser/scrollable/mouseEvent.ts:233,247`, `browser/scrollable/scrollableElement.ts:23`). How many rows a notch moves therefore depends on the `wheelDeltaY` the platform reports for it: a Chromium-on-Windows notch (`deltaY` 100, `wheelDeltaY` 120) is 50 px, about 3 rows at the 13 px / 1.15 line height this terminal uses; a faster or accelerated wheel is more.
+- With a duration set, xterm animates only what its `MouseWheelClassifier` calls a physical wheel (`scrollableElement.ts:56,423-425`). That classifier scores a whole-number delta stream as a wheel, and a trackpad can send whole numbers, so GitPulse does not rely on it alone (`isWheelNotch`, below).
+- The viewport is row-quantized: `Viewport._handleScroll` rounds the pixel position to a row (`browser/Viewport.ts:212`) and both renderers index rows as `y + ydisp` (`addon-webgl/src/WebglRenderer.ts:458`; `browser/renderer/dom/DomRenderer.ts:537`). "Smooth" can only mean the same distance in smaller row steps.
+- No public call scrolls without the smooth viewport: `Terminal.scrollLines`, `scrollPages` and `scrollToLine` all go through `Viewport.scrollLines` (`browser/CoreBrowserTerminal.ts:702-707,728-732`), and `Terminal.scrollToBottom()` passes no argument (`browser/public/Terminal.ts:213-215`), though the core method has a `disableSmoothScroll` parameter (`CoreBrowserTerminal.ts:720`).
+
+### The bench
+
+`node scripts/terminal-scroll-bench.mjs <chrome|webkit> [rounds] [deadlineSeconds] [query]`, page `harness/terminal-scroll.html`, code `harness/scrollBench.ts` and `harness/scrollScript.ts`, unit tests `scripts/terminal-scroll-bench.test.ts`. Run it from the checkout to measure (Vite serves from the working directory).
+
+- **Trial:** a fresh 120 × 40 terminal with a 6,000-row scrollback, filled with 5,000 rows of colour-run text (`line` in `scrollScript.ts`), WebGL through the real `createGpuRenderer` and the attach `TerminalSession` uses, or the DOM renderer. Then one scripted gesture and 600 ms of settling.
+- **Input,** as `WheelEvent`s on `.xterm-screen`, one per animation frame (every scripted event that has come due is summed, as a browser coalesces them). A constructed event reports `wheelDeltaY` with the wrong sign and scale for xterm (Chrome: `+100` for `deltaY` 100), so `wheelEvent` sets it. The two relations used are **inferred**, not read from a device: `wheelDeltaY = -1.2 × deltaY` for the wheel inputs (100 px is a notch of 120 units, as Chromium reports on Windows) and `-3 × deltaY` for the trackpad inputs (120 units per 40 px, the relation xterm's `-deltaY / 40` fallback assumes). No real wheel or trackpad was available.
+  - `wheel`: 24 notches of `deltaY` 100, one per 70 ms: 50 px, about 3 rows each.
+  - `wheel-fast`: the same 24 events at three notches each (`deltaY` 300): a spun or accelerated wheel, about 10 rows each.
+  - `pixel`: trackpad-like, 120 Hz, fractional pixel deltas: 48 events of a finger phase, then momentum decaying 4% per event to under half a pixel.
+  - `pixel-int`: the same rounded to whole pixels, the case xterm's classifier would call a wheel.
+- **Output:** idle, or streaming 2 colour lines every 16 ms (about 125 lines/s) throughout. The scrollback is larger than the fill so streaming never trims the buffer and moves the viewport by itself.
+- **Metrics:** per animation frame, the time since the previous frame (p50, p95, max, frames over 18.5 ms, frames over 33 ms; 18.5 is 16.7 ms plus the 1.8 ms WebKit's whole-millisecond timestamps and vsync jitter add, so it reads "missed a vsync" on a 60 Hz panel), and the rows `viewportY` moved (largest step; stalls = frames that did not move between the first move and the last). Stalls are only a smoothness measure when the gesture moves more than a row per frame: at 3 rows per 70 ms (`wheel`) a perfectly even glide still has frames with no row boundary in them, so read `wheel` by its largest step and `wheel-fast` by both. Also the synchronous cost of the wheel dispatch and of the `onScroll` handler, and (`option-cost` lines) what two `smoothScrollDuration` writes cost on a full terminal: synchronous time per pair and the length of the next frame against a frame with no write, 30 pairs per renderer. "Gesture lost" is a streaming trial that ended with the view at the bottom.
+- **Design:** every round runs every arm once, in an order that rotates per round (`roundOrder`). Each metric is computed per trial and reported as min and median over the rounds; N = 5 per arm in the table. The WebKit runner is the system WKWebView (the app's engine), Chrome is headless Chrome; both ran. One WebKit page cannot run more than a few dozen WebGL trials (a 60-trial page never reported in 600 s; cause not investigated, WebKit's active-context cap in `gpuRenderer.ts` is the suspect), so the WebKit rows ran as one page per renderer, output and input. The classifier in xterm is a process-wide singleton with five items of memory, so the first events of a trial can be scored against the previous trial's; the rotation spreads that, it does not remove it.
+- **Not exercised:** fit and resize during a scroll, link scans, a warm glyph atlas (each WebGL trial starts with a cold one, so atlas uploads are inside every number), a display above 60 Hz, a real wheel or trackpad.
+
+### What it showed
+
+1. **Frame pacing is not the problem, with one exception.** On both engines and both renderers, idle and streaming, p50 is one vsync (Chrome 16.7 ms; WebKit 17 ms) and p95 is 16.7-19 ms. Frames over 33 ms: 0 in the 240 DOM trials of both engines; 6 in the 120 Chrome WebGL trials and 8 in the 120 WebKit WebGL trials, scattered across rows, before and after pooled in the table. The WebGL-only jank is **inferred** to be glyph-atlas upload on a cold atlas (every trial starts cold, DOM has no atlas, and the frames are rare and isolated); the bench did not isolate it, and it is the same before and after the change. The `onScroll` handler, including the `scrolledBack` write, costs at most 0.02 ms per event over the 480 trials (WebKit's 1 ms timer makes that an upper bound), most of its events being output lines. **No per-event Svelte write, fit or resize is attributable from these numbers, so none was changed.**
+2. **A discrete wheel moves in whole-row jumps.** With xterm's defaults a `wheel` notch moves 3 rows in one frame and then nothing until the next notch; a `wheel-fast` event moves 9-10. Both are 74 stalled frames of about 100 in a gesture, on every engine and renderer.
+3. **A smooth duration of 150 ms spreads them:** largest step 3 → 2 (`wheel`) and 9 → 5 (`wheel-fast`); `wheel-fast` stalls 74 → 3-7. The benefit grows with the size of the notch; at 3 rows a notch there is little left to smooth.
+4. **Trackpad-like input is not changed.** `pixel` and `pixel-int` are within the spread in every row (below), by design: the glide is on only while the gesture is notch-like.
+5. **Opening the glide opens a race with streaming output** (next section).
+
+Duration sweep (Chrome DOM, idle, N = 5, median; `"renderers=dom&streams=false&inputs=wheel,wheel-fast&smooths=0,100,150,250&guards=false,true"`): `wheel-fast` largest step 9 at 0 ms, 5 at 100, 150 and 250 (4 at 250 unguarded); stalls 74, 14 (4 guarded), 3-4, 3-4. `wheel` is 3 → 2 and 74 → 42-44 at every duration. 150 ms is the shortest duration at which the stalls are gone for the fast wheel and the largest step has stopped improving; longer only adds latency before the view reaches its target.
+
+### The race smooth scrolling opens, and the guard
+
+At the bottom, output moves the view (`ydisp` follows `ybase`) until the buffer counts the user as scrolling, which happens when a whole row of scroll reaches it (`common/services/BufferService.ts:143`). A smooth animation's first frames round to zero rows; a line of output landing in that window makes `Viewport._sync` see a `ydisp` it did not set and cancel the animation (`browser/Viewport.ts:195`). The gesture is swallowed and the view stays at the bottom.
+
+Measured with the first notch model (8 rows a notch, `wheelDeltaY = -3 × deltaY`; `"inputs=wheel&streams=true&smooths=150&guards=false,true"`), 150 ms and no guard: 5 of 50 streaming trials ended at the bottom in Chrome (4/25 WebGL, 1/25 DOM; earlier runs 3/50 and 2/10) and 1 of 10 in WebKit DOM, against 0 of every unsmoothed arm. In the final matrix below (the 3-row and 10-row notches) the same arm lost 1 of 80 streaming trials, and the guarded arm 0 of 80.
+
+The guard (`createScrollFeel` in `src/lib/terminal/scrollFeel.ts`) delivers one row at once on the first notch at the bottom, before xterm's own handler. A first version that called `scrollLines(-1)` without suspending the smoothing was **worse** (14/50 lost against 3/50): `Terminal.scrollLines` goes through the viewport and animates too, so it committed nothing. Because there is no public non-animated scroll, the guard writes `smoothScrollDuration` to 0 around that one call when the glide is on.
+
+**What the option writes cost.** Each write fires `onOptionChange`, which refreshes every row (and the DOM renderer rewrites its CSS). The bench's `option-cost` lines, 30 pairs per renderer per page:
+
+| engine | renderer | two writes, synchronous (min / median / max) | next frame (median / max) | control frame, no write |
+| --- | --- | --- | --- | --- |
+| Chrome | WebGL | 0.00 / 0.10 / 0.20 ms | 16.7 / 16.8 ms | 16.7 / 16.8 ms |
+| Chrome | DOM | 0.10 / 0.20-0.30 / 0.30-0.40 ms | 16.7 / 16.8 ms | 16.7 / 16.7-16.8 ms |
+| WebKit | WebGL | 0 / 0 / 1 ms (1 ms timer) | 16-17 / 18-22 ms | 16-17 / 18-19 ms |
+| WebKit | DOM | 0 / 0 / 1 ms (1 ms timer) | 16-17 / 19 ms | 16-17 / 18-28 ms |
+
+(Chrome: 2 pages per renderer; WebKit: 8 pages per renderer; ranges are across pages.) Under a frame on both engines and both renderers, so the cost is accepted; it is paid at most twice per gesture that starts at the bottom with the glide already on, once when the device changes, and never per event.
+
+### Device class, setting, reduced motion
+
+The glide is on only while the current gesture is a wheel notch, so xterm's own classifier is never the only thing standing between a trackpad and an animation.
+
+- `isWheelNotch` judges one event: `deltaMode` lines, or `wheelDeltaY` a non-zero multiple of 120 (xterm divides it by 120); sub-pixel deltas (under 1 px) are never a notch; with no `wheelDeltaY` (Gecko) a whole-number `deltaY`. A gesture is the events within 250 ms of each other; the first decides its class and any later non-notch event ends the notch class for the rest of it (`createGestureClassifier`). The duration is written only when the class changes, at the first event of a gesture or on a switch of device, not per event.
+- The guard fires only for a notch, so a trackpad's resting jitter (`deltaY` -0.1) never moves a row.
+- **Settings → Appearance → Smooth mouse-wheel scrolling in terminals** (`terminalSmoothWheel`, on by default, applies to open terminals at once). The system's `prefers-reduced-motion: reduce` turns the glide off whatever the setting says, follows changes live, and its listener is removed when the terminal is torn down.
+- **Diagnostic, opt-in:** `localStorage.setItem("gitpulse.debug.wheel", "1")`, then open a terminal. The last 50 wheel events (`deltaY`, `wheelDeltaY`, `deltaMode`, the event's verdict and the gesture's) are readable as `__gitpulseWheelLog()` in the Web Inspector console and each is written to `console.debug("[gitpulse-terminal]", "wheel", ...)` (Verbose level). See docs/TERMINAL.md for how to read it. This is the 2-minute check for whether a real mouse and trackpad are classified as the table assumes.
+
+### Before and after (N = 5 rounds per cell)
+
+"before" is xterm's defaults (`smoothScrollDuration` 0); "after" is what ships: the glide for notches, the guard, and the classifier (the bench's `guard` arm is `createScrollFeel`). p95 and max are the minimum over the rounds, the others the median. The last column is gestures lost to streaming output: before, then smooth 150 without the guard or classifier, then with them.
+
+| engine | renderer | input | output | n | p50 ms | p95 ms (min) | max ms (min) | frames >18.5 ms (med) | frames >33 ms | max rows/frame | stalls (frames) | gestures lost to output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Chrome | webgl | wheel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel-fast | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 2 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel-fast | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 11 → 10 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 11 | 14 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel-int | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 9 → 10 | 16 → 18 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel-int | stream | 5 | 16.7 → 16.7 | 16.8 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 9 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 45 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel-fast | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.7 | 0 → 0 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel-fast | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 11 | 16 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 10 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel-int | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 9 → 10 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel-int | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 9 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel | idle | 5 | 17.0 → 17.0 | 18.0 → 19.0 | 19.0 → 19.0 | 4 → 15 | 0 | 3 → 2 | 74 → 45 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 6 | 0 | 3 → 2 | 75 → 43 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel-fast | idle | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 30.0 → 21.0 | 14 → 12 | 1 | 9 → 5 | 74 → 7 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel-fast | stream | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 30.0 → 22.0 | 8 → 7 | 0 | 9 → 5 | 74 → 7 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel | idle | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 25.0 → 24.0 | 8 → 15 | 2 | 8 → 10 | 15 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel | stream | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 26.0 → 20.0 | 9 → 6 | 1 | 10 → 10 | 15 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel-int | idle | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 20.0 → 20.0 | 12 → 7 | 2 | 8 → 7 | 18 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel-int | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 24.0 → 21.0 | 10 → 7 | 1 | 10 → 8 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel | idle | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 19.0 → 19.0 | 14 → 14 | 0 | 3 → 2 | 74 → 42 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 4 | 0 | 3 → 2 | 74 → 43 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel-fast | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 8 → 5 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel-fast | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 7 | 0 | 9 → 5 | 74 → 3 | 0/5 → raw 1/5, guarded 0/5 |
+| WebKit | dom | pixel | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 7 → 8 | 0 | 9 → 7 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 3 → 5 | 0 | 7 → 7 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel-int | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 9 → 8 | 0 | 7 → 7 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel-int | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 7 → 4 | 0 | 7 → 7 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+
+Reading it: for `wheel-fast`, the largest step falls from 9 rows to 5 and the stalled frames from 74 to 3-7, on both engines and both renderers, idle and streaming; for `wheel` the largest step is 3 → 2 and stalls 74 → 42-45. p50 and p95 are unchanged within the 1 ms timer grain. Frames over 18.5 ms have no consistent direction (Chrome 0 → 0 in all 8 wheel rows; WebKit 3 of 8 rows higher, 5 lower or equal, for example 4 → 15 in WebGL idle `wheel` and 14 → 12 in WebGL idle `wheel-fast`; identical arms swing that far). For `pixel` and `pixel-int` the largest step and stalls are within about two rows, in both directions, in all 16 rows (WebKit `pixel-int`, which an earlier version of this change made worse, is 7 → 7 to 10 → 8). `scripts/terminal-scroll-bench.mjs` asserts what the table assumes: every gesture moved toward history, streaming did not pull a scrolled-back view to the bottom, a smoothed arm ends within a row of the unsmoothed one, and the option-cost probe ran (the runs above passed all of them).
+
+**What this does not settle.** The classifier is judged on the bench's two inferred `wheelDeltaY` relations. A real mouse whose notches are not multiples of 120 in `wheelDeltaY` (a macOS mouse may report others; not checked) is taken for direct input and gets no glide, which is today's behaviour, not a regression; the diagnostic above shows whether that is happening. Use it with the mouse and the trackpad on the installed app before relying on the table.
+
+### What changed
+
+- `src/lib/terminal/scrollFeel.ts`: `SMOOTH_SCROLL_MS = 150`, `scrollFeelOptions()`, `isScrolledBack()`, `isWheelNotch()`, `createGestureClassifier()`, `createScrollFeel()` (glide per gesture class, guard, reduced-motion listener, `refresh()` and `detach()`), `attachScrollGuard()`. `src/lib/terminal/wheelDiagnostic.ts`: the opt-in log.
+- `TerminalSession.svelte`: the options, `isScrolledBack` in `onScroll` (same expression as before), `createScrollFeel` after `open()`, `refresh()` on the setting, `detach()` on teardown. `interfaceStore.ts`, `settingsCatalog.ts`, `SettingsModal.svelte`: `terminalSmoothWheel`, following `terminalOptionAsMeta`.
+- Tests: `scrollFeel.test.ts` (real xterm buffer: scrolled back while output streams stays put and "Latest output" clears it; `scrollOnUserInput` still returns a typed-into view to the bottom; wiring), `scrollFeel.device.test.ts` (classifier, gestures, setting, reduced motion with listener teardown, bounded option writes, the diagnostic), `scrollFeel.adv.test.ts` (review's edge cases on a real xterm; its option-write test now asserts the bound above, with the measurement as its justification), the `interfaceStore` test for the setting, `scripts/terminal-scroll-bench.test.ts`. The race itself is only reproducible in a browser; the bench's streaming check and its "gestures lost" column are its regression test.
+
+### Where the limit is: an owner decision, not built
+
+What is left after the change is whole-row quantization: a trackpad flick still moves up to 7-11 rows between two frames, because xterm moves `ydisp` in integer rows and both renderers draw row `y + ydisp` at an integer position (sources above). A notch is now spread over several frames in steps of at most 2 rows (`wheel`) or 5 (`wheel-fast`), which is as fine as whole rows get at this font size. What a sub-row renderer would take, from the same reading (**inferred**, not prototyped):
+
+- a fractional scroll offset carried from `Viewport` (which already holds a fractional `scrollTop` and rounds it) into the render model, and a translate of the row layer by `scrollTop mod cellHeight`: a DOM-renderer change (one extra transform on the rows container) and, for WebGL, a vertical offset in the cell and glyph vertex shaders plus one extra row drawn at each edge so the translated layer has no gap;
+- selection, link hover, cursor, search decorations and the IME helper position all assume integer rows; each needs the same offset or they drift by up to a row during a scroll;
+- it has to be carried as a patch to `@xterm/xterm` and `@xterm/addon-webgl` (neither exposes it), re-applied on every bump of the beta pins, or replace xterm: the 2026-10-28 ghostty-web spike above measured 2.3x the CPU and 2-4x slower floods and is not an option as it stands.
+
+This bench would be the gate for it: the same `stalls` and `maxStep` columns, plus a sub-row measure it does not have yet. Not started.
+
+### Reproduce
+
+```
+node scripts/terminal-scroll-bench.mjs webkit 5 300 "renderers=dom&streams=true&inputs=wheel-fast&smooths=0,150&guards=false,true"
+node scripts/terminal-scroll-bench.mjs chrome 5 600 "renderers=dom&streams=false&smooths=0,150&guards=false,true"
+```
+
+Keep a WebKit page under about 15 WebGL trials (`3 arms x rounds`); a Chrome page ran 60.
+
+## 2026-11-06: git spawn profile (ft-bb756f5e, Phase 1)
+
+Bench: `cargo bench --manifest-path src-tauri/Cargo.toml --bench git_inprocess_reads`. The question was which git processes GitPulse starts on its hot read paths, so that an in-process reader is built only for reads that are hot.
+
+**Method.** A fixture repository (600 files, 61 commits, 18 worktrees with a dirty file in each linked one, 120 branches, 30 tags) is driven through one *refresh*: `get_status`, `current_branch`, `head_id`, `list_branches`, `list_tags`, `branch_stats`, `read_commit_history_paged`, `list_worktrees` (Full and Listing) and `insights::snapshot`. Git's own trace2 logs every process (`GIT_TRACE2_EVENT` through the hermetic global config), so nothing can escape the count. Each process is reduced to an argv shape (subcommand and flags; refs, paths, oids and the app's `-c` pairs dropped). Wall time is trace2's own start-to-exit figure: it leaves out fork/exec and pipe drain, so it is a floor on what the caller waited. Nested processes (git starting git) are reported separately; there were none.
+
+- **idle**: one uncounted warm-up refresh (counting rewrites the global config the ref cache stamps, so the first read in a counted block is always cold), then 12 refreshes of an unchanged repository.
+- **active**: the same, with one file rewritten, one commit and one branch moved before each refresh (12 times). Fixture git calls are told apart by lacking the app's `-c`; none were mis-attributed (the idle run asserts every process has `-c`).
+- The app's refresh is event-driven, not a timer, so the per-minute figure assumes 12 refreshes a minute and is an assumption; the per-refresh figure is the measurement.
+
+Host load 17.4 on 18 cores for this run (74 for an earlier run with the same counts and shapes, times about 1.4x lower). Times are for ranking, counts are exact. One run each.
+
+### Idle (715 processes, 59.6 per refresh, 29.0 s git wall over 12 refreshes)
+
+| rank | by count | n | total wall | each |
+| --- | --- | --- | --- | --- |
+| 1 | `status --porcelain=v1 -u -z` | 456 | 21,709 ms | 47.6 ms |
+| 2 | `diff --no-ext-diff --shortstat` | 204 | 6,734 ms | 33.0 ms |
+| 3 | `worktree --porcelain -z` | 36 | 414 ms | 11.5 ms |
+| 4 | `symbolic-ref --quiet` | 12 | 60 ms | 5.0 ms |
+| 5 | `for-each-ref --format=%(refname)%00%(objectname)` | 2 | 15 ms | 7.3 ms |
+
+By wall time the order is the same for the first four; the fifth is `for-each-ref --format=%(HEAD)...` (1 x 31 ms).
+
+### Active (1,073 processes, 89.4 per refresh, 35.0 s git wall)
+
+| rank | by count | n | total wall | each |
+| --- | --- | --- | --- | --- |
+| 1 | `status --porcelain=v1 -u -z` | 456 | 24,691 ms | 54.2 ms |
+| 2 | `diff --no-ext-diff --shortstat` | 204 | 6,578 ms | 32.3 ms |
+| 3 | `symbolic-ref --quiet` | 132 | 810 ms | 6.1 ms |
+| 4 | `for-each-ref --format=%(refname)%00%(objectname)` | 73 | 685 ms | 9.4 ms |
+| 5 | `remote` | 60 | 332 ms | 5.5 ms |
+
+By wall time the fifth is `worktree --porcelain -z` (36 x 373 ms total).
+
+### What it says
+
+- `status` and `diff --shortstat` are 92% of idle processes and 98% of idle git wall time (28.4 of 29.0 s). Per refresh that is 38 `status` and 17 `diff --shortstat`: one per worktree, from the worktree listing at Full depth and the insights snapshot, each of which scans the working tree.
+- The reads an in-process reader could answer from refs and the commit graph (`symbolic-ref`, `rev-parse`, `for-each-ref`, `merge-base`, `rev-list`, `show-ref`, `remote`) are **17 processes, 2.4% of idle count and 0.4% of idle wall**. In the active scenario, where every refresh follows a ref move, they are 349 processes (32.5% of count) but 2.9 s of 35.0 s (8.4%) of wall time.
+- Phase 2 was **not started**. The card's gate says to stop when the hot spawns are not reads that can be answered safely in-process. The hot ones here are working-tree scans, which depend on the index and the file system and not on refs or the commit graph, and the ref reads that are left are cheap (2 to 9 ms) after the ref cache. Removing all of them would save at most about 0.4% of idle wall and 8% of active wall.
+- Where the time is: the worktree listing and the snapshot each scan every worktree. Making that scan once per refresh, or skipping worktrees whose index and HEAD stamps have not moved, is the lever; neither is a ref read. Recommended as its own card.
+
+## 2026-11-06: repository tuning thresholds (ft-6b68be32)
+
+The Storage panel may offer, and on a click apply, three changes: `core.untrackedCache`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
+
+**Method.** `scripts/bench-git-tuning.mjs <packs|loose|files>`: throwaway repositories under a scratch directory built with `git fast-import` (4,000 commits, 4 changed files each, 2,000 files, for `packs`; 500 files for `loose`), git 2.54.0 (Apple Git-157), `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_OPTIONAL_LOCKS=0`, `core.commitGraph=false` so object lookups are what is timed. Arms are interleaved (every round runs each arm once, order rotated), 9 rounds (7 for `files`), min of N reported. The machine was loaded the whole time (load average 17 to 40 on 18 cores, M5 Pro, macOS 27), so the noise floor is wide: at `packs=1` the three arms are the same repository content and differed by up to 1.21x on a history walk and 0.63 to 1.96x on `status`. **`status` figures from `packs` and `loose` are therefore not used**; a history-walk ratio is read only when it is clearly outside about 1.2x. The tables give min-of-9 ratios against the baseline arm (below 1 is faster); raw logs were kept in the lane scratch directory, not committed.
+
+### Packs, and a multi-pack-index (`packs`)
+
+One pack is the baseline. The packs were cut from the same history (`pack-objects` per slice), 286 being 4,000 commits one slice each.
+
+| packs | rev-list --count | log -n 200 --stat | log -- path | rev-list --objects |
+| --- | --- | --- | --- | --- |
+| 10 | 0.94 | 0.89 | 1.09 | 0.97 |
+| 30 | 1.05 | 1.01 | 1.10 | 1.02 |
+| 100 | 1.23 to 1.44 | 1.04 to 1.13 | 1.32 to 1.38 | 1.15 to 1.22 |
+| 286 | 1.78 to 1.97 | 1.43 | 1.61 to 1.86 | 1.59 to 1.77 |
+
+(Where two figures are given they are the two runs, `packs.md` then `packs2.md`.) Many packs cost a history walk 1.2 to 1.4x at 100 and 1.6 to 2.0x at 286, and nothing outside noise at 30 or fewer. Two things did **not** help, and are why pack count is not an offer:
+
+* A multi-pack-index written over the many packs was no faster than the many packs themselves (`rev-list --count` 1.03, 0.91, 1.11, 1.44, 1.97 against 0.97, 0.94, 1.05, 1.44, 1.97 for no index). It is reported by the detector (`midx`) and not offered.
+* One `git maintenance run --task=incremental-repack` over 100 and 286 equal-sized packs left 101 and 287 packs (it added one), and the walk was as slow as before (1.33 and 1.96x `rev-list --count`). Consolidating them is `git repack -a -d`, a different and heavier action that this change does not offer.
+
+### Loose objects (`loose`)
+
+The same history held as loose objects, against packed.
+
+| loose objects | rev-list --count | log -n 200 --stat | log -- path | rev-list --objects |
+| --- | --- | --- | --- | --- |
+| 1,571 | 1.31 | 8.0 | 1.67 | 2.76 |
+| 5,471 | 2.00 | 8.9 | 4.03 | 6.70 |
+| 15,235 | 3.18 to 4.80 | 8.2 to 9.2 | 7.2 to 7.6 | 12.6 to 12.8 |
+| 39,690 | 7.98 | 11.8 | 12.0 | 16.1 |
+
+After one `git maintenance run --task=loose-objects` on the 15,235-object repository the walk was back to the packed figure: 1.09, 1.00, 1.04 and 1.10x for the four operations (one pack made; the loose copies are left for `prune-packed`). That is the action `git maintenance start` schedules, and the one measured benefit that supports an offer.
+
+### Untracked cache (`files`), corrected twice
+
+The first version of this section compared a plain repository against one with `feature.manyFiles` whose index had been rewritten and whose untracked cache primed, and showed `status` at 0.28 to 0.87x. A review control (a plain repository after one ordinary, index-refreshing `git status`) matched the primed arm, so that comparison is withdrawn, with its index-size figures. The re-measurement below replaced it, and a second pass then found that its headline number did not apply to GitPulse's own status reads.
+
+**Method.** Four repositories per size from one `fast-import` commit (N files in 100 directories, one untracked `extra.txt`): `default`, `default-b` (a second plain copy, the identical-arm control), `manyFiles` (`feature.manyFiles=true`) and `untracked cache only` (`core.untrackedCache=true`). In all four, one ordinary `git status` with `GIT_OPTIONAL_LOCKS` unset, so git may write the index. Then reads with `GIT_OPTIONAL_LOCKS=0` are timed, interleaved, min of 11 to 15 rounds. Load average 10 to 30 on 18 cores. `scripts/bench-git-tuning.mjs files`.
+
+Noise floor: the identical-arm control differed from `default` by 0.96 to 1.06x on every operation.
+
+| invocation | files | manyFiles | untracked cache only |
+| --- | --- | --- | --- |
+| `git status --porcelain` (default untracked mode) | 20,000 | 0.69, 0.69, 0.69, 0.71, 0.74 | 0.74, 0.72, 0.77 |
+| | 40,000 | 1.00, 0.67, 0.68 | 0.65 |
+| | 100,000 | 0.63, 0.66, 0.89 (heavy load) | 0.93 (heavy load) |
+| `git status --porcelain -z` | 20,000 | 0.68 | 0.74 |
+| **`git status --porcelain -u`** (all untracked files) | 20,000 | 0.97 | 1.01 |
+| **GitPulse's argv** (`-c core.quotepath=off status --porcelain=v1 -u -z`) | 20,000 | 0.98, 1.04 | 0.98, 1.04 |
+| | 40,000 | 1.00 | 0.97 |
+
+(Each cell is one run; the control, `ls-files` and one-file `add` stayed 0.90 to 1.07x throughout.)
+
+What it shows, and what it does not:
+
+* **An ordinary `git status` is about a quarter to a third faster** with the untracked cache, in nearly every run at 20,000 and 40,000 files, well outside the noise floor. One 40,000-file run showed no gain and one 100,000-file run under heavy load showed 0.89 to 0.93x.
+* **`-u` is what removes the gain, not `-z`.** With `--untracked-files=all` the cache did nothing measurable (0.97 to 1.04x). GitPulse's own status reads (`GitReader::STATUS_ARGV`) pass `-u`, so **this change does not speed up GitPulse's own reads**. It speeds up a person's own `git status` in a terminal, and any tool that runs it in the default mode. The earlier table was labelled "GitPulse-style" because it set `GIT_OPTIONAL_LOCKS=0`, but it used the default untracked mode; that label was wrong.
+* **The gain is the untracked cache's, not the index format's.** After the refreshing `status` the `manyFiles` index was still format 2 (read from the header) and about 4.6 KB (4,586 to 4,587 bytes) **larger** than the plain one (the untracked-cache extension), not smaller. The cache-only arm matched `manyFiles`. `index.version=4` and `index.skipHash` were not shown to help, and they carry the compatibility costs (git older than 2.40 reports a corrupt skipHash index on `fsck`, git older than 2.13 refuses the index). So the offer is `core.untrackedCache`, not `feature.manyFiles`; the latter is detected and reported, never offered or written.
+* **The gain needs git to write the index once with the cache**, which is the next ordinary `git status` (with locks) after the key is set. Nothing changes at the click, and GitPulse's own reads cannot do it, because `GIT_OPTIONAL_LOCKS=0` never lets `status` write the index. The preview says so.
+* Direct evidence for the cache alone is the `untracked cache only` column (five runs). The `manyFiles` cells attribute to it by inference.
+
+**Reconciliation with the 2026-10-13 spike below.** That spike's "`core.untrackedCache` showed no effect" does not contradict this; both are right for the invocation they measured. The spike timed GitPulse's argv in `gitpulse` mode and `status --porcelain=v1 -u -z` in `plain` mode, both with `-u`; it did let git write the index (two ordinary priming runs) and checked the `UNTR` extension was present. I re-ran that script today on a synthetic 40,000-file repository: `untrackedCache` 1.00x (gitpulse argv) and 0.95x (plain argv, which still has `-u`) with `UNTR` present, and `fsmonitor` 0.71x and 0.75x, the same picture as its table. The difference is the untracked-files mode, `-u` against the default, shown directly in the table above. The spike's table stands for the invocation it measured, and that note is added under it.
+
+**Threshold.** 20,000 tracked files, the smallest size measured. The offer is a strict subset of what the owner approved (one of the two config keys, `core.untrackedCache`, in place of `feature.manyFiles`). A repository whose index is a split index (the `link` extension, or a `sharedindex.*` file beside an unreadable index), with `core.splitIndex` set, or with a split index in another worktree, is never offered it. On git 2.54, `feature.manyFiles` over a split index was reproduced breaking add-then-commit and crashing `git status`; `core.untrackedCache` alone over a split index (in config, as the index's own extension, and with a delta past `splitIndex.maxPercentChange`) was run for several add, commit and status rounds at 5,000 and 30,000 files and did not reproduce it. It is refused anyway, because which part of `feature.manyFiles` breaks the split index was not isolated.
+
+**Undo.** `git config --local --unset core.untrackedCache` alone leaves the untracked cache in the index: git keeps what the index has when the key is unset, and it stayed after a further index write (run on git 2.54, `UNTR` present before and after). `git update-index --no-untracked-cache` removes it, with no warning when run after the unset; `git help update-index` says it takes effect immediately, whatever the key. The preview lists both, in that order, and runs neither.
+
+### fsmonitor
+
+Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,000 tracked files, parity near 6,000, 20 to 45 percent faster at 40,000 and above. **40,000 tracked files**, on macOS only (the only platform measured), and only for git 2.36.0 or newer. The boolean value and the built-in daemon arrived in 2.36.0: git's `Documentation/config/core.txt` at v2.35.1 and v2.35.2 describes only a hook command, and at v2.36.0 it says that if `core.fsmonitor` is set to true git enables the built-in daemon, and that older git reads `true` as a hook path. It was not re-measured today.
+
+### Thresholds, as shipped
+
+| change | offered when | evidence |
+| --- | --- | --- |
+| `core.untrackedCache` | 20,000 or more tracked files (exact count, index walked and valid), key unset, `feature.manyFiles` not on, no split index here or in another worktree | the corrected `files` table; speeds an ordinary `git status`, not GitPulse's own `-u` reads. `feature.manyFiles` is detected, never offered |
+| `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.36.0 or newer | the 2026-10-13 spike |
+| `git maintenance start` | about 6,700 or more loose objects and past `gc.auto`, not registered, `gc.auto` and `maintenance.auto` not turned off | the `loose` table and the `loose-objects` task row |
+| pack count, multi-pack-index | never offered; reported only | the `packs` tables |
+
+An unset key is the only one offered for: any value the person set (`false`, a hook path, `true`) is respected.
+
+## 2026-11-07: worktree create critical path, BEFORE (ft-8de63fe1c732adcc2fecf7da50053f4f, branch `b1106/worktree-create-fast`)
+
+`cargo bench --manifest-path src-tauri/Cargo.toml --bench worktree_create` drives `engine::worktree::add_worktree_with_devmap` with the arguments `gitpulse_worktree_create` passes (default `CacheSelection`, `DevmapMode::Copy`, hooks on) on a trusted synthetic fixture: 3 000 tracked files plus 400 Rust files, an ignored `node_modules` of 25 000 small files, and a nested `sub/Cargo.toml` with a 300-file `sub/target`. `GITPULSE_BENCH_REPO=<path>` runs it on a real checkout instead. Rows are interleaved with a rotating start; `t_*` are milliseconds after `.git` appeared, polled every 2 ms.
+
+Smoke run, n=3 (1 warmup), release profile, load 12.4 on 18 cores, current source (main 064839f0), APFS. This is the only BEFORE reading so far. It is n=3 and the phase poller in that run mis-named two paths (checkout, nested target) and the fixture has no `cas/`, so only four phases were seen; the poller is fixed in the committed bench but not re-run, see below.
+
+| row | min | p50 | max | notes |
+| --- | --- | --- | --- | --- |
+| create e2e (share_cache) | 1.32 s | 1.43 s | 2.64 s | t_store 817 ms, t_csr 820 ms, t_overlay 955 ms, t_node_modules 1331 ms (medians) |
+| `cp -c -R node_modules` (baseline) | 2.99 s | 3.22 s | 3.92 s | the fixture's 25k files |
+| `clone_ignored_caches` (node_modules + sub/target) | 515 ms | 587 ms | 712 ms | 2 caches |
+| `sync_worktree_overlay` alone | 53 ms | 74 ms | 126 ms | clean worktree, no deltas |
+
+What this says, and what it does not:
+
+- On current source the node_modules clone is already faster than one `cp -c -R` (0.59 s against 3.2 s for the whole cache clone, both caches). `clone_tree` (`engine/cow_clone.rs`) takes `clonefile(2)` on the directory root for a non-`require_clone` copy, and only falls back to `copyfile` recursion. So per-file walking is not what the create path does on macOS today. The 15-17 s on the card was measured on the installed binary, which predates 29a61881 (per the card); it is not reproduced here.
+- The overlay sync is not a 9 s gap on this fixture (the whole alone-call is 74 ms, the create reaches overlay.json at about 0.96 s, concurrent with the cache clone). A real repository's gap is not reproduced by this fixture; it needs a run on the real shape (`GITPULSE_BENCH_REPO`), which was not completed (below).
+- The fixture's `sub/target` is 300 files. A real `src-tauri/target` is about 10 GB and goes through `rewrite_build_outputs`; that is the likely remaining cost and is not measured here.

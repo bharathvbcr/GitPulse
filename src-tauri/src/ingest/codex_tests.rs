@@ -624,6 +624,42 @@ fn a_resume_that_cannot_recover_the_context_counts_the_calls_instead_of_placing_
     );
 }
 
+/// A resume whose replay does not fit what is left of the pass's budget is
+/// deferred, never dropped: the pass says it was cut short (so it is not a
+/// finished catch-up), and the next pass, with its budget back, reads it.
+#[test]
+fn a_resume_deferred_by_the_budget_leaves_the_pass_truncated_and_is_read_next_pass() {
+    let pair = Pair::new();
+    let w1 = &pair.wt[0];
+    let codex = tempfile::tempdir().unwrap();
+    let claude = tempfile::tempdir().unwrap();
+    let path = rollout_path(codex.path(), "DEFER");
+    write_lines(&path, &[session_meta("DEFER", w1), run(1, "first", w1)]);
+
+    let (first, deferred, next) = with_roots(Some(claude.path()), Some(codex.path()), || {
+        let first = pair.pass();
+        append_text(&path, &(run(5, "later", w1) + "\n"));
+        pass::RESUME_BUDGET.with(|budget| budget.set(Some(0)));
+        let deferred = pair.pass();
+        pass::RESUME_BUDGET.with(|budget| budget.set(None));
+        (first, deferred, pair.pass())
+    });
+
+    assert!(first.finished(), "{first:?}");
+    assert_eq!(deferred.recorded, 0, "{deferred:?}");
+    assert!(deferred.truncated, "{deferred:?}");
+    assert!(
+        !deferred.finished(),
+        "a deferred resume read as finished: {deferred:?}"
+    );
+    assert!(
+        deferred.error.contains("deferred to the next pass"),
+        "{deferred:?}"
+    );
+    assert_eq!(next.recorded, 1, "the deferred call was dropped: {next:?}");
+    assert!(next.finished(), "{next:?}");
+}
+
 fn call(second: u32, payload: serde_json::Value) -> String {
     envelope(second, "response_item", payload)
 }

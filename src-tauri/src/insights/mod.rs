@@ -1116,6 +1116,7 @@ fn snapshot_observed(
             dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
             catch_up_failures: 0,
             history_only_bindings: 0,
+            history_only_bindings_unknown: false,
             error: error.to_string(),
             error_code: error.code.to_string(),
             freshness: crate::ledger::Freshness::unavailable(error.to_string()),

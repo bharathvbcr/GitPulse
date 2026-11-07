@@ -214,7 +214,7 @@ export async function loadWork(
     // A section that failed inside an otherwise usable context degrades this
     // source too: the runs list being empty because `gh` choked is not the
     // same fact as there being no runs.
-    const details = [github.v.runs_error, ...(github.v.warnings ?? []),
+    const details = [github.v.prs_error, github.v.runs_error, ...(github.v.warnings ?? []),
       github.v.prs_truncated ? "pull request list truncated" : "",
       github.v.runs_truncated ? "workflow run list truncated" : ""].filter(Boolean);
     sources.github = details.length ? failed(details.join("; ")) : { ...READ };

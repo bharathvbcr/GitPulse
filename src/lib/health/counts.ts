@@ -76,9 +76,35 @@ function resolve(count: SectionCount): { shown: number; observed: number; atLeas
 
 export function formatSectionCount(count: SectionCount): string {
   const { shown, observed, atLeast } = resolve(count);
+  if (atLeast && observed === 0) {
+    // "at least 0" is no information at all: nothing survived the cut and what
+    // was cut is unknown, so say that instead of printing a floor of zero.
+    return count.qualifier ? `${count.qualifier} count unknown` : "count unknown";
+  }
   const head = atLeast ? `at least ${observed}` : `${observed}`;
   const qualified = count.qualifier ? `${head} ${count.qualifier}` : head;
   return observed > shown ? `${qualified}; showing ${shown}` : qualified;
+}
+
+/**
+ * The sentence for a vulnerability list that is empty although the audit
+ * counted findings (`audit.total` is not 0).
+ *
+ * `cap_report` keeps the most severe rows, so when the scan cap fired the rows
+ * that were dropped are the least severe and their directness was never
+ * surfaced: an empty Direct list proves nothing about them. The direct-specific
+ * sentence is only true when nothing was dropped, and says nothing about
+ * directness under the All filter.
+ */
+export function vulnerabilityEmptyMessage(filter: "all" | "direct", capped: boolean): string {
+  if (filter === "direct") {
+    return capped
+      ? "No direct advisories are in the rows kept by the scan cap. The dropped rows may include direct advisories."
+      : "No direct dependencies are vulnerable.";
+  }
+  return capped
+    ? "The scan cap dropped every vulnerability row; the audit counted more than is shown."
+    : "No vulnerabilities to show.";
 }
 
 /**

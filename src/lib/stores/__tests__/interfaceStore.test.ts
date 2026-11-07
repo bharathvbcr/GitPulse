@@ -790,6 +790,30 @@ it("treats GPU terminal rendering as on by default, switchable, and falls back t
   }
 });
 
+it("treats smooth mouse-wheel scrolling as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalSmoothWheel).toBe(true);
+  interfaceStore.setTerminalSmoothWheel(false);
+  expect(get(interfaceStore).terminalSmoothWheel).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalSmoothWheel).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalSmoothWheel: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalSmoothWheel).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalSmoothWheel: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalSmoothWheel).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("treats Option as Meta as on by default, switchable, and falls back to on for a corrupt value", async () => {
   interfaceStore.reset();
   expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);

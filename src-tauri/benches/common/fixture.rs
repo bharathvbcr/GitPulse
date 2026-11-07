@@ -184,6 +184,28 @@ pub fn count_git_processes<T>(body: impl FnOnce() -> T) -> (T, u64) {
 /// [`count_git_processes`] with each process's argv, for a bench that counts
 /// one kind of process (`diff --shortstat`, `merge-base`) apart from the rest.
 pub fn git_process_argvs<T>(body: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+    let (result, procs) = git_process_profile(|| {}, body);
+    (result, procs.into_iter().map(|p| p.argv).collect())
+}
+
+/// One git process seen by trace2.
+pub struct GitProc {
+    pub argv: Vec<String>,
+    /// Wall time of the process from its own start to its exit, in
+    /// nanoseconds. It leaves out fork/exec and the pipe drain on GitPulse's
+    /// side, so it is a floor on what the caller waited.
+    pub wall_ns: u64,
+    /// False for a process another git process started (`git fetch` running
+    /// `git remote-https`): GitPulse did not spawn it.
+    pub top_level: bool,
+}
+
+/// [`git_process_argvs`] with the wall time of every process, and a `warm`
+/// step that runs first, inside the same counting config, whose processes are
+/// dropped from the result. The ref cache stamps the global git config that
+/// counting rewrites, so the first read inside any counted block is cold;
+/// `warm` pays for it, and `body` is then the steady state.
+pub fn git_process_profile<T>(warm: impl FnOnce(), body: impl FnOnce() -> T) -> (T, Vec<GitProc>) {
     let home = PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME"));
     let config = home.join(".gitconfig");
     let log = home.join("trace2-events.json");
@@ -193,25 +215,69 @@ pub fn git_process_argvs<T>(body: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
         format!("[trace2]\n\teventTarget = {}\n", log.display()),
     )
     .expect("write the counting gitconfig");
+    warm();
+    let _ = std::fs::remove_file(&log);
     let result = body();
     let _ = std::fs::remove_file(&config);
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
-    let argvs = text
-        .lines()
-        .filter(|l| l.contains("\"event\":\"start\""))
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|event| {
-                    event["argv"].as_array().map(|argv| {
+    let mut procs: Vec<GitProc> = Vec::new();
+    let mut open: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let sid = event["sid"].as_str().unwrap_or_default().to_string();
+        match event["event"].as_str() {
+            Some("start") => {
+                let argv = event["argv"]
+                    .as_array()
+                    .map(|argv| {
                         argv.iter()
                             .filter_map(|arg| arg.as_str().map(str::to_string))
                             .collect()
                     })
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-    (result, argvs)
+                    .unwrap_or_default();
+                open.insert(sid.clone(), procs.len());
+                procs.push(GitProc {
+                    argv,
+                    wall_ns: 0,
+                    top_level: !sid.contains('/'),
+                });
+            }
+            Some("exit") => {
+                if let (Some(&at), Some(t)) = (open.get(&sid), event["t_abs"].as_f64()) {
+                    procs[at].wall_ns = (t * 1e9) as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+    (result, procs)
+}
+
+/// The shape of an argv: the subcommand and its flags, with the `-c k=v` pairs
+/// the app puts first, the binary path and every positional (ref, path, oid)
+/// dropped, so two calls that differ only in what they name are one shape.
+pub fn argv_shape(argv: &[String]) -> String {
+    let mut words = argv.iter().skip(1).peekable();
+    let mut sub = None;
+    let mut flags: Vec<String> = Vec::new();
+    while let Some(word) = words.next() {
+        if word == "-c" || word == "-C" {
+            words.next();
+        } else if sub.is_none() {
+            sub = Some(word.clone());
+        } else if let Some(flag) = word.strip_prefix('-') {
+            if !flag.is_empty() {
+                flags.push(word.chars().take(48).collect());
+            }
+        }
+    }
+    let mut out = sub.unwrap_or_else(|| "?".to_string());
+    for flag in flags {
+        out.push(' ');
+        out.push_str(&flag);
+    }
+    out
 }

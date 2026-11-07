@@ -115,6 +115,8 @@ export const AUDIT_FAILURE_LABELS: Readonly<Record<string, string>> = Object.fre
   cargo_deny_failed: "cargo-deny",
   cargo_crev_failed: "cargo-crev",
   cargo_audit_bin_failed: "cargo audit bin",
+  cargo_auditable_unreadable: "cargo-auditable binary read",
+  cargo_auditable_oversized: "cargo-auditable binary size limit",
   pip_audit_failed: "pip-audit",
   govulncheck_failed: "govulncheck",
   composer_audit_failed: "composer audit",

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 106 contracts over
- * 263 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 108 contracts over
+ * 276 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -224,6 +224,11 @@ export const CONTRACTS = Object.freeze([
   // The commit-graph census inside StorageReport. `unknown` and the nullable
   // facts are what keep "could not check" from rendering as "missing".
   { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport", "CommitGraphWritePlan", "CommitGraphWriteOutcome"] },
+  // The repository tuning census and its apply plan inside StorageReport. The
+  // nullable facts keep "could not read" from rendering as "not registered" or
+  // "no MIDX"; the plan's argv/scope/undo is what the person confirms.
+  { label: "repo-tuning", rustPath: rust("storage", "repo_tuning.rs"), tsPath: ts("storage", "types.ts"), structs: ["MaintenanceState", "ObjectPressure", "IndexInfo", "TuningKeyValue", "WorktreeFamily", "RepoTuningReport"] },
+  { label: "repo-tuning-advice", rustPath: rust("storage", "repo_tuning", "advice.rs"), tsPath: ts("storage", "types.ts"), structs: ["TuningOffer", "TuningAdvice", "TuningWrite", "TuningStep", "TuningPlan", "TuningStepResult", "TuningOutcome"] },
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "AreaCoverage", "DoraReport"] },
   { label: "commit-signature", rustPath: rust("engine", "commit_signature.rs"), tsPath: ts("pulse", "types.ts"), structs: ["CommitSignatureCheck"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
