@@ -421,7 +421,7 @@ Each option is judged on the five things a new agent worktree needs:
 | 10 | Sparse cone checkout (`--sparse`) | Fewer files written | Full | Directory-level | Proportional to the cone | Object store | Existing GitPulse feature; not re-measured | Keep for narrow tasks; DevMap-expanded cone |
 | 11 | Virtual file system (EdenFS / ProjFS / FUSE) | Instant | Full | File-level on read | Materialized files only | Server or daemon | §8 research | Rejected: daemon, entitlements, server |
 | 12 | One working tree, many lanes (GitButler style) | Instant | **None between agents' builds** | — | 0 | Total | §8 research | Rejected for parallel agents |
-| 13 | Build artifacts: per-lane `target/` CoW clone, `build.build-dir` under one root, cleanup on teardown | Seconds to clone; path crates rebuild | Per lane | Block-level | Diverges at the first build (14 lanes ate 250 GiB) | Until the first build | Memory notes plus Cargo docs (§8) | Cleanup on teardown is the fix; sccache and Cargo's CAS store are third-party or not yet shipped |
+| 13 | Build artifacts: per-lane `target/` CoW clone, `build.build-dir` under one root, cleanup on teardown | Seconds to clone; path crates rebuild | Per lane | Block-level | Diverges at the first build (14 lanes ate 250 GiB) | Until the first build | Memory notes plus Cargo docs (§8) | **Measured 2026-11-07 (below):** `gitpulse-rustc` saves the same ~1.1 GiB per lane as a `cp -c` target clone and no CPU, so it is not wired in by default. Teardown of an in-tree `target/` already reclaims it, and a test pins that. Sccache and Cargo's CAS store are third-party or not yet shipped |
 | 14 | Warm pool of pre-seeded worktrees | Hidden behind the pool | Full | — | Pool × (3) | As 3 | Idea (§8) | Worth it only if 3's 1.2 s matters to users |
 
 **Option 5 in detail.** Built by a Sonnet agent on DevCouncil `feat/devmap-manifest-blocks` (`bccaf1eb`, 8 files, +1,268/−11, no schema or dependency change).
@@ -439,6 +439,40 @@ Each option is judged on the five things a new agent worktree needs:
   - Time to `query_ready` is unchanged: 0.97–1.77 s against 0.92–1.80 s, n=5 interleaved under load ~13. With the installed binary on a quieter machine it was 0.44–0.57 s.
   - Its test fails with the artifact clone removed and with the forced manifest removed. The four-crate suite is 3,978/0.
 
+**Lane build cache: `gitpulse-rustc` against a per-lane `target/` (2026-11-07, branch `b1106w5/buildcache` from `ee34b538`).**
+
+*Question.* A second lane on a nearby commit: what does the shared CAS save over that lane building its own `target/` cold, and over a warm `target/` cloned with `cp -c` (the strongest cheap baseline, and what a lane gets today because `target` is in `STANDARD_CACHE_DIRS`)?
+
+*Setup.*
+- Hardware: Apple M5 Pro, 18 cores, 64 GiB, macOS (Darwin 27.2.0), APFS. Rust and Cargo from `~/.cargo/bin` (via the slot gate), registry and git sources already downloaded, `CARGO_NET_OFFLINE=true`.
+- Workload: `cargo build --lib --locked --manifest-path src-tauri/Cargo.toml` (debug, `CARGO_INCREMENTAL=0` on every arm, because the wrapper never caches `-C incremental` units). Lane A at `ee34b538` primes; lane B at `a92a68dc` (`ee34b538~6`, 7 files, +700/-52 under `src-tauri/src` and `crates`) is the measured lane.
+- Everything lived on a dedicated 70 GiB sparse APFS image, so `df` on the image counts clone and CoW bytes exactly (`du` does not). Bytes below are the `df` used-space delta over the arm, including the clone and any CAS growth. The image was detached and deleted afterwards, and so were the scratch worktrees.
+- Arms, each on a fresh lane B worktree and a fresh target, run interleaved (round 1 cold, cp, cas; round 2 reversed; round 3 cp, cas, cas-same-commit, cold). The CAS is re-cloned from the one primed copy before each CAS run, so no run sees the previous run's own artifacts. n=3 per arm.
+- Reproduce: `crates/gitpulse-worktree` `gitpulse-rustc` built from the lane; `RUSTC_WRAPPER=<gitpulse-rustc> GITPULSE_BUILD_CACHE_DIR=<dir> CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<fresh> cargo build --lib --locked --manifest-path src-tauri/Cargo.toml`; counters from `<dir>/stats.json`. Driver scripts and raw logs: session scratchpad `.../scratchpad/w5/bc/` (`arm.sh`, `results.tsv`, `log-*.txt`).
+
+*Results* (CPU is `/usr/bin/time -l` user+sys over the whole `cargo` run; disk is the `df` delta; wall is Cargo's own "Finished in", which excludes the slot-gate wait):
+
+| Arm | Run | CPU s | Disk GiB | Wall s (load avg at start) | Cache counters (this run) |
+|---|---|---|---|---|---|
+| Cold per-lane `target/` | 1 / 2 / 3 | 201.5 / 212.8 / 207.0 | 2.96 / 2.96 / 2.96 | 49.1 (19) / 57.6 (40) / 58.2 (29) | none |
+| Warm `target/` of lane A cloned with `cp -c` | 1 / 2 / 3 | 97.1 / 85.7 / 85.5 | 1.81 / 1.85 / 1.85 (+0.002 for the clone, 0.9–1.2 s) | 130 (10) / 49.3 (63) / 53.5 (41) | none |
+| `gitpulse-rustc`, CAS primed by lane A | 1 / 2 / 3 | 222.4 / 221.3 / 212.1 | 1.86 / 1.85 / 1.85 | 195 (72) / 141 (82) / 84 (32) | 334 hits, all zero-copy; 19 misses; 65 passthroughs; 1.11 GiB saved; 1 store failure |
+| `gitpulse-rustc`, lane A's own commit (control) | 3 | 205.6 | 1.85 | 75 (33) | same 334 / 19 / 65 |
+| Priming (lane A cold): plain, then through the wrapper with an empty CAS | 0 | 226.2, then 394.5 | 2.97, then 2.97 | 61 (11), then 93 (15) | 0 hits, 353 misses, 1.44 GiB stored |
+
+*Reading it.*
+- **Wrapper ran and hit (verified).** Each CAS run adds exactly 334 hits and 334 zero-copy hits to `stats.json`, with `restore_failures` 0 and `stage2_invalidations` 0. The control at lane A's own commit gives the same 334/19/65, so the 19 misses are units that are keyed by the lane path or inputs, not the commit difference.
+- **Correctness (verified).** `cargo test --lib workbench::agent_worktree` on lane B built from the CAS and on lane B built cold both give 10 passed, 1 failed, and the failure is the same test in both (`a_lane_cut_from_an_indexed_checkout_gets_its_own_seeded_devmap_store`, at `a92a68dc`; it is not a cache effect, since the cold build fails it too). Raw: `log-testcas-1.txt`, `log-testcold-1.txt`.
+- **Disk.** The CAS saves 1.11 GiB of 2.96 GiB per extra lane (37%), exactly what a `cp -c` clone saves (1.85 GiB each). Both leave the same 1.85 GiB, which is the workspace crate and its build-script outputs, and neither arm shares those.
+- **CPU.** `cp -c` halves CPU (about 90 s against about 207 s) because Cargo keeps every fresh unit. The CAS saves none: it is about 7% above cold. This is inferred from the counters and the source, not instrumented per unit: `build_script_build` is never cached (`build_cache.rs`, `classify_rustc_args`), proc-macros are cached only when allow-listed, and the passthrough counter is 65 per lane, so each lane still compiles and runs its build scripts and proc-macros and hashes every hit.
+- **Cold-miss cost.** The first lane through the wrapper pays +74% CPU and +52% wall (394.5 against 226.2 CPU-s; 93 against 61 s) to fill a 1.44 GiB CAS. One run each.
+- **Wall time is not decidable here.** The machine ran at load 10–82 (other lanes were building), and the same arm varies 49 to 130 s (`cp -c`) and 84 to 195 s (CAS). Do not read the wall column as an effect. CPU and bytes are the evidence. n=3 per arm, CPU spread 11 s for cold, 12 s for `cp -c` (the first run is the outlier), 10 s for CAS.
+- **Not measured.** Release or `--all-targets` profiles (this repo's main `target/` is 67 GiB, mostly those); more than two lanes sharing one CAS; a cold lane with no warm sibling; CAS pruning cost; a quiet machine.
+
+*Recommendation.* Do not wire `gitpulse-rustc` into agent lanes by default. At this scale it matches the existing CoW target clone on bytes, loses to it on CPU, and costs 74% extra CPU on the lane that fills it. Keep the clone. The CAS has one real edge the clone lacks: it does not need an idle anchor, because `cp -c` of a `target/` that is mid-build races half-written files (§2 failure mode). If that matters, offer it as an opt-in for lanes cut while the anchor is building. The 14-lanes-ate-250-GiB case came from lanes that stayed alive and diverged, so the lever is reclaiming the `target/` of idle kept lanes, not sharing artifacts (inferred: 14 lanes at 2.96 GiB is 41 GiB for this debug build, so the 250 GiB had to come from release or test profiles).
+
+*Teardown (verified by test).* GitPulse creates only in-tree `target/` (the CoW copy at provision; nothing in `src-tauri` sets `CARGO_TARGET_DIR` or `RUSTC_WRAPPER`, and nothing in `src-tauri` uses `gitpulse-worktree`), and `reclaim` on an unclaimed lane removes the whole worktree directory, `target/` included, with nothing left beside it. The CAS lives under the git common dir, is shared, and is bounded by `cache-stats --prune`, so nothing in it belongs to a lane. Two tests in `workbench::agent_worktree` pin this, including that a `target` symlink to a shared directory is unlinked and never followed. What remains uncovered: a lane whose attempt was claimed is never reclaimed by this module, and a `CARGO_TARGET_DIR` that an agent sets outside the tree is unknown to GitPulse.
+
 **Ranked next steps, from the measurements:**
 1. ~~Land 3, 4 and 5~~: landed on 2026-11-06 with owner approval, and the binaries were reinstalled from clean trees.
    - GitPulse main is at `b53767c9` (includes the `finished_builds` bound); `gitpulse-mcp` and `gitpulse-hook` are reinstalled and `mcp:doctor` is OK.
@@ -446,5 +480,5 @@ Each option is judged on the five things a new agent worktree needs:
    - `check:schema-parity` is 8/8.
    - GitPulse.app is not yet rebuilt; the owner will do that, and the app's own lane and panel seeding goes live then.
 2. Option 6.
-3. Lane teardown that reclaims `target/` (option 13).
+3. ~~Lane teardown that reclaims `target/` (option 13)~~: measured 2026-11-07, see "Lane build cache" below. Teardown already reclaims an in-tree `target/`; what is left is reclaiming the `target/` of lanes that are kept but idle, which is a new feature and not built.
 4. Options 7 and 8 only if 2–3 leave a cost worth a cross-app schema change. The owner chose to skip the extraction cache (7) on the measured evidence.
