@@ -15,10 +15,18 @@
 //!   leak into ours. The one argument that is not a hook invocation —
 //!   `--version`, which no host sends — prints plain text there instead, and
 //!   deliberately prints nothing a host could parse as a decision.
-//! * **Exit 0, except for one wake.** `deliver`, the `asyncRewake` `Stop` hook,
-//!   exits 2 with the message it claimed on stderr: the documented way to wake
-//!   the agent (<https://code.claude.com/docs/en/hooks.md>), on an event with
-//!   no tool call to block. Every other path, `deliver`'s included, exits 0.
+//!   The two worktree hooks (`worktree-create`, `worktree-remove`) speak
+//!   Claude Code's `WorktreeCreate`/`WorktreeRemove` protocol instead: stdout
+//!   carries the created worktree's path and nothing else, and every note goes
+//!   to stderr (`hooks::worktree`).
+//! * **Exit 0, except for one wake and the worktree hooks.** `deliver`, the
+//!   `asyncRewake` `Stop` hook, exits 2 with the message it claimed on stderr:
+//!   the documented way to wake the agent
+//!   (<https://code.claude.com/docs/en/hooks.md>), on an event with no tool
+//!   call to block. The worktree hooks exit with `hooks::worktree`'s codes,
+//!   because for those events a non-zero exit is how Claude Code learns that no
+//!   worktree was made or removed, and 75 tells the plugin's launcher to fall
+//!   back to plain git. Every other path, `deliver`'s included, exits 0.
 //!   Exit 2 blocks the tool call whatever the JSON says. A
 //!   hook that crashed, timed out or could not read its input must never be the
 //!   reason a user's edit is refused, so every failure path here degrades to
@@ -55,14 +63,17 @@ fn main() {
     gitpulse_lib::procguard::exit(code);
 }
 
-/// Runs the hook and returns its exit code, which is 0 even when it panicked.
-/// A panic otherwise exits 101: not the blocking 2, but not the promised 0
-/// either, and a host is free to treat any non-zero hook as a failure the user
-/// has to look at. The installed panic hook has already logged the fault.
+/// Runs the hook and returns its exit code, which is 0 when a judging hook
+/// panicked. A panic otherwise exits 101: not the blocking 2, but not the
+/// promised 0 either, and a host is free to treat any non-zero hook as a
+/// failure the user has to look at. The installed panic hook has already logged
+/// the fault. A worktree hook that panicked exits non-zero instead
+/// ([`hooks::worktree::exit_code_after_panic`]): for those events exit 0 means
+/// "made" or "removed", which a panic never did.
 fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
     std::panic::catch_unwind(decide).unwrap_or_else(|_| {
         log::error!(target: "hook", "gitpulse-hook panicked; no decision");
-        0
+        hooks::worktree::exit_code_after_panic()
     })
 }
 
@@ -112,13 +123,34 @@ fn decide() -> i32 {
     // `Notification` payload does not say which matcher routed it. It is taken
     // first because it also decides whether stdin is read at all.
     let argument = std::env::args().nth(2);
+    let worktree_hook =
+        [hooks::worktree::CREATE, hooks::worktree::REMOVE].contains(&subcommand.as_str());
+    if worktree_hook {
+        hooks::worktree::begin();
+    }
     let input = match hooks::read_for(&subcommand, argument.as_deref(), io::stdin()) {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
-            return 0;
+            // Nothing was done; the launcher can still have plain git do it.
+            return if worktree_hook {
+                hooks::worktree::EXIT_UNAVAILABLE
+            } else {
+                0
+            };
         }
     };
+
+    if worktree_hook {
+        let finished = hooks::worktree::run(&subcommand, &input);
+        for note in &finished.notes {
+            emit_stderr(format!("gitpulse-hook {subcommand}: {note}\n"));
+        }
+        if let Some(path) = &finished.path {
+            emit(format!("{path}\n"));
+        }
+        return finished.exit_code;
+    }
 
     match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
@@ -199,6 +231,7 @@ mod tests {
 
     #[test]
     fn a_panicking_hook_still_exits_zero_with_no_decision() {
+        // Outside a worktree hook, which this test process never starts.
         assert_eq!(run_guarded(|| panic!("hook fault")), 0);
         assert_eq!(run_guarded(|| 0), 0);
     }

@@ -392,7 +392,7 @@ export function declaredHookSubcommands(root = REPO_ROOT) {
       if (!isRecord(group) || !Array.isArray(group.hooks)) continue;
       for (const handler of group.hooks) {
         if (!isRecord(handler) || typeof handler.command !== "string") continue;
-        const [bin, subcommand] = handler.command.trim().split(/\s+/);
+        const [bin, subcommand] = bareHookCommand(handler.command).split(/\s+/);
         if (bin !== HOOK_BIN || !subcommand) continue;
         found.add(subcommand);
       }
@@ -400,6 +400,28 @@ export function declaredHookSubcommands(root = REPO_ROOT) {
   }
   if (found.size === 0) throw new Error(`${HOOKS_MANIFEST} declares no ${HOOK_BIN} subcommand`);
   return [...found].sort();
+}
+
+/**
+ * What the shipped manifest puts in front of `gitpulse-hook <subcommand>` for
+ * Claude Code's `WorktreeCreate` and `WorktreeRemove`: the launcher that falls
+ * back to plain git when the binary cannot run, so a missing binary never costs
+ * Claude Code its worktree. The same string as `LAUNCHER_PREFIX` in
+ * src-tauri/src/hooks/worktree.rs, which `plugin-contract.test.ts` checks.
+ */
+export const WORKTREE_LAUNCHER_PREFIX = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/gitpulse-worktree.sh" ';
+
+/**
+ * A manifest command without the worktree launcher in front of it, trimmed:
+ * every other reading of a hook command (binary, subcommand, argument) then
+ * works on it unchanged.
+ *
+ * @param {string} command
+ * @returns {string}
+ */
+export function bareHookCommand(command) {
+  const trimmed = command.trim();
+  return trimmed.startsWith(WORKTREE_LAUNCHER_PREFIX) ? trimmed.slice(WORKTREE_LAUNCHER_PREFIX.length) : trimmed;
 }
 
 /**

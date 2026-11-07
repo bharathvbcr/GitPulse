@@ -138,6 +138,9 @@ pub struct CacheReport {
     /// The volume's free space could not be read, so nothing was skipped on
     /// its account and nothing is known to be plentiful.
     pub disk_unknown: bool,
+    /// The files `.worktreeinclude` named that were copied, relative to the
+    /// worktree root ([`worktree_include`]).
+    pub included: Vec<String>,
 }
 
 impl CacheReport {
@@ -1664,6 +1667,9 @@ pub fn clone_ignored_caches(
         }
     }
 
+    // After the cache directories, which it never reaches into.
+    worktree_include::copy_included(anchor, worktree, selection, &mut report, &mut skipped);
+
     if !skipped.is_empty() {
         report.low_disk = Some(LowDisk {
             cause,
@@ -3158,6 +3164,35 @@ mod tests {
         // 4. Mach-O object file inside `out/` was left byte-identical.
         assert_eq!(fs::read(wt_build_pkg.join("out/native.o")).unwrap(), macho_bytes);
     }
+}
+
+pub mod worktree_include;
+
+/// Only the files the anchor's `.worktreeinclude` names, for a worktree made
+/// without its build caches: the repository owner's list of local files is
+/// not an optional cache, so every worktree GitPulse makes gets it.
+/// [`clone_ignored_caches`] copies the same files after the caches.
+pub fn copy_worktree_include(
+    anchor: &Path,
+    worktree: &Path,
+    selection: &CacheSelection,
+) -> CacheReport {
+    let mut report = CacheReport::default();
+    if anchor == worktree {
+        return report;
+    }
+    let mut skipped = Vec::new();
+    worktree_include::copy_included(anchor, worktree, selection, &mut report, &mut skipped);
+    if !skipped.is_empty() {
+        report.low_disk = Some(LowDisk {
+            cause: LowDiskCause::BelowFloor,
+            free_bytes: None,
+            floor_bytes: LOW_DISK_FLOOR,
+            cap_bytes: None,
+            skipped,
+        });
+    }
+    report
 }
 
 #[cfg(test)]

@@ -110,6 +110,28 @@
         ]
       }
     ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/gitpulse-worktree.sh\" gitpulse-hook worktree-create",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/gitpulse-worktree.sh\" gitpulse-hook worktree-remove",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

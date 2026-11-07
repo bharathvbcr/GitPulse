@@ -38,6 +38,22 @@ before that tag is pushed.
   (batched, input order). The card reads a commit's message alone, one
   `git log --no-walk`, never the whole patch the details pane walks, so the first
   hover on a commit of thousands of files costs what any other does.
+- **Claude Code's own worktrees go through GitPulse.** The plugin registers
+  `WorktreeCreate` and `WorktreeRemove` (`gitpulse-hook worktree-create` /
+  `worktree-remove`, through `plugins/gitpulse/hooks/gitpulse-worktree.sh`), so
+  `claude --worktree`, `EnterWorktree`, isolated subagents, workflow agents and
+  background sessions get the app's worktree setup: approved `post_create`
+  hooks, copy-on-write caches, `.worktreeinclude` and a copy-on-write clone of
+  the DevMap store. They branch from the local default branch, not `origin`. Untrusted
+  repositories and GitPulse failures fall back to plain git; removal discards
+  work only after Claude Code has confirmed it with the user, and a failed
+  `post_create` hook keeps the worktree, as the Worktrees panel does, and the
+  session's start-up brief tells the agent. On Windows the plugin needs Git
+  for Windows, and the Settings copy leaves these hooks out for now. Reinstall `gitpulse-hook`
+  (`bun run mcp:install`): an older binary is detected and plain git is used.
+- **`.worktreeinclude`** is honoured by every worktree GitPulse creates. It can
+  copy `.env`-style files; [Security](docs/SECURITY.md) says why that is
+  accepted.
 
 ### Fixed
 

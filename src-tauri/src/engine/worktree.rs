@@ -2719,6 +2719,16 @@ pub fn add_worktree_with_devmap(
         }
     } else {
         created.devmap = provision();
+        // No caches were asked for, but `.worktreeinclude` is the repository's
+        // own list of local files, which every worktree gets.
+        let repo = validate_repo(repo_path)?;
+        let report = crate::engine::cow_clone::copy_worktree_include(
+            &repo,
+            target,
+            &crate::engine::cow_clone::CacheSelection::default(),
+        );
+        created.cache_error = report.error();
+        created.low_disk = report.low_disk;
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;
