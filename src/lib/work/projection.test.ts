@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ALL_STATUSES,
+  isStaleRun,
   latestRuns,
   rowNeedsAttention,
   runNeedsAttention,
@@ -758,4 +759,83 @@ it("does not require a working-tree scan for bare repositories", () => {
   const p = projectWork(inputs({ worktrees: [{ ...worktree("/bare", null), is_bare: true, dirty_files: null }] }));
   expect(insightSummary(p).unscannedDirty).toBe(0);
   expect(rowNeedsAttention(p.rows[0])).toBe(false);
+});
+
+describe("a run on an older commit than the worktree HEAD is stale", () => {
+  const HEAD = "a".repeat(40);
+  const OLD = "b".repeat(40);
+  const failedOn = (id: number, sha: string, created_at: string): WorkflowRunInfo => ({
+    ...run(id, "a"), head_sha: sha, created_at, conclusion: "failure", outcome: "failed" as const,
+  });
+  const passedOn = (id: number, sha: string, created_at: string): WorkflowRunInfo => ({
+    ...run(id, "a"), head_sha: sha, created_at,
+  });
+  const rowWith = (runs: WorkflowRunInfo[], wt = worktree("/a", "a")) =>
+    projectWork(inputs({ worktrees: [wt], operations: { "/a": null }, runs })).rows[0];
+
+  it("treats a run on HEAD as current", () => {
+    const row = rowWith([passedOn(1, HEAD, "2026-09-07T12:00:00Z")]);
+    expect(isStaleRun(row, row.runs[0])).toBe(false);
+  });
+
+  it("marks a run only on an older commit as stale, and a stale failure does not raise attention", () => {
+    // Owner-ruled: a failure on an old commit says nothing about the code at
+    // HEAD, so it is shown dimmed and does not count as the current result.
+    const row = rowWith([failedOn(1, OLD, "2026-09-07T12:00:00Z")]);
+    expect(latestRuns(row).map((r) => r.id)).toEqual([1]);
+    expect(isStaleRun(row, row.runs[0])).toBe(true);
+    expect(rowNeedsAttention(row)).toBe(false);
+  });
+
+  it("keeps a failure on HEAD raising attention", () => {
+    expect(rowNeedsAttention(rowWith([failedOn(1, HEAD, "2026-09-07T12:00:00Z")]))).toBe(true);
+  });
+
+  it("mixed: newest run on HEAD wins over an older failure on a previous commit", () => {
+    const row = rowWith([failedOn(1, OLD, "2026-09-06T12:00:00Z"), passedOn(2, HEAD, "2026-09-07T12:00:00Z")]);
+    expect(latestRuns(row).map((r) => r.id)).toEqual([2]);
+    expect(isStaleRun(row, latestRuns(row)[0])).toBe(false);
+    expect(rowNeedsAttention(row)).toBe(false);
+  });
+
+  it("mixed: a newer run on an old commit never displaces the run on HEAD", () => {
+    const row = rowWith([passedOn(1, HEAD, "2026-09-06T12:00:00Z"), failedOn(2, OLD, "2026-09-07T12:00:00Z")]);
+    expect(latestRuns(row).map((r) => r.id)).toEqual([1]);
+    expect(rowNeedsAttention(row)).toBe(false);
+  });
+
+  it("matches a short sha against the full HEAD, case-insensitively", () => {
+    const row = rowWith([passedOn(1, HEAD.slice(0, 7).toUpperCase(), "2026-09-07T12:00:00Z")]);
+    expect(isStaleRun(row, row.runs[0])).toBe(false);
+  });
+
+  it("keeps branch-only behaviour when the worktree HEAD or the run sha is unknown", () => {
+    const unborn = { ...worktree("/a", "a"), head: "0".repeat(40) };
+    const blank = { ...worktree("/a", "a"), head: "" };
+    for (const wt of [unborn, blank]) {
+      const row = rowWith([failedOn(1, OLD, "2026-09-07T12:00:00Z")], wt);
+      expect(isStaleRun(row, row.runs[0])).toBe(false);
+      expect(rowNeedsAttention(row)).toBe(true);
+    }
+    const noSha = rowWith([failedOn(1, "", "2026-09-07T12:00:00Z")]);
+    expect(isStaleRun(noSha, noSha.runs[0])).toBe(false);
+    expect(rowNeedsAttention(noSha)).toBe(true);
+  });
+
+  it("has no worktree HEAD for an unbound row, so its runs are never stale and nothing throws", () => {
+    const p = projectWork(inputs({ runs: [failedOn(1, OLD, "2026-09-07T12:00:00Z")] }));
+    const row = p.rows[0];
+    expect(row.key).toBe(UNBOUND_ROW_ID);
+    expect(isStaleRun(row, row.runs[0])).toBe(false);
+  });
+
+  it("with an unreadable GitHub source there are no runs, and the row is degraded not stale", () => {
+    const p = projectWork(inputs({
+      worktrees: [worktree("/a", "a")], operations: { "/a": null },
+      sources: sources({ github: source({ ok: false, detail: "gh not signed in" }) }),
+    }));
+    expect(p.degraded).toBe(true);
+    expect(p.rows[0].runs).toEqual([]);
+    expect(latestRuns(p.rows[0])).toEqual([]);
+  });
 });

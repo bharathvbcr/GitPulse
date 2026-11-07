@@ -50,6 +50,7 @@
     dirtyCount,
     dirtySummary,
     measuredDirty,
+    isStaleRun,
     latestRuns,
     insightSummary,
     noteworthyStatuses,
@@ -915,9 +916,10 @@
           {#if row.runs.length > 0}
             <div class="mt-2 flex flex-wrap gap-2" aria-label="Latest observed workflow runs">
               {#each latestRuns(row) as run (run.id)}
-                <button type="button" class="gp-btn text-[10px]!" onclick={() => void openGithub(run.url)}
-                  title={`Open workflow run ${run.id} on GitHub`}>
-                  <Play size={11} /> {run.name || "Workflow"}: {run.status.toLowerCase() === "completed" ? run.conclusion || "conclusion unknown" : run.status || "status unknown"}
+                {@const stale = isStaleRun(row, run)}
+                <button type="button" class="gp-btn text-[10px]!" class:opacity-50={stale} data-stale-run={stale ? "true" : undefined} onclick={() => void openGithub(run.url)}
+                  title={stale ? `Stale: workflow run ${run.id} ran on ${run.head_sha.slice(0, 7)}, not this worktree's current commit. Open on GitHub` : `Open workflow run ${run.id} on GitHub`}>
+                  <Play size={11} /> {run.name || "Workflow"}: {run.status.toLowerCase() === "completed" ? run.conclusion || "conclusion unknown" : run.status || "status unknown"}{#if stale} (stale, {run.head_sha.slice(0, 7)}){/if}
                 </button>
               {/each}
             </div>
