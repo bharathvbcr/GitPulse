@@ -318,21 +318,83 @@ fn raise_live_wait(
     wait
 }
 
-/// Outcomes of builds [`start_refresh`] ran on a background thread, waiting to
-/// be handed to the next ask for that repository. At most one per repository.
-fn finished_builds() -> &'static Mutex<HashMap<String, LiveRefreshOutcome>> {
-    static MAP: OnceLock<Mutex<HashMap<String, LiveRefreshOutcome>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Debug)]
+pub(crate) struct ParkedBuilds<V> {
+    entries: HashMap<String, V>,
+    order: std::collections::VecDeque<String>,
 }
 
-fn lock_finished_builds() -> std::sync::MutexGuard<'static, HashMap<String, LiveRefreshOutcome>> {
+impl<V> Default for ParkedBuilds<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<V> ParkedBuilds<V> {
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    pub(crate) fn remove(&mut self, key: &str) -> Option<V> {
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            self.order.retain(|k| k != key);
+        }
+        removed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
+    }
+}
+
+#[cfg(test)]
+impl<V> std::ops::Index<&str> for ParkedBuilds<V> {
+    type Output = V;
+
+    fn index(&self, key: &str) -> &Self::Output {
+        &self.entries[key]
+    }
+}
+
+impl<V> std::ops::Index<&String> for ParkedBuilds<V> {
+    type Output = V;
+
+    fn index(&self, key: &String) -> &Self::Output {
+        &self.entries[key.as_str()]
+    }
+}
+
+/// Outcomes of builds [`start_refresh`] ran on a background thread, waiting to
+/// be handed to the next ask for that repository. At most one per repository.
+fn finished_builds() -> &'static Mutex<ParkedBuilds<LiveRefreshOutcome>> {
+    static MAP: OnceLock<Mutex<ParkedBuilds<LiveRefreshOutcome>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(ParkedBuilds::default()))
+}
+
+fn lock_finished_builds() -> std::sync::MutexGuard<'static, ParkedBuilds<LiveRefreshOutcome>> {
     finished_builds()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Most outcomes [`finished_builds`] holds at once.
-pub(crate) const MAX_FINISHED_BUILDS: usize = 64;
+pub(crate) const MAX_FINISHED_BUILDS: usize = 256;
 
 /// Park a background build's outcome for the next ask about `repo_path`.
 ///
@@ -342,10 +404,10 @@ pub(crate) const MAX_FINISHED_BUILDS: usize = 64;
 /// removed after its run, an MCP worktree nobody opens. Unbounded, the map kept
 /// one outcome (with up to a build's captured stdout) per such worktree for the
 /// life of the app or `gitpulse-mcp`. So a park first drops outcomes for paths
-/// that no longer exist, then, if the map is still full, any one other outcome.
-/// Dropping one is safe: an ask that finds nothing parked probes `devmap
-/// status` and decides from that, exactly as it does for a repository no
-/// background build ever ran for, so the cost is one extra probe.
+/// that no longer exist, then, if the map is still full, evicts the oldest
+/// parked entry (LRU/FIFO). Dropping one is safe: an ask that finds nothing
+/// parked probes `devmap status` and decides from that, exactly as it does for
+/// a repository no background build ever ran for, so the cost is one extra probe.
 fn park_finished_build(repo_path: &str, outcome: LiveRefreshOutcome) {
     park_bounded(
         &mut lock_finished_builds(),
@@ -355,18 +417,32 @@ fn park_finished_build(repo_path: &str, outcome: LiveRefreshOutcome) {
     );
 }
 
-/// [`park_finished_build`]'s rule over any map and cap, so it is testable
-/// without filling the process-wide map other tests' builds park in.
-fn park_bounded<V>(parked: &mut HashMap<String, V>, repo_path: &str, value: V, cap: usize) {
-    if !parked.contains_key(repo_path) && parked.len() >= cap {
-        parked.retain(|path, _| std::path::Path::new(path).exists());
-        if parked.len() >= cap {
-            if let Some(evicted) = parked.keys().next().cloned() {
-                parked.remove(&evicted);
+/// [`park_finished_build`]'s rule over any [`ParkedBuilds`] and cap, so it is
+/// testable without filling the process-wide map other tests' builds park in.
+fn park_bounded<V>(parked: &mut ParkedBuilds<V>, repo_path: &str, value: V, cap: usize) {
+    if cap == 0 {
+        parked.clear();
+        return;
+    }
+    if parked.entries.contains_key(repo_path) {
+        parked.order.retain(|k| k != repo_path);
+        parked.order.push_back(repo_path.to_string());
+        parked.entries.insert(repo_path.to_string(), value);
+        return;
+    }
+    if parked.entries.len() >= cap {
+        parked.entries.retain(|path, _| std::path::Path::new(path).exists());
+        parked.order.retain(|path| parked.entries.contains_key(path));
+        while parked.entries.len() >= cap {
+            if let Some(evicted) = parked.order.pop_front() {
+                parked.entries.remove(&evicted);
+            } else {
+                break;
             }
         }
     }
-    parked.insert(repo_path.to_string(), value);
+    parked.order.push_back(repo_path.to_string());
+    parked.entries.insert(repo_path.to_string(), value);
 }
 
 /// How long [`start_refresh`] waits for the `devmap status` probe it started
@@ -1436,7 +1512,7 @@ mod tests {
         // pass (1/8)^10.
         for round in 0..10 {
             let dir = tempfile::tempdir().unwrap();
-            let mut parked: HashMap<String, usize> = HashMap::new();
+            let mut parked: ParkedBuilds<usize> = ParkedBuilds::default();
             let gone = dir.path().join("removed-lane");
             std::fs::create_dir(&gone).unwrap();
             let gone = gone.to_string_lossy().into_owned();
@@ -1474,7 +1550,7 @@ mod tests {
     #[test]
     fn parked_outcomes_never_exceed_the_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parked: HashMap<String, usize> = HashMap::new();
+        let mut parked: ParkedBuilds<usize> = ParkedBuilds::default();
         let paths: Vec<String> = (0..10)
             .map(|i| {
                 let path = dir.path().join(format!("lane-{i}"));
@@ -1494,6 +1570,39 @@ mod tests {
             "re-parking one evicted another"
         );
         assert_eq!(parked[&kept[0]], 99);
+    }
+
+    #[test]
+    fn parked_outcomes_hold_256_and_evict_oldest_lru_entry_first() {
+        assert_eq!(
+            MAX_FINISHED_BUILDS, 256,
+            "finished_builds cap must be 256 for multi-lane agent worktrees"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut parked = Default::default();
+        let paths: Vec<String> = (0..6)
+            .map(|i| {
+                let path = dir.path().join(format!("lane-{i}"));
+                std::fs::create_dir(&path).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        // Park 0, 1, 2, 3 with cap 4 -> oldest is 0.
+        for (i, path) in paths[..4].iter().enumerate() {
+            park_bounded(&mut parked, path, i, 4);
+        }
+        // Refresh 0 -> recency order is now [1, 2, 3, 0], so oldest is 1!
+        park_bounded(&mut parked, &paths[0], 100, 4);
+        // Insert 4 -> must deterministically evict 1 (never 0, 2, or 3).
+        park_bounded(&mut parked, &paths[4], 4, 4);
+        assert!(
+            !parked.contains_key(&paths[1]),
+            "LRU eviction must drop oldest entry lane-1 first"
+        );
+        assert!(parked.contains_key(&paths[0]));
+        assert!(parked.contains_key(&paths[2]));
+        assert!(parked.contains_key(&paths[3]));
+        assert!(parked.contains_key(&paths[4]));
     }
     use serde_json::json;
 

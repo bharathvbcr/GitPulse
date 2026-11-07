@@ -990,7 +990,7 @@ impl Store {
         let gen_id = u32::try_from(tx.last_insert_rowid()).map_err(|_| {
             refusal("generation ID space exhausted; cannot represent another generation")
         })?;
-        Self::clear_seed_rebind_and_normalize_generations(&tx, repo_root.as_deref())?;
+        Self::clear_seed_rebind(&tx, repo_root.as_deref())?;
 
         let prev_gen: Option<u32> = tx
             .query_row(

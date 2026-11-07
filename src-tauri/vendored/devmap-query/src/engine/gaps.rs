@@ -765,7 +765,7 @@ impl StoreQueryEngine<'_> {
         let mut found = ChargedHoles::default();
         // An exact indexed file path is a file lookup, not a name.
         let target = match query_target(query) {
-            Ok(_) if query.contains('.') && self.store.latest_file(query.trim())?.is_some() => {
+            Ok(_) if query.contains('.') && self.latest_file(query.trim())?.is_some() => {
                 Err("the query is an indexed file path")
             }
             other => other,
@@ -778,7 +778,7 @@ impl StoreQueryEngine<'_> {
             .transpose()?
             .flatten()
         {
-            Some(scope) => match self.store.latest_scope_inputs()? {
+            Some(scope) => match self.latest_scope_inputs()? {
                 Some((_, root, files)) => Some(scope.resolve(&files, root.as_deref())?),
                 None => None,
             },
@@ -978,6 +978,13 @@ impl StoreQueryEngine<'_> {
             .map(|(key, (rows, truncated))| {
                 let rows = rows
                     .into_iter()
+                    .filter(|row| {
+                        !self.stacked.is_some_and(|st| {
+                            let p = Path::new(&row.source_file);
+                            st.overlay().is_file_tombstoned(p)
+                                || st.overlay().modified_files.contains_key(p)
+                        })
+                    })
                     .map(|row| RadiusSite {
                         source_file: row.source_file,
                         callee_name: row.callee_name,

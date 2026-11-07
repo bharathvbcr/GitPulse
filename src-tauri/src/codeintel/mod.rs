@@ -321,6 +321,7 @@ enum OpenedRepoStore {
         store: Store,
         base_ref: ZeroCopyBaseRef,
         anchor_root: PathBuf,
+        stacked: Option<devmap_query::StackedStore>,
     },
 }
 
@@ -331,9 +332,23 @@ impl OpenedRepoStore {
         }
     }
 
+    fn stacked(&self) -> Option<&devmap_query::StackedStore> {
+        match self {
+            Self::Local(_) => None,
+            Self::ZeroCopy { stacked, .. } => stacked.as_ref(),
+        }
+    }
+
     fn into_store(self) -> Store {
         match self {
             Self::Local(store) | Self::ZeroCopy { store, .. } => store,
+        }
+    }
+
+    fn into_store_and_stacked(self) -> (Store, Option<devmap_query::StackedStore>) {
+        match self {
+            Self::Local(store) => (store, None),
+            Self::ZeroCopy { store, stacked, .. } => (store, stacked),
         }
     }
 }
@@ -378,10 +393,13 @@ fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
         match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
             Ok(Some((store, base_ref))) => {
                 let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
+                let stacked = devmap_query::StackedStore::open_if_leased(repo)
+                    .map_err(|e| e.to_string())?;
                 return Ok(OpenedRepoStore::ZeroCopy {
                     store,
                     base_ref,
                     anchor_root,
+                    stacked,
                 });
             }
             Ok(None) => {}
@@ -395,10 +413,13 @@ fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
         match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
             Ok(Some((store, base_ref))) => {
                 let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
+                let stacked = devmap_query::StackedStore::open_if_leased(repo)
+                    .map_err(|e| e.to_string())?;
                 return Ok(OpenedRepoStore::ZeroCopy {
                     store,
                     base_ref,
                     anchor_root,
+                    stacked,
                 });
             }
             Ok(None) => {}
@@ -448,6 +469,14 @@ fn open_indexed_store(repo: &Path) -> Result<Store, String> {
 /// query surface shares.
 pub(crate) fn open_repo_map(repo_path: &str) -> Result<Store, CommandError> {
     open_indexed_store(&resolve_repo(repo_path)?).map_err(CommandError::from)
+}
+
+fn open_repo_map_with_stacked(
+    repo_path: &str,
+) -> Result<(Store, Option<devmap_query::StackedStore>), CommandError> {
+    open_indexed_store_any(&resolve_repo(repo_path)?)
+        .map(OpenedRepoStore::into_store_and_stacked)
+        .map_err(CommandError::from)
 }
 
 /// Opens a zero-copy [`devmap_store::CsrGraphReader`] for the repository's latest
@@ -1122,13 +1151,23 @@ fn evaluate_zero_copy_status(
     anchor_root: &Path,
     store: &Store,
     summary: &devmap_store::StoreStatus,
+    stacked: Option<&devmap_query::StackedStore>,
 ) -> (Option<bool>, Option<String>) {
-    let (wt_fresh, wt_reason) = worktree_overlay::verify_zero_copy_worktree_freshness(
+    let (mut wt_fresh, mut wt_reason) = worktree_overlay::verify_zero_copy_worktree_freshness(
         worktree,
         anchor_root,
         store,
         summary,
     );
+    if wt_fresh == Some(false)
+        && stacked.is_some_and(|st| {
+            st.has_delta_changes()
+                && worktree_overlay::is_stacked_delta_fully_synced(worktree, store, st)
+        })
+    {
+        wt_fresh = Some(true);
+        wt_reason = None;
+    }
     let non_source_reason = if summary.analyzer_freshness == Some(false) {
         Some("stored extraction payload is obsolete; rebuild with the current analyzer".to_string())
     } else if summary.source_freshness.is_none() {
@@ -1197,6 +1236,7 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
             store,
             base_ref,
             anchor_root,
+            stacked,
         } => {
             let db_str = base_ref.anchor_db_path;
             let summary = match store.status(&db_str) {
@@ -1206,8 +1246,13 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
             let Some(gen_id) = summary.latest_generation else {
                 return status_unavailable(db_str, "No generation indexed in database".into());
             };
-            let (wt_fresh, combined_reason) =
-                evaluate_zero_copy_status(&repo, &anchor_root, &store, &summary);
+            let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
+                &repo,
+                &anchor_root,
+                &store,
+                &summary,
+                stacked.as_ref(),
+            );
             let is_fresh = summary.pending_count == 0
                 && summary.analyzer_freshness == Some(true)
                 && wt_fresh == Some(true)
@@ -1291,6 +1336,7 @@ struct OpenedCheckedStore {
     repo: PathBuf,
     store: Store,
     anchor_root: Option<PathBuf>,
+    stacked: Option<devmap_query::StackedStore>,
     freshness_override: Option<SourceFreshness>,
     unrun: Option<String>,
 }
@@ -1324,6 +1370,7 @@ fn open_repo_map_checked(
                 repo,
                 store,
                 anchor_root: None,
+                stacked: None,
                 freshness_override: None,
                 unrun,
             })
@@ -1332,6 +1379,7 @@ fn open_repo_map_checked(
             store,
             base_ref,
             anchor_root,
+            stacked,
         } => {
             let gen_id = store.latest_generation_id().ok().flatten();
             let (freshness_override, unrun) = if verify {
@@ -1345,8 +1393,13 @@ fn open_repo_map_checked(
                         None,
                     ),
                     Ok(summary) => {
-                        let (wt_fresh, combined_reason) =
-                            evaluate_zero_copy_status(&repo, &anchor_root, &store, &summary);
+                        let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
+                            &repo,
+                            &anchor_root,
+                            &store,
+                            &summary,
+                            stacked.as_ref(),
+                        );
                         (
                             Some(SourceFreshness {
                                 fresh: wt_fresh,
@@ -1364,6 +1417,7 @@ fn open_repo_map_checked(
                 repo,
                 store,
                 anchor_root: Some(anchor_root),
+                stacked,
                 freshness_override,
                 unrun,
             })
@@ -1387,6 +1441,7 @@ struct WorktreeHitContext {
     repo: PathBuf,
     anchor_root: Option<PathBuf>,
     overlay: Option<devmap_query::WorktreeOverlay>,
+    synced_stacked_files: std::collections::HashSet<PathBuf>,
     live_deltas: Option<std::collections::HashMap<String, worktree_overlay::DeltaKind>>,
     /// Why the overlay or the live change list is missing or partial.
     degraded: Vec<String>,
@@ -1397,6 +1452,19 @@ impl WorktreeHitContext {
         let mut degraded = Vec::new();
         let gen_id = opened.store.latest_generation_id().ok().flatten();
         let repo_str = opened.repo.to_string_lossy();
+        let mut synced_stacked_files = std::collections::HashSet::new();
+        if let Some(ref st) = opened.stacked {
+            for (rel_path, expected_b3) in &st.overlay().modified_files {
+                if let Ok(Some(bytes)) = worktree_overlay::read_bounded_file(
+                    &opened.repo.join(rel_path),
+                    worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+                ) {
+                    if devmap_query::blake3_hash(&bytes) == *expected_b3 {
+                        synced_stacked_files.insert(rel_path.clone());
+                    }
+                }
+            }
+        }
         let overlay = if worktree_overlay_path(&repo_str).is_file() {
             match load_worktree_overlay(&repo_str) {
                 Ok(found) => found.filter(|ov| match gen_id {
@@ -1441,6 +1509,7 @@ impl WorktreeHitContext {
             repo: opened.repo.clone(),
             anchor_root: opened.anchor_root.clone(),
             overlay,
+            synced_stacked_files,
             live_deltas,
             degraded,
         }
@@ -1484,6 +1553,11 @@ impl WorktreeHitContext {
         {
             return true;
         }
+        if self.synced_stacked_files.contains(Path::new(file_path)) {
+            // `StoreQueryEngine::with_stacked` already masked base symbols and returned
+            // the live `delta.sqlite` declarations for this verified file.
+            return false;
+        }
         let Some(ref ov) = self.overlay else {
             return false;
         };
@@ -1506,6 +1580,9 @@ impl WorktreeHitContext {
         source_unavailable_reason: &mut Option<String>,
         source_span_omitted_bytes: &mut Option<u32>,
     ) {
+        if self.synced_stacked_files.contains(Path::new(file_path)) {
+            return;
+        }
         let Some(ref anchor) = self.anchor_root else {
             return;
         };
@@ -1714,7 +1791,7 @@ pub fn search_with(
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let hit_ctx = WorktreeHitContext::load(&opened);
-    let engine = StoreQueryEngine::new(&opened.store);
+    let engine = StoreQueryEngine::new(&opened.store).with_stacked(opened.stacked.as_ref());
     let req = Request {
         query: query.to_string(),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
@@ -2079,11 +2156,11 @@ fn at_rung_query<E: std::fmt::Display>(
         Ok(b) => b,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let store = match open_repo_map(q.repo_path) {
-        Ok(s) => s,
+    let (store, stacked) = match open_repo_map_with_stacked(q.repo_path) {
+        Ok(pair) => pair,
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
-    let mut engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     if let Some(cancel) = q.cancel {
         engine = engine.with_cancel(cancel);
     }
@@ -2105,11 +2182,11 @@ pub fn dead_symbols(
     repo_path: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelDeadSymbol> {
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
+    let (store, stacked) = match open_repo_map_with_stacked(repo_path) {
+        Ok(pair) => pair,
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
 
     match engine.dead_symbols(budget) {
@@ -2163,11 +2240,11 @@ pub fn trace_between_at_rung(
         Ok(b) => b,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
+    let (store, stacked) = match open_repo_map_with_stacked(repo_path) {
+        Ok(pair) => pair,
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
-    let mut engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     if let Some(cancel) = cancel {
         engine = engine.with_cancel(cancel);
     }
@@ -2258,8 +2335,8 @@ pub fn neighbors(
     }
     let (min_confidence, max_depth) = bounds.resolve()?;
     let rung = parse_min_rung(min_rung)?;
-    let store = open_repo_map(repo_path)?;
-    let engine = StoreQueryEngine::new(&store);
+    let (store, stacked) = open_repo_map_with_stacked(repo_path)?;
+    let engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let mut out = Vec::new();
     for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
@@ -2401,8 +2478,8 @@ pub fn impact_layered_with_cancel(
             },
         };
     }
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
+    let (store, stacked) = match open_repo_map_with_stacked(repo_path) {
+        Ok(pair) => pair,
         Err(e) => {
             return CodeintelLayeredImpact {
                 available: false,
@@ -2417,7 +2494,7 @@ pub fn impact_layered_with_cancel(
             }
         }
     };
-    let mut engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     if let Some(cancel) = cancel {
         engine = engine.with_cancel(cancel);
     }
@@ -2594,16 +2671,23 @@ pub fn affected_tests(
             store,
             base_ref,
             anchor_root,
+            stacked,
         } => match store.status(&base_ref.anchor_db_path) {
             Ok(summary) => {
-                let (wt_fresh, combined_reason) =
-                    evaluate_zero_copy_status(&repo, anchor_root, store, &summary);
+                let (wt_fresh, combined_reason) = evaluate_zero_copy_status(
+                    &repo,
+                    anchor_root,
+                    store,
+                    &summary,
+                    stacked.as_ref(),
+                );
                 if wt_fresh == Some(false)
                     && summary.pending_count == 0
                     && summary.analyzer_freshness == Some(true)
                 {
                     let candidate = affected_tests_from_store(
                         store,
+                        stacked.as_ref(),
                         targets,
                         budget,
                         min_confidence,
@@ -2651,7 +2735,14 @@ pub fn affected_tests(
             fail_closed_reason: Some(reason),
         };
     }
-    affected_tests_from_store(opened.store(), targets, budget, min_confidence, max_depth)
+    affected_tests_from_store(
+        opened.store(),
+        opened.stacked(),
+        targets,
+        budget,
+        min_confidence,
+        max_depth,
+    )
 }
 
 /// A refused affected-tests query: nothing was selected, so the caller must
@@ -2675,12 +2766,13 @@ fn affected_tests_unavailable(targets: &[String], reason: String) -> CodeintelAf
 
 fn affected_tests_from_store(
     store: &Store,
+    stacked: Option<&devmap_query::StackedStore>,
     targets: &[String],
     budget: u32,
     min_confidence: f32,
     depth: usize,
 ) -> CodeintelAffectedTests {
-    let engine = StoreQueryEngine::new(store);
+    let engine = StoreQueryEngine::new(store).with_stacked(stacked);
     let mut tests = None;
     let mut layers = None;
     let mut unmatched = Vec::new();
@@ -3296,7 +3388,7 @@ pub fn explore_with(
         Err(e) => return explore_unavailable(query, e.into_message()),
     };
     let hit_ctx = WorktreeHitContext::load(&opened);
-    let engine = StoreQueryEngine::new(&opened.store);
+    let engine = StoreQueryEngine::new(&opened.store).with_stacked(opened.stacked.as_ref());
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let limit = limit.unwrap_or(20) as usize;
     match engine.explore_filtered(
@@ -3410,7 +3502,7 @@ pub struct CodeintelClones {
 
 /// Duplicate-code groups with coverage honesty.
 pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
-    let store = match open_repo_map(repo_path) {
+    let (store, stacked) = match open_repo_map_with_stacked(repo_path) {
         Ok(s) => s,
         Err(e) => {
             return CodeintelClones {
@@ -3422,7 +3514,7 @@ pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
             }
         }
     };
-    let engine = StoreQueryEngine::new(&store);
+    let engine = StoreQueryEngine::new(&store).with_stacked(stacked.as_ref());
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     match engine.clones(budget, None, 0) {
         Ok(report) => {
@@ -4161,7 +4253,7 @@ pub(crate) mod tests {
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
         let targets = vec!["probe_island".to_owned()];
         let found = |min_confidence: f32, depth: usize| {
-            affected_tests_from_store(&store, &targets, 2000, min_confidence, depth)
+            affected_tests_from_store(&store, None, &targets, 2000, min_confidence, depth)
                 .tests
                 .items
                 .len()
@@ -4191,7 +4283,7 @@ pub(crate) mod tests {
         assert!(raw.tests.truncated);
         assert_eq!(raw.tests.total, 1);
         assert!(raw.blast_radius.layers.truncated);
-        let report = affected_tests_from_store(&store, &targets, 0, 0.0, 10);
+        let report = affected_tests_from_store(&store, None, &targets, 0, 0.0, 10);
         assert_eq!(report.tests.total, 1);
         assert_eq!(report.tests.shown, 0);
         assert!(report.tests.truncated);
@@ -4204,7 +4296,7 @@ pub(crate) mod tests {
         assert!(report.fail_closed_reason.is_some());
 
         let empty = Store::open_in_memory().unwrap();
-        let refused = affected_tests_from_store(&empty, &targets, 2000, 0.0, 10);
+        let refused = affected_tests_from_store(&empty, None, &targets, 2000, 0.0, 10);
         assert!(!refused.tests.available);
         assert!(!refused.blast_radius.layers.available);
         assert!(refused.fail_closed);
@@ -4221,7 +4313,7 @@ pub(crate) mod tests {
         .unwrap();
         drop(conn);
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
-        let report = affected_tests_from_store(&store, &["probe_callee".into()], 2000, 0.0, 0);
+        let report = affected_tests_from_store(&store, None, &["probe_callee".into()], 2000, 0.0, 0);
         assert!(report.tests.available);
         assert!(report.tests.items.is_empty());
         assert!(report.blast_radius.layers.items.is_empty());
@@ -4251,7 +4343,7 @@ pub(crate) mod tests {
         drop(conn);
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
         let targets = vec!["probe_callee".to_owned(); MAX_NEIGHBOR_TARGETS + 1];
-        let report = affected_tests_from_store(&store, &targets, 100, 0.0, 10);
+        let report = affected_tests_from_store(&store, None, &targets, 100, 0.0, 10);
         let engine = StoreQueryEngine::new(&store);
         let mut expected_shown = 0;
         let mut tokens = 0;

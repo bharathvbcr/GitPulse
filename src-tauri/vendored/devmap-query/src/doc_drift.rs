@@ -3259,6 +3259,16 @@ pub fn doc_drift_report_with(
     cancel: &Cancel,
     options: &DocDriftOptions<'_>,
 ) -> anyhow::Result<DocDriftReport> {
+    doc_drift_report_with_stacked(store, None, cancel, options)
+}
+
+/// [`doc_drift_report_with`] optionally overlaid with a stacked worktree's delta store.
+pub fn doc_drift_report_with_stacked(
+    store: &Store,
+    stacked: Option<&crate::stacked::StackedStore>,
+    cancel: &Cancel,
+    options: &DocDriftOptions<'_>,
+) -> anyhow::Result<DocDriftReport> {
     let token_budget = options.token_budget;
     let include = clean_prefixes(options.paths, "path")?;
     let exclude = clean_prefixes(options.exclude, "exclude")?;
@@ -3290,7 +3300,15 @@ pub fn doc_drift_report_with(
         tokens_used: 0,
         walk_incomplete: Some(reason.to_string()),
     };
-    let Some((page, files)) = store.all_symbols_page_with_files()? else {
+    let page_and_files = if let Some(stacked) = stacked.filter(|s| s.has_delta_changes()) {
+        match (stacked.all_merged_symbols()?, stacked.all_indexed_files()?) {
+            (Some(page), Some((_, _, files))) => Some((page, files)),
+            _ => None,
+        }
+    } else {
+        store.all_symbols_page_with_files()?
+    };
+    let Some((page, files)) = page_and_files else {
         return Ok(unavailable("no persisted generation is available"));
     };
     let recorded_root = page.repo_root.clone();
