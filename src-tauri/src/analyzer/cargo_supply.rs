@@ -75,31 +75,44 @@ pub(crate) fn classify_bin_audit(stdout: &str, stderr: &str, success: bool) -> B
     BinAuditKind::Complete
 }
 
-/// True when `path` contains the cargo-auditable linker section name.
+/// Outcome of probing one binary for the cargo-auditable linker section.
 ///
-/// The scan is capped and looks only for the section name `.dep-v0`. A hit
-/// is what justifies spawning `cargo audit bin`; a miss is not a Rust binary
+/// `NotFound` means the file was opened and read to its end with no marker. A
+/// file that could not be opened or read is `Unreadable`: it says nothing
+/// about the section, so it must never be counted as lacking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuditableSection {
+    Found,
+    NotFound,
+    Unreadable(String),
+}
+
+/// Probes `path` for the cargo-auditable linker section name `.dep-v0`.
+///
+/// The scan is capped and looks only for the section name. A `Found` is what
+/// justifies spawning `cargo audit bin`; a `NotFound` is not a Rust binary
 /// GitPulse should spend an audit timeout on.
-pub(crate) fn file_contains_auditable_section(path: &std::path::Path) -> bool {
+pub(crate) fn probe_auditable_section(path: &std::path::Path) -> AuditableSection {
     const NEEDLE: &[u8] = b".dep-v0";
     const CHUNK: usize = 64 * 1024;
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => return AuditableSection::Unreadable(format!("open failed: {err}")),
     };
     let mut reader = std::io::Read::take(file, 100 * 1024 * 1024);
     let mut pending = Vec::with_capacity(NEEDLE.len());
     let mut buf = [0u8; CHUNK];
     loop {
         let read = match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) => return false,
+            Ok(0) => return AuditableSection::NotFound,
             Ok(n) => n,
-            Err(_) => return false,
+            Err(err) => return AuditableSection::Unreadable(format!("read failed: {err}")),
         };
         let mut window = Vec::with_capacity(pending.len() + read);
         window.extend_from_slice(&pending);
         window.extend_from_slice(&buf[..read]);
         if window.windows(NEEDLE.len()).any(|slice| slice == NEEDLE) {
-            return true;
+            return AuditableSection::Found;
         }
         if window.len() > NEEDLE.len() - 1 {
             pending = window[window.len() - (NEEDLE.len() - 1)..].to_vec();
@@ -523,8 +536,12 @@ mod tests {
         let mut bytes = vec![0u8; 80];
         bytes.extend_from_slice(b"xxxx.dep-v0yyyy");
         std::fs::write(&embedded, &bytes).unwrap();
-        assert!(!file_contains_auditable_section(&plain));
-        assert!(file_contains_auditable_section(&embedded));
+        assert_eq!(probe_auditable_section(&plain), AuditableSection::NotFound);
+        assert_eq!(probe_auditable_section(&embedded), AuditableSection::Found);
+        assert!(matches!(
+            probe_auditable_section(&dir.join("absent")),
+            AuditableSection::Unreadable(_)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
