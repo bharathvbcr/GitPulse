@@ -2507,3 +2507,70 @@ Median per-phase `t_*` ms after `.git` appeared, full 1 then full 2: checkout 60
 - The ~1.4 s hypothesis is not confirmed on this host. The earlier smoke (quieter) saw 1.32 s min; under load 17 to 30 the create takes 1.7 to 2.6 s. The create is ~1.3 to 1.7x the 1.4 s claim, which fits "milliseconds to low seconds on a fixture", not 19 s. This does confirm that current source does not take anything like 15 to 19 s on a fixture, which leaves the stale-installed-binary explanation standing but unproven; no installed binary was run here.
 - Where the time goes (full 1): checkout is ready at ~0.6 s, the store (DevMap seed) at ~1.2 s, the overlay at ~1.4 s, and the caches at ~1.85 s, so the cache clone (0.55 to 0.7 s alone) overlaps the store seeding, and the nested target and node_modules finish last. A real `src-tauri/target` (about 10 GB, `rewrite_build_outputs`) is not modelled by a 300-file fixture; `GITPULSE_BENCH_REPO` was not run.
 - Run 2 is not a better or worse build: same binary, same fixture, same devmap. Do not read its slower create as a regression.
+
+## 2026-11-07: gix in-process status, parity and per-scan cost (ft-75cf4dff, pulled forward from ft-b7a499bf AC4)
+
+Question: is gix's in-process status correct against `git status --porcelain=v1 -u -z` (the 47.6 ms idle spawn in the git spawn profile above), and is it cheaper per scan? Standalone crate `crates/git-status-parity/` (own `Cargo.lock`, no workspace; `src-tauri/Cargo.toml` and `Cargo.lock` untouched). gix 0.90.0 (latest on crates.io on 2026-11-06), `default-features = false`, features `status` and `sha1`. A crate feature `max-performance` adds gix's own `max-performance` bundle. Written against the 0.90.0 docs.rs pages for `gix::status` (`Repository::status`, `Platform::{untracked_files, index_worktree_submodules, into_iter}`, `Item`, `index_worktree::Item::summary`); the compiler was the check on the rest.
+
+Commands:
+
+- Parity: `cargo test --manifest-path crates/git-status-parity/Cargo.toml -- --nocapture` (prints the table below).
+- Cost: `GSP_FILES=3000 GSP_ROUNDS=40 cargo bench --manifest-path crates/git-status-parity/Cargo.toml [--features max-performance]` (release profile, `harness = false`; `GSP_FILES` 600 or 3000, `GSP_DIRTY` modified files per worktree, default 3).
+
+### Parity (39 cases, plain-`git` fixtures, gix `UntrackedFiles::Files`, submodules `check_dirty: true`)
+
+Both sides are reduced to sorted `(path, X, Y)` rows; git runs with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and a scratch `HOME`, and gix is opened in the same process environment. **38 match exactly; 1 diverges and is pinned by the test** (a gix change that fixes or alters it fails the test).
+
+| area | cases | result |
+| --- | --- | --- |
+| clean, modified, staged add, add then modify, staged then modify (`MM`), worktree delete, staged delete, staged delete then recreated (`D ` plus `??`) | 8 | match |
+| staged rename, staged rename plus modify (`RM`) | 2 | match |
+| untracked file, untracked dir (nested files listed), empty untracked dir (not listed) | 3 | match |
+| ignored (`*.log`, `build/`), nested `.gitignore` with negation and anchored pattern, `info/exclude` | 3 | match |
+| submodule clean, new commit inside, modified content inside, untracked content inside | 4 | match (gix needs `check_dirty: true`; the default `false` would not see content changes) |
+| cone sparse checkout (modified and untracked inside the cone, rest absent) | 1 | match |
+| symlink added, retargeted, dangling untracked, file replaced by symlink (`T`) | 4 | match |
+| case-only rename staged (`git mv c.txt C.txt`), case-only rename on disk only (git: clean) | 2 | match (APFS, case-insensitive) |
+| CRLF: `core.autocrlf=true` and `.gitattributes text=auto`/`eol=crlf` rewritten stat-dirty but content-clean, real change under CRLF, LF index vs CRLF worktree (git says `M`; gix agrees), no normalisation | 5 | match |
+| exec-bit change, staged and unstaged; stale stat (touched, same bytes) | 3 | match |
+| intent-to-add (`git add -N`: git prints ` A`), plus a staged modification beside it | 2 | match |
+| status run inside a linked worktree while the main checkout is dirty differently | 1 | match |
+| merge conflict (both modified) | 1 | **diverges**: git `UU a.txt`, gix reports ` U a.txt` |
+
+The one mismatch is the conflict code only. gix's `index_worktree::Item::summary()` collapses a conflict to `Summary::Conflict` and the harness maps it to the worktree letter, so the stage pair (`UU`, `AA`, `DU`, ...) is lost; the path is reported, so "this file is conflicted" is right and the exact two-letter code is not. The detailed stages are in `EntryStatus::Conflict`, which this harness does not decode; an adoption would map them. GitPulse's own use of the porcelain codes decides whether that matters.
+
+Not covered, said plainly: other conflict shapes, rewrites in the worktree (`index_worktree_rewrites`, git does not report them in porcelain v1), copy detection, `core.fsmonitor`/untracked-cache interplay, `skip-worktree` set by hand outside a sparse checkout, paths that are not UTF-8, and nested repositories that are not submodules. A fixture that passes is evidence about that fixture, not a proof for every repository. Read against the one pinned case: the oracle can fail, it did.
+
+### Per-scan cost
+
+Fixture shape (the phase-1 profile, scaled): one main checkout plus 17 linked worktrees, **every one dirty** (3 modified files and 1 untracked file each; 72 status rows per sweep), 30 directories. Two sizes: 600 tracked files (the profile's) and 3,000. One **sweep** is one status of all 18 worktrees in order (one GitPulse refresh), and the per-scan figure is the sweep divided by 18. Each round runs every arm once with a rotating start (interleaved); round 1 is a warm-up and is dropped. Arms: `git status --porcelain=v1 -u -z` spawned (output parsed to rows); the same arm a second time under another label (the noise floor); `git status -uno`; gix with `Repository` handles opened once outside the timing (warm) and with `gix::open` inside the timing (cold), each with untracked `Files` and `None`. Before any timing the bench asserts gix's rows equal git's for every worktree (0 mismatches in all runs). Release profile, git 2.54.0 (Apple Git-157), M5 Pro, 18 cores, APFS, hermetic git config (the app's `-c` pairs are not added, and the profile's 47.6 ms was taken under load 17; these runs were under load 18 to 39, so absolute milliseconds are not comparable with it, ratios are).
+
+**Noise floor** (git spawn timed twice per round): paired ratio 0.94x to 1.16x at n=15 (600 files, lean); 0.53x to 1.25x at n=40 (3,000 files, lean, load 39); 0.77x to 1.43x at n=40 (3,000 files, max-performance). Min over min of the two copies is 1.00x to 1.03x. A gap has to clear the min/min figure and, for a claim about one round, the paired range.
+
+Min-of-N sweep time in ms (per scan in parentheses), and ratio to `git spawn -u`:
+
+| arm | 600 files, lean, n=15 | 3,000 files, lean, n=40 | 3,000 files, max-performance, n=40 |
+| --- | --- | --- | --- |
+| git spawn `-u` | 371.3 (20.6), 1.00x | 276.5 (15.4), 1.00x | 315.8 (17.5), 1.00x |
+| git spawn `-u`, second copy (noise floor) | 368.4, 0.99x | 267.9, 0.97x | 311.3, 0.99x |
+| git spawn `-uno` | 332.2, 0.89x | 246.7, 0.89x | 269.9, 0.85x |
+| gix warm, untracked Files | 97.5 (5.4), 0.26x | 180.1 (10.0), 0.65x | 76.5 (4.3), 0.24x |
+| gix warm, untracked None | 78.0 (4.3), 0.21x | 134.8 (7.5), 0.49x | 72.4 (4.0), 0.23x |
+| gix cold open, untracked Files | 122.3 (6.8), 0.33x | 180.8 (10.0), 0.65x | 87.8 (4.9), 0.28x |
+| gix cold open, untracked None | 80.3 (4.5), 0.22x | 143.0 (7.9), 0.52x | 85.6 (4.8), 0.27x |
+
+Medians and maxima are in the bench output; for example gix warm Files at 3,000 files and max-performance has median 88.6 ms and max 222.4 ms against git spawn's 357.9 and 628.8. An earlier n=15 run of the lean 3,000-file arm had a noisier floor (A against A' min/min 1.28x, so its 0.56x is not used).
+
+What it says:
+
+- **Cheaper, by more than the noise.** With gix's own performance bundle, a sweep is about 4x cheaper than spawning (76 against 316 ms, 4.3 against 17.5 ms per scan, n=40, floor 1.01x). With the lean feature set it is 3.8x cheaper at 600 files and only about 1.5x at 3,000 files under load 39, so the lean set (no `parallel`) leaves most of the win on the table at size. The bundle enables more of gix's own optional dependencies (not counted here); that choice is the owner's and is not made here.
+- **Warm against cold open barely matters** (0 to 25% across the three columns): opening a repository is not the cost, the index read and the stat/hash pass are.
+- **Untracked `None` against `Files`:** small here (a few percent with the bundle; up to 1.3x lean at 3,000 files), because the fixture has only one untracked file and no large ignored trees. `git -uno` saves 11 to 15%. The fixture says nothing about a worktree with a large untracked or ignored tree (`node_modules`); that cost is in the directory walk and was not measured.
+- Not measured: a clean tree, a repository with 20,000+ files, memory, CPU time (only wall time), and the cost of building the snapshot rows GitPulse needs beyond (path, X, Y).
+
+### Verdict: adopt with fallback
+
+- **Correctness:** adopt for the 38 matching cases. For conflicted entries, fall back to the git spawn (or decode `EntryStatus::Conflict` and add a test per stage pair before trusting it); there is no other known mismatch.
+- **Cost:** about 4x cheaper per scan with `max-performance`; 1.5x to 3.8x with the lean set. Note `diff --shortstat` (17 per refresh, 33 ms each in the profile) is not addressed by this card: this crate does not evaluate an in-process shortstat, so that cost remains unaddressed.
+- **Conditions of adoption:** pick the gix feature set with the owner (the bundle is the one that gives the measured win), keep a spawn fallback on any gix error, and add the parity suite to the app's tests.
+- **This crate is throwaway.** The adoption change in `src-tauri` deletes `crates/git-status-parity/` in the same commit (its fixtures and the table above move into the app's tests; the harness's `gix_status` mapping is the code to carry over).

@@ -1,0 +1,27 @@
+[package]
+name = "git-status-parity"
+version = "0.1.0"
+edition = "2021"
+description = "Throwaway spike: is gix's in-process status correct against `git status --porcelain=v1 -u -z`, and cheaper per scan? Deleted in the commit that adopts gix into src-tauri."
+license = "MIT"
+publish = false
+
+[lib]
+name = "git_status_parity"
+path = "src/lib.rs"
+
+[[bench]]
+name = "status_cost"
+path = "benches/status_cost.rs"
+harness = false
+
+[features]
+# Adds gix's own performance bundle (parallel dirwalk/index reads, fast zlib) to
+# the lean feature set, to measure what the lean set leaves on the table.
+max-performance = ["gix/max-performance"]
+
+[dependencies]
+gix = { version = "0.90.0", default-features = false, features = ["status", "sha1"] }
+
+[profile.release]
+debug = false
