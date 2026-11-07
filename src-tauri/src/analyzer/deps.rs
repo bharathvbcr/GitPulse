@@ -16,8 +16,8 @@
 //! DB is the user's call, not a background write outside the repo.
 
 use crate::analyzer::cargo_supply::{
-    self, classify_bin_audit, crev_summary, file_contains_auditable_section,
-    parse_cargo_crev_jsonl, parse_cargo_deny_sarif, BinAuditKind,
+    self, classify_bin_audit, crev_summary, parse_cargo_crev_jsonl, parse_cargo_deny_sarif,
+    probe_auditable_section, AuditableSection, BinAuditKind,
 };
 use crate::analyzer::language::LanguageDetector;
 use crate::deadline::{ScanDeadline, AUDIT_TIMEOUT};
@@ -1711,30 +1711,45 @@ fn scan_auditable_binaries(
     program: &str,
 ) -> bool {
     let configured = auditable_config_path(repo, locks);
-    let executables = auditable_binaries(repo, locks);
-    let mut embedded: Vec<(String, PathBuf)> = executables
-        .iter()
-        .filter(|(_, path)| file_contains_auditable_section(path))
-        .cloned()
-        .collect();
+    let (executables, mut problems) = auditable_binaries(repo, locks);
+    let mut embedded: Vec<(String, PathBuf)> = Vec::new();
+    let mut not_found = 0usize;
+    for (label, path) in &executables {
+        match probe_auditable_section(path) {
+            AuditableSection::Found => embedded.push((label.clone(), path.clone())),
+            AuditableSection::NotFound => not_found += 1,
+            AuditableSection::Unreadable(reason) => problems.push(AuditableProblem {
+                code: "cargo_auditable_unreadable",
+                path: label.clone(),
+                message: format!("{label} could not be scanned for a .dep-v0 section: {reason}"),
+            }),
+        }
+    }
+    let had_problems = !problems.is_empty();
+    if let Some(path) = &configured {
+        record_auditable_problems(report, problems, path);
+    }
     if embedded.is_empty() {
         if let Some(path) = configured {
             if executables.is_empty() {
-                push_issue(
-                    &mut report.issues,
-                    "info",
-                    "cargo_auditable_unbuilt",
-                    "cargo-auditable is configured, but no executable under target/release or target/debug was found to scan".into(),
-                    Some(path),
-                );
-            } else {
+                // An oversized or un-stat-able file has its own issue;
+                // "no executable was found" would be untrue.
+                if !had_problems {
+                    push_issue(
+                        &mut report.issues,
+                        "info",
+                        "cargo_auditable_unbuilt",
+                        "cargo-auditable is configured, but no executable under target/release or target/debug was found to scan".into(),
+                        Some(path),
+                    );
+                }
+            } else if not_found > 0 {
                 push_issue(
                     &mut report.issues,
                     "warning",
                     "cargo_auditable_missing",
                     format!(
-                        "{} built executable(s) have no .dep-v0 cargo-auditable section. Build with `cargo auditable build` so `cargo audit bin` can read exact crate versions",
-                        executables.len()
+                        "{not_found} built executable(s) have no .dep-v0 cargo-auditable section. Build with `cargo auditable build` so `cargo audit bin` can read exact crate versions"
                     ),
                     Some(path),
                 );
@@ -1866,8 +1881,54 @@ fn cargo_manifest_beside(repo: &Path, deny_rel: &str) -> Result<PathBuf, String>
     Ok(canon)
 }
 
-fn auditable_binaries(repo: &Path, locks: &[String]) -> Vec<(String, PathBuf)> {
+/// A binary under `target/` that could not be judged, as opposed to one that
+/// was scanned and lacks the section. Each one is its own issue.
+struct AuditableProblem {
+    code: &'static str,
+    path: String,
+    message: String,
+}
+
+/// Most per-binary problem issues recorded before the rest are summarised.
+const MAX_AUDITABLE_PROBLEM_ISSUES: usize = 8;
+
+fn record_auditable_problems(
+    report: &mut DepsHealthReport,
+    mut problems: Vec<AuditableProblem>,
+    config_path: &str,
+) {
+    problems.sort_by(|a, b| (a.code, &a.path).cmp(&(b.code, &b.path)));
+    problems.dedup_by(|a, b| a.code == b.code && a.path == b.path);
+    let total = problems.len();
+    for problem in problems.iter().take(MAX_AUDITABLE_PROBLEM_ISSUES) {
+        push_issue(
+            &mut report.issues,
+            "warning",
+            problem.code,
+            problem.message.clone(),
+            Some(problem.path.clone()),
+        );
+    }
+    if total > MAX_AUDITABLE_PROBLEM_ISSUES {
+        push_issue(
+            &mut report.issues,
+            "warning",
+            problems[MAX_AUDITABLE_PROBLEM_ISSUES].code,
+            format!(
+                "and {} more cargo-auditable binaries could not be scanned",
+                total - MAX_AUDITABLE_PROBLEM_ISSUES
+            ),
+            Some(config_path.to_string()),
+        );
+    }
+}
+
+fn auditable_binaries(
+    repo: &Path,
+    locks: &[String],
+) -> (Vec<(String, PathBuf)>, Vec<AuditableProblem>) {
     let mut found = Vec::new();
+    let mut problems = Vec::new();
     for rel in locks {
         let Ok(lock) = sandbox_join_canonical(repo, rel) else {
             continue;
@@ -1875,41 +1936,73 @@ fn auditable_binaries(repo: &Path, locks: &[String]) -> Vec<(String, PathBuf)> {
         let Some(dir) = lock.parent() else {
             continue;
         };
-        let mut bins = executables_in(&dir.join("target").join("release"), repo);
-        if bins.is_empty() {
-            bins = executables_in(&dir.join("target").join("debug"), repo);
+        let (mut bins, mut bin_problems) =
+            executables_in(&dir.join("target").join("release"), repo);
+        if bins.is_empty() && bin_problems.is_empty() {
+            (bins, bin_problems) = executables_in(&dir.join("target").join("debug"), repo);
         }
+        problems.append(&mut bin_problems);
         for bin in bins {
             found.push((repo_relative(repo, &bin), bin));
         }
     }
     found.sort();
     found.dedup();
-    found
+    (found, problems)
 }
 
-fn executables_in(dir: &Path, repo: &Path) -> Vec<PathBuf> {
+fn executables_in(dir: &Path, repo: &Path) -> (Vec<PathBuf>, Vec<AuditableProblem>) {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
     let Ok(canon_dir) = dir.canonicalize() else {
-        return Vec::new();
+        return (out, problems);
     };
     if !canon_dir.starts_with(repo) {
-        return Vec::new();
+        return (out, problems);
     }
-    let Ok(entries) = std::fs::read_dir(&canon_dir) else {
-        return Vec::new();
+    let dir_label = repo_relative(repo, &canon_dir);
+    let entries = match std::fs::read_dir(&canon_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            problems.push(AuditableProblem {
+                code: "cargo_auditable_unreadable",
+                path: dir_label.clone(),
+                message: format!("{dir_label} could not be listed for executables: {err}"),
+            });
+            return (out, problems);
+        }
     };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                problems.push(AuditableProblem {
+                    code: "cargo_auditable_unreadable",
+                    path: dir_label.clone(),
+                    message: format!("an entry of {dir_label} could not be listed: {err}"),
+                });
+                continue;
+            }
+        };
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !is_candidate_binary_name(&name) {
             continue;
         }
         let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let label = repo_relative(repo, &path);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                problems.push(AuditableProblem {
+                    code: "cargo_auditable_unreadable",
+                    path: label.clone(),
+                    message: format!("{label} could not be inspected: {err}"),
+                });
+                continue;
+            }
         };
-        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_AUDITABLE_BIN_BYTES {
+        if !meta.is_file() || meta.len() == 0 {
             continue;
         }
         #[cfg(unix)]
@@ -1919,14 +2012,37 @@ fn executables_in(dir: &Path, repo: &Path) -> Vec<PathBuf> {
                 continue;
             }
         }
-        let Ok(canon) = path.canonicalize() else {
+        if meta.len() > MAX_AUDITABLE_BIN_BYTES {
+            problems.push(AuditableProblem {
+                code: "cargo_auditable_oversized",
+                path: label.clone(),
+                message: format!(
+                    "{label} is {} bytes, above the {MAX_AUDITABLE_BIN_BYTES}-byte scan limit, so it was not checked for a .dep-v0 section",
+                    meta.len()
+                ),
+            });
             continue;
-        };
-        if canon.starts_with(repo) {
-            out.push(canon);
+        }
+        match resolve_in_repo(&path, repo) {
+            Ok(Some(canon)) => out.push(canon),
+            Ok(None) => {}
+            Err(err) => problems.push(AuditableProblem {
+                code: "cargo_auditable_unreadable",
+                path: label.clone(),
+                message: format!("{label} could not be resolved: {err}"),
+            }),
         }
     }
-    out
+    (out, problems)
+}
+
+/// Canonicalizes `path`. `Ok(None)` is the deliberate skip of a path that
+/// resolves OUTSIDE the repository: GitPulse never reads outside the repo, and
+/// that is a privacy boundary, not a failure. A path that cannot be resolved at
+/// all is an `Err` the caller records.
+fn resolve_in_repo(path: &Path, repo: &Path) -> std::io::Result<Option<PathBuf>> {
+    let canon = path.canonicalize()?;
+    Ok(canon.starts_with(repo).then_some(canon))
 }
 
 fn is_candidate_binary_name(name: &str) -> bool {
@@ -3574,6 +3690,8 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
         "cargo_deny_failed",
         "cargo_crev_failed",
         "cargo_audit_bin_failed",
+        "cargo_auditable_unreadable",
+        "cargo_auditable_oversized",
         "pip_audit_failed",
         "govulncheck_failed",
         "composer_audit_failed",
@@ -7188,6 +7306,346 @@ mod tests {
             "findings are not scanner failures: {:?}",
             report.issues
         );
+    }
+
+    /// A cargo-auditable repo with a cargo-audit stub, and an empty
+    /// `target/release` for the caller to fill.
+    #[cfg(unix)]
+    fn auditable_fixture() -> (TempDir, PathBuf, TempDir) {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(repo.path(), ".cargo/config.toml", "# auditable\n");
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), ".cargo/config.toml");
+        let release = repo.path().join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        (repo, release, stubs)
+    }
+
+    #[cfg(unix)]
+    fn scan_auditable_fixture(repo: &TempDir, stubs: &TempDir) -> DepsHealthReport {
+        let home = TempDir::new().unwrap();
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.path().as_os_str().to_owned()),
+            },
+        )
+        .expect("scan")
+    }
+
+    /// Makes `path` execute-only (it still passes the executable filter) and
+    /// returns true when it stays readable anyway (running as root), where
+    /// the permission-based cases below cannot be constructed.
+    #[cfg(unix)]
+    fn exec_only_is_readable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o111)).unwrap();
+        fs::File::open(path).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn issue_codes(report: &DepsHealthReport) -> Vec<&str> {
+        report.issues.iter().map(|i| i.code.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_auditable_binary_is_not_counted_as_lacking_the_section() {
+        let (repo, release, stubs) = auditable_fixture();
+        let demo = write_exec(&release, "demo", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        if exec_only_is_readable(&demo) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "cargo_auditable_unreadable"
+                    && i.path.as_deref() == Some("target/release/demo")),
+            "{:?}",
+            issue_codes(&report)
+        );
+        assert!(
+            !issue_codes(&report).contains(&"cargo_auditable_missing"),
+            "an unreadable binary was reported as lacking .dep-v0: {:?}",
+            report.issues
+        );
+        assert!(!report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_auditable_sibling_does_not_hide_an_unreadable_binary() {
+        let (repo, release, stubs) = auditable_fixture();
+        write_exec(&release, "a-ok", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        let bad = write_exec(&release, "b-bad", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "cargo_auditable_unreadable"
+                    && i.path.as_deref() == Some("target/release/b-bad")),
+            "{:?}",
+            report.issues
+        );
+        assert!(!report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_binary_is_recorded_not_dropped_and_blocks_completion() {
+        let (repo, release, stubs) = auditable_fixture();
+        let big = write_exec(&release, "huge", "x");
+        // Sparse: no real disk is written.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(MAX_AUDITABLE_BIN_BYTES + 1)
+            .unwrap();
+        let small = write_exec(&release, "small", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        assert!(small.exists());
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "cargo_auditable_oversized"
+                    && i.path.as_deref() == Some("target/release/huge")),
+            "{:?}",
+            report.issues
+        );
+        assert!(!report.audit_complete, "{:?}", report.issues);
+
+        // Only oversized binaries: not "no executable was found".
+        fs::remove_file(&small).unwrap();
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(issue_codes(&report).contains(&"cargo_auditable_oversized"));
+        assert!(!issue_codes(&report).contains(&"cargo_auditable_unbuilt"));
+        assert!(!report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_cannot_be_stated_is_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, release, stubs) = auditable_fixture();
+        let demo = write_exec(&release, "demo", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        // Listable but not searchable: read_dir works, lstat on the entry fails.
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o444)).unwrap();
+        let constructible = fs::symlink_metadata(&demo).is_err();
+        let report = constructible.then(|| scan_auditable_fixture(&repo, &stubs));
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(report) = report else {
+            return;
+        };
+        assert!(
+            issue_codes(&report).contains(&"cargo_auditable_unreadable"),
+            "{:?}",
+            report.issues
+        );
+        assert!(!report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_binary_issues_are_capped_with_an_overflow_line() {
+        let (repo, release, stubs) = auditable_fixture();
+        let mut first = None;
+        for i in 0..(MAX_AUDITABLE_PROBLEM_ISSUES + 3) {
+            let path = write_exec(&release, &format!("bin{i:02}"), "#!/bin/sh\n# .dep-v0\n");
+            first.get_or_insert(path);
+        }
+        if exec_only_is_readable(first.as_ref().unwrap()) {
+            return;
+        }
+        for i in 1..(MAX_AUDITABLE_PROBLEM_ISSUES + 3) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                release.join(format!("bin{i:02}")),
+                fs::Permissions::from_mode(0o111),
+            )
+            .unwrap();
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let unreadable: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.code == "cargo_auditable_unreadable")
+            .collect();
+        assert_eq!(unreadable.len(), MAX_AUDITABLE_PROBLEM_ISSUES + 1);
+        assert!(unreadable
+            .iter()
+            .any(|i| i.message.starts_with("and 3 more")));
+        assert!(!report.audit_complete);
+    }
+
+    /// A path that vanishes between listing and canonicalize is an error the
+    /// scan records; a path resolving outside the repo is the deliberate skip.
+    /// The race itself is not constructible without a seam, so the resolver is
+    /// tested directly.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_in_repo_distinguishes_unresolvable_from_outside_the_repo() {
+        let (_guard, repo) = canonical_repo();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().canonicalize().unwrap().join("bin");
+        fs::write(&outside_file, "x").unwrap();
+        fs::write(repo.join("inside"), "x").unwrap();
+        assert!(resolve_in_repo(&repo.join("gone"), &repo).is_err());
+        assert_eq!(resolve_in_repo(&outside_file, &repo).unwrap(), None);
+        assert_eq!(
+            resolve_in_repo(&repo.join("inside"), &repo).unwrap(),
+            Some(repo.join("inside"))
+        );
+    }
+
+    #[cfg(unix)]
+    fn make_sparse_oversized(path: &Path) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(MAX_AUDITABLE_BIN_BYTES + 1)
+            .unwrap();
+    }
+
+    /// adv: without a cargo-auditable config the user has not opted in, so an
+    /// unreadable or oversized binary must not clear `audit_complete`.
+    #[cfg(unix)]
+    #[test]
+    fn adv_unconfigured_auditable_problems_do_not_block_completion() {
+        let (repo, release, stubs) = auditable_fixture();
+        fs::remove_file(repo.path().join(".cargo/config.toml")).unwrap();
+        let bad = write_exec(&release, "bad", "#!/bin/sh\n# .dep-v0\n");
+        let huge = write_exec(&release, "huge", "x");
+        make_sparse_oversized(&huge);
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let codes = issue_codes(&report);
+        assert!(
+            !codes.contains(&"cargo_auditable_unreadable"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !codes.contains(&"cargo_auditable_oversized"),
+            "{:?}",
+            report.issues
+        );
+        assert!(report.audit_complete, "{:?}", report.issues);
+    }
+
+    /// adv: 8 oversized + 1 unreadable. The overflow line carries the code of
+    /// the first problem past the cap (unreadable) and completion is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn adv_overflow_line_carries_the_first_overflowed_code() {
+        let (repo, release, stubs) = auditable_fixture();
+        for i in 0..MAX_AUDITABLE_PROBLEM_ISSUES {
+            let big = write_exec(&release, &format!("big{i:02}"), "x");
+            make_sparse_oversized(&big);
+        }
+        let bad = write_exec(&release, "zz-bad", "#!/bin/sh\n# .dep-v0\n");
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let oversized = report
+            .issues
+            .iter()
+            .filter(|i| i.code == "cargo_auditable_oversized")
+            .count();
+        assert_eq!(
+            oversized, MAX_AUDITABLE_PROBLEM_ISSUES,
+            "{:?}",
+            report.issues
+        );
+        let overflow = report
+            .issues
+            .iter()
+            .find(|i| i.message.starts_with("and 1 more"))
+            .expect("overflow line");
+        assert_eq!(overflow.code, "cargo_auditable_unreadable");
+        assert!(!report.audit_complete);
+    }
+
+    /// adv: symlinks named like binaries (to a binary outside the repo, a
+    /// loop, a dangling target) are never opened and never counted.
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlinked_binaries_are_never_read_or_counted() {
+        let (repo, release, stubs) = auditable_fixture();
+        std::os::unix::fs::symlink("/bin/sh", release.join("outside")).unwrap();
+        std::os::unix::fs::symlink("loop-b", release.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", release.join("loop-b")).unwrap();
+        std::os::unix::fs::symlink("nowhere", release.join("dangling")).unwrap();
+        let report = scan_auditable_fixture(&repo, &stubs);
+        let codes = issue_codes(&report);
+        assert!(
+            !codes.contains(&"cargo_auditable_unreadable"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !codes.contains(&"cargo_auditable_missing"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            codes.contains(&"cargo_auditable_unbuilt"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// adv: release holds only an unreadable binary, debug holds a good one.
+    /// Debug is skipped, the unreadable one is reported, completion blocked.
+    #[cfg(unix)]
+    #[test]
+    fn adv_debug_fallback_is_skipped_when_release_has_problems() {
+        let (repo, release, stubs) = auditable_fixture();
+        let bad = write_exec(&release, "bad", "#!/bin/sh\n# .dep-v0\n");
+        let debug = repo.path().join("target").join("debug");
+        fs::create_dir_all(&debug).unwrap();
+        write_exec(&debug, "good", "#!/bin/sh\n# .dep-v0\n");
+        if exec_only_is_readable(&bad) {
+            return;
+        }
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(issue_codes(&report).contains(&"cargo_auditable_unreadable"));
+        assert!(!report.audit_complete, "{:?}", report.issues);
+        // release holds only an oversized file: same decision.
+        fs::remove_file(&bad).unwrap();
+        let huge = write_exec(&release, "huge", "x");
+        make_sparse_oversized(&huge);
+        let report = scan_auditable_fixture(&repo, &stubs);
+        assert!(issue_codes(&report).contains(&"cargo_auditable_oversized"));
+        assert!(!report.audit_complete, "{:?}", report.issues);
     }
 
     #[cfg(unix)]
