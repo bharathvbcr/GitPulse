@@ -2308,7 +2308,11 @@ fn try_add_worktree_cow_macos(
     };
 
     // Probe APFS `clonefile(2)` once in `ancestor` before running any git write.
-    let probe_dst = ancestor.join(format!(".gp-cow-probe-{}-{}", std::process::id(), donor_clean.len()));
+    let probe_dst = ancestor.join(format!(
+        ".gp-cow-probe-{}-{}",
+        std::process::id(),
+        donor_clean.len()
+    ));
     if !try_apfs_clone_regular_file(&probe_file, &probe_dst) {
         return Ok(None);
     }
@@ -12814,7 +12818,11 @@ some-future-field whatever
             .unwrap()
             .permissions()
             .mode();
-        assert_ne!(mode & 0o111, 0, "executable bit must be preserved: {mode:o}");
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "executable bit must be preserved: {mode:o}"
+        );
     }
 
     #[test]
@@ -12842,6 +12850,9 @@ some-future-field whatever
             DevmapOutcome::Provisioned { zero_copy: true }
         );
         let lease_path = devmap_query::paths::state_dir(&wt).join("codeintel/stack_lease.json");
-        assert!(lease_path.is_file(), "expected stack_lease.json at {lease_path:?}");
+        assert!(
+            lease_path.is_file(),
+            "expected stack_lease.json at {lease_path:?}"
+        );
     }
 }

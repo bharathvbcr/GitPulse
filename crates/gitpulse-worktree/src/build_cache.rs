@@ -826,7 +826,7 @@ fn split_makefile_escaped_words(rhs: &str) -> Vec<String> {
 enum Classification {
     Probe,
     Passthrough,
-    Cacheable(CacheableInvocation),
+    Cacheable(Box<CacheableInvocation>),
 }
 
 #[derive(Debug)]
@@ -1422,7 +1422,7 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
         }
     }
 
-    Classification::Cacheable(CacheableInvocation {
+    Classification::Cacheable(Box::new(CacheableInvocation {
         crate_name,
         extra_filename,
         out_dir,
@@ -1433,7 +1433,7 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
         dep_search_dirs,
         native_libs,
         native_search_dirs,
-    })
+    }))
 }
 
 fn is_uncacheable_codegen_flag(val: &str) -> bool {
@@ -1450,13 +1450,19 @@ fn normalize_manifest_dir_for_stage1(
 ) -> String {
     let mpath = Path::new(manifest_dir);
     let mcanon = fs::canonicalize(mpath).unwrap_or_else(|_| mpath.to_path_buf());
-    for root in [worktree_root_canon, worktree_root_raw].into_iter().flatten() {
+    for root in [worktree_root_canon, worktree_root_raw]
+        .into_iter()
+        .flatten()
+    {
         for cand in [&mcanon, mpath] {
             if cand == root {
                 return COMPILE_ONLY_MANIFEST_DIR_SENTINEL.to_string();
             }
             if let Ok(rel) = cand.strip_prefix(root) {
-                return format!("{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/{}", rel.to_string_lossy());
+                return format!(
+                    "{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/{}",
+                    rel.to_string_lossy()
+                );
             }
         }
     }
@@ -2245,8 +2251,7 @@ fn is_stage1_manifest_dir_safe(input_rs: &Path, cargo_manifest_dir: Option<&str>
     rs_paths.push(input_canon.clone());
 
     if let (Some(mdir_raw), Some(parent_dir)) = (cargo_manifest_dir, input_canon.parent()) {
-        let mdir_canon =
-            fs::canonicalize(mdir_raw).unwrap_or_else(|_| PathBuf::from(mdir_raw));
+        let mdir_canon = fs::canonicalize(mdir_raw).unwrap_or_else(|_| PathBuf::from(mdir_raw));
         if parent_dir.starts_with(&mdir_canon) {
             let mut stack = vec![parent_dir.to_path_buf()];
             while let Some(dir) = stack.pop() {
@@ -2741,7 +2746,7 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
             update_counters(&cache_dir, |c| c.passthroughs += 1);
             return passthrough_rustc(rustc, rustc_args);
         }
-        Classification::Cacheable(c) => c,
+        Classification::Cacheable(c) => *c,
     };
 
     let (worktree_root_raw, worktree_root_canon) = detect_worktree_roots(&cwd);
@@ -3444,8 +3449,8 @@ mod tests {
     }
 
     #[test]
-    fn pure_ast_proc_macros_share_stage1_and_stage2_across_worktrees_and_invalidate_on_dylib_change()
-    {
+    fn pure_ast_proc_macros_share_stage1_and_stage2_across_worktrees_and_invalidate_on_dylib_change(
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(tmp.path()).unwrap();
         let wt_a = root.join("wt-a");
@@ -3482,7 +3487,7 @@ mod tests {
                 "crates/demo/src/lib.rs".to_string(),
             ];
             match classify_rustc_args(&args, wt) {
-                Classification::Cacheable(c) => c,
+                Classification::Cacheable(c) => *c,
                 other => panic!("expected Cacheable, got {other:?}"),
             }
         };
@@ -3533,8 +3538,7 @@ mod tests {
 
         // Stage 2 sentinel verification succeeds across sibling worktrees for the same crate path
         // and rejects mismatched crate subdirectories.
-        let norm_sentinel =
-            normalize_manifest_dir_for_stage1(&mdir_a, Some(&wt_a), Some(&wt_a));
+        let norm_sentinel = normalize_manifest_dir_for_stage1(&mdir_a, Some(&wt_a), Some(&wt_a));
         assert_eq!(
             norm_sentinel,
             format!("{COMPILE_ONLY_MANIFEST_DIR_SENTINEL}/crates/demo")
@@ -3544,7 +3548,10 @@ mod tests {
         let manifest = DirectManifest {
             schema_version: 1,
             crate_name: "demo".to_string(),
-            recorded_out_dir: wt_a.join("target/debug/deps").to_string_lossy().into_owned(),
+            recorded_out_dir: wt_a
+                .join("target/debug/deps")
+                .to_string_lossy()
+                .into_owned(),
             recorded_out_dir_canon: None,
             recorded_worktree_root: Some(wt_a.to_string_lossy().into_owned()),
             recorded_worktree_root_raw: Some(wt_a.to_string_lossy().into_owned()),
@@ -3595,9 +3602,15 @@ mod tests {
         fs::write(&custom_dylib, b"custom-macro").unwrap();
 
         for (label, extern_spec) in [
-            ("sqlx_macros", format!("sqlx_macros={}", sqlx_dylib.display())),
+            (
+                "sqlx_macros",
+                format!("sqlx_macros={}", sqlx_dylib.display()),
+            ),
             ("tauri_facade", format!("tauri={}", tauri_rlib.display())),
-            ("unknown_dylib", format!("custom_embed={}", custom_dylib.display())),
+            (
+                "unknown_dylib",
+                format!("custom_embed={}", custom_dylib.display()),
+            ),
         ] {
             let mk_inv = |wt: &Path| {
                 let args = vec![
@@ -3613,7 +3626,7 @@ mod tests {
                     "src/lib.rs".to_string(),
                 ];
                 match classify_rustc_args(&args, wt) {
-                    Classification::Cacheable(c) => c,
+                    Classification::Cacheable(c) => *c,
                     other => panic!("{label}: expected Cacheable, got {other:?}"),
                 }
             };
@@ -3646,9 +3659,9 @@ mod tests {
             );
         }
 
-        assert!(!dep_info_proc_macros_all_pure(&[
-            custom_dylib.to_string_lossy().into_owned()
-        ]));
+        assert!(!dep_info_proc_macros_all_pure(&[custom_dylib
+            .to_string_lossy()
+            .into_owned()]));
     }
 
     #[test]
@@ -3712,7 +3725,7 @@ mod tests {
                     "src/lib.rs".to_string(),
                 ];
                 match classify_rustc_args(&args, wt) {
-                    Classification::Cacheable(c) => c,
+                    Classification::Cacheable(c) => *c,
                     other => panic!("{label}: expected Cacheable, got {other:?}"),
                 }
             };
@@ -3771,7 +3784,7 @@ mod tests {
                 "src/lib.rs".to_string(),
             ];
             match classify_rustc_args(&args, wt) {
-                Classification::Cacheable(c) => c,
+                Classification::Cacheable(c) => *c,
                 other => panic!("submodule: expected Cacheable, got {other:?}"),
             }
         };

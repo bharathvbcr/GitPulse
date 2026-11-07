@@ -1264,12 +1264,7 @@ fn looks_like_binary_object(bytes: &[u8]) -> bool {
         let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if matches!(
             magic,
-            0xFEED_FACE
-                | 0xCEFA_EDFE
-                | 0xFEED_FACF
-                | 0xCFFAEDFE
-                | 0xCAFE_BABE
-                | 0xBEBA_FECA
+            0xFEED_FACE | 0xCEFA_EDFE | 0xFEED_FACF | 0xCFFAEDFE | 0xCAFE_BABE | 0xBEBA_FECA
         ) {
             return true;
         }
@@ -1301,7 +1296,7 @@ fn rewrite_out_tree_text_files(
             };
             let kind = meta.file_type();
             if kind.is_dir() {
-                if depth + 1 <= MAX_OUT_DEPTH {
+                if depth < MAX_OUT_DEPTH {
                     stack.push((path, depth + 1));
                 }
             } else if kind.is_file() && meta.len() <= MAX_BUILD_OUTPUT {
@@ -3048,7 +3043,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn nested_cargo_targets_and_node_modules_clone_prune_incremental_rewrite_out_and_preserve_mtime() {
+    fn nested_cargo_targets_and_node_modules_clone_prune_incremental_rewrite_out_and_preserve_mtime(
+    ) {
         let (main, _parent, worktree) =
             anchor_and_worktree(&["src-tauri/target", "rust/target", "frontend/node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
@@ -3107,7 +3103,8 @@ mod tests {
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
         for p in [&output_file, &gen_rs] {
             let f = fs::OpenOptions::new().write(true).open(p).unwrap();
-            f.set_times(fs::FileTimes::new().set_modified(past)).unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(past))
+                .unwrap();
         }
         let expected_mtime = fs::metadata(&gen_rs).unwrap().modified().unwrap();
 
@@ -3121,8 +3118,11 @@ mod tests {
         fs::create_dir_all(anchor.join("rust/target/debug/deps")).unwrap();
         fs::write(anchor.join("rust/target/debug/deps/libeng.rlib"), b"rlib").unwrap();
         fs::create_dir_all(anchor.join("frontend/node_modules/vite")).unwrap();
-        fs::write(anchor.join("frontend/node_modules/vite/index.js"), b"export default 1;\n")
-            .unwrap();
+        fs::write(
+            anchor.join("frontend/node_modules/vite/index.js"),
+            b"export default 1;\n",
+        )
+        .unwrap();
 
         let report = clone_ignored_caches(&anchor, &wt, &selection(roomy)).unwrap();
         assert!(report.failures.is_empty(), "{report:?}");
@@ -3136,13 +3136,19 @@ mod tests {
         // 2. Both `output` and `out/generated.rs` rewrote target + root prefixes cleanly.
         let wt_build_pkg = wt.join("src-tauri/target/debug/build/app-1234abcd");
         let rewritten_output = fs::read_to_string(wt_build_pkg.join("output")).unwrap();
-        assert!(!rewritten_output.contains(&*anchor.to_string_lossy()), "{rewritten_output}");
+        assert!(
+            !rewritten_output.contains(&*anchor.to_string_lossy()),
+            "{rewritten_output}"
+        );
         assert!(
             rewritten_output.contains(&format!("{}/src-tauri/tauri.conf.json", wt.display())),
             "{rewritten_output}"
         );
         let rewritten_gen = fs::read_to_string(wt_build_pkg.join("out/generated.rs")).unwrap();
-        assert!(!rewritten_gen.contains(&*anchor.to_string_lossy()), "{rewritten_gen}");
+        assert!(
+            !rewritten_gen.contains(&*anchor.to_string_lossy()),
+            "{rewritten_gen}"
+        );
         assert!(
             rewritten_gen.contains(&format!("\"{}/out\"", wt_build_pkg.display())),
             "{rewritten_gen}"
@@ -3162,7 +3168,10 @@ mod tests {
         );
 
         // 4. Mach-O object file inside `out/` was left byte-identical.
-        assert_eq!(fs::read(wt_build_pkg.join("out/native.o")).unwrap(), macho_bytes);
+        assert_eq!(
+            fs::read(wt_build_pkg.join("out/native.o")).unwrap(),
+            macho_bytes
+        );
     }
 }
 

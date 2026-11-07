@@ -476,14 +476,13 @@ pub fn provision_worktree_devmap(
     ));
     let mut tmp_guard = TempSqliteGuard::new(tmp_db.clone());
 
-    let seed_method = devmap_store::seed::stage_seed_healing_wal(&anchor_db, &tmp_db).map_err(
-        |e| {
+    let seed_method =
+        devmap_store::seed::stage_seed_healing_wal(&anchor_db, &tmp_db).map_err(|e| {
             CommandError::from(format!(
                 "failed to stage DevMap seed from {}: {e}",
                 anchor_db.display()
             ))
-        },
-    )?;
+        })?;
     let is_cow = seed_method == devmap_store::seed::SeedMethod::Clone;
     let used_online_backup = seed_method == devmap_store::seed::SeedMethod::Backup;
 
@@ -781,7 +780,7 @@ pub fn provision_worktree_devmap_zero_copy(
     let stack_lease = devmap_query::stacked::provision_stacked_worktree(&anchor, &worktree)
         .map_err(|e| CommandError::from(format!("failed to acquire DevMap stack lease: {e}")))?;
     let base_csr_candidate =
-        devmap_extract::paths::csr_path_for_store(&stack_lease.base_sqlite_path());
+        devmap_extract::paths::csr_path_for_store(stack_lease.base_sqlite_path());
 
     let base_ref = ZeroCopyBaseRef {
         anchor_repo_root: anchor.to_string_lossy().into_owned(),
@@ -813,7 +812,12 @@ pub fn provision_worktree_devmap_zero_copy(
         used_online_backup: false,
         zero_copy_base_ref: true,
         generation_id: Some(generation_id),
-        db_path: Some(stack_lease.base_sqlite_path().to_string_lossy().into_owned()),
+        db_path: Some(
+            stack_lease
+                .base_sqlite_path()
+                .to_string_lossy()
+                .into_owned(),
+        ),
         csr_seeded: base_ref.anchor_csr_path.is_some(),
         repo_map_seeded: devmap_query::paths::repo_map_path(&worktree).is_file(),
         cas_seeded: base_ref.anchor_cas_dir.is_some(),
@@ -1101,7 +1105,9 @@ fn load_zero_copy_base_ref_internal(repo: &Path) -> Result<Option<ZeroCopyBaseRe
     let anchor_root = validate_repo(&base_ref.anchor_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common || !devmap_extract::paths::same_registered_repo(repo, &anchor_root) {
+    if repo_common != anchor_common
+        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
+    {
         return Err(CommandError::from(format!(
             "refusing zero-copy DevMap base ref {} pointing outside worktree family ({})",
             ref_path.display(),
@@ -1125,12 +1131,13 @@ fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandErro
             manifest_path.display()
         ))
     })?;
-    let manifest: devmap_query::stacked::BaseManifest = serde_json::from_slice(&raw).map_err(|e| {
-        CommandError::from(format!(
-            "failed to parse stacked base manifest {}: {e}",
-            manifest_path.display()
-        ))
-    })?;
+    let manifest: devmap_query::stacked::BaseManifest =
+        serde_json::from_slice(&raw).map_err(|e| {
+            CommandError::from(format!(
+                "failed to parse stacked base manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
     let donor = validate_repo(&manifest.source_repo_root)?;
     if !devmap_extract::paths::same_registered_repo(repo, &donor) {
         return Err(CommandError::from(format!(
@@ -1158,16 +1165,19 @@ fn open_verified_stack_lease_store(
             manifest_path.display()
         ))
     })?;
-    let manifest: devmap_query::stacked::BaseManifest = serde_json::from_slice(&raw).map_err(|e| {
-        CommandError::from(format!(
-            "failed to parse stacked base manifest {}: {e}",
-            manifest_path.display()
-        ))
-    })?;
+    let manifest: devmap_query::stacked::BaseManifest =
+        serde_json::from_slice(&raw).map_err(|e| {
+            CommandError::from(format!(
+                "failed to parse stacked base manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
     let anchor_root = validate_repo(&manifest.source_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common || !devmap_extract::paths::same_registered_repo(repo, &anchor_root) {
+    if repo_common != anchor_common
+        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
+    {
         return Err(CommandError::from(format!(
             "refusing stack lease {} pointing outside worktree family ({})",
             lease_path.display(),
@@ -1543,20 +1553,6 @@ fn insert_cone_symbol_and_identifiers(
     }
 }
 
-/// Proves whether `candidate` (`affected_tests` computed from `anchor_store`) is
-/// graph-theoretically invariant under `worktree`'s dirty deltas (`F4`).
-///
-/// Returns `true` ONLY when:
-/// 1. `candidate` is available, complete (`!fail_closed`), and has zero omitted
-///    blast-radius layer nodes (`nodes_omitted == 0` on every layer).
-/// 2. Every difference between `worktree` and `anchor_store`'s indexed generation
-///    is a bounded (`<= MAX_OVERLAY_DIRTY_FILES`) set of modified/added files
-///    with zero deleted files and unchanged discovery refusals / over-limit sets.
-/// 3. Every modified/added file is disjoint from `targets`, `seeds`, `layers`,
-///    and `tests` (both by path and by indexed symbols in `anchor_store`), AND
-///    for declarative code files, its UTF-8 comment-stripped source contains
-///    zero wildcard re-exports/imports and zero identifier tokens matching any
-///    target, seed, blast-layer symbol, test symbol, or cone file stem.
 /// Verifies that every file divergence between `anchor_store`'s latest generation
 /// and `worktree` on disk is accounted for in `stacked` (`delta.sqlite`) with
 /// matching current blake3 content hashes and file tombstones.
@@ -1660,6 +1656,20 @@ pub(super) fn is_stacked_delta_fully_synced(
     true
 }
 
+/// Proves whether `candidate` (`affected_tests` computed from `anchor_store`) is
+/// graph-theoretically invariant under `worktree`'s dirty deltas (`F4`).
+///
+/// Returns `true` ONLY when:
+/// 1. `candidate` is available, complete (`!fail_closed`), and has zero omitted
+///    blast-radius layer nodes (`nodes_omitted == 0` on every layer).
+/// 2. Every difference between `worktree` and `anchor_store`'s indexed generation
+///    is a bounded (`<= MAX_OVERLAY_DIRTY_FILES`) set of modified/added files
+///    with zero deleted files and unchanged discovery refusals / over-limit sets.
+/// 3. Every modified/added file is disjoint from `targets`, `seeds`, `layers`,
+///    and `tests` (both by path and by indexed symbols in `anchor_store`), AND
+///    for declarative code files, its UTF-8 comment-stripped source contains
+///    zero wildcard re-exports/imports and zero identifier tokens matching any
+///    target, seed, blast-layer symbol, test symbol, or cone file stem.
 pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
     worktree: &Path,
     anchor: &Path,
@@ -2451,7 +2461,9 @@ mod tests {
             .unwrap();
         let wal_path = PathBuf::from(format!("{}-wal", anchor_db.display()));
         assert!(
-            fs::metadata(&wal_path).map(|m| m.len() > 0).unwrap_or(false),
+            fs::metadata(&wal_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
             "expected non-empty unpinned WAL before heal"
         );
 
@@ -3305,8 +3317,7 @@ mod tests {
         assert!(report.seeded, "{report:?}");
 
         // 1. `resolution-reuse-1/` must be CoW-cloned into the worktree (`F9`).
-        let wt_reuse_file =
-            devmap_query::paths::state_dir(&wt).join("resolution-reuse-1/unit.bin");
+        let wt_reuse_file = devmap_query::paths::state_dir(&wt).join("resolution-reuse-1/unit.bin");
         assert_eq!(
             fs::read(&wt_reuse_file).unwrap(),
             b"cached-resolution-artifact"
@@ -3462,7 +3473,8 @@ mod tests {
         let anchor = dir.path();
         git(anchor, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(anchor.join("src")).unwrap();
-        let rs_src = "pub const MAX_RETRIES: usize = 3;\npub fn keep_me() -> usize { MAX_RETRIES }\n";
+        let rs_src =
+            "pub const MAX_RETRIES: usize = 3;\npub fn keep_me() -> usize { MAX_RETRIES }\n";
         let go_src = "package srv\ntype Srv struct{}\nfunc (s *Srv) HandleReq() {}\n";
         let ts_src = "export const API_URL = 'https://example.test';\nexport class Client { fetchAll() { return API_URL; } }\n";
         fs::write(anchor.join("src/lib.rs"), rs_src).unwrap();
@@ -3546,7 +3558,13 @@ mod tests {
         let wt = wt_parent.path().join("wt-polyglot");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/polyglot", wt.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/polyglot",
+                wt.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt);
         provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy");
