@@ -3043,6 +3043,7 @@ mod tests {
                 dropped_scope: "this_process".to_string(),
                 catch_up_failures: 0,
                 history_only_bindings: 0,
+                history_only_bindings_unknown: false,
                 error: String::new(),
                 error_code: String::new(),
                 freshness: Default::default(),

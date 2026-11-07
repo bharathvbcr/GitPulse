@@ -59,6 +59,8 @@ export interface LedgerStatus extends Freshness {
   catch_up_failures?: number;
   /** Sibling-worktree bind/unbind rows the ledger keeps as history only. */
   history_only_bindings: number;
+  /** True when that count could not be read, so its 0 is not a count. Absent when known. */
+  history_only_bindings_unknown?: boolean;
   error: string;
   error_code: string;
 }
