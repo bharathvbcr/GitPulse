@@ -2488,3 +2488,22 @@ What this says, and what it does not:
 - On current source the node_modules clone is already faster than one `cp -c -R` (0.59 s against 3.2 s for the whole cache clone, both caches). `clone_tree` (`engine/cow_clone.rs`) takes `clonefile(2)` on the directory root for a non-`require_clone` copy, and only falls back to `copyfile` recursion. So per-file walking is not what the create path does on macOS today. The 15-17 s on the card was measured on the installed binary, which predates 29a61881 (per the card); it is not reproduced here.
 - The overlay sync is not a 9 s gap on this fixture (the whole alone-call is 74 ms, the create reaches overlay.json at about 0.96 s, concurrent with the cache clone). A real repository's gap is not reproduced by this fixture; it needs a run on the real shape (`GITPULSE_BENCH_REPO`), which was not completed (below).
 - The fixture's `sub/target` is 300 files. A real `src-tauri/target` is about 10 GB and goes through `rewrite_build_outputs`; that is the likely remaining cost and is not measured here.
+
+## 2026-11-06: worktree create, first end-to-end runs of `worktree_create` (lane wtbench, base cd9be37a)
+
+The bench had never run end to end. It runs unmodified at cd9be37a: no code fix was needed, so there is no regression test. Spawn path: the fixture's `devmap build --manifest` goes through `output_locked()` and the `cp -c -R` baseline through `status_locked()`; the bench asserts the build left a store and that `cp` exited 0, and both rows produced samples, so both spawn calls ran (no spawn counter exists to cite). `phases_seen=6` in every run (7 phases minus `cas`, which this fixture does not have), so the poller fix from 1c74e31d works.
+
+Setup: `devmap` copied to scratch (`devmap 0.2.5, store schema 29, build 947090b7fa87`) and pinned with `GITPULSE_DEVMAP_BIN`, so a mid-run swap of `~/.local/bin/devmap` cannot change results. Synthetic fixture (3 000 tracked + 400 Rust files, 25 000-file `node_modules`, 300-file `sub/target`), APFS, 18 cores, bench profile for the full runs (dev profile for the smoke), engine code of cd9be37a (not the uncommitted edits in the main checkout). The host was loaded the whole time (load 16.8, 18.2 and 30.4 at the three starts), so absolute times are inflated.
+
+| run | profile | n | create e2e min / p50 | `cp -c -R node_modules` min / p50 | `clone_ignored_caches` min / p50 | overlay sync min / p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| smoke | dev | 3 | 1.72 s / 1.80 s | 4.27 s / 5.31 s | 577 ms / 613 ms | 38 ms / 43 ms |
+| full 1 | bench | 5 | 1.83 s / 1.90 s | 4.60 s / 6.29 s | 548 ms / 700 ms | 42 ms / 62 ms |
+| full 2 (identical config) | bench | 5 | 2.55 s / 3.93 s | 4.82 s / 13.05 s | 691 ms / 798 ms | 50 ms / 55 ms |
+
+Median per-phase `t_*` ms after `.git` appeared, full 1 then full 2: checkout 604 / 2145, store 1227 / 3155, csr 1232 / 3163, overlay 1369 / 3289, node_modules 1844 / 3846, nested target 1862 / 3864.
+
+- Noise floor: identical config, back to back, moved the create min by 39% (1.83 s to 2.55 s) and the `cp` p50 by 2x, with the host load at 17 to 18. Only the ordering is stable: create e2e < `cp -c -R` in every run, create min is 0.40x to 0.53x of the `cp -c -R` min, and the cache clone alone is 0.12x to 0.14x of it. Absolute numbers carry about 40% noise at this load; the stable minima are 1.7 to 1.8 s (smoke and full 1).
+- The ~1.4 s hypothesis is not confirmed on this host. The earlier smoke (quieter) saw 1.32 s min; under load 17 to 30 the create takes 1.7 to 2.6 s. The create is ~1.3 to 1.7x the 1.4 s claim, which fits "milliseconds to low seconds on a fixture", not 19 s. This does confirm that current source does not take anything like 15 to 19 s on a fixture, which leaves the stale-installed-binary explanation standing but unproven; no installed binary was run here.
+- Where the time goes (full 1): checkout is ready at ~0.6 s, the store (DevMap seed) at ~1.2 s, the overlay at ~1.4 s, and the caches at ~1.85 s, so the cache clone (0.55 to 0.7 s alone) overlaps the store seeding, and the nested target and node_modules finish last. A real `src-tauri/target` (about 10 GB, `rewrite_build_outputs`) is not modelled by a 300-file fixture; `GITPULSE_BENCH_REPO` was not run.
+- Run 2 is not a better or worse build: same binary, same fixture, same devmap. Do not read its slower create as a regression.
