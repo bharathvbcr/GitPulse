@@ -221,8 +221,9 @@ fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {
     )
 }
 
+/// An exclusive `flock(2)` held until dropped.
 #[cfg(unix)]
-struct AdvisoryFileLock {
+pub(crate) struct AdvisoryFileLock {
     file: fs::File,
 }
 
@@ -243,7 +244,6 @@ fn acquire_bus_file_lock(
     create_dir: bool,
 ) -> Result<Option<AdvisoryFileLock>, CommandError> {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
 
     if create_dir {
         fs::create_dir_all(lanes_dir).map_err(|e| {
@@ -268,14 +268,26 @@ fn acquire_bus_file_lock(
             )))
         }
     };
+    lock_exclusive_within(file, &lock_path, BUS_LOCK_TIMEOUT, "coordination bus").map(Some)
+}
 
-    let deadline = std::time::Instant::now() + BUS_LOCK_TIMEOUT;
+/// Takes an exclusive `flock(2)` on the already-open `file`, retrying with
+/// backoff (1–25 ms) until `timeout`. `what` names the lock in errors.
+#[cfg(unix)]
+fn lock_exclusive_within(
+    file: fs::File,
+    lock_path: &Path,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<AdvisoryFileLock, CommandError> {
+    use std::os::unix::io::AsRawFd;
+    let deadline = std::time::Instant::now() + timeout;
     let mut backoff_ms = 1u64;
     loop {
         // SAFETY: `file` is a valid open file descriptor owned by this stack frame.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return Ok(Some(AdvisoryFileLock { file }));
+            return Ok(AdvisoryFileLock { file });
         }
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::Interrupted {
@@ -286,20 +298,55 @@ fn acquire_bus_file_lock(
             || err.raw_os_error() == Some(libc::EAGAIN);
         if !contended {
             return Err(CommandError::from(format!(
-                "cannot lock coordination bus {}: {err}",
+                "cannot lock {what} {}: {err}",
                 lock_path.display()
             )));
         }
         if std::time::Instant::now() >= deadline {
             return Err(CommandError::from(format!(
-                "timed out after {}s waiting for coordination lock {}",
-                BUS_LOCK_TIMEOUT.as_secs(),
+                "timed out after {}s waiting for {what} lock {}",
+                timeout.as_secs(),
                 lock_path.display()
             )));
         }
         std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
         backoff_ms = (backoff_ms * 2).min(25);
     }
+}
+
+/// An exclusive advisory lock on `lock_path`, created (mode 0600, with its
+/// directory) when missing, waited for up to `timeout`. Another process
+/// holding it is waited out; anything else is an error. `what` names the lock
+/// in errors. Elsewhere than Unix there is no such lock and this is `None`.
+#[cfg(unix)]
+pub(crate) fn exclusive_file_lock(
+    lock_path: &Path,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<Option<AdvisoryFileLock>, CommandError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = lock_path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| CommandError::from(format!("cannot create {}: {e}", dir.display())))?;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)
+        .map_err(|e| format!("cannot open {what} lock {}: {e}", lock_path.display()))?;
+    lock_exclusive_within(file, lock_path, timeout, what).map(Some)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn exclusive_file_lock(
+    _lock_path: &Path,
+    _timeout: std::time::Duration,
+    _what: &str,
+) -> Result<Option<()>, CommandError> {
+    Ok(None)
 }
 
 #[cfg(not(unix))]

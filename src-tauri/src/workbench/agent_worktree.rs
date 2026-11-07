@@ -1032,7 +1032,10 @@ mod tests {
         let reopened = devmap_store::Store::open_read_only(&db).unwrap();
         let effective_root = reopened.latest_repo_root().unwrap().unwrap();
         drop(reopened);
-        assert_eq!(Path::new(&effective_root).canonicalize().unwrap(), lane_canon);
+        assert_eq!(
+            Path::new(&effective_root).canonicalize().unwrap(),
+            lane_canon
+        );
 
         let conn =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

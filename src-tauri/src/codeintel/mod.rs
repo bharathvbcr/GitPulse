@@ -321,7 +321,7 @@ enum OpenedRepoStore {
         store: Store,
         base_ref: ZeroCopyBaseRef,
         anchor_root: PathBuf,
-        stacked: Option<devmap_query::StackedStore>,
+        stacked: Option<Box<devmap_query::StackedStore>>,
     },
 }
 
@@ -335,7 +335,7 @@ impl OpenedRepoStore {
     fn stacked(&self) -> Option<&devmap_query::StackedStore> {
         match self {
             Self::Local(_) => None,
-            Self::ZeroCopy { stacked, .. } => stacked.as_ref(),
+            Self::ZeroCopy { stacked, .. } => stacked.as_deref(),
         }
     }
 
@@ -348,7 +348,7 @@ impl OpenedRepoStore {
     fn into_store_and_stacked(self) -> (Store, Option<devmap_query::StackedStore>) {
         match self {
             Self::Local(store) => (store, None),
-            Self::ZeroCopy { store, stacked, .. } => (store, stacked),
+            Self::ZeroCopy { store, stacked, .. } => (store, stacked.map(|s| *s)),
         }
     }
 }
@@ -393,13 +393,13 @@ fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
         match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
             Ok(Some((store, base_ref))) => {
                 let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
-                let stacked = devmap_query::StackedStore::open_if_leased(repo)
-                    .map_err(|e| e.to_string())?;
+                let stacked =
+                    devmap_query::StackedStore::open_if_leased(repo).map_err(|e| e.to_string())?;
                 return Ok(OpenedRepoStore::ZeroCopy {
                     store,
                     base_ref,
                     anchor_root,
-                    stacked,
+                    stacked: stacked.map(Box::new),
                 });
             }
             Ok(None) => {}
@@ -413,13 +413,13 @@ fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
         match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
             Ok(Some((store, base_ref))) => {
                 let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
-                let stacked = devmap_query::StackedStore::open_if_leased(repo)
-                    .map_err(|e| e.to_string())?;
+                let stacked =
+                    devmap_query::StackedStore::open_if_leased(repo).map_err(|e| e.to_string())?;
                 return Ok(OpenedRepoStore::ZeroCopy {
                     store,
                     base_ref,
                     anchor_root,
-                    stacked,
+                    stacked: stacked.map(Box::new),
                 });
             }
             Ok(None) => {}
@@ -1251,7 +1251,7 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
                 &anchor_root,
                 &store,
                 &summary,
-                stacked.as_ref(),
+                stacked.as_deref(),
             );
             let is_fresh = summary.pending_count == 0
                 && summary.analyzer_freshness == Some(true)
@@ -1398,7 +1398,7 @@ fn open_repo_map_checked(
                             &anchor_root,
                             &store,
                             &summary,
-                            stacked.as_ref(),
+                            stacked.as_deref(),
                         );
                         (
                             Some(SourceFreshness {
@@ -1417,7 +1417,7 @@ fn open_repo_map_checked(
                 repo,
                 store,
                 anchor_root: Some(anchor_root),
-                stacked,
+                stacked: stacked.map(|s| *s),
                 freshness_override,
                 unrun,
             })
@@ -2679,7 +2679,7 @@ pub fn affected_tests(
                     anchor_root,
                     store,
                     &summary,
-                    stacked.as_ref(),
+                    stacked.as_deref(),
                 );
                 if wt_fresh == Some(false)
                     && summary.pending_count == 0
@@ -2687,7 +2687,7 @@ pub fn affected_tests(
                 {
                     let candidate = affected_tests_from_store(
                         store,
-                        stacked.as_ref(),
+                        stacked.as_deref(),
                         targets,
                         budget,
                         min_confidence,
@@ -4313,7 +4313,8 @@ pub(crate) mod tests {
         .unwrap();
         drop(conn);
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
-        let report = affected_tests_from_store(&store, None, &["probe_callee".into()], 2000, 0.0, 0);
+        let report =
+            affected_tests_from_store(&store, None, &["probe_callee".into()], 2000, 0.0, 0);
         assert!(report.tests.available);
         assert!(report.tests.items.is_empty());
         assert!(report.blast_radius.layers.items.is_empty());

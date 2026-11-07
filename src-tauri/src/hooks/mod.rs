@@ -57,6 +57,7 @@ pub use notify_input::SESSION_END_HOST_TIMEOUT;
 use notify_outcome::send_unsupported as notify_send;
 pub use notify_outcome::{diagnostic, Diagnostic, HookError, SendError};
 pub mod signal_guard;
+pub mod worktree;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
 ///
@@ -260,6 +261,18 @@ pub struct HookInput {
     /// `asyncRewake` wake starts is itself a stop-hook continuation (see the
     /// `stop_hook_active` paragraph of `deliver.rs`'s module documentation).
     pub stop_hook_active: bool,
+    /// `WorktreeCreate`'s `name`: the slug Claude Code would have put the
+    /// worktree under (`bold-oak-a3f2`). See [`worktree`].
+    pub worktree_name: String,
+    /// `WorktreeRemove`'s `worktree_path`: the absolute path of the worktree
+    /// to remove.
+    pub worktree_path: String,
+    /// `discard_changes`, when a `WorktreeRemove` payload carries it. The
+    /// hooks reference read on 2026-11-06 lists only `worktree_path` for that
+    /// event (`discard_changes` is the `ExitWorktree` tool's parameter), so
+    /// this is `false` for every payload documented today, and a removal of a
+    /// worktree with work in it is refused.
+    pub discard_changes: bool,
 }
 
 impl HookInput {
@@ -307,6 +320,9 @@ impl HookInput {
                 .filter(|mode| !mode.is_empty())
                 .unwrap_or_else(|| string_at(Some(value), "permissionMode")),
             stop_hook_active: value.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
+            worktree_name: string_at(Some(value), "name"),
+            worktree_path: string_at(Some(value), "worktree_path"),
+            discard_changes: value.get("discard_changes").and_then(Value::as_bool) == Some(true),
         }
     }
 }
@@ -2030,12 +2046,19 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
             BUDGET.as_secs()
         ));
     };
+    let brief = session_brief(&snapshot, &here, &input.source);
+    // A worktree the WorktreeCreate hook handed over with its setup failed:
+    // the one place that reaches the session (`worktree::setup_failure`).
+    let brief = match worktree::setup_failure(&root) {
+        Some(warning) => format!("{warning}\n{brief}"),
+        None => brief,
+    };
     HookOutput {
         hook_specific_output: Some(HookSpecificOutput {
             hook_event_name: SESSION_START.to_string(),
             permission_decision: None,
             permission_decision_reason: None,
-            additional_context: Some(session_brief(&snapshot, &here, &input.source)),
+            additional_context: Some(brief),
         }),
         system_message: None,
     }
@@ -2044,12 +2067,16 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
-pub const SUBCOMMANDS: [&str; 5] = [
+pub const SUBCOMMANDS: [&str; 7] = [
     "collision-guard",
     "command-gate",
     "session-brief",
     "notify",
     "deliver",
+    // `worktree::CREATE` and `worktree::REMOVE`, spelled out because
+    // `plugin-contract.test.ts` reads this list as literals.
+    "worktree-create",
+    "worktree-remove",
 ];
 
 /// The subcommands GitPulse puts on the sessions it launches, beside any the
@@ -2103,6 +2130,13 @@ pub fn dispatch(
         "session-brief" => Ok(run_session_brief(input)),
         "notify" => run_notify(argument, input, notify_send),
         "deliver" => deliver::run(input),
+        // Not a JSON answer: the worktree events take a path on stdout and an
+        // exit code, so the binary runs them through `worktree::run` before it
+        // gets here.
+        worktree::CREATE | worktree::REMOVE => Err(format!(
+            "{subcommand} answers with a path and an exit code, not hook JSON; run it through hooks::worktree::run"
+        )
+        .into()),
         other => Err(format!(
             "unknown subcommand '{other}'; expected one of {}",
             SUBCOMMANDS.join(", ")
@@ -5782,6 +5816,13 @@ done
     fn every_advertised_subcommand_dispatches() {
         for name in SUBCOMMANDS {
             let outcome = dispatch(name, None, &HookInput::default());
+            // Routed by the binary to `worktree::run`, which speaks a path and
+            // an exit code; `dispatch` says so rather than calling them unknown.
+            if [worktree::CREATE, worktree::REMOVE].contains(&name) {
+                let error = outcome.expect_err("not a JSON hook").to_string();
+                assert!(error.contains("hooks::worktree::run"), "{name}: {error}");
+                continue;
+            }
             if REPORTERS.contains(&name) {
                 let error = outcome
                     .expect_err("a reporter with no argument has nothing to send")
@@ -6318,6 +6359,7 @@ done
                 let matcher = group["matcher"].as_str().unwrap_or_default();
                 for handler in group["hooks"].as_array().into_iter().flatten() {
                     let command = handler["command"].as_str().unwrap_or_default();
+                    let (command, launched) = worktree::strip_launcher(command);
                     let mut words = command.split_whitespace();
                     assert_eq!(
                         words.next(),
@@ -6328,6 +6370,13 @@ done
                     assert!(
                         SUBCOMMANDS.contains(&subcommand),
                         "{event_name} asks for an unknown subcommand: {command}"
+                    );
+                    // The worktree events, and only they, run through the
+                    // launcher that falls back to plain git.
+                    assert_eq!(
+                        launched,
+                        [worktree::CREATE, worktree::REMOVE].contains(&subcommand),
+                        "{event_name}: {command}"
                     );
                     if subcommand != "notify" {
                         assert_eq!(words.next(), None, "{command} passes an unread argument");

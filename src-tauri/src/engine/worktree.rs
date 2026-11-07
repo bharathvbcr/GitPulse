@@ -2308,7 +2308,11 @@ fn try_add_worktree_cow_macos(
     };
 
     // Probe APFS `clonefile(2)` once in `ancestor` before running any git write.
-    let probe_dst = ancestor.join(format!(".gp-cow-probe-{}-{}", std::process::id(), donor_clean.len()));
+    let probe_dst = ancestor.join(format!(
+        ".gp-cow-probe-{}-{}",
+        std::process::id(),
+        donor_clean.len()
+    ));
     if !try_apfs_clone_regular_file(&probe_file, &probe_dst) {
         return Ok(None);
     }
@@ -2719,6 +2723,16 @@ pub fn add_worktree_with_devmap(
         }
     } else {
         created.devmap = provision();
+        // No caches were asked for, but `.worktreeinclude` is the repository's
+        // own list of local files, which every worktree gets.
+        let repo = validate_repo(repo_path)?;
+        let report = crate::engine::cow_clone::copy_worktree_include(
+            &repo,
+            target,
+            &crate::engine::cow_clone::CacheSelection::default(),
+        );
+        created.cache_error = report.error();
+        created.low_disk = report.low_disk;
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;
@@ -12804,7 +12818,11 @@ some-future-field whatever
             .unwrap()
             .permissions()
             .mode();
-        assert_ne!(mode & 0o111, 0, "executable bit must be preserved: {mode:o}");
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "executable bit must be preserved: {mode:o}"
+        );
     }
 
     #[test]
@@ -12832,6 +12850,9 @@ some-future-field whatever
             DevmapOutcome::Provisioned { zero_copy: true }
         );
         let lease_path = devmap_query::paths::state_dir(&wt).join("codeintel/stack_lease.json");
-        assert!(lease_path.is_file(), "expected stack_lease.json at {lease_path:?}");
+        assert!(
+            lease_path.is_file(),
+            "expected stack_lease.json at {lease_path:?}"
+        );
     }
 }

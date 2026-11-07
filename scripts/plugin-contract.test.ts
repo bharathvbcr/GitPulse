@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { declaredBinaryNames } from "./check-release-assets.mjs";
+import { bareHookCommand, WORKTREE_LAUNCHER_PREFIX } from "./check-mcp-install.mjs";
 
 /**
  * Agent Plugins 1.0.0 compatibility surface in the canonical GitPulse plugin.
@@ -121,7 +122,30 @@ describe("plugin hooks", () => {
       "Stop",
       "StopFailure",
       "UserPromptSubmit",
+      "WorktreeCreate",
+      "WorktreeRemove",
     ]);
+  });
+
+  it("runs the worktree hooks, and only them, through the launcher that falls back to plain git", () => {
+    // A WorktreeCreate hook that cannot start fails closed: Claude Code gets no
+    // worktree. The launcher runs plain git instead when the binary is absent,
+    // too old, or hands the job back (exit 75).
+    const rust = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "worktree.rs"), "utf8");
+    const declared = /pub const LAUNCHER_PREFIX: &str = "((?:[^"\\]|\\.)*)";/.exec(rust)?.[1];
+    expect(declared, "LAUNCHER_PREFIX is no longer a plain string in hooks/worktree.rs").toBeTruthy();
+    expect(JSON.parse(`"${declared}"`)).toBe(WORKTREE_LAUNCHER_PREFIX);
+    expect(existsSync(path.join(PLUGIN, "hooks", "gitpulse-worktree.sh"))).toBe(true);
+    for (const [event, groups] of Object.entries(hooks.hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          const launched = String(handler.command).startsWith(WORKTREE_LAUNCHER_PREFIX);
+          expect(launched, `${event}: ${handler.command}`).toBe(event === "WorktreeCreate" || event === "WorktreeRemove");
+        }
+      }
+    }
+    expect(bareHookCommand(String(hooks.hooks.WorktreeCreate[0].hooks[0].command))).toBe("gitpulse-hook worktree-create");
+    expect(bareHookCommand(String(hooks.hooks.WorktreeRemove[0].hooks[0].command))).toBe("gitpulse-hook worktree-remove");
   });
 
   it("never makes the agent wait on a report it could have sent in the background", () => {
@@ -134,7 +158,7 @@ describe("plugin hooks", () => {
     for (const [event, groups] of Object.entries(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
-          const subcommand = String(handler.command).split(/\s+/)[1];
+          const subcommand = bareHookCommand(String(handler.command)).split(/\s+/)[1];
           const reports = subcommand === "notify";
           // `deliver` is the one hook that waits, in the background: `asyncRewake`
           // runs it without blocking the agent and wakes the agent on exit 2. It
@@ -172,9 +196,13 @@ describe("plugin hooks", () => {
           expect(handler.timeout as number).toBeGreaterThan(0);
           // An `asyncRewake` waiter is the one entry that lives for minutes: it
           // runs in the background, so no tool call waits on it, and Claude Code
-          // enforces its `timeout` (default 600 s) by killing it. Everything
-          // else is on the agent's path and stays under a minute.
-          const ceiling = handler.asyncRewake === true ? 1800 : 60;
+          // enforces its `timeout` (default 600 s) by killing it. The worktree
+          // hooks run once per worktree, not per tool call, and Claude Code
+          // waits for the worktree it asked for: they keep that 600 s default,
+          // written down. Everything else is on the agent's path and stays
+          // under a minute.
+          const worktree = event === "WorktreeCreate" || event === "WorktreeRemove";
+          const ceiling = handler.asyncRewake === true ? 1800 : worktree ? 600 : 60;
           expect(handler.timeout as number, `${event} ${handler.command}`).toBeLessThanOrEqual(ceiling);
         }
       }
@@ -190,7 +218,7 @@ describe("plugin hooks", () => {
     for (const groups of Object.values(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
-          const [bin, ...rest] = String(handler.command).split(/\s+/);
+          const [bin, ...rest] = bareHookCommand(String(handler.command)).split(/\s+/);
           expect(bin).toBe("gitpulse-hook");
           expect(rest.length, `${handler.command} names no subcommand`).toBeGreaterThan(0);
           // Only `notify` takes a second word, and it is the notification type
@@ -408,7 +436,9 @@ describe("the package's executables are installable", () => {
     for (const groups of Object.values(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
-          const bin = String(handler.command ?? "").trim().split(/\s+/)[0];
+          // The worktree launcher is a script in the package, run by the
+          // host's `sh`; what it spawns is the binary named after it.
+          const bin = bareHookCommand(String(handler.command ?? "")).split(/\s+/)[0];
           if (bin) found.add(bin);
         }
       }
@@ -527,6 +557,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
   function budgetSecondsFor(subcommand: string, argument = ""): number {
     if (subcommand === "notify") return notifyRunSeconds(argument);
     if (subcommand === "deliver") return deliverWaitSeconds();
+    if (subcommand === "worktree-create" || subcommand === "worktree-remove") return worktreeBudgetSeconds();
     const handler = new RegExp(
       `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?within_budget\\(\\s*([A-Z_]+)`,
     ).exec(hookSource);
@@ -544,6 +575,18 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(declared, `${constant} is not a plain Duration constant; update this contract`).toBeTruthy();
     const value = Number(declared![2]);
     return declared![1] === "secs" ? value : value / 1000;
+  }
+
+  /**
+   * The worktree hooks' whole-process deadline: `WORKTREE_BUDGET` in
+   * hooks/worktree.rs. Not `TOTAL_BUDGET`: creating a worktree runs git, a cache
+   * copy and the repository's approved post_create hooks, and Claude Code waits.
+   */
+  function worktreeBudgetSeconds(): number {
+    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "worktree.rs"), "utf8");
+    const declared = /pub const WORKTREE_BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+    expect(declared, "WORKTREE_BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
+    return Number(declared![1]);
   }
 
   const notifyInputSource = readFileSync(
@@ -601,7 +644,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
         for (const handler of group.hooks) {
           rows.push({
             event,
-            command: String(handler.command),
+            command: bareHookCommand(String(handler.command)),
             timeout: Number(handler.timeout),
           });
         }
@@ -656,11 +699,14 @@ describe("hook budgets sit inside the host's timeouts", () => {
     // Reports (`notify`) wait their own short budget; the deciding hooks are
     // the ones that can reach the whole deadline.
     for (const { event, command, timeout } of declaredTimeouts()) {
-      if (command.split(/\s+/)[1] === "notify") continue;
+      const subcommand = command.split(/\s+/)[1];
+      if (subcommand === "notify") continue;
+      // The worktree hooks have their own whole-process deadline.
+      const deadline = subcommand === "worktree-create" || subcommand === "worktree-remove" ? worktreeBudgetSeconds() : total;
       expect(
         timeout,
-        `${event} "${command}" times out at ${timeout}s; the hook's own deadline is ${total}s plus a ${margin}s margin`,
-      ).toBeGreaterThanOrEqual(total + margin);
+        `${event} "${command}" times out at ${timeout}s; the hook's own deadline is ${deadline}s plus a ${margin}s margin`,
+      ).toBeGreaterThanOrEqual(deadline + margin);
     }
   });
 
