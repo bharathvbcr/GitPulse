@@ -23,6 +23,7 @@
   import Skeleton from "./Skeleton.svelte";
   import HygienePanel from "./HygienePanel.svelte";
   import CommitGraphWrite from "./CommitGraphWrite.svelte";
+  import TuningApply from "./TuningApply.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
   import {
@@ -576,6 +577,13 @@
             report={report.commit_graph}
             repoPath={report.repo_path}
             onwritten={() => scan(report?.repo_path)}
+          />
+        {/key}
+        {#key report.repo_path}
+          <TuningApply
+            advice={report.tuning}
+            repoPath={report.repo_path}
+            onapplied={() => scan(report?.repo_path)}
           />
         {/key}
       </section>

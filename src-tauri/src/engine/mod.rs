@@ -18,6 +18,7 @@ pub mod sqlite_wal;
 pub mod stash;
 pub mod submodules;
 pub mod text_shape;
+pub mod tuning_apply;
 pub mod worktree;
 #[cfg(all(test, unix))]
 mod worktree_family_adversarial_tests;

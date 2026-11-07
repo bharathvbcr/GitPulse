@@ -316,11 +316,13 @@ describe("annotated but unregistered commands", () => {
     // cmd_commit_graph_write, cmd_commit_graph_write_cancel), and 292 with
     // cmd_terminal_transcript (a session's saved output), and 296 with the Diff
     // view's history rail reads (cmd_get_compare_diff, cmd_get_compare_files,
-    // cmd_get_commit_notes, cmd_get_commit_bodies);
+    // cmd_get_commit_notes, cmd_get_commit_bodies), and 299 with the tuning
+    // advisor commands (cmd_tuning_plan, cmd_tuning_apply,
+    // cmd_tuning_apply_cancel);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(296);
+    expect(found.size).toBe(299);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod commit_graph;
 pub mod hygiene;
+pub mod repo_tuning;
 #[cfg(test)]
 mod walk_adversarial;
 #[cfg(test)]
@@ -405,6 +406,10 @@ pub struct StorageReport {
     /// it deserialize to `Unknown`, never to a claim that the graph is fine.
     #[serde(default)]
     pub commit_graph: commit_graph::CommitGraphReport,
+    /// What the repository tuning detector found and which tuning is worth
+    /// offering. `None` when the git directory could not be resolved.
+    #[serde(default)]
+    pub tuning: Option<repo_tuning::TuningAdvice>,
     pub scan: ScanStats,
 }
 
@@ -1071,7 +1076,7 @@ fn collect_large_files(
 ///
 /// `None` unless every one of the four figures was present and numeric, so a
 /// reader never takes a missing figure for a measured zero.
-fn parse_count_objects(stdout: &str) -> Option<(u64, u64, u64, u64)> {
+pub(crate) fn parse_count_objects(stdout: &str) -> Option<(u64, u64, u64, u64)> {
     let mut out = [None::<u64>; 4];
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -1092,6 +1097,48 @@ fn parse_count_objects(stdout: &str) -> Option<(u64, u64, u64, u64)> {
         out[slot] = digits.parse::<u64>().ok();
     }
     Some((out[0]?, out[1]?, out[2]?, out[3]?))
+}
+
+/// The tuning detector's report and offers for `repo`, with the object counts
+/// git itself gives (`counted`: the `parse_count_objects` figures). The scan
+/// passes the counts it already has, through the cached config;
+/// [`tuning_advice_fresh`] asks git for everything. Either way the offers read
+/// the same numbers, so what the panel showed is what the apply's own check sees.
+pub(crate) fn tuning_advice(
+    repo: &Path,
+    private: &Path,
+    common: &Path,
+    counted: Option<(u64, u64, u64, u64)>,
+) -> repo_tuning::TuningAdvice {
+    advise_with(counted, |counts| {
+        repo_tuning::inspect(repo, private, common, counts)
+    })
+}
+
+/// [`tuning_advice`] for the apply: one `git count-objects -v` for the counts
+/// and the config read fresh, never from the cache.
+pub(crate) fn tuning_advice_fresh(
+    repo: &Path,
+    private: &Path,
+    common: &Path,
+) -> repo_tuning::TuningAdvice {
+    let counted = git_text(repo, &["count-objects", "-v"])
+        .ok()
+        .and_then(|text| parse_count_objects(&text));
+    advise_with(counted, |counts| {
+        repo_tuning::inspect_fresh(repo, private, common, counts)
+    })
+}
+
+fn advise_with(
+    counted: Option<(u64, u64, u64, u64)>,
+    inspect: impl FnOnce(Option<repo_tuning::ObjectCounts>) -> repo_tuning::RepoTuningReport,
+) -> repo_tuning::TuningAdvice {
+    let counts = counted.map(|(loose_objects, _, packs, _)| repo_tuning::ObjectCounts {
+        loose_objects,
+        packs,
+    });
+    repo_tuning::advise(inspect(counts), repo_tuning::GitEnv::current())
 }
 
 /// Sizes the named subdirectory of the git dir, tolerating absence.
@@ -2249,6 +2296,14 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
                 ..commit_graph::CommitGraphReport::default()
             },
         },
+        tuning: crate::engine::git_cli::resolve_git_dir(&repo)
+            .ok()
+            .map(|private_dir| {
+                let mut advice = tuning_advice(&repo, &private_dir, &git_dir, counted);
+                advice.apply_in_flight =
+                    crate::engine::tuning_apply::tuning_apply_running(&git_dir);
+                advice
+            }),
         scan: ScanStats {
             elapsed_ms: started.elapsed().as_millis(),
             files_visited: tally.files_visited,
