@@ -4,7 +4,7 @@
 //! `WorktreeOverlay` (`RoaringBitmap` dirty-node masking) (`F1`, `F4`, `F6`,
 //! `F10`, `OQ1`, `OQ2`).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -989,6 +989,12 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
             source_canon.display()
         )
     })?;
+    let delta_path = stack_delta_path(&wt_canon);
+    let _delta_lock = if delta_path.exists() {
+        Some(Store::lock_writer_at(&delta_path, Store::WRITER_LOCK_WAIT)?)
+    } else {
+        None
+    };
     let _bases_lock = lock_bases(&common_git_dir, BASES_LOCK_WAIT)?;
     let (base_dir, manifest) = publish_base_snapshot(&source_canon)?;
     // Everything that can fail comes before the lease: a failed provision must
@@ -1509,15 +1515,9 @@ impl StackedStore {
         Ok(Some(reader))
     }
 
-    fn lock_delta_writer(&self) -> Result<(PathBuf, devmap_store::WriterLock)> {
+    fn lock_delta_writer(&self) -> Result<devmap_store::WriterLock> {
         let delta_path = stack_delta_path(&self.worktree_root);
-        let guard = Store::lock_writer_at(&delta_path, Store::WRITER_LOCK_WAIT)?;
-        Ok((delta_path, guard))
-    }
-
-    fn cleanup_delta_lock(delta_path: &Path, guard: devmap_store::WriterLock) {
-        drop(guard);
-        let _ = fs::remove_file(devmap_store::seed::sidecar(delta_path, ".lock"));
+        Store::lock_writer_at(&delta_path, Store::WRITER_LOCK_WAIT)
     }
 
     /// Record a parsed `Extraction` for `rel_path` in the worktree's private
@@ -1530,10 +1530,8 @@ impl StackedStore {
         source_bytes: &[u8],
         extraction: &Extraction,
     ) -> Result<()> {
-        let (delta_path, guard) = self.lock_delta_writer()?;
-        let res = self.record_extracted_file_locked(rel_path, source_bytes, extraction);
-        Self::cleanup_delta_lock(&delta_path, guard);
-        res
+        let _guard = self.lock_delta_writer()?;
+        self.record_extracted_file_locked(rel_path, source_bytes, extraction)
     }
 
     fn record_extracted_file_locked(
@@ -1558,10 +1556,8 @@ impl StackedStore {
     /// Mark `rel_path` as deleted in the worktree's private `delta.sqlite` and
     /// mask all of its base symbols in `WorktreeOverlay` (`F4`).
     pub fn record_deleted_file(&mut self, rel_path: &str) -> Result<()> {
-        let (delta_path, guard) = self.lock_delta_writer()?;
-        let res = self.record_deleted_file_locked(rel_path);
-        Self::cleanup_delta_lock(&delta_path, guard);
-        res
+        let _guard = self.lock_delta_writer()?;
+        self.record_deleted_file_locked(rel_path)
     }
 
     fn record_deleted_file_locked(&mut self, rel_path: &str) -> Result<()> {
@@ -1576,10 +1572,8 @@ impl StackedStore {
 
     /// Clear `rel_path` from `delta.sqlite` when it matches the base snapshot again.
     pub fn clear_reverted_file(&mut self, rel_path: &str) -> Result<()> {
-        let (delta_path, guard) = self.lock_delta_writer()?;
-        let res = self.clear_reverted_file_locked(rel_path);
-        Self::cleanup_delta_lock(&delta_path, guard);
-        res
+        let _guard = self.lock_delta_writer()?;
+        self.clear_reverted_file_locked(rel_path)
     }
 
     fn clear_reverted_file_locked(&mut self, rel_path: &str) -> Result<()> {
@@ -1592,10 +1586,8 @@ impl StackedStore {
     /// Tree-sitter frontend (`devmap_extract::extract_file`) — never regex!
     #[cfg(feature = "parse")]
     pub fn sync_file_from_disk(&mut self, rel_path: &str) -> Result<()> {
-        let (delta_path, guard) = self.lock_delta_writer()?;
-        let res = self.sync_file_from_disk_locked(rel_path);
-        Self::cleanup_delta_lock(&delta_path, guard);
-        res
+        let _guard = self.lock_delta_writer()?;
+        self.sync_file_from_disk_locked(rel_path)
     }
 
     #[cfg(feature = "parse")]
@@ -1653,7 +1645,7 @@ impl StackedStore {
     /// `devmap.sqlite` when thresholds (`250` dirty files / `16 MiB`) are exceeded.
     #[cfg(feature = "parse")]
     pub fn sync_worktree(&mut self) -> Result<StackedSyncReport> {
-        let (delta_path, guard) = self.lock_delta_writer()?;
+        let guard = self.lock_delta_writer()?;
         let sync_res = (|| -> Result<(usize, usize, usize)> {
             let (changed_paths, status_deleted_paths) =
                 git_changed_paths_and_deletions_against_head(&self.worktree_root, &self.base)?;
@@ -1758,7 +1750,7 @@ impl StackedStore {
 
             Ok((synced_files, deleted_files, cleaned_files))
         })();
-        Self::cleanup_delta_lock(&delta_path, guard);
+        drop(guard);
         let (synced_files, deleted_files, cleaned_files) = sync_res?;
 
         let rebased_to_standalone = if self.needs_rebase()? {
@@ -2676,23 +2668,75 @@ fn bare_tail(symbol: &str) -> Option<&str> {
     (!tail.is_empty()).then_some(tail)
 }
 
+struct ImportAliasMaps {
+    /// `local_name -> (module_specifier, imported_name)` from `ExtractedImport::binding_pairs()`.
+    symbol_aliases: BTreeMap<String, (String, String)>,
+    /// `module_alias -> module_specifier` when `imported_names` is empty (excluding `.`).
+    module_aliases: BTreeMap<String, String>,
+}
+
+fn import_alias_maps(ext: &Extraction) -> ImportAliasMaps {
+    let mut symbol_aliases = BTreeMap::new();
+    let mut module_aliases = BTreeMap::new();
+    for imp in &ext.imports {
+        let spec = imp.module_specifier.trim();
+        for (local, imported) in imp.binding_pairs() {
+            let local = local.trim();
+            let imported = imported.trim();
+            if !local.is_empty() && !imported.is_empty() {
+                symbol_aliases.insert(local.to_string(), (spec.to_string(), imported.to_string()));
+            }
+        }
+        if imp.imported_names.is_empty() {
+            if let Some(alias) = imp.alias.as_deref().map(str::trim) {
+                if !alias.is_empty() && alias != "." && !spec.is_empty() {
+                    module_aliases.insert(alias.to_string(), spec.to_string());
+                }
+            }
+        }
+    }
+    ImportAliasMaps {
+        symbol_aliases,
+        module_aliases,
+    }
+}
+
 fn specifier_matches_path(specifier: &str, candidate_path: &str) -> bool {
-    let norm_spec = specifier
-        .trim()
-        .trim_start_matches("./")
-        .trim_start_matches("../")
-        .replace("::", "/");
-    if norm_spec.is_empty() {
+    let mut s = specifier.trim();
+    while let Some(rest) = s
+        .strip_prefix("./")
+        .or_else(|| s.strip_prefix("../"))
+        .or_else(|| s.strip_prefix("crate::"))
+        .or_else(|| s.strip_prefix("self::"))
+        .or_else(|| s.strip_prefix("super::"))
+    {
+        s = rest;
+    }
+    if matches!(s, "" | "crate" | "self" | "super" | ".") {
         return false;
     }
     let cand_no_ext = candidate_path
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(candidate_path);
-    cand_no_ext == norm_spec
-        || cand_no_ext.ends_with(&format!("/{norm_spec}"))
-        || cand_no_ext.ends_with(&format!("/{norm_spec}/mod"))
-        || cand_no_ext.ends_with(&format!("/{norm_spec}/index"))
+    let mut norm_variants = Vec::with_capacity(2);
+    let slash_spec = s.replace("::", "/").trim_matches('/').to_string();
+    if !slash_spec.is_empty() {
+        norm_variants.push(slash_spec);
+    }
+    if s.contains('.') && !s.contains('/') && !s.contains("::") {
+        let dot_spec = s.trim_start_matches('.').replace('.', "/");
+        if !dot_spec.is_empty() && !norm_variants.contains(&dot_spec) {
+            norm_variants.push(dot_spec);
+        }
+    }
+    norm_variants.iter().any(|norm_spec| {
+        cand_no_ext == norm_spec
+            || cand_no_ext.ends_with(&format!("/{norm_spec}"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/mod"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/index"))
+            || cand_no_ext.ends_with(&format!("/{norm_spec}/__init__"))
+    })
 }
 
 fn resolve_delta_stored_edges(
@@ -2705,6 +2749,7 @@ fn resolve_delta_stored_edges(
     let caller_family = LangFamily::from_lang(devmap_extract::languages::detect_language(
         Path::new(rel_path),
     ));
+    let aliases = import_alias_maps(ext);
 
     for sym in &ext.symbols {
         out.push(StoredEdge {
@@ -2719,8 +2764,8 @@ fn resolve_delta_stored_edges(
     }
 
     for call in &ext.calls {
-        let callee = call.callee_name.trim();
-        if callee.is_empty() {
+        let raw_callee = call.callee_name.trim();
+        if raw_callee.is_empty() {
             continue;
         }
         let source_symbol = call
@@ -2739,24 +2784,25 @@ fn resolve_delta_stored_edges(
                     .unwrap_or(want_qual)
             })
             .unwrap_or_else(|| rel_path.to_string());
-        let recv =
+        let raw_recv =
             call.receiver_expr.as_deref().map(str::trim).filter(|r| {
                 !r.is_empty() && !matches!(*r, "self" | "this" | "Self" | "super" | "cls")
             });
 
-        // 1. SameFile resolution (deterministic 1.0).
+        // 1. SameFile resolution (deterministic 1.0) checks raw local callee/receiver first.
         let same_file: Vec<&devmap_extract::model::ExtractedSymbol> = ext
             .symbols
             .iter()
             .filter(|s| {
-                let tail_ok = s.name == callee || bare_tail(&s.qualified_name) == Some(callee);
+                let tail_ok =
+                    s.name == raw_callee || bare_tail(&s.qualified_name) == Some(raw_callee);
                 if !tail_ok {
                     return false;
                 }
-                match recv {
+                match raw_recv {
                     Some(r) => {
-                        s.qualified_name.contains(&format!("{r}.{callee}"))
-                            || s.qualified_name.contains(&format!("{r}::{callee}"))
+                        s.qualified_name.contains(&format!("{r}.{raw_callee}"))
+                            || s.qualified_name.contains(&format!("{r}::{raw_callee}"))
                     }
                     None => true,
                 }
@@ -2777,6 +2823,39 @@ fn resolve_delta_stored_edges(
         if !same_file.is_empty() {
             continue;
         }
+
+        // Resolve symbol and module import aliases (`use a::b as c`, `import { b as c }`,
+        // `use crate::mod_a as m`, `import * as m`).
+        let mut explicit_specs: Vec<String> = Vec::new();
+        let (callee, recv): (&str, Option<&str>) = match raw_recv {
+            None => {
+                if let Some((spec, imported)) = aliases.symbol_aliases.get(raw_callee) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                    }
+                    (imported.as_str(), None)
+                } else {
+                    (raw_callee, None)
+                }
+            }
+            Some(r) => {
+                if let Some(mod_spec) = aliases.module_aliases.get(r) {
+                    explicit_specs.push(mod_spec.clone());
+                    (raw_callee, None)
+                } else if let Some((spec, imported)) = aliases.symbol_aliases.get(r) {
+                    if !spec.is_empty() {
+                        explicit_specs.push(spec.clone());
+                        explicit_specs.push(format!("{spec}::{imported}"));
+                        explicit_specs.push(format!("{spec}/{imported}"));
+                    } else {
+                        explicit_specs.push(imported.clone());
+                    }
+                    (raw_callee, Some(imported.as_str()))
+                } else {
+                    (raw_callee, Some(r))
+                }
+            }
+        };
 
         // 2. Cross-file resolution across other delta extractions + non-masked base symbols.
         let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
@@ -2835,6 +2914,9 @@ fn resolve_delta_stored_edges(
             .iter()
             .filter(|(cand_file, _)| {
                 Path::new(cand_file).parent() == Path::new(rel_path).parent()
+                    || explicit_specs
+                        .iter()
+                        .any(|spec| specifier_matches_path(spec, cand_file))
                     || ext
                         .imports
                         .iter()
@@ -2868,41 +2950,55 @@ fn resolve_delta_stored_edges(
         }
     }
 
+    let base_scope_paths: Vec<String> = base
+        .latest_scope_inputs()?
+        .map(|(_, _, base_files)| base_files.into_iter().map(|(bp, _)| bp).collect())
+        .unwrap_or_default();
+
     for imp in &ext.imports {
         let spec = imp.module_specifier.trim();
         if spec.is_empty() {
             continue;
         }
-        let mut matched_files: BTreeSet<String> = BTreeSet::new();
-        for other_path in overlay.added_extractions.keys() {
-            if other_path != rel_path && specifier_matches_path(spec, other_path) {
-                matched_files.insert(other_path.clone());
+        let mut candidate_specs = vec![spec.to_string()];
+        for (_, imported) in imp.binding_pairs() {
+            let imported = imported.trim();
+            if !imported.is_empty() {
+                candidate_specs.push(format!("{spec}::{imported}"));
+                candidate_specs.push(format!("{spec}/{imported}"));
             }
         }
-        if matched_files.is_empty() {
-            if let Some((_, _, base_files)) = base.latest_scope_inputs()? {
-                for (bp, _) in base_files {
-                    let p = Path::new(&bp);
+        for cand_spec in candidate_specs {
+            let mut matched_files: BTreeSet<String> = BTreeSet::new();
+            for other_path in overlay.added_extractions.keys() {
+                if other_path != rel_path && specifier_matches_path(&cand_spec, other_path) {
+                    matched_files.insert(other_path.clone());
+                }
+            }
+            if matched_files.is_empty() {
+                for bp in &base_scope_paths {
+                    let p = Path::new(bp);
                     if bp != rel_path
                         && !overlay.is_file_tombstoned(p)
-                        && specifier_matches_path(spec, &bp)
+                        && specifier_matches_path(&cand_spec, bp)
                     {
-                        matched_files.insert(bp);
+                        matched_files.insert(bp.clone());
                     }
                 }
             }
-        }
-        if matched_files.len() == 1 {
-            if let Some(target_file) = matched_files.into_iter().next() {
-                out.push(StoredEdge {
-                    source_file: rel_path.to_string(),
-                    target_file: target_file.clone(),
-                    source_symbol: rel_path.to_string(),
-                    target_symbol: target_file,
-                    edge_kind: "Imports".to_string(),
-                    confidence: 1.0,
-                    resolution: Some("ImportScoped".to_string()),
-                });
+            if matched_files.len() == 1 {
+                if let Some(target_file) = matched_files.into_iter().next() {
+                    out.push(StoredEdge {
+                        source_file: rel_path.to_string(),
+                        target_file: target_file.clone(),
+                        source_symbol: rel_path.to_string(),
+                        target_symbol: target_file,
+                        edge_kind: "Imports".to_string(),
+                        confidence: 1.0,
+                        resolution: Some("ImportScoped".to_string()),
+                    });
+                    break;
+                }
             }
         }
     }
@@ -2966,14 +3062,27 @@ fn build_overlay_from_delta(
 fn extract_delta_edges(rel_path: &str, extraction: &Extraction) -> Vec<DeltaEdgeRecord> {
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
+    let aliases = import_alias_maps(extraction);
     for call in &extraction.calls {
         let src = call
             .caller_symbol
             .clone()
             .unwrap_or_else(|| rel_path.to_string());
-        let dst = match &call.receiver_expr {
-            Some(recv) if !recv.is_empty() => format!("{recv}.{}", call.callee_name),
-            _ => call.callee_name.clone(),
+        let dst = match call.receiver_expr.as_deref().map(str::trim) {
+            Some(recv) if !recv.is_empty() => {
+                if aliases.module_aliases.contains_key(recv) {
+                    call.callee_name.clone()
+                } else if let Some((_, imported)) = aliases.symbol_aliases.get(recv) {
+                    format!("{imported}.{}", call.callee_name)
+                } else {
+                    format!("{recv}.{}", call.callee_name)
+                }
+            }
+            _ => aliases
+                .symbol_aliases
+                .get(call.callee_name.trim())
+                .map(|(_, imported)| imported.clone())
+                .unwrap_or_else(|| call.callee_name.clone()),
         };
         if seen.insert((src.clone(), dst.clone(), "Calls")) {
             edges.push(DeltaEdgeRecord {
@@ -4931,7 +5040,211 @@ mod tests {
         );
         assert!(!delta_file.with_extension("sqlite-wal").exists());
         assert!(!delta_file.with_extension("sqlite-shm").exists());
-        assert!(!delta_file.with_extension("sqlite.lock").exists());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(all(unix, feature = "parse"))]
+    #[test]
+    fn test_delta_writer_lock_preserves_inode_and_mutual_exclusion() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::Duration;
+
+        let root = temp_repo_dir("delta-lock-inode");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::write(anchor.join("src/a.rs"), "pub fn a() -> i32 { 1 }\n").unwrap();
+        fs::write(anchor.join("src/b.rs"), "pub fn b() -> i32 { 2 }\n").unwrap();
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["config", "user.email", "t@t"]);
+        run_git_ok(&anchor, &["config", "user.name", "t"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "initial"]);
+
+        {
+            let db_path = store_path(&anchor);
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let store = Store::open(&db_path).unwrap();
+            let anchor_canon = anchor.canonicalize().unwrap();
+            store.bind_repo_root(&anchor_canon).unwrap();
+            let exts: Vec<Extraction> = ["src/a.rs", "src/b.rs"]
+                .iter()
+                .map(|p| {
+                    devmap_extract::extract_file(p, &fs::read_to_string(anchor.join(p)).unwrap())
+                })
+                .collect();
+            let mut resolver = devmap_resolve::Resolver::new();
+            resolver.index_extractions(&exts);
+            let res = resolver.resolve_all(&exts).unwrap();
+            let analysis = devmap_analyze::analyze(&exts, &res);
+            store
+                .save_generation_with_metadata(
+                    &exts,
+                    &res,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts {
+                        repo_root: Some(anchor_canon.to_string_lossy().into_owned()),
+                        ..devmap_store::GenerationWriteOpts::default()
+                    },
+                    &git_head(&anchor),
+                )
+                .unwrap();
+        }
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        let lane_canon = lane.canonicalize().unwrap();
+        let delta_path = stack_delta_path(&lane_canon);
+        let lock_path = Store::writer_lock_path(&delta_path);
+
+        // Read-only open + status must NEVER create `delta.sqlite.writer.lock`.
+        {
+            let ro = StackedStore::open(&lane).unwrap();
+            let _ = ro.status().unwrap();
+        }
+        assert!(
+            !lock_path.exists(),
+            "read-only StackedStore::open must not create delta.sqlite.writer.lock"
+        );
+
+        // First write creates `delta.sqlite.writer.lock` and MUST leave its inode intact on disk
+        // so concurrent `flock` waiters cannot split-brain onto a second inode.
+        {
+            let mut w1 = StackedStore::open(&lane).unwrap();
+            w1.record_deleted_file("src/a.rs").unwrap();
+        }
+        let meta1 = fs::metadata(&lock_path).expect(
+            "delta.sqlite.writer.lock must remain on disk after write so flock inode stays stable",
+        );
+
+        {
+            let mut w2 = StackedStore::open(&lane).unwrap();
+            w2.record_deleted_file("src/b.rs").unwrap();
+        }
+        let meta2 = fs::metadata(&lock_path).expect("delta.sqlite.writer.lock must still exist");
+        assert_eq!(
+            (meta1.dev(), meta1.ino()),
+            (meta2.dev(), meta2.ino()),
+            "delta.sqlite.writer.lock inode must never be unlinked and recreated across writes"
+        );
+
+        // While an external holder holds `WriterLock` on `delta_path`, a concurrent writer
+        // must block/refuse on the exact same inode.
+        let held = Store::lock_writer_at(&delta_path, Duration::from_secs(2)).unwrap();
+        let contender = Store::lock_writer_at(&delta_path, Duration::from_millis(50));
+        assert!(
+            contender.is_err(),
+            "concurrent WriterLock on delta.sqlite must be refused while lock is held"
+        );
+        drop(held);
+        let after_release = Store::lock_writer_at(&delta_path, Duration::from_secs(2));
+        assert!(after_release.is_ok());
+
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn test_stacked_aliased_imports_resolve_calls_and_affected_tests() {
+        let root = temp_repo_dir("aliased-imports");
+        let anchor = root.join("anchor");
+        fs::create_dir_all(anchor.join("src")).unwrap();
+        fs::create_dir_all(anchor.join("tests")).unwrap();
+        let callee_src = "pub fn probe_callee() -> i32 {\n    7\n}\n";
+        let mod_src = "pub fn mod_target() -> i32 {\n    11\n}\n";
+        let lib_src = "pub mod callee;\npub mod mod_callee;\n";
+        let smoke_src = "#[test]\nfn test_initial() {\n    assert_eq!(1, 1);\n}\n";
+        fs::write(anchor.join("src/callee.rs"), callee_src).unwrap();
+        fs::write(anchor.join("src/mod_callee.rs"), mod_src).unwrap();
+        fs::write(anchor.join("src/lib.rs"), lib_src).unwrap();
+        fs::write(anchor.join("tests/alias_test.rs"), smoke_src).unwrap();
+        fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+        run_git_ok(&anchor, &["init", "-b", "main"]);
+        run_git_ok(&anchor, &["config", "user.email", "t@t"]);
+        run_git_ok(&anchor, &["config", "user.name", "t"]);
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "initial"]);
+
+        {
+            let db_path = store_path(&anchor);
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let store = Store::open(&db_path).unwrap();
+            let anchor_canon = anchor.canonicalize().unwrap();
+            store.bind_repo_root(&anchor_canon).unwrap();
+            let rel_paths = [
+                "src/callee.rs",
+                "src/mod_callee.rs",
+                "src/lib.rs",
+                "tests/alias_test.rs",
+            ];
+            let exts: Vec<Extraction> = rel_paths
+                .iter()
+                .map(|p| {
+                    devmap_extract::extract_file(p, &fs::read_to_string(anchor.join(p)).unwrap())
+                })
+                .collect();
+            let mut resolver = devmap_resolve::Resolver::new();
+            resolver.index_extractions(&exts);
+            let res = resolver.resolve_all(&exts).unwrap();
+            let analysis = devmap_analyze::analyze(&exts, &res);
+            store
+                .save_generation_with_metadata(
+                    &exts,
+                    &res,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts {
+                        repo_root: Some(anchor_canon.to_string_lossy().into_owned()),
+                        ..devmap_store::GenerationWriteOpts::default()
+                    },
+                    &git_head(&anchor),
+                )
+                .unwrap();
+            let _ = store.write_latest_csr_sidecar().unwrap();
+        }
+
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        fs::write(
+            lane.join("tests/alias_test.rs"),
+            "use crate::callee::probe_callee as aliased_callee;\nuse crate::mod_callee as mc;\n\n#[test]\nfn test_via_symbol_alias() {\n    let _ = aliased_callee();\n}\n\n#[test]\nfn test_via_module_alias() {\n    let _ = mc::mod_target();\n}\n",
+        )
+        .unwrap();
+
+        {
+            let mut writer = StackedStore::open(&lane).unwrap();
+            writer.sync_worktree().unwrap();
+        }
+
+        let stacked = StackedStore::open(&lane).unwrap();
+        let engine =
+            crate::StoreQueryEngine::new(stacked.base_store()).with_stacked(Some(&stacked));
+
+        let aff_sym = engine
+            .affected_tests(&["probe_callee".to_string()], 4000, 0.0, 5)
+            .unwrap();
+        assert!(
+            aff_sym.tests.items.iter().any(|t| t
+                .symbols
+                .iter()
+                .any(|s| s.contains("test_via_symbol_alias"))),
+            "aliased symbol import caller must reach probe_callee in affected_tests: {:?}",
+            aff_sym.tests.items
+        );
+
+        let aff_mod = engine
+            .affected_tests(&["mod_target".to_string()], 4000, 0.0, 5)
+            .unwrap();
+        assert!(
+            aff_mod.tests.items.iter().any(|t| t
+                .symbols
+                .iter()
+                .any(|s| s.contains("test_via_module_alias"))),
+            "aliased module import caller must reach mod_target in affected_tests: {:?}",
+            aff_mod.tests.items
+        );
 
         let _ = remove_readonly_tree(&root);
     }

@@ -2906,7 +2906,7 @@ printf '%s\n' '{"ok":true}'
             &bin,
             r#"#!/bin/sh
 printf '%s\n' "$*" > sync_delta.argv
-printf '%s\n' '{"synced_files":2,"deleted_files":0,"cleaned_files":0,"rebased":false}'
+printf '%s\n' '{"synced_files":2,"deleted_files":0,"cleaned_files":0,"rebased_to_standalone":null}'
 "#,
         )
         .unwrap();

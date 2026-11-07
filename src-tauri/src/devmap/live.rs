@@ -793,12 +793,18 @@ pub(crate) fn build_is_echo_or_failure(build: &BuildOutcome) -> bool {
     if !build.ok {
         return true;
     }
-    build
-        .report
-        .as_ref()
-        .and_then(|report| report.get("unchanged"))
-        .and_then(Value::as_bool)
-        == Some(true)
+    let Some(report) = build.report.as_ref() else {
+        return false;
+    };
+    if report.get("unchanged").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    report.get("synced_files").and_then(Value::as_u64) == Some(0)
+        && report.get("deleted_files").and_then(Value::as_u64) == Some(0)
+        && report.get("cleaned_files").and_then(Value::as_u64) == Some(0)
+        && report
+            .get("rebased_to_standalone")
+            .is_some_and(Value::is_null)
 }
 
 /// True when `devmap status --json` says only a full rebuild can fix the store.
@@ -2066,6 +2072,51 @@ mod tests {
             ..echo
         };
         assert!(build_is_echo_or_failure(&failed));
+    }
+
+    #[test]
+    fn build_is_echo_or_failure_treats_noop_stacked_sync_report_as_echo() {
+        let noop_sync = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({
+                "synced_files": 0,
+                "deleted_files": 0,
+                "cleaned_files": 0,
+                "rebased_to_standalone": null
+            })),
+        };
+        assert!(
+            build_is_echo_or_failure(&noop_sync),
+            "0-change StackedSyncReport must raise echo cooldown to prevent watcher spin"
+        );
+
+        let synced_one = BuildOutcome {
+            report: Some(json!({
+                "synced_files": 1,
+                "deleted_files": 0,
+                "cleaned_files": 0,
+                "rebased_to_standalone": null
+            })),
+            ..noop_sync.clone()
+        };
+        assert!(!build_is_echo_or_failure(&synced_one));
+
+        let rebased = BuildOutcome {
+            report: Some(json!({
+                "synced_files": 0,
+                "deleted_files": 0,
+                "cleaned_files": 0,
+                "rebased_to_standalone": "/tmp/.devcouncil/codeintel/devmap.sqlite"
+            })),
+            ..noop_sync
+        };
+        assert!(!build_is_echo_or_failure(&rebased));
     }
 
     #[test]
@@ -3426,7 +3477,7 @@ exit 2
             r#"#!/bin/sh
 printf '%s\n' "$*" >> argv.log
 if [ "$1" = "seed" ]; then
-  printf '%s\n' '{"synced_files":1,"deleted_files":0,"cleaned_files":0,"rebased":false}'
+  printf '%s\n' '{"synced_files":1,"deleted_files":0,"cleaned_files":0,"rebased_to_standalone":null}'
   exit 0
 fi
 echo "unexpected full build on stacked lane: $*" >&2
