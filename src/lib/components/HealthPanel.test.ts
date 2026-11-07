@@ -68,6 +68,13 @@ describe("HealthPanel source contracts", () => {
     expect(counts.filter((expression) => /["'`]/.test(expression))).toEqual([]);
   });
 
+  it("takes the empty vulnerability sentence from the shared copy, not a hard-coded direct claim", () => {
+    // The empty branch runs under both filters; a literal here said "direct"
+    // under All and hid a cap that dropped the direct rows.
+    expect(source).not.toContain('"No direct dependencies are vulnerable."');
+    expect(source).toContain("vulnerabilityEmptyMessage(filter, vulnerabilitiesCapped)");
+  });
+
   it("releases its pending work and feedback timers on teardown", () => {
     // A late completion writing into an unmounted panel, or a timer outliving
     // it, leaves nothing a page can show.

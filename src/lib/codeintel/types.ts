@@ -295,6 +295,7 @@ export function parseCodeintelResponse<T>(
       filtered_out: num("filtered_out"),
     };
   }
+  const scope = parseScopeReport(value.scope, command);
   const walk = value.walk_incomplete;
   if (walk !== undefined && typeof walk !== "string") {
     throw new Error(`${command} returned a corrupt walk_incomplete`);
@@ -315,6 +316,36 @@ export function parseCodeintelResponse<T>(
     truncated: value.truncated === true,
     ...(foldedWalk !== undefined ? { walk_incomplete: foldedWalk } : {}),
     ...(histogram ? { rungs: histogram } : {}),
+    ...(scope ? { scope } : {}),
+  };
+}
+
+/** Validates the optional `scope` field field by field; absent or null stays absent. */
+function parseScopeReport(raw: unknown, command: string): ScopeReport | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const corrupt = () => new Error(`${command} returned a corrupt scope`);
+  if (!isRecord(raw)) throw corrupt();
+  const strings = (field: unknown): string[] => {
+    if (!Array.isArray(field) || !field.every((entry) => typeof entry === "string")) {
+      throw corrupt();
+    }
+    return field as string[];
+  };
+  const count = (field: unknown): number => {
+    if (typeof field !== "number" || !Number.isFinite(field)) throw corrupt();
+    return field;
+  };
+  return {
+    paths: strings(raw.paths),
+    languages: strings(raw.languages),
+    ...(raw.kinds !== undefined ? { kinds: strings(raw.kinds) } : {}),
+    files: count(raw.files),
+    symbols: count(raw.symbols),
+    corpus_files: count(raw.corpus_files),
+    corpus_symbols: count(raw.corpus_symbols),
+    ...(raw.related_tests_outside_scope !== undefined
+      ? { related_tests_outside_scope: count(raw.related_tests_outside_scope) }
+      : {}),
   };
 }
 

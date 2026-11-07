@@ -58,6 +58,40 @@ describe("parseCodeintelResponse", () => {
     });
     expect(parsed.source_freshness).toEqual({ fresh: true, generation_id: 12 });
   });
+
+  describe("scope", () => {
+    const base = { available: true, items: [], truncated: false, source_freshness: { fresh: true } };
+    const scope = {
+      paths: ["src/lib"],
+      languages: ["typescript"],
+      kinds: ["function"],
+      files: 3,
+      symbols: 40,
+      corpus_files: 300,
+      corpus_symbols: 4000,
+      related_tests_outside_scope: 2,
+    };
+
+    it("round-trips a scope the payload carries", () => {
+      expect(parseCodeintelResponse({ ...base, scope }).scope).toEqual(scope);
+    });
+
+    it("leaves scope absent when the payload has none", () => {
+      const parsed = parseCodeintelResponse(base);
+      expect(parsed.scope).toBeUndefined();
+      expect("scope" in parsed).toBe(false);
+    });
+
+    it("refuses a malformed scope like it refuses a corrupt rung histogram", () => {
+      expect(() => parseCodeintelResponse({ ...base, scope: "src" })).toThrow(/corrupt scope/);
+      expect(() => parseCodeintelResponse({ ...base, scope: { ...scope, paths: "src" } })).toThrow(
+        /corrupt scope/,
+      );
+      expect(() => parseCodeintelResponse({ ...base, scope: { ...scope, files: "3" } })).toThrow(
+        /corrupt scope/,
+      );
+    });
+  });
 });
 
 describe("parseCodeintelResponse folds walk_incomplete at the boundary", () => {
