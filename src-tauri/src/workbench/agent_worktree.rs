@@ -1159,4 +1159,132 @@ mod tests {
             "only one of the two cache outcomes is advised: {advisory:?}"
         );
     }
+
+    // ---- lane teardown reclaims the lane's build output (b1106w5) ----
+
+    /// The run record [`super::made_for`] reads, for a lane `provision` made.
+    fn unclaimed_run(root: &Path, title: &str, run_id: &str, lane: &Path) -> serde_json::Value {
+        let name = super::lane_name(title, run_id).unwrap();
+        // The recorded Git directory is spelled as `provision` spelled the lane
+        // (canonical: `/private/var`, not `/var`).
+        let root = root.canonicalize().unwrap();
+        serde_json::json!({
+            "id": run_id,
+            "task_title": title,
+            "owner_id": null,
+            "git_common_dir": root.join(".git").to_str().unwrap(),
+            "cwd": lane.to_str().unwrap(),
+            "head_ref": format!("refs/heads/{}", super::lane_branch(&name)),
+        })
+    }
+
+    /// Writes a cargo-shaped `target/` of `files` files into `at`.
+    fn write_target(at: &Path, files: usize) {
+        std::fs::create_dir_all(at.join("debug/deps")).unwrap();
+        std::fs::create_dir_all(at.join("debug/incremental/crate-abc")).unwrap();
+        for n in 0..files {
+            std::fs::write(
+                at.join(format!("debug/deps/libdep{n}.rlib")),
+                vec![b'r'; 4096],
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            at.join("debug/incremental/crate-abc/s.bin"),
+            vec![b'i'; 4096],
+        )
+        .unwrap();
+        std::fs::write(
+            at.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+    }
+
+    /// Bytes of regular files under `dir`, not following links.
+    fn tree_bytes(dir: &Path) -> u64 {
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                total += tree_bytes(&entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    /// A lane that built in its own `target/` and was then cancelled unclaimed
+    /// is given back whole: the worktree directory, `target/` with it, is gone,
+    /// and the main checkout's own `target/` is not touched. This is the owner
+    /// of lane teardown for what GitPulse creates (an in-tree `target/`).
+    #[test]
+    fn reclaiming_an_unclaimed_lane_removes_its_built_target_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        std::fs::write(root.join(".git/info/exclude"), "node_modules/\ntarget/\n").unwrap();
+        write_target(&root.join("target"), 3);
+        let main_target_bytes = tree_bytes(&root.join("target"));
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "bc-leak-1",
+            "Build lane",
+            false,
+            &with_reader(plenty),
+        )
+        .unwrap();
+        let lane = Path::new(&made.path);
+        write_target(&lane.join("target"), 40);
+        assert!(tree_bytes(&lane.join("target")) > 40 * 4096);
+
+        let run = unclaimed_run(&root, "Build lane", "bc-leak-1", lane);
+        let outcome = super::reclaim_unshed(&run, &|_| Ok(())).expect("an unclaimed lane");
+        assert!(outcome.removed, "{}", outcome.describe());
+        assert_eq!(outcome.cleanup_error, None);
+        assert!(
+            std::fs::symlink_metadata(lane).is_err(),
+            "the lane directory (and its target/) is still on disk"
+        );
+        assert_eq!(tree_bytes(&root.join("target")), main_target_bytes);
+        // No teardown leftover beside it either.
+        let leftovers: Vec<_> = std::fs::read_dir(lane.parent().unwrap())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "left beside the lane: {leftovers:?}");
+    }
+
+    /// A lane whose `target/` is a link to a shared `CARGO_TARGET_DIR` (the
+    /// one shape that puts build output outside the tree) loses the link and
+    /// never the shared directory it points at: removal must not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn reclaiming_a_lane_never_deletes_through_a_target_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        std::fs::write(root.join(".git/info/exclude"), "node_modules/\ntarget\n").unwrap();
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "bc-leak-2",
+            "Shared lane",
+            false,
+            &with_reader(plenty),
+        )
+        .unwrap();
+        let lane = Path::new(&made.path);
+        let shared = dir.path().join("shared-target");
+        write_target(&shared, 5);
+        let shared_bytes = tree_bytes(&shared);
+        std::os::unix::fs::symlink(&shared, lane.join("target")).unwrap();
+
+        let run = unclaimed_run(&root, "Shared lane", "bc-leak-2", lane);
+        let outcome = super::reclaim_unshed(&run, &|_| Ok(())).expect("an unclaimed lane");
+        assert!(outcome.removed, "{}", outcome.describe());
+        assert!(std::fs::symlink_metadata(lane).is_err());
+        assert_eq!(
+            tree_bytes(&shared),
+            shared_bytes,
+            "removal followed the target link and deleted the shared directory"
+        );
+    }
 }
