@@ -4,9 +4,9 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, command_target, is_whole_command, link_commits, read_command, runs_git_mutation,
-    CommitLink, Target, COMMAND_META_VERSION, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS,
-    LINK_WINDOW_MS,
+    basis, command_target, is_whole_command, link_commits, read_command, read_command_from,
+    runs_git_mutation, CommitLink, Target, COMMAND_META_VERSION, HIDDEN_PROBE_ROWS,
+    LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
 };
 use super::*;
 use std::path::Path;
@@ -1321,12 +1321,36 @@ fn r2_commands_aimed_here_still_count_controls() {
     let w = t.w.display();
     for c in [
         "git commit -m x".to_string(),
-        "git -C . -C sub commit -m x".to_string(),
-        format!("git -C {w}/sub commit -m x"),
-        "cd sub && git commit -m x".to_string(),
+        "git -C . commit -m x".to_string(),
+        format!("git -C {w} commit -m x"),
+        format!("cd {w} && git commit -m x"),
         format!("git --git-dir={w}/.git --work-tree={w} commit -m x"),
     ] {
         assert!(runs_git_mutation(&c, &t.w), "control missed: {c}");
+    }
+}
+
+/// Where a run lands is judged as text and must be the worktree's root: a
+/// subdirectory of the worktree, once proved by the filesystem, is not (it may
+/// be a nested repository today or a link tomorrow), and neither is a `..`.
+#[test]
+fn w9r_only_the_worktrees_own_root_is_here() {
+    let t = tree();
+    let w = t.w.display();
+    for c in [
+        "git -C . -C sub commit -m x".to_string(),
+        format!("git -C {w}/sub commit -m x"),
+        "cd sub && git commit -m x".to_string(),
+        format!("git -C {w}/sub/.. commit -m x"),
+        format!("git -C {w}/./sub/.. commit -m x"),
+        "git -C sub/.. commit -m x".to_string(),
+        "git -C ../w commit -m x".to_string(),
+    ] {
+        assert!(
+            !runs_git_mutation(&c, &t.w),
+            "proved here though not the root: {c}"
+        );
+        assert_eq!(command_target(&c, &t.w), Target::Unknown, "{c}");
     }
 }
 
@@ -1748,7 +1772,7 @@ fn a_command_of_unknown_target_from_another_session_makes_a_proved_one_ambiguous
 }
 
 #[test]
-fn a_command_proved_to_aim_elsewhere_is_not_a_candidate_and_does_not_make_anyone_ambiguous() {
+fn a_command_aimed_at_another_checkout_stays_a_candidate_since_text_cannot_prove_it_elsewhere() {
     let t = tree();
     let (_d, repo) = repo_dir();
     let at = t0();
@@ -1762,7 +1786,12 @@ fn a_command_proved_to_aim_elsewhere_is_not_a_candidate_and_does_not_make_anyone
     );
     reflog_row(&repo, None, &sha(1), "commit", at);
 
-    assert_eq!(link(&repo, &sha(1)).session_id.as_deref(), Some("A"));
+    // Not proved elsewhere: a place that is not this root, spelled as text,
+    // may still be this worktree under a link, so B stays a candidate and A is
+    // not the only one.
+    let got = link(&repo, &sha(1));
+    assert_eq!(got.session_id, None, "{got:?}");
+    assert!(got.ambiguous, "{got:?}");
 }
 
 #[test]
@@ -2726,15 +2755,19 @@ fn w9r_the_recorded_cwd_decides_where_a_bare_git_ran() {
     let at = t0();
     for (cwd_of, command, links) in [
         ("", "git commit -m x", true),
-        ("src/deep", "git commit -m x", true),
+        ("", "git -C . commit -m x", true),
+        // A subdirectory is not proved to be the worktree: it may be a nested
+        // repository, now or later.
+        ("src/deep", "git commit -m x", false),
+        ("src", "git -C .. commit -m x", false),
         ("vendor/lib", "git commit -m x", false),
         ("sub", "git commit -m x", false),
-        // Relative `-C` resolves from the cwd, not from the worktree root.
+        // Relative `-C` is resolved from the cwd, as text, and must land at
+        // the root itself.
         ("", "git -C sub commit -m x", false),
+        ("", "git -C src commit -m x", false),
         ("vendor", "git -C lib commit -m x", false),
-        ("vendor/lib", "git -C ../.. commit -m x", true),
-        ("", "git -C src commit -m x", true),
-        ("src", "git -C .. commit -m x", true),
+        ("vendor/lib", "git -C ../.. commit -m x", false),
         ("src", "git -C ../vendor/lib commit -m x", false),
     ] {
         let (_d2, repo2) = repo_dir();
@@ -2956,4 +2989,139 @@ fn w9r_a_lane_path_reads_the_anchor_ledger() {
         from_lane, from_anchor,
         "the lane's path reads another ledger"
     );
+}
+
+/// Every shape of "ran somewhere else under this worktree" is not the root: a
+/// nested repository, `-C` and `cd` through it, a `..` out of it, and the
+/// forms whose directory is not text at all.
+#[test]
+fn w9r_cwd_forms_never_here_when_elsewhere() {
+    let (outer, repo) = repo_dir();
+    let nested = outer.path().join("sub").join("inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(nested.join(".git")).unwrap();
+    std::fs::create_dir(outer.path().join(".git")).unwrap();
+    let sub = outer.path().join("sub").canonicalize().unwrap();
+    let nested = nested.canonicalize().unwrap();
+    let root = Path::new(&repo);
+    let mut wrong = Vec::new();
+    for (cwd, text) in [
+        (sub.clone(), "git -C inner commit -m x"),
+        (sub.clone(), "git -C inner/.. -C inner commit -m x"),
+        (nested.clone(), "git commit -m x"),
+        (nested.clone(), "git -C . commit -m x"),
+        (sub.clone(), "cd inner && git commit -m x"),
+        (sub.clone(), "cd - && git commit -m x"),
+        (sub.clone(), "cd ~ && git commit -m x"),
+        (sub.clone(), "cd $X && git commit -m x"),
+        (sub.clone(), "pushd inner && git commit -m x"),
+        (sub.clone(), "git -C \"\" commit -m x"),
+        // A subdirectory is not the root.
+        (sub.clone(), "git commit -m x"),
+        (sub.clone(), "git -C .. commit -m x"),
+    ] {
+        if read_command_from(text, root, Some(&cwd)).0 == Target::Here {
+            wrong.push(format!("{} :: {text}", cwd.display()));
+        }
+    }
+    assert!(wrong.is_empty(), "Here though it ran elsewhere: {wrong:?}");
+    let own = outer.path().canonicalize().unwrap();
+    assert_eq!(
+        read_command_from("git commit -m x", root, Some(&own)).0,
+        Target::Here
+    );
+}
+
+/// Where a call ran is the text recorded when it ran. What the directory is
+/// now (a nested repository since un-nested, a link in its place) does not
+/// move an old command to the root.
+#[cfg(unix)]
+#[test]
+fn w9r_where_a_call_ran_is_not_judged_by_todays_filesystem() {
+    let at = t0();
+    let row = |repo: &str, cwd: &str| {
+        append(Draft {
+            repo_path: repo.into(),
+            actor_kind: Some(ActorKind::Agent),
+            session_id: Some("S1".into()),
+            action: "session.command".into(),
+            object: Some("git commit -m x".into()),
+            outcome: Some(Outcome::Ok),
+            duration_ms: Some(5_000),
+            detail_json: Some(command_detail("ok", cwd, false)),
+            event_stamp: Some(stamp(at - 2 * SEC, "transcript")),
+            ..Draft::default()
+        })
+        .unwrap();
+        reflog_row(repo, None, &sha(1), "commit", at);
+        link(repo, &sha(1))
+    };
+
+    // A nested repository that stops being one after the call ran.
+    let (outer, repo) = repo_dir();
+    std::fs::create_dir(outer.path().join(".git")).unwrap();
+    let nested = outer.path().join("vendor").join("lib");
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    let nested_s = nested
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::remove_dir_all(nested.join(".git")).unwrap();
+    let got = row(&repo, &nested_s);
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    assert_eq!(got.basis, basis::COMMAND_TARGET_UNKNOWN);
+
+    // A link in the root's place: its text is not the root's.
+    let (outer2, repo2) = repo_dir();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let alias = outer2.path().join("alias");
+    std::os::unix::fs::symlink(&repo2, &alias).unwrap();
+    let got = row(&repo2, alias.to_str().unwrap());
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    drop(elsewhere);
+
+    // The root, spelled the way the platform spells it either way (`/var` or
+    // `/private/var`), with a trailing slash or a `.`, is the root.
+    for variant in 0..4 {
+        let (_o, repo_n) = repo_dir();
+        let canonical = std::fs::canonicalize(&repo_n)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let spelled = match variant {
+            0 => repo_n.clone(),
+            1 => canonical,
+            2 => format!("{repo_n}/"),
+            _ => format!("{canonical}/."),
+        };
+        let got = row(&repo_n, &spelled);
+        assert_eq!(got.session_id.as_deref(), Some("S1"), "{spelled}: {got:?}");
+    }
+}
+
+#[test]
+fn w9r_lexical_reads_a_path_as_text() {
+    use super::attribution::lexical;
+    for (path, want) in [
+        ("/a/b", Some("/a/b")),
+        ("/a/./b/", Some("/a/b")),
+        ("/a/b/../c", Some("/a/c")),
+        ("/a/../../b", Some("/b")),
+        ("/", Some("/")),
+        ("/var/x", Some("/private/var/x")),
+        ("/private/var/x", Some("/private/var/x")),
+        ("/tmp", Some("/private/tmp")),
+        ("/tmp/../var/y", Some("/private/var/y")),
+        ("/variable/x", Some("/variable/x")),
+        ("/tmpx", Some("/tmpx")),
+        ("a/b", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            lexical(path).as_deref().and_then(Path::to_str),
+            want,
+            "{path}"
+        );
+    }
 }

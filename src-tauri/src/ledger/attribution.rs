@@ -570,6 +570,33 @@ fn place(row: Row, anchor: &str, seen: &mut HashMap<String, String>) -> Placed {
     Placed { row, worktree }
 }
 
+/// `path` as an absolute path read as text: `.` and `..` resolved textually, and
+/// the two spellings macOS gives one directory (`/var`, `/tmp` against
+/// `/private/var`, `/private/tmp`) made one. `None` for a path that is not
+/// absolute. It never asks the filesystem, so a symlink, a directory since
+/// removed, or a repository since nested or un-nested changes nothing.
+pub(super) fn lexical(path: &str) -> Option<PathBuf> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = PathBuf::from("/");
+    if matches!(parts.first(), Some(&("var" | "tmp"))) {
+        out.push("private");
+    }
+    out.extend(parts);
+    Some(out)
+}
+
 /// A command row that is, or may be, a commit-making run in its own worktree.
 struct Command {
     placed: Placed,
@@ -595,28 +622,27 @@ fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) ->
             let recorded = row
                 .meta
                 .is_some_and(|version| version >= COMMAND_META_VERSION);
-            // Where the call ran, resolved through the filesystem. A row with
-            // no record of it, or whose directory is gone, has none: a bare
-            // `git` or a relative path then aims nowhere known.
+            // Where the call ran, and the worktree root it must equal, both as
+            // recorded and read as text: nothing here asks the filesystem, so
+            // what a directory is today (a nested repository since removed, a
+            // path since replaced by a link) cannot change where a call that
+            // already ran is taken to have run. A row with no record of its
+            // directory has none: a bare `git` or a relative path then aims
+            // nowhere known.
             let cwd = row
                 .cwd
                 .as_deref()
                 .filter(|cwd| recorded && cwd.len() <= MAX_COMMAND_CWD_BYTES)
-                .filter(|cwd| Path::new(cwd).is_absolute())
-                .and_then(|cwd| {
-                    std::fs::canonicalize(cwd)
-                        .ok()
-                        .filter(|dir| dir.is_dir())
-                        // A worktree since removed (a lane, after its merge)
-                        // has no directory to resolve; a call that ran at its
-                        // root, by its own spelling, is still at its root.
-                        .or_else(|| {
-                            (canonical(cwd) == placed.worktree)
-                                .then(|| PathBuf::from(&placed.worktree))
-                        })
-                });
-            let (mut target, shape) =
-                read_command_from(object, Path::new(&placed.worktree), cwd.as_deref());
+                .and_then(lexical);
+            let root = lexical(if row.worktree.is_empty() {
+                anchor
+            } else {
+                &row.worktree
+            });
+            let (mut target, shape) = match &root {
+                Some(root) => read_command_from(object, root, cwd.as_deref()),
+                None => (Target::Unknown, Shape::NONE),
+            };
             // Only a call known to have run in a known directory is proved to
             // have run here; one without is a candidate and no more.
             if target == Target::Here && cwd.is_none() {
@@ -1335,16 +1361,19 @@ fn mentions_git(command: &str) -> bool {
 /// Where a command line aims its commit-making git runs, relative to
 /// `worktree`, the checkout it ran in.
 ///
-/// Fails closed. [`Target::Here`] needs proof: a plain `git <verb>`, or `-C`,
-/// `cd` or `--work-tree` / `--git-dir` through plain paths that exist and lead
-/// back to `worktree`. Everything else that mentions a commit-making git is
-/// [`Target::Unknown`], not a guess in either direction: an env prefix
-/// (`GIT_DIR=x git ...`, `env ...`), a wrapper or nested shell (`sh -c`,
-/// `eval`, `xargs`, `time`), a quoted, escaped, `~`/`$`-expanded or globbed
-/// path, a path that does not exist, `..` (resolved by the filesystem, never
-/// lexically), a `-c` that can move the tree, `--config-env`, groupings and
-/// substitutions. Only a run that is provably elsewhere, or not a commit-making
-/// form, is [`Target::Elsewhere`].
+/// Fails closed, and reads paths as text ([`lexical`]), never through the
+/// filesystem. [`Target::Here`] needs proof: a plain `git <verb>`, or `-C`,
+/// `cd` or `--work-tree` / `--git-dir` through plain paths, that put the run
+/// exactly at `worktree`'s root as recorded (`.` and `..` resolved textually,
+/// the `/var` and `/tmp` spellings made one with `/private/var` and
+/// `/private/tmp`). Everything else that mentions a commit-making git is
+/// [`Target::Unknown`], not a guess in either direction: a subdirectory, a
+/// nested path or a spelling through a link (any of which may or may not be
+/// this worktree), an env prefix (`GIT_DIR=x git ...`, `env ...`), a wrapper or
+/// nested shell (`sh -c`, `eval`, `xargs`, `time`), a quoted, escaped,
+/// `~`/`$`-expanded or globbed path, a `-c` that can move the tree,
+/// `--config-env`, groupings and substitutions. Only a form that is not
+/// commit-making is [`Target::Elsewhere`].
 #[cfg(test)]
 pub(crate) fn command_target(command: &str, worktree: &Path) -> Target {
     read_command(command, worktree).0
@@ -1432,8 +1461,14 @@ pub(crate) fn read_command_from(
     worktree: &Path,
     cwd: Option<&Path>,
 ) -> (Target, Shape) {
+    // Both read as text ([`lexical`]), so the same directory spelled two ways
+    // by the platform is one, and nothing depends on the filesystem.
+    let Some(root) = worktree.to_str().and_then(lexical) else {
+        return (Target::Unknown, Shape::NONE);
+    };
+    let cwd = cwd.and_then(|cwd| cwd.to_str().and_then(lexical));
     let mut shape: Option<Shape> = None;
-    let target = read_command_into(command, worktree, cwd, &mut shape);
+    let target = read_command_into(command, &root, cwd.as_deref(), &mut shape);
     (target, shape.unwrap_or(Shape::NONE))
 }
 
@@ -1487,35 +1522,36 @@ fn read_command_into(
     best
 }
 
-/// The directory `word` names from `base`, through the filesystem: a plain
-/// path that exists and is a directory, with symlinks and `..` resolved by the
-/// kernel. `None` for anything else.
+/// The directory `word` names from `base`, read as text ([`lexical`]): a plain
+/// path, relative to `base` unless absolute. `None` for anything else, for a
+/// path with a `..` in it, and whenever there is no `base` to start a relative
+/// one from. A `..` is not resolved: after a link it names a different place
+/// than it spells, which text cannot tell.
 fn enter(base: Option<&Path>, word: &Word) -> Option<PathBuf> {
     if !word.plain || word.text.is_empty() || word.text == "-" {
         return None;
     }
     let path = Path::new(&word.text);
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base?.join(path)
     };
-    std::fs::canonicalize(joined)
-        .ok()
-        .filter(|dir| dir.is_dir())
+    lexical(joined.to_str()?)
 }
 
-/// Whether a git run at the existing directory `dir` takes effect in
-/// `worktree`: the same checkout, or one whose nearest enclosing checkout (the
-/// closest ancestor holding a `.git`) is it. The second keeps a subdirectory in
-/// and a lane nested under the worktree out.
+/// Whether a git run at `dir` takes effect in `worktree`: only when `dir` is the
+/// worktree's root, spelled as recorded. A subdirectory, a nested repository, a
+/// lane under the worktree and a spelling through a link are all other places
+/// as far as the text can say, so none of them is proved to be this one.
 fn lands_in(dir: &Path, worktree: &Path) -> bool {
-    let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
-    dir == there
-        || dir
-            .ancestors()
-            .find(|candidate| candidate.join(".git").exists())
-            .is_some_and(|root| root == there)
+    dir == worktree
 }
 
 /// One git invocation's words after `git`, run from `dir`.
@@ -1599,7 +1635,7 @@ fn git_target(
     let Some(args) = commit_making_args(subcommand, &all_args) else {
         return Target::Unknown;
     };
-    let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
+    let there = worktree.to_path_buf();
     let target = aimed_at(work_tree, git_dir, here, worktree, &there);
     if target == Target::Here {
         *run = Some(shape_of(subcommand, &args));
@@ -1903,6 +1939,11 @@ fn shape_of(subcommand: &str, args: &[&str]) -> Shape {
 }
 
 /// Where a run lands, given the work tree and git dir it named and where it ran.
+///
+/// [`Target::Here`] only when every place the words name is the worktree's root
+/// as recorded. Any other place may still be this worktree under a spelling the
+/// text does not show (a link, a subdirectory's parent), so it is
+/// [`Target::Unknown`]: a candidate, never a link.
 fn aimed_at(
     work_tree: Option<Option<PathBuf>>,
     git_dir: Option<Option<PathBuf>>,
@@ -1910,41 +1951,24 @@ fn aimed_at(
     worktree: &Path,
     there: &Path,
 ) -> Target {
-    match (work_tree, git_dir) {
-        (None, None) => match here {
-            Some(dir) if lands_in(&dir, worktree) => Target::Here,
-            Some(_) => Target::Elsewhere,
-            None => Target::Unknown,
-        },
+    let proved = match (work_tree, git_dir) {
+        (None, None) => here.is_some_and(|dir| lands_in(&dir, worktree)),
         // A named git dir without a work tree is that repository's own: it is
         // this one only when it is this worktree's `.git`.
-        (None, Some(Some(git))) => {
-            if git == there.join(".git") {
-                Target::Here
-            } else {
-                Target::Elsewhere
-            }
-        }
+        (None, Some(Some(git))) => git == there.join(".git"),
         (Some(Some(tree)), None) => {
-            let (in_tree, in_dir) = (
-                lands_in(&tree, worktree),
-                here.as_deref().is_some_and(|dir| lands_in(dir, worktree)),
-            );
-            match (in_tree, in_dir) {
-                (true, true) => Target::Here,
-                (false, false) => Target::Elsewhere,
-                _ => Target::Unknown,
-            }
+            lands_in(&tree, worktree) && here.is_some_and(|dir| lands_in(&dir, worktree))
         }
         (Some(Some(tree)), Some(Some(git))) => {
-            match (lands_in(&tree, worktree), git == there.join(".git")) {
-                (true, true) => Target::Here,
-                (false, false) => Target::Elsewhere,
-                _ => Target::Unknown,
-            }
+            lands_in(&tree, worktree) && git == there.join(".git")
         }
         // A path that does not resolve is not a place.
-        _ => Target::Unknown,
+        _ => false,
+    };
+    if proved {
+        Target::Here
+    } else {
+        Target::Unknown
     }
 }
 

@@ -133,6 +133,9 @@ pub struct ToolCall {
     /// only that the call was handed off.
     #[serde(skip)]
     pub background: bool,
+    /// The call's own `timeout` input (milliseconds), when it set one.
+    #[serde(skip)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Every ledger action a transcript call can become, and only those.
@@ -314,6 +317,7 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
             // Anything but a plain `false` reads as backgrounded: the field is
             // the agent's, and an unfamiliar spelling of it must not read as a
             // call that ran to its end.
+            timeout_ms: input.get("timeout").and_then(|t| t.as_u64()),
             background: input
                 .get("run_in_background")
                 .is_some_and(|flag| !flag.is_null() && flag.as_bool() != Some(false)),
@@ -356,7 +360,112 @@ struct ResultRecord<'a> {
     /// The record's structured result, read only for whether it names a
     /// background task.
     #[serde(default, rename = "toolUseResult")]
-    tool_use_result: BackgroundMark,
+    tool_use_result: Option<BackgroundMark>,
+}
+
+/// Claude Code's Bash timeout when a call sets none, in milliseconds.
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+
+/// How far short of its timeout a call may answer and still read as having
+/// been cut off by it, in milliseconds.
+const TIMEOUT_MARGIN_MS: u64 = 1_000;
+
+/// Whether a tool result's output says the call was handed off: Claude Code
+/// writes "Command did not complete within its Ns timeout and was moved to the
+/// background", "Command was moved to the background (ID: x) after running for
+/// Ns" or "Command running in background with ID: x" in place of the command's
+/// output, with `is_error: false`. In a subagent's transcript (`agent-*.jsonl`)
+/// that is all it writes: there is no `toolUseResult`. Read off real
+/// transcripts (versions 2.1.237 to 2.1.317); matched anywhere in the text, any
+/// case, since partial output can come first. `Command timed out` is kept with
+/// them: a result that says the command was cut short says nothing of what it
+/// made. The output is walked without being kept, a string or the `text` of
+/// each block of a list.
+#[derive(Default)]
+struct HandedOff(bool);
+
+/// The words [`HandedOff`] looks for, lowercase.
+const HANDED_OFF_WORDS: [&str; 5] = [
+    "did not complete within",
+    "moved to the background",
+    "running in background",
+    "command timed out",
+    "timed out after",
+];
+
+/// Whether `text` holds any of [`HANDED_OFF_WORDS`], in any case.
+fn says_handed_off(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    HANDED_OFF_WORDS.iter().any(|word| {
+        let word = word.as_bytes();
+        bytes
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word))
+    })
+}
+
+impl<'de> Deserialize<'de> for HandedOff {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Words;
+        impl<'de> serde::de::Visitor<'de> for Words {
+            type Value = HandedOff;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a tool's output")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(HandedOff(says_handed_off(text)))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut said = false;
+                while let Some(HandedOff(block)) = seq.next_element::<HandedOff>()? {
+                    said |= block;
+                }
+                Ok(HandedOff(said))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut said = false;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "text" {
+                        said |= map.next_value::<HandedOff>()?.0;
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(HandedOff(said))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+        }
+        deserializer.deserialize_any(Words)
+    }
 }
 
 /// Whether a record's `toolUseResult` carries a `backgroundTaskId`: Claude
@@ -484,6 +593,9 @@ struct ResultBlock<'a> {
     #[serde(borrow)]
     tool_use_id: Option<Cow<'a, str>>,
     is_error: Option<bool>,
+    /// The tool's output, read only for the words of a handed-off call.
+    #[serde(default)]
+    content: HandedOff,
 }
 
 /// An assistant record read only for its response's identity and token counts.
@@ -727,7 +839,10 @@ impl Reader {
         if let Some(at) = at_ms {
             self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
         }
-        let background = record.tool_use_result.0;
+        let (structured, background) = match &record.tool_use_result {
+            Some(mark) => (true, mark.0),
+            None => (false, false),
+        };
         let mut out = Vec::new();
         for block in blocks {
             if block.kind.as_deref() != Some("tool_result") {
@@ -751,15 +866,33 @@ impl Reader {
             } else {
                 CallResult::Succeeded
             };
-            // One record can answer several calls; when it says a task was
-            // backgrounded, none of them is read as having finished.
-            call.background |= background;
             call.duration_ms = at_ms
                 .zip(crate::ledger::ids::parse_event_time(&call.ts_utc))
                 .and_then(|(done, began)| {
                     done.checked_sub(began)
                         .and_then(|span| i64::try_from(span).ok())
                 });
+            // A call handed off to the background answers `is_error: false`
+            // and no more, so it is read as not finished when any of three
+            // things says so (one record can answer several calls, and a
+            // marker on it covers each):
+            //  * a marker: the input's `run_in_background`, or a result that
+            //    names a background task (`toolUseResult.backgroundTaskId`);
+            //  * the output's words (see [`HandedOff`]), which a subagent's
+            //    transcript carries without any `toolUseResult`;
+            //  * its length, for a wording this does not know: a result with no
+            //    `toolUseResult` that came back as late as the call's timeout
+            //    (its own `timeout` input, else Claude Code's 120 s default)
+            //    less a second, which is when a timed-out call is answered.
+            // Every one of them costs a link at worst: a call read as handed
+            // off is a candidate and never evidence.
+            let timeout = call.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
+            let at_timeout = !structured
+                && call
+                    .duration_ms
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .is_some_and(|ms| ms >= timeout.saturating_sub(TIMEOUT_MARGIN_MS));
+            call.background |= background || block.content.0 || at_timeout;
             out.push(call);
         }
         out.extend(self.expire());
@@ -1571,6 +1704,109 @@ mod reader_tests {
             assert!(feed(&mut reader, 0, &assistant(T0, "m1", &block, 5)).is_empty());
             let done = feed(&mut reader, 400, &result(T0_2S, "tu1", Some(false)));
             assert_eq!(done[0].background, background, "{flag}");
+        }
+    }
+
+    /// A result record with the given `content` (any JSON) and no
+    /// `toolUseResult`, as a subagent's transcript writes it.
+    fn result_text(ts: &str, id: &str, content: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":false}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_result_that_says_the_call_was_handed_off_is_marked_in_any_case_and_shape() {
+        for (content, background) in [
+            // The three wordings read off real transcripts (2.1.237 - 2.1.317).
+            (
+                r#""Command did not complete within its 120s timeout and was moved to the background (ID: bx). Output is being written to: /tmp/bx.output""#,
+                true,
+            ),
+            (
+                r#""Command was moved to the background (ID: b1) after running for 180s. Output is being written to: /tmp/b1.output""#,
+                true,
+            ),
+            (
+                r#""Command running in background with ID: b2. Output is being written to: /tmp/b2.output""#,
+                true,
+            ),
+            // Partial output first, a list of blocks, another case.
+            (
+                r#""/dev/disk3s1s1  926Gi  % /\nCommand did not complete within its 120s timeout and was moved to the background""#,
+                true,
+            ),
+            (
+                r#"[{"type":"text","text":"COMMAND DID NOT COMPLETE WITHIN its 30s timeout"}]"#,
+                true,
+            ),
+            (
+                r#"[{"type":"text","text":"x"},{"type":"text","text":"Moved To The Background"}]"#,
+                true,
+            ),
+            (r#""Exit code 124\nCommand timed out after 2m 0s""#, true),
+            // Outputs that say nothing of the kind, whatever their shape.
+            (r#""[main abc] fix: parser""#, false),
+            (r#""""#, false),
+            (r#"[]"#, false),
+            (
+                r#"[{"type":"image","source":{"data":"background"}}]"#,
+                false,
+            ),
+            ("null", false),
+            ("7", false),
+            ("true", false),
+            (r#"{"unexpected":"moved to the background"}"#, false),
+        ] {
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5)).is_empty());
+            let done = feed(&mut reader, 400, &result_text(T0_2S, "tu1", content));
+            assert_eq!(done.len(), 1, "{content}");
+            assert_eq!(done[0].result, CallResult::Succeeded, "{content}");
+            assert_eq!(done[0].background, background, "{content}");
+        }
+    }
+
+    #[test]
+    fn a_result_as_late_as_the_timeout_with_no_structured_result_is_marked() {
+        const T_120S: &str = "2026-09-01T12:02:00.356Z";
+        const T_119S: &str = "2026-09-01T12:01:59.100Z";
+        const T_118S: &str = "2026-09-01T12:01:58.500Z";
+        const T_300S: &str = "2026-09-01T12:04:59.500Z";
+        let timeout =
+            |ms: Option<u64>| ms.map_or(String::new(), |ms| format!(r#","timeout":{ms}"#));
+        for (timeout_input, done_at, structured, background) in [
+            // The default 120 s timeout, to a second short of it.
+            (None, T_120S, false, true),
+            (None, T_119S, false, true),
+            (None, T_118S, false, false),
+            // The call's own timeout.
+            (Some(300_000), T_300S, false, true),
+            (Some(300_000), T_120S, false, false),
+            (Some(600_000), T_300S, false, false),
+            // A `toolUseResult` says the call finished, however late.
+            (None, T_120S, true, false),
+        ] {
+            let block = format!(
+                r#"{{"type":"tool_use","id":"tu1","name":"Bash","input":{{"command":"git commit -m x"{}}}}}"#,
+                timeout(timeout_input)
+            );
+            let line = if structured {
+                result_with(
+                    done_at,
+                    "tu1",
+                    r#"{"stdout":"ok","stderr":"","interrupted":false}"#,
+                )
+            } else {
+                result_text(done_at, "tu1", r#""ok""#)
+            };
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &block, 5)).is_empty());
+            let done = feed(&mut reader, 400, &line);
+            assert_eq!(
+                done[0].background, background,
+                "timeout {timeout_input:?} done {done_at} structured {structured}"
+            );
         }
     }
 

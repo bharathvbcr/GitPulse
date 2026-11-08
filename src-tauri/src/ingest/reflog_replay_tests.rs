@@ -1043,7 +1043,18 @@ fn w9_real_transcript_agent_in_a_nested_repo_is_not_credited_with_the_outer_comm
     assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
     assert_eq!(
         got.basis,
-        ledger::attribution::basis::NO_INGESTED_SESSION_COMMAND,
+        ledger::attribution::basis::COMMAND_TARGET_UNKNOWN,
+        "{got:?}"
+    );
+    // Where the call ran is what was recorded when it ran: the nested
+    // repository ceasing to be one afterwards (a submodule deinit, an
+    // `rm -rf .git`) does not move the call to the outer root.
+    std::fs::remove_dir_all(nested.join(".git")).unwrap();
+    let got = w9_link(&repo, &person);
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    assert_eq!(
+        got.basis,
+        ledger::attribution::basis::COMMAND_TARGET_UNKNOWN,
         "{got:?}"
     );
 }
@@ -1154,5 +1165,113 @@ fn w9_real_transcript_non_committing_and_masked_forms_never_link() {
         );
         let got = w9_link(&repo, &person);
         assert_eq!(got.session_id, None, "WRONG LINK for `{command}`: {got:?}");
+    }
+}
+
+/// A call that outlived its timeout in a subagent's transcript
+/// (`agent-*.jsonl`): `is_error: false`, text saying it was moved to the
+/// background, and NO `toolUseResult`, no `run_in_background`. The heuristics
+/// of `transcript::Reader` read it three ways, each alone enough: (b) the
+/// words, (c) the length (a result that came back at the timeout, with no
+/// `toolUseResult`). None of them may link a person's commit made during it.
+#[test]
+fn w9_real_transcript_a_timed_out_subagent_call_never_links() {
+    let moved = "Command did not complete within its 120s timeout and was moved to the \
+                 background (ID: bx). Output is being written to: /tmp/bx.output. You will \
+                 be notified when it completes.";
+    for (what, input, content, span) in [
+        // (b) the words alone: a short span, nothing structured.
+        ("words", serde_json::json!({ "command": "git commit -m 'agent work'" }), moved, 5_000),
+        (
+            "words after partial output",
+            serde_json::json!({ "command": "git commit -m 'agent work'" }),
+            "[main abc] agent work\nCOMMAND DID NOT COMPLETE WITHIN its 30s timeout and was MOVED TO THE BACKGROUND",
+            5_000,
+        ),
+        (
+            "other wording",
+            serde_json::json!({ "command": "git commit -m 'agent work'" }),
+            "Command running in background with ID: bz",
+            5_000,
+        ),
+        // (c) the length alone: generic text, the default timeout.
+        ("default timeout", serde_json::json!({ "command": "git commit -m 'agent work'" }), "ok", 120_356),
+        ("just short of it", serde_json::json!({ "command": "git commit -m 'agent work'" }), "ok", 119_000),
+        // (c) with the call's own timeout.
+        (
+            "own timeout",
+            serde_json::json!({ "command": "git commit -m 'agent work'", "timeout": 300_000 }),
+            "ok",
+            299_500,
+        ),
+    ] {
+        let (dir, repo) = seeded_repo();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(dir.path(), &["commit", "--allow-empty", "-m", "person work"], now);
+        let person = w9_head(&repo);
+        let start = u64::try_from(now).unwrap() * 1000 - 30_000;
+        let row = w9_ingest_bash_call(
+            &repo,
+            "S_SUB",
+            &repo,
+            input,
+            (start, start + span),
+            (serde_json::Value::Null, content),
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["background"], true, "{what}: {detail}");
+        let got = w9_link(&repo, &person);
+        assert_eq!(got.session_id, None, "{what}: WRONG LINK {got:?}");
+        assert_eq!(
+            got.basis,
+            ledger::attribution::basis::COMMAND_OUTCOME_UNKNOWN,
+            "{what}: {got:?}"
+        );
+    }
+}
+
+/// The controls of the above: a result with no `toolUseResult` that is neither
+/// worded as handed off nor as long as its timeout is a finished foreground
+/// call, and still links.
+#[test]
+fn w9_real_transcript_a_finished_subagent_call_still_links() {
+    // (input, when the call began relative to the commit's second, its span)
+    for (input, began, span) in [
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'" }),
+            200,
+            2_000,
+        ),
+        // Longer than the default timeout, but the call set a longer one.
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'", "timeout": 600_000 }),
+            -100_000,
+            130_000,
+        ),
+    ] {
+        let (dir, repo) = seeded_repo();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "fix: parser"],
+            now,
+        );
+        let sha = w9_head(&repo);
+        let start = (u64::try_from(now).unwrap() * 1000).saturating_add_signed(began);
+        let row = w9_ingest_bash_call(
+            &repo,
+            "S_SUB",
+            &repo,
+            input,
+            (start, start + span),
+            (serde_json::Value::Null, "[main abc] fix: parser"),
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["background"], false, "{detail}");
+        let got = w9_link(&repo, &sha);
+        assert_eq!(got.session_id.as_deref(), Some("S_SUB"), "{got:?}");
+        assert_eq!(got.basis, ledger::attribution::basis::INFERRED);
     }
 }
