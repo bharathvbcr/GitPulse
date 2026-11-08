@@ -837,3 +837,46 @@ fn the_sleep_scanner_scans_test_code_and_only_test_code() {
     assert!(!sleep_scan::cfg_requires_test("not(test)"));
     assert!(!sleep_scan::cfg_requires_test("all(testing, unix)"));
 }
+
+/// A `prefix | .. | owned-elsewhere:..` line allowlists EVERY short sleep ever
+/// added under it. One that covers no short sleep today is not holding a
+/// conversion in flight, it is a standing exemption for the next sleep someone
+/// adds to that file, with no test left to refuse it.
+#[test]
+fn an_owned_elsewhere_prefix_covers_a_sleep_that_exists_today() {
+    let list = parse_sleep_allowlist(SLEEP_ALLOWLIST);
+    let sites = test_code_sleeps();
+    let idle: Vec<&str> = list
+        .prefixes
+        .iter()
+        .map(|(prefix, _)| prefix.as_str())
+        .filter(|prefix| {
+            !sites
+                .iter()
+                .any(|site| site.flagged() && site.file.starts_with(prefix))
+        })
+        .collect();
+    assert!(
+        idle.is_empty(),
+        "these owned-elsewhere prefixes cover no short sleep, so they silently allow every \
+         future one: {idle:?}"
+    );
+}
+
+/// A duration name is judged by the one definition the file has. A parameter of
+/// another function that happens to share the name of a literal-valued binding
+/// elsewhere in the file is not that definition: its value is the caller's, so
+/// the sleep is unprovable and must be flagged.
+#[test]
+fn a_parameter_sharing_a_name_with_a_long_binding_elsewhere_is_unprovable() {
+    let sites = sleep_scan::scan_snippet(
+        "fn a() { let nap = Duration::from_millis(500); sleep(nap); }\n\
+         fn b(nap: Duration) { sleep(nap); }",
+    );
+    let in_b = sites.iter().find(|site| site.func == "b").unwrap();
+    assert!(
+        in_b.flagged(),
+        "`sleep(nap)` with `nap` a parameter was judged {:?} ns from another function's binding",
+        in_b.nanos
+    );
+}
