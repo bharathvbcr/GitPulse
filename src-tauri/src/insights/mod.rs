@@ -5494,6 +5494,33 @@ mod tests {
         assert!(windows_hook_command(r"C:\x.exe", "").is_err());
     }
 
+    /// ADVERSARIAL. `exit $LASTEXITCODE` is `exit $null`, which is exit 0, the
+    /// "allow" verdict, whenever the `&` call never produced a native exit
+    /// status: `Test-Path -PathType Leaf` is true for a zero-byte or non-PE
+    /// file or one an antivirus has locked, `&` then raises a statement-
+    /// terminating "failed to run" error, the script carries on, and
+    /// `$LASTEXITCODE` is still `$null`. Claude Code sees a clean exit 0, so
+    /// neither exit 2 nor `onFailure: "block"` (which keys off a non-0/2 exit
+    /// or a failure to start) ever fires: the collision guard and command gate
+    /// are silently off, the exact outcome this card exists to prevent.
+    /// A deciding hook must not forward a possibly-null status unguarded.
+    #[test]
+    fn the_windows_deciding_hooks_do_not_exit_zero_when_the_binary_never_ran() {
+        let binary = r"C:\Program Files\GitPulse\gitpulse-hook.exe";
+        for args in ["collision-guard", "command-gate"] {
+            let command = windows_hook_command(binary, args).unwrap();
+            let forwarded = command
+                .rfind("exit $LASTEXITCODE")
+                .expect("forwards status");
+            assert!(
+                command[..forwarded].contains("$null")
+                    || command[..forwarded].contains("-is [int]"),
+                "{args}: `exit $LASTEXITCODE` is exit 0 when the binary never ran \
+                 ($LASTEXITCODE is $null); guard it so that case exits 2: {command}"
+            );
+        }
+    }
+
     /// The bare command a plugin manifest names reaches nothing with an empty
     /// `PATH`; Settings says so instead of reporting the binary as fine.
     #[test]
