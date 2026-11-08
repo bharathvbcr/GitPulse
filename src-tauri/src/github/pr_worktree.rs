@@ -145,6 +145,9 @@ struct Attempt {
     fetched_staging: bool,
 }
 
+/// `update-ref` old value meaning "the ref must not exist".
+const ABSENT_OID: &str = "0000000000000000000000000000000000000000";
+
 /// What is already on disk for one pull request.
 enum Plan {
     Create,
@@ -312,25 +315,26 @@ fn create_worktree(
     let branch = attempt.branch.clone();
     let branch_ref = format!("refs/heads/{branch}");
 
-    let existed = ref_exists(&repo, &repo_key, &branch_ref, gate)?;
+    let mut existed = ref_exists(&repo, &repo_key, &branch_ref, gate)?;
     if !existed {
         // `fetch_staging` rolls this call back itself when it fails.
         fetch_staging(attempt, remote_name, number, gate)?;
+        // Create the branch only if it is still absent. A branch somebody
+        // else made in the meantime (GitHub's own `git fetch origin
+        // pull/N/head:pr/N` recipe makes one at this very commit) is theirs:
+        // it is attached, not created, and never deleted by this call.
+        match claim_branch(attempt, gate) {
+            Ok(true) => attempt.created_branch = true,
+            Ok(false) => existed = true,
+            Err(error) => return Err(rollback(attempt, error, gate)),
+        }
     }
 
-    let staging = attempt.staging.clone();
-    let (new_branch, start): (Option<&str>, Option<&str>) = if existed {
-        // Attach the branch where it is. The fast-forward runs after the
-        // worktree exists, and only inside that worktree, so a refused add
-        // cannot move this branch.
-        (None, Some(branch.as_str()))
-    } else {
-        // Rollback may delete the branch only when its tip is still the
-        // staging commit this call fetched.
-        attempt.created_branch = true;
-        (Some(branch.as_str()), Some(staging.as_str()))
-    };
-
+    // The branch exists now, created by this call or found. The add attaches
+    // it without \`-b\`, and the fast-forward (for a branch found) runs only in
+    // the new worktree, so a refused add cannot move it.
+    let new_branch: Option<&str> = None;
+    let start = Some(branch.as_str());
     let argv = add_worktree_argv_configured(&target, new_branch, start, false, false);
     if let Err(error) = judge(&repo_key, &argv, gate) {
         return Err(rollback(attempt, error, gate));
@@ -380,6 +384,38 @@ fn create_worktree(
     let mut opened = opened_from(target, branch, false, head_oid, view, Some(created));
     opened.update_error = update_error;
     Ok(opened)
+}
+
+/// Creates `refs/heads/pr/N` at this call's staging commit, only if the branch
+/// is absent (`update-ref` with an all-zero old value). `Ok(true)` means this
+/// call created it; `Ok(false)` means it already existed.
+fn claim_branch(attempt: &Attempt, gate: Gate<'_>) -> Result<bool, PrWorktreeError> {
+    let oid =
+        ref_object(&attempt.repo, &attempt.repo_key, &attempt.staging, gate)?.ok_or_else(|| {
+            refused(
+                PrWorktreeRefusalCode::FetchFailed,
+                "The fetched pull request head is missing",
+            )
+        })?;
+    let branch_ref = format!("refs/heads/{}", attempt.branch);
+    match judged_git(
+        &attempt.repo,
+        &attempt.repo_key,
+        &["update-ref", &branch_ref, &oid, ABSENT_OID],
+        gate,
+    ) {
+        Ok(_) => Ok(true),
+        Err(StepError::Gate(message)) => {
+            Err(PrWorktreeError::Command(CommandError::plain(message)))
+        }
+        Err(StepError::Git(error)) => {
+            if ref_exists(&attempt.repo, &attempt.repo_key, &branch_ref, gate)? {
+                Ok(false)
+            } else {
+                Err(PrWorktreeError::Command(error))
+            }
+        }
+    }
 }
 
 /// Decides, from one listing, whether the pull request already has a
@@ -1290,12 +1326,19 @@ exec "$real" "$@"
                     event.action == "git.worktree"
                         && event.outcome == "ok"
                         && event.argv_json.as_deref().is_some_and(|argv| {
-                            argv.contains("\"add\"")
-                                && argv.contains("\"-b\"")
-                                && argv.contains("\"pr/7\"")
+                            argv.contains("\"add\"") && argv.contains("\"pr/7\"")
                         })
                 }),
                 "worktree add was not judged: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event.outcome == "ok"
+                        && event.argv_json.as_deref().is_some_and(|argv| {
+                            argv.contains("\"update-ref\"") && argv.contains("\"refs/heads/pr/7\"")
+                        })
+                }),
+                "branch creation was not judged: {events:?}"
             );
 
             let again = open_at(&case.repo_s, 7, true, true).expect("reuse pr 7");
@@ -1705,15 +1748,16 @@ exec "$real" "$@"
                     let adding = argv.first() == Some(&"git")
                         && argv.get(1) == Some(&"worktree")
                         && argv.contains(&"add");
-                    if adding && argv.contains(&"pr/9") {
+                    if adding && (argv.contains(&"pr/9") || argv.contains(&"pr/7")) {
                         return Err("worktree add refused".into());
                     }
-                    if adding && argv.contains(&"pr/7") {
+                    // The branch is created just before the add, so a foreign
+                    // one lands just before that creation.
+                    if argv.get(1) == Some(&"update-ref") && argv.contains(&"refs/heads/pr/7") {
                         crate::test_support::git_in(
                             Path::new(repo),
                             &["branch", "pr/7", foreign.as_str()],
                         );
-                        return Err("worktree add refused".into());
                     }
                     real_gate(repo, argv)
                 };
@@ -2088,6 +2132,141 @@ exec "$real" "$@"
             let error = fetchable_remote_name(name).expect_err(name);
             assert_eq!(refusal(&error).code, PrWorktreeRefusalCode::FetchFailed);
         }
+    }
+
+    /// Publishes a commit on the bare remote as `refs/pull/7/head` that edits
+    /// README.md and adds NEW.md, one commit ahead of main. Returns its oid.
+    #[cfg(unix)]
+    fn publish_readme_change(case: &Case) -> String {
+        crate::test_support::git_in(&case.repo, &["checkout", "-b", "pr-ahead"]);
+        std::fs::write(case.repo.join("README.md"), "pr version\n").unwrap();
+        std::fs::write(case.repo.join("NEW.md"), "from the pr\n").unwrap();
+        crate::test_support::git_in(&case.repo, &["add", "README.md", "NEW.md"]);
+        crate::test_support::git_in(&case.repo, &["commit", "-m", "pr edits readme"]);
+        let oid = git_text(&case.repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let bare = case.repo.parent().unwrap().join("origin.git");
+        crate::test_support::git_in(
+            &case.repo,
+            &[
+                "push",
+                "-f",
+                bare.to_str().unwrap(),
+                "pr-ahead:refs/pull/7/head",
+            ],
+        );
+        crate::test_support::git_in(&case.repo, &["checkout", "main"]);
+        crate::test_support::git_in(&case.repo, &["branch", "-D", "pr-ahead"]);
+        oid
+    }
+
+    /// A reused worktree with uncommitted edits to a file the pull request
+    /// changes, and an untracked file the pull request adds: the fast-forward
+    /// must not overwrite either, and must say it did not update.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_with_a_conflicting_dirty_tree_keeps_the_work_and_says_why() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                let wt = PathBuf::from(&opened.path);
+                std::fs::write(wt.join("README.md"), "my uncommitted edit\n").unwrap();
+                std::fs::write(wt.join("NEW.md"), "my untracked notes\n").unwrap();
+                let ahead = publish_readme_change(case);
+                let again = open_at(&case.repo_s, 7, false, false).expect("reuse");
+                assert!(again.reused);
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("README.md")).unwrap(),
+                    "my uncommitted edit\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("NEW.md")).unwrap(),
+                    "my untracked notes\n"
+                );
+                assert_ne!(again.head_oid, ahead);
+                let reason = again
+                    .update_error
+                    .expect("a refused fast-forward must be reported");
+                assert!(reason.contains("fast-forward"), "{reason}");
+            },
+        );
+    }
+
+    /// A reused worktree with a staged, non-conflicting change: the
+    /// fast-forward proceeds and the staged change survives.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_with_a_staged_unrelated_change_keeps_it() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                let wt = PathBuf::from(&opened.path);
+                std::fs::write(wt.join("MINE.md"), "staged work\n").unwrap();
+                crate::test_support::git_in(&wt, &["add", "MINE.md"]);
+                let ahead = publish_readme_change(case);
+                let again = open_at(&case.repo_s, 7, false, false).expect("reuse");
+                assert_eq!(again.update_error, None);
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("MINE.md")).unwrap(),
+                    "staged work\n"
+                );
+                let cached = git_text(&wt, &["diff", "--cached", "--name-only"]).unwrap();
+                assert!(cached.contains("MINE.md"), "staged change lost: {cached:?}");
+                assert_eq!(again.head_oid, ahead);
+            },
+        );
+    }
+
+    /// Another process, or the person following GitHub's own
+    /// `git fetch origin pull/7/head:pr/7` recipe, creates `pr/7` at the pull
+    /// request head after this call checked it was absent. That branch is not
+    /// this call's: it must survive whether the open then fails or attaches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_commit_branch_made_elsewhere_is_never_deleted() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let oid = case.oid_a.clone();
+                let planted = std::cell::Cell::new(false);
+                // Planted just before this call's first step that would create
+                // the branch or add the worktree.
+                let gate = |repo: &str, argv: &[&str]| {
+                    let creating = argv.first() == Some(&"git")
+                        && ((argv.get(1) == Some(&"update-ref")
+                            && argv.contains(&"refs/heads/pr/7"))
+                            || (argv.get(1) == Some(&"worktree") && argv.contains(&"add")));
+                    if creating && !planted.replace(true) {
+                        crate::test_support::git_in(
+                            Path::new(repo),
+                            &["branch", "pr/7", oid.as_str()],
+                        );
+                    }
+                    real_gate(repo, argv)
+                };
+                let result = open_pull_request_worktree(&case.repo_s, 7, false, false, &gate);
+                assert!(planted.get(), "the branch was never planted");
+                assert!(
+                    !ref_absent(&case.repo, "refs/heads/pr/7"),
+                    "pr/7, made elsewhere at the same commit, was deleted: {:?}",
+                    result.as_ref().map(|o| &o.path).map_err(error_text)
+                );
+                let opened = result.expect("the branch that was there is attached");
+                assert!(!opened.reused);
+                assert!(Path::new(&opened.path).is_dir());
+                assert!(staging_refs(&case.repo).is_empty());
+            },
+        );
     }
 
     #[cfg(unix)]

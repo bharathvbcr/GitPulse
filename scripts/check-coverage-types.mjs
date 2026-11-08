@@ -167,6 +167,9 @@ export const CONTRACTS = Object.freeze([
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult", "WorktreeRemoval"] },
+  // The pull request opened in its own worktree: `update_error` decides whether
+  // the notice says the branch is the pull request head.
+  { label: "pr-worktree", rustPath: rust("github", "pr_worktree.rs"), tsPath: ts("github", "prActions.ts"), structs: ["PrWorktreeOpened"] },
   // The hooks file as the approval dialog shows it: `approved` decides whether
   // the panel offers to approve, so a renamed field would read as unapproved.
   { label: "worktree-hooks", rustPath: rust("engine", "worktree_hooks.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeHooksPreview", "WorktreeHooksConfig"] },
