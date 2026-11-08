@@ -75,6 +75,12 @@
   import { formatReleaseDate } from "../ops/model";
   import { pullRequestCreateUrl } from "../github/compareUrl";
   import {
+    checkoutPullRequestInPlace,
+    describePrWorktree,
+    openPullRequestWorktree,
+    withVerdict,
+  } from "../github/prActions";
+  import {
     filterIssues,
     filterPullRequests,
     filterReleases,
@@ -134,6 +140,11 @@
   let loading = $state(false);
   /** PR numbers with a checkout in flight; any in-flight checkout disables all. */
   const checkingOut = new SvelteSet<number>();
+  /** PR numbers being opened in a new worktree. Either set disables both actions. */
+  const openingWorktree = new SvelteSet<number>();
+  /** An expanded detail is running its own action (review, merge, checkout or worktree open). */
+  let detailBusy = $state(false);
+  const prActionsLocked = $derived(checkingOut.size > 0 || openingWorktree.size > 0 || detailBusy);
   let inflight: AsyncGuard | null = null;
 
   // --- Actions workflows (CI/CD) ---
@@ -631,7 +642,7 @@
    * These actions bypass repoStore.runMutating, so without this the verdict
    * would be dropped on the floor.
    */
-  function fileVerdict(result: Guarded<string> | null, repoPath: string) {
+  function fileVerdict(result: Guarded<unknown> | null, repoPath: string) {
     harnessStore.recordVerdict(result?.policy ?? null, repoPath);
   }
 
@@ -641,18 +652,33 @@
     return `${base}${result.policy ? ` — ${verdictLabel(result.policy)}` : ""}`;
   }
 
+  async function openPrWorktree(number: number) {
+    const repo = $repoStore.currentPath;
+    if (!repo || prActionsLocked) return;
+    openingWorktree.add(number);
+    actionError = null;
+    actionNotice = null;
+    try {
+      const result = await openPullRequestWorktree(repo, number);
+      if ($repoStore.currentPath !== repo) return;
+      await repoStore.refresh(repo);
+      if ($repoStore.currentPath !== repo) return;
+      actionNotice = withVerdict(describePrWorktree(result.output), result.policy);
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) actionError = formatError(err);
+    } finally {
+      openingWorktree.delete(number);
+    }
+  }
+
   async function checkoutPr(number: number) {
     const repo = $repoStore.currentPath;
-    if (!repo) return;
+    if (!repo || prActionsLocked) return;
     // Track per-id so concurrent checkouts cannot clobber each other's
     // spinner state; while any is running every button is disabled.
     checkingOut.add(number);
     try {
-      const result = await invoke<Guarded<string>>("cmd_github_checkout_pr", {
-        repoPath: repo,
-        number,
-      });
-      fileVerdict(result, repo);
+      const result = await checkoutPullRequestInPlace(repo, number);
       if ($repoStore.currentPath !== repo) return;
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
@@ -661,6 +687,7 @@
       // still showed the selection. The backend applies every query term,
       // so the reload answers exactly what the scheduler keys on.
       await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);
+      actionNotice = withVerdict(result.output || `Checked out pull request #${number} in place.`, result.policy);
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) {
         repoStore.setError(formatError(err));
@@ -671,6 +698,35 @@
       // clobber a newer instance — but a path-gated reset here would strand
       // the spinner when the user switches repos mid-checkout.
       checkingOut.delete(number);
+    }
+  }
+
+  /** A worktree opened from the detail: refresh what lists worktrees, then say so. */
+  async function openedInWorktree(message: string) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    actionError = null;
+    try {
+      await repoStore.refresh(repo);
+      if ($repoStore.currentPath !== repo) return;
+      actionNotice = message;
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) repoStore.setError(formatError(err));
+    }
+  }
+
+  /** In-place checkout from the detail: the checkout already happened. */
+  async function checkedOutInPlace(message: string) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    actionError = null;
+    try {
+      await repoStore.refresh(repo);
+      if ($repoStore.currentPath !== repo) return;
+      await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);
+      actionNotice = message;
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) repoStore.setError(formatError(err));
     }
   }
 
@@ -1135,11 +1191,21 @@
                       </button>
                       <button
                         type="button"
-                        onclick={() => void checkoutPr(pr.number)}
-                        disabled={checkingOut.size > 0}
+                        onclick={() => void openPrWorktree(pr.number)}
+                        disabled={prActionsLocked}
                         class="gp-icon-btn hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed"
-                        title={checkingOut.has(pr.number) ? "Checking out…" : "Checkout pull request"}
-                        aria-label={checkingOut.has(pr.number) ? `Checking out PR #${pr.number}` : `Checkout pull request #${pr.number}`}
+                        title={openingWorktree.has(pr.number) ? "Opening worktree…" : "Open in new worktree"}
+                        aria-label={openingWorktree.has(pr.number) ? `Opening pull request #${pr.number} in a worktree` : `Open pull request #${pr.number} in a new worktree`}
+                      >
+                        <FolderGit2 size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        onclick={() => void checkoutPr(pr.number)}
+                        disabled={prActionsLocked}
+                        class="gp-icon-btn hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={checkingOut.has(pr.number) ? "Checking out…" : "Checkout in place"}
+                        aria-label={checkingOut.has(pr.number) ? `Checking out PR #${pr.number}` : `Checkout pull request #${pr.number} in place`}
                       >
                         <GitBranch size={14} />
                       </button>
@@ -1159,7 +1225,11 @@
                       repoPath={$repoStore.currentPath}
                       number={pr.number}
                       slug="{ctx.owner}/{ctx.repo}"
+                      locked={prActionsLocked}
                       onChanged={(message) => void reloadThenNotice(message)}
+                      onCheckedOut={(message) => void checkedOutInPlace(message)}
+                      onWorktreeOpened={(message) => void openedInWorktree(message)}
+                      onBusyChange={(busy) => (detailBusy = busy)}
                     />
                   {/if}
                   </div>

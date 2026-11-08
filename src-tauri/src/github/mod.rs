@@ -6,6 +6,7 @@ use crate::engine::git_cli::{
 use crate::ipc_error::CommandError;
 pub mod actions;
 pub mod outcome;
+pub mod pr_worktree;
 use outcome::RunOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -631,7 +632,18 @@ pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
     vec!["--repo".to_string(), gh_repo_flag_value(remote)]
 }
 
-/// Selects the trusted GitHub remote from `git remote -v` output.
+/// A GitHub fetch remote and the git remote name `git fetch` must use.
+///
+/// The name is what carries the user's credentials and `insteadOf` rules.
+/// Fetching the URL directly would drop both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedGitHubRemote {
+    pub name: String,
+    pub github: GitHubRepoRef,
+}
+
+/// Selects the trusted GitHub remote from `git remote -v` output, keeping
+/// the git remote name beside the parsed repository.
 ///
 /// Only **fetch** URLs are eligible. `remote -v` lists every remote twice —
 /// a fetch line and a push line, told apart by the trailing `(fetch)` /
@@ -640,12 +652,14 @@ pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
 /// (`--repo`, Dependabot endpoints, checkout, issue creation) at a
 /// repository the user never pulls from. Origin wins over other remotes;
 /// among the rest, the first listed fetch URL is used.
-pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
-    let mut origin: Option<GitHubRepoRef> = None;
-    let mut first: Option<GitHubRepoRef> = None;
+pub fn pick_named_github_remote(remote_v_output: &str) -> Option<NamedGitHubRemote> {
+    let mut origin: Option<NamedGitHubRemote> = None;
+    let mut first: Option<NamedGitHubRemote> = None;
     for line in remote_v_output.lines() {
         let mut parts = line.split_whitespace();
-        let name = parts.next();
+        let Some(name) = parts.next() else {
+            continue;
+        };
         let Some(url) = parts.next() else {
             continue;
         };
@@ -656,17 +670,30 @@ pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
         }
         if let Some(parsed) = parse_github_remote_url(url) {
             if is_github_host(&parsed.host) {
-                if name == Some("origin") {
-                    origin = Some(parsed);
+                let named = NamedGitHubRemote {
+                    name: name.to_string(),
+                    github: parsed,
+                };
+                if name == "origin" {
+                    origin = Some(named);
                     break;
                 }
                 if first.is_none() {
-                    first = Some(parsed);
+                    first = Some(named);
                 }
             }
         }
     }
     origin.or(first)
+}
+
+/// Selects the trusted GitHub remote from `git remote -v` output.
+///
+/// See [`pick_named_github_remote`] for which line wins. Callers that also
+/// fetch use the named form so the remote name, not the raw URL, is what git
+/// receives.
+pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
+    pick_named_github_remote(remote_v_output).map(|named| named.github)
 }
 
 pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, CommandError> {
@@ -3180,6 +3207,19 @@ mod tests {
         assert!(split_owner_repo("/a/b", false).is_none());
         assert!(split_owner_repo("github.com/", false).is_none());
         assert!(split_owner_repo("github.com/only-owner", false).is_none());
+    }
+
+    /// git accepts a remote named `team/upstream`, and every GitHub feature
+    /// found it before the worktree opener existed. The opener's own
+    /// fetch-safety check must not narrow what the selector accepts.
+    #[test]
+    fn a_remote_name_with_a_slash_still_resolves_for_existing_callers() {
+        let remote_v = "team/upstream\thttps://github.com/acme/x.git (fetch)\n\
+                        team/upstream\thttps://github.com/acme/x.git (push)\n";
+        let github = pick_github_remote(remote_v).expect("a GitHub remote named team/upstream");
+        assert_eq!((github.owner.as_str(), github.name.as_str()), ("acme", "x"));
+        let named = pick_named_github_remote(remote_v).expect("named selection");
+        assert_eq!(named.name, "team/upstream");
     }
 
     /// Regression: `git remote -v` lists every remote twice — fetch and push

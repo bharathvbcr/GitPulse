@@ -2,7 +2,87 @@ import type { PrAction, PullRequestDetail } from "./types";
 import { shortHash } from "../format";
 import { invoke } from "../ipc/invoke";
 import { askConfirm } from "../stores/modalStore";
-import { harnessStore, type Guarded } from "../stores/harnessStore";
+import { harnessStore, verdictLabel, type Guarded, type PolicyVerdict } from "../stores/harnessStore";
+import { worktreeSetupNotices, type WorktreeCreated } from "../branches/types";
+
+/** A pull request checked out in its own worktree. Mirrors `github::pr_worktree::PrWorktreeOpened`. */
+export interface PrWorktreeOpened {
+  path: string;
+  branch: string;
+  reused: boolean;
+  head_oid: string;
+  cross_repository: boolean;
+  head_ref: string;
+  head_owner: string;
+  /** Present when this call created the worktree; null when one was reused. */
+  created: WorktreeCreated | null;
+  /** Why the branch was not brought up to the pull request head; null when it was. */
+  update_error: string | null;
+}
+
+/**
+ * The notice for a worktree that was created or reused: where it is, and
+ * every step that did not happen. A branch that could not be updated is said
+ * first, so a stale `pr/N` is never read as the pull request's current head.
+ */
+export function describePrWorktree(opened: PrWorktreeOpened): string {
+  const verb = opened.reused ? "Reused" : "Opened";
+  const parts = [`${verb} worktree ${opened.branch} at ${opened.path}`];
+  if (opened.update_error) {
+    parts.push(`${opened.branch} was not brought up to the pull request head: ${opened.update_error}`);
+  }
+  const created = opened.created;
+  if (created) {
+    parts.push(...worktreeSetupNotices(created, "create"));
+    if (created.low_disk) {
+      parts.push(`Build caches were not copied for want of disk: ${created.low_disk.skipped.join(", ")}`);
+    }
+    if (created.disk_unknown) parts.push("Free disk space could not be read, so no cache copy was limited on its account");
+    if (created.devmap?.status === "failed") parts.push(`DevMap setup failed: ${created.devmap.error}`);
+    if (created.devmap?.status === "skipped") parts.push(`DevMap setup was skipped: ${created.devmap.reason}`);
+  }
+  return parts.join("; ");
+}
+
+function withVerdict(message: string, policy: PolicyVerdict | null | undefined): string {
+  return policy ? `${message} — ${verdictLabel(policy)}` : message;
+}
+
+/**
+ * Opens the pull request in a new worktree. Records the gate verdict once.
+ * Callers must not record it again.
+ */
+export async function openPullRequestWorktree(
+  repoPath: string,
+  number: number,
+): Promise<Guarded<PrWorktreeOpened>> {
+  const result = await invoke<Guarded<PrWorktreeOpened>>("cmd_github_open_pr_worktree", {
+    repoPath,
+    number,
+    cowCaches: true,
+    runHooks: false,
+  });
+  harnessStore.recordVerdict(result.policy, repoPath);
+  return result;
+}
+
+/**
+ * Checks the pull request out in the open checkout. Records the gate verdict
+ * once. Callers must not record it again.
+ */
+export async function checkoutPullRequestInPlace(
+  repoPath: string,
+  number: number,
+): Promise<Guarded<string>> {
+  const result = await invoke<Guarded<string>>("cmd_github_checkout_pr", {
+    repoPath,
+    number,
+  });
+  harnessStore.recordVerdict(result.policy, repoPath);
+  return result;
+}
+
+export { withVerdict };
 
 /**
  * Confirms, sends and journals one pull-request action — the only way the

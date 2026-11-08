@@ -48,6 +48,25 @@
             if (refuseNext) { const message = refuseNext; refuseNext = null; throw new Error(message); }
             sent.push(args.action);
             return { policy: null, output: `done ${args.action.kind}` };
+          case "cmd_github_open_pr_worktree":
+            sent.push({ kind: "worktree", number: args.number, cowCaches: args.cowCaches, runHooks: args.runHooks });
+            return {
+              policy: null,
+              output: {
+                path: `/tmp/GitPulse.pr-${args.number}`,
+                branch: `pr/${args.number}`,
+                reused: false,
+                head_oid: HEAD,
+                cross_repository: false,
+                head_ref: "feat/search",
+                head_owner: "acme",
+                created: null,
+                update_error: null,
+              },
+            };
+          case "cmd_github_checkout_pr":
+            sent.push({ kind: "checkout", number: args.number });
+            return { policy: null, output: `Switched to pr/${args.number}` };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       });
@@ -60,10 +79,15 @@
       let changed = 0;
       /** What each action reported to the list that reloads, in order. */
       const changedMessages = [];
+      const checkedOut = [];
       let created = null;
       mount(Host, {
         target: document.querySelector("#app"),
-        props: { onChanged: message => { changed += 1; changedMessages.push(message); }, onCreated: message => { created = message; } },
+        props: {
+          onChanged: message => { changed += 1; changedMessages.push(message); },
+          onCreated: message => { created = message; },
+          onCheckedOut: message => { checkedOut.push(message); },
+        },
       });
 
       const wait = () => new Promise(resolve => setTimeout(resolve, 40));
@@ -96,8 +120,10 @@
           check("and the size of the change", () => open.textContent.includes("+12") && open.textContent.includes("in 2 files"));
           check("a cut description says so", () => pane(8).textContent.includes("longer than shown here"));
           check("a whole description does not", () => !open.textContent.includes("longer than shown here"));
-          check("a closed pull request offers no actions", () =>
+          check("a closed pull request offers no review or merge", () =>
             !button(pane(9), "Merge…") && !button(pane(9), "Approve…") && pane(9).textContent.includes("closed"));
+          check("a closed pull request can still be opened in a worktree or checked out in place", () =>
+            !!button(pane(9), "Open in new worktree") && !!button(pane(9), "Checkout in place"));
           check("a draft cannot be merged", () => button(pane(8), "Merge…").disabled);
           check("comment and request-changes wait for review text", () =>
             button(open, "Comment…").disabled && button(open, "Request changes…").disabled && !button(open, "Approve…").disabled);
@@ -179,6 +205,21 @@
             sent[3].kind === "create" && sent[3].base === "main" && sent[3].title === "Add search");
           check("a detached HEAD cannot open one", () =>
             detachedCreate().textContent.includes("HEAD is detached") && !button(detachedCreate(), "Open pull request…"));
+
+          // --- checkout stays in place; a worktree is a separate action ------
+          const sentBeforeCheckout = sent.length;
+          button(pane(9), "Checkout in place").click();
+          await until(() => checkedOut.length === 1);
+          check("checkout in place is its own command and tells the parent", () =>
+            checkedOut[0] === "Switched to pr/9" &&
+            sent[sentBeforeCheckout].kind === "checkout" && sent[sentBeforeCheckout].number === 9);
+          button(pane(9), "Open in new worktree").click();
+          await until(() => changedMessages.at(-1)?.includes("Opened worktree pr/9"));
+          check("opening a worktree names the branch and path and does not check the pull request out", () =>
+            changedMessages.at(-1) === "Opened worktree pr/9 at /tmp/GitPulse.pr-9" &&
+            sent.at(-1).kind === "worktree" && sent.at(-1).number === 9 &&
+            sent.at(-1).cowCaches === true && sent.at(-1).runHooks === false &&
+            sent.filter(action => action.kind === "checkout").length === 1);
 
           check("no unhandled runtime errors", () => errors.length === 0);
           report();

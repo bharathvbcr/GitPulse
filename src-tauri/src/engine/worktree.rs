@@ -4601,6 +4601,18 @@ pub fn prune_worktree_argv() -> Vec<String> {
     ]
 }
 
+/// `git worktree list --porcelain -z`, the exact line [`read_worktree_entries`]
+/// runs, so a caller can judge it before reading the listing.
+pub fn worktree_list_porcelain_argv() -> Vec<String> {
+    vec![
+        "git".into(),
+        "worktree".into(),
+        "list".into(),
+        "--porcelain".into(),
+        "-z".into(),
+    ]
+}
+
 /// Sanitizes a branch name for safe directory naming (replaces `/`, `\`, `:`, whitespace, etc. with `-`).
 pub fn sanitize_branch_name(branch: &str) -> String {
     let sanitized: String = branch
@@ -12971,6 +12983,19 @@ some-future-field whatever
         assert!(
             lease_path.is_file(),
             "expected stack_lease.json at {lease_path:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worktree_list_porcelain_tests {
+    use super::worktree_list_porcelain_argv;
+
+    #[test]
+    fn porcelain_list_argv_is_the_line_the_gate_judges() {
+        assert_eq!(
+            worktree_list_porcelain_argv(),
+            vec!["git", "worktree", "list", "--porcelain", "-z"]
         );
     }
 }
