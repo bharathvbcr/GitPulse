@@ -136,6 +136,15 @@ pub struct ToolCall {
     /// The call's own `timeout` input (milliseconds), when it set one.
     #[serde(skip)]
     pub timeout_ms: Option<u64>,
+    /// Whether [`ToolCall::cwd`] is where the call ran. Claude Code writes every
+    /// call of one assistant message with the directory the message *started*
+    /// in, and a `cd` in an earlier call of the message carries over to the
+    /// later ones without their recorded cwd changing. So only the first Bash
+    /// call of a message (by position in the transcript, never by time) has a
+    /// cwd that is known; a later one may have run anywhere. Absent, as for a
+    /// call built any other way, it is not known.
+    #[serde(skip)]
+    pub cwd_trusted: bool,
 }
 
 /// Every ledger action a transcript call can become, and only those.
@@ -344,6 +353,9 @@ const MAX_PENDING: usize = 256;
 /// time a command is allowed to run, so a call still running is not given up
 /// on; a call the agent never got a result for is not held for ever.
 pub const PENDING_MAX_AGE_MS: u64 = 15 * 60 * 1000;
+
+/// Messages remembered as having had a Bash call, per transcript read.
+const MAX_BASH_MESSAGES: usize = 256;
 
 /// Response ids remembered as already counted, per transcript read.
 const MAX_COUNTED: usize = 64;
@@ -688,6 +700,10 @@ pub struct Reader {
     open_usage: Option<OpenUsage>,
     counted: VecDeque<String>,
     newest_ms: Option<u64>,
+    /// Messages a Bash call has been seen in, newest last: a call whose message
+    /// is here is not the first of it. Bounded; messages arrive one after the
+    /// other, so one that fell out is long over.
+    bash_messages: VecDeque<String>,
 }
 
 impl Reader {
@@ -704,6 +720,7 @@ impl Reader {
             open_usage: None,
             counted: VecDeque::new(),
             newest_ms: None,
+            bash_messages: VecDeque::new(),
         }
     }
 
@@ -761,7 +778,11 @@ impl Reader {
             };
             self.note_time(&base.ts_utc);
             let response_from = self.response_start(record["message"]["id"].as_str());
+            let message_id = record["message"]["id"].as_str().filter(|id| !id.is_empty());
             for (ordinal, mut call) in calls_in(&record).into_iter().enumerate() {
+                if call.tool == "Bash" {
+                    call.cwd_trusted = self.first_bash_call_of(message_id);
+                }
                 call.subagent_id.clone_from(&self.subagent_id);
                 call.origin = self.origin(ordinal);
                 if let (Some(_), Some(origin), Some(response_from)) =
@@ -926,6 +947,23 @@ impl Reader {
             .filter(|open| message_id.is_some() && open.call.message_id.as_deref() == message_id)
             .and_then(|open| open.call.origin.map(|o| o.offset));
         Some(open.map_or(own, |from| from.min(own)))
+    }
+
+    /// Whether a Bash call of `message_id` is the first of its message that this
+    /// reader has seen, and notes it. A message with no id is never known to
+    /// have a first call.
+    fn first_bash_call_of(&mut self, message_id: Option<&str>) -> bool {
+        let Some(id) = message_id else {
+            return false;
+        };
+        if self.bash_messages.iter().any(|seen| seen == id) {
+            return false;
+        }
+        if self.bash_messages.len() >= MAX_BASH_MESSAGES {
+            self.bash_messages.pop_front();
+        }
+        self.bash_messages.push_back(id.to_string());
+        true
     }
 
     fn note_time(&mut self, ts: &str) {
@@ -1808,6 +1846,62 @@ mod reader_tests {
                 "timeout {timeout_input:?} done {done_at} structured {structured}"
             );
         }
+    }
+
+    /// An assistant record holding one Bash call, for message `message_id`.
+    fn bash_in(message_id: &str, id: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.241","cwd":"/repo","gitBranch":"main","message":{{"id":"{message_id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"git commit -m x"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn only_the_first_bash_call_of_a_message_has_a_known_cwd() {
+        let mut reader = Reader::new(None);
+        // One message, one record per call, as Claude Code writes it.
+        feed(&mut reader, 0, &bash_in("m1", "a", T0));
+        feed(&mut reader, 100, &bash_in("m1", "b", T0));
+        feed(&mut reader, 200, &bash_in("m2", "c", T0));
+        feed(&mut reader, 300, &bash_in("m1", "d", T0));
+        // A message with no id has no first call to know.
+        feed(&mut reader, 400, &bash_in("", "e", T0));
+        let mut trusted = Vec::new();
+        for (offset, id) in [(500, "a"), (600, "b"), (700, "c"), (800, "d"), (900, "e")] {
+            let done = feed(&mut reader, offset, &result(T0_2S, id, Some(false)));
+            trusted.push((id, done[0].cwd_trusted));
+        }
+        assert_eq!(
+            trusted,
+            [
+                ("a", true),
+                ("b", false),
+                ("c", true),
+                ("d", false),
+                ("e", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn two_bash_blocks_of_one_record_and_a_file_tool_in_between() {
+        let mut reader = Reader::new(None);
+        let line = format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{T0}","cwd":"/repo","message":{{"id":"m1","content":[{},{},{}]}}}}"#,
+            edit("e1"),
+            bash("b1"),
+            bash("b2"),
+        );
+        feed(&mut reader, 0, &line);
+        let mut done = Vec::new();
+        for (offset, id) in [(100, "b1"), (200, "b2")] {
+            done.extend(feed(&mut reader, offset, &result(T0_2S, id, Some(false))));
+        }
+        assert_eq!(
+            done.iter()
+                .map(|c| (c.tool.as_str(), c.cwd_trusted))
+                .collect::<Vec<_>>(),
+            [("Bash", true), ("Bash", false)]
+        );
     }
 
     #[test]

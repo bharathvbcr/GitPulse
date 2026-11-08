@@ -94,11 +94,13 @@ pub const LINK_SCAN_ROWS: i64 = 20_000;
 pub const HIDDEN_PROBE_ROWS: i64 = 200_000;
 
 /// The version of the record a transcript command row carries beside its
-/// result: `command_meta` (this number), `cwd` (where the call ran) and
-/// `background` (whether it was moved to the background). Ingest writes it; a
-/// row without it was written before the cwd and the backgrounding were known,
-/// and is never used to link.
-pub const COMMAND_META_VERSION: i64 = 1;
+/// result: `command_meta` (this number), `cwd` (where the call ran),
+/// `cwd_trusted` (whether the recorded cwd is known to be where it ran: only
+/// the first Bash call of an assistant message) and `background` (whether it
+/// was moved to the background). Version 1 had no `cwd_trusted`. Ingest writes
+/// it; a row without it, or of an older version, was written before one of them
+/// was known, and is never used to link.
+pub const COMMAND_META_VERSION: i64 = 2;
 
 /// The longest `cwd` ingest records and the reader resolves.
 pub const MAX_COMMAND_CWD_BYTES: usize = 4096;
@@ -250,8 +252,10 @@ struct Row {
     /// `detail_json.command_meta` of a transcript row ([`COMMAND_META_VERSION`]);
     /// absent on a row written before the record existed.
     meta: Option<i64>,
-    /// `detail_json.cwd`: where the call ran.
+    /// `detail_json.cwd`: where the call ran, as recorded.
     cwd: Option<String>,
+    /// `detail_json.cwd_trusted`: the recorded cwd is known to be where it ran.
+    cwd_trusted: bool,
     /// `detail_json.background`: the call was moved to the background.
     background: bool,
     after_ref: Option<String>,
@@ -383,7 +387,9 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                     CASE WHEN json_valid(detail_json)
                          THEN json_extract(detail_json, '$.cwd') END,
                     CASE WHEN json_valid(detail_json)
-                         THEN json_extract(detail_json, '$.background') END
+                         THEN json_extract(detail_json, '$.background') END,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.cwd_trusted') END
              FROM events
              WHERE id > ?1
                AND ((action = 'session.command' AND object LIKE '%git%')
@@ -419,6 +425,8 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                 // Anything but a plain `false` is a backgrounded call, and so
                 // is a record that does not say.
                 background: !matches!(row.get_ref(14)?, ValueRef::Integer(0)),
+                // Only a plain `true` is a cwd known to be where the call ran.
+                cwd_trusted: matches!(row.get_ref(15)?, ValueRef::Integer(1)),
                 at_ms: at
                     .filter(|_| stamp_basis.as_deref() == Some(trusted))
                     .and_then(|text| ids::parse_event_time(&text)),
@@ -632,7 +640,7 @@ fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) ->
             let cwd = row
                 .cwd
                 .as_deref()
-                .filter(|cwd| recorded && cwd.len() <= MAX_COMMAND_CWD_BYTES)
+                .filter(|cwd| recorded && row.cwd_trusted && cwd.len() <= MAX_COMMAND_CWD_BYTES)
                 .and_then(lexical);
             let root = lexical(if row.worktree.is_empty() {
                 anchor

@@ -146,10 +146,12 @@ fn claude_rows_digest() -> (String, u64) {
 
 /// Pinned on the code before the source trait existed: the trait is a
 /// refactor of the Claude path, so every row and every counter it produces
-/// must be the one the old code produced. Moved once, deliberately, for the
+/// must be the one the old code produced. Moved twice, deliberately, for the
 /// command record a Bash row now carries in `detail_json` (`command_meta`,
-/// `cwd`, `background`: additive keys, no column or schema change).
-const CLAUDE_DIGEST: u64 = 7_206_014_933_657_775_814;
+/// `cwd`, `background`, `cwd_trusted`: additive keys, no column or schema
+/// change). The fixture's call has no message id, so its `cwd_trusted` is
+/// false: only the first Bash call of an identified message is trusted.
+const CLAUDE_DIGEST: u64 = 10_997_412_588_441_155_206;
 
 #[test]
 fn claude_rows_are_byte_identical_to_what_they_were_before_sources() {

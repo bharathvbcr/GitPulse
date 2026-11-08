@@ -47,6 +47,7 @@ fn command_detail(result: &str, cwd: &str, background: bool) -> String {
         "command_meta": COMMAND_META_VERSION,
         "cwd": cwd,
         "background": background,
+        "cwd_trusted": true,
     })
     .to_string()
 }
@@ -818,6 +819,7 @@ fn unobserved_command_row(repo: &str, session: &str, text: &str, at: u64) {
                 "command_meta": COMMAND_META_VERSION,
                 "cwd": repo,
                 "background": false,
+                "cwd_trusted": true,
             })
             .to_string(),
         ),
@@ -1139,6 +1141,7 @@ fn r2_raw(
             object.insert("command_meta".into(), COMMAND_META_VERSION.into());
             object.insert("cwd".into(), wt.unwrap_or(repo).into());
             object.insert("background".into(), false.into());
+            object.insert("cwd_trusted".into(), true.into());
         }
         serde_json::Value::Object(object).to_string()
     });
@@ -2665,19 +2668,31 @@ fn w9r_a_command_row_without_the_command_record_never_links() {
     for (n, detail) in [
         r#"{"result":"ok"}"#.to_string(),
         // The version is there but the directory is not.
-        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"background":false})
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"background":false,"cwd_trusted":true})
             .to_string(),
         // The directory is there but the version is not.
-        serde_json::json!({"result":"ok","cwd":repo,"background":false}).to_string(),
-        // A directory that is not absolute, or is not a place.
-        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":"sub","background":false})
+        serde_json::json!({"result":"ok","cwd":repo,"background":false,"cwd_trusted":true}).to_string(),
+        // A record of the version before the trust rule (no `cwd_trusted`).
+        serde_json::json!({"result":"ok","command_meta":1,"cwd":repo,"background":false})
             .to_string(),
-        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":"/no/such/dir","background":false})
+        serde_json::json!({"result":"ok","command_meta":1,"cwd":repo,"background":false,"cwd_trusted":true})
             .to_string(),
-        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":7,"background":false})
+        // The current version without the trust flag, or with it not true.
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo,"background":false})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo,"background":false,"cwd_trusted":false})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo,"background":false,"cwd_trusted":"true"})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo,"background":false,"cwd_trusted":1.5})
+            .to_string(),
+        // A directory that is not absolute, or is not text.
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":"sub","background":false,"cwd_trusted":true})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":7,"background":false,"cwd_trusted":true})
             .to_string(),
         // A record that does not say whether it was backgrounded.
-        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo})
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo,"cwd_trusted":true})
             .to_string(),
     ]
     .into_iter()

@@ -2884,6 +2884,7 @@ mod batch_tests {
                         "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
                         "cwd": repo.as_str(),
                         "background": false,
+                        "cwd_trusted": true,
                     })
                     .to_string(),
                 ),

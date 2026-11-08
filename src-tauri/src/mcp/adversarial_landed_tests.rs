@@ -323,6 +323,7 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
                     "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
                     "cwd": repo,
                     "background": false,
+                    "cwd_trusted": true,
                 })
                 .to_string(),
             ),
@@ -445,6 +446,7 @@ fn put_row(
                 "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
                 "cwd": repo,
                 "background": false,
+                "cwd_trusted": true,
             });
             if let Some(word) = result {
                 detail["result"] = word.into();
@@ -502,6 +504,7 @@ fn every_session_basis_validates_against_the_output_schema() {
                             "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
                             "cwd": r,
                             "background": false,
+                            "cwd_trusted": true,
                         })
                         .to_string(),
                     ),

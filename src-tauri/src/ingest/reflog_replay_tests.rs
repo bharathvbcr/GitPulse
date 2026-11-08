@@ -630,6 +630,7 @@ fn w9_command_detail(cwd: &str) -> String {
         "command_meta": ledger::attribution::COMMAND_META_VERSION,
         "cwd": cwd,
         "background": false,
+        "cwd_trusted": true,
     })
     .to_string()
 }
@@ -1272,6 +1273,207 @@ fn w9_real_transcript_a_finished_subagent_call_still_links() {
         assert_eq!(detail["background"], false, "{detail}");
         let got = w9_link(&repo, &sha);
         assert_eq!(got.session_id.as_deref(), Some("S_SUB"), "{got:?}");
+        assert_eq!(got.basis, ledger::attribution::basis::INFERRED);
+    }
+}
+
+// ---- W9 w7 round 4: one assistant message, several Bash calls ----
+
+/// One call of an assistant message: `(message id, tool_use id, cwd, command,
+/// began, ended)`.
+type W9Call<'a> = (&'a str, &'a str, &'a str, &'a str, u64, u64);
+
+/// Writes `calls` the way Claude Code writes an assistant message that made
+/// several Bash calls: one assistant record per call, all with the message's
+/// id and the directory the message STARTED in (`cwd` of every record is the
+/// same), then the results. Runs the real reflog replay and transcript ingest
+/// and returns the ledger's command rows in the order of `calls`.
+fn w9_ingest_message(repo: &str, session: &str, calls: &[W9Call<'_>]) -> Vec<ledger::LedgerEvent> {
+    let troot = tempfile::tempdir().expect("transcript root");
+    let file = troot.path().join("slug").join(format!("{session}.jsonl"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut lines = Vec::new();
+    for (message, tool, cwd, command, began, _) in calls {
+        lines.push(
+            serde_json::json!({
+                "type": "assistant", "sessionId": session,
+                "timestamp": ledger::ids::iso8601_utc(*began),
+                "version": "2.1.309", "cwd": cwd, "gitBranch": "main",
+                "message": { "id": message, "content": [
+                    { "type": "tool_use", "id": tool, "name": "Bash",
+                      "input": { "command": command } } ] }
+            })
+            .to_string(),
+        );
+    }
+    for (_, tool, _, _, _, ended) in calls {
+        lines.push(
+            serde_json::json!({
+                "type": "user", "sessionId": session,
+                "timestamp": ledger::ids::iso8601_utc(*ended),
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": tool,
+                      "content": "ok", "is_error": false } ] },
+                "toolUseResult": w9_finished(),
+            })
+            .to_string(),
+        );
+    }
+    std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    crate::test_support::trust_repo(std::path::Path::new(repo));
+    let serial = crate::test_support::env::env_serial();
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
+    ingest_reflog_into(repo, repo, 200);
+    ingest_transcripts(repo);
+    let rows: Vec<_> = ledger::tail(repo, 0, 1000)
+        .expect("tail")
+        .into_iter()
+        .filter(|event| event.action == "session.command")
+        .collect();
+    calls
+        .iter()
+        .map(|call| {
+            rows.iter()
+                .find(|row| row.object.as_deref() == Some(call.3))
+                .cloned()
+                .expect("the call's command row")
+        })
+        .collect()
+}
+
+fn w9_trusted(row: &ledger::LedgerEvent) -> serde_json::Value {
+    let detail: serde_json::Value =
+        serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        detail["command_meta"],
+        ledger::attribution::COMMAND_META_VERSION
+    );
+    detail["cwd_trusted"].clone()
+}
+
+/// Only the first Bash call of a message has a recorded cwd that is known: a
+/// `cd` in call 1 carries into call 2, which is recorded at the directory the
+/// message started in. A person's commit at the outer root during call 2 is not
+/// the agent's, however the calls are ordered in time.
+#[test]
+fn w9_real_transcript_a_later_call_of_a_message_after_a_cd_never_links() {
+    let (dir, repo) = seeded_repo();
+    let nested = dir.path().join("vendor").join("lib");
+    std::fs::create_dir_all(&nested).unwrap();
+    git_in(&nested, &["init", "-q", "-b", "main"]);
+    let nested_s = nested
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "person work"],
+        now,
+    );
+    let person = w9_head(&repo);
+    let start = u64::try_from(now).unwrap() * 1000 + 200;
+    let cd = format!("cd {nested_s} && true");
+    let rows = w9_ingest_message(
+        &repo,
+        "S_SAME",
+        &[
+            ("msg_1", "tu0", &repo, &cd, start - 40, start),
+            (
+                "msg_1",
+                "tu1",
+                &repo,
+                "git commit -m 'agent'",
+                start,
+                start + 4_000,
+            ),
+        ],
+    );
+    assert_eq!(w9_trusted(&rows[0]), true);
+    assert_eq!(
+        w9_trusted(&rows[1]),
+        false,
+        "the second call of the message"
+    );
+    let got = w9_link(&repo, &person);
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    assert_eq!(
+        got.basis,
+        ledger::attribution::basis::COMMAND_TARGET_UNKNOWN,
+        "{got:?}"
+    );
+}
+
+/// The rule is positional and deliberately simple: a commit that is the second
+/// call is unknown even after a harmless first call.
+#[test]
+fn w9_real_transcript_a_commit_after_a_harmless_first_call_is_unknown() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "fix: parser"],
+        now,
+    );
+    let sha = w9_head(&repo);
+    let start = u64::try_from(now).unwrap() * 1000 + 200;
+    let rows = w9_ingest_message(
+        &repo,
+        "S_SAME",
+        &[
+            ("msg_1", "tu0", &repo, "ls", start - 40, start),
+            (
+                "msg_1",
+                "tu1",
+                &repo,
+                "git commit -m 'fix: parser'",
+                start,
+                start + 4_000,
+            ),
+        ],
+    );
+    assert_eq!(w9_trusted(&rows[1]), false);
+    let got = w9_link(&repo, &sha);
+    assert_eq!(got.session_id, None, "{got:?}");
+    assert_eq!(
+        got.basis,
+        ledger::attribution::basis::COMMAND_TARGET_UNKNOWN,
+        "{got:?}"
+    );
+}
+
+/// The first call of a message is trusted whatever follows it, and the first
+/// call of the NEXT message is trusted again.
+#[test]
+fn w9_real_transcript_the_first_call_of_a_message_still_links() {
+    for (calls_before, same_message_after) in [(0, false), (0, true), (1, false)] {
+        let (dir, repo) = seeded_repo();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "fix: parser"],
+            now,
+        );
+        let sha = w9_head(&repo);
+        let start = u64::try_from(now).unwrap() * 1000 + 200;
+        let commit = "git commit -m 'fix: parser'";
+        let mut calls: Vec<W9Call<'_>> = Vec::new();
+        if calls_before == 1 {
+            // An earlier message's call, then this message's first call.
+            calls.push(("msg_0", "tu_a", &repo, "ls", start - 2_000, start - 1_500));
+        }
+        let message = "msg_1";
+        calls.push((message, "tu_b", &repo, commit, start, start + 4_000));
+        if same_message_after {
+            calls.push((message, "tu_c", &repo, "echo done", start + 10, start + 20));
+        }
+        let rows = w9_ingest_message(&repo, "S_SAME", &calls);
+        let commit_row = &rows[calls_before];
+        assert_eq!(w9_trusted(commit_row), true);
+        let got = w9_link(&repo, &sha);
+        assert_eq!(got.session_id.as_deref(), Some("S_SAME"), "{got:?}");
         assert_eq!(got.basis, ledger::attribution::basis::INFERRED);
     }
 }
