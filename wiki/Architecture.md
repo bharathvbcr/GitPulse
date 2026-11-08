@@ -130,7 +130,7 @@ flowchart LR
 | --- | --- | --- |
 | `gitpulse-mcp` | MCP JSON-RPC over stdio | Control plane for coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, inbox, ledger, and DevMap queries, plus repository-trust-gated task-board and `gitpulse_worktree_*` lifecycle/coordination tools. |
 | `gitpulsed` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed. Serves no requests and never takes a lease. |
-| `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control. |
+| `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control, except a bare invocation with no subcommand, which exits 2 (blocks) so a host that drops the hook's arguments cannot read it as allow. |
 | `gitpulse-ptyd` | Unix socket to the app | Optional terminal host: holds terminal sessions when "Keep terminals running when GitPulse quits" is on. See [Terminal host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL_HOST.md). |
 | `gitpulse-worktree` | CLI (`--json` or text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` compiler, and `<git-common-dir>/gitpulse/lanes/` multi-agent coordination CLI. See [Zero-copy agentic worktrees](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
 | `gitpulse-rustc` | `RUSTC_WRAPPER` | Two-stage Blake3 + `.d` dep-info / `# env-dep:` Rust compiler cache materializing artifacts via APFS `clonefile` / Linux `FICLONE` from `<git-common-dir>/gitpulse/build-cache/`. |

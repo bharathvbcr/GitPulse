@@ -91,11 +91,17 @@ fn decide() -> i32 {
     let _ = gitpulse_lib::procguard::install_signal_handlers();
 
     let Some(subcommand) = std::env::args().nth(1) else {
-        log::warn!(target: "hook",
-            "gitpulse-hook: no subcommand given; expected one of {}",
+        // Exit 2, the host's "block", not 0: a host that does not know the
+        // exec form's `args` field (the Windows settings copy uses it) would
+        // start this binary with no arguments, and exit 0 there would read as
+        // "allowed" for a collision guard or command gate that never ran.
+        let reason = format!(
+            "gitpulse-hook: no subcommand given; expected one of {}. Blocking: no safety check ran.",
             SUBCOMMANDS.join(", ")
         );
-        return 0;
+        log::warn!(target: "hook", "{reason}");
+        emit_stderr(format!("{reason}\n"));
+        return 2;
     };
 
     // Asked who we are rather than to judge anything. No host sends this — it
