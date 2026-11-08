@@ -1,18 +1,25 @@
 <script lang="ts">
   /**
-   * One pull request, read with `gh pr view`, and the three things a reader
-   * does to it from here: approve, comment / request changes, merge.
+   * One pull request, read with `gh pr view`, and the things a reader does
+   * to it from here: open it in a new worktree, check it out in place,
+   * approve, comment / request changes, merge.
    *
-   * Every action goes through `confirmAndRunPrAction`, which names what will
-   * be published before sending it. A merge is pinned to the head commit this
-   * view loaded (`--match-head-commit`), so a push made after the reader
+   * Published actions go through `confirmAndRunPrAction`, which names what
+   * will be published before sending it. A merge is pinned to the head commit
+   * this view loaded (`--match-head-commit`), so a push made after the reader
    * looked makes gh refuse instead of merging what was never shown.
    */
   import { invoke } from "../../ipc/invoke";
   import { formatError } from "../../ui/formatError";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { verdictLabel } from "../../stores/harnessStore";
-  import { confirmAndRunPrAction } from "../../github/prActions";
+  import {
+    checkoutPullRequestInPlace,
+    confirmAndRunPrAction,
+    describePrWorktree,
+    openPullRequestWorktree,
+    withVerdict,
+  } from "../../github/prActions";
   import type { PrMergeMethod, PrReviewVerdict, PullRequestDetail } from "../../github/types";
   import { shortHash } from "../../format";
 
@@ -20,11 +27,15 @@
     repoPath,
     number,
     slug,
+    locked = false,
     onChanged,
+    onCheckedOut,
   }: {
     repoPath: string;
     number: number;
     slug: string;
+    /** A list-row checkout or worktree open is already in flight. */
+    locked?: boolean;
     /**
      * Called after an action succeeded, so the list can reload, with what the
      * action reported. The confirmation is the caller's to show: a merged pull
@@ -32,6 +43,8 @@
      * would vanish with the very thing it confirms.
      */
     onChanged: (message: string) => void;
+    /** In-place checkout succeeded. The parent refreshes the open checkout. */
+    onCheckedOut: (message: string) => void;
   } = $props();
 
   let detail = $state<PullRequestDetail | null>(null);
@@ -83,6 +96,34 @@
     }
   }
 
+  async function checkoutInPlace() {
+    if (busy || locked) return;
+    busy = true;
+    actionError = null;
+    try {
+      const result = await checkoutPullRequestInPlace(repoPath, number);
+      onCheckedOut(withVerdict(result.output || `Checked out pull request #${number} in place.`, result.policy));
+    } catch (error) {
+      actionError = formatError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function openInWorktree() {
+    if (busy || locked) return;
+    busy = true;
+    actionError = null;
+    try {
+      const result = await openPullRequestWorktree(repoPath, number);
+      onChanged(withVerdict(describePrWorktree(result.output), result.policy));
+    } catch (error) {
+      actionError = formatError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
   function review(verdict: PrReviewVerdict) {
     void run({ kind: "review", number, verdict, body: reviewBody }, "Review submitted.");
   }
@@ -123,6 +164,21 @@
       <div class="text-textMuted italic">No description.</div>
     {/if}
 
+    <div class="flex flex-wrap gap-1.5">
+      <button
+        type="button"
+        class="gp-btn py-1! px-2.5! text-[11px]!"
+        disabled={busy || locked}
+        onclick={() => void openInWorktree()}
+      >Open in new worktree</button>
+      <button
+        type="button"
+        class="gp-btn py-1! px-2.5! text-[11px]!"
+        disabled={busy || locked}
+        onclick={() => void checkoutInPlace()}
+      >Checkout in place</button>
+    </div>
+
     {#if open}
       <div class="space-y-1.5">
         <textarea
@@ -130,31 +186,31 @@
           placeholder="Review comment (required to comment or request changes)"
           aria-label="Review comment for #{number}"
           bind:value={reviewBody}
-          disabled={busy}
+          disabled={busy || locked}
         ></textarea>
         <div class="flex flex-wrap gap-1.5">
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy} onclick={() => review("approve")}>Approve…</button>
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || !reviewBody.trim()} onclick={() => review("comment")}>Comment…</button>
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || !reviewBody.trim()} onclick={() => review("request_changes")}>Request changes…</button>
+          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked} onclick={() => review("approve")}>Approve…</button>
+          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("comment")}>Comment…</button>
+          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("request_changes")}>Request changes…</button>
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">
         <label class="flex items-center gap-1.5 text-[11px] text-textMuted">
           Merge as
-          <select class="gp-field py-0.5! text-[11px]!" bind:value={mergeMethod} disabled={busy} aria-label="Merge method for #{number}">
+          <select class="gp-field py-0.5! text-[11px]!" bind:value={mergeMethod} disabled={busy || locked} aria-label="Merge method for #{number}">
             <option value="squash">squash</option>
             <option value="merge">merge commit</option>
             <option value="rebase">rebase</option>
           </select>
         </label>
         <label class="flex items-center gap-1.5 text-[11px] text-textMuted">
-          <input type="checkbox" bind:checked={deleteBranch} disabled={busy} />
+          <input type="checkbox" bind:checked={deleteBranch} disabled={busy || locked} />
           delete branch
         </label>
         <button
           type="button"
           class="gp-btn py-1! px-2.5! text-[11px]! text-rose-300"
-          disabled={busy || detail.is_draft}
+          disabled={busy || locked || detail.is_draft}
           title={detail.is_draft ? "A draft cannot be merged" : `Merge, pinned to ${shortHash(detail.head_oid)}`}
           onclick={merge}
         >Merge…</button>

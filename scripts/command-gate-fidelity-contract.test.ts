@@ -63,6 +63,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_repo_operation_action: "argv varies by OperationAction variant",
   cmd_github_create_issue: "shells out to gh, not git",
   cmd_github_checkout_pr: "shells out to gh, not git",
+  cmd_github_open_pr_worktree: "argv is built in github::pr_worktree and engine::worktree, not git_writer",
   cmd_github_trigger_workflow: "shells out to gh, not git",
   cmd_github_rerun_run: "shells out to gh, not git",
   cmd_github_cancel_run: "shells out to gh, not git",

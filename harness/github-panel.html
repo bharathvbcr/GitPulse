@@ -186,6 +186,19 @@
         cmd_github_rerun_run: () => ({ policy: null, output: "rerun queued by gh" }),
         cmd_github_cancel_run: () => ({ policy: null, output: "" }),
         cmd_github_checkout_pr: () => ({ policy: VERDICT, output: "Switched to branch 'topic-4'" }),
+        cmd_github_open_pr_worktree: (a) => ({
+          policy: VERDICT,
+          output: {
+            path: `/tmp/app.pr-${a.number}`,
+            branch: `pr/${a.number}`,
+            reused: false,
+            head_oid: "c".repeat(40),
+            cross_repository: false,
+            head_ref: `topic-${a.number}`,
+            head_owner: "acme",
+            created: null,
+          },
+        }),
         cmd_ci_local: () => new Promise((resolve) => ciPending.push(resolve)),
         cmd_provenance_freshness_batch: () => [],
         cmd_firebase_status: () => ({
@@ -393,13 +406,23 @@
           filterStore.setSearch("author:ada");
           filterStore.selectBranch("main");
           const graphsBefore = count("cmd_get_commit_graph");
-          buttonLabelled("Checkout pull request #4").click();
+          buttonLabelled("Checkout pull request #4 in place").click();
           await until(() => count("cmd_get_commit_graph") > graphsBefore);
           await settle();
           check("checking out a pull request files its verdict", () =>
             lastArgs("cmd_github_checkout_pr")?.number === 4 && verdicts.at(-1)?.verdict?.status === "warned");
           check("and reloads the graph with the filter the reader can see", () =>
             lastArgs("cmd_get_commit_graph")?.query === "author:ada" && lastArgs("cmd_get_commit_graph")?.revision === "main");
+          const graphsAtWorktree = count("cmd_get_commit_graph");
+          buttonLabelled("Open pull request #4 in a new worktree").click();
+          await until(() => text().includes("Opened worktree pr/4 at /tmp/app.pr-4"));
+          check("opening a pull request in a worktree names where it landed and leaves the checkout", () =>
+            text().includes("Opened worktree pr/4 at /tmp/app.pr-4") &&
+            count("cmd_get_commit_graph") === graphsAtWorktree &&
+            lastArgs("cmd_github_open_pr_worktree")?.number === 4 &&
+            lastArgs("cmd_github_open_pr_worktree")?.cowCaches === true &&
+            lastArgs("cmd_github_open_pr_worktree")?.runHooks === false &&
+            verdicts.at(-1)?.verdict?.status === "warned");
           filterStore.clear();
 
           // ---- external links --------------------------------------------------
