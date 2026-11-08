@@ -3243,6 +3243,47 @@ mod tests {
         assert!(!risk.claims_truncated);
     }
 
+    /// Security and honesty of the read tools. `gitpulse_collision_risk` (with
+    /// and without a path) and `gitpulse_insights` are advertised read-only, so a
+    /// claim store with a torn line is reported as degraded and left exactly as
+    /// it was: the repair belongs to the next claim write.
+    #[test]
+    fn the_read_tools_report_a_torn_claim_store_and_leave_its_bytes_alone() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        let common = crate::engine::git_cli::resolve_git_common_dir(main.path()).unwrap();
+        let store = claims::store_path(&common);
+        claims::record_observed(main.path(), "session-a", "a.rs", repo, claims::now_ms()).unwrap();
+        let mut bytes = fs::read(&store).unwrap();
+        bytes.extend_from_slice(b"{\"source\":\"observed\",\"sess\n{\"source\":\"obs");
+        fs::write(&store, &bytes).unwrap();
+
+        let risk = collision_risk_observed(repo, &Vec::new());
+        let row = collision_row_for_path(repo, "a.rs");
+        let snap = snapshot_observed(repo, SNAPSHOT_DEADLINE, MAX_SNAPSHOT_WORKTREES, &Vec::new());
+        for (what, error) in [
+            ("collision_risk", &risk.claims_error),
+            ("collision_risk with a path", &row.claims_error),
+            ("insights", &snap.collisions.claims_error),
+        ] {
+            assert!(
+                error.contains("2 unreadable claim lines skipped"),
+                "{what}: {error:?}"
+            );
+        }
+        assert_eq!(risk.file_claims.len(), 1, "the good row is still served");
+        assert_eq!(
+            fs::read(&store).unwrap(),
+            bytes,
+            "a read tool changed the claim store"
+        );
+        // Only a write repairs it.
+        claims::record_observed(main.path(), "session-b", "b.rs", repo, claims::now_ms()).unwrap();
+        let after = collision_risk_observed(repo, &Vec::new());
+        assert!(after.claims_error.is_empty(), "{:?}", after.claims_error);
+        assert_eq!(after.file_claims.len(), 2);
+    }
+
     /// `sessions_ok: false` always says why. Attribution that could not read
     /// the hook claims drops `ok`; before, the reason stayed on the live facet
     /// and the collision answer carried a bare `false`.

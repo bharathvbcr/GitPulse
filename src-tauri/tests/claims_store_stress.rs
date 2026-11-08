@@ -8,7 +8,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gitpulse_lib::insights::claims::{
-    append_claim, read_store, ClaimSource, FileClaim, DEFAULT_CAP, DEFAULT_TTL_MS,
+    append_claim, append_claims_repairing, read_store, ClaimSource, FileClaim, DEFAULT_CAP,
+    DEFAULT_TTL_MS,
 };
 use gitpulse_lib::procguard::LockedSpawn;
 
@@ -230,11 +231,18 @@ fn a_torn_line_is_healed_by_the_next_append_in_a_quiet_store() {
     assert_eq!(later.skipped, 0, "{later:?}");
 }
 
-/// A bad line in the middle of the file is not a torn tail, so an append cannot
-/// see it. The read that does see it repairs the store, and the next read is
-/// clean.
+/// A bad line in the middle of the file is not a torn tail, so a plain append
+/// cannot see it. A degraded read leaves the file byte-identical (it only
+/// reports), the next repairing append rewrites the store without the line,
+/// and the read after that is clean.
 #[test]
-fn a_degraded_read_repairs_the_store_so_the_next_read_is_clean() {
+fn a_degraded_read_writes_nothing_and_the_next_append_repairs_it() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let hash = |path: &Path| {
+        let mut hasher = DefaultHasher::new();
+        fs::read(path).unwrap().hash(&mut hasher);
+        hasher.finish()
+    };
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     append_claim(
@@ -256,14 +264,53 @@ fn a_degraded_read_repairs_the_store_so_the_next_read_is_clean() {
         T0,
     )
     .unwrap();
+
+    let before = hash(&store);
     let first = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
-    assert_eq!(
-        (first.rows.len(), first.skipped),
-        (2, 1),
-        "this read saw it: {first:?}"
-    );
+    assert_eq!((first.rows.len(), first.skipped), (2, 1), "{first:?}");
     let second = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
-    assert_eq!((second.rows.len(), second.skipped), (2, 0), "{second:?}");
+    assert_eq!(
+        (second.rows.len(), second.skipped),
+        (2, 1),
+        "reads do not repair: {second:?}"
+    );
+    assert_eq!(hash(&store), before, "a read changed the store");
+
+    append_claims_repairing(
+        &store,
+        &[realistic("m", 3, T0)],
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        T0,
+    )
+    .unwrap();
+    assert_ne!(hash(&store), before);
+    let clean = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+    assert_eq!((clean.rows.len(), clean.skipped), (3, 0), "{clean:?}");
+}
+
+/// A read only reports. It must leave the file exactly as it found it, however
+/// many times it is asked: the tools that call it are advertised read-only.
+#[test]
+fn a_degraded_read_leaves_the_file_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+    append_claim(
+        &store,
+        &realistic("m", 1, T0),
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        T0,
+    )
+    .unwrap();
+    let mut bytes = fs::read(&store).unwrap();
+    bytes.extend_from_slice(b"{\"source\":\"observed\",\"sess\n{\"source\":\"obs");
+    fs::write(&store, &bytes).unwrap();
+    for _ in 0..3 {
+        let read = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+        assert_eq!((read.rows.len(), read.skipped), (1, 2), "{read:?}");
+        assert_eq!(fs::read(&store).unwrap(), bytes, "a read changed the store");
+    }
 }
 
 /// Compaction kept half the cap, so live claims inside the cap vanished at

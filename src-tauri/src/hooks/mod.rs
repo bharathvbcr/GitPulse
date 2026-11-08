@@ -680,6 +680,9 @@ pub struct ClaimNotices {
     /// The store was read, with unreadable lines skipped. Rows found still
     /// count, but the check was not complete.
     pub store_degraded: String,
+    /// The store had unreadable lines. The write that follows tries to repair
+    /// it; a read never does.
+    pub unreadable_lines: bool,
 }
 
 /// The collision-guard contract, over facts someone else gathered.
@@ -1035,12 +1038,16 @@ type WriteJob = Box<dyn FnOnce() -> harness::FileScopeCheck + Send>;
 struct PendingClaim {
     root: std::path::PathBuf,
     path: String,
+    /// The collision check read the claim store degraded, so the write that
+    /// records this claim also tries to repair it. A read never does.
+    repair: bool,
 }
 
 fn pending_claim(root: &Path, path: &str) -> PendingClaim {
     PendingClaim {
         root: root.to_path_buf(),
         path: path.to_string(),
+        repair: false,
     }
 }
 
@@ -1126,6 +1133,7 @@ fn claim_notices(
         owner_unknown: dirty_shared && !covered,
         store_error: String::new(),
         store_degraded,
+        unreadable_lines: read.skipped > 0,
     }
 }
 
@@ -1151,12 +1159,13 @@ fn record_let_through(
     if input.session_id.is_empty() || !lets_write_through(&output) {
         return output;
     }
-    match crate::insights::claims::record_observed(
+    match crate::insights::claims::record_observed_with(
         &pending.root,
         &input.session_id,
         &pending.path,
         &input.cwd,
         crate::insights::claims::now_ms(),
+        pending.repair,
     ) {
         Ok(()) => output,
         Err(error) => merge_outputs(output, claim_write_incomplete(&pending.path, &error)),
@@ -1304,9 +1313,13 @@ fn collision_guard_decided(
     );
     let notices = claim_notices(&root, &risk, &target, &input.session_id);
     let output = merge_outputs(scoped, collision_decision_with_claims(&facts, &notices));
+    let pending = PendingClaim {
+        repair: notices.unreadable_lines,
+        ..pending_claim(&root, &target)
+    };
     (
         announce_unscoped(output, unscoped, Judged::Write, input),
-        Some(pending_claim(&root, &target)),
+        Some(pending),
     )
 }
 
@@ -4236,14 +4249,23 @@ mod tests {
         // SAFETY: as above.
         unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
         let now = crate::insights::claims::now_ms;
-        let repair = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
+        // A read only reports; the next edit's guard, which read the store
+        // degraded, repairs it when it records its claim.
+        let before = std::fs::read(&store).unwrap();
+        let read = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
+        assert_eq!((read.rows.len(), read.skipped), (1, 1), "{read:?}");
         assert_eq!(
-            (repair.rows.len(), repair.skipped, repair.repaired),
-            (1, 1, true),
-            "{repair:?}"
+            std::fs::read(&store).unwrap(),
+            before,
+            "a read wrote the store"
         );
+        let mut second = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
+        second.session_id = "session-b".into();
+        let output = guard_here(&second);
+        let text = said(&output);
+        assert!(!text.contains("could not be recorded"), "{text}");
         let clean = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
-        assert_eq!((clean.rows.len(), clean.skipped), (1, 0), "{clean:?}");
+        assert_eq!((clean.rows.len(), clean.skipped), (2, 0), "{clean:?}");
     }
 
     /// Security. The hook runs in every repository an agent edits. In one

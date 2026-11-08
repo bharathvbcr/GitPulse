@@ -16,10 +16,16 @@
 //! * Readers take no lock. They skip a line that does not parse or is not
 //!   terminated, count it, and report the count as degraded: one bad line is
 //!   never a whole-store failure, and never reads as clean.
-//! * A bad line does not stay. A read that skipped one, and an append that
-//!   closed a torn tail, each try once, without waiting, to rewrite the store
-//!   without it. If the exclusive lock is not free they leave it for the next
-//!   one, so no hook waits longer than it did before.
+//! * Reads never write. The tools that read the store are advertised
+//!   read-only, so a degraded store is reported and left exactly as it is.
+//! * A bad line does not stay, because writes repair it. An append that closes
+//!   a torn tail does, and so does one whose caller read the store degraded
+//!   (the edit hook) or that starts a run (declared claims). Each tries once,
+//!   without waiting, to rewrite the store without the bad line. If the
+//!   exclusive lock is not free it appends the claim under the shared lock
+//!   and leaves the repair for the next writer, so no hook waits longer than
+//!   it did before. A quiet repository with a bad line mid-file stays honestly
+//!   degraded until the next claim write.
 //! * Appends take a shared lock, so concurrent hooks do not queue behind one
 //!   another. Only compaction takes the exclusive lock. The new file is written
 //!   beside the store before that lock is asked for; under it the appends made
@@ -98,10 +104,6 @@ pub struct StoreRead {
     /// Live claims past the cap that this read did not keep. They are the
     /// oldest; a non-zero count is degraded, not a complete list.
     pub dropped: usize,
-    /// This read saw `skipped` lines and rewrote the store without them, so the
-    /// next read is clean. False when the lock was not free: the next writer
-    /// or reader tries again.
-    pub repaired: bool,
     /// The repository is not trusted, so nothing was read and nothing may be
     /// said about claims there. Distinct from an empty store.
     pub untrusted: bool,
@@ -114,10 +116,9 @@ impl StoreRead {
         let mut parts = Vec::new();
         if self.skipped > 0 {
             parts.push(format!(
-                "{} unreadable claim line{} skipped{}",
+                "{} unreadable claim line{} skipped",
                 self.skipped,
-                if self.skipped == 1 { "" } else { "s" },
-                if self.repaired { " and removed" } else { "" }
+                if self.skipped == 1 { "" } else { "s" }
             ));
         }
         if self.dropped > 0 {
@@ -247,26 +248,17 @@ pub fn read_for_worktree(worktree: &Path, now_ms: u64) -> Result<StoreRead, Stri
     read_store(&store_path(&common), now_ms, DEFAULT_TTL_MS, DEFAULT_CAP)
 }
 
-/// Reads the store without taking a lock. A torn or foreign line is skipped
-/// and counted; it never fails the read. A read that skipped lines then tries
-/// once, without waiting, to rewrite the store without them, so the damage is
-/// reported by one read and not by every read until a size-triggered
-/// compaction. If the lock is not free it leaves that to the next one.
+/// Reads the store without taking a lock, and without writing anything. A torn
+/// or foreign line is skipped and counted; it never fails the read. The tools
+/// that call this are advertised read-only, so a degraded store is reported
+/// and left as it is: the next claim write repairs it.
 pub fn read_store(store: &Path, now_ms: u64, ttl_ms: u64, cap: usize) -> Result<StoreRead, String> {
     let loaded = load_lines(store)?;
     let (rows, dropped) = trim(loaded.rows, now_ms, ttl_ms, cap);
-    let mut repaired = false;
-    if loaded.skipped > 0 {
-        let (_, keep_bytes) = compaction_limits(cap);
-        let healed = render(&rows, keep_bytes)
-            .and_then(|(text, _)| Prepared::write(store, loaded.end, loaded.id, &text));
-        repaired = healed.is_ok_and(|prepared| try_repair(store, prepared, cap));
-    }
     Ok(StoreRead {
         rows,
         skipped: loaded.skipped,
         dropped,
-        repaired,
         untrusted: false,
     })
 }
@@ -279,6 +271,20 @@ pub fn record_observed(
     path: &str,
     cwd: &str,
     now_ms: u64,
+) -> Result<(), String> {
+    record_observed_with(worktree, session_id, path, cwd, now_ms, false)
+}
+
+/// [`record_observed`] for a caller that has just read the store and found it
+/// degraded (`repair`): this write then tries to rewrite the store without its
+/// bad lines. Reads never do; the repair belongs to a write.
+pub fn record_observed_with(
+    worktree: &Path,
+    session_id: &str,
+    path: &str,
+    cwd: &str,
+    now_ms: u64,
+    repair: bool,
 ) -> Result<(), String> {
     if !admitted(worktree)? {
         return Ok(());
@@ -293,17 +299,19 @@ pub fn record_observed(
         ts_ms: now_ms,
         cwd: Some(cwd.to_string()),
     };
-    append_claim(
+    append_claims_with(
         &store_path(&common),
-        &claim,
+        std::slice::from_ref(&claim),
         DEFAULT_CAP,
         DEFAULT_TTL_MS,
         now_ms,
+        repair,
     )
 }
 
 /// Declared claims for the paths a run said it would edit, in one locked
-/// append. An empty list writes nothing.
+/// append. An empty list writes nothing. A run starts rarely, so this write
+/// checks the store first and repairs it if it is degraded.
 pub fn declare(
     git_common_dir: &Path,
     run_id: &str,
@@ -326,12 +334,13 @@ pub fn declare(
             cwd: None,
         });
     }
-    append_claims(
+    append_claims_with(
         &store_path(git_common_dir),
         &batch,
         DEFAULT_CAP,
         DEFAULT_TTL_MS,
         now_ms,
+        true,
     )?;
     Ok(paths.len())
 }
@@ -354,6 +363,31 @@ pub fn append_claims(
     ttl_ms: u64,
     now_ms: u64,
 ) -> Result<(), String> {
+    append_claims_with(store, claims, cap, ttl_ms, now_ms, false)
+}
+
+/// [`append_claims`] that first reads the store, and rewrites it without its
+/// bad lines when it finds any. That read costs a parse of the whole file, so
+/// a hook that has just read the store passes the result of that read instead
+/// of paying for a second one on every edit.
+pub fn append_claims_repairing(
+    store: &Path,
+    claims: &[FileClaim],
+    cap: usize,
+    ttl_ms: u64,
+    now_ms: u64,
+) -> Result<(), String> {
+    append_claims_with(store, claims, cap, ttl_ms, now_ms, true)
+}
+
+fn append_claims_with(
+    store: &Path,
+    claims: &[FileClaim],
+    cap: usize,
+    ttl_ms: u64,
+    now_ms: u64,
+    repair: bool,
+) -> Result<(), String> {
     if claims.is_empty() {
         return Ok(());
     }
@@ -370,7 +404,14 @@ pub fn append_claims(
     }
     let len = fs::metadata(store).map(|meta| meta.len()).unwrap_or(0);
     let (threshold, _) = compaction_limits(cap);
-    if len < threshold && len < MAX_STORE_BYTES {
+    // A degraded store, when the caller asked for the check, is compacted by
+    // this write however small the file is.
+    let degraded = if repair {
+        load_lines(store).ok().filter(|loaded| loaded.skipped > 0)
+    } else {
+        None
+    };
+    if degraded.is_none() && len < threshold && len < MAX_STORE_BYTES {
         let closed_a_torn_tail = with_lock(store, Mode::Shared, wait(), || {
             append_buffer(store, &buffer)
         })?;
@@ -390,17 +431,24 @@ pub fn append_claims(
     // get the lock compacts and the rest find a store that is already small:
     // they append to it instead of compacting again, so none of them holds the
     // lock for a second rewrite.
-    let prepared = prepare_compaction(store, claims, cap, ttl_ms, now_ms)?;
-    let mut prepared = prepared;
-    let attempt = with_lock_if_free(store, Mode::Exclusive, wait(), || {
-        compact_locked(store, &mut prepared, &buffer, false, threshold)
+    let repairing = degraded.is_some();
+    let mut prepared = match degraded {
+        Some(loaded) => prepare_from_loaded(store, loaded, claims, cap, ttl_ms, now_ms)?,
+        None => prepare_compaction(store, claims, cap, ttl_ms, now_ms)?,
+    };
+    // A repair never waits for the lock: a store that stays degraded costs the
+    // next writer a try, not this one a delay. A size compaction waits the same
+    // 20 ms every claim operation gets.
+    let lock_wait = if repairing { Duration::ZERO } else { wait() };
+    let attempt = with_lock_if_free(store, Mode::Exclusive, lock_wait, || {
+        compact_locked(store, &mut prepared, &buffer, repairing, threshold)
     })?;
     if attempt.is_some() {
         return Ok(());
     }
     // Another hook is mid-append, so the exclusive lock was not free in time.
     // The claim is not lost for that: it is appended under the shared lock, and
-    // the next writer past the threshold compacts.
+    // the next writer compacts.
     with_lock(store, Mode::Shared, wait(), || {
         append_buffer(store, &buffer)
     })
@@ -487,7 +535,18 @@ fn prepare_compaction(
     ttl_ms: u64,
     now_ms: u64,
 ) -> Result<Prepared, String> {
-    let loaded = load_lines(store)?;
+    prepare_from_loaded(store, load_lines(store)?, claims, cap, ttl_ms, now_ms)
+}
+
+/// [`prepare_compaction`] over a read the caller already made.
+fn prepare_from_loaded(
+    store: &Path,
+    loaded: Loaded,
+    claims: &[FileClaim],
+    cap: usize,
+    ttl_ms: u64,
+    now_ms: u64,
+) -> Result<Prepared, String> {
     let mut rows = loaded.rows;
     rows.extend(claims.iter().cloned());
     let (kept, mut dropped) = trim(rows, now_ms, ttl_ms, cap);
@@ -1050,20 +1109,30 @@ mod tests {
         let paths: Vec<_> = read.rows.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, ["a.rs", "b.rs", "c.rs"], "{read:?}");
         assert_eq!(read.skipped, 1, "the torn line is counted, not hidden");
-        assert!(!read.repaired, "the lock was not free: {read:?}");
         assert!(
             read.degraded()
                 .is_some_and(|text| text.contains("1 unreadable")),
             "{read:?}"
         );
-        // The lock comes free: the next read repairs the store, and the one
-        // after it is clean.
+        // The lock comes free. A read still only reports: the file does not
+        // change. The next write that can repair does, and the read after it is
+        // clean.
         // SAFETY: as above.
         unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
-        let repair = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
-        assert!(repair.repaired && repair.skipped == 1, "{repair:?}");
+        let before = fs::read(&store).unwrap();
+        let again = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+        assert_eq!(again.skipped, 1, "{again:?}");
+        assert_eq!(fs::read(&store).unwrap(), before, "a read wrote the store");
+        append_claims_repairing(
+            &store,
+            &[claim("d.rs", now + 3)],
+            DEFAULT_CAP,
+            DEFAULT_TTL_MS,
+            now + 3,
+        )
+        .unwrap();
         let clean = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
-        assert_eq!((clean.rows.len(), clean.skipped), (3, 0), "{clean:?}");
+        assert_eq!((clean.rows.len(), clean.skipped), (4, 0), "{clean:?}");
         // Long after every claim expired the store still reads, and does not
         // fail the way the whole-store error did.
         let later = read_store(
