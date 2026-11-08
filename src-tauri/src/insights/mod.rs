@@ -2642,6 +2642,92 @@ fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// Single-quotes `text` for PowerShell, which reads a single-quoted string
+/// literally: `$`, a backtick, `%`, `&`, `\` and `"` are all plain text, and
+/// only a single quote needs doubling. Text that cannot be quoted that way is
+/// refused rather than emitted: a control character (a newline would end the
+/// statement) or one of the typographic single quotes PowerShell also treats
+/// as a quote, which would close the string early.
+fn ps_quote(text: &str) -> Result<String, String> {
+    if let Some(bad) = text
+        .chars()
+        .find(|c| c.is_control() || matches!(c, '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}'))
+    {
+        return Err(format!(
+            "{text:?} cannot be safely quoted for PowerShell (it contains {bad:?})"
+        ));
+    }
+    Ok(format!("'{}'", text.replace('\'', "''")))
+}
+
+/// `json` with every non-ASCII character written as a `\u` escape, so a
+/// PowerShell console of any code page prints exactly the bytes meant.
+fn ascii_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+/// Why a deciding hook refuses when `binary` is missing.
+fn blocked_reason(binary: &str) -> String {
+    format!("GitPulse blocked this call: its safety hook {binary} cannot run. Reinstall GitPulse or set the hook path in Settings.")
+}
+
+/// What a session is told at start when `binary` is missing.
+fn hooks_off_warning(binary: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": format!(
+                "WARNING: GitPulse's safety hooks cannot run ({binary} is missing), so the collision guard and command gate are OFF in this session."
+            )
+        }
+    })
+    .to_string()
+}
+
+/// The Windows command for one hook, written for PowerShell (the handler is
+/// pinned to it with `"shell": "powershell"`, see [`hooks_config_with`]). A
+/// deciding hook (`collision-guard`, `command-gate`) whose binary is missing
+/// writes the reason to stderr and exits 2; `session-brief` prints the warning
+/// JSON and exits 0; anything else just runs. A present binary is run with `&`
+/// and its exit status is passed on. `args` come from the plugin's own manifest
+/// and must be plain words; a `binary` PowerShell cannot quote is refused.
+/// Pure and not `cfg(windows)`, so it is tested everywhere (not executed on
+/// Windows by any test).
+fn windows_hook_command(binary: &str, args: &str) -> Result<String, String> {
+    if args.is_empty()
+        || !args
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+    {
+        return Err(format!("unexpected hook arguments: {args:?}"));
+    }
+    let quoted = ps_quote(binary)?;
+    let run = format!("& {quoted} {args}; exit $LASTEXITCODE");
+    let missing = format!("if (-not (Test-Path -LiteralPath {quoted} -PathType Leaf))");
+    Ok(match args.split_whitespace().next() {
+        Some("collision-guard" | "command-gate") => format!(
+            "{missing} {{ [Console]::Error.WriteLine({}); exit 2 }}; {run}",
+            ps_quote(&blocked_reason(binary))?
+        ),
+        Some("session-brief") => format!(
+            "{missing} {{ [Console]::Out.Write({}); exit 0 }}; {run}",
+            ps_quote(&ascii_json(&hooks_off_warning(binary)))?
+        ),
+        _ => run,
+    })
+}
+
 /// The plugin's MCP manifest with `gitpulse` started by `binary`'s absolute
 /// path. A bare `gitpulse-mcp` only works when something put it on `PATH`, and
 /// a released app does not.
@@ -2671,13 +2757,17 @@ fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
 /// notification, never a decision. The worktree hooks keep their launcher
 /// (`plugin_root`'s [`crate::hooks::worktree::LAUNCHER`]), named by path.
 ///
-/// On Windows every command is the quoted path alone. Claude Code there runs
-/// under Git for Windows' bash or PowerShell, and which one runs a hook has
-/// not been checked, so nothing is wrapped in `sh`. That makes the worktree
-/// hooks unsafe there: a missing binary would fail every `WorktreeCreate`,
-/// where Claude Code's own `git worktree add` would have succeeded. So the
-/// Windows copy leaves `WorktreeCreate` and `WorktreeRemove` out, and Claude
-/// Code makes those worktrees itself, until the launcher is qualified there.
+/// On Windows Claude Code runs a hook's `command` with Git Bash, or PowerShell
+/// when Git Bash is not installed (code.claude.com/docs/en/hooks), so which
+/// shell ran it depended on the machine. Every Windows handler is therefore
+/// pinned with `"shell": "powershell"` (a documented field) and written by
+/// [`windows_hook_command`]; the deciding hooks also get `"onFailure": "block"`
+/// (Claude Code 2.1.295 and later; older versions rely on the exit 2 above),
+/// which makes any other failure to run block as well. The worktree hooks are
+/// unsafe there: a missing binary would fail every `WorktreeCreate`, where
+/// Claude Code's own `git worktree add` would have succeeded. So the Windows
+/// copy leaves `WorktreeCreate` and `WorktreeRemove` out, and Claude Code makes
+/// those worktrees itself, until the launcher is qualified there.
 fn hooks_config_with(template: &str, binary: &str, plugin_root: &str) -> Result<String, String> {
     hooks_config_for(template, binary, plugin_root, cfg!(windows))
 }
@@ -2722,8 +2812,12 @@ fn hooks_config_for(
                         crate::hooks::worktree::LAUNCHER
                     ));
                 }
+                let deciding = matches!(
+                    args.split_whitespace().next(),
+                    Some("collision-guard" | "command-gate")
+                );
                 let wrapped = if windows {
-                    format!("\"{binary}\" {args}")
+                    windows_hook_command(binary, args)?
                 } else if launched {
                     // Settings have no `${CLAUDE_PLUGIN_ROOT}`, so the launcher
                     // is named by path too. It runs the binary when it can and
@@ -2738,26 +2832,22 @@ fn hooks_config_for(
                     match args.split_whitespace().next() {
                         Some("collision-guard" | "command-gate") => format!(
                             "[ -x {quoted} ] || {{ echo {} >&2; exit 2; }}; exec {quoted} {args}",
-                            sh_quote(&format!(
-                                "GitPulse blocked this call: its safety hook {binary} cannot run. Reinstall GitPulse or set the hook path in Settings."
-                            ))
+                            sh_quote(&blocked_reason(binary))
                         ),
                         Some("session-brief") => format!(
                             "[ -x {quoted} ] || {{ printf '%s' {}; exit 0; }}; exec {quoted} {args}",
-                            sh_quote(&serde_json::json!({
-                                "hookSpecificOutput": {
-                                    "hookEventName": "SessionStart",
-                                    "additionalContext": format!(
-                                        "WARNING: GitPulse's safety hooks cannot run ({binary} is missing), so the collision guard and command gate are OFF in this session."
-                                    )
-                                }
-                            })
-                            .to_string())
+                            sh_quote(&hooks_off_warning(binary))
                         ),
                         _ => format!("{quoted} {args}"),
                     }
                 };
                 handler["command"] = serde_json::Value::String(wrapped);
+                if windows {
+                    handler["shell"] = serde_json::Value::String("powershell".into());
+                    if deciding {
+                        handler["onFailure"] = serde_json::Value::String("block".into());
+                    }
+                }
             }
         }
     }
@@ -5253,6 +5343,155 @@ mod tests {
                 "{sub}"
             );
         }
+    }
+
+    /// The Windows copy's handlers, keyed by the subcommand they run.
+    fn windows_handlers(binary: &str) -> Vec<(String, serde_json::Value)> {
+        let json = hooks_config_for(&plugin_hooks_template(), binary, "C:/plugin", true)
+            .expect("rewritten");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut found = Vec::new();
+        for groups in value["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let command = handler["command"].as_str().unwrap();
+                    let args = command.rsplit("& ").next().unwrap();
+                    let sub = args
+                        .split(';')
+                        .next()
+                        .unwrap()
+                        .rsplit(' ')
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    found.push((sub, handler.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The Windows copy used to be the quoted path alone, so a missing binary
+    /// made a deciding hook fail to start, which the host treats as "allow".
+    /// Pinned: the deciding hooks refuse with exit 2 and the reason on stderr,
+    /// session start warns and exits 0, every handler is pinned to PowerShell
+    /// (Claude Code otherwise picks Git Bash or PowerShell by machine), and the
+    /// deciding hooks also ask the host to block on any other failure. Built
+    /// here by the cfg-independent function; not executed on Windows.
+    #[test]
+    fn the_windows_deciding_hooks_fail_closed_when_the_binary_is_missing() {
+        let binary = r"C:\Program Files\GitPulse\gitpulse-hook.exe";
+        let handlers = windows_handlers(binary);
+        for (sub, handler) in &handlers {
+            let command = handler["command"].as_str().unwrap();
+            assert_eq!(handler["shell"], "powershell", "{sub}: {command}");
+            assert!(!command.starts_with('"'), "{sub}: {command}");
+            match sub.as_str() {
+                "collision-guard" | "command-gate" => {
+                    assert_eq!(handler["onFailure"], "block", "{sub}");
+                    assert_eq!(
+                        command,
+                        format!(
+                            "if (-not (Test-Path -LiteralPath '{binary}' -PathType Leaf)) {{ [Console]::Error.WriteLine('GitPulse blocked this call: its safety hook {binary} cannot run. Reinstall GitPulse or set the hook path in Settings.'); exit 2 }}; & '{binary}' {sub}; exit $LASTEXITCODE"
+                        )
+                    );
+                }
+                "session-brief" => {
+                    assert!(handler.get("onFailure").is_none());
+                    assert!(command.contains("[Console]::Out.Write('{"), "{command}");
+                    assert!(command.contains("exit 0 }"), "{command}");
+                    assert!(!command.contains("exit 2"), "{command}");
+                    assert!(command.contains("safety hooks cannot run"), "{command}");
+                    assert!(command.ends_with("& 'C:\\Program Files\\GitPulse\\gitpulse-hook.exe' session-brief; exit $LASTEXITCODE"), "{command}");
+                }
+                _ => {
+                    assert!(command.starts_with("& '"), "{sub}: {command}");
+                    assert!(handler.get("onFailure").is_none(), "{sub}");
+                }
+            }
+        }
+        for sub in ["collision-guard", "command-gate", "session-brief"] {
+            assert!(handlers.iter().any(|(s, _)| s == sub), "{sub} missing");
+        }
+        // The warning is the Unix one, word for word, and survives the JSON
+        // inside a PowerShell literal ('GitPulse''s').
+        let (_, brief) = handlers.iter().find(|(s, _)| s == "session-brief").unwrap();
+        assert!(brief["command"]
+            .as_str()
+            .unwrap()
+            .contains(&hooks_off_warning(binary).replace('\'', "''")));
+    }
+
+    /// Paths PowerShell would misread if they were not quoted as a literal:
+    /// each must sit inside one single-quoted string, with only `'` doubled.
+    #[test]
+    fn the_windows_hook_command_quotes_hostile_paths_literally() {
+        for path in [
+            r"C:\Git Pulse\gitpulse-hook.exe",
+            r"C:\a&b\x.exe",
+            r"C:\%PATH%\x.exe",
+            r"C:\^caret\x.exe",
+            r#"C:\say "hi"\x.exe"#,
+            r"C:\$env:TEMP\`x\x.exe",
+            r"C:\it's\x.exe",
+            r"C:\ünï–日本\x.exe",
+            r"C:\trailing\",
+            r"C:\a;b\x.exe",
+        ] {
+            let command = windows_hook_command(path, "command-gate").unwrap();
+            let literal = format!("'{}'", path.replace('\'', "''"));
+            assert!(
+                command.starts_with(&format!(
+                    "if (-not (Test-Path -LiteralPath {literal} -PathType Leaf)) {{ "
+                )),
+                "{path}: {command}"
+            );
+            assert!(
+                command.ends_with(&format!("& {literal} command-gate; exit $LASTEXITCODE")),
+                "{path}: {command}"
+            );
+            // Unquoted, the only single quotes are the literals' own: an
+            // odd count would mean one was left open.
+            let rest = command.replace("''", "");
+            assert_eq!(rest.matches('\'').count() % 2, 0, "{path}: {command}");
+        }
+        // A session brief for a non-ASCII path prints ASCII only.
+        let brief = windows_hook_command(r"C:\ünï–日本😀\x.exe", "session-brief").unwrap();
+        let warning = brief.split("Write(").nth(1).unwrap();
+        let literal = warning.split("); exit 0").next().unwrap();
+        assert!(literal.is_ascii(), "{literal}");
+        let decoded: serde_json::Value =
+            serde_json::from_str(literal.trim_matches('\'').replace("''", "'").as_str()).unwrap();
+        assert!(decoded["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(r"C:\ünï–日本😀\x.exe"));
+    }
+
+    /// A path that cannot be quoted as a PowerShell literal is refused, so no
+    /// broken (and so fail-open) command is ever handed out.
+    #[test]
+    fn the_windows_hook_command_refuses_what_it_cannot_quote() {
+        for path in [
+            "C:\\a\nb\\x.exe",
+            "C:\\a\rb\\x.exe",
+            "C:\\a\0b\\x.exe",
+            "C:\\a\u{2019}b\\x.exe",
+            "C:\\a\u{2018}b\\x.exe",
+            "C:\\a\u{201A}b\\x.exe",
+            "C:\\a\u{201B}b\\x.exe",
+        ] {
+            assert!(
+                windows_hook_command(path, "command-gate").is_err(),
+                "{path:?}"
+            );
+            assert!(
+                hooks_config_for(&plugin_hooks_template(), path, "C:/plugin", true).is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(windows_hook_command(r"C:\x.exe", "command-gate; calc").is_err());
+        assert!(windows_hook_command(r"C:\x.exe", "").is_err());
     }
 
     /// The bare command a plugin manifest names reaches nothing with an empty
