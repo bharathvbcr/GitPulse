@@ -1372,6 +1372,11 @@
                           hooks.json
                         </button>
                       </div>
+                      {#if mcpInfo.hooks_config_json}
+                        <p class="text-[10px] text-textMuted" data-testid="hooks-version-floor">
+                          On Windows the copied safety hooks block a call when gitpulse-hook cannot start only on Claude Code 2.1.295 or later; older versions let it through.
+                        </p>
+                      {/if}
                       {#if mcpInfo.tools.length > 0}
                         <details class="pt-1">
                           <summary class="cursor-pointer text-[10px] text-textMuted">
