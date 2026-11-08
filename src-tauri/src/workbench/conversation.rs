@@ -45,7 +45,9 @@ pub(super) fn judge(
     let refuse = |reason: &str| json!({"ok":true,"resumable":false,"reason":reason});
     let provider = run["provider"].as_str().unwrap_or_default();
     if provider != "claude" && provider != "agy" {
-        return refuse("Only a Claude Code or Antigravity conversation can be resumed from GitPulse.");
+        return refuse(
+            "Only a Claude Code or Antigravity conversation can be resumed from GitPulse.",
+        );
     }
     let state = run["state"].as_str().unwrap_or_default();
     if matches!(state, "prepared" | "starting" | "running" | "unresolved") {
@@ -124,10 +126,7 @@ pub(crate) fn antigravity_homes() -> Vec<PathBuf> {
     antigravity_homes_in(var("ANTIGRAVITY_HOME").map(PathBuf::from), home.as_deref())
 }
 
-pub(crate) fn antigravity_homes_in(
-    agy_home: Option<PathBuf>,
-    home: Option<&Path>,
-) -> Vec<PathBuf> {
+pub(crate) fn antigravity_homes_in(agy_home: Option<PathBuf>, home: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(explicit) = agy_home {
         candidates.push(explicit);
@@ -678,32 +677,48 @@ mod tests {
     #[test]
     fn antigravity_transcript_is_found_when_db_file_exists() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+        assert_eq!(
+            super::search_antigravity(home.path(), ID),
+            Transcript::Absent
+        );
         let conv_dir = home.path().join("conversations");
         std::fs::create_dir_all(&conv_dir).unwrap();
-        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+        assert_eq!(
+            super::search_antigravity(home.path(), ID),
+            Transcript::Absent
+        );
 
         // 0-byte file must be treated as Absent
         let db_file = conv_dir.join(format!("{ID}.db"));
         std::fs::write(&db_file, b"").unwrap();
-        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+        assert_eq!(
+            super::search_antigravity(home.path(), ID),
+            Transcript::Absent
+        );
 
         // Valid non-empty file is Found
         std::fs::write(&db_file, b"SQLite format 3\0").unwrap();
-        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Found);
+        assert_eq!(
+            super::search_antigravity(home.path(), ID),
+            Transcript::Found
+        );
 
         // Unreadable file reports Unknown error
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o000)).unwrap();
-            assert!(matches!(super::search_antigravity(home.path(), ID), Transcript::Unknown(_)));
+            assert!(matches!(
+                super::search_antigravity(home.path(), ID),
+                Transcript::Unknown(_)
+            ));
             std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
     }
 
     #[test]
-    fn multi_account_claude_config_dirs_finds_transcripts_in_sibling_profiles_and_preserves_unknown() {
+    fn multi_account_claude_config_dirs_finds_transcripts_in_sibling_profiles_and_preserves_unknown(
+    ) {
         let home = tempfile::tempdir().unwrap();
         let sibling = home.path().join(".claude-work");
         let proj = sibling.join("projects").join("-Users-a-repo");
@@ -711,8 +726,14 @@ mod tests {
         std::fs::write(proj.join(format!("{ID}.jsonl")), b"{}\n").unwrap();
 
         let configs = super::config_dirs_in(None, None, None, Some(home.path()));
-        assert_eq!(super::search_claude_configs(&configs, ID), Transcript::Found);
-        assert_eq!(super::search_claude_configs(&configs, THREAD), Transcript::Absent);
+        assert_eq!(
+            super::search_claude_configs(&configs, ID),
+            Transcript::Found
+        );
+        assert_eq!(
+            super::search_claude_configs(&configs, THREAD),
+            Transcript::Absent
+        );
 
         // Empty config directory set (no HOME/USERPROFILE) reports Unknown, never Absent.
         let empty = super::ClaudeConfigDirs::default();
@@ -725,7 +746,10 @@ mod tests {
         // while still returning Found when a listed dir holds the transcript.
         let mut partial = configs.clone();
         partial.error = Some("home truncated".into());
-        assert_eq!(super::search_claude_configs(&partial, ID), Transcript::Found);
+        assert_eq!(
+            super::search_claude_configs(&partial, ID),
+            Transcript::Found
+        );
         assert_eq!(
             super::search_claude_configs(&partial, THREAD),
             Transcript::Unknown("home truncated".into())
@@ -751,7 +775,10 @@ mod tests {
         .unwrap();
 
         let configs = super::config_dirs_in(None, None, None, Some(&home));
-        assert_eq!(super::search_claude_configs(&configs, ID), Transcript::Found);
+        assert_eq!(
+            super::search_claude_configs(&configs, ID),
+            Transcript::Found
+        );
         assert!(configs.dirs.contains(&home.join("custom-seat")));
 
         // Standalone Antigravity CLI stores `.pb` transcripts under `~/.gemini/antigravity-cli/conversations/`.
@@ -763,10 +790,15 @@ mod tests {
         let pb_file = agy_cli_conv.join(format!("{THREAD}.pb"));
         std::fs::write(&pb_file, b"").unwrap();
         let agy_homes = super::antigravity_homes_in(None, Some(&home));
-        assert_eq!(super::search_antigravity_homes(&agy_homes, THREAD), Transcript::Absent);
+        assert_eq!(
+            super::search_antigravity_homes(&agy_homes, THREAD),
+            Transcript::Absent
+        );
 
         std::fs::write(&pb_file, b"\x0a\x04turn").unwrap();
-        assert_eq!(super::search_antigravity_homes(&agy_homes, THREAD), Transcript::Found);
+        assert_eq!(
+            super::search_antigravity_homes(&agy_homes, THREAD),
+            Transcript::Found
+        );
     }
 }
-

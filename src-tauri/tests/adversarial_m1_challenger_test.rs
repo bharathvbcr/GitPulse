@@ -4,9 +4,8 @@
 mod common;
 
 use gitpulse_lib::engine::agent_bus::{
-    answer_ask, list_inbox_threads, post_thread_message, read_messages,
-    read_thread_messages, withdraw_ask, MAX_BUS_MESSAGES,
-    MAX_MESSAGE_BODY_BYTES,
+    answer_ask, list_inbox_threads, post_thread_message, read_messages, read_thread_messages,
+    withdraw_ask, MAX_BUS_MESSAGES, MAX_MESSAGE_BODY_BYTES,
 };
 use tempfile::TempDir;
 
@@ -104,10 +103,14 @@ fn test_adversarial_oversized_message_bodies() {
 
     // 5. Empty or whitespace-only bodies
     assert!(post_thread_message(repo_path, "agent", None, None, "note", "", None).is_err());
-    assert!(post_thread_message(repo_path, "agent", None, None, "note", "   \t\n  ", None).is_err());
+    assert!(
+        post_thread_message(repo_path, "agent", None, None, "note", "   \t\n  ", None).is_err()
+    );
 
     // 6. Null byte in body
-    assert!(post_thread_message(repo_path, "agent", None, None, "note", "hello\0world", None).is_err());
+    assert!(
+        post_thread_message(repo_path, "agent", None, None, "note", "hello\0world", None).is_err()
+    );
 }
 
 #[test]
@@ -193,16 +196,46 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let repo_path = repo.path().to_str().unwrap();
 
     // 1. Missing thread_keys (None)
-    let m1 = post_thread_message(repo_path, "agent-1", None, None, "note", "unthreaded 1", None).unwrap();
-    let m2 = post_thread_message(repo_path, "agent-1", None, None, "note", "unthreaded 2", None).unwrap();
+    let m1 = post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        None,
+        "note",
+        "unthreaded 1",
+        None,
+    )
+    .unwrap();
+    let m2 = post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        None,
+        "note",
+        "unthreaded 2",
+        None,
+    )
+    .unwrap();
 
     // 2. Whitespace-only thread_key should normalize to None / standalone
-    let m3 = post_thread_message(repo_path, "agent-1", None, Some("   "), "note", "whitespace key", None).unwrap();
+    let m3 = post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        Some("   "),
+        "note",
+        "whitespace key",
+        None,
+    )
+    .unwrap();
 
     // Verify unthreaded messages are isolated into distinct thread keys msg-{seq}
     let threads_unthreaded = list_inbox_threads(repo_path, None, None).unwrap();
     assert_eq!(threads_unthreaded.len(), 3);
-    let keys: Vec<String> = threads_unthreaded.iter().map(|t| t.thread_key.clone()).collect();
+    let keys: Vec<String> = threads_unthreaded
+        .iter()
+        .map(|t| t.thread_key.clone())
+        .collect();
     assert!(keys.contains(&format!("msg-{}", m1.seq)));
     assert!(keys.contains(&format!("msg-{}", m2.seq)));
     assert!(keys.contains(&format!("msg-{}", m3.seq)));
@@ -252,25 +285,62 @@ fn test_adversarial_thread_grouping_edge_cases() {
 
     // 6. Max length boundary for thread_key: exactly 80 bytes
     let key_80 = "k".repeat(80);
-    assert!(post_thread_message(repo_path, "agent-1", None, Some(&key_80), "note", "80 bytes", None).is_ok());
+    assert!(post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        Some(&key_80),
+        "note",
+        "80 bytes",
+        None
+    )
+    .is_ok());
 
     // Exceeds 80 bytes: 81 bytes must be rejected
     let key_81 = "k".repeat(81);
-    let err_81 = post_thread_message(repo_path, "agent-1", None, Some(&key_81), "note", "81 bytes", None);
+    let err_81 = post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        Some(&key_81),
+        "note",
+        "81 bytes",
+        None,
+    );
     assert!(err_81.is_err());
-    assert!(err_81.err().unwrap().message().to_string().contains("exceeds maximum length of 80 bytes"));
+    assert!(err_81
+        .err()
+        .unwrap()
+        .message()
+        .to_string()
+        .contains("exceeds maximum length of 80 bytes"));
 
     // 7. Null byte in thread_key must be rejected
-    assert!(post_thread_message(repo_path, "agent-1", None, Some("bad\0key"), "note", "bad", None).is_err());
+    assert!(post_thread_message(
+        repo_path,
+        "agent-1",
+        None,
+        Some("bad\0key"),
+        "note",
+        "bad",
+        None
+    )
+    .is_err());
 
     // 8. Query by thread key and verify retrieval of complex & emoji threads
     let complex_page = read_thread_messages(repo_path, Some(complex_key), None, 0).unwrap();
     assert_eq!(complex_page.messages.len(), 1);
-    assert_eq!(complex_page.messages[0].thread_key.as_deref(), Some(complex_key));
+    assert_eq!(
+        complex_page.messages[0].thread_key.as_deref(),
+        Some(complex_key)
+    );
 
     let emoji_page = read_thread_messages(repo_path, Some(emoji_key), None, 0).unwrap();
     assert_eq!(emoji_page.messages.len(), 1);
-    assert_eq!(emoji_page.messages[0].thread_key.as_deref(), Some(emoji_key));
+    assert_eq!(
+        emoji_page.messages[0].thread_key.as_deref(),
+        Some(emoji_key)
+    );
 
     // 9. Thread list reflects all aggregated threads
     let all_threads = list_inbox_threads(repo_path, None, None).unwrap();
@@ -322,7 +392,8 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
         "ask",
         r#"{"ask_type":"do","question":"Run migrations","steps":["Step 1","Step 2"]}"#,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let th_do = list_inbox_threads(repo_path, None, Some("open")).unwrap();
     let d2 = th_do.iter().find(|t| t.thread_key == t_do).unwrap();
@@ -392,7 +463,8 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
         "ask",
         r#"{"ask_type":"decide","question":"To be cancelled"}"#,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     withdraw_ask(repo_path, "claude", t_withdraw, "Cancelled by user").unwrap();
     let th_withdrawn = list_inbox_threads(repo_path, None, Some("withdrawn")).unwrap();
@@ -413,10 +485,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
         "ask",
         r#"{"ask_type":"decide","question":"Re-opened decision"}"#,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let th_reopened = list_inbox_threads(repo_path, None, Some("open")).unwrap();
-    let re = th_reopened.iter().find(|t| t.thread_key == t_withdraw).unwrap();
+    let re = th_reopened
+        .iter()
+        .find(|t| t.thread_key == t_withdraw)
+        .unwrap();
     assert_eq!(re.status, "open");
     assert_eq!(re.title, "Re-opened decision");
 
@@ -432,13 +508,17 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
         "ask",
         "This is not JSON at all, just plain text request",
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let th_raw = list_inbox_threads(repo_path, None, Some("open")).unwrap();
     let raw_entry = th_raw.iter().find(|t| t.thread_key == t_raw).unwrap();
     assert_eq!(raw_entry.status, "open");
     assert_eq!(raw_entry.ask_type, None); // Cannot infer ask_type, remains None safely
-    assert_eq!(raw_entry.title, "This is not JSON at all, just plain text request");
+    assert_eq!(
+        raw_entry.title,
+        "This is not JSON at all, just plain text request"
+    );
 }
 
 #[test]
@@ -485,12 +565,18 @@ fn test_open_asks_survive_ring_buffer_note_flood_until_resolved() {
     assert_eq!(survived.title, "Keep migration reversible?");
 
     // Answering the open ask unpins seq 1 so subsequent compaction evicts it cleanly.
-    answer_ask(repo_path, "developer", "critical-open-ask", "Decision selected: Yes")
-        .expect("answer open ask");
+    answer_ask(
+        repo_path,
+        "developer",
+        "critical-open-ask",
+        "Decision selected: Yes",
+    )
+    .expect("answer open ask");
     let open_after = list_inbox_threads(repo_path, None, Some("open")).expect("list open after");
     assert!(
-        !open_after.iter().any(|t| t.thread_key == "critical-open-ask"),
+        !open_after
+            .iter()
+            .any(|t| t.thread_key == "critical-open-ask"),
         "answered ask must no longer appear in open filter"
     );
 }
-

@@ -3356,7 +3356,8 @@ mod hook_launch_tests {
             brief_dir: Some(dir.path()),
             launch: LaunchOptions::default(),
         };
-        let argv = super::arguments("agy", "edit", false, "/work/repo", &brief_path, &extras).unwrap();
+        let argv =
+            super::arguments("agy", "edit", false, "/work/repo", &brief_path, &extras).unwrap();
         assert!(argv.contains(&"--mode".to_string()));
         assert!(argv.contains(&"accept-edits".to_string()));
         assert!(!argv.contains(&"--conversation".to_string()));
@@ -3364,7 +3365,10 @@ mod hook_launch_tests {
         let dir_pos = argv.iter().position(|a| a == "--add-dir").unwrap();
         assert_eq!(argv[dir_pos + 1], dir.path().to_str().unwrap());
         assert!(argv.contains(&"--prompt-interactive".to_string()));
-        let prompt_pos = argv.iter().position(|a| a == "--prompt-interactive").unwrap();
+        let prompt_pos = argv
+            .iter()
+            .position(|a| a == "--prompt-interactive")
+            .unwrap();
         assert!(prompt_pos + 1 < argv.len());
         assert!(argv[prompt_pos + 1].contains("Read the UTF-8 task brief at"));
     }

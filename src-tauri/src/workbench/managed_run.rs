@@ -68,9 +68,7 @@ fn parse_launch(input: &str) -> Result<(String, Option<u32>), WorkbenchError> {
         Some(_) => {
             return Err(WorkbenchError::new(
                 "invalid_input",
-                format!(
-                    "Managed follow-ups may be at most {MAX_MANAGED_CONTINUATIONS} turns."
-                ),
+                format!("Managed follow-ups may be at most {MAX_MANAGED_CONTINUATIONS} turns."),
             ))
         }
     };
@@ -1248,8 +1246,16 @@ mod tests {
         let birth = process_birth::read(pid).unwrap();
         for (label, raw_input, expected_cont) in [
             ("default-omitted", r#"{"id":"run"}"#, None),
-            ("explicit-zero", r#"{"id":"run","max_continuations":0}"#, None),
-            ("warm-eight", r#"{"id":"run","max_continuations":8}"#, Some(8_u64)),
+            (
+                "explicit-zero",
+                r#"{"id":"run","max_continuations":0}"#,
+                None,
+            ),
+            (
+                "warm-eight",
+                r#"{"id":"run","max_continuations":8}"#,
+                Some(8_u64),
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (state, _) = prepared_attempt(dir.path(), "claude");
@@ -1284,10 +1290,15 @@ mod tests {
             assert_eq!(result["item"]["state"], "running", "{label}");
             let prepare_params = seen_prepare.expect("prepare called");
             assert_eq!(prepare_params["id"], "run", "{label}");
-            assert_eq!(prepare_params["request_id"], "managed_launch_run", "{label}");
+            assert_eq!(
+                prepare_params["request_id"], "managed_launch_run",
+                "{label}"
+            );
             assert_eq!(prepare_params["expected_revision"], 1, "{label}");
             assert_eq!(
-                prepare_params.get("max_continuations").and_then(Value::as_u64),
+                prepare_params
+                    .get("max_continuations")
+                    .and_then(Value::as_u64),
                 expected_cont,
                 "{label}: {prepare_params}"
             );
@@ -1307,7 +1318,10 @@ mod tests {
             r#"{"id":"run","max_continuations":"8"}"#,
         ] {
             assert_eq!(
-                state.request("runs.launch_managed", bad_launch).unwrap_err().code,
+                state
+                    .request("runs.launch_managed", bad_launch)
+                    .unwrap_err()
+                    .code,
                 "invalid_input",
                 "{bad_launch}"
             );
@@ -1598,7 +1612,9 @@ rl.on("line", (line) => {
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             let single_end = loop {
-                let row = host.request("runs.get", r#"{"id":"claude-single"}"#).unwrap();
+                let row = host
+                    .request("runs.get", r#"{"id":"claude-single"}"#)
+                    .unwrap();
                 if row["item"]["state"] != "running" {
                     break row;
                 }

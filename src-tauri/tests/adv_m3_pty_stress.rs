@@ -269,7 +269,10 @@ fn hidden_tab_backpressure_sheds_buffer_without_terminating_process() {
 
     // Check that session is listed
     let sessions = list_sessions(&view.state).unwrap();
-    assert!(sessions.iter().any(|s| s.id == id), "session must be listed");
+    assert!(
+        sessions.iter().any(|s| s.id == id),
+        "session must be listed"
+    );
 
     // Turn off ACKs: view stops acknowledging output chunks
     view.acking.store(false, Ordering::SeqCst);
@@ -285,7 +288,10 @@ fn hidden_tab_backpressure_sheds_buffer_without_terminating_process() {
 
     // Verify session is listed and NOT ending
     let sessions = list_sessions(&view.state).unwrap();
-    let sess = sessions.iter().find(|s| s.id == id).expect("session listed");
+    let sess = sessions
+        .iter()
+        .find(|s| s.id == id)
+        .expect("session listed");
     assert!(!sess.ending, "session must not be in ending state");
 
     // Catch up: view starts acknowledging again
@@ -531,10 +537,9 @@ fn child_sigkilled_on_hidden_tab_exits_cleanly() {
     assert_eq!(exit["id"], session.id.as_str());
 
     assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
-    assert!(wait_until(
-        Duration::from_secs(2),
-        || list_sessions(&state).unwrap().is_empty()
-    ));
+    assert!(wait_until(Duration::from_secs(2), || list_sessions(&state)
+        .unwrap()
+        .is_empty()));
 }
 
 // ---------------------------------------------------------------------------
@@ -568,4 +573,3 @@ fn rapid_visibility_toggling_under_heavy_output_does_not_crash_or_wedge() {
     assert_eq!(exit["id"], id.as_str());
     assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
 }
-

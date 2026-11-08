@@ -847,8 +847,7 @@ fn build_pty_command(
     let inherited_claude_vars: Vec<String> = cmd
         .iter_full_env_as_str()
         .filter(|(k, _)| {
-            k.eq_ignore_ascii_case("CLAUDECODE")
-                || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+            k.eq_ignore_ascii_case("CLAUDECODE") || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
         })
         .map(|(k, _)| k.to_owned())
         .collect();
@@ -8572,7 +8571,8 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let proc_env = PtyEnv::from_process();
             for (program, is_shell) in [("/bin/zsh", true), ("claude", false)] {
-                let cmd = build_pty_command(program, is_shell, None, None, home.path(), &proc_env).cmd;
+                let cmd =
+                    build_pty_command(program, is_shell, None, None, home.path(), &proc_env).cmd;
                 let leaked: Vec<(String, String)> = cmd
                     .iter_full_env_as_str()
                     .filter(|(k, _)| {

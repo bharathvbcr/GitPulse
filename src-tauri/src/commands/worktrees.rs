@@ -514,7 +514,11 @@ pub async fn cmd_inbox_read(
             agent_id.as_deref(),
             status.as_deref(),
         )?;
-        if let Some(ref tk) = thread_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(ref tk) = thread_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             threads.retain(|t| t.thread_key == *tk);
         }
         let total = threads.len();
@@ -552,31 +556,30 @@ pub async fn cmd_inbox_post(
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
         crate::engine::git_cli::mark_user_action(&repo_path);
         let effective_kind = kind.as_deref().unwrap_or("ask");
-        let effective_body = if let Some(title_str) =
-            title.as_deref().map(str::trim).filter(|t| !t.is_empty())
-        {
-            if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(obj) = parsed.as_object_mut() {
-                    if !obj.contains_key("title") {
-                        obj.insert(
-                            "title".to_string(),
-                            serde_json::Value::String(title_str.to_string()),
-                        );
+        let effective_body =
+            if let Some(title_str) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(obj) = parsed.as_object_mut() {
+                        if !obj.contains_key("title") {
+                            obj.insert(
+                                "title".to_string(),
+                                serde_json::Value::String(title_str.to_string()),
+                            );
+                        }
+                        serde_json::to_string(&parsed).unwrap_or_else(|_| body.clone())
+                    } else {
+                        body.clone()
                     }
-                    serde_json::to_string(&parsed).unwrap_or_else(|_| body.clone())
                 } else {
-                    body.clone()
+                    serde_json::json!({
+                        "title": title_str,
+                        "text": body,
+                    })
+                    .to_string()
                 }
             } else {
-                serde_json::json!({
-                    "title": title_str,
-                    "text": body,
-                })
-                .to_string()
-            }
-        } else {
-            body
-        };
+                body
+            };
         let message = crate::engine::agent_bus::post_thread_message(
             &repo_path,
             &from_agent,

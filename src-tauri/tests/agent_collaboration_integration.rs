@@ -53,7 +53,10 @@ fn test_agent_bus_message_delivery_and_monotonic_sequence() {
     .expect("post msg2");
 
     assert_eq!(msg2.seq, 2);
-    assert!(msg2.seq > msg1.seq, "sequence numbers must be strictly monotonic");
+    assert!(
+        msg2.seq > msg1.seq,
+        "sequence numbers must be strictly monotonic"
+    );
 
     // 2. Read messages with pagination
     let page = read_messages(repo_path, None, 0).expect("read messages from 0");
@@ -74,7 +77,8 @@ fn test_vespin_threaded_asks_lifecycle_and_answering() {
 
     // 1. Post a structured "decide" ask in a thread
     let thread_key = "thread-arch-decision-1";
-    let ask_body = r#"{"ask_type":"decide","question":"Which storage engine?","options":["SQLite","JSON"]}"#;
+    let ask_body =
+        r#"{"ask_type":"decide","question":"Which storage engine?","options":["SQLite","JSON"]}"#;
 
     let ask_msg = post_thread_message(
         repo_path,
@@ -100,13 +104,8 @@ fn test_vespin_threaded_asks_lifecycle_and_answering() {
 
     // 3. User / Orchestrator answers the ask
     let answer_body = r#"{"selected":"SQLite","notes":"Optimized for WAL concurrency"}"#;
-    let answer_msg = answer_ask(
-        repo_path,
-        "orchestrator",
-        thread_key,
-        answer_body,
-    )
-    .expect("answer ask");
+    let answer_msg =
+        answer_ask(repo_path, "orchestrator", thread_key, answer_body).expect("answer ask");
 
     assert_eq!(answer_msg.kind, "reply");
     assert_eq!(answer_msg.thread_key.as_deref(), Some(thread_key));
@@ -118,7 +117,8 @@ fn test_vespin_threaded_asks_lifecycle_and_answering() {
     assert_eq!(updated_threads[0].messages.len(), 2);
 
     // 5. Test thread read
-    let thread_msgs = read_thread_messages(repo_path, Some(thread_key), None, 0).expect("read thread msgs");
+    let thread_msgs =
+        read_thread_messages(repo_path, Some(thread_key), None, 0).expect("read thread msgs");
     assert_eq!(thread_msgs.messages.len(), 2);
     assert_eq!(thread_msgs.messages[0].kind, "ask");
     assert_eq!(thread_msgs.messages[1].kind, "reply");
@@ -273,7 +273,10 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
         .expect("run agy --version");
     assert!(output.status.success(), "agy --version failed");
     let version_str = String::from_utf8_lossy(&output.stdout);
-    assert!(!version_str.trim().is_empty(), "version output should not be empty");
+    assert!(
+        !version_str.trim().is_empty(),
+        "version output should not be empty"
+    );
 
     // 2. Verify --help publishes required flags on stderr/stdout
     let help_output = Command::new(agy_path)
@@ -286,8 +289,14 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
         String::from_utf8_lossy(&help_output.stderr)
     );
 
-    assert!(help_text.contains("--prompt-interactive"), "agy must support --prompt-interactive");
-    assert!(help_text.contains("--conversation"), "agy must support --conversation");
+    assert!(
+        help_text.contains("--prompt-interactive"),
+        "agy must support --prompt-interactive"
+    );
+    assert!(
+        help_text.contains("--conversation"),
+        "agy must support --conversation"
+    );
     assert!(help_text.contains("--mode"), "agy must support --mode");
     assert!(help_text.contains("--model"), "agy must support --model");
     assert!(help_text.contains("--effort"), "agy must support --effort");
@@ -303,9 +312,15 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
         "Task prompt content".to_string(),
     ];
 
-    let conv_pos = generated_args.iter().position(|a| a == "--conversation").unwrap();
+    let conv_pos = generated_args
+        .iter()
+        .position(|a| a == "--conversation")
+        .unwrap();
     assert_eq!(generated_args[conv_pos + 1], test_uuid);
-    let prompt_pos = generated_args.iter().position(|a| a == "--prompt-interactive").unwrap();
+    let prompt_pos = generated_args
+        .iter()
+        .position(|a| a == "--prompt-interactive")
+        .unwrap();
     assert_eq!(generated_args[prompt_pos + 1], "Task prompt content");
 }
 
@@ -357,22 +372,38 @@ fn test_inbox_threads_multibyte_utf8_truncation_without_panic() {
     .expect("post accent message");
 
     // Must list threads without panicking
-    let threads = list_inbox_threads(repo_path, None, None).expect("list threads with multi-byte text");
+    let threads =
+        list_inbox_threads(repo_path, None, None).expect("list threads with multi-byte text");
     assert_eq!(threads.len(), 3);
 
-    let t_emoji = threads.iter().find(|t| t.thread_key == "thread-emoji").expect("find thread-emoji");
+    let t_emoji = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-emoji")
+        .expect("find thread-emoji");
     assert!(t_emoji.title.ends_with('…'), "Title must end with ellipsis");
-    assert_eq!(t_emoji.title.chars().count(), 58, "Title must have exactly 57 chars + 1 ellipsis char");
-    assert!(t_emoji.title.contains('🚀'), "Emoji at offset 55 must be preserved in title snippet");
+    assert_eq!(
+        t_emoji.title.chars().count(),
+        58,
+        "Title must have exactly 57 chars + 1 ellipsis char"
+    );
+    assert!(
+        t_emoji.title.contains('🚀'),
+        "Emoji at offset 55 must be preserved in title snippet"
+    );
 
-    let t_cjk = threads.iter().find(|t| t.thread_key == "thread-cjk").expect("find thread-cjk");
+    let t_cjk = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-cjk")
+        .expect("find thread-cjk");
     assert!(t_cjk.title.ends_with('…'));
     assert_eq!(t_cjk.title.chars().count(), 58);
     assert!(t_cjk.title.contains('中'));
 
-    let t_accent = threads.iter().find(|t| t.thread_key == "thread-accent").expect("find thread-accent");
+    let t_accent = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-accent")
+        .expect("find thread-accent");
     assert!(t_accent.title.ends_with('…'));
     assert_eq!(t_accent.title.chars().count(), 58);
     assert!(t_accent.title.contains('é'));
 }
-
