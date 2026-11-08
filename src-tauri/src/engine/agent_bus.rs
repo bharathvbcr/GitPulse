@@ -1033,7 +1033,7 @@ pub fn list_inbox_threads(
             });
         }
 
-        threads.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at_ms));
         Ok(threads)
     })
 }
