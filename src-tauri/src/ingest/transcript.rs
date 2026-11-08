@@ -141,8 +141,13 @@ pub struct ToolCall {
     /// in, and a `cd` in an earlier call of the message carries over to the
     /// later ones without their recorded cwd changing. So only the first Bash
     /// call of a message (by position in the transcript, never by time) has a
-    /// cwd that is known; a later one may have run anywhere. Absent, as for a
-    /// call built any other way, it is not known.
+    /// cwd that is known, and only when this file holds the message from its
+    /// start: a resumed session's copy can hold a later call of a message
+    /// without the earlier one that did the `cd`, so every earlier block of the
+    /// message (`apiBlockIndex` 0 up to the call's own) must be in this file
+    /// before the call. A record with no `apiBlockIndex` (older Claude Code)
+    /// cannot show it. Absent, as for a call built any other way, it is not
+    /// known.
     #[serde(skip)]
     pub cwd_trusted: bool,
 }
@@ -354,8 +359,8 @@ const MAX_PENDING: usize = 256;
 /// on; a call the agent never got a result for is not held for ever.
 pub const PENDING_MAX_AGE_MS: u64 = 15 * 60 * 1000;
 
-/// Messages remembered as having had a Bash call, per transcript read.
-const MAX_BASH_MESSAGES: usize = 256;
+/// Messages remembered, per transcript read.
+const MAX_SEEN_MESSAGES: usize = 256;
 
 /// Response ids remembered as already counted, per transcript read.
 const MAX_COUNTED: usize = 64;
@@ -625,6 +630,9 @@ struct UsageRecord<'a> {
     version: Option<Cow<'a, str>>,
     #[serde(borrow, rename = "gitBranch")]
     git_branch: Option<Cow<'a, str>>,
+    /// Which block of its API response the record holds (0, 1, 2...).
+    #[serde(default, rename = "apiBlockIndex")]
+    api_block_index: Option<u64>,
     message: Option<UsageMessage<'a>>,
 }
 
@@ -700,10 +708,18 @@ pub struct Reader {
     open_usage: Option<OpenUsage>,
     counted: VecDeque<String>,
     newest_ms: Option<u64>,
-    /// Messages a Bash call has been seen in, newest last: a call whose message
-    /// is here is not the first of it. Bounded; messages arrive one after the
-    /// other, so one that fell out is long over.
-    bash_messages: VecDeque<String>,
+    /// The messages seen, newest last: which of their blocks this file holds
+    /// and whether a Bash call has been seen in them. Bounded; messages arrive
+    /// one after the other, so one that fell out is long over.
+    messages: VecDeque<SeenMessage>,
+}
+
+/// What a reader has seen of one assistant message.
+struct SeenMessage {
+    id: String,
+    /// Bit `n` is set when the record with `apiBlockIndex` `n` was read.
+    blocks: u64,
+    bash: bool,
 }
 
 impl Reader {
@@ -720,7 +736,7 @@ impl Reader {
             open_usage: None,
             counted: VecDeque::new(),
             newest_ms: None,
-            bash_messages: VecDeque::new(),
+            messages: VecDeque::new(),
         }
     }
 
@@ -779,9 +795,10 @@ impl Reader {
             self.note_time(&base.ts_utc);
             let response_from = self.response_start(record["message"]["id"].as_str());
             let message_id = record["message"]["id"].as_str().filter(|id| !id.is_empty());
+            let block = record["apiBlockIndex"].as_u64();
             for (ordinal, mut call) in calls_in(&record).into_iter().enumerate() {
                 if call.tool == "Bash" {
-                    call.cwd_trusted = self.first_bash_call_of(message_id);
+                    call.cwd_trusted = self.first_bash_call_of(message_id, block);
                 }
                 call.subagent_id.clone_from(&self.subagent_id);
                 call.origin = self.origin(ordinal);
@@ -797,6 +814,7 @@ impl Reader {
                     out.push(call);
                 }
             }
+            self.note_block(message_id, block);
             let message = &record["message"];
             let counts = UsageWire {
                 input_tokens: message["usage"]["input_tokens"].as_u64(),
@@ -826,6 +844,10 @@ impl Reader {
                 };
                 self.note_time(ts);
                 let message = record.message.as_ref();
+                self.note_block(
+                    message.and_then(|m| m.id.as_deref()),
+                    record.api_block_index,
+                );
                 out.extend(
                     self.note_usage(
                         base,
@@ -949,21 +971,48 @@ impl Reader {
         Some(open.map_or(own, |from| from.min(own)))
     }
 
-    /// Whether a Bash call of `message_id` is the first of its message that this
-    /// reader has seen, and notes it. A message with no id is never known to
-    /// have a first call.
-    fn first_bash_call_of(&mut self, message_id: Option<&str>) -> bool {
+    /// The record of `id` in the reader's memory, made if it is new.
+    fn seen(&mut self, id: &str) -> &mut SeenMessage {
+        match self.messages.iter().position(|seen| seen.id == id) {
+            Some(at) => &mut self.messages[at],
+            None => {
+                if self.messages.len() >= MAX_SEEN_MESSAGES {
+                    self.messages.pop_front();
+                }
+                self.messages.push_back(SeenMessage {
+                    id: id.to_string(),
+                    blocks: 0,
+                    bash: false,
+                });
+                self.messages.back_mut().expect("just pushed")
+            }
+        }
+    }
+
+    /// Notes that the record of `message_id` with `apiBlockIndex` `block` was
+    /// read.
+    fn note_block(&mut self, message_id: Option<&str>, block: Option<u64>) {
+        if let (Some(id), Some(block)) = (message_id, block.filter(|block| *block < 64)) {
+            self.seen(id).blocks |= 1 << block;
+        }
+    }
+
+    /// Whether a Bash call in the record of `message_id` with `apiBlockIndex`
+    /// `block` is the first Bash call of its message that this reader has seen
+    /// AND this file holds every block of the message before it, and notes the
+    /// call and the block. A message with no id, a record with no (or an
+    /// out-of-range) block index, and a gap in the blocks are all not known.
+    fn first_bash_call_of(&mut self, message_id: Option<&str>, block: Option<u64>) -> bool {
         let Some(id) = message_id else {
             return false;
         };
-        if self.bash_messages.iter().any(|seen| seen == id) {
-            return false;
-        }
-        if self.bash_messages.len() >= MAX_BASH_MESSAGES {
-            self.bash_messages.pop_front();
-        }
-        self.bash_messages.push_back(id.to_string());
-        true
+        let known = block.filter(|block| *block < 64);
+        let entry = self.seen(id);
+        let earlier = known.map_or(0, |block| (1u64 << block) - 1);
+        let trusted = !entry.bash && known.is_some() && entry.blocks & earlier == earlier;
+        entry.bash = true;
+        self.note_block(message_id, block);
+        trusted
     }
 
     fn note_time(&mut self, ts: &str) {
@@ -1848,23 +1897,36 @@ mod reader_tests {
         }
     }
 
-    /// An assistant record holding one Bash call, for message `message_id`.
-    fn bash_in(message_id: &str, id: &str, ts: &str) -> String {
+    /// An assistant record holding one Bash call, for message `message_id`, as
+    /// the block `block` of its API response.
+    fn bash_in(message_id: &str, id: &str, ts: &str, block: u64) -> String {
         format!(
-            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.241","cwd":"/repo","gitBranch":"main","message":{{"id":"{message_id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"git commit -m x"}}}}]}}}}"#
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.255","apiBlockIndex":{block},"cwd":"/repo","gitBranch":"main","message":{{"id":"{message_id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"git commit -m x"}}}}]}}}}"#
         )
+    }
+
+    /// An assistant record holding only thinking, block `block` of `message_id`.
+    fn thinking_in(message_id: &str, ts: &str, block: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.255","apiBlockIndex":{block},"cwd":"/repo","message":{{"id":"{message_id}","content":[{{"type":"thinking","thinking":"SYNTHETIC-REASONING"}}]}}}}"#
+        )
+    }
+
+    /// The `cwd_trusted` of the call `id`, once its result is read.
+    fn trusted_after(reader: &mut Reader, offset: u64, id: &str) -> bool {
+        feed(reader, offset, &result(T0_2S, id, Some(false)))[0].cwd_trusted
     }
 
     #[test]
     fn only_the_first_bash_call_of_a_message_has_a_known_cwd() {
         let mut reader = Reader::new(None);
         // One message, one record per call, as Claude Code writes it.
-        feed(&mut reader, 0, &bash_in("m1", "a", T0));
-        feed(&mut reader, 100, &bash_in("m1", "b", T0));
-        feed(&mut reader, 200, &bash_in("m2", "c", T0));
-        feed(&mut reader, 300, &bash_in("m1", "d", T0));
+        feed(&mut reader, 0, &bash_in("m1", "a", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "b", T0, 1));
+        feed(&mut reader, 200, &bash_in("m2", "c", T0, 0));
+        feed(&mut reader, 300, &bash_in("m1", "d", T0, 2));
         // A message with no id has no first call to know.
-        feed(&mut reader, 400, &bash_in("", "e", T0));
+        feed(&mut reader, 400, &bash_in("", "e", T0, 0));
         let mut trusted = Vec::new();
         for (offset, id) in [(500, "a"), (600, "b"), (700, "c"), (800, "d"), (900, "e")] {
             let done = feed(&mut reader, offset, &result(T0_2S, id, Some(false)));
@@ -1882,11 +1944,50 @@ mod reader_tests {
         );
     }
 
+    /// A resumed session's copy can hold a later call of a message without the
+    /// earlier one that did a `cd` (a real pair of files: the original holds
+    /// blocks 0 thinking, 1 Bash, 2 Bash, the copy 0 thinking and 2 Bash, its
+    /// parent links rewritten so the chain still looks whole). The block
+    /// numbers are what shows the gap.
+    #[test]
+    fn a_call_is_trusted_only_when_the_file_holds_every_earlier_block_of_its_message() {
+        // The whole message: thinking, then two calls.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &thinking_in("m1", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "a", T0, 1));
+        feed(&mut reader, 200, &bash_in("m1", "b", T0, 2));
+        assert!(trusted_after(&mut reader, 300, "a"));
+        assert!(!trusted_after(&mut reader, 400, "b"));
+
+        // The copy: block 1 (the first call) is not in the file.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &thinking_in("m1", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "b", T0, 2));
+        assert!(!trusted_after(&mut reader, 200, "b"), "block 1 is missing");
+
+        // The copy holding the call alone, and a call whose own block is the
+        // first of its message.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &bash_in("m1", "b", T0, 2));
+        feed(&mut reader, 100, &bash_in("m2", "c", T0, 0));
+        assert!(!trusted_after(&mut reader, 200, "b"));
+        assert!(trusted_after(&mut reader, 300, "c"));
+
+        // A record with no block index (older Claude Code), or an impossible
+        // one, cannot show that nothing is missing.
+        let mut reader = Reader::new(None);
+        let bare = bash_in("m1", "a", T0, 0).replace(r#""apiBlockIndex":0,"#, "");
+        feed(&mut reader, 0, &bare);
+        feed(&mut reader, 100, &bash_in("m2", "b", T0, 64));
+        assert!(!trusted_after(&mut reader, 200, "a"));
+        assert!(!trusted_after(&mut reader, 300, "b"));
+    }
+
     #[test]
     fn two_bash_blocks_of_one_record_and_a_file_tool_in_between() {
         let mut reader = Reader::new(None);
         let line = format!(
-            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{T0}","cwd":"/repo","message":{{"id":"m1","content":[{},{},{}]}}}}"#,
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{T0}","apiBlockIndex":0,"cwd":"/repo","message":{{"id":"m1","content":[{},{},{}]}}}}"#,
             edit("e1"),
             bash("b1"),
             bash("b2"),

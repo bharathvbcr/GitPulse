@@ -937,7 +937,7 @@ fn w9_ingest_bash_call(
     let call = serde_json::json!({
         "type": "assistant", "sessionId": session,
         "timestamp": ledger::ids::iso8601_utc(start_ms),
-        "version": "2.1.241", "cwd": cwd, "gitBranch": "main",
+        "version": "2.1.255", "cwd": cwd, "gitBranch": "main", "apiBlockIndex": 0,
         "message": { "id": "msg_1", "content": [
             { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": input } ] }
     });
@@ -1280,57 +1280,68 @@ fn w9_real_transcript_a_finished_subagent_call_still_links() {
 // ---- W9 w7 round 4: one assistant message, several Bash calls ----
 
 /// One call of an assistant message: `(message id, tool_use id, cwd, command,
-/// began, ended)`.
-type W9Call<'a> = (&'a str, &'a str, &'a str, &'a str, u64, u64);
+/// began, ended, apiBlockIndex)`.
+type W9Call<'a> = (&'a str, &'a str, &'a str, &'a str, u64, u64, u64);
 
-/// Writes `calls` the way Claude Code writes an assistant message that made
+/// One transcript file: its name, its session, and the calls it holds.
+type W9File<'a> = (&'a str, &'a str, Vec<W9Call<'a>>);
+
+/// Writes each file the way Claude Code writes assistant messages that made
 /// several Bash calls: one assistant record per call, all with the message's
-/// id and the directory the message STARTED in (`cwd` of every record is the
-/// same), then the results. Runs the real reflog replay and transcript ingest
-/// and returns the ledger's command rows in the order of `calls`.
-fn w9_ingest_message(repo: &str, session: &str, calls: &[W9Call<'_>]) -> Vec<ledger::LedgerEvent> {
+/// id, its `apiBlockIndex` and the directory the message STARTED in (`cwd` of
+/// every record is the same), then the results. Runs the real reflog replay and
+/// transcript ingest and returns every command row in the ledger's order.
+fn w9_ingest_files(repo: &str, files: &[W9File<'_>]) -> Vec<ledger::LedgerEvent> {
     let troot = tempfile::tempdir().expect("transcript root");
-    let file = troot.path().join("slug").join(format!("{session}.jsonl"));
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let mut lines = Vec::new();
-    for (message, tool, cwd, command, began, _) in calls {
-        lines.push(
-            serde_json::json!({
-                "type": "assistant", "sessionId": session,
-                "timestamp": ledger::ids::iso8601_utc(*began),
-                "version": "2.1.309", "cwd": cwd, "gitBranch": "main",
-                "message": { "id": message, "content": [
-                    { "type": "tool_use", "id": tool, "name": "Bash",
-                      "input": { "command": command } } ] }
-            })
-            .to_string(),
-        );
+    for (name, session, calls) in files {
+        let file = troot.path().join("slug").join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut lines = Vec::new();
+        for (message, tool, cwd, command, began, _, block) in calls {
+            lines.push(
+                serde_json::json!({
+                    "type": "assistant", "sessionId": session,
+                    "timestamp": ledger::ids::iso8601_utc(*began),
+                    "version": "2.1.255", "cwd": cwd, "gitBranch": "main",
+                    "apiBlockIndex": block,
+                    "message": { "id": message, "content": [
+                        { "type": "tool_use", "id": tool, "name": "Bash",
+                          "input": { "command": command } } ] }
+                })
+                .to_string(),
+            );
+        }
+        for (_, tool, _, _, _, ended, _) in calls {
+            lines.push(
+                serde_json::json!({
+                    "type": "user", "sessionId": session,
+                    "timestamp": ledger::ids::iso8601_utc(*ended),
+                    "message": { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": tool,
+                          "content": "ok", "is_error": false } ] },
+                    "toolUseResult": w9_finished(),
+                })
+                .to_string(),
+            );
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
     }
-    for (_, tool, _, _, _, ended) in calls {
-        lines.push(
-            serde_json::json!({
-                "type": "user", "sessionId": session,
-                "timestamp": ledger::ids::iso8601_utc(*ended),
-                "message": { "role": "user", "content": [
-                    { "type": "tool_result", "tool_use_id": tool,
-                      "content": "ok", "is_error": false } ] },
-                "toolUseResult": w9_finished(),
-            })
-            .to_string(),
-        );
-    }
-    std::fs::write(&file, lines.join("\n") + "\n").unwrap();
     crate::test_support::trust_repo(std::path::Path::new(repo));
     let serial = crate::test_support::env::env_serial();
-    let _env =
-        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
+    let _env = crate::test_support::env::bind_env(&serial)
+        .set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
     ingest_reflog_into(repo, repo, 200);
     ingest_transcripts(repo);
-    let rows: Vec<_> = ledger::tail(repo, 0, 1000)
+    ledger::tail(repo, 0, 1000)
         .expect("tail")
         .into_iter()
         .filter(|event| event.action == "session.command")
-        .collect();
+        .collect()
+}
+
+/// [`w9_ingest_files`] of one file, with the rows in the order of `calls`.
+fn w9_ingest_message(repo: &str, session: &str, calls: &[W9Call<'_>]) -> Vec<ledger::LedgerEvent> {
+    let rows = w9_ingest_files(repo, &[("one.jsonl", session, calls.to_vec())]);
     calls
         .iter()
         .map(|call| {
@@ -1380,7 +1391,7 @@ fn w9_real_transcript_a_later_call_of_a_message_after_a_cd_never_links() {
         &repo,
         "S_SAME",
         &[
-            ("msg_1", "tu0", &repo, &cd, start - 40, start),
+            ("msg_1", "tu0", &repo, &cd, start - 40, start, 0),
             (
                 "msg_1",
                 "tu1",
@@ -1388,6 +1399,7 @@ fn w9_real_transcript_a_later_call_of_a_message_after_a_cd_never_links() {
                 "git commit -m 'agent'",
                 start,
                 start + 4_000,
+                1,
             ),
         ],
     );
@@ -1423,7 +1435,7 @@ fn w9_real_transcript_a_commit_after_a_harmless_first_call_is_unknown() {
         &repo,
         "S_SAME",
         &[
-            ("msg_1", "tu0", &repo, "ls", start - 40, start),
+            ("msg_1", "tu0", &repo, "ls", start - 40, start, 0),
             (
                 "msg_1",
                 "tu1",
@@ -1431,6 +1443,7 @@ fn w9_real_transcript_a_commit_after_a_harmless_first_call_is_unknown() {
                 "git commit -m 'fix: parser'",
                 start,
                 start + 4_000,
+                1,
             ),
         ],
     );
@@ -1462,12 +1475,12 @@ fn w9_real_transcript_the_first_call_of_a_message_still_links() {
         let mut calls: Vec<W9Call<'_>> = Vec::new();
         if calls_before == 1 {
             // An earlier message's call, then this message's first call.
-            calls.push(("msg_0", "tu_a", &repo, "ls", start - 2_000, start - 1_500));
+            calls.push(("msg_0", "tu_a", &repo, "ls", start - 2_000, start - 1_500, 0));
         }
         let message = "msg_1";
-        calls.push((message, "tu_b", &repo, commit, start, start + 4_000));
+        calls.push((message, "tu_b", &repo, commit, start, start + 4_000, 0));
         if same_message_after {
-            calls.push((message, "tu_c", &repo, "echo done", start + 10, start + 20));
+            calls.push((message, "tu_c", &repo, "echo done", start + 10, start + 20, 1));
         }
         let rows = w9_ingest_message(&repo, "S_SAME", &calls);
         let commit_row = &rows[calls_before];
@@ -1475,5 +1488,55 @@ fn w9_real_transcript_the_first_call_of_a_message_still_links() {
         let got = w9_link(&repo, &sha);
         assert_eq!(got.session_id.as_deref(), Some("S_SAME"), "{got:?}");
         assert_eq!(got.basis, ledger::attribution::basis::INFERRED);
+    }
+}
+
+/// A resumed session's copy of a message's later call. The original (call 0 is a
+/// `cd`, call 1 the commit) is in one file; the copy holds only call 1 under the
+/// resumed session's own id, with its `apiBlockIndex` still 1. Whether or not
+/// the original was ingested, the copy's call is not known to have run at the
+/// recorded directory: block 0 is not in its file.
+#[test]
+fn w9_real_transcript_a_resumed_copy_of_a_later_call_never_links() {
+    for with_original in [true, false] {
+        let (dir, repo) = seeded_repo();
+        let nested = dir.path().join("vendor").join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        git_in(&nested, &["init", "-q", "-b", "main"]);
+        let nested_s = nested.canonicalize().unwrap().to_string_lossy().into_owned();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(dir.path(), &["commit", "--allow-empty", "-m", "person work"], now);
+        let person = w9_head(&repo);
+        let start = u64::try_from(now).unwrap() * 1000 + 200;
+        let cd = format!("cd {nested_s} && true");
+        let commit = "git commit -m 'agent'";
+        let mut files: Vec<W9File<'_>> = Vec::new();
+        if with_original {
+            files.push((
+                "a.jsonl",
+                "S_ORIG",
+                vec![
+                    ("msg_1", "tu0", &repo, &cd, start - 40, start, 0),
+                    ("msg_1", "tu1", &repo, commit, start, start + 4_000, 1),
+                ],
+            ));
+        }
+        files.push((
+            "b.jsonl",
+            "S_RESUMED",
+            vec![("msg_1", "tu1", &repo, commit, start, start + 4_000, 1)],
+        ));
+        let rows = w9_ingest_files(&repo, &files);
+        let copy: Vec<_> = rows
+            .iter()
+            .filter(|row| row.session_id.as_deref() == Some("S_RESUMED"))
+            .collect();
+        assert_eq!(copy.len(), 1, "with_original={with_original}");
+        assert_eq!(w9_trusted(copy[0]), false, "with_original={with_original}");
+        let got = w9_link(&repo, &person);
+        assert_eq!(
+            got.session_id, None,
+            "with_original={with_original}: WRONG LINK {got:?}"
+        );
     }
 }
