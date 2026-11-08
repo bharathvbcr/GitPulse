@@ -1056,11 +1056,38 @@ mod tests {
             .unwrap();
         drop(conn);
         assert_eq!(Path::new(&seeded_bound).canonicalize().unwrap(), lane_canon);
+        // Since devmap@947090b7 `rebind_staged` also rewrites the LATEST
+        // generation row (a small row; historical rows and their overflow
+        // chains stay CoW-shared) so raw SQLite readers see the lane root.
+        // That rewrite is on the lane's staged copy only: the donor's own
+        // store must keep its donor root.
         assert_eq!(
             Path::new(&raw_gen_root).canonicalize().unwrap(),
-            donor_canon,
-            "provisioning must not rewrite generations overflow pages"
+            lane_canon,
+            "the lane's latest generation row must be rebound to the lane"
         );
+        let donor_conn = rusqlite::Connection::open_with_flags(
+            devmap_query::paths::store_path(anchor_dir.path()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let donor_gen_root: String = donor_conn
+            .query_row(
+                "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let donor_has_rebind: i64 = donor_conn
+            .query_row("SELECT COUNT(*) FROM seed_rebind", [], |row| row.get(0))
+            .unwrap();
+        drop(donor_conn);
+        assert_eq!(
+            Path::new(&donor_gen_root).canonicalize().unwrap(),
+            donor_canon,
+            "provisioning must never rewrite the donor's store"
+        );
+        assert_eq!(donor_has_rebind, 0, "the donor store gained a seed_rebind");
 
         // Its own inode — two worktrees writing one SQLite file corrupts it.
         #[cfg(unix)]

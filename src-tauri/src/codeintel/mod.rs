@@ -3854,6 +3854,68 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Commits `src/` of a `repo_with_one_generation` fixture and stamps that
+    /// commit onto the fixture's generation and build-history rows, returning
+    /// the commit sha.
+    ///
+    /// Since devmap@947090b7 a stacked base is only taken from "a built,
+    /// committed checkout": `BaseKey::new` refuses a donor generation whose
+    /// `head_sha` is not a full git commit id. The plain fixture's placeholder
+    /// `'fixture'` is fine for reads, so only tests that publish a stacked base
+    /// need this.
+    pub(crate) fn commit_and_stamp_head(repo: &Path) -> String {
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=f@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo)
+                .output_locked()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        // The donor must also be "fresh": its latest generation has to match
+        // the working tree file for file, so the two indexed paths the fixture
+        // leaves off disk exist here, and each payload row carries the hash
+        // and payload identity a real build of that file stamps.
+        for path in ["src/callee.rs", "src/island.rs"] {
+            std::fs::write(repo.join(path), "pub fn placeholder() {}\n").expect("write source");
+        }
+        git(&["add", "src"]);
+        git(&["commit", "-m", "fixture"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let scanned = devmap_extract::scan_tree(repo).expect("scan fixture tree");
+        let hashes: std::collections::BTreeMap<&str, u64> =
+            scanned.file_hashes().into_iter().collect();
+        let (grammar, analyzer) = devmap_extract::cache::current_payload_identity("rust");
+        let conn = rusqlite::Connection::open(map_path(repo)).expect("open fixture db");
+        for (id, path) in (1i64..).zip(["src/caller.rs", "src/callee.rs", "src/island.rs"]) {
+            let hash = *hashes.get(path).expect("fixture file scanned");
+            conn.execute(
+                "UPDATE file_payloads SET content_hash = ?2, grammar_version = ?3,
+                    analyzer_version = ?4 WHERE payload_id = ?1",
+                (id, hash as i64, &grammar, &analyzer),
+            )
+            .expect("stamp payload identity");
+        }
+        conn.execute("UPDATE generations SET head_sha = ?1", [&head])
+            .expect("stamp generation head");
+        conn.execute("UPDATE build_history SET head_sha = ?1", [&head])
+            .expect("stamp build history head");
+        conn.close().expect("close fixture db");
+        head
+    }
+
     /// Puts an empty, fully migrated map database at `repo`'s store path.
     ///
     /// Creating the schema is the dominant write of a seeded fixture (about
