@@ -6931,7 +6931,9 @@ mod tests {
     /// 5 us per spawn, far above what a thread-local swap and a map bump cost.
     #[test]
     fn spawn_source_tagging_adds_negligible_per_spawn_overhead() {
-        const N: u32 = 200_000;
+        // 20k x 9 rounds x 2 arms keeps this near 2 s in a debug build; the
+        // 5 us bound is ~100x what the swap and map bump cost.
+        const N: u32 = 20_000;
         let time = |tagged: bool| {
             let mut counts = super::LabelCounts::default();
             let started = std::time::Instant::now();
