@@ -30,6 +30,8 @@
     locked = false,
     onChanged,
     onCheckedOut,
+    onWorktreeOpened,
+    onBusyChange,
   }: {
     repoPath: string;
     number: number;
@@ -45,6 +47,10 @@
     onChanged: (message: string) => void;
     /** In-place checkout succeeded. The parent refreshes the open checkout. */
     onCheckedOut: (message: string) => void;
+    /** A worktree was opened. The parent refreshes what lists worktrees; `onChanged` is used when absent. */
+    onWorktreeOpened?: (message: string) => void;
+    /** Tells the parent whether this row is mid-action, so the list rows lock too. */
+    onBusyChange?: (busy: boolean) => void;
   } = $props();
 
   let detail = $state<PullRequestDetail | null>(null);
@@ -55,6 +61,11 @@
   let mergeMethod = $state<PrMergeMethod>("squash");
   let deleteBranch = $state(false);
   let inflight: AsyncGuard | null = null;
+
+  $effect(() => {
+    onBusyChange?.(busy);
+    return () => onBusyChange?.(false);
+  });
 
   async function load() {
     inflight?.cancel();
@@ -116,7 +127,7 @@
     actionError = null;
     try {
       const result = await openPullRequestWorktree(repoPath, number);
-      onChanged(withVerdict(describePrWorktree(result.output), result.policy));
+      (onWorktreeOpened ?? onChanged)(withVerdict(describePrWorktree(result.output), result.policy));
     } catch (error) {
       actionError = formatError(error);
     } finally {

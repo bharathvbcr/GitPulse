@@ -4601,65 +4601,16 @@ pub fn prune_worktree_argv() -> Vec<String> {
     ]
 }
 
-/// `git worktree list --porcelain`, the listing a caller can judge and run
-/// without the per-worktree scan [`list_worktrees`] does.
+/// `git worktree list --porcelain -z`, the exact line [`read_worktree_entries`]
+/// runs, so a caller can judge it before reading the listing.
 pub fn worktree_list_porcelain_argv() -> Vec<String> {
     vec![
         "git".into(),
         "worktree".into(),
         "list".into(),
         "--porcelain".into(),
+        "-z".into(),
     ]
-}
-
-/// One checkout from `git worktree list --porcelain`.
-///
-/// `branch` is the full ref (`refs/heads/…`) when the checkout has one, and
-/// absent when it is detached or bare. `head` is empty only for a bare record
-/// that printed no HEAD line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListedWorktree {
-    pub path: String,
-    pub head: String,
-    pub branch: Option<String>,
-}
-
-/// Parses `git worktree list --porcelain`.
-///
-/// Records are separated by a blank line. A missing trailing blank line still
-/// yields the last record. Unknown keys (`locked`, `prunable`) are ignored.
-pub fn parse_worktree_list_porcelain(text: &str) -> Vec<ListedWorktree> {
-    let mut out = Vec::new();
-    let mut current: Option<ListedWorktree> = None;
-    let finish = |current: &mut Option<ListedWorktree>, out: &mut Vec<ListedWorktree>| {
-        if let Some(entry) = current.take() {
-            out.push(entry);
-        }
-    };
-    for line in text.lines() {
-        if line.is_empty() {
-            finish(&mut current, &mut out);
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("worktree ") {
-            finish(&mut current, &mut out);
-            current = Some(ListedWorktree {
-                path: path.to_string(),
-                head: String::new(),
-                branch: None,
-            });
-        } else if let Some(entry) = current.as_mut() {
-            if let Some(head) = line.strip_prefix("HEAD ") {
-                entry.head = head.to_string();
-            } else if let Some(branch) = line.strip_prefix("branch ") {
-                entry.branch = Some(branch.to_string());
-            } else if line == "detached" || line == "bare" {
-                entry.branch = None;
-            }
-        }
-    }
-    finish(&mut current, &mut out);
-    out
 }
 
 /// Sanitizes a branch name for safe directory naming (replaces `/`, `\`, `:`, whitespace, etc. with `-`).
@@ -13038,43 +12989,13 @@ some-future-field whatever
 
 #[cfg(test)]
 mod worktree_list_porcelain_tests {
-    use super::{parse_worktree_list_porcelain, worktree_list_porcelain_argv};
+    use super::worktree_list_porcelain_argv;
 
     #[test]
     fn porcelain_list_argv_is_the_line_the_gate_judges() {
         assert_eq!(
             worktree_list_porcelain_argv(),
-            vec!["git", "worktree", "list", "--porcelain"]
+            vec!["git", "worktree", "list", "--porcelain", "-z"]
         );
-    }
-
-    #[test]
-    fn porcelain_parser_keeps_branch_checkouts_and_detached_ones() {
-        let text = "\
-worktree /repo
-HEAD aaaa
-branch refs/heads/main
-
-worktree /repo.pr-7
-HEAD bbbb
-branch refs/heads/pr/7
-
-worktree /repo.detached
-HEAD cccc
-detached
-";
-        let listed = parse_worktree_list_porcelain(text);
-        assert_eq!(listed.len(), 3);
-        assert_eq!(listed[0].path, "/repo");
-        assert_eq!(listed[0].branch.as_deref(), Some("refs/heads/main"));
-        assert_eq!(listed[1].branch.as_deref(), Some("refs/heads/pr/7"));
-        assert_eq!(listed[1].head, "bbbb");
-        assert_eq!(listed[2].branch, None);
-        assert_eq!(listed[2].head, "cccc");
-        // A record that is not closed by a blank line is still returned.
-        let tail =
-            parse_worktree_list_porcelain("worktree /only\nHEAD dddd\nbranch refs/heads/only");
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].branch.as_deref(), Some("refs/heads/only"));
     }
 }

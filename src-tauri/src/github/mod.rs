@@ -652,9 +652,6 @@ pub struct NamedGitHubRemote {
 /// (`--repo`, Dependabot endpoints, checkout, issue creation) at a
 /// repository the user never pulls from. Origin wins over other remotes;
 /// among the rest, the first listed fetch URL is used.
-///
-/// A remote name that cannot be a single git argument (leading `-`, whitespace
-/// already split off, or a character git would treat specially) is skipped.
 pub fn pick_named_github_remote(remote_v_output: &str) -> Option<NamedGitHubRemote> {
     let mut origin: Option<NamedGitHubRemote> = None;
     let mut first: Option<NamedGitHubRemote> = None;
@@ -669,9 +666,6 @@ pub fn pick_named_github_remote(remote_v_output: &str) -> Option<NamedGitHubRemo
         // The marker decides eligibility; its absence reads as a fetch line
         // (every git release prints it, but be liberal about bare output).
         if matches!(parts.next(), Some("(push)")) {
-            continue;
-        }
-        if !git_remote_name_is_safe(name) {
             continue;
         }
         if let Some(parsed) = parse_github_remote_url(url) {
@@ -691,17 +685,6 @@ pub fn pick_named_github_remote(remote_v_output: &str) -> Option<NamedGitHubRemo
         }
     }
     origin.or(first)
-}
-
-/// A git remote name that can be one argument to `git fetch` without changing
-/// the command. Names git itself refuses are not fetched.
-fn git_remote_name_is_safe(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && !name.contains("..")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Selects the trusted GitHub remote from `git remote -v` output.
@@ -3224,6 +3207,19 @@ mod tests {
         assert!(split_owner_repo("/a/b", false).is_none());
         assert!(split_owner_repo("github.com/", false).is_none());
         assert!(split_owner_repo("github.com/only-owner", false).is_none());
+    }
+
+    /// git accepts a remote named `team/upstream`, and every GitHub feature
+    /// found it before the worktree opener existed. The opener's own
+    /// fetch-safety check must not narrow what the selector accepts.
+    #[test]
+    fn a_remote_name_with_a_slash_still_resolves_for_existing_callers() {
+        let remote_v = "team/upstream\thttps://github.com/acme/x.git (fetch)\n\
+                        team/upstream\thttps://github.com/acme/x.git (push)\n";
+        let github = pick_github_remote(remote_v).expect("a GitHub remote named team/upstream");
+        assert_eq!((github.owner.as_str(), github.name.as_str()), ("acme", "x"));
+        let named = pick_named_github_remote(remote_v).expect("named selection");
+        assert_eq!(named.name, "team/upstream");
     }
 
     /// Regression: `git remote -v` lists every remote twice — fetch and push

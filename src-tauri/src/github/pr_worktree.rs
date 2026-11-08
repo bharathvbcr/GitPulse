@@ -7,21 +7,30 @@
 //! [`crate::engine::worktree::add_worktree_configured`]. The local branch is
 //! `pr/N`, never the head ref name: a fork whose head is `main` must not
 //! become this repository's `main`.
+//!
+//! Everything that decides "what is already here" and then creates it runs
+//! under a lock for that pull request, and a call removes only what it made
+//! itself: its own staging ref (named per call), a branch it created, a
+//! worktree whose add returned. Two opens of one pull request therefore
+//! cannot tear each other down.
 
 use super::{
     bounded_error, gh_repo_flags, gh_unavailable_reason, pick_named_github_remote, probe_gh_cli,
     GitHubRepoRef,
 };
-use crate::engine::git_cli::{git_text, run_command_in, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_network, run_command_in, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::worktree::{
-    add_worktree_argv_configured, add_worktree_configured, parse_worktree_list_porcelain,
-    prune_worktree_argv, remove_worktree_argv, resolve_worktree_path_for_branch,
-    worktree_list_porcelain_argv, DevmapMode, WorktreeCreated,
+    add_worktree_argv_configured, add_worktree_configured, prune_worktree_argv,
+    read_worktree_entries, remove_worktree_argv, resolve_worktree_path_for_branch,
+    worktree_list_porcelain_argv, DevmapMode, ParsedWorktree, WorktreeCreated,
 };
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Why opening a pull request worktree stopped before anything was left behind.
@@ -33,6 +42,7 @@ pub enum PrWorktreeRefusalCode {
     FetchFailed,
     TargetExists,
     BranchCheckedOut,
+    WorktreeMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +82,11 @@ pub struct PrWorktreeOpened {
     /// Present when this call created the worktree. Absent when an existing
     /// worktree for `pr/N` was reused; hooks and cache copies do not re-run.
     pub created: Option<WorktreeCreated>,
+    /// Why the branch was not brought up to the pull request head. `None`
+    /// means it was updated or was already there. The worktree is still
+    /// opened: this is what the person is told so a stale `pr/N` is never
+    /// mistaken for the pull request's current head.
+    pub update_error: Option<String>,
 }
 
 /// `gh pr view` fields this opener reads. The list is the wire contract.
@@ -114,15 +129,51 @@ enum StepError {
     Git(CommandError),
 }
 
+/// What this call has made so far, and so may remove if it must stop.
 struct Attempt {
     repo: PathBuf,
     repo_key: String,
     target: String,
     branch: String,
+    /// This call's own staging ref. Never shared with another call.
     staging: String,
-    add_started: bool,
+    /// `git worktree add` returned. A directory that was merely at the
+    /// target is not this call's.
+    owns_worktree: bool,
+    /// This call asked git to create the branch.
     created_branch: bool,
     fetched_staging: bool,
+}
+
+/// What is already on disk for one pull request.
+enum Plan {
+    Create,
+    Reuse(String),
+}
+
+/// A staging ref no other call shares: the pull request number, this process
+/// and a counter. Deleting it can only ever delete this call's fetch.
+fn staging_ref(number: u64) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "refs/gitpulse/pr-heads/{number}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A remote name is passed to `git fetch` after `--`, so only the one shape
+/// that survives that, an empty name, or one `git remote` would never have
+/// printed as a name, is refused here. A name starting with `-` is refused
+/// too: older tooling around the gate reads it as an option.
+fn fetchable_remote_name(name: &str) -> Result<(), PrWorktreeError> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(refused(
+            PrWorktreeRefusalCode::FetchFailed,
+            format!("The remote name {name:?} cannot be fetched from safely"),
+        ));
+    }
+    Ok(())
 }
 
 /// Opens pull request `number` in a new worktree of `repo_path`.
@@ -156,35 +207,35 @@ pub fn open_pull_request_worktree(
             "No GitHub remote configured",
         )
     })?;
+    fetchable_remote_name(&named.name)?;
 
     let branch = format!("pr/{number}");
     validate_ref_name(&branch).map_err(PrWorktreeError::Command)?;
     let target_buf = resolve_worktree_path_for_branch(&repo_key, &branch, None)
         .map_err(PrWorktreeError::Command)?;
     let target = utf8_path(&target_buf, "worktree path")?;
-    let branch_ref = format!("refs/heads/{branch}");
-    let staging = format!("refs/gitpulse/pr-heads/{number}");
 
-    // Judge the shared porcelain argv, then run that same line. The parser
-    // decides reuse from what it prints.
-    let list_argv = worktree_list_porcelain_argv();
-    judge(&repo_key, &list_argv, gate)?;
-    let list_args: Vec<&str> = list_argv.iter().skip(1).map(String::as_str).collect();
-    let listing = git_text(&repo, &list_args).map_err(PrWorktreeError::Command)?;
-    let listed = parse_worktree_list_porcelain(&listing);
-    if listed.iter().any(|entry| {
-        entry.branch.as_deref() == Some(branch_ref.as_str())
-            && same_path(Path::new(&entry.path), &repo)
-    }) {
-        return Err(refused(
-            PrWorktreeRefusalCode::BranchCheckedOut,
-            format!("Branch {branch} is already checked out in this worktree"),
-        ));
-    }
-    if let Some(existing) = listed
-        .iter()
-        .find(|entry| entry.branch.as_deref() == Some(branch_ref.as_str()))
-    {
+    // One open of one pull request at a time. The engine's own
+    // `add_worktree` takes the repository mutation lock, which is not
+    // reentrant, so this call cannot hold that one across the add; this lock
+    // is per pull request and per repository, so a second open of the same
+    // pull request waits here and then finds the first one's worktree, and
+    // opens of other pull requests (or other work on the repository) never
+    // wait on it.
+    let main_checkout = list_entries(&repo, &repo_key, gate)?
+        .first()
+        .map(|entry| PathBuf::from(&entry.path))
+        .unwrap_or_else(|| repo.clone());
+    let open_lock = pull_request_open_lock(&main_checkout, number);
+    let _open_guard = open_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Decided under the lock, from a listing taken under the lock, so a
+    // refusal or a reuse costs no `gh` call and no fetch, and what is found
+    // is what exists when this call acts.
+    let entries = list_entries(&repo, &repo_key, gate)?;
+    if let Plan::Reuse(path) = plan(&entries, &repo, &branch, &target_buf)? {
         return reuse_worktree(
             &repo,
             &repo_key,
@@ -192,52 +243,98 @@ pub fn open_pull_request_worktree(
             &named.github,
             number,
             &branch,
-            existing.path.clone(),
+            path,
             gate,
         );
     }
 
-    // An existing path is the caller's. Refuse before `gh pr view` and before
-    // any fetch so a retry finds the directory and the log untouched.
-    if std::fs::symlink_metadata(&target_buf).is_ok() {
-        return Err(refused(
-            PrWorktreeRefusalCode::TargetExists,
-            format!("Worktree path already exists: {target}"),
-        ));
-    }
-
     let view = view_pull_request(&repo, &repo_key, &named.github, number, gate)?;
-    let existed = ref_exists(&repo, &repo_key, &branch_ref, gate)?;
     let mut attempt = Attempt {
         repo: repo.clone(),
         repo_key: repo_key.clone(),
         target: target.clone(),
         branch: branch.clone(),
-        staging: staging.clone(),
-        add_started: false,
+        staging: staging_ref(number),
+        owns_worktree: false,
         created_branch: false,
         fetched_staging: false,
     };
+    create_worktree(
+        &mut attempt,
+        &named.name,
+        number,
+        &view,
+        cow_caches,
+        run_hooks,
+        gate,
+    )
+}
 
+/// One lock per (main checkout, pull request number). The registry forgets
+/// idle entries once it grows, as the repository mutation registry does.
+fn pull_request_open_lock(main_checkout: &Path, number: u64) -> Arc<Mutex<()>> {
+    type OpenLocks = Mutex<HashMap<(PathBuf, u64), Arc<Mutex<()>>>>;
+    static REGISTRY: OnceLock<OpenLocks> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (
+        main_checkout
+            .canonicalize()
+            .unwrap_or_else(|_| main_checkout.to_path_buf()),
+        number,
+    );
+    let mut map = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() >= 64 {
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Adds the worktree for a pull request that has none. The caller holds the
+/// pull request's open lock. Every exit after the staging fetch deletes this
+/// call's staging ref, and rolls back only what [`Attempt`] says this call
+/// made.
+fn create_worktree(
+    attempt: &mut Attempt,
+    remote_name: &str,
+    number: u64,
+    view: &GhPrWorktreeView,
+    cow_caches: bool,
+    run_hooks: bool,
+    gate: Gate<'_>,
+) -> Result<PrWorktreeOpened, PrWorktreeError> {
+    let repo = attempt.repo.clone();
+    let repo_key = attempt.repo_key.clone();
+    let target = attempt.target.clone();
+    let branch = attempt.branch.clone();
+    let branch_ref = format!("refs/heads/{branch}");
+
+    let existed = ref_exists(&repo, &repo_key, &branch_ref, gate)?;
+    if !existed {
+        // `fetch_staging` rolls this call back itself when it fails.
+        fetch_staging(attempt, remote_name, number, gate)?;
+    }
+
+    let staging = attempt.staging.clone();
     let (new_branch, start): (Option<&str>, Option<&str>) = if existed {
         // Attach the branch where it is. The fast-forward runs after the
         // worktree exists, and only inside that worktree, so a refused add
         // cannot move this branch.
         (None, Some(branch.as_str()))
     } else {
-        fetch_staging(&repo, &repo_key, &named.name, number, &staging, gate)?;
-        attempt.fetched_staging = true;
-        // The branch does not exist yet. Rollback may delete it only when
-        // its tip is still the staging commit this call fetched.
+        // Rollback may delete the branch only when its tip is still the
+        // staging commit this call fetched.
         attempt.created_branch = true;
         (Some(branch.as_str()), Some(staging.as_str()))
     };
 
     let argv = add_worktree_argv_configured(&target, new_branch, start, false, false);
     if let Err(error) = judge(&repo_key, &argv, gate) {
-        return Err(rollback(&attempt, error, gate));
+        return Err(rollback(attempt, error, gate));
     }
-    attempt.add_started = true;
     let mut refuse_sparse = |args: &[&str]| -> Result<(), CommandError> {
         Err(CommandError::plain(format!(
             "pull-request worktrees are full checkouts; refused git {}",
@@ -258,35 +355,93 @@ pub fn open_pull_request_worktree(
         None,
         &mut refuse_sparse,
     ) {
-        Ok(created) => created,
-        Err(error) => return Err(rollback(&attempt, PrWorktreeError::Command(error), gate)),
+        // Only an add that returned is this call's worktree. A failed add
+        // removes nothing: git cleans up its own failed add, and a directory
+        // found at the target (planted after the check, or made by another
+        // process) is never this call's to delete.
+        Ok(created) => {
+            attempt.owns_worktree = true;
+            created
+        }
+        Err(error) => return Err(rollback(attempt, PrWorktreeError::Command(error), gate)),
     };
+
+    let mut update_error = None;
     if existed {
-        let worktree = PathBuf::from(&target);
-        if let Err(error) =
-            fast_forward_checked_out(&worktree, &repo_key, &named.name, number, gate)
-        {
-            return Err(rollback(&attempt, error, gate));
+        match update_in_worktree(Path::new(&target), &repo_key, remote_name, number, gate) {
+            Ok(outcome) => update_error = outcome,
+            Err(error) => return Err(rollback(attempt, error, gate)),
         }
     }
     // The worktree is the result, including a hook that failed after the add.
     // A refused cleanup must not spawn git and must not fail the open.
-    let _ = delete_ref(
-        &repo,
-        &repo_key,
-        &staging,
-        &["update-ref", "-d", &staging],
-        gate,
-    );
+    let _ = rollback_staging(attempt, gate);
     let head_oid = head_oid(&repo, &repo_key, &branch_ref, gate)?;
-    Ok(opened_from(
-        target,
-        branch,
-        false,
-        head_oid,
-        &view,
-        Some(created),
-    ))
+    let mut opened = opened_from(target, branch, false, head_oid, view, Some(created));
+    opened.update_error = update_error;
+    Ok(opened)
+}
+
+/// Decides, from one listing, whether the pull request already has a
+/// worktree, may be created, or must be refused.
+fn plan(
+    entries: &[ParsedWorktree],
+    repo: &Path,
+    branch: &str,
+    target: &Path,
+) -> Result<Plan, PrWorktreeError> {
+    // `git worktree list` prints the main checkout first. A pull request
+    // branch checked out there, or in the checkout this call was handed, is
+    // somebody's own work and is never updated by this feature.
+    let main = entries.first().map(|entry| Path::new(&entry.path));
+    if let Some(holder) = entries
+        .iter()
+        .find(|entry| entry.branch.as_deref() == Some(branch))
+    {
+        let holder_path = Path::new(&holder.path);
+        if same_path(holder_path, repo) {
+            return Err(refused(
+                PrWorktreeRefusalCode::BranchCheckedOut,
+                format!("Branch {branch} is already checked out in this worktree"),
+            ));
+        }
+        if main.is_some_and(|main| same_path(holder_path, main)) {
+            return Err(refused(
+                PrWorktreeRefusalCode::BranchCheckedOut,
+                format!("Branch {branch} is already checked out in the main checkout"),
+            ));
+        }
+        if holder.is_prunable || holder_path.symlink_metadata().is_err() {
+            return Err(refused(
+                PrWorktreeRefusalCode::WorktreeMissing,
+                format!(
+                    "The worktree for {branch} is registered at {} but its directory is gone; \
+                     run `git worktree prune`, then open the pull request again",
+                    holder.path
+                ),
+            ));
+        }
+        return Ok(Plan::Reuse(holder.path.clone()));
+    }
+    // An existing path is the caller's. Refuse before `gh pr view` and before
+    // any fetch so a retry finds the directory and the log untouched.
+    if target.symlink_metadata().is_ok() {
+        return Err(refused(
+            PrWorktreeRefusalCode::TargetExists,
+            format!("Worktree path already exists: {}", target.display()),
+        ));
+    }
+    Ok(Plan::Create)
+}
+
+/// The worktrees of `repo`, read from the one line the gate judged.
+fn list_entries(
+    repo: &Path,
+    repo_key: &str,
+    gate: Gate<'_>,
+) -> Result<Vec<ParsedWorktree>, PrWorktreeError> {
+    judge(repo_key, &worktree_list_porcelain_argv(), gate)?;
+    read_worktree_entries(repo).map_err(PrWorktreeError::Command)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,67 +456,80 @@ fn reuse_worktree(
     gate: Gate<'_>,
 ) -> Result<PrWorktreeOpened, PrWorktreeError> {
     let view = view_pull_request(repo, repo_key, github, number, gate)?;
-    // Update only this worktree. A source-only refspec writes FETCH_HEAD and
-    // does not move the remote-tracking refs the main checkout uses. A gate
-    // refusal stops here; this worktree already existed, so it is not removed.
-    let worktree = PathBuf::from(&path);
-    fast_forward_checked_out(&worktree, repo_key, remote_name, number, gate)?;
+    // Update only this worktree. A gate refusal stops here; this worktree
+    // already existed, so it is not removed.
+    let update_error = update_in_worktree(Path::new(&path), repo_key, remote_name, number, gate)?;
     let head_oid = head_oid(repo, repo_key, &format!("refs/heads/{branch}"), gate)?;
-    Ok(opened_from(
-        path,
-        branch.to_string(),
-        true,
-        head_oid,
-        &view,
-        None,
-    ))
+    let mut opened = opened_from(path, branch.to_string(), true, head_oid, &view, None);
+    opened.update_error = update_error;
+    Ok(opened)
 }
 
 /// Fast-forward the branch checked out in `cwd` to `pull/<number>/head`.
 ///
-/// The fetch names only the source, so it writes `FETCH_HEAD` in `cwd` and
-/// does not move remote-tracking refs. A gate refusal is returned. A rejected
-/// fast-forward leaves the checked-out tip where it was.
-fn fast_forward_checked_out(
+/// `Ok(None)` is an update (or nothing to do). `Ok(Some(reason))` is a failed
+/// fetch or a branch that cannot fast-forward; the checked-out tip stays where
+/// it was and the reason reaches the person. A gate refusal is an `Err`.
+///
+/// The fetch names only the source, so it writes `FETCH_HEAD` in `cwd` (a
+/// linked worktree has its own) and does not move remote-tracking refs.
+fn update_in_worktree(
     cwd: &Path,
     repo_key: &str,
     remote_name: &str,
     number: u64,
     gate: Gate<'_>,
-) -> Result<(), PrWorktreeError> {
+) -> Result<Option<String>, PrWorktreeError> {
     let pull = format!("pull/{number}/head");
-    match judged_git(
+    match judged_git_network(
         cwd,
         repo_key,
-        &["fetch", "--no-tags", remote_name, &pull],
+        &["fetch", "--no-tags", "--", remote_name, &pull],
         gate,
     ) {
-        Err(StepError::Gate(message)) => {
-            Err(PrWorktreeError::Command(CommandError::plain(message)))
-        }
-        Err(StepError::Git(_)) => Ok(()),
+        Err(StepError::Gate(message)) => Err(PrWorktreeError::Command(CommandError::plain(message))),
+        Err(StepError::Git(error)) => Ok(Some(format!(
+            "Could not fetch the pull request head, so the branch was not updated: {}",
+            bounded_error(error.message().to_string())
+        ))),
         Ok(_) => match judged_git(cwd, repo_key, &["merge", "--ff-only", "FETCH_HEAD"], gate) {
             Err(StepError::Gate(message)) => {
                 Err(PrWorktreeError::Command(CommandError::plain(message)))
             }
-            Err(StepError::Git(_)) | Ok(_) => Ok(()),
+            Err(StepError::Git(error)) => Ok(Some(format!(
+                "The local branch cannot fast-forward to the pull request head and was left as it is: {}",
+                bounded_error(error.message().to_string())
+            ))),
+            Ok(_) => Ok(None),
         },
     }
 }
 
+/// Fetches the pull request head onto this call's own staging ref. The ref is
+/// written with `--no-write-fetch-head` so the repository's `FETCH_HEAD`, the
+/// record of somebody's last fetch, is left alone (git 2.29; the supported
+/// floor is 2.36).
 fn fetch_staging(
-    repo: &Path,
-    repo_key: &str,
+    attempt: &mut Attempt,
     remote_name: &str,
     number: u64,
-    staging: &str,
     gate: Gate<'_>,
 ) -> Result<(), PrWorktreeError> {
-    let spec = format!("+pull/{number}/head:{staging}");
-    match judged_git(
-        repo,
-        repo_key,
-        &["fetch", "--no-tags", remote_name, &spec],
+    let spec = format!("+pull/{number}/head:{}", attempt.staging);
+    // Recorded before the fetch: a fetch that fails after creating the ref
+    // must still be cleaned up, and deleting an absent ref is a no-op.
+    attempt.fetched_staging = true;
+    match judged_git_network(
+        &attempt.repo,
+        &attempt.repo_key,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            remote_name,
+            &spec,
+        ],
         gate,
     ) {
         Ok(_) => Ok(()),
@@ -376,16 +544,7 @@ fn fetch_staging(
                     bounded_error(error.message().to_string())
                 ),
             );
-            if let Err(message) = delete_ref(
-                repo,
-                repo_key,
-                staging,
-                &["update-ref", "-d", staging],
-                gate,
-            ) {
-                return Err(cleanup_refused(failed, message));
-            }
-            Err(failed)
+            Err(rollback(attempt, failed, gate))
         }
     }
 }
@@ -451,6 +610,7 @@ fn opened_from(
             .map(|owner| owner.login.clone())
             .unwrap_or_default(),
         created,
+        update_error: None,
     }
 }
 
@@ -522,12 +682,33 @@ fn judged_git(
     args: &[&str],
     gate: Gate<'_>,
 ) -> Result<String, StepError> {
+    judged(cwd, repo_key, args, gate, git_text)
+}
+
+/// [`judged_git`] under the network timeout, for the commands that talk to
+/// the remote.
+fn judged_git_network(
+    cwd: &Path,
+    repo_key: &str,
+    args: &[&str],
+    gate: Gate<'_>,
+) -> Result<String, StepError> {
+    judged(cwd, repo_key, args, gate, git_text_network)
+}
+
+fn judged(
+    cwd: &Path,
+    repo_key: &str,
+    args: &[&str],
+    gate: Gate<'_>,
+    run: fn(&Path, &[&str]) -> Result<String, CommandError>,
+) -> Result<String, StepError> {
     let mut owned = Vec::with_capacity(args.len() + 1);
     owned.push("git".to_string());
     owned.extend(args.iter().copied().map(str::to_string));
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
     gate(repo_key, &refs).map_err(StepError::Gate)?;
-    git_text(cwd, args).map_err(StepError::Git)
+    run(cwd, args).map_err(StepError::Git)
 }
 
 fn judge(repo_key: &str, argv: &[String], gate: Gate<'_>) -> Result<(), PrWorktreeError> {
@@ -567,27 +748,39 @@ fn delete_ref(
     }
 }
 
+/// Deletes this call's staging ref, when it fetched one.
+fn rollback_staging(attempt: &Attempt, gate: Gate<'_>) -> Result<(), PrWorktreeError> {
+    if !attempt.fetched_staging {
+        return Ok(());
+    }
+    delete_ref(
+        &attempt.repo,
+        &attempt.repo_key,
+        &attempt.staging,
+        &["update-ref", "-d", &attempt.staging],
+        gate,
+    )
+    .map_err(|message| PrWorktreeError::Command(CommandError::plain(message)))
+}
+
+/// Removes what this call made and nothing else: a worktree whose add
+/// returned (never a directory it merely found), the branch it created while
+/// that branch still points at its own staging commit and no worktree holds
+/// it, and its own staging ref.
 fn rollback(attempt: &Attempt, origin: PrWorktreeError, gate: Gate<'_>) -> PrWorktreeError {
-    if attempt.add_started {
+    if attempt.owns_worktree {
         let remove = remove_worktree_argv(&attempt.target, true);
         if let Err(error) = judge(&attempt.repo_key, &remove, gate) {
             return cleanup_refused(origin, error_text(&error));
         }
         run_git(&attempt.repo, &remove);
-        let target = Path::new(&attempt.target);
-        if target.symlink_metadata().is_ok() && !same_path(target, &attempt.repo) {
-            let _ = std::fs::remove_dir_all(target);
-        }
         let prune = prune_worktree_argv();
         if let Err(error) = judge(&attempt.repo_key, &prune, gate) {
             return cleanup_refused(origin, error_text(&error));
         }
         run_git(&attempt.repo, &prune);
     }
-    if attempt.created_branch {
-        // Delete the branch only when it still points at the staging commit
-        // this call fetched. A branch someone else created, including one
-        // planted at a different commit before `git worktree add` ran, stays.
+    if attempt.created_branch && attempt.fetched_staging {
         let branch_ref = format!("refs/heads/{}", attempt.branch);
         let branch_tip = match ref_object(&attempt.repo, &attempt.repo_key, &branch_ref, gate) {
             Ok(tip) => tip,
@@ -599,7 +792,15 @@ fn rollback(attempt: &Attempt, origin: PrWorktreeError, gate: Gate<'_>) -> PrWor
                     Ok(tip) => tip,
                     Err(error) => return cleanup_refused(origin, error_text(&error)),
                 };
-            if staging_tip.as_deref() == Some(branch_tip.as_str()) {
+            // A listing that cannot be read counts as held: the branch stays.
+            let held = list_entries(&attempt.repo, &attempt.repo_key, gate)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.branch.as_deref() == Some(attempt.branch.as_str()))
+                })
+                .unwrap_or(true);
+            if staging_tip.as_deref() == Some(branch_tip.as_str()) && !held {
                 if let Err(message) = delete_ref(
                     &attempt.repo,
                     &attempt.repo_key,
@@ -612,16 +813,8 @@ fn rollback(attempt: &Attempt, origin: PrWorktreeError, gate: Gate<'_>) -> PrWor
             }
         }
     }
-    if attempt.fetched_staging {
-        if let Err(message) = delete_ref(
-            &attempt.repo,
-            &attempt.repo_key,
-            &attempt.staging,
-            &["update-ref", "-d", &attempt.staging],
-            gate,
-        ) {
-            return cleanup_refused(origin, message);
-        }
+    if let Err(error) = rollback_staging(attempt, gate) {
+        return cleanup_refused(origin, error_text(&error));
     }
     origin
 }
@@ -1012,8 +1205,7 @@ exec "$real" "$@"
 
     #[cfg(unix)]
     fn worktree_count(repo: &Path) -> usize {
-        let text = git_text(repo, &["worktree", "list", "--porcelain"]).unwrap();
-        parse_worktree_list_porcelain(&text).len()
+        read_worktree_entries(repo).unwrap().len()
     }
 
     #[cfg(unix)]
@@ -1052,7 +1244,7 @@ exec "$real" "$@"
             );
             assert!(!case.repo.join("ran.marker").exists());
             assert!(ref_absent(&case.repo, "refs/heads/feature"));
-            assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+            assert!(staging_refs(&case.repo).is_empty());
             assert_eq!(
                 git_text(&case.repo, &["rev-parse", "refs/remotes/origin/main"])
                     .unwrap()
@@ -1193,10 +1385,7 @@ exec "$real" "$@"
                         open_at(&case.repo_s, number, true, false).expect_err("must refuse");
                     assert_eq!(refusal(&error).code, PrWorktreeRefusalCode::FetchFailed);
                     assert!(ref_absent(&case.repo, &format!("refs/heads/pr/{number}")));
-                    assert!(ref_absent(
-                        &case.repo,
-                        &format!("refs/gitpulse/pr-heads/{number}")
-                    ));
+                    assert!(staging_refs(&case.repo).is_empty());
                     let target = resolve_worktree_path_for_branch(
                         &case.repo_s,
                         &format!("pr/{number}"),
@@ -1270,7 +1459,7 @@ exec "$real" "$@"
                     "pr/7"
                 );
                 assert_eq!(worktree_count(&case.repo), 1);
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+                assert!(staging_refs(&case.repo).is_empty());
                 let calls = std::fs::read_to_string(&case.log).unwrap();
                 assert!(
                     !calls.lines().any(|line| line.contains("pr view")),
@@ -1414,7 +1603,7 @@ exec "$real" "$@"
                 );
                 let target = resolve_worktree_path_for_branch(&case.repo_s, "pr/7", None).unwrap();
                 assert!(!target.exists(), "{}", target.display());
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+                assert!(staging_refs(&case.repo).is_empty());
                 assert_eq!(worktree_count(&case.repo), 1);
                 assert_ne!(ahead, case.oid_a);
             },
@@ -1460,7 +1649,7 @@ exec "$real" "$@"
                     std::fs::read_to_string(worktree.join("AHEAD.md")).unwrap(),
                     "ahead\n"
                 );
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+                assert!(staging_refs(&case.repo).is_empty());
             },
         );
     }
@@ -1498,7 +1687,7 @@ exec "$real" "$@"
                 let target = resolve_worktree_path_for_branch(&case.repo_s, "pr/7", None).unwrap();
                 assert!(!target.exists(), "{}", target.display());
                 assert_eq!(worktree_count(&case.repo), 1);
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+                assert!(staging_refs(&case.repo).is_empty());
             },
         );
     }
@@ -1532,7 +1721,7 @@ exec "$real" "$@"
                     .expect_err("add must refuse");
                 refuses_message(&missing, "worktree add refused");
                 assert!(ref_absent(&case.repo, "refs/heads/pr/9"));
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/9"));
+                assert!(staging_refs(&case.repo).is_empty());
                 let missing_target =
                     resolve_worktree_path_for_branch(&case.repo_s, "pr/9", None).unwrap();
                 assert!(!missing_target.exists(), "{}", missing_target.display());
@@ -1547,7 +1736,7 @@ exec "$real" "$@"
                     case.oid_b,
                     "rollback must not delete a branch this call did not create"
                 );
-                assert!(ref_absent(&case.repo, "refs/gitpulse/pr-heads/7"));
+                assert!(staging_refs(&case.repo).is_empty());
                 let target = resolve_worktree_path_for_branch(&case.repo_s, "pr/7", None).unwrap();
                 assert!(!target.exists(), "{}", target.display());
                 assert_eq!(
@@ -1598,5 +1787,310 @@ exec "$real" "$@"
             );
             assert!(!calls.contains("--hostname"), "{calls}");
         });
+    }
+
+    /// A directory that appears at the target after the existence check and
+    /// before `git worktree add` is not this call's. Rollback must not delete
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_does_not_delete_a_directory_it_did_not_create() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let target = resolve_worktree_path_for_branch(&case.repo_s, "pr/7", None).unwrap();
+                let planted = target.clone();
+                let gate = move |repo: &str, argv: &[&str]| {
+                    let adding = argv.first() == Some(&"git")
+                        && argv.get(1) == Some(&"worktree")
+                        && argv.contains(&"add");
+                    if adding && !planted.exists() {
+                        std::fs::create_dir_all(&planted).unwrap();
+                        std::fs::write(planted.join("keep-me"), "user work").unwrap();
+                    }
+                    real_gate(repo, argv)
+                };
+                let result = open_pull_request_worktree(&case.repo_s, 7, false, false, &gate);
+                assert!(result.is_err(), "git cannot add into a populated directory");
+                assert!(
+                    target.join("keep-me").is_file(),
+                    "rollback deleted {} which this call did not create",
+                    target.display()
+                );
+                assert!(ref_absent(&case.repo, "refs/heads/pr/7"));
+                assert!(staging_refs(&case.repo).is_empty());
+            },
+        );
+    }
+
+    /// B reaches its `worktree add` and a second open of the same pull request
+    /// starts then. A must wait for B (the pull request's open lock), and reuse
+    /// B's worktree. Nothing either call does may remove the other's worktree
+    /// or branch, and neither leaves a staging ref.
+    #[cfg(unix)]
+    #[test]
+    fn a_concurrent_open_of_the_same_pull_request_keeps_one_worktree() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::channel;
+        use std::sync::Mutex;
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let (done_tx, done_rx) = channel::<()>();
+                let done_rx = Mutex::new(done_rx);
+                let spawned = AtomicBool::new(false);
+                let other: Mutex<Option<Result<PrWorktreeOpened, String>>> = Mutex::new(None);
+                let repo_s = case.repo_s.as_str();
+                let other_ref = &other;
+                // The command gate takes the serial lock this test already
+                // holds, so a second thread could never reach it.
+                let allow_all = |_: &str, _: &[&str]| -> Result<(), String> { Ok(()) };
+                let first = std::thread::scope(|scope| {
+                    let gate = |repo: &str, argv: &[&str]| {
+                        let adding = argv.first() == Some(&"git")
+                            && argv.get(1) == Some(&"worktree")
+                            && argv.contains(&"add");
+                        if adding && !spawned.swap(true, Ordering::SeqCst) {
+                            let tx = done_tx.clone();
+                            scope.spawn(move || {
+                                let result =
+                                    open_pull_request_worktree(repo_s, 7, false, false, &allow_all)
+                                        .map_err(|e| error_text(&e));
+                                *other_ref.lock().unwrap() = Some(result);
+                                let _ = tx.send(());
+                            });
+                            // Without the open lock the other call
+                            // finishes inside this window.
+                            let _ = done_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(std::time::Duration::from_millis(1500));
+                        }
+                        allow_all(repo, argv)
+                    };
+                    open_pull_request_worktree(repo_s, 7, false, false, &gate)
+                        .map_err(|e| error_text(&e))
+                });
+                let second = other.lock().unwrap().take().expect("the other call ran");
+                let first = first.expect("the first open succeeds");
+                let second = second.expect("the second open succeeds");
+                assert_eq!(first.path, second.path, "one worktree serves both");
+                assert!(
+                    Path::new(&first.path).is_dir(),
+                    "a rollback removed the worktree {}",
+                    first.path
+                );
+                assert!(!ref_absent(&case.repo, "refs/heads/pr/7"));
+                assert_eq!(worktree_count(&case.repo), 2);
+                assert_eq!(
+                    [first.reused, second.reused]
+                        .iter()
+                        .filter(|reused| **reused)
+                        .count(),
+                    1,
+                    "exactly one call created it"
+                );
+                assert!(staging_refs(&case.repo).is_empty());
+            },
+        );
+    }
+
+    /// Opening from a linked worktree while `pr/7` is checked out in the main
+    /// checkout must neither fast-forward nor otherwise touch the main
+    /// checkout.
+    #[cfg(unix)]
+    #[test]
+    fn opening_from_a_linked_worktree_does_not_move_the_main_checkout() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let ahead = publish_fast_forward(case);
+                crate::test_support::git_in(&case.repo, &["switch", "pr/7"]);
+                let side = case.repo.parent().unwrap().join("side");
+                let side_s = side.to_str().unwrap().to_string();
+                crate::test_support::git_in(&case.repo, &["worktree", "add", "--detach", &side_s]);
+                let side_s = side.canonicalize().unwrap().to_str().unwrap().to_string();
+                let before = git_text(&case.repo, &["rev-parse", "HEAD"]).unwrap();
+                let error = open_at(&side_s, 7, false, false)
+                    .expect_err("pr/7 is checked out in the main checkout");
+                assert_eq!(
+                    refusal(&error).code,
+                    PrWorktreeRefusalCode::BranchCheckedOut
+                );
+                let after = git_text(&case.repo, &["rev-parse", "HEAD"]).unwrap();
+                assert_eq!(
+                    before.trim(),
+                    after.trim(),
+                    "main checkout HEAD moved (ahead {ahead})"
+                );
+                assert!(!case.repo.join("AHEAD.md").exists());
+                assert!(staging_refs(&case.repo).is_empty());
+            },
+        );
+    }
+
+    /// A worktree whose directory was deleted is listed `prunable`. It is not
+    /// reusable, and the open must say so rather than report it reused.
+    #[cfg(unix)]
+    #[test]
+    fn a_prunable_worktree_is_refused_not_reported_as_reused() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                std::fs::remove_dir_all(&opened.path).unwrap();
+                let error = open_at(&case.repo_s, 7, false, false)
+                    .expect_err("a missing worktree is not reusable");
+                let refusal = refusal(&error);
+                assert_eq!(refusal.code, PrWorktreeRefusalCode::WorktreeMissing);
+                assert!(refusal.message.contains("prune"), "{}", refusal.message);
+                assert!(!Path::new(&opened.path).exists());
+                assert!(staging_refs(&case.repo).is_empty());
+            },
+        );
+    }
+
+    /// Reusing a worktree whose update fails (the pull request head is gone
+    /// from the remote) is reported with the reason, not as a clean update.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_update_on_reuse_is_reported() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                assert_eq!(opened.update_error, None);
+                let bare = case.repo.parent().unwrap().join("origin.git");
+                crate::test_support::git_in(&bare, &["update-ref", "-d", "refs/pull/7/head"]);
+                let again = open_at(&case.repo_s, 7, false, false).expect("the worktree exists");
+                assert!(again.reused);
+                let reason = again.update_error.expect("the failed fetch is reported");
+                assert!(reason.contains("fetch"), "{reason}");
+                assert_eq!(again.head_oid, opened.head_oid);
+            },
+        );
+    }
+
+    /// An existing local `pr/7` that cannot be fast-forwarded (it has commits
+    /// the pull request does not) is attached as it is and says so.
+    #[cfg(unix)]
+    #[test]
+    fn an_attached_branch_that_cannot_fast_forward_says_so() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                crate::test_support::git_in(&case.repo, &["checkout", "-b", "other"]);
+                std::fs::write(case.repo.join("OTHER.md"), "other\n").unwrap();
+                crate::test_support::git_in(&case.repo, &["add", "OTHER.md"]);
+                crate::test_support::git_in(&case.repo, &["commit", "-m", "unrelated local work"]);
+                let local = git_text(&case.repo, &["rev-parse", "HEAD"]).unwrap();
+                let local = local.trim().to_string();
+                crate::test_support::git_in(&case.repo, &["checkout", "main"]);
+                crate::test_support::git_in(&case.repo, &["branch", "-f", "pr/7", &local]);
+                crate::test_support::git_in(&case.repo, &["checkout", "-b", "theirs"]);
+                std::fs::write(case.repo.join("THEIRS.md"), "theirs\n").unwrap();
+                crate::test_support::git_in(&case.repo, &["add", "THEIRS.md"]);
+                crate::test_support::git_in(&case.repo, &["commit", "-m", "the pull request"]);
+                let bare = case.repo.parent().unwrap().join("origin.git");
+                let bare_s = bare.to_str().unwrap();
+                crate::test_support::git_in(
+                    &case.repo,
+                    &["push", "-f", bare_s, "theirs:refs/pull/7/head"],
+                );
+                crate::test_support::git_in(&case.repo, &["checkout", "main"]);
+                crate::test_support::git_in(&case.repo, &["branch", "-D", "theirs"]);
+                crate::test_support::git_in(&case.repo, &["branch", "-D", "other"]);
+                let opened = open_at(&case.repo_s, 7, false, false).expect("attach pr/7");
+                assert_eq!(opened.head_oid, local);
+                let reason = opened
+                    .update_error
+                    .expect("an unrelated local branch is not the pull request");
+                assert!(reason.contains("fast-forward"), "{reason}");
+            },
+        );
+    }
+
+    /// A worktree path holding a newline must not split its listing record:
+    /// the second line below would read as that checkout's branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_path_with_a_newline_cannot_pose_as_the_pull_request_branch() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let odd = case
+                    .repo
+                    .parent()
+                    .unwrap()
+                    .join("odd\nbranch refs/heads/pr/7");
+                crate::test_support::git_in(
+                    &case.repo,
+                    &["worktree", "add", "--detach", odd.to_str().unwrap()],
+                );
+                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                assert!(!opened.reused, "reused {}", opened.path);
+                assert_eq!(opened.branch, "pr/7");
+                assert_ne!(Path::new(&opened.path), odd.as_path());
+                assert!(Path::new(&opened.path).is_dir());
+            },
+        );
+    }
+
+    /// The staging fetch writes a ref, not `FETCH_HEAD`: the main checkout's
+    /// own `FETCH_HEAD` is somebody else's record of their last fetch.
+    #[cfg(unix)]
+    #[test]
+    fn opening_does_not_overwrite_the_main_checkouts_fetch_head() {
+        with_pr_repo(
+            "https://github.com/acme/gitpulse.git",
+            false,
+            false,
+            |case| {
+                let fetch_head = case.repo.join(".git").join("FETCH_HEAD");
+                std::fs::write(&fetch_head, "sentinel\n").unwrap();
+                open_at(&case.repo_s, 7, false, false).expect("open pr 7");
+                assert_eq!(std::fs::read_to_string(&fetch_head).unwrap(), "sentinel\n");
+            },
+        );
+    }
+
+    #[test]
+    fn a_remote_name_git_would_read_as_an_option_is_refused() {
+        assert!(fetchable_remote_name("origin").is_ok());
+        assert!(fetchable_remote_name("team/upstream").is_ok());
+        for name in ["-origin", "--upload-pack=x", ""] {
+            let error = fetchable_remote_name(name).expect_err(name);
+            assert_eq!(refusal(&error).code, PrWorktreeRefusalCode::FetchFailed);
+        }
+    }
+
+    #[cfg(unix)]
+    fn staging_refs(repo: &Path) -> Vec<String> {
+        git_text(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/gitpulse/pr-heads/",
+            ],
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
     }
 }

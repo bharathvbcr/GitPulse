@@ -197,6 +197,7 @@
             head_ref: `topic-${a.number}`,
             head_owner: "acme",
             created: null,
+            update_error: null,
           },
         }),
         cmd_ci_local: () => new Promise((resolve) => ciPending.push(resolve)),

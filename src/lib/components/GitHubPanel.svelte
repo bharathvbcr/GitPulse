@@ -142,7 +142,9 @@
   const checkingOut = new SvelteSet<number>();
   /** PR numbers being opened in a new worktree. Either set disables both actions. */
   const openingWorktree = new SvelteSet<number>();
-  const prActionsLocked = $derived(checkingOut.size > 0 || openingWorktree.size > 0);
+  /** An expanded detail is running its own action (review, merge, checkout or worktree open). */
+  let detailBusy = $state(false);
+  const prActionsLocked = $derived(checkingOut.size > 0 || openingWorktree.size > 0 || detailBusy);
   let inflight: AsyncGuard | null = null;
 
   // --- Actions workflows (CI/CD) ---
@@ -659,6 +661,8 @@
     try {
       const result = await openPullRequestWorktree(repo, number);
       if ($repoStore.currentPath !== repo) return;
+      await repoStore.refresh(repo);
+      if ($repoStore.currentPath !== repo) return;
       actionNotice = withVerdict(describePrWorktree(result.output), result.policy);
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) actionError = formatError(err);
@@ -694,6 +698,20 @@
       // clobber a newer instance — but a path-gated reset here would strand
       // the spinner when the user switches repos mid-checkout.
       checkingOut.delete(number);
+    }
+  }
+
+  /** A worktree opened from the detail: refresh what lists worktrees, then say so. */
+  async function openedInWorktree(message: string) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    actionError = null;
+    try {
+      await repoStore.refresh(repo);
+      if ($repoStore.currentPath !== repo) return;
+      actionNotice = message;
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) repoStore.setError(formatError(err));
     }
   }
 
@@ -1210,6 +1228,8 @@
                       locked={prActionsLocked}
                       onChanged={(message) => void reloadThenNotice(message)}
                       onCheckedOut={(message) => void checkedOutInPlace(message)}
+                      onWorktreeOpened={(message) => void openedInWorktree(message)}
+                      onBusyChange={(busy) => (detailBusy = busy)}
                     />
                   {/if}
                   </div>
