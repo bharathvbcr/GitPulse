@@ -64,11 +64,13 @@ use std::path::{Path, PathBuf};
 /// How long before a reflog entry a command may have started and still be
 /// credited with it: two minutes.
 ///
-/// A command row is dated when the agent *issued* the Bash call; the reflog
-/// entry is written when `git` finishes, after any `pre-commit` /
-/// `commit-msg` hook. Hooks that run a type check or a test suite take tens of
-/// seconds, so a window of a few seconds would drop the commits that matter
-/// most (the ones with a slow gate). A rebase replays every pick inside one
+/// A command row is dated when the agent *issued* the Bash call; git dates the
+/// reflog entry at the second its run *started* (the entry is written after
+/// any `pre-commit` / `commit-msg` hook, but stamped with the time the run
+/// began), so the entry is never earlier than the call. A command that ends
+/// before the entry's second cannot have made it. Hooks that run a type check
+/// or a test suite take tens of seconds, so a window of a few seconds would
+/// drop the commits that matter most (the ones with a slow gate). A rebase replays every pick inside one
 /// command, so its entries land well after it started too. Longer widens the
 /// chance that a second session's command also fits, which the matcher
 /// reports as ambiguity rather than resolving, so the cost of a generous
@@ -90,6 +92,16 @@ pub const LINK_SCAN_ROWS: i64 = 20_000;
 /// proof that nothing in it matters. A ledger larger than both is not provable
 /// and reads as [`basis::SCAN_CAPPED`].
 pub const HIDDEN_PROBE_ROWS: i64 = 200_000;
+
+/// The version of the record a transcript command row carries beside its
+/// result: `command_meta` (this number), `cwd` (where the call ran) and
+/// `background` (whether it was moved to the background). Ingest writes it; a
+/// row without it was written before the cwd and the backgrounding were known,
+/// and is never used to link.
+pub const COMMAND_META_VERSION: i64 = 1;
+
+/// The longest `cwd` ingest records and the reader resolves.
+pub const MAX_COMMAND_CWD_BYTES: usize = 4096;
 
 /// Most commits one call links; the rest are reported as not examined.
 pub const LINK_MAX_COMMITS: usize = 256;
@@ -235,6 +247,13 @@ struct Row {
     /// result's (the `duration_ms` column). Present only when both were timed:
     /// the call's completion is then `at_ms + duration_ms`.
     duration_ms: Option<i64>,
+    /// `detail_json.command_meta` of a transcript row ([`COMMAND_META_VERSION`]);
+    /// absent on a row written before the record existed.
+    meta: Option<i64>,
+    /// `detail_json.cwd`: where the call ran.
+    cwd: Option<String>,
+    /// `detail_json.background`: the call was moved to the background.
+    background: bool,
     after_ref: Option<String>,
     ts_utc: String,
     /// The event's own time, only when its basis is the one this kind of row's
@@ -274,6 +293,17 @@ pub fn link_commits(repo_path: &str, commits: &[String]) -> HashMap<String, Comm
     for sha in skipped {
         answers.insert(sha.to_string(), CommitLink::none(basis::NOT_EXAMINED));
     }
+    // The ledger lives at the repository's anchor, like every other reader's:
+    // asked from a lane's path, the lane's own (absent) ledger is not the
+    // answer. A path that is not in a repository is read as given.
+    // A main checkout (`.git` is a directory) is its own anchor, which costs
+    // no process; any other path is resolved.
+    let repo_path = &if Path::new(repo_path).join(".git").is_dir() {
+        repo_path.to_string()
+    } else {
+        super::bindings::repository_address_readonly(repo_path)
+            .map_or_else(|_| repo_path.to_string(), |address| address.anchor)
+    };
     if !super::is_initialised(repo_path) {
         for sha in examined {
             answers.insert(sha.to_string(), CommitLink::none(basis::LEDGER_ABSENT));
@@ -347,7 +377,13 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                          THEN json_extract(detail_json, '$.occurred_at_basis') END,
                     CASE WHEN json_valid(detail_json)
                          THEN json_extract(detail_json, '$.result') END,
-                    duration_ms
+                    duration_ms,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.command_meta') END,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.cwd') END,
+                    CASE WHEN json_valid(detail_json)
+                         THEN json_extract(detail_json, '$.background') END
              FROM events
              WHERE id > ?1
                AND ((action = 'session.command' AND object LIKE '%git%')
@@ -375,6 +411,14 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                     ValueRef::Integer(ms) => Some(ms),
                     _ => None,
                 },
+                meta: match row.get_ref(12)? {
+                    ValueRef::Integer(version) => Some(version),
+                    _ => None,
+                },
+                cwd: text(row, 13)?,
+                // Anything but a plain `false` is a backgrounded call, and so
+                // is a record that does not say.
+                background: !matches!(row.get_ref(14)?, ValueRef::Integer(0)),
                 at_ms: at
                     .filter(|_| stamp_basis.as_deref() == Some(trusted))
                     .and_then(|text| ids::parse_event_time(&text)),
@@ -531,9 +575,11 @@ struct Command {
     placed: Placed,
     target: Target,
     shape: Shape,
-    /// The git run is not the whole command ([`is_whole_command`]): the
-    /// transcript's `ok` is the exit status of something else, so it says
-    /// nothing about whether the commit was made.
+    /// The transcript's `ok` does not say the git run made its commit: the run
+    /// is not the whole command ([`is_whole_command`]), so `ok` is the status
+    /// of something else; or the call was moved to the background, so `ok` is
+    /// only that it was handed off; or the row has no command record
+    /// ([`COMMAND_META_VERSION`]) to say either. Never evidence for a link.
     masked: bool,
 }
 
@@ -545,8 +591,38 @@ fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) ->
         .filter_map(|row| {
             let placed = place(row, anchor, seen);
             let object = placed.row.object.as_deref()?;
-            let (target, shape) = read_command(object, Path::new(&placed.worktree));
-            let masked = !is_whole_command(object);
+            let row = &placed.row;
+            let recorded = row
+                .meta
+                .is_some_and(|version| version >= COMMAND_META_VERSION);
+            // Where the call ran, resolved through the filesystem. A row with
+            // no record of it, or whose directory is gone, has none: a bare
+            // `git` or a relative path then aims nowhere known.
+            let cwd = row
+                .cwd
+                .as_deref()
+                .filter(|cwd| recorded && cwd.len() <= MAX_COMMAND_CWD_BYTES)
+                .filter(|cwd| Path::new(cwd).is_absolute())
+                .and_then(|cwd| {
+                    std::fs::canonicalize(cwd)
+                        .ok()
+                        .filter(|dir| dir.is_dir())
+                        // A worktree since removed (a lane, after its merge)
+                        // has no directory to resolve; a call that ran at its
+                        // root, by its own spelling, is still at its root.
+                        .or_else(|| {
+                            (canonical(cwd) == placed.worktree)
+                                .then(|| PathBuf::from(&placed.worktree))
+                        })
+                });
+            let (mut target, shape) =
+                read_command_from(object, Path::new(&placed.worktree), cwd.as_deref());
+            // Only a call known to have run in a known directory is proved to
+            // have run here; one without is a candidate and no more.
+            if target == Target::Here && cwd.is_none() {
+                target = Target::Unknown;
+            }
+            let masked = !recorded || row.background || !is_whole_command(object);
             (target != Target::Elsewhere).then_some(Command {
                 masked,
                 placed,
@@ -558,7 +634,7 @@ fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) ->
 }
 
 /// A reflog entry's message, split the way git writes it: `verb (step): tail`.
-struct Entry<'a> {
+pub(super) struct Entry<'a> {
     verb: &'a str,
     /// The text of a trailing `(...)`, as in `rebase (pick)`.
     step: Option<&'a str>,
@@ -581,7 +657,7 @@ struct Entry<'a> {
 /// The verb is the head's first word (`cherry_pick` is the one hyphenated verb a
 /// run can write); the step is the last parenthesised word, which the folding
 /// leaves as a trailing `_` after a `__`.
-fn parse_entry<'a>(action: &'a str, object: &'a str) -> Option<Entry<'a>> {
+pub(super) fn parse_entry<'a>(action: &'a str, object: &'a str) -> Option<Entry<'a>> {
     let head = action.strip_prefix("reflog.")?;
     let (head, step) = match head
         .strip_suffix('_')
@@ -624,7 +700,7 @@ fn entry_of(row: &Row) -> Option<Entry<'_>> {
 /// `rebase (pick|continue|fixup|squash|reword|edit): m`,
 /// `pull --rebase (pick): m`, `merge b: Merge made by the 'ort' strategy.` and
 /// `pull: Merge made by ...`.
-fn creates_commit(entry: &Entry<'_>) -> bool {
+pub(super) fn creates_commit(entry: &Entry<'_>) -> bool {
     match entry.verb {
         "commit" | "revert" | "am" => true,
         // `git cherry-pick` of a commit whose parent is already HEAD moves the
@@ -634,10 +710,14 @@ fn creates_commit(entry: &Entry<'_>) -> bool {
                 && entry.step.is_none_or(|s| s == "continue")
         }
         "rebase" | "pull" => {
-            matches!(
+            // A step is read off a folded head, which a branch name can fake
+            // (`pull origin wip--pick-: Fast-forward` folds to a `pick` step),
+            // so a step counts only with a tail that is not a fast-forward.
+            (matches!(
                 entry.step,
                 Some("pick" | "continue" | "fixup" | "squash" | "reword" | "edit")
-            ) || (entry.verb == "pull" && entry.tail.starts_with("Merge made by"))
+            ) && !entry.tail.eq_ignore_ascii_case("fast-forward"))
+                || (entry.verb == "pull" && entry.tail.starts_with("Merge made by"))
         }
         "merge" => entry.tail.starts_with("Merge made by"),
         _ => false,
@@ -1139,7 +1219,9 @@ fn tokenize(command: &str) -> Option<(Vec<Vec<Word>>, bool)> {
                 open = true;
                 if matches!(other, '$' | '~' | '*' | '?' | '[' | ']' | '!') {
                     plain = false;
-                    grouped |= other == '$' && chars.peek() == Some(&'(');
+                    // `$(`, and `$'` / `$"` (ANSI-C and locale quoting, whose
+                    // escapes this reader does not follow).
+                    grouped |= other == '$' && matches!(chars.peek(), Some('(' | '\'' | '"'));
                 }
                 text.push(other);
             }
@@ -1161,7 +1243,7 @@ fn tokenize(command: &str) -> Option<(Vec<Vec<Word>>, bool)> {
 /// group, backtick, or `$(` / `$((` anywhere outside single quotes makes it
 /// false. A wrapper (`eval`, `sh -c`, `env`, `time`, `xargs`, `VAR=x git`,
 /// `! git`) is false because the first word must be `git` itself.
-fn is_whole_command(command: &str) -> bool {
+pub(super) fn is_whole_command(command: &str) -> bool {
     let command = command.trim();
     let Some(first) = command.split(is_boundary).next() else {
         return false;
@@ -1192,7 +1274,10 @@ fn is_whole_command(command: &str) -> bool {
             '\\' => {
                 chars.next();
             }
-            '$' if chars.peek() == Some(&'(') => return false,
+            // `$'...'` and `$"..."` quote differently from `'` and `"` (a `\'`
+            // inside the first does not end it), so what follows cannot be
+            // read by this scan: not a whole command.
+            '$' if matches!(chars.peek(), Some('(' | '\'' | '"')) => return false,
             ';' | '&' | '|' | '\n' | '\r' | '<' | '>' | '(' | ')' | '{' | '}' | '`' => {
                 return false;
             }
@@ -1334,13 +1419,30 @@ const REBASE_VERBS: &[&str] = &["rebase", "pull"];
 
 /// [`command_target`], and the shape of the commit-making runs proved to be
 /// here ([`Shape::NONE`] when there are none).
+#[cfg(test)]
 pub(crate) fn read_command(command: &str, worktree: &Path) -> (Target, Shape) {
+    read_command_from(command, worktree, Some(worktree))
+}
+
+/// [`read_command`] for a call that ran in `cwd`: the directory a bare `git`,
+/// a `cd` or a relative `-C` starts from. `None` when it is not known, so
+/// nothing relative to it resolves (an absolute path still does).
+pub(crate) fn read_command_from(
+    command: &str,
+    worktree: &Path,
+    cwd: Option<&Path>,
+) -> (Target, Shape) {
     let mut shape: Option<Shape> = None;
-    let target = read_command_into(command, worktree, &mut shape);
+    let target = read_command_into(command, worktree, cwd, &mut shape);
     (target, shape.unwrap_or(Shape::NONE))
 }
 
-fn read_command_into(command: &str, worktree: &Path, shape: &mut Option<Shape>) -> Target {
+fn read_command_into(
+    command: &str,
+    worktree: &Path,
+    cwd: Option<&Path>,
+    shape: &mut Option<Shape>,
+) -> Target {
     if !mentions_git(command) {
         return Target::Elsewhere;
     }
@@ -1350,7 +1452,7 @@ fn read_command_into(command: &str, worktree: &Path, shape: &mut Option<Shape>) 
     if grouped {
         return Target::Unknown;
     }
-    let mut dir: Option<PathBuf> = Some(worktree.to_path_buf());
+    let mut dir: Option<PathBuf> = cwd.map(Path::to_path_buf);
     let mut best = Target::Elsewhere;
     for words in segments.iter().filter(|words| !words.is_empty()) {
         let leading = words[0].text.as_str();
@@ -1485,25 +1587,281 @@ fn git_target(
         };
     }
     let all_args: Vec<&str> = rest.map(|word| word.text.as_str()).collect();
-    // The words that are the command's own, not a message's text.
-    let mut args = Vec::new();
-    let mut remaining = all_args.iter().copied();
-    while let Some(arg) = remaining.next() {
-        if NO_OP_ARGUMENTS.contains(&arg) {
-            return Target::Elsewhere;
-        }
-        if matches!(arg, "-m" | "--message" | "-F" | "--file") {
-            remaining.next();
-        } else {
-            args.push(arg);
-        }
+    if all_args.iter().any(|arg| NO_OP_ARGUMENTS.contains(arg)) {
+        return Target::Elsewhere;
     }
+    // The words that are the command's own, not an option's value. Every
+    // option must be one known to leave the run making a commit: any other
+    // (`--porcelain`, `--short`, `-z`, `--dry` and every other prefix of
+    // `--dry-run`, `--no-commit`, `--squash`, `-n` of a cherry-pick or revert,
+    // a flag this list has not heard of) may make the run create nothing, so
+    // what it did is not known.
+    let Some(args) = commit_making_args(subcommand, &all_args) else {
+        return Target::Unknown;
+    };
     let there = PathBuf::from(canonical(&worktree.to_string_lossy()));
     let target = aimed_at(work_tree, git_dir, here, worktree, &there);
     if target == Target::Here {
         *run = Some(shape_of(subcommand, &args));
     }
     target
+}
+
+/// What a commit-making verb's options may be for the run to still make its
+/// commit: the flags that take nothing, and the ones that take a value (a
+/// following word, `=value`, or for a short flag the rest of its cluster).
+struct Options {
+    short: &'static str,
+    short_valued: &'static str,
+    long: &'static [&'static str],
+    long_valued: &'static [&'static str],
+}
+
+fn options_of(subcommand: &str) -> Option<Options> {
+    Some(match subcommand {
+        "commit" => Options {
+            short: "asnqvS",
+            short_valued: "mFCct",
+            long: &[
+                "--all",
+                "--amend",
+                "--no-edit",
+                "--signoff",
+                "--no-signoff",
+                "--allow-empty",
+                "--allow-empty-message",
+                "--quiet",
+                "--no-verify",
+                "--verbose",
+                "--gpg-sign",
+                "--only",
+                "--include",
+                "--reset-author",
+                "--no-post-rewrite",
+            ],
+            long_valued: &[
+                "--message",
+                "--file",
+                "--author",
+                "--date",
+                "--reuse-message",
+                "--reedit-message",
+                "--fixup",
+                "--squash",
+                "--trailer",
+                "--cleanup",
+                "--template",
+                "--gpg-sign",
+            ],
+        },
+        "merge" => Options {
+            short: "qvS",
+            short_valued: "mXs",
+            long: &[
+                "--no-edit",
+                "--edit",
+                "--no-ff",
+                "--ff",
+                "--ff-only",
+                "--signoff",
+                "--no-signoff",
+                "--quiet",
+                "--verbose",
+                "--no-verify",
+                "--allow-unrelated-histories",
+                "--log",
+                "--no-log",
+                "--stat",
+                "--no-stat",
+                "--autostash",
+                "--no-autostash",
+                "--continue",
+                "--gpg-sign",
+            ],
+            long_valued: &[
+                "--message",
+                "--strategy",
+                "--strategy-option",
+                "--cleanup",
+                "--gpg-sign",
+                "--into-name",
+            ],
+        },
+        "cherry-pick" => Options {
+            short: "xsS",
+            short_valued: "mX",
+            long: &[
+                "--ff",
+                "--allow-empty",
+                "--allow-empty-message",
+                "--keep-redundant-commits",
+                "--signoff",
+                "--continue",
+                "--no-edit",
+                "--edit",
+                "--gpg-sign",
+            ],
+            long_valued: &[
+                "--mainline",
+                "--strategy",
+                "--strategy-option",
+                "--gpg-sign",
+            ],
+        },
+        "revert" => Options {
+            short: "sS",
+            short_valued: "mX",
+            long: &[
+                "--no-edit",
+                "--edit",
+                "--signoff",
+                "--continue",
+                "--gpg-sign",
+            ],
+            long_valued: &[
+                "--mainline",
+                "--strategy",
+                "--strategy-option",
+                "--gpg-sign",
+            ],
+        },
+        "pull" => Options {
+            short: "rqvp",
+            short_valued: "sX",
+            long: &[
+                "--rebase",
+                "--no-rebase",
+                "--ff-only",
+                "--ff",
+                "--no-ff",
+                "--no-edit",
+                "--edit",
+                "--autostash",
+                "--no-autostash",
+                "--quiet",
+                "--verbose",
+                "--no-tags",
+                "--tags",
+                "--prune",
+                "--no-verify",
+                "--signoff",
+                "--log",
+                "--no-log",
+                "--stat",
+                "--no-stat",
+            ],
+            long_valued: &["--rebase", "--strategy", "--strategy-option", "--depth"],
+        },
+        "am" => Options {
+            short: "3skqr",
+            short_valued: "",
+            long: &[
+                "--3way",
+                "--signoff",
+                "--keep",
+                "--quiet",
+                "--continue",
+                "--resolved",
+                "--no-verify",
+                "--keep-non-patch",
+                "--utf8",
+                "--committer-date-is-author-date",
+                "--ignore-date",
+            ],
+            long_valued: &["--directory", "--exclude", "--include"],
+        },
+        "rebase" => Options {
+            short: "qvifrx",
+            short_valued: "xs",
+            long: &[
+                "--continue",
+                "--skip",
+                "--interactive",
+                "--autostash",
+                "--no-autostash",
+                "--rebase-merges",
+                "--autosquash",
+                "--no-autosquash",
+                "--keep-empty",
+                "--no-keep-empty",
+                "--quiet",
+                "--verbose",
+                "--no-verify",
+                "--root",
+                "--force-rebase",
+                "--fork-point",
+                "--no-fork-point",
+                "--signoff",
+                "--update-refs",
+                "--no-update-refs",
+                "--ff",
+                "--no-ff",
+                "--reapply-cherry-picks",
+                "--no-reapply-cherry-picks",
+            ],
+            long_valued: &[
+                "--onto",
+                "--exec",
+                "--empty",
+                "--strategy",
+                "--strategy-option",
+                "--rebase-merges",
+                "--gpg-sign",
+            ],
+        },
+        _ => return None,
+    })
+}
+
+/// The words of `args` that are the command's own (not an option's value),
+/// when every option among them is one [`options_of`] lists for `subcommand`;
+/// `None` when any option is not, or the verb is not one it lists.
+fn commit_making_args<'a>(subcommand: &str, args: &[&'a str]) -> Option<Vec<&'a str>> {
+    let options = options_of(subcommand)?;
+    let mut own = Vec::new();
+    let mut words = args.iter().copied();
+    let mut after_dashes = false;
+    while let Some(arg) = words.next() {
+        if after_dashes || !arg.starts_with('-') || arg == "-" {
+            own.push(arg);
+        } else if arg == "--" {
+            after_dashes = true;
+            own.push(arg);
+        } else if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) => {
+                    let name = format!("--{name}");
+                    if !options.long_valued.contains(&name.as_str()) {
+                        return None;
+                    }
+                    own.push(arg.split_once('=').map_or(arg, |(flag, _)| flag));
+                }
+                None if options.long_valued.contains(&arg) && !options.long.contains(&arg) => {
+                    words.next()?;
+                    own.push(arg);
+                }
+                None if options.long.contains(&arg) => own.push(arg),
+                None => return None,
+            }
+        } else {
+            // A cluster of short flags (`-am`): each is a flag, and a valued
+            // one takes the rest of the word, or the next word when it ends it.
+            let cluster = &arg[1..];
+            for (at, letter) in cluster.char_indices() {
+                if options.short_valued.contains(letter) {
+                    if at + letter.len_utf8() == cluster.len() {
+                        words.next()?;
+                    }
+                    break;
+                }
+                if !options.short.contains(letter) {
+                    return None;
+                }
+            }
+            own.push(arg);
+        }
+    }
+    Some(own)
 }
 
 /// How many commits `git <subcommand> <args>` makes, as far as the words say.

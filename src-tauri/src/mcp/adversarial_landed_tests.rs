@@ -317,7 +317,15 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
             object: Some("git commit -m x".into()),
             outcome: Some(Outcome::Ok),
             duration_ms: Some(10_000),
-            detail_json: Some(r#"{"result":"ok"}"#.into()),
+            detail_json: Some(
+                serde_json::json!({
+                    "result": "ok",
+                    "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
+                    "cwd": repo,
+                    "background": false,
+                })
+                .to_string(),
+            ),
             event_stamp: Some(stamp(*at, "transcript")),
             ..Draft::default()
         })
@@ -430,7 +438,21 @@ fn put_row(
         // A call whose result was read ok was timed; one whose result was never
         // read has no end.
         duration_ms: (result == Some("ok")).then_some(5_000),
-        detail_json: result.map(|word| format!(r#"{{"result":"{word}"}}"#)),
+        // A command row as ingest writes it records where the call ran, with
+        // its result only when the result was read.
+        detail_json: if is_command {
+            let mut detail = serde_json::json!({
+                "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
+                "cwd": repo,
+                "background": false,
+            });
+            if let Some(word) = result {
+                detail["result"] = word.into();
+            }
+            Some(detail.to_string())
+        } else {
+            result.map(|word| format!(r#"{{"result":"{word}"}}"#))
+        },
         event_stamp: stamp.map(|(at, basis)| EventStamp {
             occurred_at: ids::iso8601_utc(at),
             occurred_at_basis: basis.into(),
@@ -474,7 +496,15 @@ fn every_session_basis_validates_against_the_output_schema() {
                     object: Some(cmd.into()),
                     outcome: Some(crate::ledger::Outcome::Ok),
                     duration_ms: Some(10_000),
-                    detail_json: Some(r#"{"result":"ok"}"#.into()),
+                    detail_json: Some(
+                        serde_json::json!({
+                            "result": "ok",
+                            "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
+                            "cwd": r,
+                            "background": false,
+                        })
+                        .to_string(),
+                    ),
                     event_stamp: Some(crate::ledger::EventStamp {
                         occurred_at: crate::ledger::ids::iso8601_utc(now - 2_000),
                         occurred_at_basis: "transcript".into(),

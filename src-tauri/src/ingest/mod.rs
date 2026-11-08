@@ -519,6 +519,19 @@ fn transcript_draft(
             detail["tool_use_id"] = id.clone().into();
         }
     }
+    if call.tool == "Bash" {
+        // What a reader needs to know of a command that the row's own columns
+        // do not say: where it ran (the row is filed under the deepest worktree
+        // containing it, which is not the directory a relative path or a bare
+        // `git` meant) and whether it ran to its end. The marker is the version
+        // of this record; a row without it was written before either was
+        // known, and a reader never links from one.
+        detail["command_meta"] = ledger::attribution::COMMAND_META_VERSION.into();
+        detail["background"] = call.background.into();
+        if !call.cwd.is_empty() && call.cwd.len() <= ledger::attribution::MAX_COMMAND_CWD_BYTES {
+            detail["cwd"] = call.cwd.clone().into();
+        }
+    }
     let outcome = match call.result {
         transcript::CallResult::Errored => Outcome::Failed,
         transcript::CallResult::Succeeded | transcript::CallResult::Unobserved => Outcome::Ok,

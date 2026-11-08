@@ -2878,7 +2878,15 @@ mod batch_tests {
                 object: Some((*text).into()),
                 outcome: Some(Outcome::Ok),
                 duration_ms: Some(10_000),
-                detail_json: Some(r#"{"result":"ok"}"#.into()),
+                detail_json: Some(
+                    serde_json::json!({
+                        "result": "ok",
+                        "command_meta": crate::ledger::attribution::COMMAND_META_VERSION,
+                        "cwd": repo.as_str(),
+                        "background": false,
+                    })
+                    .to_string(),
+                ),
                 event_stamp: Some(stamp(*at, "transcript")),
                 ..Draft::default()
             })

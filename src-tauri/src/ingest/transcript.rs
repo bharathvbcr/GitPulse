@@ -126,6 +126,13 @@ pub struct ToolCall {
     /// What a [`USAGE_TOOL`] row counted.
     #[serde(skip)]
     pub usage: Option<TokenUsage>,
+    /// The call was moved to the background: its input said
+    /// `run_in_background`, or its result was Claude Code's answer to a call
+    /// that outlived its timeout (`toolUseResult.backgroundTaskId`). The result
+    /// then says nothing of how the command ended, and `is_error: false` is
+    /// only that the call was handed off.
+    #[serde(skip)]
+    pub background: bool,
 }
 
 /// Every ledger action a transcript call can become, and only those.
@@ -304,6 +311,12 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
                 .get("command")
                 .and_then(|c| c.as_str())
                 .map(str::to_string),
+            // Anything but a plain `false` reads as backgrounded: the field is
+            // the agent's, and an unfamiliar spelling of it must not read as a
+            // call that ran to its end.
+            background: input
+                .get("run_in_background")
+                .is_some_and(|flag| !flag.is_null() && flag.as_bool() != Some(false)),
             ..base.clone()
         });
     }
@@ -340,6 +353,76 @@ struct ResultRecord<'a> {
     #[serde(borrow)]
     timestamp: Option<Cow<'a, str>>,
     message: Option<ResultMessage<'a>>,
+    /// The record's structured result, read only for whether it names a
+    /// background task.
+    #[serde(default, rename = "toolUseResult")]
+    tool_use_result: BackgroundMark,
+}
+
+/// Whether a record's `toolUseResult` carries a `backgroundTaskId`: Claude
+/// Code's answer to a call it moved to the background, whether the agent asked
+/// (`run_in_background`) or the call outlived its timeout. Every other field,
+/// and every other shape (the field is a string in some records), is skipped
+/// unread: it holds the tool's whole output.
+#[derive(Default)]
+struct BackgroundMark(bool);
+
+impl<'de> Deserialize<'de> for BackgroundMark {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Mark;
+        impl<'de> serde::de::Visitor<'de> for Mark {
+            type Value = BackgroundMark;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a tool result")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut named = false;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    named |= key == "backgroundTaskId";
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(BackgroundMark(named))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+        }
+        deserializer.deserialize_any(Mark)
+    }
 }
 
 #[derive(Deserialize)]
@@ -644,6 +727,7 @@ impl Reader {
         if let Some(at) = at_ms {
             self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
         }
+        let background = record.tool_use_result.0;
         let mut out = Vec::new();
         for block in blocks {
             if block.kind.as_deref() != Some("tool_result") {
@@ -667,6 +751,9 @@ impl Reader {
             } else {
                 CallResult::Succeeded
             };
+            // One record can answer several calls; when it says a task was
+            // backgrounded, none of them is read as having finished.
+            call.background |= background;
             call.duration_ms = at_ms
                 .zip(crate::ledger::ids::parse_event_time(&call.ts_utc))
                 .and_then(|(done, began)| {
@@ -1427,6 +1514,64 @@ mod reader_tests {
         let origin = call.origin.expect("origin");
         assert_eq!((origin.offset, origin.ordinal), (0, 0));
         assert_eq!(origin.digest, 0xabc);
+    }
+
+    /// A result record with a structured `toolUseResult`, as Claude Code writes
+    /// it (`toolUseResult` is a sibling of `message`, and a string in some
+    /// records).
+    fn result_with(ts: &str, id: &str, tool_use_result: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"SYNTHETIC-OUTPUT","is_error":false}}]}},"toolUseResult":{tool_use_result}}}"#
+        )
+    }
+
+    #[test]
+    fn a_call_moved_to_the_background_is_marked_whichever_side_says_so() {
+        // The result names a background task (a call that outlived its timeout,
+        // or one the agent backgrounded); no other shape of `toolUseResult`
+        // does, and none of them makes the record unreadable.
+        for (tool_use_result, background) in [
+            (
+                r#"{"stdout":"","stderr":"","backgroundTaskId":"b1","timedOutAfterMs":600000}"#,
+                true,
+            ),
+            (r#"{"stdout":"x","stderr":"","interrupted":false}"#, false),
+            (r#""Error: exit 1""#, false),
+            (r#"[1,2]"#, false),
+            ("null", false),
+            ("7", false),
+            ("true", false),
+            ("{}", false),
+        ] {
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5)).is_empty());
+            let done = feed(
+                &mut reader,
+                400,
+                &result_with(T0_2S, "tu1", tool_use_result),
+            );
+            assert_eq!(done.len(), 1, "{tool_use_result}");
+            assert_eq!(done[0].result, CallResult::Succeeded, "{tool_use_result}");
+            assert_eq!(done[0].background, background, "{tool_use_result}");
+        }
+        // The input's own flag, however it is spelled, and only a plain false
+        // is a call that ran in the foreground.
+        for (flag, background) in [
+            (r#","run_in_background":true"#, true),
+            (r#","run_in_background":"true""#, true),
+            (r#","run_in_background":1"#, true),
+            (r#","run_in_background":false"#, false),
+            (r#","run_in_background":null"#, false),
+            ("", false),
+        ] {
+            let block = format!(
+                r#"{{"type":"tool_use","id":"tu1","name":"Bash","input":{{"command":"git commit -m x"{flag}}}}}"#
+            );
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &block, 5)).is_empty());
+            let done = feed(&mut reader, 400, &result(T0_2S, "tu1", Some(false)));
+            assert_eq!(done[0].background, background, "{flag}");
+        }
     }
 
     #[test]

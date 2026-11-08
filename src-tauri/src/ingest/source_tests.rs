@@ -146,8 +146,10 @@ fn claude_rows_digest() -> (String, u64) {
 
 /// Pinned on the code before the source trait existed: the trait is a
 /// refactor of the Claude path, so every row and every counter it produces
-/// must be the one the old code produced.
-const CLAUDE_DIGEST: u64 = 15_870_773_247_515_364_499;
+/// must be the one the old code produced. Moved once, deliberately, for the
+/// command record a Bash row now carries in `detail_json` (`command_meta`,
+/// `cwd`, `background`: additive keys, no column or schema change).
+const CLAUDE_DIGEST: u64 = 7_206_014_933_657_775_814;
 
 #[test]
 fn claude_rows_are_byte_identical_to_what_they_were_before_sources() {

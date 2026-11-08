@@ -622,6 +622,18 @@ fn adv_deleting_an_identical_entry_does_not_swallow_the_next_one() {
     assert_eq!(resets, 3, "three resets happened: {second:?}");
 }
 
+/// What ingest writes into a command row's `detail_json`: the result, where the
+/// call ran, and that it was not backgrounded.
+fn w9_command_detail(cwd: &str) -> String {
+    serde_json::json!({
+        "result": "ok",
+        "command_meta": ledger::attribution::COMMAND_META_VERSION,
+        "cwd": cwd,
+        "background": false,
+    })
+    .to_string()
+}
+
 // ---- W7 attack: one lane commit on the default branch is recorded twice ----
 
 fn w7_command(repo: &str, wt: Option<&str>, session: &str, text: &str, at_ms: u64, dur: i64) {
@@ -635,7 +647,7 @@ fn w7_command(repo: &str, wt: Option<&str>, session: &str, text: &str, at_ms: u6
         object: Some(text.into()),
         outcome: Some(ledger::Outcome::Ok),
         duration_ms: Some(dur),
-        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        detail_json: Some(w9_command_detail(wt.unwrap_or(repo))),
         event_stamp: Some(ledger::EventStamp {
             occurred_at: ledger::ids::iso8601_utc(at_ms),
             occurred_at_basis: "transcript".into(),
@@ -669,7 +681,7 @@ fn w7_lane_commit_on_main_is_not_credited_to_the_anchor_agent() {
         std::process::Command::new("git")
             .args(["rev-parse", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )
@@ -685,7 +697,14 @@ fn w7_lane_commit_on_main_is_not_credited_to_the_anchor_agent() {
     ingest_reflogs(&repo, &lane_s, &Ok(vec![lane_s.clone()]), 1, &budget);
 
     let at_ms = u64::try_from(now).unwrap() * 1000;
-    w7_command(&repo, Some(&lane_s), "S_LANE", "git commit -m 'lane work'", at_ms - 3_000, 2_500);
+    w7_command(
+        &repo,
+        Some(&lane_s),
+        "S_LANE",
+        "git commit -m 'lane work'",
+        at_ms - 3_000,
+        2_500,
+    );
     w7_command(
         &repo,
         None,
@@ -698,8 +717,14 @@ fn w7_lane_commit_on_main_is_not_credited_to_the_anchor_agent() {
     for row in reflog_rows(&repo) {
         eprintln!("{} wt={:?} {:?}", row.id, row.worktree_path, row.object);
     }
-    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
-    assert_ne!(got.session_id.as_deref(), Some("S_ANCHOR"), "WRONG LINK: {got:?}");
+    let got = ledger::attribution::link_commits(&repo, std::slice::from_ref(&sha))
+        .remove(&sha)
+        .unwrap();
+    assert_ne!(
+        got.session_id.as_deref(),
+        Some("S_ANCHOR"),
+        "WRONG LINK: {got:?}"
+    );
 }
 
 /// What real ingest writes must link: a lane agent commits, replay records the
@@ -709,12 +734,16 @@ fn w7_lane_commit_on_main_is_not_credited_to_the_anchor_agent() {
 fn w7_an_ingested_real_commit_links_to_the_agent_that_ran_it() {
     let (dir, repo) = seeded_repo();
     let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
-    git_at(dir.path(), &["commit", "--allow-empty", "-m", "fix: parser"], now);
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "fix: parser"],
+        now,
+    );
     let sha = String::from_utf8(
         std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )
@@ -723,11 +752,25 @@ fn w7_an_ingested_real_commit_links_to_the_agent_that_ran_it() {
     .to_string();
     ingest_reflog_into(&repo, &repo, 200);
     let at_ms = u64::try_from(now).unwrap() * 1000;
-    w7_command(&repo, None, "S_REAL", "git commit -m 'fix: parser'", at_ms - 3_000, 2_500);
+    // Adjudicated (W9 w7 review): a row's time is the call's, a duration runs
+    // from the call to its result, and git dates the reflog entry at the second
+    // its run started. So a call that made the commit starts at or before that
+    // second's end and runs past its start; this fixture's call used to end half
+    // a second before the entry, which cannot happen in production.
+    w7_command(
+        &repo,
+        None,
+        "S_REAL",
+        "git commit -m 'fix: parser'",
+        at_ms + 200,
+        2_000,
+    );
     for row in reflog_rows(&repo) {
         eprintln!("ROW {} {} {:?}", row.id, row.action, row.object);
     }
-    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
+    let got = ledger::attribution::link_commits(&repo, std::slice::from_ref(&sha))
+        .remove(&sha)
+        .unwrap();
     eprintln!("LINK {got:?}");
     assert_eq!(got.session_id.as_deref(), Some("S_REAL"), "{got:?}");
 }
@@ -750,7 +793,7 @@ fn w7_conventional_revert_subject_is_credited_to_a_masked_failed_git_revert() {
         std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )
@@ -759,10 +802,23 @@ fn w7_conventional_revert_subject_is_credited_to_a_masked_failed_git_revert() {
     .to_string();
     ingest_reflog_into(&repo, &repo, 200);
     let at_ms = u64::try_from(now).unwrap() * 1000;
-    w7_command(&repo, None, "S_AGENT", "git revert --no-edit HEAD~1 2>&1 | tail -3", at_ms - 20_000, 40_000);
-    let got = ledger::attribution::link_commits(&repo, &[sha.clone()]).remove(&sha).unwrap();
+    w7_command(
+        &repo,
+        None,
+        "S_AGENT",
+        "git revert --no-edit HEAD~1 2>&1 | tail -3",
+        at_ms - 20_000,
+        40_000,
+    );
+    let got = ledger::attribution::link_commits(&repo, std::slice::from_ref(&sha))
+        .remove(&sha)
+        .unwrap();
     eprintln!("LINK {got:?}");
-    assert_ne!(got.session_id.as_deref(), Some("S_AGENT"), "WRONG LINK: {got:?}");
+    assert_ne!(
+        got.session_id.as_deref(),
+        Some("S_AGENT"),
+        "WRONG LINK: {got:?}"
+    );
 }
 
 // ---- W9 w7: end to end, real git -> real replay -> the attribution reader ----
@@ -857,4 +913,246 @@ fn w9_real_commit_behind_a_masked_exit_status_is_not_linked() {
         ledger::attribution::basis::COMMAND_OUTCOME_UNKNOWN,
         "{got:?}"
     );
+}
+
+// ---- W9 w7 round 2: real git, real transcript lines, real ingest, the reader ----
+
+/// Writes one Bash call and its result as Claude Code writes them (shapes read
+/// from real transcripts: the assistant record holds the `tool_use`, the user
+/// record the `tool_result` and the structured `toolUseResult`), then runs the
+/// real reflog replay and transcript ingest into `repo`'s ledger. Returns the
+/// ledger's command row.
+fn w9_ingest_bash_call(
+    repo: &str,
+    session: &str,
+    cwd: &str,
+    input: serde_json::Value,
+    (start_ms, end_ms): (u64, u64),
+    (tool_use_result, content): (serde_json::Value, &str),
+) -> ledger::LedgerEvent {
+    let troot = tempfile::tempdir().expect("transcript root");
+    let file = troot.path().join("slug").join(format!("{session}.jsonl"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let call = serde_json::json!({
+        "type": "assistant", "sessionId": session,
+        "timestamp": ledger::ids::iso8601_utc(start_ms),
+        "version": "2.1.241", "cwd": cwd, "gitBranch": "main",
+        "message": { "id": "msg_1", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": input } ] }
+    });
+    let result = serde_json::json!({
+        "type": "user", "sessionId": session,
+        "timestamp": ledger::ids::iso8601_utc(end_ms),
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1",
+              "content": content, "is_error": false } ] },
+        "toolUseResult": tool_use_result,
+    });
+    std::fs::write(&file, format!("{call}\n{result}\n")).unwrap();
+    crate::test_support::trust_repo(std::path::Path::new(repo));
+    let serial = crate::test_support::env::env_serial();
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
+    ingest_reflog_into(repo, repo, 200);
+    ingest_transcripts(repo);
+    ledger::tail(repo, 0, 1000)
+        .expect("tail")
+        .into_iter()
+        .find(|event| event.action == "session.command")
+        .expect("the call's command row")
+}
+
+/// The plain result of a finished call.
+fn w9_finished() -> serde_json::Value {
+    serde_json::json!({ "stdout": "[main abc] x", "stderr": "", "interrupted": false })
+}
+
+fn w9_link(repo: &str, sha: &str) -> ledger::attribution::CommitLink {
+    ledger::attribution::link_commits(repo, std::slice::from_ref(&sha.to_string()))
+        .remove(sha)
+        .expect("answered")
+}
+
+/// A plain `git commit` by an agent, made and ingested the way production
+/// does it: the call's row carries where it ran and that it was not
+/// backgrounded, and the link names the session.
+#[test]
+fn w9_real_transcript_plain_agent_commit_links() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "fix: parser"],
+        now,
+    );
+    let sha = w9_head(&repo);
+    let start = u64::try_from(now).unwrap() * 1000 + 200;
+    let row = w9_ingest_bash_call(
+        &repo,
+        "S_PLAIN",
+        &repo,
+        serde_json::json!({ "command": "git commit -m 'fix: parser'" }),
+        (start, start + 2_000),
+        (w9_finished(), "[main abc] fix: parser"),
+    );
+    let detail: serde_json::Value =
+        serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        detail["command_meta"],
+        ledger::attribution::COMMAND_META_VERSION
+    );
+    assert_eq!(detail["cwd"], repo.as_str());
+    assert_eq!(detail["background"], false);
+    let got = w9_link(&repo, &sha);
+    assert_eq!(got.session_id.as_deref(), Some("S_PLAIN"), "{got:?}");
+    assert_eq!(got.basis, ledger::attribution::basis::INFERRED);
+}
+
+/// An agent working in a nested repository (a submodule, a vendored clone) is
+/// filed under the outer worktree by its cwd. A person's commit in the outer
+/// repository during that call is not the agent's.
+#[test]
+fn w9_real_transcript_agent_in_a_nested_repo_is_not_credited_with_the_outer_commit() {
+    let (dir, repo) = seeded_repo();
+    let nested = dir.path().join("vendor").join("lib");
+    std::fs::create_dir_all(&nested).unwrap();
+    git_in(&nested, &["init", "-q", "-b", "main"]);
+    let nested_s = nested
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "person work"],
+        now,
+    );
+    let person = w9_head(&repo);
+    let start = u64::try_from(now).unwrap() * 1000 + 200;
+    let row = w9_ingest_bash_call(
+        &repo,
+        "S_NESTED",
+        &nested_s,
+        serde_json::json!({ "command": "git commit -m 'agent work'" }),
+        (start, start + 2_000),
+        (w9_finished(), "ok"),
+    );
+    assert_eq!(row.worktree_path, None, "filed under the outer worktree");
+    let got = w9_link(&repo, &person);
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    assert_eq!(
+        got.basis,
+        ledger::attribution::basis::NO_INGESTED_SESSION_COMMAND,
+        "{got:?}"
+    );
+}
+
+/// A call Claude Code moved to the background answers `is_error: false` at
+/// once (or after its timeout); the command goes on, and what it did is not
+/// in that result. Both shapes are outcome-unknown, never a link.
+#[test]
+fn w9_real_transcript_backgrounded_calls_never_link() {
+    let moved = "Command was moved to the background (ID: bqev6606z) after running for 180s. \
+                 Output is being written to: /tmp/x.output. You will be notified when it completes.";
+    let started = "Command running in background with ID: b6whyicfl. Output is being written \
+                   to: /tmp/y.output. You will be notified when it completes.";
+    for (input, content, tool_use_result, span) in [
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'" }),
+            moved,
+            serde_json::json!({ "stdout": "", "stderr": "", "interrupted": false,
+                "backgroundTaskId": "bqev6606z", "timedOutAfterMs": 600_000 }),
+            180_356,
+        ),
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'",
+                "run_in_background": true }),
+            started,
+            serde_json::json!({ "stdout": "", "stderr": "", "interrupted": false,
+                "backgroundTaskId": "b6whyicfl" }),
+            600,
+        ),
+        // Only the input says so.
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'",
+                "run_in_background": true }),
+            "ok",
+            w9_finished(),
+            600,
+        ),
+        // Only the result says so.
+        (
+            serde_json::json!({ "command": "git commit -m 'agent work'" }),
+            moved,
+            serde_json::json!({ "stdout": "", "backgroundTaskId": "bqev6606z" }),
+            600,
+        ),
+    ] {
+        let (dir, repo) = seeded_repo();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "person work"],
+            now,
+        );
+        let person = w9_head(&repo);
+        let start = u64::try_from(now).unwrap() * 1000 - 30_000;
+        let row = w9_ingest_bash_call(
+            &repo,
+            "S_BG",
+            &repo,
+            input,
+            (start, start + span),
+            (tool_use_result, content),
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["background"], true, "{detail}");
+        let got = w9_link(&repo, &person);
+        assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+        assert_eq!(
+            got.basis,
+            ledger::attribution::basis::COMMAND_OUTCOME_UNKNOWN,
+            "{got:?}"
+        );
+    }
+}
+
+/// Forms that exit 0 and make no commit (`--porcelain`, `--short`, a prefix of
+/// `--dry-run`, `--no-commit`), and the ANSI-C quoted line whose `;` is outside
+/// its quotes: none is the maker of a person's commit made during the call.
+#[test]
+fn w9_real_transcript_non_committing_and_masked_forms_never_link() {
+    for command in [
+        "git commit -m wip --porcelain",
+        "git commit -m wip --short",
+        "git commit --dry -m wip",
+        "git commit -m wip --dry-run",
+        "git commit -m wip -z",
+        "git merge --no-commit feature",
+        "git cherry-pick -n abc123",
+        "git revert -n HEAD",
+        r"git commit -m $'x\'' ; true #'",
+    ] {
+        let (dir, repo) = seeded_repo();
+        let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+        git_at(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "person work"],
+            now,
+        );
+        let person = w9_head(&repo);
+        let start = u64::try_from(now).unwrap() * 1000 + 200;
+        w9_ingest_bash_call(
+            &repo,
+            "S_AGENT",
+            &repo,
+            serde_json::json!({ "command": command }),
+            (start, start + 20_000),
+            (w9_finished(), "ok"),
+        );
+        let got = w9_link(&repo, &person);
+        assert_eq!(got.session_id, None, "WRONG LINK for `{command}`: {got:?}");
+    }
 }

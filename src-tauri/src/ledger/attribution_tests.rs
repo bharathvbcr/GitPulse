@@ -4,8 +4,9 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, command_target, link_commits, read_command, runs_git_mutation, CommitLink, Target,
-    HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
+    basis, command_target, is_whole_command, link_commits, read_command, runs_git_mutation,
+    CommitLink, Target, COMMAND_META_VERSION, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS,
+    LINK_WINDOW_MS,
 };
 use super::*;
 use std::path::Path;
@@ -37,6 +38,19 @@ fn stamp(ms: u64, basis: &str) -> EventStamp {
     }
 }
 
+/// What ingest writes into a transcript command row's `detail_json`
+/// (`ingest::transcript_draft`): the call's result, and the record of where it
+/// ran and whether it was backgrounded.
+fn command_detail(result: &str, cwd: &str, background: bool) -> String {
+    serde_json::json!({
+        "result": result,
+        "command_meta": COMMAND_META_VERSION,
+        "cwd": cwd,
+        "background": background,
+    })
+    .to_string()
+}
+
 /// A transcript `session.command` row.
 fn command_row(repo: &str, worktree: Option<&str>, session: &str, text: &str, at: u64) {
     append(Draft {
@@ -51,7 +65,7 @@ fn command_row(repo: &str, worktree: Option<&str>, session: &str, text: &str, at
         // A call that ran long enough to cover any entry a test puts after it,
         // and whose result was timed: only a timed end can be credited.
         duration_ms: Some(i64::try_from(LINK_WINDOW_MS).unwrap() + 10_000),
-        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        detail_json: Some(command_detail("ok", worktree.unwrap_or(repo), false)),
         event_stamp: Some(stamp(at, "transcript")),
         ..Draft::default()
     })
@@ -68,7 +82,7 @@ fn command_row_untimed(repo: &str, session: &str, text: &str, at: u64) {
         action: "session.command".into(),
         object: Some(text.into()),
         outcome: Some(Outcome::Ok),
-        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        detail_json: Some(command_detail("ok", repo, false)),
         event_stamp: Some(stamp(at, "transcript")),
         ..Draft::default()
     })
@@ -566,14 +580,15 @@ fn command_row_full(
         object: Some(text.into()),
         outcome: Some(outcome),
         duration_ms: Some(i64::try_from(LINK_WINDOW_MS).unwrap() + 10_000),
-        detail_json: Some(
+        detail_json: Some(command_detail(
             if outcome == Outcome::Failed {
-                r#"{"result":"error"}"#
+                "error"
             } else {
-                r#"{"result":"ok"}"#
-            }
-            .into(),
-        ),
+                "ok"
+            },
+            wt.unwrap_or(repo),
+            false,
+        )),
         event_stamp: Some(EventStamp {
             occurred_at: stamp_text,
             occurred_at_basis: "transcript".into(),
@@ -796,6 +811,16 @@ fn unobserved_command_row(repo: &str, session: &str, text: &str, at: u64) {
         action: "session.command".into(),
         object: Some(text.into()),
         outcome: Some(Outcome::Ok),
+        // Ingest records where the call ran whether or not its result was
+        // read; only the `result` key is absent.
+        detail_json: Some(
+            serde_json::json!({
+                "command_meta": COMMAND_META_VERSION,
+                "cwd": repo,
+                "background": false,
+            })
+            .to_string(),
+        ),
         event_stamp: Some(stamp(at, "transcript")),
         ..Draft::default()
     })
@@ -1104,6 +1129,20 @@ fn r2_raw(
     after_ref: Option<&str>,
 ) {
     let n = R2_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // A command row as ingest writes it carries the record of where it ran; a
+    // detail that is not a JSON object is left as the case wrote it.
+    let detail = detail.map(|detail| {
+        let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str(detail) else {
+            return detail.to_string();
+        };
+        if action == "session.command" && !object.contains_key("command_meta") {
+            object.insert("command_meta".into(), COMMAND_META_VERSION.into());
+            object.insert("cwd".into(), wt.unwrap_or(repo).into());
+            object.insert("background".into(), false.into());
+        }
+        serde_json::Value::Object(object).to_string()
+    });
+    let detail = detail.as_deref();
     with_conn(repo, |conn| {
         conn.execute(
             "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, session_id, action, object, outcome, after_ref, detail_json)
@@ -2147,7 +2186,7 @@ fn command_row_timed(
         object: Some(text.into()),
         outcome: Some(Outcome::Ok),
         duration_ms: Some(duration_ms),
-        detail_json: Some(r#"{"result":"ok"}"#.into()),
+        detail_json: Some(command_detail("ok", worktree.unwrap_or(repo), false)),
         event_stamp: Some(stamp(at, "transcript")),
         ..Draft::default()
     })
@@ -2429,7 +2468,11 @@ fn w7_nothing_to_commit_then_a_passing_step_credits_a_hand_commit() {
     );
     reflog_row(&repo, None, &sha(1), "commit", at);
     let got = link(&repo, &sha(1));
-    assert_ne!(got.session_id.as_deref(), Some("CODEX"), "WRONG LINK: {got:?}");
+    assert_ne!(
+        got.session_id.as_deref(),
+        Some("CODEX"),
+        "WRONG LINK: {got:?}"
+    );
 }
 
 // ---- W9 w7: the verb is read from `action`, and only a whole command counts ----
@@ -2579,4 +2622,338 @@ fn w9_a_commit_that_is_not_the_whole_command_is_never_linked() {
             "`{command}`: {got:?}"
         );
     }
+}
+
+// ---- W9 w7 round 2: the review's wrong-link paths ----
+
+/// A command row written without the record of where it ran or whether it was
+/// backgrounded (every row ingested before the record existed), or with a
+/// malformed one, is never evidence for a link.
+#[test]
+fn w9r_a_command_row_without_the_command_record_never_links() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    for (n, detail) in [
+        r#"{"result":"ok"}"#.to_string(),
+        // The version is there but the directory is not.
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"background":false})
+            .to_string(),
+        // The directory is there but the version is not.
+        serde_json::json!({"result":"ok","cwd":repo,"background":false}).to_string(),
+        // A directory that is not absolute, or is not a place.
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":"sub","background":false})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":"/no/such/dir","background":false})
+            .to_string(),
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":7,"background":false})
+            .to_string(),
+        // A record that does not say whether it was backgrounded.
+        serde_json::json!({"result":"ok","command_meta":COMMAND_META_VERSION,"cwd":repo})
+            .to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_d2, repo2) = repo_dir();
+        let detail = detail.replace(&repo, &repo2);
+        append(Draft {
+            repo_path: repo2.clone(),
+            actor_kind: Some(ActorKind::Agent),
+            session_id: Some("LEGACY".into()),
+            action: "session.command".into(),
+            object: Some("git commit -m a".into()),
+            outcome: Some(Outcome::Ok),
+            duration_ms: Some(5_000),
+            detail_json: Some(detail),
+            event_stamp: Some(stamp(at - 2 * SEC, "transcript")),
+            ..Draft::default()
+        })
+        .unwrap();
+        reflog_row(&repo2, None, &sha(1), "commit", at);
+        let got = link(&repo2, &sha(1));
+        assert_eq!(got.session_id, None, "case {n}: WRONG LINK {got:?}");
+        assert!(
+            matches!(
+                got.basis,
+                basis::COMMAND_TARGET_UNKNOWN | basis::COMMAND_OUTCOME_UNKNOWN
+            ),
+            "case {n}: {got:?}"
+        );
+    }
+}
+
+/// A call recorded as backgrounded is outcome-unknown, however ok its result.
+#[test]
+fn w9r_a_backgrounded_command_is_outcome_unknown() {
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    append(Draft {
+        repo_path: repo.clone(),
+        actor_kind: Some(ActorKind::Agent),
+        session_id: Some("BG".into()),
+        action: "session.command".into(),
+        object: Some("git commit -m a".into()),
+        outcome: Some(Outcome::Ok),
+        duration_ms: Some(180_000),
+        detail_json: Some(command_detail("ok", &repo, true)),
+        event_stamp: Some(stamp(at - 100 * SEC, "transcript")),
+        ..Draft::default()
+    })
+    .unwrap();
+    reflog_row(&repo, None, &sha(1), "commit", at);
+    let got = link(&repo, &sha(1));
+    assert_eq!(got.session_id, None, "{got:?}");
+    assert_eq!(got.basis, basis::COMMAND_OUTCOME_UNKNOWN);
+}
+
+/// Where a call ran decides where `git` aimed: a nested repository inside the
+/// worktree is not the worktree, `-C` and `cd` are relative to the cwd, and a
+/// subdirectory of the worktree is the worktree.
+#[test]
+fn w9r_the_recorded_cwd_decides_where_a_bare_git_ran() {
+    let (_d, repo) = repo_dir();
+    let root = Path::new(&repo);
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src/deep")).unwrap();
+    std::fs::create_dir_all(root.join("vendor/lib/.git")).unwrap();
+    std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+    let cwd = |sub: &str| {
+        std::fs::canonicalize(root.join(sub))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let at = t0();
+    for (cwd_of, command, links) in [
+        ("", "git commit -m x", true),
+        ("src/deep", "git commit -m x", true),
+        ("vendor/lib", "git commit -m x", false),
+        ("sub", "git commit -m x", false),
+        // Relative `-C` resolves from the cwd, not from the worktree root.
+        ("", "git -C sub commit -m x", false),
+        ("vendor", "git -C lib commit -m x", false),
+        ("vendor/lib", "git -C ../.. commit -m x", true),
+        ("", "git -C src commit -m x", true),
+        ("src", "git -C .. commit -m x", true),
+        ("src", "git -C ../vendor/lib commit -m x", false),
+    ] {
+        let (_d2, repo2) = repo_dir();
+        // The same tree under a fresh path, so each case has its own ledger.
+        let root2 = Path::new(&repo2);
+        std::fs::create_dir(root2.join(".git")).unwrap();
+        std::fs::create_dir_all(root2.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root2.join("vendor/lib/.git")).unwrap();
+        std::fs::create_dir_all(root2.join("sub/.git")).unwrap();
+        let cwd2 = cwd(cwd_of).replace(
+            &cwd(""),
+            &std::fs::canonicalize(root2).unwrap().to_string_lossy(),
+        );
+        append(Draft {
+            repo_path: repo2.clone(),
+            actor_kind: Some(ActorKind::Agent),
+            session_id: Some("S1".into()),
+            action: "session.command".into(),
+            object: Some(command.into()),
+            outcome: Some(Outcome::Ok),
+            duration_ms: Some(5_000),
+            detail_json: Some(command_detail("ok", &cwd2, false)),
+            event_stamp: Some(stamp(at - 2 * SEC, "transcript")),
+            ..Draft::default()
+        })
+        .unwrap();
+        reflog_row(&repo2, None, &sha(1), "commit", at);
+        let got = link(&repo2, &sha(1));
+        assert_eq!(
+            got.session_id.is_some(),
+            links,
+            "cwd `{cwd_of}` `{command}`: {got:?}"
+        );
+    }
+}
+
+/// Options that make a commit are listed; any other leaves what the run did
+/// unknown, so a person's commit beside it is not the command's.
+#[test]
+fn w9r_only_options_known_to_commit_let_a_command_link() {
+    let refused = [
+        ("git commit -m wip --porcelain", "commit: person's work"),
+        ("git commit -m wip --short", "commit: person's work"),
+        ("git commit -m wip --long", "commit: person's work"),
+        ("git commit -m wip -z", "commit: person's work"),
+        ("git commit -m wip --null", "commit: person's work"),
+        ("git commit --dry -m wip", "commit: person's work"),
+        ("git commit --porc -m wip", "commit: person's work"),
+        ("git commit --dry-r -m wip", "commit: person's work"),
+        (
+            "git commit -m wip --some-future-flag",
+            "commit: person's work",
+        ),
+        (
+            "git merge --no-commit feature",
+            "merge feature: Merge made by the 'ort' strategy.",
+        ),
+        (
+            "git merge --squash feature",
+            "merge feature: Merge made by the 'ort' strategy.",
+        ),
+        ("git cherry-pick -n abc123", "cherry-pick: person's pick"),
+        (
+            "git cherry-pick --no-commit abc123",
+            "cherry-pick: person's pick",
+        ),
+        ("git revert -n HEAD", "revert: Revert \"x\""),
+        ("git revert --no-commit HEAD", "revert: Revert \"x\""),
+    ];
+    for (command, message) in refused {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row_timed(&repo, None, "S_AGENT", command, at + 100, 150);
+        reflog_row(&repo, None, &sha(7), message, at);
+        let got = link(&repo, &sha(7));
+        assert_ne!(
+            got.session_id.as_deref(),
+            Some("S_AGENT"),
+            "WRONG LINK for `{command}`: {got:?}"
+        );
+    }
+    for (command, message) in [
+        ("git commit -m wip", "commit: wip"),
+        ("git commit -am wip", "commit: wip"),
+        ("git commit -mwip", "commit: wip"),
+        ("git commit --message=wip --no-verify", "commit: wip"),
+        (
+            "git commit --amend --no-edit --allow-empty",
+            "commit (amend): wip",
+        ),
+        ("git commit -s -S -m wip", "commit: wip"),
+        ("git commit -m wip -- src/a.rs", "commit: wip"),
+        (
+            "git merge --no-ff feature",
+            "merge feature: Merge made by the 'ort' strategy.",
+        ),
+        ("git cherry-pick -x abc123", "cherry-pick: picked"),
+        ("git revert --no-edit HEAD", "revert: Revert \"x\""),
+        (
+            "git pull --rebase origin main",
+            "pull --rebase (pick): picked",
+        ),
+        ("git rebase --onto main a b", "rebase (pick): picked"),
+    ] {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row_timed(&repo, None, "S_AGENT", command, at + 100, 2_000);
+        reflog_row(&repo, None, &sha(7), message, at);
+        let got = link(&repo, &sha(7));
+        assert_eq!(
+            got.session_id.as_deref(),
+            Some("S_AGENT"),
+            "`{command}` / `{message}`: {got:?}"
+        );
+    }
+}
+
+/// `$'...'` and `$"..."` quote by their own rules (a `\'` does not end the
+/// first), so a `;` that follows is outside any quote while the line reads as
+/// quoted: not a whole command, and never a link.
+#[test]
+fn w9r_ansi_c_quoting_never_hides_a_masked_command() {
+    for command in [
+        r"git commit -m $'x\'' ; true #'",
+        r"git commit -m $'a\'b' ; true",
+        r"git commit -m $'it\'s' || true #'",
+        r#"git commit -m $"x" ; true"#,
+        r"git commit -m $'x'",
+    ] {
+        assert!(!is_whole_command(command), "{command}");
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row_timed(&repo, None, "S_AGENT", command, at - 5 * SEC, 20_000);
+        reflog_row(&repo, None, &sha(9), "commit: person's work", at);
+        let got = link(&repo, &sha(9));
+        assert_eq!(got.session_id, None, "WRONG LINK for `{command}`: {got:?}");
+    }
+}
+
+/// A branch name can fold into a step (`pull origin wip--pick-` writes
+/// `pull origin wip--pick-: Fast-forward`); a fast-forward made nothing.
+#[test]
+fn w9r_a_branch_name_cannot_fake_a_rebase_step() {
+    for head in [
+        "pull origin wip--pick-",
+        "rebase wip--continue-",
+        "pull wip--reword-",
+    ] {
+        let action = format!("reflog.{}", action_segment(head));
+        let object = format!("{} Fast-forward", sha(3));
+        let entry = super::attribution::parse_entry(&action, &object).expect("parsed");
+        assert!(
+            !super::attribution::creates_commit(&entry),
+            "a fast-forward read as an origin: {action}"
+        );
+    }
+    let (_d, repo) = repo_dir();
+    let at = t0();
+    command_row_timed(
+        &repo,
+        None,
+        "S1",
+        "git pull origin wip--pick-",
+        at - SEC,
+        3_000,
+    );
+    reflog_row(
+        &repo,
+        None,
+        &sha(3),
+        "pull origin wip--pick-: Fast-forward",
+        at,
+    );
+    assert_eq!(link(&repo, &sha(3)).basis, basis::NO_ORIGIN_ENTRY);
+}
+
+/// Asked from a lane's path, the reader answers from the repository's own
+/// (anchor's) ledger, like every other ledger reader.
+#[test]
+fn w9r_a_lane_path_reads_the_anchor_ledger() {
+    use crate::test_support::git_in;
+    let anchor_dir = tempfile::tempdir().unwrap();
+    git_in(anchor_dir.path(), &["init", "-q", "-b", "main"]);
+    git_in(
+        anchor_dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "seed"],
+    );
+    let anchor = anchor_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let lane_parent = tempfile::tempdir().unwrap();
+    let lane = lane_parent.path().join("lane");
+    git_in(
+        anchor_dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane",
+            lane.to_str().unwrap(),
+        ],
+    );
+    let lane = lane.canonicalize().unwrap().to_string_lossy().into_owned();
+    let at = t0();
+    command_row(&anchor, Some(&lane), "S_LANE", "git commit -m x", at + 100);
+    reflog_row(&anchor, Some(&lane), &sha(5), "commit: x", at);
+    let from_anchor = link(&anchor, &sha(5));
+    let from_lane = link(&lane, &sha(5));
+    assert_eq!(
+        from_anchor.session_id.as_deref(),
+        Some("S_LANE"),
+        "{from_anchor:?}"
+    );
+    assert_eq!(
+        from_lane, from_anchor,
+        "the lane's path reads another ledger"
+    );
 }
