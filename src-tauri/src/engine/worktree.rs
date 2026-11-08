@@ -14125,6 +14125,9 @@ some-future-field whatever
         let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
         let repo_dir = anchor_fixture.path().to_path_buf();
         crate::test_support::trust_repo(&repo_dir);
+        // A stacked base must come from a committed checkout (BaseKey::new
+        // refuses a non-commit head_sha), so the fixture gets a real commit.
+        crate::codeintel::tests::commit_and_stamp_head(&repo_dir);
 
         let wt = sandbox.path().join("wt-stacked");
         let created = add_worktree_with_devmap(
