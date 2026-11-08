@@ -318,11 +318,11 @@ describe("annotated but unregistered commands", () => {
     // view's history rail reads (cmd_get_compare_diff, cmd_get_compare_files,
     // cmd_get_commit_notes, cmd_get_commit_bodies), and 299 with the tuning
     // advisor commands (cmd_tuning_plan, cmd_tuning_apply,
-    // cmd_tuning_apply_cancel);
+    // cmd_tuning_apply_cancel), and 300 with cmd_github_open_pr_worktree;
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(299);
+    expect(found.size).toBe(300);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);
