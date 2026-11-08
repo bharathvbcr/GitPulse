@@ -728,10 +728,12 @@ pub(crate) fn run_at(
     }
     let spec = format!("{head}^");
     let parent = base_from_parent_read(
-        crate::engine::git_cli::git_text(
-            Path::new(&local.path),
-            &["rev-parse", "--verify", "--end-of-options", &spec],
-        ),
+        crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+            crate::engine::git_cli::git_text(
+                Path::new(&local.path),
+                &["rev-parse", "--verify", "--end-of-options", &spec],
+            )
+        }),
         &head,
     )
     .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
@@ -957,9 +959,18 @@ pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, C
         worktree,
         &[crate::engine::ref_cache::ALL_REFS],
         &["verification-base", head],
-        || verification_base_uncached(worktree, head).map(|base| (base, true)),
+        || {
+            crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+                verification_base_uncached(worktree, head)
+            })
+            .map(|base| (base, true))
+        },
     )
 }
+
+/// What the spawn-gate report calls the launches [`verification_base`] makes
+/// when the ref cache cannot answer.
+pub(crate) const VERIFICATION_BASE_SOURCE: &str = "verification_driver.verification_base";
 
 fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, CommandError> {
     let head = resolve_commit(worktree, head)?;

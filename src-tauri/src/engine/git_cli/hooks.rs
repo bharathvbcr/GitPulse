@@ -126,7 +126,10 @@ fn installed_hooks(repo: &Path, sub: &str) -> Option<(PathBuf, Vec<&'static str>
     let candidates = hooks_run_by(sub)?;
     // `--git-path hooks` honours `core.hooksPath` and linked worktrees, which
     // is where git itself looks; guessing `.git/hooks` would miss husky.
-    let raw = super::git_text(repo, &["rev-parse", "--git-path", "hooks"]).ok()?;
+    let raw = super::with_spawn_source("git_cli.hooks.installed_hooks", || {
+        super::git_text(repo, &["rev-parse", "--git-path", "hooks"])
+    })
+    .ok()?;
     let dir = PathBuf::from(raw.trim());
     let dir = if dir.is_absolute() {
         dir

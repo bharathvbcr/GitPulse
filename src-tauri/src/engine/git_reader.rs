@@ -941,11 +941,11 @@ impl GitReader {
 
     pub fn head_id(repo_path: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
-        Ok(
-            ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])?
-                .trim()
-                .to_string(),
-        )
+        Ok(git_cli::with_spawn_source("git_reader.head_id", || {
+            ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])
+        })?
+        .trim()
+        .to_string())
     }
 
     /// Short name of the repository's default branch: the primary remote's

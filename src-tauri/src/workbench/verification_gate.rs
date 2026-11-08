@@ -173,6 +173,9 @@ pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> 
     }
 }
 
+/// What the spawn-gate report calls the launches [`current_head`] makes.
+pub(crate) const CURRENT_HEAD_SOURCE: &str = "verification_gate.current_head";
+
 /// HEAD of the worktree a verification was taken in, as it is now.
 pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // The driver asks this of every held card every sweep, and the board asks
@@ -181,11 +184,13 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // the whole ref store is stamped, as for the verification base. An
     // unchanged worktree is answered from the ref cache by file stats, with no
     // process.
-    crate::engine::ref_cache::git_text(
-        Path::new(worktree),
-        &[crate::engine::ref_cache::ALL_REFS],
-        &["rev-parse", "--verify", "HEAD^{commit}"],
-    )
+    crate::engine::git_cli::with_spawn_source(CURRENT_HEAD_SOURCE, || {
+        crate::engine::ref_cache::git_text(
+            Path::new(worktree),
+            &[crate::engine::ref_cache::ALL_REFS],
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )
+    })
     .map(|head| head.trim().to_owned())
 }
 
