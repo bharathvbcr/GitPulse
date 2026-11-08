@@ -135,7 +135,7 @@ fn process_is_alive(_pid: u32) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) use env::coverage_relaxed;
+pub(crate) use env::{coverage_relaxed, wait_until};
 
 /// Runs `cmd` to completion inside `budget` through the engine's bounded
 /// runner (process group killed at the deadline, output capped) and panics

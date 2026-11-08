@@ -214,61 +214,30 @@ fn test_agent_lane_claims_and_registration_lifecycle() {
     assert_eq!(empty_lanes.len(), 0);
 }
 
-#[test]
-fn test_subtask_lineage_rollup_contract() {
-    // Linear-style task decomposition schema verification
-    let parent_json = serde_json::json!({
-        "id": "T-100",
-        "title": "Implement Agent Inbox",
-        "status": "in_progress",
-        "parent": null
-    });
-
-    let subtask1_json = serde_json::json!({
-        "id": "T-101",
-        "title": "Build Svelte Component",
-        "status": "done",
-        "parent": "T-100"
-    });
-
-    let subtask2_json = serde_json::json!({
-        "id": "T-102",
-        "title": "Wire Agent Bus",
-        "status": "in_progress",
-        "parent": "T-100"
-    });
-
-    assert_eq!(parent_json["parent"], serde_json::Value::Null);
-    assert_eq!(subtask1_json["parent"], "T-100");
-    assert_eq!(subtask2_json["parent"], "T-100");
-
-    // Lineage rollup: 1 of 2 done
-    let subtasks = [&subtask1_json, &subtask2_json];
-    let done_count = subtasks.iter().filter(|s| s["status"] == "done").count();
-    let total_count = subtasks.len();
-
-    let lineage_payload = serde_json::json!({
-        "parent_id": "T-100",
-        "done": done_count,
-        "total": total_count,
-        "ratio": format!("{done_count}/{total_count}")
-    });
-
-    assert_eq!(lineage_payload["done"], 1);
-    assert_eq!(lineage_payload["total"], 2);
-    assert_eq!(lineage_payload["ratio"], "1/2");
+/// The `agy` binary a live run checks: `GITPULSE_LIVE_AGY` names it, otherwise
+/// the first `agy` on `PATH`. `None` means there is none to check.
+fn live_agy_binary() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("GITPULSE_LIVE_AGY") {
+        return Some(path.into());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("agy"))
+        .find(|candidate| candidate.is_file())
 }
 
+/// Live: it runs the installed Antigravity CLI, which only some machines have,
+/// so it is opt-in (`cargo test -- --ignored`) and cargo reports it as ignored
+/// rather than as passed. Once asked for, a missing binary is a failure. The
+/// argv GitPulse builds for `agy` is asserted by `terminal_command`'s own
+/// tests, which run without the binary.
 #[test]
-fn test_antigravity_cli_binary_and_argument_conformance() {
-    let agy_path = "/Users/bharath/.local/bin/agy";
-    if !std::path::Path::new(agy_path).exists() {
-        eprintln!("Skipping live agy binary test: {agy_path} not found");
-        return;
-    }
+#[ignore = "live: needs the Antigravity CLI (GITPULSE_LIVE_AGY or `agy` on PATH)"]
+fn test_antigravity_cli_binary_advertises_the_flags_gitpulse_passes() {
+    let agy_path = live_agy_binary()
+        .expect("no agy binary: set GITPULSE_LIVE_AGY or put `agy` on PATH to run this live test");
 
     // 1. Verify --version returns expected semver
-    let output = Command::new(agy_path)
+    let output = Command::new(&agy_path)
         .arg("--version")
         .output_locked()
         .expect("run agy --version");
@@ -280,7 +249,7 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
     );
 
     // 2. Verify --help publishes required flags on stderr/stdout
-    let help_output = Command::new(agy_path)
+    let help_output = Command::new(&agy_path)
         .arg("--help")
         .output_locked()
         .expect("run agy --help");
@@ -301,28 +270,6 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
     assert!(help_text.contains("--mode"), "agy must support --mode");
     assert!(help_text.contains("--model"), "agy must support --model");
     assert!(help_text.contains("--effort"), "agy must support --effort");
-
-    // 3. Verify argument generator contract for Antigravity
-    let test_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-    let generated_args = [
-        "--mode".to_string(),
-        "accept-edits".to_string(),
-        "--conversation".to_string(),
-        test_uuid.to_string(),
-        "--prompt-interactive".to_string(),
-        "Task prompt content".to_string(),
-    ];
-
-    let conv_pos = generated_args
-        .iter()
-        .position(|a| a == "--conversation")
-        .unwrap();
-    assert_eq!(generated_args[conv_pos + 1], test_uuid);
-    let prompt_pos = generated_args
-        .iter()
-        .position(|a| a == "--prompt-interactive")
-        .unwrap();
-    assert_eq!(generated_args[prompt_pos + 1], "Task prompt content");
 }
 
 #[test]
