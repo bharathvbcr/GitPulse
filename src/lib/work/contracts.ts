@@ -107,6 +107,19 @@ export function validateWorkResponse(command: string, value: unknown): void {
             });
           }
         });
+        if (risk.claims_error != null) text(risk.claims_error);
+        if (risk.claims_total != null) count(risk.claims_total);
+        if (risk.claims_truncated != null) flag(risk.claims_truncated);
+        if (risk.file_claims != null) {
+          list(risk.file_claims, (entry) => {
+            const claim = fields(entry, ["source", "path", "worktree"]);
+            if (claim.source !== "declared" && claim.source !== "observed") throw new Error(`unknown claim source: ${claim.source}`);
+            nullableText(claim.session_id);
+            nullableText(claim.run_id);
+            nullableText(claim.cwd);
+            count(claim.ts_ms);
+          });
+        }
         break;
       }
     }

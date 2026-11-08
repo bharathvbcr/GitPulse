@@ -148,6 +148,12 @@ export interface WaveDeps {
   mainState(signal: AbortSignal): Promise<MainState>;
   /** Writes the record durably; a failure stops the wave. */
   persist(record: WaveRecord): Promise<void>;
+  /**
+   * Paths already claimed by a run or a session, for a notice. Absent means
+   * none were read. A claim never holds a member back and is not called a
+   * collision; `unreadable` and `partial` say what the claim store could not give.
+   */
+  heldPaths?(signal: AbortSignal): Promise<HeldRead>;
   now(): number;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   id(): string;
@@ -191,15 +197,42 @@ function scopeKey(path: string, options: PathIdentityOptions): string | null {
   return !key || key === ".." || key.startsWith("../") ? null : key;
 }
 
-export interface BatchPlan { chosen: Candidate[]; skipped: { id: string; title: string; reason: string }[] }
+/** One path the two lists share, in the spelling of `theirs`, or null when they do not meet. */
+function overlappingPath(mine: readonly string[], theirs: readonly string[], options: PathIdentityOptions): string | null {
+  const left = mine.map((raw) => ({ raw, key: scopeKey(raw, options) }));
+  const right = theirs.map((raw) => ({ raw, key: scopeKey(raw, options) }));
+  for (const x of left) for (const y of right) {
+    if (!x.key || !y.key) continue;
+    if (x.key === "." || y.key === "." || x.key === y.key || x.key.startsWith(`${y.key}/`) || y.key.startsWith(`${x.key}/`)) return y.raw;
+  }
+  return null;
+}
+
+export interface Held { path: string; holder: string }
+/**
+ * Claims read for a batch. `unreadable` is why no claim could be used, so none
+ * were checked; `partial` is what limited the ones that were (a list cut to its
+ * newest rows, lines skipped, a claim with no holder).
+ */
+export interface HeldRead { held: readonly Held[]; unreadable?: string; partial?: string }
+export interface BatchPlan {
+  chosen: Candidate[];
+  skipped: { id: string; title: string; reason: string }[];
+  /** Chosen candidates whose files another run or session has claimed. Told, never held back. */
+  notices: { id: string; title: string; reason: string }[];
+}
 
 /**
- * The first `n` candidates, in rank order, whose scopes do not collide. A
- * candidate with no readable scope is admitted only first, and then nothing
- * else is admitted beside it, so unknown never reads as disjoint.
+ * The first `n` candidates, in rank order, whose scopes do not collide with
+ * each other. A candidate with no readable scope is admitted only first, and
+ * then nothing else is admitted beside it, so unknown never reads as disjoint.
+ * Overlap between two members names the path. A path in `held` is "claimed by"
+ * its holder: that is a notice on the candidate, not a collision and not a
+ * reason to leave it out. Whether a claim from another run or batch should hold
+ * a candidate back is an owner decision, and until it is made nothing does.
  */
-export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions()): BatchPlan {
-  const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [];
+export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions(), held: readonly Held[] = []): BatchPlan {
+  const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [], notices: BatchPlan["notices"] = [];
   // A scope with any entry that cannot be read is an unknown scope, which runs alone.
   const known = (id: string) => {
     const keys = (scopes.get(id) ?? []).map((p) => scopeKey(p, options));
@@ -214,12 +247,16 @@ export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<
       return mine.length === 0 || theirs.length === 0 || scopesOverlap(mine, theirs, options);
     });
     if (clash) {
-      skipped.push({ id: candidate.id, title: candidate.title, reason: mine.length === 0 || known(clash.id).length === 0 ? `its file scope is unknown next to "${clash.title}"` : `its files overlap "${clash.title}"` });
+      const unknown = mine.length === 0 || known(clash.id).length === 0;
+      const path = unknown ? null : overlappingPath(scopes.get(candidate.id) ?? [], scopes.get(clash.id) ?? [], options);
+      skipped.push({ id: candidate.id, title: candidate.title, reason: unknown ? `its file scope is unknown next to "${clash.title}"` : path ? `its files overlap "${clash.title}" on ${path}` : `its files overlap "${clash.title}"` });
       continue;
     }
+    const claim = held.find((row) => scopesOverlap(mine, [row.path], options));
+    if (claim) notices.push({ id: candidate.id, title: candidate.title, reason: `${claim.path} is claimed by ${claim.holder}` });
     chosen.push(candidate);
   }
-  return { chosen, skipped };
+  return { chosen, skipped, notices };
 }
 
 function member(candidate: Candidate, deps: WaveDeps): WaveMember {
@@ -346,9 +383,16 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     const open = ranked.filter((c) => !excluded.has(c.id));
     if (open.length === 0) { await save({ state: "done", note: "No further task is ready to start." }); return false; }
     const scopes = await deps.scopes(open.map((c) => c.id), abort.signal);
-    const plan = planBatch(open, scopes, record.n, excluded);
+    const claimed = deps.heldPaths ? await deps.heldPaths(abort.signal) : { held: [] };
+    const plan = planBatch(open, scopes, record.n, excluded, hostOptions(), claimed.held);
     const members = plan.chosen.map((c) => member(c, deps));
-    const note = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
+    const base = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
+    const extras = [
+      plan.notices.length ? `Launched although another run or session has claimed a file: ${plan.notices.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "",
+      claimed.unreadable ? `File claims were not read (${claimed.unreadable}), so none were checked.` : "",
+      claimed.partial ? `File claims were read in part (${claimed.partial}).` : "",
+    ].filter(Boolean).join(" ");
+    const note = extras ? (base ? `${base.trimEnd()} ${extras}` : extras) : base;
     await save({
       batch: record.batch + 1, batchesLeft: record.batchesLeft - 1, members, note,
       attempted: [...record.attempted, ...members.map((m) => m.taskId)].slice(-MAX_ATTEMPTED),

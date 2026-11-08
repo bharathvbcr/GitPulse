@@ -107,6 +107,10 @@ struct ClaudeRegistryEntry {
     entrypoint: String,
     #[serde(default)]
     status: String,
+    #[serde(default, rename = "sessionId")]
+    session_id: String,
+    #[serde(default, rename = "procStart")]
+    proc_start: String,
 }
 
 /// Observes every agent kind on this machine.
@@ -183,6 +187,9 @@ pub(crate) fn from_scan(
             tree: session.tree.clone(),
             run_id: session.run_id.clone(),
             parent_pid: session.parent_pid.and_then(|pid| u32::try_from(pid).ok()),
+            session_id: entry.and_then(|e| nonempty(&e.session_id)),
+            proc_start: entry.and_then(|e| nonempty(&e.proc_start)),
+            registry_cwd: entry.map(|e| e.cwd.clone()),
         });
     }
     kinds
@@ -342,11 +349,14 @@ fn read_claude_registry(dir: &Path, alive: &dyn Fn(u32, u128) -> Liveness) -> Ki
                 pid: entry.pid,
                 entrypoint: entry.entrypoint,
                 status: entry.status,
-                cwd: entry.cwd,
+                cwd: entry.cwd.clone(),
                 // A registry entry says nothing about launch or lineage.
                 tree: None,
                 run_id: None,
                 parent_pid: None,
+                session_id: nonempty(&entry.session_id),
+                proc_start: nonempty(&entry.proc_start),
+                registry_cwd: Some(entry.cwd),
             }),
             // Claude Code removes an entry when its session exits cleanly; one
             // left behind by a crash names a process that is gone.
@@ -376,6 +386,15 @@ fn read_entry(path: &Path) -> Result<ClaudeRegistryEntry, String> {
     Ok(entry)
 }
 
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// The canonical spelling of a path when it exists, else the path as given.
 ///
 /// Both sides of a containment test go through this, so `/tmp` and
@@ -396,13 +415,47 @@ fn owning_worktree<'a>(cwd: &Path, worktrees: &'a [(String, PathBuf)]) -> Option
         .map(|(path, _)| path.as_str())
 }
 
+/// A worktree lock whose pid and start identify the session git assigned
+/// the checkout to. A pid with no start is not a match: a reused pid must
+/// not inherit a lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeLock {
+    pub worktree: String,
+    pub pid: u32,
+    pub start_text: Option<String>,
+}
+
 /// Attributes an observation to the worktrees of one repository.
 ///
 /// `worktree_paths` is the repository's worktree listing, spelled as git
 /// listed it; the facet reports paths in that spelling. A session whose
 /// directory is in none of them belongs to another repository and is not
 /// counted here.
+///
+/// Ownership, first match wins: the worktree lock's pid and start, then the
+/// cwd the edit hook last claimed for the session, then the registry cwd,
+/// then the process cwd. Isolation worktrees keep the process inside the
+/// parent checkout, so the process cwd alone files that session on main.
 pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) -> LiveSessionFacet {
+    let locks = read_worktree_locks(worktree_paths);
+    let (claims, problems) = load_claims(worktree_paths);
+    let mut facet = attribute_with(observation, worktree_paths, &locks, &claims);
+    if !problems.is_empty() {
+        // Attribution fell back to the registry or process cwd for whatever
+        // the claims would have said, so the facet is not "observed
+        // completely and verifiably".
+        facet.ok = false;
+        facet.attribution_error = format!("hook claims not read in full: {}", problems.join("; "));
+    }
+    facet
+}
+
+pub(crate) fn attribute_with(
+    observation: &Observation,
+    worktree_paths: &[String],
+    locks: &[WorktreeLock],
+    claims: &[super::claims::FileClaim],
+) -> LiveSessionFacet {
     let roots: Vec<(String, PathBuf)> = worktree_paths
         .iter()
         .map(|path| (path.clone(), comparable(path)))
@@ -412,7 +465,7 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
     for seen in observation {
         let mut sessions = 0u32;
         for session in &seen.live {
-            let Some(owner) = owning_worktree(&comparable(&session.cwd), &roots) else {
+            let Some(owner) = owner_of(session, &roots, locks, claims) else {
                 continue;
             };
             sessions += 1;
@@ -458,7 +511,197 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
         sessions,
         kinds,
         worktrees,
+        attribution_error: String::new(),
     }
+}
+
+fn owner_of<'a>(
+    session: &LiveSession,
+    roots: &'a [(String, PathBuf)],
+    locks: &[WorktreeLock],
+    claims: &[super::claims::FileClaim],
+) -> Option<&'a str> {
+    // One parent CLI that started several isolation agents has one pid and one
+    // start across all their locks, so "the lock names this session" is true of
+    // every lane at once. That is no evidence for any one of them: the session
+    // is not moved, and the rest of the order decides.
+    let mut matching = locks.iter().filter(|lock| lock_matches(session, lock));
+    if let (Some(locked), None) = (matching.next(), matching.next()) {
+        if let Some((path, _)) = roots.iter().find(|(path, _)| path == &locked.worktree) {
+            return Some(path.as_str());
+        }
+    }
+    if let Some(cwd) = session
+        .session_id
+        .as_deref()
+        .and_then(|id| super::claims::last_claimed_cwd(claims, id))
+    {
+        if let Some(owner) = owning_worktree(&comparable(cwd), roots) {
+            return Some(owner);
+        }
+    }
+    if let Some(cwd) = session.registry_cwd.as_deref() {
+        if Path::new(cwd).is_absolute() {
+            if let Some(owner) = owning_worktree(&comparable(cwd), roots) {
+                return Some(owner);
+            }
+        }
+    }
+    owning_worktree(&comparable(&session.cwd), roots)
+}
+
+fn lock_matches(session: &LiveSession, lock: &WorktreeLock) -> bool {
+    if lock.pid != session.pid {
+        return false;
+    }
+    match (&lock.start_text, &session.proc_start) {
+        (Some(lock_start), Some(session_start)) => lock_start == session_start,
+        _ => false,
+    }
+}
+
+/// Lock files of the listed worktrees. A linked worktree's `.git` is a
+/// `gitdir:` pointer; the lock is `<admin>/locked`. A missing file is an
+/// unlocked checkout, not an error. At most one lock is read per worktree.
+pub(crate) fn read_worktree_locks(worktree_paths: &[String]) -> Vec<WorktreeLock> {
+    let mut locks = Vec::new();
+    for path in worktree_paths.iter().take(64) {
+        let Some(admin) = gitdir_admin(Path::new(path)) else {
+            continue;
+        };
+        let Ok(text) = read_small(&admin.join("locked"), 1024) else {
+            continue;
+        };
+        if let Some((pid, start_text)) = parse_lock_reason(&text) {
+            if start_text.is_none() {
+                continue;
+            }
+            locks.push(WorktreeLock {
+                worktree: path.clone(),
+                pid,
+                start_text,
+            });
+        }
+    }
+    locks
+}
+
+fn gitdir_admin(worktree: &Path) -> Option<PathBuf> {
+    let git = worktree.join(".git");
+    let meta = fs_meta(&git)?;
+    if !meta.is_file() {
+        return None;
+    }
+    let text = read_small(&git, 4096).ok()?;
+    let line = text.lines().next()?.trim();
+    let rest = line.strip_prefix("gitdir:")?.trim();
+    if rest.is_empty() || rest.contains('\0') {
+        return None;
+    }
+    let pointed = PathBuf::from(rest);
+    if pointed.is_absolute() {
+        Some(pointed)
+    } else {
+        Some(worktree.join(pointed))
+    }
+}
+
+fn fs_meta(path: &Path) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(path).ok()
+}
+
+fn read_small(path: &Path, cap: u64) -> Result<String, ()> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let mut buf = String::new();
+    file.take(cap + 1)
+        .read_to_string(&mut buf)
+        .map_err(|_| ())?;
+    if buf.len() as u64 > cap {
+        return Err(());
+    }
+    Ok(buf)
+}
+
+/// Claude Code writes `claude agent|session <id> (pid N start <procStart>)`.
+/// A pid with no start is parsed and then ignored: it cannot be checked
+/// against pid reuse. The structured `pid=<n> start_us=<n>` form is accepted
+/// so a test can name a start without inventing a date string; it is stored
+/// as text and matched against `proc_start` the same way.
+pub(crate) fn parse_lock_reason(text: &str) -> Option<(u32, Option<String>)> {
+    let line = text.lines().next()?.trim();
+    if let Some(rest) = line.strip_prefix("pid=") {
+        let (pid, start) = rest.split_once(" start_us=")?;
+        let pid: u32 = pid.parse().ok()?;
+        if start.is_empty() || !start.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        return Some((pid, Some(format!("start_us:{start}"))));
+    }
+    let rest = line
+        .strip_prefix("claude agent ")
+        .or_else(|| line.strip_prefix("claude session "))?;
+    let marker = " (pid ";
+    let at = rest.rfind(marker)?;
+    if at == 0 || at > 255 {
+        return None;
+    }
+    let after = rest[at + marker.len()..].strip_suffix(')')?;
+    let (pid_text, start) = match after.split_once(" start ") {
+        Some((pid, start)) if !start.is_empty() && start.len() <= 255 => {
+            (pid, Some(start.to_string()))
+        }
+        Some(_) => return None,
+        None => (after, None),
+    };
+    if pid_text.is_empty() || pid_text.len() > 10 || !pid_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((pid_text.parse().ok()?, start))
+}
+
+/// The hook claims of every repository in `worktree_paths`, and why any of them
+/// could not be read in full. A repository GitPulse does not trust has no
+/// claims to read; a store that failed, or was read with unreadable lines
+/// skipped, is a problem the caller reports, never an empty list.
+fn load_claims(worktree_paths: &[String]) -> (Vec<super::claims::FileClaim>, Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    let now = super::claims::now_ms();
+    for path in worktree_paths.iter().take(16) {
+        let Ok(common) = crate::engine::git_cli::resolve_git_common_dir(Path::new(path)) else {
+            // A listed worktree whose git dir cannot be resolved (pruned, or
+            // gone from disk) has no store of its own to read.
+            continue;
+        };
+        if !seen.insert(common.clone()) {
+            continue;
+        }
+        match super::claims::admitted(Path::new(path)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                problems.push(format!("trust for {path} could not be read ({error})"));
+                continue;
+            }
+        }
+        match super::claims::read_store(
+            &super::claims::store_path(&common),
+            now,
+            super::claims::DEFAULT_TTL_MS,
+            super::claims::DEFAULT_CAP,
+        ) {
+            Ok(read) => {
+                if let Some(degraded) = read.degraded() {
+                    problems.push(format!("{}: {degraded}", common.display()));
+                }
+                rows.extend(read.rows);
+            }
+            Err(error) => problems.push(error),
+        }
+    }
+    (rows, problems)
 }
 
 /// How deep [`nest`] descends. Real agent trees are a few levels (Manvi bounds
@@ -569,6 +812,7 @@ pub(crate) fn unattributed(error: &str) -> LiveSessionFacet {
         sessions: 0,
         kinds,
         worktrees: Vec::new(),
+        attribution_error: String::new(),
     }
 }
 
@@ -660,6 +904,213 @@ mod tests {
                 .collect::<Vec<_>>(),
             [102]
         );
+    }
+
+    fn session_at(pid: u32, cwd: &Path) -> LiveSession {
+        LiveSession {
+            kind: "claude".into(),
+            pid,
+            entrypoint: "cli".into(),
+            status: "busy".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            tree: None,
+            run_id: None,
+            parent_pid: None,
+            session_id: None,
+            proc_start: None,
+            registry_cwd: None,
+        }
+    }
+
+    fn observation_of(session: LiveSession) -> Observation {
+        vec![KindObservation {
+            kind: "claude".into(),
+            ok: true,
+            live: vec![session],
+            ..KindObservation::default()
+        }]
+    }
+
+    fn owner_of_pid(facet: &LiveSessionFacet, pid: u32) -> Option<&str> {
+        facet
+            .worktrees
+            .iter()
+            .find(|row| row.sessions.iter().any(|session| session.pid == pid))
+            .map(|row| row.path.as_str())
+    }
+
+    /// The process sits in the main checkout. The lane's lock names that pid
+    /// and the same start string, so the session belongs to the lane.
+    #[test]
+    fn a_locked_lane_owns_the_session_whose_process_cwd_is_the_main_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let lane = root.path().join("lane");
+        let admin = root.path().join("admin");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(lane.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let start = "Thu Nov  5 17:58:03 2026";
+        fs::write(
+            admin.join("locked"),
+            format!("claude agent lane-1 (pid 42 start {start})\n"),
+        )
+        .unwrap();
+        let mut session = session_at(42, &main);
+        session.proc_start = Some(start.into());
+        session.session_id = Some("lane-1".into());
+        session.registry_cwd = Some(main.to_string_lossy().into_owned());
+        let listing = vec![
+            main.to_string_lossy().into_owned(),
+            lane.to_string_lossy().into_owned(),
+        ];
+        // A last-claimed cwd of main disagrees with the lock. The lock wins.
+        let claim = super::super::claims::FileClaim {
+            source: super::super::claims::ClaimSource::Observed,
+            session_id: Some("lane-1".into()),
+            run_id: None,
+            path: "a.rs".into(),
+            worktree: main.to_string_lossy().into_owned(),
+            ts_ms: 1,
+            cwd: Some(main.to_string_lossy().into_owned()),
+        };
+        let facet = attribute_with(&observation_of(session.clone()), &listing, &[], &[claim]);
+        assert_eq!(
+            owner_of_pid(&facet, 42).map(Path::new),
+            Some(main.as_path()),
+            "without the lock the claim cwd is main: {facet:?}"
+        );
+        let facet = attribute(&observation_of(session), &listing);
+        assert_eq!(
+            owner_of_pid(&facet, 42).map(Path::new),
+            Some(lane.as_path()),
+            "the lock file names the lane: {facet:?}"
+        );
+    }
+
+    #[test]
+    fn a_lock_without_a_start_does_not_steal_a_session() {
+        let parsed = parse_lock_reason("claude session abc (pid 42)").unwrap();
+        assert_eq!(parsed, (42, None));
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let lane = root.path().join("lane");
+        let admin = root.path().join("admin");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(lane.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        fs::write(admin.join("locked"), "claude agent lane-1 (pid 42)\n").unwrap();
+        let mut session = session_at(42, &main);
+        session.proc_start = Some("Thu Nov  5 17:58:03 2026".into());
+        let listing = vec![
+            main.to_string_lossy().into_owned(),
+            lane.to_string_lossy().into_owned(),
+        ];
+        assert!(read_worktree_locks(&listing).is_empty());
+        let facet = attribute(&observation_of(session), &listing);
+        assert_eq!(
+            owner_of_pid(&facet, 42).map(Path::new),
+            Some(main.as_path()),
+            "{facet:?}"
+        );
+    }
+
+    /// Process cwd and registry cwd name two different checkouts. The hook's
+    /// last-claimed cwd is the worktree the session is attributed to.
+    #[test]
+    fn a_hook_reported_worktree_wins_when_registry_cwd_differs_from_process_cwd() {
+        let repo = crate::test_support::git_repo();
+        let main = repo.path().to_path_buf();
+        let lane = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        super::super::claims::record_observed(
+            &main,
+            "enter-worktree",
+            "a.rs",
+            lane.path().to_str().unwrap(),
+            super::super::claims::now_ms(),
+        )
+        .unwrap();
+        let mut session = session_at(7, &main);
+        session.session_id = Some("enter-worktree".into());
+        session.registry_cwd = Some(elsewhere.path().to_string_lossy().into_owned());
+        let listing = vec![
+            main.to_string_lossy().into_owned(),
+            lane.path().to_string_lossy().into_owned(),
+            elsewhere.path().to_string_lossy().into_owned(),
+        ];
+        let facet = attribute(&observation_of(session), &listing);
+        assert_eq!(
+            owner_of_pid(&facet, 7).map(Path::new),
+            Some(lane.path()),
+            "{facet:?}"
+        );
+    }
+
+    /// One parent CLI started two isolation agents: both locks name its pid and
+    /// start. That is no evidence for either lane, so the session stays where
+    /// its cwd puts it. Before, the first lock listed took it.
+    #[test]
+    fn two_locks_naming_one_session_move_it_to_neither_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        let start = "Thu Nov  5 17:58:03 2026";
+        let mut listing = vec![main.to_string_lossy().into_owned()];
+        for lane in ["lane-a", "lane-b"] {
+            let checkout = root.path().join(lane);
+            let admin = root.path().join(format!("admin-{lane}"));
+            fs::create_dir_all(&checkout).unwrap();
+            fs::create_dir_all(&admin).unwrap();
+            fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", admin.display()),
+            )
+            .unwrap();
+            fs::write(
+                admin.join("locked"),
+                format!("claude agent {lane} (pid 42 start {start})\n"),
+            )
+            .unwrap();
+            listing.push(checkout.to_string_lossy().into_owned());
+        }
+        assert_eq!(read_worktree_locks(&listing).len(), 2);
+        let mut session = session_at(42, &main);
+        session.proc_start = Some(start.into());
+        let facet = attribute(&observation_of(session), &listing);
+        assert_eq!(
+            owner_of_pid(&facet, 42).map(Path::new),
+            Some(main.as_path()),
+            "{facet:?}"
+        );
+    }
+
+    /// A claim store the attribution could not read in full is said on the
+    /// facet, and `ok` drops: before, `if let Ok` made it an empty claim list.
+    #[test]
+    fn an_unreadable_claim_store_marks_attribution_degraded() {
+        let repo = crate::test_support::git_repo();
+        let main = repo.path().to_path_buf();
+        let common = crate::engine::git_cli::resolve_git_common_dir(&main).unwrap();
+        let store = super::super::claims::store_path(&common);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, b"{\"source\":\"obs").unwrap();
+        let listing = vec![main.to_string_lossy().into_owned()];
+        let facet = attribute(&observation_of(session_at(7, &main)), &listing);
+        assert!(!facet.ok, "{facet:?}");
+        assert!(
+            facet.attribution_error.contains("1 unreadable claim line"),
+            "{facet:?}"
+        );
+        // The session is still attributed, by what could be read.
+        assert_eq!(owner_of_pid(&facet, 7).map(Path::new), Some(main.as_path()));
+
+        let clean = crate::test_support::git_repo();
+        let clean_listing = vec![clean.path().to_string_lossy().into_owned()];
+        let facet = attribute(&observation_of(session_at(8, clean.path())), &clean_listing);
+        assert!(facet.attribution_error.is_empty(), "{facet:?}");
     }
 
     #[test]

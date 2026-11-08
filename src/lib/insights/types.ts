@@ -61,6 +61,12 @@ export interface LiveSession {
    * "none the scan could see", not "started by a person".
    */
   parent_pid?: number;
+  /** The agent's own session id, when its registry named one. Hook claims join on it. */
+  session_id?: string;
+  /** Claude Code's `procStart` string; a worktree lock matches only when pid and this agree. */
+  proc_start?: string;
+  /** The cwd the registry recorded; differs from `cwd` for an isolation worktree. */
+  registry_cwd?: string;
 }
 
 /** A session nested under another in the same worktree. */
@@ -98,6 +104,12 @@ export interface LiveSessionFacet {
   sessions: number;
   kinds: LiveKindStatus[];
   worktrees: LiveWorktree[];
+  /**
+   * Set when attribution by worktree lock or hook claim could not be read in
+   * full, so a session may be filed under its process cwd. Omitted when empty;
+   * `ok` is false while it is set.
+   */
+  attribution_error?: string;
 }
 
 export interface AgentSummary {
@@ -186,6 +198,17 @@ export interface SharedWorktree {
   truncated: boolean;
 }
 
+/** One file claim. A declared claim names the run that planned the path. An observed claim names the session the edit hook let through. */
+export interface FileClaim {
+  source: "declared" | "observed";
+  session_id?: string;
+  run_id?: string;
+  path: string;
+  worktree: string;
+  ts_ms: number;
+  cwd?: string;
+}
+
 export interface CollisionRisk {
   ok: boolean;
   error: string;
@@ -201,9 +224,24 @@ export interface CollisionRisk {
   /** Dirty files in worktrees two live sessions share — invisible to `overlapping_files`. */
   shared_worktree_files: number;
   shared_worktrees: SharedWorktree[];
-  /** False when some agent kind could not be observed; empty `shared_worktrees` is then not clean. */
+  /** False when some agent kind could not be observed, or attribution by hook claim could not be read in full; empty `shared_worktrees` is then not clean. */
   sessions_ok: boolean;
+  /** Why `sessions_ok` is false: each kind that could not be observed, and `attribution: …` when claims were not read. */
   sessions_error: string;
+  /**
+   * Declared and observed claims for this repository. Omitted when empty.
+   * Empty means none only when `claims_error` is also empty.
+   */
+  file_claims?: FileClaim[];
+  /**
+   * Set when the claim store was not read, or read with unreadable lines
+   * skipped. Omitted when empty. A cut list is said by `claims_truncated`.
+   */
+  claims_error?: string;
+  /** How many claims matched before `file_claims` was cut to its cap. Omitted when it was not cut. */
+  claims_total?: number;
+  /** True when `file_claims` holds only the newest rows up to its cap. Omitted when it was not cut. */
+  claims_truncated?: boolean;
 }
 
 export interface InsightsSnapshot {

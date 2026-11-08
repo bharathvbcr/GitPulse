@@ -6,6 +6,8 @@
 
 import { get } from "svelte/store";
 import { withDeadline } from "../async/deadline";
+import { getCollisionRisk } from "../insights/client";
+import type { CollisionRisk } from "../insights/types";
 import { invoke } from "../ipc/invoke";
 import { kindLabel, type RepoOperation } from "../repos/operation";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
@@ -23,7 +25,7 @@ import { startPreparedAttempt } from "./taskTerminal";
 import { getVerification, runVerification } from "./verification";
 import { supportsManaged } from "./vocabulary";
 import { createWavePersister, findActiveWave, type WaveTaskApi } from "./waveStore";
-import { resumeWave, startWave, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
+import { resumeWave, startWave, type Held, type HeldRead, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
 import type { TaskSuggestions } from "./client";
 
 /** `work.verify.task` can take minutes; a verdict still `running` after this is reported as such, never trusted. */
@@ -91,6 +93,41 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Claims the planner tells a person about. They hold nothing back, so a claim
+ * store that could not be read, was read in part, or named a holder it could
+ * not read is said in the answer and the batch still plans: refusing a wave
+ * over an advisory sidecar would be a policy nobody asked for. The holder
+ * wording is what `planBatch` puts after "claimed by".
+ *
+ * `unreadable` means no claim could be used, so none were checked. `partial`
+ * means some were: the list was cut to its newest rows, the store was read with
+ * lines skipped, or one claim named no holder. The two are not the same
+ * sentence in the wave note.
+ */
+export function heldFromRisk(risk: Pick<CollisionRisk, "file_claims" | "claims_error" | "claims_truncated" | "claims_total">): HeldRead {
+  const claims = risk.file_claims ?? [];
+  const partial: string[] = [];
+  const held: Held[] = [];
+  for (const claim of claims) {
+    const holder = claim.source === "declared" && claim.run_id
+      ? `run ${claim.run_id}`
+      : claim.source === "observed" && claim.session_id
+        ? `session ${claim.session_id}`
+        : "";
+    if (!claim.path || !holder) {
+      partial.push(`a claim on ${claim.path || "an unnamed path"} named no holder`);
+      continue;
+    }
+    held.push({ path: claim.path, holder });
+  }
+  const error = (risk.claims_error ?? "").trim();
+  if (error && held.length === 0) return { held, unreadable: [error, ...partial].join("; ") };
+  if (error) partial.unshift(error);
+  if (risk.claims_truncated) partial.unshift(`the notices cover the newest ${claims.length} of ${risk.claims_total ?? "more"} claims`);
+  return partial.length ? { held, partial: partial.join("; ") } : { held };
+}
+
 export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"], maxPriority?: number): Promise<WaveDeps> {
   const checkout = await checkoutFor(repositoryId);
   return {
@@ -104,6 +141,15 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
     scopes: async (ids, signal) => {
       const found = await stoppable(loadTaskScopes(invoke, checkout, ids), signal);
       return new Map(Object.values(found).map((scope) => [scope.id, [...scope.planned_files, ...scope.agent_appended_files]]));
+    },
+    heldPaths: async (signal) => {
+      try {
+        return heldFromRisk(await stoppable(getCollisionRisk(checkout), signal));
+      } catch (cause) {
+        // A stop ends the wave; any other failure is claims not read, said in the note.
+        if (signal.aborted) throw cause;
+        return { held: [], unreadable: cause instanceof Error ? cause.message : String(cause) };
+      }
     },
     launch: async (taskId, ids, signal) => {
       // The provider the person last chose when it can be supervised, else Claude; never bypass, which is acknowledged afresh on every launch.

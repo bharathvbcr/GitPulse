@@ -359,6 +359,107 @@ fn fold_description(description: &str, planned: &[String], repositories: &[Strin
     out
 }
 
+/// Repo-relative paths under a description's `## Planned files` list.
+///
+/// The board stores the card's planned files in the description (see
+/// [`fold_description`]), not in a column. Absolute paths, `..`, and anything
+/// the claim store would reject are skipped. At most 64 paths are returned.
+pub(crate) fn planned_paths(description: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_section = false;
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_section = heading.trim() == "Planned files";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        let Some(item) = bare_path(item) else {
+            continue;
+        };
+        let Ok(path) = crate::insights::claims::normalize_rel(&item) else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        if paths.len() >= 64 {
+            break;
+        }
+    }
+    paths
+}
+
+/// The path in one `## Planned files` list item. Cards annotate their items:
+/// `` `src/a.rs` `` in backticks, or `src/a.rs (new, bounded store)` with a
+/// trailing parenthetical. Both name the file; neither spelling is the path.
+/// An item that is still not one token after that is prose, not a path, and
+/// is dropped rather than claimed.
+fn bare_path(item: &str) -> Option<String> {
+    let item = item.trim();
+    let path = match item.strip_prefix('`') {
+        Some(rest) => rest.split('`').next()?.trim(),
+        None => {
+            let mut path = item;
+            while path.ends_with(')') {
+                match path.rfind(" (") {
+                    Some(at) => path = path[..at].trim_end(),
+                    None => break,
+                }
+            }
+            path
+        }
+    };
+    (!path.is_empty() && !path.contains(char::is_whitespace)).then(|| path.to_string())
+}
+
+/// The paths a run declares claims for: the structured scope the wave planner
+/// reads (`TaskScope.planned_files` and what an executor appended to it) when
+/// DevCouncil's store has one, and otherwise the card's `## Planned files`
+/// list, cleaned by [`bare_path`]. The Markdown list is a fallback because a
+/// card filed over MCP keeps its planned files only there. A scope that cannot
+/// be read is logged and falls back; it is never an empty claim list.
+pub(crate) fn declared_paths(repo_path: &str, task_id: &str, description: &str) -> Vec<String> {
+    let scope = crate::ledger::bindings::repository_address(repo_path)
+        .map_err(|error| error.to_string())
+        .and_then(|address| crate::tasks::scopes(&address.anchor, &[task_id.to_string()]));
+    match scope {
+        Ok(found) => {
+            let mut paths = Vec::new();
+            for scope in found {
+                for raw in scope
+                    .planned_files
+                    .iter()
+                    .chain(&scope.agent_appended_files)
+                {
+                    if let Ok(path) = crate::insights::claims::normalize_rel(raw) {
+                        if !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                    }
+                }
+            }
+            if !paths.is_empty() {
+                paths.truncate(64);
+                return paths;
+            }
+        }
+        Err(error) => log::warn!(
+            target: "workbench",
+            "the structured scope of {task_id} could not be read for declared claims ({error}); using its planned-files list"
+        ),
+    }
+    planned_paths(description)
+}
+
 /// `YYYY-MM-DD` (placed at 12:00 UTC, which is that calendar day in every
 /// time zone from UTC−11 to UTC+11), or Unix seconds.
 pub(crate) fn parse_due(raw: Option<&str>) -> Result<Option<i64>, String> {

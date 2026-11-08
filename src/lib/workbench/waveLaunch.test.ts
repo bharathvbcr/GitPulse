@@ -90,7 +90,28 @@ describe("file-scope collisions", () => {
     const scopes = new Map([["a", ["src/x.ts"]], ["b", ["src/x.ts", "src/y.ts"]], ["c", ["docs/z.md"]]]);
     const plan = planBatch([task("a"), task("b"), task("c")], scopes, 3, new Set());
     expect(plan.chosen.map((c) => c.id)).toEqual(["a", "c"]);
-    expect(plan.skipped).toEqual([{ id: "b", title: "Task b", reason: 'its files overlap "Task a"' }]);
+    expect(plan.skipped).toEqual([{ id: "b", title: "Task b", reason: 'its files overlap "Task a" on src/x.ts' }]);
+  });
+
+  it("tells a member its file is claimed elsewhere and still launches it: a claim from another run or batch is a notice, not a hold", () => {
+    const scopes = new Map([["a", ["a.rs"]], ["b", ["b.rs"]]]);
+    const plan = planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }, [{ path: "a.rs", holder: "run X" }]);
+    expect(plan.chosen.map((c) => c.id)).toEqual(["a", "b"]);
+    expect(plan.skipped).toEqual([]);
+    expect(plan.notices).toEqual([{ id: "a", title: "Task a", reason: "a.rs is claimed by run X" }]);
+    expect(plan.notices[0].reason).not.toMatch(/collision/i);
+  });
+
+  it("launches an unknown-scope candidate beside an unrelated claim", () => {
+    const scopes = new Map<string, string[]>([["b", ["x"]]]);
+    const plan = planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }, [{ path: "unrelated.rs", holder: "run X" }]);
+    // Unknown scope still runs alone (the within-batch rule), but a claim elsewhere does not refuse it.
+    expect(plan.chosen.map((c) => c.id)).toEqual(["a"]);
+    expect(plan.skipped.map((s) => s.reason)).toEqual(['its file scope is unknown next to "Task a"']);
+    expect(plan.notices).toEqual([]);
+    const alone = planBatch([task("a")], scopes, 2, new Set(), { caseInsensitive: false }, [{ path: "unrelated.rs", holder: "run X" }]);
+    expect(alone.chosen.map((c) => c.id)).toEqual(["a"]);
+    expect(alone.skipped).toEqual([]);
   });
 
   it("treats an unknown scope as colliding with everything, so it runs alone", () => {

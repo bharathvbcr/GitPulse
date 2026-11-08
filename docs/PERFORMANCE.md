@@ -2574,3 +2574,22 @@ What it says:
 - **Cost:** about 4x cheaper per scan with `max-performance`; 1.5x to 3.8x with the lean set. Note `diff --shortstat` (17 per refresh, 33 ms each in the profile) is not addressed by this card: this crate does not evaluate an in-process shortstat, so that cost remains unaddressed.
 - **Conditions of adoption:** pick the gix feature set with the owner (the bundle is the one that gives the measured win), keep a spawn fallback on any gix error, and add the parity suite to the app's tests.
 - **This crate is throwaway.** The adoption change in `src-tauri` deletes `crates/git-status-parity/` in the same commit (its fixtures and the table above move into the app's tests; the harness's `gix_status` mapping is the code to carry over).
+
+
+## 2026-11-08: file-claim store append latency at a full store (ft-9cfa517403d3412725e753db97175cac, lane b1106w9/claims; row for ft-c0d9313f)
+
+What: one `append_claim` into `<git-common-dir>/gitpulse/file-claims.jsonl` at its compaction threshold (cap 4096, 6,786 rows, about 2 MiB, realistic 311-byte rows), and six hook processes of 50 appends each against that store.
+
+Where: Apple Silicon macOS, debug (unoptimized) test profile, `src-tauri/tests/claims_store_stress.rs`; the "before" numbers are the reviewer's attack tests run against the unmodified store at merge `759adb03`. Release builds are faster; none was measured.
+
+| | before (every append past the threshold rewrote and fsynced the file, under the exclusive lock) | after (shared lock, no fsync, compaction every few thousand appends) |
+| --- | --- | --- |
+| one process, appends below the threshold | p50 3.06 ms, p99 5.79 ms, max 15.2 ms (n=1,265) | p50 48 to 68 us, p99 94 to 207 us (n=400, 5 runs) |
+| one process, appends past the threshold | p50 23.1 ms, p99 43.9 ms, max 49.5 ms (n=1,735) | the single compaction in the 400: max 35 to 120 ms; every other append as above |
+| 6 processes x 50 appends at the threshold | 252 of 300 failed on the 20 ms lock wait | 0 of 300 failed, 5 of 5 runs; 0 skipped lines |
+
+The 20 ms lock wait was not widened. Why it holds now: appends take a shared lock, so they do not queue behind each other; only the compaction takes the exclusive lock, and it prepares the new file before asking for it and copies onto it what was appended meanwhile, so the lock covers one read of a short tail, one write and a rename. Hooks that cross the threshold together find the store already compacted and append to it instead of compacting again. The compaction itself (about 35 ms in this build) is outside the lock except for that write.
+
+Not measured: the target of under 1 ms per append is met at p99 for the append alone in this build (0.2 ms), but the whole hook also reads the store twice (attribution and notices), each a lock-free read and parse of up to about 2 MiB; that read was not timed separately.
+
+Round 3 (same lane): compaction now keeps every live row up to the cap (4,096 live rows after the stress run, where the half-cap compaction left about 2,340), and the new file is written before the exclusive lock is taken, so the lock covers a read of a short tail, one small write and a rename. Three more runs of the same tests, debug build, machine under load: 0 of 300 appends failed in each; single-process append at a full store p50 77 to 94 us, p99 0.21 to 1.6 ms, max 62 to 72 ms (the one compaction). A read is a lock-free parse of up to about 2 MiB: 28 to 59 ms in a debug build per the reviewer, not measured in release, and listed as a follow-up.

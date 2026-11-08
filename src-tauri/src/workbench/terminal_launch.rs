@@ -333,7 +333,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
         })
     };
     if !input.worktree && kind != "managed" {
-        return in_place();
+        return finish_declared(state, &input, in_place());
     }
     let (_, root, inside) =
         crate::terminal::checkout_root(&input.repo_path).map_err(unavailable)?;
@@ -350,7 +350,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
             ));
         }
         if !input.worktree {
-            return in_place();
+            return finish_declared(state, &input, in_place());
         }
     }
     // Nothing prepared under this id (`own_prepared` answered every other
@@ -369,21 +369,92 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
         Some(inside) => native_path(&Path::new(&provisioned.path).join(inside))?,
         None => provisioned.path.clone(),
     };
-    let prepared = prepare_in(state, &input, kind, &cwd, &model_choice);
-    if let Err(refusal) = prepared {
-        // The attempt does not exist, so neither may the worktree made for it.
-        return Err(match super::agent_worktree::discard(&provisioned) {
-            Ok(()) => refusal,
-            Err(cleanup) => WorkbenchError::new(
-                &refusal.code,
-                format!(
-                    "{} The worktree made for it could not be removed and is still at {} on branch {}: {cleanup}",
-                    refusal.message, provisioned.path, provisioned.branch, cleanup = cleanup.message()
+    match prepare_in(state, &input, kind, &cwd, &model_choice) {
+        Err(refusal) => {
+            // The attempt does not exist, so neither may the worktree made for it.
+            Err(match super::agent_worktree::discard(&provisioned) {
+                Ok(()) => refusal,
+                Err(cleanup) => WorkbenchError::new(
+                    &refusal.code,
+                    format!(
+                        "{} The worktree made for it could not be removed and is still at {} on branch {}: {cleanup}",
+                        refusal.message, provisioned.path, provisioned.branch, cleanup = cleanup.message()
+                    ),
                 ),
-            ),
-        });
+            })
+        }
+        ok => finish_declared(state, &input, ok),
     }
-    prepared
+}
+
+/// Records the card's planned files as declared claims after a preparation
+/// commits. A claim that cannot be written is logged. The launch still stands:
+/// a missing claim is not a missing attempt.
+fn finish_declared(
+    state: &WorkbenchState,
+    input: &Preparation,
+    prepared: Result<Value, WorkbenchError>,
+) -> Result<Value, WorkbenchError> {
+    let prepared = prepared?;
+    record_declared_claims(state, input, &prepared);
+    Ok(prepared)
+}
+
+fn record_declared_claims(state: &WorkbenchState, input: &Preparation, prepared: &Value) {
+    let Ok(task) = state.with_store(|store| {
+        query(
+            store,
+            "items.get",
+            &json!({"id": input.task_id}).to_string(),
+        )
+    }) else {
+        return;
+    };
+    match crate::insights::claims::admitted(Path::new(&input.repo_path)) {
+        Ok(true) => {}
+        // An untrusted repository gets no claim files under its `.git`.
+        Ok(false) => return,
+        Err(error) => {
+            log::warn!(
+                target: "workbench",
+                "declared file claims were not recorded for {}: trust could not be read ({error})",
+                input.id
+            );
+            return;
+        }
+    }
+    let paths = super::intake::declared_paths(
+        &input.repo_path,
+        &input.task_id,
+        task["item"]["description"].as_str().unwrap_or(""),
+    );
+    if paths.is_empty() {
+        return;
+    }
+    let Some(common) = prepared["item"]["git_common_dir"].as_str() else {
+        log::warn!(
+            target: "workbench",
+            "declared file claims were not recorded for {}: the preparation named no git common dir",
+            input.id
+        );
+        return;
+    };
+    let worktree = prepared["item"]["cwd"]
+        .as_str()
+        .unwrap_or(input.repo_path.as_str());
+    if let Err(error) = crate::insights::claims::declare(
+        Path::new(common),
+        &input.id,
+        worktree,
+        &paths,
+        crate::insights::claims::now_ms(),
+    ) {
+        log::warn!(
+            target: "workbench",
+            "declared file claims were not recorded for {}: {error}",
+            input.id
+        );
+    }
 }
 
 /// The attempt this request already committed, when one exists under its id.
@@ -780,6 +851,79 @@ mod tests {
             .register(root.to_str().unwrap(), "repo", "register")
             .unwrap();
         state.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Preserve E42","description":"Exact saved instructions","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
+    }
+
+    #[test]
+    fn preparing_a_run_records_declared_claims_for_planned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        state
+            .register(root.to_str().unwrap(), "repo", "register")
+            .unwrap();
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id":"task",
+                    "request_id":"task",
+                    "expected_revision":0,
+                    "title":"Touch a.rs",
+                    "description":"Do the thing\n\n## Planned files\n- a.rs\n- /etc/passwd\n- ../outside\n\n## Related repositories\n- other",
+                    "repository_ids":["repo"],
+                    "primary_repository_id":"repo"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let input = prepare(&root).to_string();
+        let result = state.request("runs.prepare_terminal", &input).unwrap();
+        assert_eq!(result["item"]["state"], "prepared");
+        let common = result["item"]["git_common_dir"].as_str().unwrap();
+        let store = Path::new(common).join("gitpulse").join("file-claims.jsonl");
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"source\":\"declared\""), "{text}");
+        assert!(text.contains("\"path\":\"a.rs\""), "{text}");
+        assert!(text.contains("\"run_id\":\"run\""), "{text}");
+        assert!(!text.contains("passwd"), "{text}");
+        assert!(!text.contains("outside"), "{text}");
+        let lines = text.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(lines, 1, "{text}");
+        // A retry answers with the saved attempt and does not record again.
+        state.request("runs.prepare_terminal", &input).unwrap();
+        let again = std::fs::read_to_string(&store).unwrap();
+        assert_eq!(again.lines().filter(|line| !line.is_empty()).count(), 1);
+
+        let blocked = tempfile::tempdir().unwrap();
+        let blocked_root = blocked.path().join("repo");
+        init(&blocked_root);
+        commit(&blocked_root);
+        std::fs::write(blocked_root.join(".git").join("gitpulse"), b"x").unwrap();
+        let blocked_state = host(&blocked.path().join("profile.sqlite"));
+        blocked_state
+            .register(blocked_root.to_str().unwrap(), "repo", "register")
+            .unwrap();
+        blocked_state
+            .request(
+                "items.put",
+                &json!({
+                    "id":"task",
+                    "request_id":"task",
+                    "expected_revision":0,
+                    "title":"Touch a.rs",
+                    "description":"## Planned files\n- a.rs",
+                    "repository_ids":["repo"],
+                    "primary_repository_id":"repo"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let still = blocked_state
+            .request("runs.prepare_terminal", &prepare(&blocked_root).to_string())
+            .unwrap();
+        assert_eq!(still["item"]["state"], "prepared");
     }
 
     #[test]
