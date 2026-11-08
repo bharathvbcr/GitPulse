@@ -1,0 +1,506 @@
+# Sub-100 ms (or unprovable) sleeps in test code. Enforced by
+# tests/hermetic_contract.rs (`every_short_sleep_in_test_code_is_listed_with_a_reason`
+# and `the_sleep_allowlist_names_only_sleeps_that_exist_and_reasons_that_hold`);
+# the reasons and the rule each one must satisfy are `SLEEP_REASONS` there.
+#
+#   site | path | function | ordinal | reason
+#   prefix | path-prefix | owned-elsewhere:<owner>
+#
+# The anchor is the enclosing function (`Type::fn` inside an impl) and the
+# ordinal of the sleep among ALL sleeps of that function, so a line number or a
+# duration changing never moves it. An entry whose sleep is gone or is now 100 ms
+# or longer fails the second test: delete it in the same change.
+#
+# Whole files other wave-2 lanes were converting when this list was written are
+# held by prefix. That is deliberate and temporary: tighten each prefix to
+# per-site entries (or delete it) once the owning lane has landed.
+prefix | src/engine/worktree.rs | owned-elsewhere:b1108w2
+prefix | src/insights/ | owned-elsewhere:b1108w2
+prefix | src/engine/git_reader.rs | owned-elsewhere:b1108w2
+prefix | src/engine/ref_cache.rs | owned-elsewhere:b1108w2
+prefix | src/workbench.rs | owned-elsewhere:b1108w2
+prefix | src/harness/ | owned-elsewhere:b1108w2
+prefix | tests/agent_collaboration_integration.rs | owned-elsewhere:b1108w2
+prefix | tests/adv_m1_ | owned-elsewhere:b1108w2
+prefix | tests/adv_m3_pty_stress.rs | owned-elsewhere:b1108w2
+prefix | tests/adv_m4_ | owned-elsewhere:b1108w2
+prefix | tests/adversarial_m1_challenger_test.rs | owned-elsewhere:b1108w2
+prefix | src/watcher/mod.rs | owned-elsewhere:ft-ade6e999
+
+# src/adv_w3l2_tests.rs
+site | src/adv_w3l2_tests.rs | BandWatch::start | 0 | unbounded-poll
+site | src/adv_w3l2_tests.rs | never_settled | 0 | bounded-poll
+
+# src/agent_mailbox/tests.rs
+site | src/agent_mailbox/tests.rs | a_waiter_arriving_at_a_full_session_waits_and_hears_the_message | 0 | bounded-poll
+site | src/agent_mailbox/tests.rs | a_waiter_beyond_the_global_cap_is_told_to_leave | 0 | mtime-gap
+site | src/agent_mailbox/tests.rs | a_waiter_displaced_by_a_later_stop_leaves_without_taking_the_message | 0 | bounded-poll
+site | src/agent_mailbox/tests.rs | a_waiter_displaced_by_a_later_stop_leaves_without_taking_the_message | 1 | mtime-gap
+site | src/agent_mailbox/tests.rs | register_next | 0 | mtime-gap
+site | src/agent_mailbox/tests.rs | waiting_takes_a_message_that_arrives_while_it_waits_and_then_leaves_no_trace | 0 | bounded-poll
+
+# src/ai/http.rs
+site | src/ai/http.rs | overall_deadline_bounds_a_dribbling_server | 0 | fixture-delay
+
+# src/alerts/bridge.rs
+site | src/alerts/bridge.rs | a_restart_retires_the_old_loop_without_unlinking_the_new_socket | 0 | bounded-poll
+site | src/alerts/bridge.rs | hold_after_wait | 0 | hold
+site | src/alerts/bridge.rs | poke_until | 0 | bounded-poll
+site | src/alerts/bridge.rs | wait_until | 0 | bounded-poll
+site | src/alerts/bridge.rs | within | 0 | bounded-poll
+
+# src/alerts/bridge/tests/adv_tests.rs
+site | src/alerts/bridge/tests/adv_tests.rs | a_fatal_accept_error_racing_stop_leaves_nothing_behind | 0 | spacing
+site | src/alerts/bridge/tests/adv_tests.rs | a_fatal_accept_error_racing_stop_leaves_nothing_behind | 1 | spacing
+
+# src/alerts/intake_adv_tests.rs
+site | src/alerts/intake_adv_tests.rs | answers_flat_out_do_not_cost_other_sessions_their_reports | 0 | spacing
+
+# src/alerts/intake_tests.rs
+site | src/alerts/intake_tests.rs | fifty_thousand_bells_on_one_session_drop_no_hook_report | 0 | spacing
+
+# src/bin/gitpulse-mcp.rs
+site | src/bin/gitpulse-mcp.rs | Trickle::write | 0 | fixture-delay
+site | src/bin/gitpulse-mcp.rs | a_request_whose_thread_cannot_start_is_still_answered_once | 0 | bounded-poll
+
+# src/codeintel/mod.rs
+site | src/codeintel/mod.rs | an_earlier_registration_wakes_a_timer_waiting_on_a_later_one | 0 | race-widen
+site | src/codeintel/mod.rs | dropping_the_timer_stops_its_thread | 0 | bounded-poll
+site | src/codeintel/mod.rs | short_deadlines_registered_behind_a_long_one_all_fire_on_time | 0 | spacing
+site | src/codeintel/mod.rs | short_deadlines_registered_behind_a_long_one_all_fire_on_time | 1 | bounded-poll
+site | src/codeintel/mod.rs | wait_for | 0 | bounded-poll
+site | src/codeintel/mod.rs | wait_until | 0 | bounded-poll
+
+# src/commands/audit.rs
+site | src/commands/audit.rs | an_unbind_catches_up_what_happened_under_the_binding_it_ends | 0 | mtime-gap
+site | src/commands/audit.rs | an_unbind_catches_up_what_happened_under_the_binding_it_ends | 1 | mtime-gap
+
+# src/commands/intel.rs
+site | src/commands/intel.rs | cancelling_the_token_stops_preview_many_within_one_file | 0 | bounded-poll
+
+# src/commands/tests.rs
+site | src/commands/tests.rs | a_third_background_job_waits_until_one_of_the_first_two_ends | 0 | hold
+
+# src/commands/worktrees.rs
+site | src/commands/worktrees.rs | seed_devmap_clones_the_store_and_starts_the_worktrees_own_build | 0 | bounded-poll
+
+# src/desktop/instance_tests.rs
+site | src/desktop/instance_tests.rs | a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch | 0 | bounded-poll
+site | src/desktop/instance_tests.rs | a_panicking_job_keeps_its_worker_and_gives_back_its_slot | 0 | bounded-poll
+site | src/desktop/instance_tests.rs | closing_the_pool_ends_idle_workers | 0 | bounded-poll
+site | src/desktop/instance_tests.rs | closing_the_pool_ends_idle_workers | 1 | bounded-poll
+site | src/desktop/instance_tests.rs | contender | 0 | bounded-poll
+site | src/desktop/instance_tests.rs | shutdown_ends_a_blocked_accept_thread_promptly | 1 | bounded-poll
+site | src/desktop/instance_tests.rs | successive_launches_are_answered_by_the_same_handler_threads | 0 | race-widen
+site | src/desktop/instance_tests.rs | the_pool_never_starts_more_threads_than_the_mailbox_admits | 0 | hold
+site | src/desktop/instance_tests.rs | the_pool_never_starts_more_threads_than_the_mailbox_admits | 2 | hold
+
+# src/desktop/popover.rs
+site | src/desktop/popover.rs | wait_for | 0 | bounded-poll
+
+# src/devmap/cli.rs
+site | src/devmap/cli.rs | wait_test_status_delay | 0 | bounded-poll
+
+# src/devmap/live.rs
+site | src/devmap/live.rs | LockHolder::hold | 0 | bounded-poll
+site | src/devmap/live.rs | LockHolder::release_and_reap | 0 | bounded-poll
+site | src/devmap/live.rs | ReleaseStub::drop | 0 | bounded-poll
+site | src/devmap/live.rs | RemovalFixture::release_and_wait | 0 | bounded-poll
+site | src/devmap/live.rs | concurrency_stress_multiple_distinct_repositories | 0 | hold
+site | src/devmap/live.rs | removal_waits_for_the_seeded_refresh_and_leaves_no_directory | 1 | bounded-poll
+site | src/devmap/live.rs | start_refresh_answers_before_a_hung_status_probe_and_collects_it_once | 0 | bounded-poll
+site | src/devmap/live.rs | start_refresh_answers_before_the_build_and_the_next_ask_collects_it | 0 | bounded-poll
+site | src/devmap/live.rs | xproc_writer_lock_holder | 0 | bounded-poll
+
+# src/docs/rename_tests.rs
+site | src/docs/rename_tests.rs | counting_gate_rename | 0 | fixture-delay
+
+# src/engine/git_cli.rs
+site | src/engine/git_cli.rs | a_hook_running_command_is_never_shared_so_it_stays_cancellable | 0 | bounded-poll
+site | src/engine/git_cli.rs | a_queued_command_still_gets_its_full_runtime_after_a_slot | 0 | hold
+site | src/engine/git_cli.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 0 | spacing
+site | src/engine/git_cli.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 1 | spacing
+site | src/engine/git_cli.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 0 | race-widen
+site | src/engine/git_cli.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 1 | spacing
+site | src/engine/git_cli.rs | a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh | 1 | hold
+site | src/engine/git_cli.rs | create_refuses_existing_tracked_untracked_ignored_lf_crlf_empty | 0 | mtime-gap
+site | src/engine/git_cli.rs | mixed_class_stress_holds_every_gate_invariant | 0 | hold
+site | src/engine/git_cli.rs | run_bounded_never_exceeds_the_spawn_limit_under_fan_out | 0 | spacing
+
+# src/engine/git_cli/budget_adversarial_tests.rs
+site | src/engine/git_cli/budget_adversarial_tests.rs | a_local_bucket_waiter_does_not_spin_on_a_stale_shared_ask_time | 0 | race-widen
+site | src/engine/git_cli/budget_adversarial_tests.rs | reactive_waiters_are_served_in_arrival_order | 0 | clock-seam-needed
+
+# src/engine/git_cli/grace_adversarial.rs
+site | src/engine/git_cli/grace_adversarial.rs | reap_leak | 0 | bounded-poll
+
+# src/engine/git_cli/pipe_drain.rs
+site | src/engine/git_cli/pipe_drain.rs | unfinished_pipe_keeps_bytes_and_closes_its_read_descriptor | 0 | bounded-poll
+
+# src/engine/git_cli/run_errors_adversarial_tests.rs
+site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | hold
+
+# src/engine/git_cli/shared_budget.rs
+site | src/engine/git_cli/shared_budget.rs | SharedBudget::lock | 0 | bounded-poll
+
+# src/engine/git_cli/thread_io.rs
+site | src/engine/git_cli/thread_io.rs | Slow::read_cancellable | 0 | fixture-delay
+site | src/engine/git_cli/thread_io.rs | a_child_that_closes_stdin_early_fails_the_feed_with_a_broken_pipe_not_a_hang | 1 | bounded-poll
+site | src/engine/git_cli/thread_io.rs | an_empty_payload_closes_stdin_so_the_child_sees_eof | 0 | bounded-poll
+site | src/engine/git_cli/thread_io.rs | fallback_handles_simultaneous_input_stdout_and_stderr | 0 | bounded-poll
+site | src/engine/git_cli/thread_io.rs | nonblocking_mode_never_reaches_the_childs_end | 0 | bounded-poll
+site | src/engine/git_cli/thread_io.rs | settle_or_report | 0 | bounded-poll
+
+# src/engine/git_writer.rs
+site | src/engine/git_writer.rs | a_cancelled_commit_leaves_no_index_lock | 0 | bounded-poll
+site | src/engine/git_writer.rs | a_cancelled_commit_whose_hook_flooded_leaves_no_index_lock | 0 | bounded-poll
+site | src/engine/git_writer.rs | a_running_hook_is_cancelled_on_request | 0 | bounded-poll
+site | src/engine/git_writer.rs | stage_retries_while_index_lock_is_held_then_released | 0 | hold
+
+# src/engine/git_writer_commit_graph_adv_tests.rs
+site | src/engine/git_writer_commit_graph_adv_tests.rs | wait_for_flight | 0 | bounded-poll
+
+# src/engine/git_writer_commit_graph_tests.rs
+site | src/engine/git_writer_commit_graph_tests.rs | a_cancel_stops_the_write_and_leaves_no_lock_or_graph | 0 | bounded-poll
+site | src/engine/git_writer_commit_graph_tests.rs | a_running_write_is_reported_and_no_second_write_is_planned | 0 | bounded-poll
+site | src/engine/git_writer_commit_graph_tests.rs | concurrent_clicks_in_one_common_dir_are_one_write | 0 | bounded-poll
+
+# src/github/mod.rs
+site | src/github/mod.rs | tiers_run_up_to_the_concurrency_cap_and_no_further | 0 | hold
+
+# src/hooks/deliver/tests.rs
+site | src/hooks/deliver/tests.rs | a_later_stops_hooks_displace_an_earlier_stops_and_hear_the_message | 0 | mtime-gap
+site | src/hooks/deliver/tests.rs | a_later_stops_hooks_displace_an_earlier_stops_and_hear_the_message | 1 | bounded-poll
+site | src/hooks/deliver/tests.rs | a_stop_that_continues_a_stop_hook_still_waits_and_hears_a_later_message | 0 | bounded-poll
+site | src/hooks/deliver/tests.rs | a_waiter_past_the_global_cap_exits_0_at_once | 0 | mtime-gap
+site | src/hooks/deliver/tests.rs | a_waiter_past_the_global_cap_exits_0_at_once | 1 | bounded-poll
+site | src/hooks/deliver/tests.rs | two_copies_of_the_hook_deliver_one_message_once | 0 | bounded-poll
+
+# src/hooks/tests/adv_w6_tests.rs
+site | src/hooks/tests/adv_w6_tests.rs | w6_a_status_slower_than_the_hook_budget_still_finds_the_holder | 0 | fixture-delay
+
+# src/ingest/event_time_tests.rs
+site | src/ingest/event_time_tests.rs | pause | 0 | mtime-gap
+
+# src/ingest/flight.rs
+site | src/ingest/flight.rs | a_caller_arriving_mid_flight_joins_it | 0 | race-widen
+site | src/ingest/flight.rs | an_abandoned_pass_still_records_its_result | 0 | bounded-poll
+
+# src/ingest/mod.rs
+site | src/ingest/mod.rs | serialize_single_flight_and_condvar_wakeup | 0 | race-widen
+site | src/ingest/mod.rs | serialize_stress_ten_plus_concurrent_threads_contention | 0 | spacing
+site | src/ingest/mod.rs | serialize_wakeup_latency_via_cvar_notification | 0 | race-widen
+
+# src/ingest/reflog_replay_tests.rs
+site | src/ingest/reflog_replay_tests.rs | adv_a_future_dated_entry_is_not_recorded_twice_after_a_kill_before_the_watermark | 0 | mtime-gap
+site | src/ingest/reflog_replay_tests.rs | replay_child | 0 | bounded-poll
+site | src/ingest/reflog_replay_tests.rs | two_processes_replaying_at_once_record_exactly_one_row_per_entry | 0 | bounded-poll
+
+# src/ledger/anchor.rs
+site | src/ledger/anchor.rs | a_busy_ledger_does_not_stall_another_repositorys_settle | 0 | hold
+site | src/ledger/anchor.rs | a_hung_path_costs_one_probe_thread_however_often_it_is_asked | 0 | bounded-poll
+
+# src/ledger/bindings/adversarial2_tests.rs
+site | src/ledger/bindings/adversarial2_tests.rs | settle | 0 | mtime-gap
+
+# src/ledger/bindings/adversarial_tests.rs
+site | src/ledger/bindings/adversarial_tests.rs | settle | 0 | mtime-gap
+
+# src/ledger/bindings/authority_tests.rs
+site | src/ledger/bindings/authority_tests.rs | settle | 0 | mtime-gap
+
+# src/ledger/schema_bump_adv_tests.rs
+site | src/ledger/schema_bump_adv_tests.rs | two_processes_opening_one_old_ledger_migrate_it_once_and_both_succeed | 0 | race-widen
+
+# src/logging/performance.rs
+site | src/logging/performance.rs | a_burst_of_quick_calls_wakes_the_watchdog_once_not_once_per_call | 0 | spacing
+site | src/logging/performance.rs | wait_until | 0 | bounded-poll
+
+# src/mcp/worktree_seed_tests.rs
+site | src/mcp/worktree_seed_tests.rs | assert_build_runs_in | 0 | bounded-poll
+
+# src/output.rs
+site | src/output.rs | a_panicking_writer_is_recorded_as_a_stopped_subsystem | 0 | bounded-poll
+site | src/output.rs | another_writer_finishing_cleanly_does_not_clear_a_stopped_writer | 0 | bounded-poll
+
+# src/pools.rs
+site | src/pools.rs | the_blocking_pool_is_bounded | 1 | bounded-poll
+
+# src/procguard/mod.rs
+site | src/procguard/mod.rs | a_background_band_child_is_demoted_and_a_sibling_is_not | 0 | unbounded-poll
+site | src/procguard/mod.rs | a_kill_aimed_at_an_unreaped_corpse_is_not_a_failure | 0 | bounded-poll
+site | src/procguard/mod.rs | a_reaped_child_is_forgotten | 0 | bounded-poll
+site | src/procguard/mod.rs | adv_a_kept_pid_that_later_becomes_a_leader_is_not_killed | 0 | bounded-poll
+site | src/procguard/mod.rs | reap_within | 0 | bounded-poll
+site | src/procguard/mod.rs | the_sweep_asks_before_it_insists | 0 | bounded-poll
+
+# src/storage/hygiene/global/tests.rs
+site | src/storage/hygiene/global/tests.rs | wait | 0 | bounded-poll
+
+# src/supervisor.rs
+site | src/supervisor.rs | wait | 0 | bounded-poll
+
+# src/sysload/procscan.rs
+site | src/sysload/procscan.rs | fixture_pid | 0 | bounded-poll
+site | src/sysload/procscan.rs | fixture_process | 0 | hold
+site | src/sysload/procscan.rs | real_reparented_fixture_is_attributed_to_its_run_with_its_footprint | 0 | unbounded-poll
+site | src/sysload/procscan.rs | the_signal_itself_refuses_a_pid_whose_start_time_moved | 0 | unbounded-poll
+
+# src/sysload/sampler.rs
+site | src/sysload/sampler.rs | real_sampler_holds_its_activity_only_while_enabled | 0 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_keeps_publishing_after_a_tick_panics | 0 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_publishes_and_a_second_one_reads | 0 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_publishes_and_a_second_one_reads | 1 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_switched_off_publishes_a_heartbeat_without_readings | 0 | bounded-poll
+
+# src/sysload/snapshot.rs
+site | src/sysload/snapshot.rs | elect_eventually | 0 | bounded-poll
+
+# src/terminal/executor.rs
+site | src/terminal/executor.rs | wait_until | 0 | bounded-poll
+
+# src/terminal/foreground.rs
+site | src/terminal/foreground.rs | a_process_working_in_a_directory_is_found_even_outside_its_parents_group | 0 | unbounded-poll
+
+# src/terminal/host/adv_w3a_tests.rs
+site | src/terminal/host/adv_w3a_tests.rs | SlowFinish::finished | 0 | bounded-poll
+
+# src/terminal/host/client_adversarial_tests.rs
+site | src/terminal/host/client_adversarial_tests.rs | FakeHost::start | 0 | unbounded-poll
+site | src/terminal/host/client_adversarial_tests.rs | FakeHost::start | 1 | unbounded-poll
+site | src/terminal/host/client_adversarial_tests.rs | a_hundred_threads_ask_while_the_host_churns_and_a_session_ends | 0 | spacing
+site | src/terminal/host/client_adversarial_tests.rs | a_hundred_threads_ask_while_the_host_churns_and_a_session_ends | 2 | spacing
+site | src/terminal/host/client_adversarial_tests.rs | serve | 0 | fixture-delay
+site | src/terminal/host/client_adversarial_tests.rs | serve | 1 | fixture-delay
+site | src/terminal/host/client_adversarial_tests.rs | serve | 2 | fixture-delay
+site | src/terminal/host/client_adversarial_tests.rs | serve | 3 | fixture-delay
+site | src/terminal/host/client_adversarial_tests.rs | until | 0 | bounded-poll
+
+# src/terminal/host/client_tests.rs
+site | src/terminal/host/client_tests.rs | FakeHost::start | 0 | unbounded-poll
+site | src/terminal/host/client_tests.rs | a_failed_first_listing_is_retried_in_the_background | 0 | bounded-poll
+site | src/terminal/host/client_tests.rs | a_session_that_exited_is_no_longer_known | 0 | bounded-poll
+site | src/terminal/host/client_tests.rs | delivered_exits_are_not_vouched_for_while_their_recording_is_pending | 0 | bounded-poll
+
+# src/terminal/incident.rs
+site | src/terminal/incident.rs | wait_until | 0 | bounded-poll
+
+# src/terminal/mod.rs
+site | src/terminal/mod.rs | a_session_whose_page_reloaded_keeps_running_and_can_be_shown_again | 0 | bounded-poll
+site | src/terminal/mod.rs | a_task_terminal_carries_its_run_id_and_a_plain_one_none_whatever_the_caller_sent | 0 | bounded-poll
+site | src/terminal/mod.rs | a_terminal_still_opens_under_a_sticky_world_writable_holder | 0 | unbounded-poll
+site | src/terminal/mod.rs | an_agent_pty_is_refused_under_pressure_a_shell_is_not_and_it_resumes | 0 | bounded-poll
+site | src/terminal/mod.rs | characterization_a_terminal_claude_with_no_registry_entry_goes_uncounted | 0 | bounded-poll
+site | src/terminal/mod.rs | output_printed_while_detached_is_replayed_to_the_next_view | 0 | bounded-poll
+site | src/terminal/mod.rs | read_pid | 0 | bounded-poll
+site | src/terminal/mod.rs | wait_until | 0 | bounded-poll
+
+# src/test_support.rs
+site | src/test_support.rs | wait_gone | 0 | bounded-poll
+
+# src/test_support/env.rs
+site | src/test_support/env.rs | wait_until | 0 | bounded-poll
+
+# src/tool_capability.rs
+site | src/tool_capability.rs | a_stale_entry_costs_one_probe_however_many_threads_arrive | 0 | hold
+
+# src/watcher/storm.rs
+site | src/watcher/storm.rs | assert_storm_stays_bounded | 1 | linger
+
+# src/workbench/agent_worktree.rs
+site | src/workbench/agent_worktree.rs | a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started | 0 | bounded-poll
+
+# src/workbench/external_changes.rs
+site | src/workbench/external_changes.rs | a_zero_and_an_unbounded_wait_are_both_safe | 0 | race-widen
+site | src/workbench/external_changes.rs | hide_then_show_in_a_millisecond_never_strands_a_hidden_loop | 0 | spacing
+site | src/workbench/external_changes.rs | hide_then_show_in_a_millisecond_never_strands_a_hidden_loop | 1 | clock-seam-needed
+site | src/workbench/external_changes.rs | until | 0 | bounded-poll
+
+# src/workbench/in_flight.rs
+site | src/workbench/in_flight.rs | racers_for_one_attempt_are_admitted_once_or_one_at_a_time | 0 | hold
+
+# src/workbench/managed_run.rs
+site | src/workbench/managed_run.rs | live_manvi_single_turn_finishes_while_warm_claude_and_agy_runs_park_continue_and_resume | 0 | bounded-poll
+site | src/workbench/managed_run.rs | live_manvi_single_turn_finishes_while_warm_claude_and_agy_runs_park_continue_and_resume | 1 | bounded-poll
+site | src/workbench/managed_run.rs | live_manvi_single_turn_finishes_while_warm_claude_and_agy_runs_park_continue_and_resume | 2 | bounded-poll
+site | src/workbench/managed_run.rs | live_manvi_single_turn_finishes_while_warm_claude_and_agy_runs_park_continue_and_resume | 3 | bounded-poll
+
+# src/workbench/notifications/graft/fake_server_tests.rs
+site | src/workbench/notifications/graft/fake_server_tests.rs | serve | 0 | unbounded-poll
+site | src/workbench/notifications/graft/fake_server_tests.rs | serve | 1 | fixture-delay
+
+# src/workbench/notifications/graft/tests/adv_w3b_graft_differential_tests.rs
+site | src/workbench/notifications/graft/tests/adv_w3b_graft_differential_tests.rs | held_a_peer_that_reads_one_byte_at_a_time_ends_the_same_way_as_before | 0 | bounded-poll
+
+# src/workbench/process_birth.rs
+site | src/workbench/process_birth.rs | an_exited_but_unreaped_child_is_gone | 0 | bounded-poll
+
+# src/workbench/reconcile_tests.rs
+site | src/workbench/reconcile_tests.rs | a_worktree_with_any_process_in_it_is_not_removed_even_without_a_profile | 0 | bounded-poll
+site | src/workbench/reconcile_tests.rs | an_escaped_descendant_in_the_worktree_holds_the_checkout | 0 | unbounded-poll
+
+# src/workbench/terminal_launch.rs
+site | src/workbench/terminal_launch.rs | a_retry_during_worktree_setup_is_refused_rather_than_handed_the_half_built_tree | 0 | bounded-poll
+
+# src/workbench/terminal_run.rs
+site | src/workbench/terminal_run.rs | a_second_launch_in_flight_waits_and_attaches_to_the_first | 0 | bounded-poll
+site | src/workbench/terminal_run.rs | a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded | 0 | bounded-poll
+site | src/workbench/terminal_run.rs | a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded | 1 | bounded-poll
+site | src/workbench/terminal_run.rs | a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded | 2 | bounded-poll
+site | src/workbench/terminal_run.rs | a_task_agent_that_exits_while_no_app_is_connected_gets_its_real_exit_recorded | 3 | bounded-poll
+site | src/workbench/terminal_run.rs | an_attempt_in_a_subdirectory_of_its_checkout_starts_there | 0 | bounded-poll
+site | src/workbench/terminal_run.rs | real_pty_records_process_then_exit_and_replay_attaches_without_spawning | 0 | bounded-poll
+site | src/workbench/terminal_run.rs | real_pty_records_process_then_exit_and_replay_attaches_without_spawning | 1 | bounded-poll
+site | src/workbench/terminal_run.rs | real_pty_records_process_then_exit_and_replay_attaches_without_spawning | 2 | bounded-poll
+
+# src/workbench/verification_driver_measure.rs
+site | src/workbench/verification_driver_measure.rs | measure_driver_children_over_a_profile_copy | 0 | bounded-poll
+
+# src/workbench/verification_driver_tests.rs
+site | src/workbench/verification_driver_tests.rs | steady_head_read_rate_before_and_after | 1 | bounded-poll
+
+# tests/adv_notify_process.rs
+site | tests/adv_notify_process.rs | Socket::start | 0 | bounded-poll
+site | tests/adv_notify_process.rs | a_dribbling_writer_ends_in_a_quiet_exit_zero_inside_the_hook_timeout | 0 | bounded-poll
+
+# tests/adv_w3c_process.rs
+site | tests/adv_w3c_process.rs | SilentSocket::bind | 0 | unbounded-poll
+
+# tests/adv_w4a_signal_guard.rs
+site | tests/adv_w4a_signal_guard.rs | build_lab | 0 | bounded-poll
+site | tests/adv_w4a_signal_guard.rs | delivered | 0 | bounded-poll
+site | tests/adv_w4a_signal_guard.rs | victim | 0 | bounded-poll
+
+# tests/adv_w5b_signal_guard.rs
+site | tests/adv_w5b_signal_guard.rs | Lab::start | 0 | bounded-poll
+site | tests/adv_w5b_signal_guard.rs | shape_case | 0 | bounded-poll
+
+# tests/agent_notify_socket.rs
+site | tests/agent_notify_socket.rs | exchange | 0 | fixture-delay
+site | tests/agent_notify_socket.rs | exchange | 1 | bounded-poll
+
+# tests/cli_io_process.rs
+site | tests/cli_io_process.rs | wait | 0 | bounded-poll
+
+# tests/common/marked_children.rs
+site | tests/common/marked_children.rs | Marked::spawn | 0 | bounded-poll
+
+# tests/gitpulsed_single_owner.rs
+site | tests/gitpulsed_single_owner.rs | a_second_daemon_for_one_profile_is_refused_and_a_later_one_is_admitted | 0 | bounded-poll
+site | tests/gitpulsed_single_owner.rs | wait_exit | 0 | bounded-poll
+
+# tests/gtk_dispatch.rs
+site | tests/gtk_dispatch.rs | pump_until | 0 | bounded-poll
+
+# tests/hook_deadline_reap.rs
+site | tests/hook_deadline_reap.rs | a_stalled_child_is_reaped_and_the_total_stays_under_the_host_timeout | 1 | bounded-poll
+
+# tests/hook_protocol_stress.rs
+site | tests/hook_protocol_stress.rs | ask | 0 | bounded-poll
+site | tests/hook_protocol_stress.rs | sixty_four_concurrent_hooks_read_a_live_ledger | 0 | spacing
+
+# tests/host_load_soak.rs
+site | tests/host_load_soak.rs | the_sampler_misses_no_tick_over_a_soak | 0 | hold
+
+# tests/ledger_binding_descriptors.rs
+site | tests/ledger_binding_descriptors.rs | settled | 0 | bounded-poll
+
+# tests/logging_process.rs
+site | tests/logging_process.rs | wait_for_probe | 0 | bounded-poll
+
+# tests/mcp_stdio.rs
+site | tests/mcp_stdio.rs | run_with_args | 0 | bounded-poll
+
+# tests/mcp_transport_stress.rs
+site | tests/mcp_transport_stress.rs | a_client_that_never_reads_ends_the_session_after_the_write_window | 0 | bounded-poll
+site | tests/mcp_transport_stress.rs | a_reader_that_closes_mid_frame_ends_the_server_promptly | 0 | bounded-poll
+site | tests/mcp_transport_stress.rs | stall | 0 | hold
+site | tests/mcp_transport_stress.rs | stall | 1 | hold
+site | tests/mcp_transport_stress.rs | the_server_exits_when_its_client_stops_reading | 0 | unbounded-poll
+
+# tests/native_event_unwind.rs
+site | tests/native_event_unwind.rs | run | 0 | bounded-poll
+
+# tests/native_quit_guard.rs
+site | tests/native_quit_guard.rs | parent | 0 | bounded-poll
+site | tests/native_quit_guard.rs | wait_for | 0 | bounded-poll
+
+# tests/native_watcher_faults.rs
+site | tests/native_watcher_faults.rs | finish | 0 | bounded-poll
+site | tests/native_watcher_faults.rs | probe | 0 | bounded-poll
+
+# tests/notify_stdin_process.rs
+site | tests/notify_stdin_process.rs | Socket::start | 0 | bounded-poll
+
+# tests/process_admission_stress.rs
+site | tests/process_admission_stress.rs | rename_storm | 0 | spacing
+
+# tests/procguard_signals.rs
+site | tests/procguard_signals.rs | Fixture::blocked | 0 | bounded-poll
+site | tests/procguard_signals.rs | assert_all_gone | 0 | bounded-poll
+site | tests/procguard_signals.rs | every_shim_invocation_blocks_and_records_itself | 0 | bounded-poll
+
+# tests/repository_trust.rs
+site | tests/repository_trust.rs | trust_persistence_repeated_grant_kill_restart_never_loses_an_approval | 0 | bounded-poll
+
+# tests/secrets_stress.rs
+site | tests/secrets_stress.rs | a_superseded_scan_stuck_in_its_version_probe_does_not_delay_the_next | 0 | bounded-poll
+
+# tests/signal_guard_hook.rs
+site | tests/signal_guard_hook.rs | gate | 0 | bounded-poll
+
+# tests/signal_guard_live.rs
+site | tests/signal_guard_live.rs | NamedSleepers::spawn | 0 | bounded-poll
+site | tests/signal_guard_live.rs | a_not_dumpable_process_of_this_user_is_counted | 0 | bounded-poll
+
+# tests/signal_teardown.rs
+site | tests/signal_teardown.rs | sigterm_runs_the_hook_then_sweeps_registered_children | 0 | bounded-poll
+site | tests/signal_teardown.rs | wait_for | 0 | bounded-poll
+
+# tests/terminal_hardening.rs
+site | tests/terminal_hardening.rs | wait_until | 0 | bounded-poll
+
+# tests/terminal_host.rs
+site | tests/terminal_host.rs | wait_for | 0 | bounded-poll
+
+# tests/terminal_incident.rs
+site | tests/terminal_incident.rs | four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behind | 0 | bounded-poll
+site | tests/terminal_incident.rs | four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behind | 1 | bounded-poll
+site | tests/terminal_incident.rs | four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behind | 3 | bounded-poll
+site | tests/terminal_incident.rs | read_pid | 0 | bounded-poll
+
+# tests/terminal_ipc_latency.rs
+site | tests/terminal_ipc_latency.rs | attach_and_detach_while_writes_are_queued_keep_every_byte_in_order | 0 | spacing
+site | tests/terminal_ipc_latency.rs | attach_and_detach_while_writes_are_queued_keep_every_byte_in_order | 1 | linger
+site | tests/terminal_ipc_latency.rs | concurrent_writers_to_one_session_keep_each_callers_order_and_every_byte | 0 | linger
+site | tests/terminal_ipc_latency.rs | dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back | 1 | spacing
+site | tests/terminal_ipc_latency.rs | thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full | 1 | bounded-poll
+site | tests/terminal_ipc_latency.rs | thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full | 2 | linger
+site | tests/terminal_ipc_latency.rs | wait_until | 0 | bounded-poll
+site | tests/terminal_ipc_latency.rs | writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone | 0 | spacing
+
+# tests/terminal_output_emits.rs
+site | tests/terminal_output_emits.rs | Viewer::new | 0 | unbounded-poll
+site | tests/terminal_output_emits.rs | a_one_megabyte_burst_is_byte_exact_in_few_events_with_exact_credit | 0 | bounded-poll
+site | tests/terminal_output_emits.rs | coalesced_late_acknowledgements_across_a_shed_keep_credit_exact | 1 | unbounded-poll
+site | tests/terminal_output_emits.rs | echo_latencies | 0 | spacing
+site | tests/terminal_output_emits.rs | wait_for | 0 | bounded-poll
+
+# tests/terminal_pty_stress.rs
+site | tests/terminal_pty_stress.rs | close_wakes_a_reader_blocked_on_a_full_output_window | 0 | linger
+
+# tests/terminal_session_lifecycle.rs
+site | tests/terminal_session_lifecycle.rs | a_close_marks_the_session_ended_by_gitpulse_before_it_signals | 0 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly | 0 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | context_names_the_foreground_program_and_follows_cd | 0 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | context_names_the_foreground_program_and_follows_cd | 1 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | context_reads_race_spawns_and_closes_without_leaking_a_slot | 0 | spacing
+site | tests/terminal_session_lifecycle.rs | read_pid | 0 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else | 0 | bounded-poll
+site | tests/terminal_session_lifecycle.rs | wait_for_output | 0 | bounded-poll
+
+# tests/terminal_session_survival.rs
+site | tests/terminal_session_survival.rs | detaching_leaves_the_process_running_and_attach_takes_it_back | 0 | bounded-poll
+site | tests/terminal_session_survival.rs | read_pid | 0 | bounded-poll
+site | tests/terminal_session_survival.rs | settled_count | 0 | bounded-poll
+site | tests/terminal_session_survival.rs | wait_until | 0 | bounded-poll

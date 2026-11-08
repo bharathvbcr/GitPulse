@@ -529,7 +529,17 @@ fn a_front_waiter_that_leaves_does_not_strand_those_behind() {
                     .is_err(),
                 }
             });
-            std::thread::sleep(Duration::from_millis(30));
+            // Wait for the line itself: the front is in it, then the waiter
+            // behind it. A fixed pause is a bet that each thread got to the
+            // gate in time, and loses that bet on a loaded host. The deadline
+            // exit leaves the line on its own after 100 ms, so for it the
+            // wait is bounded and its result is not an assertion.
+            let queued = |places: usize| {
+                crate::test_support::wait_until(Duration::from_secs(10), || {
+                    gate.state.lock().unwrap().reactive_line.len() >= places
+                })
+            };
+            let front_in_line = queued(1);
             let behind = scope.spawn(|| {
                 let deadline = Instant::now() + Duration::from_millis(2_000);
                 with_admission(Admission::Reactive, || {
@@ -537,7 +547,11 @@ fn a_front_waiter_that_leaves_does_not_strand_those_behind() {
                 })
                 .is_ok()
             });
-            std::thread::sleep(Duration::from_millis(50));
+            let behind_in_line = queued(2);
+            if !matches!(exit, Exit::Deadline) {
+                assert!(front_in_line, "the front waiter never joined the line");
+                assert!(behind_in_line, "the waiter behind never joined the line");
+            }
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             (front.join().unwrap(), behind.join().unwrap())
         });

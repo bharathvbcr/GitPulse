@@ -160,16 +160,23 @@ mod tests {
     #[test]
     fn another_key_is_not_held_behind_a_slow_one() {
         let flights = Arc::new(SingleFlight::<&'static str, u8>::default());
+        let (in_flight, slow_started) = std::sync::mpsc::channel::<()>();
         let slow = {
             let flights = flights.clone();
             std::thread::spawn(move || {
-                flights.run("slow", || {
+                flights.run("slow", move || {
+                    in_flight.send(()).unwrap();
                     std::thread::sleep(Duration::from_millis(800));
                     1
                 })
             })
         };
-        std::thread::sleep(Duration::from_millis(50));
+        // The slow call is running before the fast one is timed against it.
+        slow_started
+            .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                10,
+            )))
+            .expect("the slow call never started");
         let started = Instant::now();
         assert_eq!(flights.run("fast", || 2), 2);
         assert!(
@@ -181,16 +188,23 @@ mod tests {
     #[test]
     fn a_leader_that_panics_does_not_strand_its_followers() {
         let flights = Arc::new(SingleFlight::<&'static str, u8>::default());
+        let (in_flight, leader_started) = std::sync::mpsc::channel::<()>();
         let leader = {
             let flights = flights.clone();
             std::thread::spawn(move || {
-                flights.run("k", || {
+                flights.run("k", move || {
+                    in_flight.send(()).unwrap();
                     std::thread::sleep(Duration::from_millis(200));
                     panic!("injected panic in the leader")
                 })
             })
         };
-        std::thread::sleep(Duration::from_millis(50));
+        // The follower asks while the leader is running, not before it started.
+        leader_started
+            .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                10,
+            )))
+            .expect("the leader never started");
         let follower = flights.run("k", || 7);
         assert_eq!(follower, 7);
         assert!(leader.join().is_err());

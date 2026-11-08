@@ -89,15 +89,29 @@ fn it_never_runs_beside_itself() {
     let (_d2, path2) = profile();
     let running = Arc::new(AtomicBool::new(false));
     let passes = Arc::new(AtomicUsize::new(0));
+    // The pass that runs holds until the other seven have been told it is
+    // busy, so the overlap is guaranteed rather than a bet that eight thread
+    // starts all land inside a fixed pause.
+    let busy = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..8)
         .map(|_| {
-            let (path, running, passes) = (path2.clone(), running.clone(), passes.clone());
+            let (path, running, passes, busy) =
+                (path2.clone(), running.clone(), passes.clone(), busy.clone());
             std::thread::spawn(move || {
-                run_once(&path, &running, 9, || {
+                let outcome = run_once(&path, &running, 9, || {
                     passes.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(50));
+                    assert!(
+                        crate::test_support::wait_until(Duration::from_secs(30), || {
+                            busy.load(Ordering::SeqCst) == 7
+                        }),
+                        "the other seven callers were never refused while the pass ran"
+                    );
                     Ok(report())
-                })
+                });
+                if outcome == Outcome::Busy {
+                    busy.fetch_add(1, Ordering::SeqCst);
+                }
+                outcome
             })
         })
         .collect();
@@ -105,6 +119,7 @@ fn it_never_runs_beside_itself() {
         t.join().unwrap();
     }
     assert_eq!(passes.load(Ordering::SeqCst), 1);
+    assert_eq!(busy.load(Ordering::SeqCst), 7);
 }
 
 #[test]
