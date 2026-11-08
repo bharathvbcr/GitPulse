@@ -4095,6 +4095,7 @@ exit 2
         fixture.finish();
     }
 
+    #[cfg(unix)]
     impl RemovalFixture {
         fn merge_and_teardown(
             &self,

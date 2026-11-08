@@ -435,3 +435,4 @@ blob-report/
 .claude/*
 !.claude/settings.json
 /crates/gitpulse-worktree/target/
+/crates/git-status-parity/target/
