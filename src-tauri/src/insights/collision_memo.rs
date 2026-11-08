@@ -11,10 +11,14 @@
 //!
 //! What is remembered, and what is not:
 //!
-//! - The worktree listing and each worktree's changed-path read are kept for
-//!   [`TTL`]. Nothing cheaper can stamp them: a sibling's unstaged edit moves
-//!   neither its index nor its HEAD, so (unlike `ref_cache`'s ref listings)
-//!   there is no file to compare, and the age is the whole invalidation rule.
+//! - The worktree listing is kept for [`TTL`], and each worktree's changed-path
+//!   read is accepted from the worktree's shared status cell
+//!   ([`worktree::read_status_since`]) when it began within [`TTL`]. Nothing
+//!   cheaper can stamp them: a sibling's unstaged edit moves neither its index
+//!   nor its HEAD, so (unlike `ref_cache`'s ref listings) there is no file to
+//!   compare, and the age is the whole invalidation rule. The cell is the one
+//!   owner of the read: the memo keeps none of its own, and a read the app's
+//!   listing or snapshot just made serves the hook too.
 //! - **A read that failed is never kept**, and a failure seen while the listing
 //!   came from memory throws the listing away and scans once more: a worktree
 //!   removed in the last [`TTL`] must not leave the notice "1 worktree could
@@ -36,8 +40,8 @@
 //!   a moment after it was read), so the memo widens a window that already
 //!   existed rather than opening one, and the age is reported in the reply so
 //!   the hook can refuse an answer older than it was promised.
-//! - Concurrent callers for one key share one read: the slot is held while it
-//!   is filled, so a burst of hooks costs one scan, not one each.
+//! - Concurrent callers for one worktree share one read: the cell holds one
+//!   read at a time, so a burst of hooks costs one scan, not one each.
 
 use crate::ipc_error::CommandError;
 use std::collections::HashMap;
@@ -51,7 +55,7 @@ use super::{
     collision_from_list_reading, empty_collisions, entity_collision, live_in, live_sessions,
     CollisionRisk, CollisionScope, PathsRead,
 };
-use crate::engine::worktree::{self, changed_paths_within, WorktreeInfo};
+use crate::engine::worktree::{self, changed_paths_since, WorktreeInfo};
 
 /// How long a listing or a worktree's changed paths are served from memory.
 ///
@@ -62,14 +66,13 @@ pub const TTL: Duration = Duration::from_secs(5);
 
 /// Repositories whose listing is kept at once when no changed-path read from
 /// that listing is still cached. A listing is not dropped while one of its
-/// worktrees is still in the read cache ([`MAX_READS`]): the next scan would
-/// pay for `git worktree list` and find `git status` already remembered. Those
-/// listings may outgrow this cap, and they become eligible again when the
-/// read expires or is itself evicted, so the extra listings stay within the
-/// read cache's own bound.
+/// worktrees still has a status read in the shared cell younger than [`TTL`]:
+/// the next scan would pay for `git worktree list` and find `git status`
+/// already remembered. Those listings may outgrow this cap, and they become
+/// eligible again when the read expires or the cell evicts it
+/// ([`worktree::STATUS_CELL_CAP`]), so the extra listings stay within the
+/// cell's own bound.
 const MAX_LISTS: usize = 32;
-/// Worktrees whose changed paths are kept at once.
-const MAX_READS: usize = 512;
 /// Symbol verdicts kept at once.
 const MAX_VERDICTS: usize = 128;
 
@@ -152,17 +155,6 @@ impl<T: Clone> Memo<T> {
         slot
     }
 
-    /// True when `key` still holds a value younger than `ttl`. Does not touch
-    /// the slot, so a retention check cannot pin it.
-    fn fresh(&self, key: &str, ttl: Duration) -> bool {
-        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((_, slot)) = slots.get(key) else {
-            return false;
-        };
-        let held = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.as_ref().is_some_and(|(at, _)| at.elapsed() < ttl)
-    }
-
     /// The kept answer while it is younger than `ttl`, else `fill`'s, which is
     /// kept only when it succeeded. Returns the answer's age: zero when `fill`
     /// ran.
@@ -220,7 +212,6 @@ impl<T: Clone> Memo<T> {
 pub(crate) struct CollisionMemo {
     ttl: Duration,
     lists: Memo<Vec<WorktreeInfo>>,
-    reads: Memo<(Vec<String>, bool)>,
     verdicts: Memo<entity_collision::EntityCollisionVerdict>,
 }
 
@@ -229,7 +220,6 @@ impl CollisionMemo {
         Self {
             ttl,
             lists: Memo::new(MAX_LISTS),
-            reads: Memo::new(MAX_READS),
             verdicts: Memo::new(MAX_VERDICTS),
         }
     }
@@ -246,7 +236,7 @@ impl CollisionMemo {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| repo_path.to_string());
         let oldest = AtomicU64::new(0);
-        let (mut risk, list_age) = self.assemble(&key, repo_path, focus, observation, &oldest);
+        let (mut risk, list_age) = self.assemble(&key, repo_path, focus, observation, &oldest, &[]);
 
         // A failure beside a listing served from memory may be the listing
         // itself being out of date. One scan from scratch settles it; a failure
@@ -254,7 +244,7 @@ impl CollisionMemo {
         if !risk.ok && list_age > Duration::ZERO {
             self.lists.forget(&key);
             risk = self
-                .assemble(&key, repo_path, focus, observation, &oldest)
+                .assemble(&key, repo_path, focus, observation, &oldest, &[])
                 .0;
         }
 
@@ -266,11 +256,8 @@ impl CollisionMemo {
             .flat_map(|item| item.worktrees.iter().map(|party| party.path.clone()))
             .collect();
         if !contended.is_empty() {
-            for path in &contended {
-                self.reads.forget(path);
-            }
             risk = self
-                .assemble(&key, repo_path, focus, observation, &oldest)
+                .assemble(&key, repo_path, focus, observation, &oldest, &contended)
                 .0;
         }
 
@@ -306,14 +293,19 @@ impl CollisionMemo {
         focus: &str,
         observation: &live_sessions::Observation,
         oldest: &AtomicU64,
+        refresh: &[String],
     ) -> (CollisionRisk, Duration) {
         let ttl = self.ttl;
-        let reads = &self.reads;
         let (listed, list_age) = self.lists.get_or_fill_retaining(
             key,
             ttl,
             || worktree::list_worktrees_lite(repo_path),
-            |list| list.iter().any(|wt| reads.fresh(&wt.path, ttl)),
+            |list| {
+                list.iter().any(|wt| {
+                    worktree::status_age(std::path::Path::new(&wt.path))
+                        .is_some_and(|age| age < ttl)
+                })
+            },
         );
         oldest.fetch_max(list_age.as_millis() as u64, Ordering::Relaxed);
         let list = match listed {
@@ -321,13 +313,18 @@ impl CollisionMemo {
             Err(error) => return (empty_collisions(error.into_message()), list_age),
         };
         let read = |path: &str, _deadline: Option<&worktree::ScanDeadline>| -> PathsRead {
-            // No deadline: a memoized read is shared, so one caller's clock must
-            // not decide what the next one is told.
-            let (read, age) = self
-                .reads
-                .get_or_fill(path, self.ttl, || changed_paths_within(path, None));
-            oldest.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
-            read
+            // No deadline: a shared read must not end at one caller's clock.
+            // A worktree named in `refresh` is read for this call, whatever the
+            // cell holds.
+            let now = Instant::now();
+            let not_before = if refresh.iter().any(|named| named == path) {
+                now
+            } else {
+                now.checked_sub(ttl).unwrap_or(now)
+            };
+            let read = changed_paths_since(path, None, not_before)?;
+            oldest.fetch_max(read.age.as_millis() as u64, Ordering::Relaxed);
+            Ok((read.paths, read.truncated))
         };
         let live = live_in(observation, &list);
         (
@@ -411,7 +408,7 @@ mod tests {
     }
 
     /// One repository past the old listing cap, each with its status read still
-    /// inside [`MAX_READS`]. The pre-fix LRU dropped the first listing and the
+    /// inside the shared cell cap. The pre-fix LRU dropped the first listing and the
     /// next read spawned `git worktree list` while `git status` stayed cached.
     #[test]
     fn a_listing_survives_past_the_old_cap_while_its_status_read_is_cached() {
@@ -425,7 +422,7 @@ mod tests {
             .map(|_| crate::test_support::git_repo())
             .collect();
         assert!(
-            1 + others.len() > MAX_LISTS && others.len() < MAX_READS,
+            1 + others.len() > MAX_LISTS && others.len() < worktree::STATUS_CELL_CAP,
             "the status cache still has room"
         );
         for other in &others {
