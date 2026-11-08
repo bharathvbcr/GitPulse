@@ -126,6 +126,30 @@ pub struct ToolCall {
     /// What a [`USAGE_TOOL`] row counted.
     #[serde(skip)]
     pub usage: Option<TokenUsage>,
+    /// The call was moved to the background: its input said
+    /// `run_in_background`, or its result was Claude Code's answer to a call
+    /// that outlived its timeout (`toolUseResult.backgroundTaskId`). The result
+    /// then says nothing of how the command ended, and `is_error: false` is
+    /// only that the call was handed off.
+    #[serde(skip)]
+    pub background: bool,
+    /// The call's own `timeout` input (milliseconds), when it set one.
+    #[serde(skip)]
+    pub timeout_ms: Option<u64>,
+    /// Whether [`ToolCall::cwd`] is where the call ran. Claude Code writes every
+    /// call of one assistant message with the directory the message *started*
+    /// in, and a `cd` in an earlier call of the message carries over to the
+    /// later ones without their recorded cwd changing. So only the first Bash
+    /// call of a message (by position in the transcript, never by time) has a
+    /// cwd that is known, and only when this file holds the message from its
+    /// start: a resumed session's copy can hold a later call of a message
+    /// without the earlier one that did the `cd`, so every earlier block of the
+    /// message (`apiBlockIndex` 0 up to the call's own) must be in this file
+    /// before the call. A record with no `apiBlockIndex` (older Claude Code)
+    /// cannot show it. Absent, as for a call built any other way, it is not
+    /// known.
+    #[serde(skip)]
+    pub cwd_trusted: bool,
 }
 
 /// Every ledger action a transcript call can become, and only those.
@@ -304,6 +328,13 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
                 .get("command")
                 .and_then(|c| c.as_str())
                 .map(str::to_string),
+            // Anything but a plain `false` reads as backgrounded: the field is
+            // the agent's, and an unfamiliar spelling of it must not read as a
+            // call that ran to its end.
+            timeout_ms: input.get("timeout").and_then(|t| t.as_u64()),
+            background: input
+                .get("run_in_background")
+                .is_some_and(|flag| !flag.is_null() && flag.as_bool() != Some(false)),
             ..base.clone()
         });
     }
@@ -328,6 +359,9 @@ const MAX_PENDING: usize = 256;
 /// on; a call the agent never got a result for is not held for ever.
 pub const PENDING_MAX_AGE_MS: u64 = 15 * 60 * 1000;
 
+/// Messages remembered, per transcript read.
+const MAX_SEEN_MESSAGES: usize = 256;
+
 /// Response ids remembered as already counted, per transcript read.
 const MAX_COUNTED: usize = 64;
 
@@ -340,6 +374,181 @@ struct ResultRecord<'a> {
     #[serde(borrow)]
     timestamp: Option<Cow<'a, str>>,
     message: Option<ResultMessage<'a>>,
+    /// The record's structured result, read only for whether it names a
+    /// background task.
+    #[serde(default, rename = "toolUseResult")]
+    tool_use_result: Option<BackgroundMark>,
+}
+
+/// Claude Code's Bash timeout when a call sets none, in milliseconds.
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+
+/// How far short of its timeout a call may answer and still read as having
+/// been cut off by it, in milliseconds.
+const TIMEOUT_MARGIN_MS: u64 = 1_000;
+
+/// Whether a tool result's output says the call was handed off: Claude Code
+/// writes "Command did not complete within its Ns timeout and was moved to the
+/// background", "Command was moved to the background (ID: x) after running for
+/// Ns" or "Command running in background with ID: x" in place of the command's
+/// output, with `is_error: false`. In a subagent's transcript (`agent-*.jsonl`)
+/// that is all it writes: there is no `toolUseResult`. Read off real
+/// transcripts (versions 2.1.237 to 2.1.317); matched anywhere in the text, any
+/// case, since partial output can come first. `Command timed out` is kept with
+/// them: a result that says the command was cut short says nothing of what it
+/// made. The output is walked without being kept, a string or the `text` of
+/// each block of a list.
+#[derive(Default)]
+struct HandedOff(bool);
+
+/// The words [`HandedOff`] looks for, lowercase.
+const HANDED_OFF_WORDS: [&str; 5] = [
+    "did not complete within",
+    "moved to the background",
+    "running in background",
+    "command timed out",
+    "timed out after",
+];
+
+/// Whether `text` holds any of [`HANDED_OFF_WORDS`], in any case.
+fn says_handed_off(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    HANDED_OFF_WORDS.iter().any(|word| {
+        let word = word.as_bytes();
+        bytes
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word))
+    })
+}
+
+impl<'de> Deserialize<'de> for HandedOff {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Words;
+        impl<'de> serde::de::Visitor<'de> for Words {
+            type Value = HandedOff;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a tool's output")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(HandedOff(says_handed_off(text)))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut said = false;
+                while let Some(HandedOff(block)) = seq.next_element::<HandedOff>()? {
+                    said |= block;
+                }
+                Ok(HandedOff(said))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut said = false;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "text" {
+                        said |= map.next_value::<HandedOff>()?.0;
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(HandedOff(said))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(HandedOff(false))
+            }
+        }
+        deserializer.deserialize_any(Words)
+    }
+}
+
+/// Whether a record's `toolUseResult` carries a `backgroundTaskId`: Claude
+/// Code's answer to a call it moved to the background, whether the agent asked
+/// (`run_in_background`) or the call outlived its timeout. Every other field,
+/// and every other shape (the field is a string in some records), is skipped
+/// unread: it holds the tool's whole output.
+#[derive(Default)]
+struct BackgroundMark(bool);
+
+impl<'de> Deserialize<'de> for BackgroundMark {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Mark;
+        impl<'de> serde::de::Visitor<'de> for Mark {
+            type Value = BackgroundMark;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a tool result")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut named = false;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    named |= key == "backgroundTaskId";
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(BackgroundMark(named))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(BackgroundMark(false))
+            }
+        }
+        deserializer.deserialize_any(Mark)
+    }
 }
 
 #[derive(Deserialize)]
@@ -401,6 +610,9 @@ struct ResultBlock<'a> {
     #[serde(borrow)]
     tool_use_id: Option<Cow<'a, str>>,
     is_error: Option<bool>,
+    /// The tool's output, read only for the words of a handed-off call.
+    #[serde(default)]
+    content: HandedOff,
 }
 
 /// An assistant record read only for its response's identity and token counts.
@@ -418,6 +630,9 @@ struct UsageRecord<'a> {
     version: Option<Cow<'a, str>>,
     #[serde(borrow, rename = "gitBranch")]
     git_branch: Option<Cow<'a, str>>,
+    /// Which block of its API response the record holds (0, 1, 2...).
+    #[serde(default, rename = "apiBlockIndex")]
+    api_block_index: Option<u64>,
     message: Option<UsageMessage<'a>>,
 }
 
@@ -493,6 +708,18 @@ pub struct Reader {
     open_usage: Option<OpenUsage>,
     counted: VecDeque<String>,
     newest_ms: Option<u64>,
+    /// The messages seen, newest last: which of their blocks this file holds
+    /// and whether a Bash call has been seen in them. Bounded; messages arrive
+    /// one after the other, so one that fell out is long over.
+    messages: VecDeque<SeenMessage>,
+}
+
+/// What a reader has seen of one assistant message.
+struct SeenMessage {
+    id: String,
+    /// Bit `n` is set when the record with `apiBlockIndex` `n` was read.
+    blocks: u64,
+    bash: bool,
 }
 
 impl Reader {
@@ -509,6 +736,7 @@ impl Reader {
             open_usage: None,
             counted: VecDeque::new(),
             newest_ms: None,
+            messages: VecDeque::new(),
         }
     }
 
@@ -566,7 +794,12 @@ impl Reader {
             };
             self.note_time(&base.ts_utc);
             let response_from = self.response_start(record["message"]["id"].as_str());
+            let message_id = record["message"]["id"].as_str().filter(|id| !id.is_empty());
+            let block = record["apiBlockIndex"].as_u64();
             for (ordinal, mut call) in calls_in(&record).into_iter().enumerate() {
+                if call.tool == "Bash" {
+                    call.cwd_trusted = self.first_bash_call_of(message_id, block);
+                }
                 call.subagent_id.clone_from(&self.subagent_id);
                 call.origin = self.origin(ordinal);
                 if let (Some(_), Some(origin), Some(response_from)) =
@@ -581,6 +814,7 @@ impl Reader {
                     out.push(call);
                 }
             }
+            self.note_block(message_id, block);
             let message = &record["message"];
             let counts = UsageWire {
                 input_tokens: message["usage"]["input_tokens"].as_u64(),
@@ -610,6 +844,10 @@ impl Reader {
                 };
                 self.note_time(ts);
                 let message = record.message.as_ref();
+                self.note_block(
+                    message.and_then(|m| m.id.as_deref()),
+                    record.api_block_index,
+                );
                 out.extend(
                     self.note_usage(
                         base,
@@ -644,6 +882,10 @@ impl Reader {
         if let Some(at) = at_ms {
             self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
         }
+        let (structured, background) = match &record.tool_use_result {
+            Some(mark) => (true, mark.0),
+            None => (false, false),
+        };
         let mut out = Vec::new();
         for block in blocks {
             if block.kind.as_deref() != Some("tool_result") {
@@ -673,6 +915,27 @@ impl Reader {
                     done.checked_sub(began)
                         .and_then(|span| i64::try_from(span).ok())
                 });
+            // A call handed off to the background answers `is_error: false`
+            // and no more, so it is read as not finished when any of three
+            // things says so (one record can answer several calls, and a
+            // marker on it covers each):
+            //  * a marker: the input's `run_in_background`, or a result that
+            //    names a background task (`toolUseResult.backgroundTaskId`);
+            //  * the output's words (see [`HandedOff`]), which a subagent's
+            //    transcript carries without any `toolUseResult`;
+            //  * its length, for a wording this does not know: a result with no
+            //    `toolUseResult` that came back as late as the call's timeout
+            //    (its own `timeout` input, else Claude Code's 120 s default)
+            //    less a second, which is when a timed-out call is answered.
+            // Every one of them costs a link at worst: a call read as handed
+            // off is a candidate and never evidence.
+            let timeout = call.timeout_ms.unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
+            let at_timeout = !structured
+                && call
+                    .duration_ms
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .is_some_and(|ms| ms >= timeout.saturating_sub(TIMEOUT_MARGIN_MS));
+            call.background |= background || block.content.0 || at_timeout;
             out.push(call);
         }
         out.extend(self.expire());
@@ -706,6 +969,50 @@ impl Reader {
             .filter(|open| message_id.is_some() && open.call.message_id.as_deref() == message_id)
             .and_then(|open| open.call.origin.map(|o| o.offset));
         Some(open.map_or(own, |from| from.min(own)))
+    }
+
+    /// The record of `id` in the reader's memory, made if it is new.
+    fn seen(&mut self, id: &str) -> &mut SeenMessage {
+        match self.messages.iter().position(|seen| seen.id == id) {
+            Some(at) => &mut self.messages[at],
+            None => {
+                if self.messages.len() >= MAX_SEEN_MESSAGES {
+                    self.messages.pop_front();
+                }
+                self.messages.push_back(SeenMessage {
+                    id: id.to_string(),
+                    blocks: 0,
+                    bash: false,
+                });
+                self.messages.back_mut().expect("just pushed")
+            }
+        }
+    }
+
+    /// Notes that the record of `message_id` with `apiBlockIndex` `block` was
+    /// read.
+    fn note_block(&mut self, message_id: Option<&str>, block: Option<u64>) {
+        if let (Some(id), Some(block)) = (message_id, block.filter(|block| *block < 64)) {
+            self.seen(id).blocks |= 1 << block;
+        }
+    }
+
+    /// Whether a Bash call in the record of `message_id` with `apiBlockIndex`
+    /// `block` is the first Bash call of its message that this reader has seen
+    /// AND this file holds every block of the message before it, and notes the
+    /// call and the block. A message with no id, a record with no (or an
+    /// out-of-range) block index, and a gap in the blocks are all not known.
+    fn first_bash_call_of(&mut self, message_id: Option<&str>, block: Option<u64>) -> bool {
+        let Some(id) = message_id else {
+            return false;
+        };
+        let known = block.filter(|block| *block < 64);
+        let entry = self.seen(id);
+        let earlier = known.map_or(0, |block| (1u64 << block) - 1);
+        let trusted = !entry.bash && known.is_some() && entry.blocks & earlier == earlier;
+        entry.bash = true;
+        self.note_block(message_id, block);
+        trusted
     }
 
     fn note_time(&mut self, ts: &str) {
@@ -1427,6 +1734,275 @@ mod reader_tests {
         let origin = call.origin.expect("origin");
         assert_eq!((origin.offset, origin.ordinal), (0, 0));
         assert_eq!(origin.digest, 0xabc);
+    }
+
+    /// A result record with a structured `toolUseResult`, as Claude Code writes
+    /// it (`toolUseResult` is a sibling of `message`, and a string in some
+    /// records).
+    fn result_with(ts: &str, id: &str, tool_use_result: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"SYNTHETIC-OUTPUT","is_error":false}}]}},"toolUseResult":{tool_use_result}}}"#
+        )
+    }
+
+    #[test]
+    fn a_call_moved_to_the_background_is_marked_whichever_side_says_so() {
+        // The result names a background task (a call that outlived its timeout,
+        // or one the agent backgrounded); no other shape of `toolUseResult`
+        // does, and none of them makes the record unreadable.
+        for (tool_use_result, background) in [
+            (
+                r#"{"stdout":"","stderr":"","backgroundTaskId":"b1","timedOutAfterMs":600000}"#,
+                true,
+            ),
+            (r#"{"stdout":"x","stderr":"","interrupted":false}"#, false),
+            (r#""Error: exit 1""#, false),
+            (r#"[1,2]"#, false),
+            ("null", false),
+            ("7", false),
+            ("true", false),
+            ("{}", false),
+        ] {
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5)).is_empty());
+            let done = feed(
+                &mut reader,
+                400,
+                &result_with(T0_2S, "tu1", tool_use_result),
+            );
+            assert_eq!(done.len(), 1, "{tool_use_result}");
+            assert_eq!(done[0].result, CallResult::Succeeded, "{tool_use_result}");
+            assert_eq!(done[0].background, background, "{tool_use_result}");
+        }
+        // The input's own flag, however it is spelled, and only a plain false
+        // is a call that ran in the foreground.
+        for (flag, background) in [
+            (r#","run_in_background":true"#, true),
+            (r#","run_in_background":"true""#, true),
+            (r#","run_in_background":1"#, true),
+            (r#","run_in_background":false"#, false),
+            (r#","run_in_background":null"#, false),
+            ("", false),
+        ] {
+            let block = format!(
+                r#"{{"type":"tool_use","id":"tu1","name":"Bash","input":{{"command":"git commit -m x"{flag}}}}}"#
+            );
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &block, 5)).is_empty());
+            let done = feed(&mut reader, 400, &result(T0_2S, "tu1", Some(false)));
+            assert_eq!(done[0].background, background, "{flag}");
+        }
+    }
+
+    /// A result record with the given `content` (any JSON) and no
+    /// `toolUseResult`, as a subagent's transcript writes it.
+    fn result_text(ts: &str, id: &str, content: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":false}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_result_that_says_the_call_was_handed_off_is_marked_in_any_case_and_shape() {
+        for (content, background) in [
+            // The three wordings read off real transcripts (2.1.237 - 2.1.317).
+            (
+                r#""Command did not complete within its 120s timeout and was moved to the background (ID: bx). Output is being written to: /tmp/bx.output""#,
+                true,
+            ),
+            (
+                r#""Command was moved to the background (ID: b1) after running for 180s. Output is being written to: /tmp/b1.output""#,
+                true,
+            ),
+            (
+                r#""Command running in background with ID: b2. Output is being written to: /tmp/b2.output""#,
+                true,
+            ),
+            // Partial output first, a list of blocks, another case.
+            (
+                r#""/dev/disk3s1s1  926Gi  % /\nCommand did not complete within its 120s timeout and was moved to the background""#,
+                true,
+            ),
+            (
+                r#"[{"type":"text","text":"COMMAND DID NOT COMPLETE WITHIN its 30s timeout"}]"#,
+                true,
+            ),
+            (
+                r#"[{"type":"text","text":"x"},{"type":"text","text":"Moved To The Background"}]"#,
+                true,
+            ),
+            (r#""Exit code 124\nCommand timed out after 2m 0s""#, true),
+            // Outputs that say nothing of the kind, whatever their shape.
+            (r#""[main abc] fix: parser""#, false),
+            (r#""""#, false),
+            (r#"[]"#, false),
+            (
+                r#"[{"type":"image","source":{"data":"background"}}]"#,
+                false,
+            ),
+            ("null", false),
+            ("7", false),
+            ("true", false),
+            (r#"{"unexpected":"moved to the background"}"#, false),
+        ] {
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5)).is_empty());
+            let done = feed(&mut reader, 400, &result_text(T0_2S, "tu1", content));
+            assert_eq!(done.len(), 1, "{content}");
+            assert_eq!(done[0].result, CallResult::Succeeded, "{content}");
+            assert_eq!(done[0].background, background, "{content}");
+        }
+    }
+
+    #[test]
+    fn a_result_as_late_as_the_timeout_with_no_structured_result_is_marked() {
+        const T_120S: &str = "2026-09-01T12:02:00.356Z";
+        const T_119S: &str = "2026-09-01T12:01:59.100Z";
+        const T_118S: &str = "2026-09-01T12:01:58.500Z";
+        const T_300S: &str = "2026-09-01T12:04:59.500Z";
+        let timeout =
+            |ms: Option<u64>| ms.map_or(String::new(), |ms| format!(r#","timeout":{ms}"#));
+        for (timeout_input, done_at, structured, background) in [
+            // The default 120 s timeout, to a second short of it.
+            (None, T_120S, false, true),
+            (None, T_119S, false, true),
+            (None, T_118S, false, false),
+            // The call's own timeout.
+            (Some(300_000), T_300S, false, true),
+            (Some(300_000), T_120S, false, false),
+            (Some(600_000), T_300S, false, false),
+            // A `toolUseResult` says the call finished, however late.
+            (None, T_120S, true, false),
+        ] {
+            let block = format!(
+                r#"{{"type":"tool_use","id":"tu1","name":"Bash","input":{{"command":"git commit -m x"{}}}}}"#,
+                timeout(timeout_input)
+            );
+            let line = if structured {
+                result_with(
+                    done_at,
+                    "tu1",
+                    r#"{"stdout":"ok","stderr":"","interrupted":false}"#,
+                )
+            } else {
+                result_text(done_at, "tu1", r#""ok""#)
+            };
+            let mut reader = Reader::new(None);
+            assert!(feed(&mut reader, 0, &assistant(T0, "m1", &block, 5)).is_empty());
+            let done = feed(&mut reader, 400, &line);
+            assert_eq!(
+                done[0].background, background,
+                "timeout {timeout_input:?} done {done_at} structured {structured}"
+            );
+        }
+    }
+
+    /// An assistant record holding one Bash call, for message `message_id`, as
+    /// the block `block` of its API response.
+    fn bash_in(message_id: &str, id: &str, ts: &str, block: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.255","apiBlockIndex":{block},"cwd":"/repo","gitBranch":"main","message":{{"id":"{message_id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"git commit -m x"}}}}]}}}}"#
+        )
+    }
+
+    /// An assistant record holding only thinking, block `block` of `message_id`.
+    fn thinking_in(message_id: &str, ts: &str, block: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.255","apiBlockIndex":{block},"cwd":"/repo","message":{{"id":"{message_id}","content":[{{"type":"thinking","thinking":"SYNTHETIC-REASONING"}}]}}}}"#
+        )
+    }
+
+    /// The `cwd_trusted` of the call `id`, once its result is read.
+    fn trusted_after(reader: &mut Reader, offset: u64, id: &str) -> bool {
+        feed(reader, offset, &result(T0_2S, id, Some(false)))[0].cwd_trusted
+    }
+
+    #[test]
+    fn only_the_first_bash_call_of_a_message_has_a_known_cwd() {
+        let mut reader = Reader::new(None);
+        // One message, one record per call, as Claude Code writes it.
+        feed(&mut reader, 0, &bash_in("m1", "a", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "b", T0, 1));
+        feed(&mut reader, 200, &bash_in("m2", "c", T0, 0));
+        feed(&mut reader, 300, &bash_in("m1", "d", T0, 2));
+        // A message with no id has no first call to know.
+        feed(&mut reader, 400, &bash_in("", "e", T0, 0));
+        let mut trusted = Vec::new();
+        for (offset, id) in [(500, "a"), (600, "b"), (700, "c"), (800, "d"), (900, "e")] {
+            let done = feed(&mut reader, offset, &result(T0_2S, id, Some(false)));
+            trusted.push((id, done[0].cwd_trusted));
+        }
+        assert_eq!(
+            trusted,
+            [
+                ("a", true),
+                ("b", false),
+                ("c", true),
+                ("d", false),
+                ("e", false)
+            ]
+        );
+    }
+
+    /// A resumed session's copy can hold a later call of a message without the
+    /// earlier one that did a `cd` (a real pair of files: the original holds
+    /// blocks 0 thinking, 1 Bash, 2 Bash, the copy 0 thinking and 2 Bash, its
+    /// parent links rewritten so the chain still looks whole). The block
+    /// numbers are what shows the gap.
+    #[test]
+    fn a_call_is_trusted_only_when_the_file_holds_every_earlier_block_of_its_message() {
+        // The whole message: thinking, then two calls.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &thinking_in("m1", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "a", T0, 1));
+        feed(&mut reader, 200, &bash_in("m1", "b", T0, 2));
+        assert!(trusted_after(&mut reader, 300, "a"));
+        assert!(!trusted_after(&mut reader, 400, "b"));
+
+        // The copy: block 1 (the first call) is not in the file.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &thinking_in("m1", T0, 0));
+        feed(&mut reader, 100, &bash_in("m1", "b", T0, 2));
+        assert!(!trusted_after(&mut reader, 200, "b"), "block 1 is missing");
+
+        // The copy holding the call alone, and a call whose own block is the
+        // first of its message.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &bash_in("m1", "b", T0, 2));
+        feed(&mut reader, 100, &bash_in("m2", "c", T0, 0));
+        assert!(!trusted_after(&mut reader, 200, "b"));
+        assert!(trusted_after(&mut reader, 300, "c"));
+
+        // A record with no block index (older Claude Code), or an impossible
+        // one, cannot show that nothing is missing.
+        let mut reader = Reader::new(None);
+        let bare = bash_in("m1", "a", T0, 0).replace(r#""apiBlockIndex":0,"#, "");
+        feed(&mut reader, 0, &bare);
+        feed(&mut reader, 100, &bash_in("m2", "b", T0, 64));
+        assert!(!trusted_after(&mut reader, 200, "a"));
+        assert!(!trusted_after(&mut reader, 300, "b"));
+    }
+
+    #[test]
+    fn two_bash_blocks_of_one_record_and_a_file_tool_in_between() {
+        let mut reader = Reader::new(None);
+        let line = format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{T0}","apiBlockIndex":0,"cwd":"/repo","message":{{"id":"m1","content":[{},{},{}]}}}}"#,
+            edit("e1"),
+            bash("b1"),
+            bash("b2"),
+        );
+        feed(&mut reader, 0, &line);
+        let mut done = Vec::new();
+        for (offset, id) in [(100, "b1"), (200, "b2")] {
+            done.extend(feed(&mut reader, offset, &result(T0_2S, id, Some(false))));
+        }
+        assert_eq!(
+            done.iter()
+                .map(|c| (c.tool.as_str(), c.cwd_trusted))
+                .collect::<Vec<_>>(),
+            [("Bash", true), ("Bash", false)]
+        );
     }
 
     #[test]

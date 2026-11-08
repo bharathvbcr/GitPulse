@@ -2080,6 +2080,8 @@ fn build_tools() -> Vec<Value> {
                     "verified": { "type": "boolean" },
                     "verification": { "type": ["object", "null"] },
                     "session": { "type": ["object", "null"] },
+                    "session_basis": { "type": "string" },
+                    "session_ambiguous": { "type": "boolean" },
                     "landed_on_base": { "type": ["boolean", "null"] },
                     "on_base": { "type": ["boolean", "null"] },
                     "base_oid": { "type": ["string", "null"] },

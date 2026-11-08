@@ -43,6 +43,8 @@ function session(): SessionEpisodeNote {
     transcript_path: null,
     created_at: 1_788_000_000,
     summary: "wrote the batch path",
+    attribution: null,
+    window_ms: null,
   };
 }
 
@@ -57,6 +59,8 @@ function fresh(over: Partial<ProvenanceFreshness> = {}): ProvenanceFreshness {
     verified: false,
     verification: null,
     session: null,
+    session_basis: "no_ingested_session_command",
+    session_ambiguous: false,
     landed_on_base: null,
     on_base: null,
     base_oid: null,
@@ -205,6 +209,54 @@ describe("freshnessBadge", () => {
     expect(b.label).toContain("unverified");
     expect(b.detail).toContain("S1");
     expect(b.detail).toContain("wrote the batch path");
+  });
+
+  it("says an inferred session is an inference, with its window", () => {
+    const b = freshnessBadge(
+      fresh({
+        session: { ...session(), attribution: "inferred", window_ms: 120_000 },
+        session_basis: "inferred_from_command",
+      }),
+    );
+    expect(b.kind).toBe("agent");
+    expect(b.label).toBe("unverified · agent (inferred)");
+    expect(b.detail).toContain("inferred");
+    expect(b.detail).toContain("within 120s");
+    expect(b.detail).toContain("S1");
+  });
+
+  it("does not call a recorded session an inference", () => {
+    const b = freshnessBadge(
+      fresh({ session: { ...session(), attribution: "recorded" }, session_basis: "recorded_note" }),
+    );
+    expect(b.label).toBe("unverified · agent");
+    expect(b.detail).not.toContain("inferred");
+  });
+
+  it("names no session when two could fit, and says that is why", () => {
+    const b = freshnessBadge(
+      fresh({ session_basis: "ambiguous_sessions", session_ambiguous: true }),
+    );
+    expect(b.kind).toBe("unverified");
+    expect(b.detail).toContain("more than one agent session");
+  });
+
+  it("only says no agent's command matches when that is the basis", () => {
+    const hand = freshnessBadge(fresh({ session_basis: "no_ingested_session_command" }));
+    expect(hand.detail).toContain("no ingested agent session's git command matches");
+    expect(hand.detail).toContain("GitPulse does not ingest");
+    const unknown = freshnessBadge(fresh({ session_basis: "scan_capped" }));
+    expect(unknown.detail).toContain("could not be determined (scan capped)");
+    expect(unknown.detail).not.toContain("no ingested agent session's git command matches");
+  });
+
+  it("renders an answer from a build that predates the session fields", () => {
+    const old = fresh() as Partial<ProvenanceFreshness>;
+    delete old.session_basis;
+    delete old.session_ambiguous;
+    const b = freshnessBadge(old as ProvenanceFreshness);
+    expect(b.kind).toBe("unverified");
+    expect(b.detail).toBe("no verification has been recorded for this commit");
   });
 
   it("omits the checker when the note does not name one", () => {

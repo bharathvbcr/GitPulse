@@ -29,6 +29,7 @@
 //! by every later consumer.
 
 mod anchor;
+pub mod attribution;
 pub mod bindings;
 mod cap;
 mod consolidated;
@@ -5465,6 +5466,9 @@ mod reliability_tests;
 
 #[cfg(test)]
 mod query_tests;
+
+#[cfg(test)]
+mod attribution_tests;
 
 #[cfg(test)]
 mod schema_bump_tests;

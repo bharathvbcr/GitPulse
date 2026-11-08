@@ -74,6 +74,26 @@ function verifiedBy(f: ProvenanceFreshness): string {
   return by ? ` by ${by}` : "";
 }
 
+/** Why no session is named, as a sentence tail; empty when the backend gave no reason. */
+function sessionNote(f: ProvenanceFreshness): string {
+  // An answer from a build that predates these fields carries neither: read
+  // that as "no reason given", never as a failure to render.
+  const basis = f.session_basis ?? "";
+  if (f.session_ambiguous) {
+    return "; more than one agent session ran git here at that time, so none is named";
+  }
+  switch (basis) {
+    case "":
+      return "";
+    case "no_ingested_session_command":
+      // Not "no agent was involved": a session this machine does not ingest
+      // (another Claude config directory, another tool) leaves no command row.
+      return "; no ingested agent session's git command matches it (sessions GitPulse does not ingest are not seen)";
+    default:
+      return `; which session made it could not be determined (${basis.replace(/_/g, " ")})`;
+  }
+}
+
 /**
  * Classifies one commit's provenance.
  *
@@ -159,25 +179,36 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
     };
   }
 
-  // 7. An agent wrote it and nobody checked it. Worth saying out loud: it is
-  //    not the same as a commit nothing has ever touched.
+  // 7. A session is tied to it and nobody checked it. Worth saying out loud:
+  //    it is not the same as a commit nothing has ever touched. The tie is
+  //    either a note someone recorded or an inference from a transcript's git
+  //    command and the reflog entry after it; the detail says which, because
+  //    an inference from time is weaker than a record.
   if (f.session) {
+    const inferred = f.session.attribution === "inferred";
+    const windowSeconds = f.session.window_ms === null ? null : Math.round(f.session.window_ms / 1000);
     return {
       kind: "agent",
       tone: "warn",
-      label: "unverified · agent",
+      label: inferred ? "unverified · agent (inferred)" : "unverified · agent",
       detail:
-        `written in agent session ${f.session.session_id}` +
+        (inferred
+          ? `inferred to be from agent session ${f.session.session_id}: its git command ran ` +
+            `${windowSeconds === null ? "shortly" : `within ${windowSeconds}s`} before this commit was made`
+          : `written in agent session ${f.session.session_id}`) +
         `${f.session.summary ? ` (${f.session.summary})` : ""}, with no verification recorded`,
     };
   }
 
-  // 8. Nothing recorded, and we know that for a fact.
+  // 8. Nothing recorded, and we know that for a fact. No session is named, and
+  //    the detail says why rather than leaving "no session" to read as "no
+  //    agent": only `no_ingested_session_command` means no transcript shows a git
+  //    command for it.
   return {
     kind: "unverified",
     tone: "muted",
     label: "unverified",
-    detail: "no verification has been recorded for this commit",
+    detail: `no verification has been recorded for this commit${sessionNote(f)}`,
   };
 }
 
