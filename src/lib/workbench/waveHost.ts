@@ -95,30 +95,37 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Claims the planner tells a person about. They hold nothing back, so a claim
- * store that could not be read, was cut, or named a holder it could not read is
- * said in `unreadable` and the batch still plans: refusing a wave over an
- * advisory sidecar would be a policy nobody asked for. The holder wording is
- * what `planBatch` puts after "claimed by".
+ * store that could not be read, was read in part, or named a holder it could
+ * not read is said in the answer and the batch still plans: refusing a wave
+ * over an advisory sidecar would be a policy nobody asked for. The holder
+ * wording is what `planBatch` puts after "claimed by".
+ *
+ * `unreadable` means no claim could be used, so none were checked. `partial`
+ * means some were: the list was cut to its newest rows, the store was read with
+ * lines skipped, or one claim named no holder. The two are not the same
+ * sentence in the wave note.
  */
 export function heldFromRisk(risk: Pick<CollisionRisk, "file_claims" | "claims_error" | "claims_truncated" | "claims_total">): HeldRead {
-  const problems: string[] = [];
-  const error = (risk.claims_error ?? "").trim();
-  if (error) problems.push(error);
-  if (risk.claims_truncated) problems.push(`only the newest ${(risk.file_claims ?? []).length} of ${risk.claims_total ?? "more"} claims were returned`);
+  const claims = risk.file_claims ?? [];
+  const partial: string[] = [];
   const held: Held[] = [];
-  for (const claim of risk.file_claims ?? []) {
+  for (const claim of claims) {
     const holder = claim.source === "declared" && claim.run_id
       ? `run ${claim.run_id}`
       : claim.source === "observed" && claim.session_id
         ? `session ${claim.session_id}`
         : "";
     if (!claim.path || !holder) {
-      problems.push(`a claim on ${claim.path || "an unnamed path"} named no holder`);
+      partial.push(`a claim on ${claim.path || "an unnamed path"} named no holder`);
       continue;
     }
     held.push({ path: claim.path, holder });
   }
-  return problems.length ? { held, unreadable: problems.join("; ") } : { held };
+  const error = (risk.claims_error ?? "").trim();
+  if (error && held.length === 0) return { held, unreadable: [error, ...partial].join("; ") };
+  if (error) partial.unshift(error);
+  if (risk.claims_truncated) partial.unshift(`the notices cover the newest ${claims.length} of ${risk.claims_total ?? "more"} claims`);
+  return partial.length ? { held, partial: partial.join("; ") } : { held };
 }
 
 export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"], maxPriority?: number): Promise<WaveDeps> {

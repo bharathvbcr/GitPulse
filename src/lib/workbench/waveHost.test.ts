@@ -119,7 +119,6 @@ describe("claims already recorded are told, never a hold", () => {
   it("plans the batch and says so in the note when the claim store was not read", async () => {
     const runner = await startWave({ repositoryId: "r", n: 2, waves: 1 }, waveDeps({
       heldPaths: async () => heldFromRisk({ claims_error: "cannot open claim lock" }),
-      
     }));
     while (runner.record().members.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
     const { note, members } = runner.record();
@@ -127,6 +126,20 @@ describe("claims already recorded are told, never a hold", () => {
     expect(members.map((member) => member.taskId)).toEqual(["a", "b"]);
     expect(note).toContain("cannot open claim lock");
     expect(note).toContain("none were checked");
+  });
+
+  it("says a cut or partly read claim list was read in part, not that none were checked", async () => {
+    const cut = { source: "declared" as const, run_id: "X", path: "a.rs", worktree: "/o", ts_ms: 1 };
+    const runner = await startWave({ repositoryId: "r", n: 2, waves: 1 }, waveDeps({
+      heldPaths: async () => heldFromRisk({ file_claims: [cut], claims_truncated: true, claims_total: 900, claims_error: "1 unreadable claim line skipped" }),
+    }));
+    while (runner.record().members.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    const { note } = runner.record();
+    await runner.cancel();
+    expect(note).toContain("the notices cover the newest 1 of 900 claims");
+    expect(note).toContain("1 unreadable claim line skipped");
+    expect(note).not.toContain("none were checked");
+    expect(note).toContain("a.rs is claimed by run X");
   });
 
   it("notes a cross-batch claim in the wave record without holding the member back", async () => {
@@ -145,13 +158,16 @@ describe("claims already recorded are told, never a hold", () => {
     expect(heldFromRisk({ file_claims: [{ source: "observed", session_id: "session-a", path: "a.rs", worktree: "/wt", ts_ms: 1 }] }))
       .toEqual({ held: [{ path: "a.rs", holder: "session session-a" }] });
     expect(heldFromRisk({})).toEqual({ held: [] });
-    expect(heldFromRisk({ file_claims: [{ source: "declared", path: "a.rs", worktree: "/wt", ts_ms: 1 }] }).unreadable).toMatch(/named no holder/);
+    const holderless = heldFromRisk({ file_claims: [{ source: "declared", path: "a.rs", worktree: "/wt", ts_ms: 1 }] });
+    expect(holderless.unreadable).toBeUndefined();
+    expect(holderless.partial).toMatch(/named no holder/);
   });
 
   it("says a cut claim list was cut, never that nothing else is claimed", () => {
     const read = heldFromRisk({ file_claims: [{ source: "declared", run_id: "X", path: "a.rs", worktree: "/o", ts_ms: 1 }], claims_truncated: true, claims_total: 900 });
     expect(read.held).toHaveLength(1);
-    expect(read.unreadable).toMatch(/only the newest 1 of 900 claims were returned/);
+    expect(read.unreadable).toBeUndefined();
+    expect(read.partial).toMatch(/the notices cover the newest 1 of 900 claims/);
   });
 });
 

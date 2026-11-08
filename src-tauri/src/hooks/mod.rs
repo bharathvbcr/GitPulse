@@ -4200,18 +4200,28 @@ mod tests {
             "the read was fine: {text}"
         );
     }
-
-    /// A torn line in the store does not stop claims. The check says it ran on a
-    /// degraded store, and the append that follows closes the torn line so the
-    /// store reads clean again once a compaction drops it.
+    /// A torn line in the store does not stop claims. While another hook holds
+    /// the lock a repair needs, the check says it ran on a degraded store and
+    /// the claim is still recorded; once the lock is free the next read repairs
+    /// the store, and a read after that is clean.
     #[cfg(unix)]
     #[test]
     fn a_torn_claim_line_is_said_out_loud_and_does_not_stop_the_next_claim() {
+        use std::os::unix::io::AsRawFd;
         let repo = crate::test_support::git_repo();
         let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
         let store = crate::insights::claims::store_path(&common);
         std::fs::create_dir_all(store.parent().unwrap()).unwrap();
         std::fs::write(&store, b"{\"source\":\"observed\",\"sess").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.with_extension("lock"))
+            .unwrap();
+        // SAFETY: `holder` is an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_SH) }, 0);
         let file = repo.path().join("a.rs");
         let mut call = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
         call.session_id = "session-a".into();
@@ -4223,13 +4233,17 @@ mod tests {
             !text.contains("could not be recorded"),
             "the append must succeed: {text}"
         );
-        let read = crate::insights::claims::read_for_worktree(
-            repo.path(),
-            crate::insights::claims::now_ms(),
-        )
-        .unwrap();
-        assert_eq!(read.rows.len(), 1, "{read:?}");
-        assert_eq!(read.skipped, 1, "{read:?}");
+        // SAFETY: as above.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
+        let now = crate::insights::claims::now_ms;
+        let repair = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
+        assert_eq!(
+            (repair.rows.len(), repair.skipped, repair.repaired),
+            (1, 1, true),
+            "{repair:?}"
+        );
+        let clean = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
+        assert_eq!((clean.rows.len(), clean.skipped), (1, 0), "{clean:?}");
     }
 
     /// Security. The hook runs in every repository an agent edits. In one

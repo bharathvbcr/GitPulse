@@ -16,13 +16,22 @@
 //! * Readers take no lock. They skip a line that does not parse or is not
 //!   terminated, count it, and report the count as degraded: one bad line is
 //!   never a whole-store failure, and never reads as clean.
+//! * A bad line does not stay. A read that skipped one, and an append that
+//!   closed a torn tail, each try once, without waiting, to rewrite the store
+//!   without it. If the exclusive lock is not free they leave it for the next
+//!   one, so no hook waits longer than it did before.
 //! * Appends take a shared lock, so concurrent hooks do not queue behind one
-//!   another. Only compaction takes the exclusive lock. It rewrites the file
-//!   (dropping expired, duplicate and unreadable rows) through a temp file and
-//!   an atomic rename, so a reader sees the old file or the new one.
+//!   another. Only compaction takes the exclusive lock. The new file is written
+//!   beside the store before that lock is asked for; under it the appends made
+//!   meanwhile are copied on and the file is renamed over the store, so a
+//!   reader sees the old file or the new one. A hook whose compaction cannot
+//!   get the lock appends its claim under the shared lock instead.
 //! * Compaction is rare by design. It starts when the file passes
-//!   [`COMPACT_BYTES_PER_ROW`] bytes per row of cap, and keeps half the cap,
-//!   so the next one is thousands of appends away.
+//!   [`COMPACT_BYTES_PER_ROW`] bytes per row of cap. It drops expired and
+//!   duplicate rows, keeps every live row up to the cap, and leaves at most
+//!   three quarters of the starting size, so the next one is thousands of
+//!   appends away. Live rows past the cap or that size are the oldest to go,
+//!   and are logged and counted on the next read.
 //! * Nothing is fsynced. A claim is advisory and expires in minutes; a lost
 //!   tail after a crash is the same as the claim never having been made, and
 //!   a sync on every hook write is what put it over its latency budget.
@@ -34,7 +43,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,21 +95,39 @@ pub struct StoreRead {
     /// Lines that were unparsable, unterminated or oversized, plus the cut
     /// head of a store read from its tail. Non-zero is degraded, not clean.
     pub skipped: usize,
+    /// Live claims past the cap that this read did not keep. They are the
+    /// oldest; a non-zero count is degraded, not a complete list.
+    pub dropped: usize,
+    /// This read saw `skipped` lines and rewrote the store without them, so the
+    /// next read is clean. False when the lock was not free: the next writer
+    /// or reader tries again.
+    pub repaired: bool,
     /// The repository is not trusted, so nothing was read and nothing may be
     /// said about claims there. Distinct from an empty store.
     pub untrusted: bool,
 }
 
 impl StoreRead {
-    /// The degraded reading of this read, or `None` when every line was used.
+    /// The degraded reading of this read, or `None` when every line was used
+    /// and every live claim was kept.
     pub fn degraded(&self) -> Option<String> {
-        (self.skipped > 0).then(|| {
-            format!(
-                "{} unreadable claim line{} skipped",
+        let mut parts = Vec::new();
+        if self.skipped > 0 {
+            parts.push(format!(
+                "{} unreadable claim line{} skipped{}",
                 self.skipped,
-                if self.skipped == 1 { "" } else { "s" }
-            )
-        })
+                if self.skipped == 1 { "" } else { "s" },
+                if self.repaired { " and removed" } else { "" }
+            ));
+        }
+        if self.dropped > 0 {
+            parts.push(format!(
+                "{} older live claim{} past the store cap not kept",
+                self.dropped,
+                if self.dropped == 1 { "" } else { "s" }
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 }
 
@@ -221,12 +248,25 @@ pub fn read_for_worktree(worktree: &Path, now_ms: u64) -> Result<StoreRead, Stri
 }
 
 /// Reads the store without taking a lock. A torn or foreign line is skipped
-/// and counted; it never fails the read.
+/// and counted; it never fails the read. A read that skipped lines then tries
+/// once, without waiting, to rewrite the store without them, so the damage is
+/// reported by one read and not by every read until a size-triggered
+/// compaction. If the lock is not free it leaves that to the next one.
 pub fn read_store(store: &Path, now_ms: u64, ttl_ms: u64, cap: usize) -> Result<StoreRead, String> {
     let loaded = load_lines(store)?;
+    let (rows, dropped) = trim(loaded.rows, now_ms, ttl_ms, cap);
+    let mut repaired = false;
+    if loaded.skipped > 0 {
+        let (_, keep_bytes) = compaction_limits(cap);
+        let healed = render(&rows, keep_bytes)
+            .and_then(|(text, _)| Prepared::write(store, loaded.end, loaded.id, &text));
+        repaired = healed.is_ok_and(|prepared| try_repair(store, prepared, cap));
+    }
     Ok(StoreRead {
-        rows: trim(loaded.rows, now_ms, ttl_ms, cap),
+        rows,
         skipped: loaded.skipped,
+        dropped,
+        repaired,
         untrusted: false,
     })
 }
@@ -329,56 +369,222 @@ pub fn append_claims(
         buffer.push('\n');
     }
     let len = fs::metadata(store).map(|meta| meta.len()).unwrap_or(0);
-    let threshold = (cap as u64).saturating_mul(COMPACT_BYTES_PER_ROW);
+    let (threshold, _) = compaction_limits(cap);
     if len < threshold && len < MAX_STORE_BYTES {
-        return with_lock(store, Mode::Shared, || append_buffer(store, &buffer));
+        let closed_a_torn_tail = with_lock(store, Mode::Shared, wait(), || {
+            append_buffer(store, &buffer)
+        })?;
+        if closed_a_torn_tail {
+            // The append kept the new row out of the torn line. The line itself
+            // is still in the file, and every read would count it until a size
+            // threshold that a quiet repository may never reach.
+            heal(store, cap, ttl_ms, now_ms);
+        }
+        return Ok(());
     }
     // Reading, parsing, trimming and rendering is most of a compaction, so it
     // is done before the exclusive lock is asked for. Appends made meanwhile
-    // are the bytes past `loaded.end`; they are copied onto the new file under
+    // are the bytes past `prepared.end`; they are copied onto the new file under
     // the lock, which is then held only for a read of that tail, one write and
     // a rename. When several hooks cross the threshold together, the first to
     // get the lock compacts and the rest find a store that is already small:
     // they append to it instead of compacting again, so none of them holds the
     // lock for a second rewrite.
-    let keep = (cap / 2).max(claims.len()).max(1);
-    let prepared = prepare_compaction(store, claims, ttl_ms, now_ms, keep)?;
-    with_lock(store, Mode::Exclusive, || {
-        let len = fs::metadata(store).map(|meta| meta.len()).unwrap_or(0);
-        let same_file = identity(store) == prepared.loaded.id && len >= prepared.loaded.end;
-        if !same_file || len < threshold {
-            return append_buffer(store, &buffer);
-        }
-        let mut out = prepared.text.into_bytes();
-        out.extend(read_from(store, prepared.loaded.end)?);
-        replace_store(store, &out)
+    let prepared = prepare_compaction(store, claims, cap, ttl_ms, now_ms)?;
+    let mut prepared = prepared;
+    let attempt = with_lock_if_free(store, Mode::Exclusive, wait(), || {
+        compact_locked(store, &mut prepared, &buffer, false, threshold)
+    })?;
+    if attempt.is_some() {
+        return Ok(());
+    }
+    // Another hook is mid-append, so the exclusive lock was not free in time.
+    // The claim is not lost for that: it is appended under the shared lock, and
+    // the next writer past the threshold compacts.
+    with_lock(store, Mode::Shared, wait(), || {
+        append_buffer(store, &buffer)
     })
+    .map(|_| ())
 }
 
+/// The lock wait every claim operation gets. One place, so it is not widened by
+/// one caller.
+fn wait() -> Duration {
+    Duration::from_millis(LOCK_WAIT_MS)
+}
+
+/// The byte size that starts a compaction for `cap`, and how many bytes a
+/// compaction may leave: three quarters of that, so the next one is thousands
+/// of appends away rather than the very next append.
+fn compaction_limits(cap: usize) -> (u64, u64) {
+    let threshold = (cap.max(1) as u64).saturating_mul(COMPACT_BYTES_PER_ROW);
+    (threshold, threshold / 4 * 3)
+}
+
+/// A compaction's new file, already written, and which bytes of the old one it
+/// was made from. The file is removed unless a compaction renames it into place.
 struct Prepared {
-    loaded: Loaded,
-    text: String,
+    /// Where the read it was made from stopped; the bytes after it are appends.
+    end: u64,
+    /// The file that was read, when the platform can say which.
+    id: Option<(u64, u64)>,
+    /// The new file, beside the store.
+    tmp: PathBuf,
+    committed: bool,
 }
 
-/// The compacted store as it would be written now. Keeps `keep` rows, half the
-/// cap: the next rewrite is then thousands of appends away instead of the very
-/// next one.
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+impl Prepared {
+    /// Writes `text` to a file of its own beside `store`. The name carries this
+    /// process and a counter, so hooks compacting together never share one.
+    fn write(store: &Path, end: u64, id: Option<(u64, u64)>, text: &str) -> Result<Self, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = store.with_extension(format!(
+            "jsonl.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if let Some(parent) = store.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        let prepared = Prepared {
+            end,
+            id,
+            tmp,
+            committed: false,
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&prepared.tmp)
+            .map_err(|error| format!("cannot open claims {}: {error}", prepared.tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .map_err(|error| format!("cannot write claims {}: {error}", prepared.tmp.display()))?;
+        Ok(prepared)
+    }
+}
+
+/// The compacted store as it would be written now: every live row up to the
+/// cap, and no more bytes than [`compaction_limits`] allows. Expiry drops rows
+/// first. Past the cap or the byte limit the oldest go, and that is logged.
 fn prepare_compaction(
     store: &Path,
     claims: &[FileClaim],
+    cap: usize,
     ttl_ms: u64,
     now_ms: u64,
-    keep: usize,
 ) -> Result<Prepared, String> {
-    let mut loaded = load_lines(store)?;
-    let mut rows = std::mem::take(&mut loaded.rows);
+    let loaded = load_lines(store)?;
+    let mut rows = loaded.rows;
     rows.extend(claims.iter().cloned());
-    let mut text = String::new();
-    for row in trim(rows, now_ms, ttl_ms, keep) {
-        text.push_str(&serde_json::to_string(&row).map_err(|error| error.to_string())?);
+    let (kept, mut dropped) = trim(rows, now_ms, ttl_ms, cap);
+    let (_, keep_bytes) = compaction_limits(cap);
+    let (text, over_bytes) = render(&kept, keep_bytes)?;
+    dropped += over_bytes;
+    if dropped > 0 {
+        log::warn!(
+            target: "insights",
+            "the claim store {} dropped {dropped} live claim(s) it could not keep within its cap",
+            store.display()
+        );
+    }
+    Prepared::write(store, loaded.end, loaded.id, &text)
+}
+
+/// `kept` (oldest first) as store text, with the oldest rows left out until it
+/// fits `max_bytes`. Returns the text and how many rows that cost.
+fn render(kept: &[FileClaim], max_bytes: u64) -> Result<(String, usize), String> {
+    let mut lines = Vec::with_capacity(kept.len());
+    let mut bytes = 0u64;
+    for row in kept {
+        let line = serde_json::to_string(row).map_err(|error| error.to_string())?;
+        bytes += line.len() as u64 + 1;
+        lines.push(line);
+    }
+    let mut skip = 0usize;
+    while bytes > max_bytes && skip < lines.len() {
+        bytes -= lines[skip].len() as u64 + 1;
+        skip += 1;
+    }
+    let mut text = String::with_capacity(bytes as usize);
+    for line in &lines[skip..] {
+        text.push_str(line);
         text.push('\n');
     }
-    Ok(Prepared { loaded, text })
+    Ok((text, skip))
+}
+
+/// Under the exclusive lock: puts whatever was appended since `prepared` was
+/// read onto its file and renames it over the store. That is a read of a short
+/// tail, one small write and a rename; the rest was done before the lock was
+/// asked for. A store that is no longer the file that was read (someone else
+/// compacted) is left alone and `buffer`, if any, is appended to it; so is a
+/// store that has fallen under `threshold` unless `force`. Returns whether the
+/// store was rewritten.
+fn compact_locked(
+    store: &Path,
+    prepared: &mut Prepared,
+    buffer: &str,
+    force: bool,
+    threshold: u64,
+) -> Result<bool, String> {
+    let len = fs::metadata(store).map(|meta| meta.len()).unwrap_or(0);
+    let same_file = identity(store) == prepared.id && len >= prepared.end;
+    if !same_file || (!force && len < threshold) {
+        if !buffer.is_empty() {
+            append_buffer(store, buffer)?;
+        }
+        return Ok(false);
+    }
+    let tail = read_from(store, prepared.end)?;
+    if !tail.is_empty() {
+        OpenOptions::new()
+            .append(true)
+            .open(&prepared.tmp)
+            .and_then(|mut file| file.write_all(&tail))
+            .map_err(|error| format!("cannot write claims {}: {error}", prepared.tmp.display()))?;
+    }
+    fs::rename(&prepared.tmp, store).map_err(|error| {
+        format!(
+            "cannot replace claims {} with {}: {error}",
+            store.display(),
+            prepared.tmp.display()
+        )
+    })?;
+    prepared.committed = true;
+    Ok(true)
+}
+
+/// Rewrites the store without its bad lines, if the exclusive lock is free
+/// right now. Never waits and never fails the caller: a store that stays
+/// degraded is reported again by the next read.
+fn heal(store: &Path, cap: usize, ttl_ms: u64, now_ms: u64) {
+    if let Ok(prepared) = prepare_compaction(store, &[], cap, ttl_ms, now_ms) {
+        try_repair(store, prepared, cap);
+    }
+}
+
+fn try_repair(store: &Path, mut prepared: Prepared, cap: usize) -> bool {
+    let (threshold, _) = compaction_limits(cap);
+    matches!(
+        with_lock_if_free(store, Mode::Exclusive, Duration::ZERO, || {
+            compact_locked(store, &mut prepared, "", true, threshold)
+        }),
+        Ok(Some(true))
+    )
 }
 
 /// The bytes of the store from `offset` on: what was appended since a read
@@ -411,8 +617,9 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Live rows, oldest first: expired rows dropped, one row per holder and path
-/// (the newest), then the newest `cap` kept.
-fn trim(rows: Vec<FileClaim>, now_ms: u64, ttl_ms: u64, cap: usize) -> Vec<FileClaim> {
+/// (the newest), then the newest `cap` kept. Also how many live rows the cap
+/// cost, so a caller never presents a cut list as a whole one.
+fn trim(rows: Vec<FileClaim>, now_ms: u64, ttl_ms: u64, cap: usize) -> (Vec<FileClaim>, usize) {
     let mut indexed: Vec<(usize, FileClaim)> = rows
         .into_iter()
         .enumerate()
@@ -436,9 +643,10 @@ fn trim(rows: Vec<FileClaim>, now_ms: u64, ttl_ms: u64, cap: usize) -> Vec<FileC
             newest_first.push(claim);
         }
     }
+    let dropped = newest_first.len().saturating_sub(cap);
     newest_first.truncate(cap);
     newest_first.reverse();
-    newest_first
+    (newest_first, dropped)
 }
 
 /// Every parsable, terminated line of the store, and how many were skipped.
@@ -513,8 +721,9 @@ fn parse_lines(buf: &[u8], cut_head: bool) -> (Vec<FileClaim>, usize) {
 
 /// Appends `buffer` (whole rows, each ending in `\n`) in one write. When the
 /// file's last byte is not a newline, an earlier writer was cut off; the
-/// buffer then starts with one so the torn line stands alone.
-fn append_buffer(store: &Path, buffer: &str) -> Result<(), String> {
+/// buffer then starts with one so the torn line stands alone. Returns whether
+/// it found a torn tail.
+fn append_buffer(store: &Path, buffer: &str) -> Result<bool, String> {
     let mut file = open_store(store)?;
     let append_error =
         |error: std::io::Error| format!("cannot append claim {}: {error}", store.display());
@@ -531,37 +740,8 @@ fn append_buffer(store: &Path, buffer: &str) -> Result<(), String> {
         bytes.push(b'\n');
     }
     bytes.extend_from_slice(buffer.as_bytes());
-    file.write_all(&bytes).map_err(append_error)
-}
-
-/// Replaces the store with `contents` through a temp file and a rename.
-fn replace_store(store: &Path, contents: &[u8]) -> Result<(), String> {
-    if let Some(parent) = store.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
-    let tmp = store.with_extension("jsonl.tmp");
-    {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .map_err(|error| format!("cannot open claims {}: {error}", tmp.display()))?;
-        file.write_all(contents)
-            .map_err(|error| format!("cannot write claims {}: {error}", tmp.display()))?;
-    }
-    fs::rename(&tmp, store).map_err(|error| {
-        format!(
-            "cannot replace claims {} with {}: {error}",
-            store.display(),
-            tmp.display()
-        )
-    })
+    file.write_all(&bytes).map_err(append_error)?;
+    Ok(torn)
 }
 
 /// The store, opened for append and created when missing.
@@ -590,23 +770,55 @@ enum Mode {
     Exclusive,
 }
 
+/// Runs `body` under the claim lock, waiting up to `wait` for it. A lock that
+/// is not free in time is an error.
 fn with_lock<T>(
     store: &Path,
     mode: Mode,
+    wait: Duration,
     body: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    with_lock_if_free(store, mode, wait, body)?.ok_or_else(|| {
+        format!(
+            "timed out waiting for claim lock {}",
+            store.with_extension("lock").display()
+        )
+    })
+}
+
+/// [`with_lock`] that says `None` when the lock was not free within `wait`
+/// instead of failing, so a caller with something else it can do does it.
+fn with_lock_if_free<T>(
+    store: &Path,
+    mode: Mode,
+    wait: Duration,
+    body: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
     // The lock file orders processes. Compaction also takes this mutex so two
     // threads of one process do not both rewrite; appends do not, so they do
     // not queue behind each other. Where there is no file lock, the mutex is
     // the only ordering there is and every writer takes it.
     static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _local = (cfg!(not(unix)) || mode == Mode::Exclusive).then(|| {
-        LOCAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    });
-    let _file = acquire(store, mode)?;
-    body()
+    let _local = if cfg!(not(unix)) || mode == Mode::Exclusive {
+        let guard = if wait.is_zero() {
+            match LOCAL.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            }
+        } else {
+            LOCAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    match acquire(store, mode, wait)? {
+        Acquired::Busy => Ok(None),
+        Acquired::Held(_lock) => body().map(Some),
+    }
 }
 
 struct HeldLock {
@@ -627,7 +839,14 @@ impl Drop for HeldLock {
     }
 }
 
-fn acquire(store: &Path, mode: Mode) -> Result<Option<HeldLock>, String> {
+enum Acquired {
+    /// The lock, or `None` where the platform has no file lock to hold.
+    Held(Option<HeldLock>),
+    /// Not free within the wait.
+    Busy,
+}
+
+fn acquire(store: &Path, mode: Mode, wait: Duration) -> Result<Acquired, String> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -649,30 +868,27 @@ fn acquire(store: &Path, mode: Mode) -> Result<Option<HeldLock>, String> {
             Mode::Shared => libc::LOCK_SH,
             Mode::Exclusive => libc::LOCK_EX,
         } | libc::LOCK_NB;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(LOCK_WAIT_MS);
+        let deadline = std::time::Instant::now() + wait;
         loop {
             // SAFETY: `file` is an open descriptor this frame owns.
             let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if rc == 0 {
-                return Ok(Some(HeldLock { file }));
+                return Ok(Acquired::Held(Some(HeldLock { file })));
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for claim lock {}",
-                    lock_path.display()
-                ));
+                return Ok(Acquired::Busy);
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            std::thread::sleep(Duration::from_micros(200));
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (store, mode);
-        Ok(None)
+        let _ = (store, mode, wait);
+        Ok(Acquired::Held(None))
     }
 }
 
@@ -781,9 +997,13 @@ mod tests {
 
     /// C1. One torn line used to fail every later read and every compacting
     /// append for good, because only a successful rewrite could remove it and
-    /// the rewrite refused to read the store.
+    /// the rewrite refused to read the store. Here another hook holds the lock
+    /// the repair needs, so the torn line stays and is counted: skipped and
+    /// reported, never a failure, and repaired by the first read that can.
+    #[cfg(unix)]
     #[test]
     fn a_torn_line_is_skipped_and_counted_and_every_good_row_survives_the_appends_after_it() {
+        use std::os::unix::io::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("gitpulse").join("file-claims.jsonl");
         let now = 1_000_000u64;
@@ -795,6 +1015,15 @@ mod tests {
             now,
         )
         .unwrap();
+        // Another hook is mid-append: it holds the shared lock, which keeps the
+        // exclusive lock a repair needs from being free.
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.with_extension("lock"))
+            .unwrap();
+        // SAFETY: `holder` is an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_SH) }, 0);
         // A writer cut off mid-row: no newline, and not JSON.
         let torn = serde_json::to_string(&claim("torn.rs", now)).unwrap();
         let mut file = OpenOptions::new().append(true).open(&store).unwrap();
@@ -821,11 +1050,20 @@ mod tests {
         let paths: Vec<_> = read.rows.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, ["a.rs", "b.rs", "c.rs"], "{read:?}");
         assert_eq!(read.skipped, 1, "the torn line is counted, not hidden");
+        assert!(!read.repaired, "the lock was not free: {read:?}");
         assert!(
             read.degraded()
                 .is_some_and(|text| text.contains("1 unreadable")),
             "{read:?}"
         );
+        // The lock comes free: the next read repairs the store, and the one
+        // after it is clean.
+        // SAFETY: as above.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
+        let repair = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+        assert!(repair.repaired && repair.skipped == 1, "{repair:?}");
+        let clean = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+        assert_eq!((clean.rows.len(), clean.skipped), (3, 0), "{clean:?}");
         // Long after every claim expired the store still reads, and does not
         // fail the way the whole-store error did.
         let later = read_store(
@@ -835,6 +1073,32 @@ mod tests {
             DEFAULT_CAP,
         );
         assert!(later.is_ok(), "{later:?}");
+    }
+
+    /// The cap is not silent: live claims past it are counted on the read, so a
+    /// list cut at the cap never reads as the whole list.
+    #[test]
+    fn live_claims_past_the_cap_are_counted_not_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("file-claims.jsonl");
+        let lines: String = (0..5u64)
+            .map(|i| {
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&claim(&format!("{i}.rs"), 100 + i)).unwrap()
+                )
+            })
+            .collect();
+        fs::write(&store, lines).unwrap();
+        let read = read_store(&store, 200, DEFAULT_TTL_MS, 2).unwrap();
+        assert_eq!((read.rows.len(), read.dropped), (2, 3), "{read:?}");
+        assert!(
+            read.degraded()
+                .is_some_and(|text| text.contains("3 older live claims past the store cap")),
+            "{read:?}"
+        );
+        let whole = read_store(&store, 200, DEFAULT_TTL_MS, 8).unwrap();
+        assert!(whole.degraded().is_none(), "{whole:?}");
     }
 
     /// C1. A torn tail is closed by the next append instead of swallowing it,

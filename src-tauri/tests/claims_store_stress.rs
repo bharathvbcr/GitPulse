@@ -183,3 +183,168 @@ fn an_append_to_a_full_store_stays_far_under_the_lock_wait() {
         percentile(&took, 0.5)
     );
 }
+
+fn torn_store(dir: &Path) -> std::path::PathBuf {
+    let store = dir.join("gitpulse").join("file-claims.jsonl");
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    fs::write(&store, b"{\"source\":\"observed\",\"sess").unwrap();
+    store
+}
+
+/// A torn line used to stay counted on every read until a size-triggered
+/// compaction: about 7,000 appends later, or never in a quiet repository. An
+/// append that closes a torn tail now repairs the store, with no size
+/// threshold anywhere near.
+#[test]
+fn a_torn_line_is_healed_by_the_next_append_in_a_quiet_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = torn_store(dir.path());
+    append_claim(
+        &store,
+        &realistic("q", 1, T0),
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        T0,
+    )
+    .unwrap();
+    let read = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+    assert_eq!((read.rows.len(), read.skipped), (1, 0), "{read:?}");
+    // A few more appends and a read hours later stay clean.
+    for i in 2..5usize {
+        append_claim(
+            &store,
+            &realistic("q", i, T0),
+            DEFAULT_CAP,
+            DEFAULT_TTL_MS,
+            T0,
+        )
+        .unwrap();
+    }
+    let later = read_store(
+        &store,
+        T0 + DEFAULT_TTL_MS * 10,
+        DEFAULT_TTL_MS,
+        DEFAULT_CAP,
+    )
+    .unwrap();
+    assert_eq!(later.skipped, 0, "{later:?}");
+}
+
+/// A bad line in the middle of the file is not a torn tail, so an append cannot
+/// see it. The read that does see it repairs the store, and the next read is
+/// clean.
+#[test]
+fn a_degraded_read_repairs_the_store_so_the_next_read_is_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+    append_claim(
+        &store,
+        &realistic("m", 1, T0),
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        T0,
+    )
+    .unwrap();
+    let mut text = fs::read_to_string(&store).unwrap();
+    text.push_str("{\"source\":\"observed\",\"sess\n");
+    fs::write(&store, text).unwrap();
+    append_claim(
+        &store,
+        &realistic("m", 2, T0),
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        T0,
+    )
+    .unwrap();
+    let first = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+    assert_eq!(
+        (first.rows.len(), first.skipped),
+        (2, 1),
+        "this read saw it: {first:?}"
+    );
+    let second = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+    assert_eq!((second.rows.len(), second.skipped), (2, 0), "{second:?}");
+}
+
+/// Compaction kept half the cap, so live claims inside the cap vanished at
+/// append 7,109 without any signal. It now drops by expiry and the cap only.
+#[test]
+fn a_compaction_keeps_every_live_claim_within_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+    let mut most = 0usize;
+    for i in 0..8000usize {
+        let ts = T0 + i as u64;
+        append_claim(
+            &store,
+            &realistic("d", i, ts),
+            DEFAULT_CAP,
+            DEFAULT_TTL_MS,
+            ts,
+        )
+        .unwrap();
+        if i % 50 == 0 || i > 6500 {
+            let live = read_store(&store, ts, DEFAULT_TTL_MS, DEFAULT_CAP)
+                .unwrap()
+                .rows
+                .len();
+            assert!(
+                live >= most,
+                "live claims fell from {most} to {live} at append {i}"
+            );
+            most = most.max(live);
+        }
+    }
+    assert_eq!(
+        most, DEFAULT_CAP,
+        "the store holds the whole cap of live claims"
+    );
+}
+
+/// An exclusive attempt that times out because another hook is mid-append used
+/// to fail the claim. The row is appended under the shared lock instead.
+#[cfg(unix)]
+#[test]
+fn a_compaction_that_cannot_get_its_lock_still_records_the_claim() {
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    // A store already past its compaction threshold, so the next append is the
+    // one that tries to compact.
+    let mut text = String::new();
+    let mut i = 0usize;
+    while (text.len() as u64) < DEFAULT_CAP as u64 * COMPACT_BYTES_PER_ROW {
+        text.push_str(&serde_json::to_string(&realistic("fill", i, T0 + i as u64)).unwrap());
+        text.push('\n');
+        i += 1;
+    }
+    fs::write(&store, text).unwrap();
+    // Another hook, mid-append: it holds the shared lock, which an exclusive
+    // attempt cannot take.
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(store.with_extension("lock"))
+        .unwrap();
+    // SAFETY: `holder` is an open descriptor owned by this test.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_SH) }, 0);
+    let ts = T0 + 500_000;
+    let result = append_claim(
+        &store,
+        &realistic("late", 1, ts),
+        DEFAULT_CAP,
+        DEFAULT_TTL_MS,
+        ts,
+    );
+    // SAFETY: as above.
+    unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
+    assert!(result.is_ok(), "the claim was lost: {result:?}");
+    let read = read_store(&store, ts, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
+    assert!(
+        read.rows.iter().any(|row| row.path.contains("late_00001")),
+        "the claim is not in the store"
+    );
+}

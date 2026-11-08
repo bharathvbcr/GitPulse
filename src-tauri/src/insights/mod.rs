@@ -352,7 +352,8 @@ pub struct CollisionRisk {
     /// means a worktree shared with an unobservable session is missing from
     /// `shared_worktrees`, so its emptiness is not a clean result.
     pub sessions_ok: bool,
-    /// Why `sessions_ok` is false: each kind that could not be observed.
+    /// Why `sessions_ok` is false: each kind that could not be observed, and
+    /// `attribution: …` when the hook claims could not be read in full.
     pub sessions_error: String,
     /// Declared and observed file claims. Empty is "none" only when
     /// `claims_error` is empty; a failed read is not an empty list.
@@ -687,6 +688,11 @@ pub fn mark_deferrals(payload: &mut serde_json::Value) -> bool {
 
 /// Every kind that could not be fully observed, and why, as one sentence.
 fn sessions_error(live: &LiveSessionFacet) -> String {
+    // Attribution that could not read the hook claims drops `live.ok`, and the
+    // reason has to travel with the `false`: `sessions_ok: false` with an empty
+    // `sessions_error` is a refusal nobody can act on.
+    let attribution = (!live.attribution_error.is_empty())
+        .then(|| format!("attribution: {}", live.attribution_error));
     live.kinds
         .iter()
         .filter_map(|k| {
@@ -703,6 +709,7 @@ fn sessions_error(live: &LiveSessionFacet) -> String {
                 None
             }
         })
+        .chain(attribution)
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -3234,6 +3241,38 @@ mod tests {
         let risk = collision_risk_observed(repo, &Vec::new());
         assert_eq!(risk.file_claims.len(), 1, "{:?}", risk.file_claims);
         assert!(!risk.claims_truncated);
+    }
+
+    /// `sessions_ok: false` always says why. Attribution that could not read
+    /// the hook claims drops `ok`; before, the reason stayed on the live facet
+    /// and the collision answer carried a bare `false`.
+    #[test]
+    fn sessions_error_carries_the_attribution_reason_that_made_sessions_ok_false() {
+        let degraded = LiveSessionFacet {
+            ok: false,
+            sessions: 1,
+            kinds: Vec::new(),
+            worktrees: Vec::new(),
+            attribution_error: "hook claims not read in full: 1 unreadable claim line skipped"
+                .into(),
+        };
+        let reason = sessions_error(&degraded);
+        assert!(
+            reason.contains("attribution: hook claims not read in full"),
+            "{reason}"
+        );
+        let list: Vec<WorktreeInfo> = Vec::new();
+        let risk = collision_from_list(&list, &degraded, None);
+        assert!(
+            !risk.sessions_ok && !risk.sessions_error.is_empty(),
+            "{risk:?}"
+        );
+        let clean = LiveSessionFacet {
+            ok: true,
+            attribution_error: String::new(),
+            ..degraded
+        };
+        assert!(sessions_error(&clean).is_empty());
     }
 
     #[cfg(unix)]

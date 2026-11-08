@@ -224,8 +224,9 @@ export interface CollisionRisk {
   /** Dirty files in worktrees two live sessions share — invisible to `overlapping_files`. */
   shared_worktree_files: number;
   shared_worktrees: SharedWorktree[];
-  /** False when some agent kind could not be observed; empty `shared_worktrees` is then not clean. */
+  /** False when some agent kind could not be observed, or attribution by hook claim could not be read in full; empty `shared_worktrees` is then not clean. */
   sessions_ok: boolean;
+  /** Why `sessions_ok` is false: each kind that could not be observed, and `attribution: …` when claims were not read. */
   sessions_error: string;
   /**
    * Declared and observed claims for this repository. Omitted when empty.

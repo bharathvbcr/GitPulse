@@ -151,7 +151,7 @@ export interface WaveDeps {
   /**
    * Paths already claimed by a run or a session, for a notice. Absent means
    * none were read. A claim never holds a member back and is not called a
-   * collision; `unreadable` says the claim store could not be read in full.
+   * collision; `unreadable` and `partial` say what the claim store could not give.
    */
   heldPaths?(signal: AbortSignal): Promise<HeldRead>;
   now(): number;
@@ -209,8 +209,12 @@ function overlappingPath(mine: readonly string[], theirs: readonly string[], opt
 }
 
 export interface Held { path: string; holder: string }
-/** Claims read for a batch. `unreadable` is why the claim store was not read in full. */
-export interface HeldRead { held: readonly Held[]; unreadable?: string }
+/**
+ * Claims read for a batch. `unreadable` is why no claim could be used, so none
+ * were checked; `partial` is what limited the ones that were (a list cut to its
+ * newest rows, lines skipped, a claim with no holder).
+ */
+export interface HeldRead { held: readonly Held[]; unreadable?: string; partial?: string }
 export interface BatchPlan {
   chosen: Candidate[];
   skipped: { id: string; title: string; reason: string }[];
@@ -385,7 +389,8 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     const base = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
     const extras = [
       plan.notices.length ? `Launched although another run or session has claimed a file: ${plan.notices.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "",
-      claimed.unreadable ? `File claims were not read in full (${claimed.unreadable}), so none were checked.` : "",
+      claimed.unreadable ? `File claims were not read (${claimed.unreadable}), so none were checked.` : "",
+      claimed.partial ? `File claims were read in part (${claimed.partial}).` : "",
     ].filter(Boolean).join(" ");
     const note = extras ? (base ? `${base.trimEnd()} ${extras}` : extras) : base;
     await save({
