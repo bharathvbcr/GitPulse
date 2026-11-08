@@ -1,7 +1,16 @@
-//! Git-native provenance notes under `refs/notes/gitpulse/*`.
+//! Git-native provenance notes under `refs/notes/gitpulse/*`, and the session a
+//! commit is attributed to.
 //!
-//! Stores verification records and agent session episodes directly in git notes,
-//! surviving machine re-installs and syncing with git remotes.
+//! Verification records live directly in git notes, surviving machine
+//! re-installs and syncing with git remotes. GitPulse writes no session notes:
+//! `refs/notes/gitpulse/sessions` is read (a note another tool or an older build
+//! left is shown as `attribution: recorded`), but the session a commit carries
+//! is otherwise *inferred* from the ledger by [`crate::ledger::attribution`],
+//! which matches a transcript's `git commit` command to the reflog entry that
+//! followed it. That answer is an inference from time, says so
+//! (`attribution: inferred`, `window_ms`), and when it has no session it says
+//! why (`session_basis`), so a commit with no session is not read as one no
+//! agent touched.
 //!
 //! A note is keyed to the commit's sha, so **a verification does not survive a
 //! rewrite**: a rebased, amended or cherry-picked commit is a new commit with no
@@ -52,6 +61,16 @@ pub struct SessionEpisodeNote {
     pub transcript_path: Option<String>,
     pub created_at: i64,
     pub summary: Option<String>,
+    /// How the session was tied to the commit: `recorded` (a note says so) or
+    /// `inferred` (a transcript command and the reflog entry that followed it,
+    /// within `window_ms`). Absent on a note written before this field existed,
+    /// which is a recorded one.
+    #[serde(default)]
+    pub attribution: Option<String>,
+    /// The window an `inferred` link was made in, in milliseconds; `None` for
+    /// a recorded one.
+    #[serde(default)]
+    pub window_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +119,21 @@ pub struct ProvenanceFreshness {
     pub verified: bool,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
+    /// Why `session` is what it is: `recorded_note`, `inferred_from_command`,
+    /// or, when it is `None`, the reason (`no_ingested_session_command`,
+    /// `ambiguous_sessions`, `command_outside_window`, ...; the full list is
+    /// [`crate::ledger::attribution::basis`]). `None` session with
+    /// `notes_readable: true` does not mean no agent was involved: even
+    /// `no_ingested_session_command` says only that no *ingested* transcript
+    /// shows a git command for it (a session under another Claude config
+    /// directory is not ingested).
+    /// Empty when the commit was not examined at all.
+    #[serde(default)]
+    pub session_basis: String,
+    /// More than one session had a git command that could have made this
+    /// commit, so `session` is `None` rather than a guess.
+    #[serde(default)]
+    pub session_ambiguous: bool,
     // Where the commit sits relative to the base, additive to `distance`.
     // Every one is `None` when it could not be established, with
     // `base_relation_reason` saying why; a `false` is only ever a measured
@@ -162,9 +196,6 @@ fn ref_arg(notes_ref: &str) -> String {
 
 /// Writes `payload` as `commit_sha`'s note on `notes_ref`, replacing any note
 /// already there.
-///
-/// Both note kinds share this: two copies of the same `git notes add` is two
-/// places for a flag or a failure check to be got wrong in only one of them.
 fn write_note(
     repo: &Path,
     notes_ref: &str,
@@ -281,17 +312,6 @@ pub fn read_verification_note(
     read_note(&repo, VERIFICATION_NOTES_REF, commit_sha)
 }
 
-/// Appends or replaces a session episode note for a commit.
-pub fn write_session_note(
-    repo_path: &str,
-    commit_sha: &str,
-    note: &SessionEpisodeNote,
-) -> Result<(), CommandError> {
-    let repo = validate_repo(repo_path)?;
-    let payload = serde_json::to_string(note).map_err(|e| e.to_string())?;
-    write_note(&repo, SESSION_NOTES_REF, commit_sha, &payload)
-}
-
 /// Reads a session episode note for a commit.
 pub fn read_session_note(
     repo_path: &str,
@@ -327,6 +347,8 @@ impl ProvenanceFreshness {
             verified: false,
             verification: None,
             session: None,
+            session_basis: String::new(),
+            session_ambiguous: false,
         }
     }
 
@@ -2224,8 +2246,77 @@ fn resolve_with_base(
     (answers, base)
 }
 
-/// The rows both [`compute_freshness`] and [`freshness_batch`] answer with.
+/// The rows both [`compute_freshness`] and [`freshness_batch`] answer with:
+/// each measured against the base, then given the session the ledger ties it
+/// to ([`attach_sessions`]).
 fn freshness_rows(
+    repo: &Path,
+    revisions: &[String],
+    base_branch: Option<&str>,
+    budget: usize,
+    unnoted: Unnoted,
+) -> Vec<ProvenanceFreshness> {
+    let rows = measured_rows(repo, revisions, base_branch, budget, unnoted);
+    attach_sessions(repo, rows)
+}
+
+/// A full object id: the only spelling the ledger's `after_ref` holds, so a
+/// row for a name that did not resolve is not looked up.
+fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Longest command text kept as a session's `summary`.
+const SUMMARY_COMMAND_CHARS: usize = 120;
+
+/// Sets each row's `session` and `session_basis`: a session note wins (it is a
+/// record, not an inference), otherwise the ledger's link for the commit.
+///
+/// One bounded ledger read answers the whole batch
+/// ([`crate::ledger::attribution::link_commits`]); the ledger is opened
+/// read-only, so this never creates one.
+fn attach_sessions(repo: &Path, mut rows: Vec<ProvenanceFreshness>) -> Vec<ProvenanceFreshness> {
+    let asked: Vec<String> = rows
+        .iter()
+        .filter(|row| row.session.is_none() && is_object_id(&row.commit_sha))
+        .map(|row| row.commit_sha.to_ascii_lowercase())
+        .collect();
+    let links = crate::ledger::attribution::link_commits(&repo.to_string_lossy(), &asked);
+    for row in &mut rows {
+        if let Some(note) = row.session.as_mut() {
+            note.attribution.get_or_insert_with(|| "recorded".into());
+            row.session_basis = "recorded_note".into();
+            continue;
+        }
+        let Some(link) = links.get(&row.commit_sha.to_ascii_lowercase()) else {
+            continue;
+        };
+        row.session_basis = link.basis.to_string();
+        row.session_ambiguous = link.ambiguous;
+        row.session = link
+            .session_id
+            .as_ref()
+            .map(|session_id| SessionEpisodeNote {
+                session_id: session_id.clone(),
+                actor_kind: "agent".into(),
+                transcript_path: None,
+                created_at: link
+                    .command_at_ms
+                    .and_then(|ms| i64::try_from(ms / 1000).ok())
+                    .unwrap_or_default(),
+                summary: link
+                    .command
+                    .as_deref()
+                    .map(|command| command.chars().take(SUMMARY_COMMAND_CHARS).collect()),
+                attribution: Some("inferred".into()),
+                window_ms: Some(link.window_ms),
+            });
+    }
+    rows
+}
+
+/// [`freshness_rows`] before sessions are attached.
+fn measured_rows(
     repo: &Path,
     revisions: &[String],
     base_branch: Option<&str>,
@@ -2741,16 +2832,20 @@ mod batch_tests {
     fn a_session_note_is_measured_but_is_not_a_verification() {
         let repo = Repo::new(2);
         let sha = repo.rev("HEAD");
-        write_session_note(
-            repo.as_str(),
+        let note = SessionEpisodeNote {
+            session_id: "S1".into(),
+            actor_kind: "agent".into(),
+            transcript_path: None,
+            created_at: 1_788_000_000,
+            summary: Some("wrote the batch path".into()),
+            attribution: None,
+            window_ms: None,
+        };
+        write_note(
+            Path::new(repo.as_str()),
+            SESSION_NOTES_REF,
             &sha,
-            &SessionEpisodeNote {
-                session_id: "S1".into(),
-                actor_kind: "agent".into(),
-                transcript_path: None,
-                created_at: 1_788_000_000,
-                summary: Some("wrote the batch path".into()),
-            },
+            &serde_json::to_string(&note).expect("encode note"),
         )
         .expect("write session note");
 
@@ -2763,6 +2858,158 @@ mod batch_tests {
             f.verification.is_none(),
             "an agent having touched it is not a verification of it"
         );
+    }
+
+    /// Ledger rows as catch-up writes them: a transcript command and the reflog
+    /// entry of the commit it made.
+    fn record_run(repo: &Repo, sha: &str, commands: &[(&str, &str, u64)], reflog_at: u64) {
+        use crate::ledger::{append, ids, ActorKind, Draft, EventStamp, Outcome};
+        let stamp = |ms: u64, basis: &str| EventStamp {
+            occurred_at: ids::iso8601_utc(ms),
+            occurred_at_basis: basis.into(),
+            task_basis: "unbound".into(),
+        };
+        for (session, text, at) in commands {
+            append(Draft {
+                repo_path: repo.as_str().into(),
+                actor_kind: Some(ActorKind::Agent),
+                session_id: Some((*session).into()),
+                action: "session.command".into(),
+                object: Some((*text).into()),
+                outcome: Some(Outcome::Ok),
+                duration_ms: Some(10_000),
+                detail_json: Some(r#"{"result":"ok"}"#.into()),
+                event_stamp: Some(stamp(*at, "transcript")),
+                ..Draft::default()
+            })
+            .expect("append command");
+        }
+        append(Draft {
+            repo_path: repo.as_str().into(),
+            actor_kind: Some(ActorKind::System),
+            actor_id: Some("reflog".into()),
+            action: "reflog.commit".into(),
+            object: Some(format!("{sha} commit: c")),
+            outcome: Some(Outcome::Ok),
+            after_ref: Some(sha.into()),
+            event_stamp: Some(stamp(reflog_at, "reflog")),
+            ..Draft::default()
+        })
+        .expect("append reflog");
+    }
+
+    fn whole_second_now() -> u64 {
+        crate::ledger::ids::now_millis() / 1000 * 1000
+    }
+
+    #[test]
+    fn a_commit_a_session_ran_git_commit_for_carries_that_session_as_inferred() {
+        let repo = Repo::new(2);
+        let sha = repo.rev("HEAD");
+        let at = whole_second_now();
+        record_run(&repo, &sha, &[("S1", "git commit -m c", at - 4_000)], at);
+
+        for f in [
+            compute_freshness(repo.as_str(), &sha, Some("main")),
+            freshness_batch(repo.as_str(), std::slice::from_ref(&sha), Some("main"))
+                .pop()
+                .expect("one"),
+        ] {
+            let session = f.session.as_ref().expect("a session is inferred");
+            assert_eq!(session.session_id, "S1");
+            assert_eq!(session.attribution.as_deref(), Some("inferred"));
+            assert_eq!(
+                session.window_ms,
+                Some(crate::ledger::attribution::LINK_WINDOW_MS)
+            );
+            assert_eq!(f.session_basis, "inferred_from_command");
+            assert!(!f.session_ambiguous);
+            assert!(f.notes_readable);
+            assert!(!f.verified, "an agent having made it is not a verification");
+        }
+    }
+
+    #[test]
+    fn a_hand_commit_has_no_session_and_says_why_it_has_none() {
+        let repo = Repo::new(2);
+        let sha = repo.rev("HEAD");
+        record_run(&repo, &sha, &[], whole_second_now());
+
+        let f = compute_freshness(repo.as_str(), &sha, Some("main"));
+
+        assert!(f.session.is_none());
+        assert!(
+            f.notes_readable,
+            "the notes were read: this is about sessions"
+        );
+        assert_eq!(f.session_basis, "no_ingested_session_command");
+        assert!(!f.session_ambiguous);
+    }
+
+    #[test]
+    fn two_sessions_in_the_window_is_ambiguous_and_names_neither() {
+        let repo = Repo::new(2);
+        let sha = repo.rev("HEAD");
+        let at = whole_second_now();
+        record_run(
+            &repo,
+            &sha,
+            &[
+                ("S1", "git commit -m a", at - 9_000),
+                ("S2", "git commit -m b", at - 3_000),
+            ],
+            at,
+        );
+
+        let f = compute_freshness(repo.as_str(), &sha, Some("main"));
+
+        assert!(f.session.is_none(), "{f:?}");
+        assert!(f.session_ambiguous);
+        assert_eq!(f.session_basis, "ambiguous_sessions");
+    }
+
+    #[test]
+    fn a_repository_with_no_ledger_says_the_ledger_is_missing_and_stays_that_way() {
+        let repo = Repo::new(1);
+        let sha = repo.rev("HEAD");
+
+        let f = compute_freshness(repo.as_str(), &sha, Some("main"));
+
+        assert!(f.session.is_none());
+        assert_eq!(f.session_basis, "ledger_not_initialised");
+        assert!(
+            !repo.path().join(".devcouncil").exists(),
+            "reading provenance must not create a ledger"
+        );
+    }
+
+    #[test]
+    fn a_recorded_session_note_outranks_an_inferred_one() {
+        let repo = Repo::new(2);
+        let sha = repo.rev("HEAD");
+        let at = whole_second_now();
+        record_run(
+            &repo,
+            &sha,
+            &[("INFERRED", "git commit -m c", at - 1_000)],
+            at,
+        );
+        let old_note = r#"{"session_id":"NOTED","actor_kind":"agent","transcript_path":null,"created_at":1,"summary":null}"#;
+        write_note(Path::new(repo.as_str()), SESSION_NOTES_REF, &sha, old_note)
+            .expect("write a note as an older build wrote it");
+
+        let f = freshness_batch(repo.as_str(), &[sha], Some("main"))
+            .pop()
+            .expect("one");
+
+        let session = f.session.expect("the note's session");
+        assert_eq!(session.session_id, "NOTED");
+        assert_eq!(
+            session.attribution.as_deref(),
+            Some("recorded"),
+            "a note from before the field existed still reads, as recorded"
+        );
+        assert_eq!(f.session_basis, "recorded_note");
     }
 
     #[test]
