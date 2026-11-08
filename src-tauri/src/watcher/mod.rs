@@ -2594,14 +2594,28 @@ mod tests {
     /// Treating it as proof of priming let the 2.1 s silence pass while the
     /// probe, and anything queued behind the setup, was still in flight, and
     /// those events then landed inside the caller's asserted-quiet window.
-    /// One FSEvents stream delivers in event order through one callback thread
-    /// and one FIFO channel into a single-threaded debounce loop, so a
-    /// callback naming a probe proves every write made before that probe has
-    /// already been delivered (this machine's fseventsd ordering is inferred
-    /// from Apple's per-stream event-id contract; the backend ignores the ids).
     ///
-    /// Panics, naming the attempt count and every path it did see, only if no
-    /// probe is ever announced within `deadline`.
+    /// Ordering, stated by evidence. Verified in the source: the backend
+    /// walks each FSEvents batch in array order and ignores the event ids
+    /// (`framework/notify/src/fsevent.rs` `callback_impl`), `forward_event`
+    /// feeds a FIFO channel, and one loop thread debounces it. ASSUMED, not
+    /// established here: that fseventsd delivers batches in event-id order
+    /// across batches and across the recursive `.git` and non-recursive root
+    /// watches of the one stream. Excluded: a full queue drops events and the
+    /// loop answers with a later full refresh, so under overflow an earlier
+    /// write can surface after the probe. Under those assumptions a callback
+    /// naming a probe means every earlier write was already delivered; even
+    /// if they fail, waiting for a named probe is strictly tighter than
+    /// accepting any callback. A probe pushed out of `paths` by
+    /// `paths_truncated` (more than [`MAX_CHANGED_PATHS`] root paths in one
+    /// window) makes priming time out loudly, never pass silently.
+    ///
+    /// Once any probe is announced the stream is known live, so writing stops
+    /// and the wait is for the LAST probe written: probes written while
+    /// delivery lagged are still in flight behind the first announced one.
+    ///
+    /// Panics, naming the attempt count and every path it did see, only if the
+    /// last probe is never announced within `deadline`.
     fn prime_watcher(
         rx: &std::sync::mpsc::Receiver<RepoChangedPayload>,
         probe_dir: &Path,
@@ -2622,19 +2636,29 @@ mod tests {
         let overall = Instant::now() + deadline;
         let mut probes: Vec<String> = Vec::new();
         let mut seen = std::collections::BTreeSet::<String>::new();
+        // Once any probe is announced the stream is proven live: stop writing
+        // and wait for the LAST probe written. Probes written during a slow
+        // delivery are still in flight behind the first announced one, and
+        // would otherwise land after the silence window.
+        let mut live = false;
         'primed: loop {
-            let name = format!("watcher-prime-{}.txt", probes.len());
-            write_probe(&name);
-            probes.push(name);
-            let attempt_ends = Instant::now() + DEBOUNCE_QUIET + Duration::from_millis(200);
+            let attempt_ends = if live {
+                overall
+            } else {
+                let name = format!("watcher-prime-{}.txt", probes.len());
+                write_probe(&name);
+                probes.push(name);
+                Instant::now() + DEBOUNCE_QUIET + Duration::from_millis(200)
+            };
             // Earlier callbacks (the caller's setup) are consumed, not
             // mistaken for the probe.
             while let Some(left) = attempt_ends.checked_duration_since(Instant::now()) {
                 match rx.recv_timeout(left) {
                     Ok(payload) => {
-                        if payload.change.paths.iter().any(|p| probes.contains(p)) {
+                        if probes.last().is_some_and(|last| payload.change.paths.contains(last)) {
                             break 'primed;
                         }
+                        live |= payload.change.paths.iter().any(|p| probes.contains(p));
                         seen.extend(payload.change.paths);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
@@ -2674,22 +2698,26 @@ mod tests {
     #[test]
     fn prime_watcher_waits_for_its_own_probe_not_the_first_callback() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut late = None;
+        let mut lagged = Vec::new();
         prime_watcher_with(&rx, PRIME_DEADLINE, |name| {
             if name == "watcher-prime-0.txt" {
                 tx.send(announced(&["staged.txt", "tracked.txt"])).unwrap();
-                let tx = tx.clone();
-                // Past the old helper's DEBOUNCE_MAX_WAIT + 100 ms silence,
-                // inside the deadline.
-                late = Some(thread::spawn(move || {
-                    thread::sleep(DEBOUNCE_MAX_WAIT + Duration::from_millis(900));
-                    tx.send(announced(&["watcher-prime-0.txt"])).unwrap();
-                }));
             }
+            // Every write is announced in order, but only after a lag past
+            // the old helper's DEBOUNCE_MAX_WAIT + 100 ms silence and inside
+            // the deadline: a slow fseventsd.
+            let tx = tx.clone();
+            let name = name.to_owned();
+            lagged.push(thread::spawn(move || {
+                thread::sleep(DEBOUNCE_MAX_WAIT + Duration::from_millis(900));
+                tx.send(announced(&[name.as_str()])).unwrap();
+            }));
         });
-        // Primed means the probe was consumed and nothing is left in flight.
+        // Primed means every probe written was consumed: nothing in flight.
         let straggler = rx.recv_timeout(Duration::from_millis(1500));
-        late.take().unwrap().join().unwrap();
+        for handle in lagged {
+            handle.join().unwrap();
+        }
         assert!(
             straggler.is_err(),
             "priming returned before its own probe was delivered: {straggler:?}"
