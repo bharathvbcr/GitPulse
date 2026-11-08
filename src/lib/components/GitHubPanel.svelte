@@ -660,8 +660,8 @@
     actionNotice = null;
     try {
       const result = await openPullRequestWorktree(repo, number);
-      if ($repoStore.currentPath !== repo) return;
-      await repoStore.refresh(repo);
+      // No repoStore refresh: the checkout this panel shows did not change, and
+      // a refresh reloads its commit graph (the github-panel harness pins that).
       if ($repoStore.currentPath !== repo) return;
       actionNotice = withVerdict(describePrWorktree(result.output), result.policy);
     } catch (err: unknown) {
@@ -701,18 +701,17 @@
     }
   }
 
-  /** A worktree opened from the detail: refresh what lists worktrees, then say so. */
-  async function openedInWorktree(message: string) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
+  /**
+   * A worktree opened from the detail: say where it landed. The checkout this
+   * panel shows did not change, so nothing here is reloaded — a repoStore
+   * refresh would reload this checkout's commit graph for nothing (the
+   * github-panel harness pins that), and the Worktrees panel lists worktrees
+   * itself.
+   */
+  function openedInWorktree(message: string) {
+    if (!$repoStore.currentPath) return;
     actionError = null;
-    try {
-      await repoStore.refresh(repo);
-      if ($repoStore.currentPath !== repo) return;
-      actionNotice = message;
-    } catch (err: unknown) {
-      if ($repoStore.currentPath === repo) repoStore.setError(formatError(err));
-    }
+    actionNotice = message;
   }
 
   /** In-place checkout from the detail: the checkout already happened. */
@@ -1228,7 +1227,7 @@
                       locked={prActionsLocked}
                       onChanged={(message) => void reloadThenNotice(message)}
                       onCheckedOut={(message) => void checkedOutInPlace(message)}
-                      onWorktreeOpened={(message) => void openedInWorktree(message)}
+                      onWorktreeOpened={(message) => openedInWorktree(message)}
                       onBusyChange={(busy) => (detailBusy = busy)}
                     />
                   {/if}
