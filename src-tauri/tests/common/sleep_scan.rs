@@ -621,8 +621,26 @@ fn is_loop_header(header: &str) -> bool {
 // Duration evaluation.
 // ---------------------------------------------------------------------------
 
-/// Names a file defines with a literal-built value, every definition of which
-/// agrees. A name defined twice with different values stays unresolved.
+/// How many times each word is followed by a single `:` (and not preceded by
+/// `::`): parameters, patterns, struct fields and typed lets.
+fn colon_bindings(text: &str) -> BTreeMap<String, usize> {
+    let bytes = text.as_bytes();
+    let mut counts = BTreeMap::new();
+    for (start, word) in word_positions(text) {
+        let end = start + word.len();
+        let after = text[end..].trim_start().as_bytes();
+        let single = after.first() == Some(&b':') && after.get(1) != Some(&b':');
+        let path = start >= 2 && &bytes[start - 2..start] == b"::";
+        if single && !path {
+            *counts.entry(word.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Names a file defines exactly once, with a literal-built value, and binds
+/// nowhere else (as a parameter, pattern or field). Anything else stays
+/// unresolved, so a same-named parameter never borrows another function's value.
 pub struct Consts {
     durations: BTreeMap<String, u128>,
     numbers: BTreeMap<String, f64>,
@@ -635,6 +653,7 @@ impl Consts {
             numbers: BTreeMap::new(),
         };
         let mut definitions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut typed_definitions: BTreeMap<String, usize> = BTreeMap::new();
         for statement in text.split(';') {
             let positions = word_positions(statement);
             let Some((at, keyword)) = positions
@@ -653,24 +672,32 @@ impl Consts {
                 continue;
             };
             if !name.is_empty() && !value.starts_with('=') {
+                if tail[name.len()..].trim_start().starts_with(':') {
+                    *typed_definitions.entry(name.clone()).or_default() += 1;
+                }
                 definitions.entry(name).or_default().push(collapse(value));
             }
         }
+        // A `name:` that is not a typed definition is a parameter, a pattern or
+        // a field: a binding whose value is somebody else's.
+        let mut bound = colon_bindings(text);
+        for (name, typed) in &typed_definitions {
+            if let Some(count) = bound.get_mut(name) {
+                *count = count.saturating_sub(*typed);
+            }
+        }
         // Two passes so a name defined in terms of one defined later resolves.
+        // A name resolves only when the file defines it exactly once and binds
+        // it nowhere else.
         for _ in 0..2 {
             for (name, values) in &definitions {
-                let durations: Vec<Option<u128>> =
-                    values.iter().map(|v| eval_duration(v, &found)).collect();
-                if durations.iter().all(Option::is_some)
-                    && durations.windows(2).all(|w| w[0] == w[1])
-                {
-                    found.durations.insert(name.clone(), durations[0].unwrap());
+                if values.len() != 1 || bound.get(name).is_some_and(|count| *count > 0) {
                     continue;
                 }
-                let numbers: Vec<Option<f64>> =
-                    values.iter().map(|v| eval_number(v, &found)).collect();
-                if numbers.iter().all(Option::is_some) && numbers.windows(2).all(|w| w[0] == w[1]) {
-                    found.numbers.insert(name.clone(), numbers[0].unwrap());
+                if let Some(nanos) = eval_duration(&values[0], &found) {
+                    found.durations.insert(name.clone(), nanos);
+                } else if let Some(number) = eval_number(&values[0], &found) {
+                    found.numbers.insert(name.clone(), number);
                 }
             }
         }

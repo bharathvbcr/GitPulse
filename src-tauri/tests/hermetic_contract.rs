@@ -470,6 +470,8 @@ struct SleepAllowlist {
     sites: BTreeMap<String, (String, usize)>,
     /// Path prefixes whose sleeps another lane owns, with that lane's reason.
     prefixes: Vec<(String, String)>,
+    /// The exact number of short sleeps each prefix covers today.
+    prefix_counts: BTreeMap<String, usize>,
     /// Malformed or duplicate lines.
     problems: Vec<String>,
 }
@@ -501,11 +503,14 @@ fn reason_is_known(reason: &str) -> bool {
 }
 
 /// `site | path | function | ordinal | reason` and `prefix | path-prefix |
-/// owned-elsewhere:<owner>`; `#` starts a comment.
+/// owned-elsewhere:<owner> | <count>`; `#` starts a comment. A prefix states
+/// exactly how many short sleeps it covers, so it can neither be idle nor
+/// quietly absorb a new one.
 fn parse_sleep_allowlist(text: &str) -> SleepAllowlist {
     let mut list = SleepAllowlist {
         sites: BTreeMap::new(),
         prefixes: Vec::new(),
+        prefix_counts: BTreeMap::new(),
         problems: Vec::new(),
     };
     for (index, raw) in text.lines().enumerate() {
@@ -533,15 +538,24 @@ fn parse_sleep_allowlist(text: &str) -> SleepAllowlist {
                         .push(format!("line {at}: `{key}` is listed twice"));
                 }
             }
-            ["prefix", prefix, reason] if reason.starts_with("owned-elsewhere:") => {
-                if !reason_is_known(reason) {
-                    list.problems
-                        .push(format!("line {at}: unknown reason `{reason}`"));
-                } else if !path_prefix_matches_a_file(prefix) {
-                    list.problems
-                        .push(format!("line {at}: nothing under `{prefix}`"));
-                } else {
-                    list.prefixes.push((prefix.to_string(), reason.to_string()));
+            ["prefix", prefix, reason, count] if reason.starts_with("owned-elsewhere:") => {
+                match count.parse::<usize>() {
+                    Err(_) => list
+                        .problems
+                        .push(format!("line {at}: count `{count}` is not a number")),
+                    Ok(0) => list.problems.push(format!(
+                        "line {at}: a prefix that covers no sleep is a standing exemption; delete it"
+                    )),
+                    Ok(_) if !reason_is_known(reason) => list
+                        .problems
+                        .push(format!("line {at}: unknown reason `{reason}`")),
+                    Ok(_) if !path_prefix_matches_a_file(prefix) => list
+                        .problems
+                        .push(format!("line {at}: nothing under `{prefix}`")),
+                    Ok(n) => {
+                        list.prefixes.push((prefix.to_string(), reason.to_string()));
+                        list.prefix_counts.insert(prefix.to_string(), n);
+                    }
                 }
             }
             _ => list
@@ -642,6 +656,26 @@ fn the_sleep_allowlist_names_only_sleeps_that_exist_and_reasons_that_hold() {
         "these allowlist entries match no short sleep (converted, moved or renamed); \
          remove them:\n{}",
         stale.join("\n")
+    );
+    let mut miscounted = Vec::new();
+    for (prefix, _) in &list.prefixes {
+        let found = sites
+            .values()
+            .filter(|site| site.flagged() && site.file.starts_with(prefix))
+            .count();
+        if found != list.prefix_counts[prefix] {
+            miscounted.push(format!(
+                "{prefix}: the list says {}, the scan finds {found}",
+                list.prefix_counts[prefix]
+            ));
+        }
+    }
+    assert!(
+        miscounted.is_empty(),
+        "an owned-elsewhere prefix must state exactly how many short sleeps it covers; \
+         update the count (and review the new sleep) or convert the sites to per-site \
+         entries:\n{}",
+        miscounted.join("\n")
     );
     assert!(
         not_polls.is_empty(),

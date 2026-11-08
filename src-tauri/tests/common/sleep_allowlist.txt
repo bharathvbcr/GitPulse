@@ -4,28 +4,25 @@
 # the reasons and the rule each one must satisfy are `SLEEP_REASONS` there.
 #
 #   site | path | function | ordinal | reason
-#   prefix | path-prefix | owned-elsewhere:<owner>
+#   prefix | path-prefix | owned-elsewhere:<owner> | <exact count of short sleeps under it>
+#
+# Design limits. Deleting one sleep and adding another in the same function at
+# the same ordinal inherits the old entry's reason: the anchor says where a
+# sleep is, not what it does. For the poll categories the loop check in the
+# second test is the only guard; every other reason is reviewed by a person
+# once, when the line is added.
 #
 # The anchor is the enclosing function (`Type::fn` inside an impl) and the
 # ordinal of the sleep among ALL sleeps of that function, so a line number or a
 # duration changing never moves it. An entry whose sleep is gone or is now 100 ms
 # or longer fails the second test: delete it in the same change.
 #
-# Whole files other wave-2 lanes were converting when this list was written are
-# held by prefix. That is deliberate and temporary: tighten each prefix to
-# per-site entries (or delete it) once the owning lane has landed.
-prefix | src/engine/worktree.rs | owned-elsewhere:b1108w2
-prefix | src/insights/ | owned-elsewhere:b1108w2
-prefix | src/engine/git_reader.rs | owned-elsewhere:b1108w2
-prefix | src/engine/ref_cache.rs | owned-elsewhere:b1108w2
-prefix | src/workbench.rs | owned-elsewhere:b1108w2
-prefix | src/harness/ | owned-elsewhere:b1108w2
-prefix | tests/agent_collaboration_integration.rs | owned-elsewhere:b1108w2
-prefix | tests/adv_m1_ | owned-elsewhere:b1108w2
-prefix | tests/adv_m3_pty_stress.rs | owned-elsewhere:b1108w2
-prefix | tests/adv_m4_ | owned-elsewhere:b1108w2
-prefix | tests/adversarial_m1_challenger_test.rs | owned-elsewhere:b1108w2
-prefix | src/watcher/mod.rs | owned-elsewhere:ft-ade6e999
+# Files another lane still holds are covered by a prefix with an exact count.
+# That is temporary: replace each with per-site entries once the owner lands.
+prefix | src/engine/worktree.rs | owned-elsewhere:b1108w2 | 2
+prefix | src/insights/ | owned-elsewhere:b1108w2 | 1
+prefix | src/engine/git_reader.rs | owned-elsewhere:b1108w2 | 2
+prefix | src/watcher/mod.rs | owned-elsewhere:ft-ade6e999 | 2
 
 # src/adv_w3l2_tests.rs
 site | src/adv_w3l2_tests.rs | BandWatch::start | 0 | unbounded-poll
@@ -138,7 +135,8 @@ site | src/engine/git_cli/grace_adversarial.rs | reap_leak | 0 | bounded-poll
 site | src/engine/git_cli/pipe_drain.rs | unfinished_pipe_keeps_bytes_and_closes_its_read_descriptor | 0 | bounded-poll
 
 # src/engine/git_cli/run_errors_adversarial_tests.rs
-site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | hold
+# hold_ms is 120-150 ms against a retry budget of MAX_LOCK_RETRIES=3 (50/150/300 ms backoff, about 500 ms): a 10x stretch outlasts it and the "git succeeds after release" assertions fail. Needs an injectable backoff.
+site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | clock-seam-needed
 
 # src/engine/git_cli/shared_budget.rs
 site | src/engine/git_cli/shared_budget.rs | SharedBudget::lock | 0 | bounded-poll
@@ -167,6 +165,22 @@ site | src/engine/git_writer_commit_graph_tests.rs | concurrent_clicks_in_one_co
 
 # src/github/mod.rs
 site | src/github/mod.rs | tiers_run_up_to_the_concurrency_cap_and_no_further | 0 | hold
+
+# src/harness/hosted_flow_tests.rs
+site | src/harness/hosted_flow_tests.rs | FakeServer::start_as | 0 | unbounded-poll
+site | src/harness/hosted_flow_tests.rs | a_fresh_server_that_cannot_be_used_is_ended_before_the_fallback | 0 | bounded-poll
+
+# src/harness/mod.rs
+site | src/harness/mod.rs | a_refusal_stops_new_checks_and_leaves_every_earlier_file_judged | 0 | unbounded-poll
+site | src/harness/mod.rs | every_file_is_checked_once_with_a_bounded_number_in_flight | 0 | hold
+
+# src/harness/sidecar.rs
+site | src/harness/sidecar.rs | a_child_that_closes_its_stdout_is_reaped_by_the_pump | 0 | bounded-poll
+site | src/harness/sidecar.rs | adv_pump_queued_in_force_kill_before_flag_does_not_hang | 1 | hold
+site | src/harness/sidecar.rs | adv_terminate_at_random_moments_against_a_chatty_child_never_hangs | 0 | bounded-poll
+site | src/harness/sidecar.rs | pump_exits | 0 | bounded-poll
+site | src/harness/sidecar.rs | status_when_it_exits | 0 | bounded-poll
+site | src/harness/sidecar.rs | unsolicited_idle_stdout_flood_faults_the_live_sidecar | 0 | bounded-poll
 
 # src/hooks/deliver/tests.rs
 site | src/hooks/deliver/tests.rs | a_later_stops_hooks_displace_an_earlier_stops_and_hear_the_message | 0 | mtime-gap
@@ -231,7 +245,9 @@ site | src/procguard/mod.rs | a_background_band_child_is_demoted_and_a_sibling_i
 site | src/procguard/mod.rs | a_kill_aimed_at_an_unreaped_corpse_is_not_a_failure | 0 | bounded-poll
 site | src/procguard/mod.rs | a_reaped_child_is_forgotten | 0 | bounded-poll
 site | src/procguard/mod.rs | adv_a_kept_pid_that_later_becomes_a_leader_is_not_killed | 0 | bounded-poll
+site | src/procguard/mod.rs | locked_spawns_wait_behind_the_inheritance_lock | 0 | hold
 site | src/procguard/mod.rs | reap_within | 0 | bounded-poll
+site | src/procguard/mod.rs | spawning_waits_behind_the_inheritance_lock | 0 | hold
 site | src/procguard/mod.rs | the_sweep_asks_before_it_insists | 0 | bounded-poll
 
 # src/storage/hygiene/global/tests.rs
@@ -307,6 +323,9 @@ site | src/tool_capability.rs | a_stale_entry_costs_one_probe_however_many_threa
 # src/watcher/storm.rs
 site | src/watcher/storm.rs | assert_storm_stays_bounded | 1 | linger
 
+# src/workbench.rs
+site | src/workbench.rs | real_profile_host_shares_native_revisions_and_refuses_a_stale_generation | 0 | bounded-poll
+
 # src/workbench/agent_worktree.rs
 site | src/workbench/agent_worktree.rs | a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started | 0 | bounded-poll
 
@@ -358,6 +377,11 @@ site | src/workbench/verification_driver_measure.rs | measure_driver_children_ov
 
 # src/workbench/verification_driver_tests.rs
 site | src/workbench/verification_driver_tests.rs | steady_head_read_rate_before_and_after | 1 | bounded-poll
+
+# tests/adv_m3_pty_stress.rs
+site | tests/adv_m3_pty_stress.rs | rapid_visibility_toggling_under_heavy_output_does_not_crash_or_wedge | 0 | unbounded-poll
+site | tests/adv_m3_pty_stress.rs | read_pid | 0 | bounded-poll
+site | tests/adv_m3_pty_stress.rs | wait_until | 0 | bounded-poll
 
 # tests/adv_notify_process.rs
 site | tests/adv_notify_process.rs | Socket::start | 0 | bounded-poll
