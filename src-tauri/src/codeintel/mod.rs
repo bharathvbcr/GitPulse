@@ -3916,6 +3916,21 @@ pub(crate) mod tests {
         head
     }
 
+    /// ADV: a fixture's git commands must not follow a neighbour test's scoped
+    /// `GIT_WORK_TREE` (the hermetic `git_in` contract). `commit_and_stamp_head`
+    /// spawns git without `pin_git`, so it reads the neighbour's work tree and
+    /// `git add src` stages nothing of the fixture's.
+    #[test]
+    fn adv_commit_and_stamp_head_does_not_follow_a_neighbours_work_tree() {
+        use crate::test_support::env::{bind_env, env_serial};
+        let serial = env_serial();
+        let neighbour = tempfile::tempdir().unwrap();
+        let fixture = repo_with_one_generation();
+        let _env = bind_env(&serial).set("GIT_WORK_TREE", neighbour.path());
+        let head = commit_and_stamp_head(fixture.path());
+        assert_eq!(head.len(), 40, "{head}");
+    }
+
     /// Puts an empty, fully migrated map database at `repo`'s store path.
     ///
     /// Creating the schema is the dominant write of a seeded fixture (about
