@@ -2,7 +2,65 @@ import type { PrAction, PullRequestDetail } from "./types";
 import { shortHash } from "../format";
 import { invoke } from "../ipc/invoke";
 import { askConfirm } from "../stores/modalStore";
-import { harnessStore, type Guarded } from "../stores/harnessStore";
+import { harnessStore, verdictLabel, type Guarded, type PolicyVerdict } from "../stores/harnessStore";
+
+/** A pull request checked out in its own worktree. */
+export interface PrWorktreeOpened {
+  path: string;
+  branch: string;
+  reused: boolean;
+  head_oid: string;
+  cross_repository: boolean;
+  head_ref: string;
+  head_owner: string;
+  created: unknown;
+}
+
+/** The notice for a worktree that was created or reused. */
+export function describePrWorktree(opened: PrWorktreeOpened): string {
+  const verb = opened.reused ? "Reused" : "Opened";
+  return `${verb} worktree ${opened.branch} at ${opened.path}`;
+}
+
+function withVerdict(message: string, policy: PolicyVerdict | null | undefined): string {
+  return policy ? `${message} — ${verdictLabel(policy)}` : message;
+}
+
+/**
+ * Opens the pull request in a new worktree. Records the gate verdict once.
+ * Callers must not record it again.
+ */
+export async function openPullRequestWorktree(
+  repoPath: string,
+  number: number,
+): Promise<Guarded<PrWorktreeOpened>> {
+  const result = await invoke<Guarded<PrWorktreeOpened>>("cmd_github_open_pr_worktree", {
+    repoPath,
+    number,
+    cowCaches: true,
+    runHooks: false,
+  });
+  harnessStore.recordVerdict(result.policy, repoPath);
+  return result;
+}
+
+/**
+ * Checks the pull request out in the open checkout. Records the gate verdict
+ * once. Callers must not record it again.
+ */
+export async function checkoutPullRequestInPlace(
+  repoPath: string,
+  number: number,
+): Promise<Guarded<string>> {
+  const result = await invoke<Guarded<string>>("cmd_github_checkout_pr", {
+    repoPath,
+    number,
+  });
+  harnessStore.recordVerdict(result.policy, repoPath);
+  return result;
+}
+
+export { withVerdict };
 
 /**
  * Confirms, sends and journals one pull-request action — the only way the

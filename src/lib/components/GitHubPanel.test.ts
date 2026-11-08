@@ -60,6 +60,23 @@ describe("GitHubPanel confirmation and refresh contracts", () => {
     expect(row).toContain(">Retry</button>");
   });
 
+  it("opens a pull request in a new worktree and keeps checkout in place as its own action", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const actions = readFileSync(join(here, "..", "github", "prActions.ts"), "utf8");
+    const row = readFileSync(join(here, "github", "PullRequestDetail.svelte"), "utf8");
+    expect(actions).toContain("cmd_github_open_pr_worktree");
+    expect(actions).toContain("cmd_github_checkout_pr");
+    for (const file of [source, row]) {
+      expect(file).toContain("Open in new worktree");
+      expect(file).toContain("Checkout in place");
+      expect(file).toContain("openPullRequestWorktree");
+      expect(file).toContain("checkoutPullRequestInPlace");
+    }
+    const openFn = source.slice(source.indexOf("async function openPrWorktree"), source.indexOf("async function checkoutPr"));
+    expect(openFn).toContain("openPullRequestWorktree");
+    expect(openFn).not.toContain("repoStore.refresh");
+  });
+
   it("keeps the last good context when a refresh fails, and disables Refresh while one is out", () => {
     expect(source).toContain("if (ctx && !ctx.error) reportRefreshFailure(formatError(err));");
     expect(source).toContain("if (next.error && ctx && !ctx.error) {");
