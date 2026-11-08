@@ -2668,17 +2668,23 @@ mod tests {
         // and wait for the LAST probe written. Probes written during a slow
         // delivery are still in flight behind the first announced one, and
         // would otherwise land after the caller's silence window.
+        //
+        // The exception is a silent pipeline: if nothing at all arrives for
+        // two probe windows and the last probe is still unnamed, that probe
+        // was lost, so a fresh one is written and keyed on instead of waiting
+        // out the deadline. Two windows, not one: probes written one window
+        // apart are delivered one window apart, so a single window cannot tell
+        // a lost probe from a spaced one, and re-probing there would feed the
+        // stream it is waiting on.
+        let window = DEBOUNCE_QUIET + Duration::from_millis(200);
         let mut live = false;
         loop {
-            let attempt_ends = if live {
-                overall
-            } else {
-                let name = format!("{stem}-{}.txt", probes.len());
-                write_probe(&name);
-                probes.push(name);
-                Instant::now() + DEBOUNCE_QUIET + Duration::from_millis(200)
-            };
-            while let Some(left) = attempt_ends.checked_duration_since(Instant::now()) {
+            let name = format!("{stem}-{}.txt", probes.len());
+            write_probe(&name);
+            probes.push(name);
+            let silence = |live: bool| if live { window * 2 } else { window };
+            let mut slice_ends = (Instant::now() + silence(live)).min(overall);
+            while let Some(left) = slice_ends.checked_duration_since(Instant::now()) {
                 match rx.recv_timeout(left) {
                     Ok(payload) => {
                         if probes.last().is_some_and(|last| announces(&payload, last)) {
@@ -2686,6 +2692,10 @@ mod tests {
                         }
                         live |= probes.iter().any(|probe| announces(&payload, probe));
                         seen.extend(payload.change.paths);
+                        if live {
+                            // Payloads still flowing: not silent yet.
+                            slice_ends = (Instant::now() + silence(live)).min(overall);
+                        }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
@@ -2792,6 +2802,47 @@ mod tests {
             straggler.is_err(),
             "an edit was still in flight: {straggler:?}"
         );
+    }
+
+    /// The stream is proven live (probe 0 is announced) but the last probe
+    /// written before that, probe 1, is lost. Waiting out the deadline for it
+    /// would fail a test whose subject is something else; the wait must go
+    /// silent for two windows and then probe again.
+    #[test]
+    fn a_lost_last_probe_is_replaced_once_the_pipeline_goes_silent() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut written: Vec<String> = Vec::new();
+        let mut lagged = Vec::new();
+        let payload = write_until_announced(
+            &rx,
+            Duration::from_secs(5),
+            "watcher-prime",
+            |name| {
+                let n = written.len();
+                written.push(name.to_owned());
+                // Probe 0 arrives late enough that probe 1 is already
+                // written; probe 1 is lost; later probes arrive promptly.
+                let lag = match n {
+                    0 => Some(Duration::from_millis(900)),
+                    1 => None,
+                    _ => Some(Duration::from_millis(100)),
+                };
+                if let Some(lag) = lag {
+                    let tx = tx.clone();
+                    let name = name.to_owned();
+                    lagged.push(thread::spawn(move || {
+                        thread::sleep(lag);
+                        tx.send(announced(&[name.as_str()])).unwrap();
+                    }));
+                }
+            },
+            names_probe,
+        );
+        for handle in lagged {
+            handle.join().unwrap();
+        }
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert_eq!(payload.change.paths, vec![written[2].clone()]);
     }
 
     /// A stalled backend still fails loud, naming the attempts and the paths
