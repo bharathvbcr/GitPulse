@@ -2631,52 +2631,78 @@ mod tests {
     fn prime_watcher_with(
         rx: &std::sync::mpsc::Receiver<RepoChangedPayload>,
         deadline: Duration,
-        mut write_probe: impl FnMut(&str),
+        write_probe: impl FnMut(&str),
     ) {
+        write_until_announced(rx, deadline, "watcher-prime", write_probe, names_probe);
+        await_watcher_quiescence(rx);
+    }
+
+    /// The usual announcement test: the payload lists the probe file.
+    fn names_probe(payload: &RepoChangedPayload, probe: &str) -> bool {
+        payload.change.paths.iter().any(|p| p == probe)
+    }
+
+    /// The one owner of "write, then wait for the pipeline to announce it".
+    /// Writes `{stem}-{n}.txt` probes through `write_probe` until
+    /// `announces(payload, probe)` holds for one, then stops writing and waits
+    /// for the announcement of the LAST probe written. Every other callback
+    /// (the caller's setup, earlier probes) is consumed rather than mistaken
+    /// for the answer. Returns the payload that announced the last probe.
+    ///
+    /// Bounded by `deadline` and the per-probe window the loops always used;
+    /// panics naming the probe count and every path seen on timeout or if the
+    /// loop hangs up. A loop whose next step asserts silence or inspects the
+    /// payload must come through here; a pure liveness probe, where any
+    /// callback is a correct answer, need not.
+    fn write_until_announced(
+        rx: &std::sync::mpsc::Receiver<RepoChangedPayload>,
+        deadline: Duration,
+        stem: &str,
+        mut write_probe: impl FnMut(&str),
+        announces: impl Fn(&RepoChangedPayload, &str) -> bool,
+    ) -> RepoChangedPayload {
         let overall = Instant::now() + deadline;
         let mut probes: Vec<String> = Vec::new();
         let mut seen = std::collections::BTreeSet::<String>::new();
         // Once any probe is announced the stream is proven live: stop writing
         // and wait for the LAST probe written. Probes written during a slow
         // delivery are still in flight behind the first announced one, and
-        // would otherwise land after the silence window.
+        // would otherwise land after the caller's silence window.
         let mut live = false;
-        'primed: loop {
+        loop {
             let attempt_ends = if live {
                 overall
             } else {
-                let name = format!("watcher-prime-{}.txt", probes.len());
+                let name = format!("{stem}-{}.txt", probes.len());
                 write_probe(&name);
                 probes.push(name);
                 Instant::now() + DEBOUNCE_QUIET + Duration::from_millis(200)
             };
-            // Earlier callbacks (the caller's setup) are consumed, not
-            // mistaken for the probe.
             while let Some(left) = attempt_ends.checked_duration_since(Instant::now()) {
                 match rx.recv_timeout(left) {
                     Ok(payload) => {
-                        if probes.last().is_some_and(|last| payload.change.paths.contains(last)) {
-                            break 'primed;
+                        if probes.last().is_some_and(|last| announces(&payload, last)) {
+                            return payload;
                         }
-                        live |= payload.change.paths.iter().any(|p| probes.contains(p));
+                        live |= probes.iter().any(|probe| announces(&payload, probe));
                         seen.extend(payload.change.paths);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                        "watch loop hung up while priming after {} probe writes; saw paths {seen:?}",
+                        "watch loop hung up waiting for a `{stem}` probe after {} writes; \
+                         saw paths {seen:?}",
                         probes.len()
                     ),
                 }
             }
             assert!(
                 Instant::now() < overall,
-                "watcher never announced a priming probe after {} probe writes within \
+                "watcher never announced a `{stem}` probe after {} probe writes within \
                  {deadline:?}; the OS watch stream likely never installed or delivery is \
                  stalled. Paths announced meanwhile: {seen:?}",
                 probes.len()
             );
         }
-        await_watcher_quiescence(rx);
     }
 
     fn announced(paths: &[&str]) -> RepoChangedPayload {
@@ -2721,6 +2747,50 @@ mod tests {
         assert!(
             straggler.is_err(),
             "priming returned before its own probe was delivered: {straggler:?}"
+        );
+    }
+
+    /// The edit loop of `worktree_file_event_triggers_and_git_only_events_still_do`
+    /// inspects the payload it gets, so a stray earlier callback (a late
+    /// priming probe) must not be handed back as the answer, and no edit may
+    /// still be in flight once it returns.
+    #[test]
+    fn the_edit_wait_returns_the_payload_of_its_last_edit_not_a_stray_callback() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut written: Vec<String> = Vec::new();
+        let mut lagged = Vec::new();
+        let payload = write_until_announced(
+            &rx,
+            PRIME_DEADLINE,
+            "unstaged-edit",
+            |name| {
+                if written.is_empty() {
+                    tx.send(announced(&["watcher-prime-3.txt"])).unwrap();
+                }
+                written.push(name.to_owned());
+                let tx = tx.clone();
+                let name = name.to_owned();
+                // Every edit is announced in order, a lag after the stray.
+                lagged.push(thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(900));
+                    tx.send(announced(&[name.as_str()])).unwrap();
+                }));
+            },
+            names_probe,
+        );
+        let last = written.last().expect("at least one edit").clone();
+        let straggler = rx.recv_timeout(Duration::from_millis(1000));
+        for handle in lagged {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            payload.change.paths,
+            vec![last],
+            "the stray callback was taken for the edit"
+        );
+        assert!(
+            straggler.is_err(),
+            "an edit was still in flight: {straggler:?}"
         );
     }
 
@@ -2809,35 +2879,29 @@ mod tests {
 
         // 1. Worktree-only write: no index/HEAD traffic involved. Kept
         //    retry-bounded too: under parallel suite load even a write to the
-        //    freshly-proven-hot stream was once lost for >15s.
-        let edit_deadline = Instant::now() + PRIME_DEADLINE;
-        let mut n = 0u32;
-        loop {
-            std::fs::write(root.join(format!("unstaged-edit-{n}.txt")), "dirty\n").unwrap();
-            n += 1;
-            if let Ok(payload) = rx.recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200)) {
-                // The emission names what it touched, not only that
-                // something did.
-                assert!(
-                    payload.change.kinds.contains(&ChangeKind::Worktree),
-                    "{payload:?}"
-                );
-                assert!(
-                    payload
-                        .change
-                        .paths
-                        .iter()
-                        .any(|p| p.starts_with("unstaged-edit-")),
-                    "{payload:?}"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < edit_deadline,
-                "unstaged worktree edit must trigger repo-changed ({n} writes within \
-                 {PRIME_DEADLINE:?})"
-            );
-        }
+        //    freshly-proven-hot stream was once lost for >15s. The wait is
+        //    keyed on the last edit written, so a late callback cannot stand
+        //    in for it.
+        let payload = write_until_announced(
+            &rx,
+            PRIME_DEADLINE,
+            "unstaged-edit",
+            |name| std::fs::write(root.join(name), "dirty\n").unwrap(),
+            names_probe,
+        );
+        // The emission names what it touched, not only that something did.
+        assert!(
+            payload.change.kinds.contains(&ChangeKind::Worktree),
+            "{payload:?}"
+        );
+        assert!(
+            payload
+                .change
+                .paths
+                .iter()
+                .any(|p| p.starts_with("unstaged-edit-")),
+            "{payload:?}"
+        );
 
         // Close the quiet window so the next write is a distinct emission
         // rather than coalesced with a late event from the first write.
@@ -2846,24 +2910,19 @@ mod tests {
         // 2. A .git-only write still triggers through the recursive watch.
         //    Retry-bounded for the same reason as above; each attempt uses a
         //    fresh name inside `.git` so no state carries between attempts.
-        let git_deadline = Instant::now() + PRIME_DEADLINE;
-        let mut n = 0u32;
-        loop {
-            std::fs::write(root.join(".git").join(format!("gitpulse-probe-{n}")), "x").unwrap();
-            n += 1;
-            if let Ok(payload) = rx.recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200)) {
-                assert!(
-                    payload.change.kinds.contains(&ChangeKind::GitState),
-                    "{payload:?}"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < git_deadline,
-                "git-dir write must still trigger repo-changed ({n} writes within \
-                 {PRIME_DEADLINE:?})"
-            );
-        }
+        //    `.git` writes are not listed in `paths`, so the announcement is
+        //    keyed on the GitState kind instead of a name.
+        let payload = write_until_announced(
+            &rx,
+            PRIME_DEADLINE,
+            "gitpulse-probe",
+            |name| std::fs::write(root.join(".git").join(name), "x").unwrap(),
+            |payload, _| payload.change.kinds.contains(&ChangeKind::GitState),
+        );
+        assert!(
+            payload.change.kinds.contains(&ChangeKind::GitState),
+            "{payload:?}"
+        );
 
         stop.stop();
     }
@@ -3399,8 +3458,8 @@ mod tests {
         let key = start_watch_observed(
             &state,
             dir.path().to_string_lossy().into_owned(),
-            move |_| {
-                let _ = tx.send(());
+            move |payload| {
+                let _ = tx.send(payload);
             },
             move |payload| {
                 let _ = gone_tx.send(payload);
@@ -3411,28 +3470,10 @@ mod tests {
 
         // Keep poking the worktree root until the OS backend delivers: a
         // single write races watch installation, especially when other tests
-        // in this process also hold FSEvents/inotify watches.
-        let git_dir = dir.path().join(".git");
-        let prime_deadline = Instant::now() + PRIME_DEADLINE;
-        let mut primed = false;
-        let mut n = 0u32;
-        while Instant::now() < prime_deadline {
-            std::fs::write(dir.path().join(format!("probe-{n}.txt")), "x").unwrap();
-            n += 1;
-            if rx
-                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
-                .is_ok()
-            {
-                primed = true;
-                break;
-            }
-            assert!(
-                git_dir.exists(),
-                "temp repo vanished before the watcher primed"
-            );
-        }
-        assert!(primed, "priming write must be delivered");
-        while rx.try_recv().is_ok() {}
+        // in this process also hold FSEvents/inotify watches. Primed through
+        // the shared keyed wait: the silence asserted below must not be
+        // broken by a probe still in flight.
+        prime_watcher(&rx, dir.path(), PRIME_DEADLINE);
 
         // Rename rather than unlink: macOS FSEvents can block `remove_dir_all`
         // on a directory that still has an active watch, which deadlocks this
