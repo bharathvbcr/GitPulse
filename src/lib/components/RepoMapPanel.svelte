@@ -13,6 +13,41 @@
     docsHits: import("../docs/client").DocsSearchHit[];
   }
   const docsSearchMemo = createRepoPanelCache<DocsSearchMemo>();
+
+  /**
+   * Apply the repo map when its own read settles. `cmd_devmap_status` keeps
+   * the 30s probe deadline and must not hold the map: the panel was staying
+   * on "Loading map…" until both reads finished.
+   *
+   * A reload that is no longer current applies neither result. The newer
+   * reload owns `loading` and is the one that clears it.
+   */
+  export function settleMapBeforeStatus<M, S>(input: {
+    map: Promise<M>;
+    status: Promise<S>;
+    isCurrent: () => boolean;
+    onMap: (result: PromiseSettledResult<M>) => void;
+    onStatus: (result: PromiseSettledResult<S>) => void;
+  }): Promise<void> {
+    const statusSettled: Promise<PromiseSettledResult<S>> = input.status.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason }),
+    );
+    void statusSettled.then((result) => {
+      if (!input.isCurrent()) return;
+      input.onStatus(result);
+    });
+    return input.map.then(
+      (value) => {
+        if (!input.isCurrent()) return;
+        input.onMap({ status: "fulfilled", value });
+      },
+      (reason: unknown) => {
+        if (!input.isCurrent()) return;
+        input.onMap({ status: "rejected", reason });
+      },
+    );
+  }
 </script>
 
 <script lang="ts">
@@ -327,30 +362,35 @@
     loading = true;
     errorMsg = null;
     const request = mapRequests.next();
-    const [mapResult, statusResult] = await Promise.allSettled([
-      getDevmapRepoMap(repoPath),
-      getDevmapCliStatus(repoPath),
-    ]);
-    if (!mapRequests.isCurrent(request) || currentRepo !== repoPath) return;
-    loading = false;
-    if (mapResult.status === "fulfilled") {
-      load = mapResult.value;
-      if (!mapResult.value.available) {
-        errorMsg = mapResult.value.reason ?? "repo map unavailable";
-      } else if (selectedArea == null && mapResult.value.map?.subsystems[0]) {
-        selectedArea = mapResult.value.map.subsystems[0].area;
-      }
-    } else {
-      load = null;
-      errorMsg = reportMapFailure("map", repoPath, mapResult.reason);
-    }
-    if (statusResult.status === "fulfilled") {
-      cliStatus = statusResult.value;
-    } else {
-      cliStatus = null;
-      reportMapFailure("status", repoPath, statusResult.reason);
-    }
-    if (refreshView) reloadView(repoPath, mapView);
+    const live = () => mapRequests.isCurrent(request) && currentRepo === repoPath;
+    await settleMapBeforeStatus({
+      map: getDevmapRepoMap(repoPath),
+      status: getDevmapCliStatus(repoPath),
+      isCurrent: live,
+      onMap(mapResult) {
+        loading = false;
+        if (mapResult.status === "fulfilled") {
+          load = mapResult.value;
+          if (!mapResult.value.available) {
+            errorMsg = mapResult.value.reason ?? "repo map unavailable";
+          } else if (selectedArea == null && mapResult.value.map?.subsystems[0]) {
+            selectedArea = mapResult.value.map.subsystems[0].area;
+          }
+        } else {
+          load = null;
+          errorMsg = reportMapFailure("map", repoPath, mapResult.reason);
+        }
+        if (refreshView) reloadView(repoPath, mapView);
+      },
+      onStatus(statusResult) {
+        if (statusResult.status === "fulfilled") {
+          cliStatus = statusResult.value;
+        } else {
+          cliStatus = null;
+          reportMapFailure("status", repoPath, statusResult.reason);
+        }
+      },
+    });
   }
 
   async function reloadGraph(path?: string) {
