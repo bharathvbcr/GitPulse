@@ -491,6 +491,29 @@ pub(crate) fn coverage_relaxed(duration: std::time::Duration) -> std::time::Dura
     relaxed_for(duration, instrumented(), host_load())
 }
 
+/// Waits for `done` to hold and says whether it did within `limit`, which is
+/// scaled like every other wall-clock limit ([`coverage_relaxed`]).
+///
+/// A test that needs another thread, process or timer to have reached a state
+/// waits on that state with this, not on a fixed sleep: a fixed sleep is a guess
+/// about the host's speed, so it goes red when the host is slower than the
+/// guess. `done` is checked once before any waiting and once more at the
+/// deadline, so a state reached just in time is seen. The poll interval is the
+/// only sleep here, and it never decides an outcome (`tests/hermetic_contract.rs`
+/// lists it as a bounded poll).
+pub(crate) fn wait_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + coverage_relaxed(limit);
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return done();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// The most a limit is stretched for host load. Bounded so a limit that exists
 /// to prove something did *not* wait (a deadline far shorter than the timeout
 /// it is racing) still discriminates on a busy machine.
