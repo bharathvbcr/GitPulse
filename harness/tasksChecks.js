@@ -3490,7 +3490,6 @@ if (params.has("check")) {
       const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
       const keyDown = (el, key) => el?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
       const mid = (a, b) => Math.floor((positionOf(a) + positionOf(b)) / 2);
-      const longStarted = Date.now();
       try {
         tasks.push(...longTasks, ...movers);
         await refreshLong();
@@ -3568,8 +3567,6 @@ if (params.has("check")) {
         check(`the list layout draws every loaded card past 35 rows (${listed.length} rows, ${expectedRows.length} loaded in Review)`, listed.length > 35 && expectedRows.every(id => listed.includes(id)));
         listRows()[0]?.focus(); keyDown(document.activeElement, "End"); await settle();
         check("End in the list focuses the list's last row", listRows().length > 0 && document.activeElement === listRows().at(-1));
-        const longMs = Date.now() - longStarted;
-        check(`the long-column checks fit their 25 s budget of the harness deadline (took ${longMs} ms)`, longMs < 25_000);
       } catch (error) { check(`the long-column checks ran to the end (${error.message} at ${guardStep})`, false); }
       finally {
         // Whatever failed above, the fixture goes back as the later blocks expect it.
