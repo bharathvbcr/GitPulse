@@ -4253,7 +4253,7 @@ mod tests {
         // degraded, repairs it when it records its claim.
         let before = std::fs::read(&store).unwrap();
         let read = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
-        assert_eq!((read.rows.len(), read.skipped), (1, 1), "{read:?}");
+        assert_eq!((read.rows.len(), read.skipped), (0, 1), "{read:?}");
         assert_eq!(
             std::fs::read(&store).unwrap(),
             before,
@@ -4265,7 +4265,7 @@ mod tests {
         let text = said(&output);
         assert!(!text.contains("could not be recorded"), "{text}");
         let clean = crate::insights::claims::read_for_worktree(repo.path(), now()).unwrap();
-        assert_eq!((clean.rows.len(), clean.skipped), (2, 0), "{clean:?}");
+        assert_eq!((clean.rows.len(), clean.skipped), (1, 0), "{clean:?}");
     }
 
     /// Security. The hook runs in every repository an agent edits. In one

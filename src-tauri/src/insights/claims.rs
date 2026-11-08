@@ -10,34 +10,41 @@
 //! # Store discipline
 //!
 //! * Every row is one `write(2)` of a buffer that already ends in `\n`, so a
-//!   kill between "the row" and "its newline" cannot happen. If an earlier
-//!   writer was cut off anyway (a full disk, a power loss), the next append
-//!   first closes the torn line so it cannot swallow the new row.
+//!   kill between "the row" and "its newline" cannot happen. If a writer died
+//!   anyway (a full disk, a power loss) it leaves a fragment with no newline.
 //! * Readers take no lock. They skip a line that does not parse or is not
 //!   terminated, count it, and report the count as degraded: one bad line is
 //!   never a whole-store failure, and never reads as clean.
 //! * Reads never write. The tools that read the store are advertised
 //!   read-only, so a degraded store is reported and left exactly as it is.
-//! * A bad line does not stay, because writes repair it. An append that closes
-//!   a torn tail does, and so does one whose caller read the store degraded
-//!   (the edit hook) or that starts a run (declared claims). Each tries once,
-//!   without waiting, to rewrite the store without the bad line. If the
-//!   exclusive lock is not free it appends the claim under the shared lock
-//!   and leaves the repair for the next writer, so no hook waits longer than
-//!   it did before. A quiet repository with a bad line mid-file stays honestly
-//!   degraded until the next claim write.
-//! * Appends take a shared lock, so concurrent hooks do not queue behind one
-//!   another. Only compaction takes the exclusive lock. The new file is written
-//!   beside the store before that lock is asked for; under it the appends made
-//!   meanwhile are copied on and the file is renamed over the store, so a
-//!   reader sees the old file or the new one. A hook whose compaction cannot
-//!   get the lock appends its claim under the shared lock instead.
+//! * Appends take a shared lock and touch nothing but the end of the file, so
+//!   concurrent hooks do not queue behind one another and no append can cut
+//!   into another's row. A fragment is therefore never closed or repaired under
+//!   the shared lock: what the file ends with there may be a row another
+//!   process is writing.
+//! * Only a compaction or repair takes the exclusive lock, and it is the only
+//!   thing that drops a fragment: under that lock no append is in flight, so
+//!   whatever follows the last newline is a dead writer's. An append that finds
+//!   the file ending mid-line, a write whose caller read the store degraded (the
+//!   edit hook), and a declared claim each try that repair first, without
+//!   waiting. If the lock is not free the claim is appended anyway and the
+//!   repair is left for the next writer; a row appended straight after a
+//!   fragment shares its line, so a crash costs the fragment and that one row,
+//!   and the reader counts the line. A quiet repository with a bad line mid-file
+//!   stays honestly degraded until the next claim write.
+//! * A compaction reads the store through one handle and takes that handle's
+//!   own device and inode, and its last complete line, as what it was made
+//!   from. The new file is written beside the store before the exclusive lock
+//!   is asked for; under it the file at the path must still be that file, and
+//!   whatever was appended since is copied on before the rename. If it is not
+//!   that file, nothing is copied and the claim is simply appended.
 //! * Compaction is rare by design. It starts when the file passes
 //!   [`COMPACT_BYTES_PER_ROW`] bytes per row of cap. It drops expired and
 //!   duplicate rows, keeps every live row up to the cap, and leaves at most
 //!   three quarters of the starting size, so the next one is thousands of
 //!   appends away. Live rows past the cap or that size are the oldest to go,
-//!   and are logged and counted on the next read.
+//!   are logged, and are written into the file as a count the next read adds
+//!   to `dropped` until it is older than the TTL.
 //! * Nothing is fsynced. A claim is advisory and expires in minutes; a lost
 //!   tail after a crash is the same as the claim never having been made, and
 //!   a sync on every hook write is what put it over its latency budget.
@@ -255,10 +262,12 @@ pub fn read_for_worktree(worktree: &Path, now_ms: u64) -> Result<StoreRead, Stri
 pub fn read_store(store: &Path, now_ms: u64, ttl_ms: u64, cap: usize) -> Result<StoreRead, String> {
     let loaded = load_lines(store)?;
     let (rows, dropped) = trim(loaded.rows, now_ms, ttl_ms, cap);
+    // What an earlier compaction had to drop still counts until it is old.
+    let evicted = live_evictions(&loaded.evicted, now_ms, ttl_ms);
     Ok(StoreRead {
         rows,
         skipped: loaded.skipped,
-        dropped,
+        dropped: dropped + evicted.1,
         untrusted: false,
     })
 }
@@ -412,16 +421,20 @@ fn append_claims_with(
         None
     };
     if degraded.is_none() && len < threshold && len < MAX_STORE_BYTES {
-        let closed_a_torn_tail = with_lock(store, Mode::Shared, wait(), || {
-            append_buffer(store, &buffer)
-        })?;
-        if closed_a_torn_tail {
-            // The append kept the new row out of the torn line. The line itself
-            // is still in the file, and every read would count it until a size
-            // threshold that a quiet repository may never reach.
+        // Nearly every append finds the file ending in a newline and goes
+        // straight to the shared lock, so appends never queue behind each
+        // other. A file that does not end in one is a dead writer's fragment or
+        // a row another process is writing right now, and a writer among
+        // writers cannot tell which. It only tries a repair first: a compaction
+        // that takes the exclusive lock without waiting, and under it, with no
+        // append in flight, drops whatever follows the last newline. Then the
+        // row is appended under the shared lock, whatever the repair found. If
+        // the lock was not free, the row shares a line with the fragment: the
+        // reader counts that one line, and the next repair removes it.
+        if ends_mid_line(store) {
             heal(store, cap, ttl_ms, now_ms);
         }
-        return Ok(());
+        return with_lock(store, Mode::Shared, wait(), || append_plain(store, &buffer));
     }
     // Reading, parsing, trimming and rendering is most of a compaction, so it
     // is done before the exclusive lock is asked for. Appends made meanwhile
@@ -440,6 +453,7 @@ fn append_claims_with(
     // next writer a try, not this one a delay. A size compaction waits the same
     // 20 ms every claim operation gets.
     let lock_wait = if repairing { Duration::ZERO } else { wait() };
+    prepared.catch_up(store);
     let attempt = with_lock_if_free(store, Mode::Exclusive, lock_wait, || {
         compact_locked(store, &mut prepared, &buffer, repairing, threshold)
     })?;
@@ -449,10 +463,7 @@ fn append_claims_with(
     // Another hook is mid-append, so the exclusive lock was not free in time.
     // The claim is not lost for that: it is appended under the shared lock, and
     // the next writer compacts.
-    with_lock(store, Mode::Shared, wait(), || {
-        append_buffer(store, &buffer)
-    })
-    .map(|_| ())
+    with_lock(store, Mode::Shared, wait(), || append_plain(store, &buffer))
 }
 
 /// The lock wait every claim operation gets. One place, so it is not widened by
@@ -490,6 +501,38 @@ impl Drop for Prepared {
 }
 
 impl Prepared {
+    /// Copies the complete lines appended since this was read onto its file,
+    /// without a lock, so what is left to copy under the exclusive lock is a
+    /// few rows and not everything every other hook wrote while the parse and
+    /// the write took their time. It stops when a read finds the store is no
+    /// longer the file this was made from; the check under the lock decides.
+    fn catch_up(&mut self, store: &Path) {
+        for _ in 0..4 {
+            let Some(mut tail) = read_tail_of(store, self.end, self.id) else {
+                return;
+            };
+            let complete = tail
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |at| at + 1);
+            tail.truncate(complete);
+            if tail.is_empty() {
+                return;
+            }
+            let copied = OpenOptions::new()
+                .append(true)
+                .open(&self.tmp)
+                .and_then(|mut file| file.write_all(&tail));
+            if copied.is_err() {
+                return;
+            }
+            self.end += complete as u64;
+            if complete < 16 * 1024 {
+                return;
+            }
+        }
+    }
+
     /// Writes `text` to a file of its own beside `store`. The name carries this
     /// process and a counter, so hooks compacting together never share one.
     fn write(store: &Path, end: u64, id: Option<(u64, u64)>, text: &str) -> Result<Self, String> {
@@ -551,7 +594,7 @@ fn prepare_from_loaded(
     rows.extend(claims.iter().cloned());
     let (kept, mut dropped) = trim(rows, now_ms, ttl_ms, cap);
     let (_, keep_bytes) = compaction_limits(cap);
-    let (text, over_bytes) = render(&kept, keep_bytes)?;
+    let (rows_text, over_bytes) = render(&kept, keep_bytes)?;
     dropped += over_bytes;
     if dropped > 0 {
         log::warn!(
@@ -560,6 +603,20 @@ fn prepare_from_loaded(
             store.display()
         );
     }
+    // The drop is written down, so the next read counts it. Earlier drops that
+    // are still inside the TTL are carried into the same line.
+    let (latest, carried) = live_evictions(&loaded.evicted, now_ms, ttl_ms);
+    let total = carried + dropped;
+    let mut text = String::new();
+    if total > 0 {
+        let marker = EvictedMarker {
+            evicted: total,
+            ts_ms: if dropped > 0 { now_ms } else { latest },
+        };
+        text.push_str(&serde_json::to_string(&marker).map_err(|error| error.to_string())?);
+        text.push('\n');
+    }
+    text.push_str(&rows_text);
     Prepared::write(store, loaded.end, loaded.id, &text)
 }
 
@@ -601,14 +658,27 @@ fn compact_locked(
     threshold: u64,
 ) -> Result<bool, String> {
     let len = fs::metadata(store).map(|meta| meta.len()).unwrap_or(0);
-    let same_file = identity(store) == prepared.id && len >= prepared.end;
+    // The file at the path now has to be the very file the prepared rows were
+    // read from, by the identity of the handle that read them. If it is not,
+    // another writer compacted or repaired in between and the rows and offsets
+    // here describe a file that no longer exists: nothing is copied from this
+    // preparation, and the claim is appended to what is there.
+    let same_file = path_identity(store) == prepared.id && len >= prepared.end;
     if !same_file || (!force && len < threshold) {
         if !buffer.is_empty() {
-            append_buffer(store, buffer)?;
+            append_exclusive(store, buffer)?;
         }
         return Ok(false);
     }
-    let tail = read_from(store, prepared.end)?;
+    let mut tail = read_from(store, prepared.end)?;
+    // No append is in flight under the exclusive lock, so whatever follows the
+    // last newline is a dead writer's fragment, not a row being written. It is
+    // left out of the new file, and the file is repaired.
+    let complete = tail
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    tail.truncate(complete);
     if !tail.is_empty() {
         OpenOptions::new()
             .append(true)
@@ -638,12 +708,28 @@ fn heal(store: &Path, cap: usize, ttl_ms: u64, now_ms: u64) {
 
 fn try_repair(store: &Path, mut prepared: Prepared, cap: usize) -> bool {
     let (threshold, _) = compaction_limits(cap);
+    prepared.catch_up(store);
     matches!(
         with_lock_if_free(store, Mode::Exclusive, Duration::ZERO, || {
             compact_locked(store, &mut prepared, "", true, threshold)
         }),
         Ok(Some(true))
     )
+}
+
+/// The bytes from `offset` on of the file `expected` names, read through one
+/// handle that is checked to be that file. `None` when the store is another
+/// file now, is shorter than `offset`, or cannot be read.
+fn read_tail_of(store: &Path, offset: u64, expected: Option<(u64, u64)>) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(store).ok()?;
+    let meta = file.metadata().ok()?;
+    if handle_identity(&meta) != expected || meta.len() < offset {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut tail = Vec::new();
+    file.take(MAX_STORE_BYTES).read_to_end(&mut tail).ok()?;
+    Some(tail)
 }
 
 /// The bytes of the store from `offset` on: what was appended since a read
@@ -660,19 +746,36 @@ fn read_from(store: &Path, offset: u64) -> Result<Vec<u8>, String> {
     Ok(tail)
 }
 
-/// Which file is at `path`, so a compaction can tell its read was of the file
-/// it is about to replace. `None` where the platform cannot say.
-fn identity(path: &Path) -> Option<(u64, u64)> {
+/// Which file `meta` describes, so a compaction can tell its read was of the
+/// file it is about to replace. `None` where the platform cannot say.
+fn handle_identity(meta: &fs::Metadata) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+        Some((meta.dev(), meta.ino()))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = meta;
         None
     }
+}
+
+/// Which file is at `path` now.
+fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| handle_identity(&meta))
+}
+
+/// The newest time and the total count of evictions still inside the TTL.
+fn live_evictions(markers: &[(u64, usize)], now_ms: u64, ttl_ms: u64) -> (u64, usize) {
+    markers
+        .iter()
+        .filter(|(ts, _)| now_ms.saturating_sub(*ts) <= ttl_ms)
+        .fold((0, 0), |(latest, total), (ts, count)| {
+            (latest.max(*ts), total + count)
+        })
 }
 
 /// Live rows, oldest first: expired rows dropped, one row per holder and path
@@ -724,7 +827,12 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
     };
     let read_error =
         |error: std::io::Error| format!("cannot read claims {}: {error}", store.display());
-    let len = file.metadata().map_err(read_error)?.len();
+    // Which file this is, and how long it is, from the handle that is read. Asking
+    // the path afterwards would name whatever another writer renamed over the
+    // store in between, with this file's rows and offsets.
+    let meta = file.metadata().map_err(read_error)?;
+    let id = handle_identity(&meta);
+    let len = meta.len();
     let cut_head = len > MAX_STORE_BYTES;
     let start = if cut_head { len - MAX_STORE_BYTES } else { 0 };
     if cut_head {
@@ -734,32 +842,60 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
     file.take(MAX_STORE_BYTES)
         .read_to_end(&mut buf)
         .map_err(read_error)?;
-    let (rows, skipped) = parse_lines(&buf, cut_head);
+    // The read stops at the last newline it saw. What follows it may be a row
+    // another process is still writing, which this read cannot tell from a torn
+    // one, so a compaction made from this read takes it from the file under the
+    // exclusive lock instead.
+    let complete = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    let parsed = parse_lines(&buf, cut_head);
     Ok(Loaded {
-        rows,
-        skipped,
-        end: start + buf.len() as u64,
-        id: identity(store),
+        rows: parsed.rows,
+        evicted: parsed.evicted,
+        skipped: parsed.skipped,
+        end: start + complete as u64,
+        id,
     })
 }
 
-/// What one read of the store found, and where it stopped.
+/// What one read of the store found, and where its last complete line ended.
 #[derive(Default)]
 struct Loaded {
     rows: Vec<FileClaim>,
+    /// Evictions a compaction recorded: when, and how many live claims.
+    evicted: Vec<(u64, usize)>,
     skipped: usize,
-    /// The byte offset the read ended at.
+    /// The byte offset just past the last newline the read saw.
     end: u64,
-    /// The file that was read, when the platform can say which.
+    /// The file that was read, from its own handle, when the platform can say.
     id: Option<(u64, u64)>,
 }
 
-fn parse_lines(buf: &[u8], cut_head: bool) -> (Vec<FileClaim>, usize) {
+/// A line a compaction writes when it had to drop live claims, so the next read
+/// counts them instead of the loss being a log line.
+#[derive(Serialize, Deserialize)]
+struct EvictedMarker {
+    evicted: usize,
+    ts_ms: u64,
+}
+
+struct Parsed {
+    rows: Vec<FileClaim>,
+    evicted: Vec<(u64, usize)>,
+    skipped: usize,
+}
+
+fn parse_lines(buf: &[u8], cut_head: bool) -> Parsed {
     let terminated = buf.last().is_none_or(|last| *last == b'\n');
     let segments: Vec<&[u8]> = buf.split(|byte| *byte == b'\n').collect();
     let last = segments.len().saturating_sub(1);
-    let mut rows = Vec::new();
-    let mut skipped = 0usize;
+    let mut parsed = Parsed {
+        rows: Vec::new(),
+        evicted: Vec::new(),
+        skipped: 0,
+    };
     for (index, segment) in segments.into_iter().enumerate() {
         if segment.is_empty() {
             continue;
@@ -767,22 +903,44 @@ fn parse_lines(buf: &[u8], cut_head: bool) -> (Vec<FileClaim>, usize) {
         let torn_head = cut_head && index == 0;
         let unterminated = !terminated && index == last;
         if torn_head || unterminated || segment.len() > MAX_LINE_BYTES {
-            skipped += 1;
+            parsed.skipped += 1;
             continue;
         }
-        match serde_json::from_slice::<FileClaim>(segment) {
-            Ok(claim) => rows.push(claim),
-            Err(_) => skipped += 1,
+        if let Ok(claim) = serde_json::from_slice::<FileClaim>(segment) {
+            parsed.rows.push(claim);
+        } else if let Ok(marker) = serde_json::from_slice::<EvictedMarker>(segment) {
+            parsed.evicted.push((marker.ts_ms, marker.evicted));
+        } else {
+            parsed.skipped += 1;
         }
     }
-    (rows, skipped)
+    parsed
 }
 
-/// Appends `buffer` (whole rows, each ending in `\n`) in one write. When the
-/// file's last byte is not a newline, an earlier writer was cut off; the
-/// buffer then starts with one so the torn line stands alone. Returns whether
-/// it found a torn tail.
-fn append_buffer(store: &Path, buffer: &str) -> Result<bool, String> {
+/// Whether the store's last byte is not a newline: a dead writer's fragment, or
+/// a row another process is writing right now. Without a lock this cannot tell
+/// which, so it is only ever a reason to try for the exclusive lock.
+fn ends_mid_line(store: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(store) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1)).is_ok()
+        && file.read_exact(&mut last).is_ok()
+        && last[0] != b'\n'
+}
+
+/// Appends `buffer` (whole rows, each ending in `\n`) in one write, under the
+/// exclusive lock. No other writer is mid-append, so a last byte that is not a
+/// newline is a writer that died: the buffer then starts with a newline so the
+/// torn line stands alone. Returns whether it found one.
+fn append_exclusive(store: &Path, buffer: &str) -> Result<bool, String> {
     let mut file = open_store(store)?;
     let append_error =
         |error: std::io::Error| format!("cannot append claim {}: {error}", store.display());
@@ -801,6 +959,19 @@ fn append_buffer(store: &Path, buffer: &str) -> Result<bool, String> {
     bytes.extend_from_slice(buffer.as_bytes());
     file.write_all(&bytes).map_err(append_error)?;
     Ok(torn)
+}
+
+/// Appends `buffer` in one write under the shared lock, and touches nothing
+/// else. Other appenders are writing at the same time, so what the file ends
+/// with is not this call's to judge: a last byte that is not a newline may be a
+/// row still being written. Each row is a complete line starting at the end of
+/// the file. After a real crash the first row appended here shares a line with
+/// the dead writer's fragment; the reader counts that one line, and the next
+/// exclusive writer repairs it.
+fn append_plain(store: &Path, buffer: &str) -> Result<(), String> {
+    let mut file = open_store(store)?;
+    file.write_all(buffer.as_bytes())
+        .map_err(|error| format!("cannot append claim {}: {error}", store.display()))
 }
 
 /// The store, opened for append and created when missing.
@@ -972,7 +1143,9 @@ mod tests {
             .unwrap()
             .lines()
             .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str::<FileClaim>(line).unwrap().path)
+            // A compaction that dropped live claims leaves a count line.
+            .filter_map(|line| serde_json::from_str::<FileClaim>(line).ok())
+            .map(|claim| claim.path)
             .collect()
     }
 
@@ -1107,7 +1280,10 @@ mod tests {
 
         let read = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
         let paths: Vec<_> = read.rows.iter().map(|row| row.path.as_str()).collect();
-        assert_eq!(paths, ["a.rs", "b.rs", "c.rs"], "{read:?}");
+        // b.rs was appended while the lock was shared, straight after the dead
+        // writer's fragment, so it shares that one line: the fragment and the row
+        // after it are what a crash costs, and the reader counts the line.
+        assert_eq!(paths, ["a.rs", "c.rs"], "{read:?}");
         assert_eq!(read.skipped, 1, "the torn line is counted, not hidden");
         assert!(
             read.degraded()
@@ -1132,7 +1308,7 @@ mod tests {
         )
         .unwrap();
         let clean = read_store(&store, now + 3, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
-        assert_eq!((clean.rows.len(), clean.skipped), (4, 0), "{clean:?}");
+        assert_eq!((clean.rows.len(), clean.skipped), (3, 0), "{clean:?}");
         // Long after every claim expired the store still reads, and does not
         // fail the way the whole-store error did.
         let later = read_store(
@@ -1327,6 +1503,66 @@ mod tests {
         record_observed(trusted.path(), "session-a", "a.rs", "/x", now_ms()).unwrap();
         let read = read_for_worktree(trusted.path(), now_ms()).unwrap();
         assert!(!read.untrusted && read.rows.len() == 1, "{read:?}");
+    }
+
+    /// A compaction prepared from one file must not be committed over another.
+    /// Here a second writer replaces the store between the first's read and its
+    /// lock: the first copies nothing from its stale offsets, appends its claim
+    /// to what is there, and no row of the new file is lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_compaction_made_from_a_replaced_file_appends_instead_of_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+        for i in 0..5u64 {
+            let name = format!("old{i}.rs");
+            append_claim(&store, &claim(&name, 100 + i), 8, DEFAULT_TTL_MS, 100 + i).unwrap();
+        }
+        let mut stale =
+            prepare_compaction(&store, &[claim("new.rs", 200)], 8, DEFAULT_TTL_MS, 200).unwrap();
+        // Another writer compacts and renames its file over the store.
+        let other = prepare_compaction(&store, &[], 8, DEFAULT_TTL_MS, 201).unwrap();
+        let mut other = other;
+        let rewrote = with_lock_if_free(&store, Mode::Exclusive, Duration::ZERO, || {
+            compact_locked(&store, &mut other, "", true, 0)
+        })
+        .unwrap();
+        assert_eq!(rewrote, Some(true));
+        let mut buffer = serde_json::to_string(&claim("new.rs", 200)).unwrap();
+        buffer.push('\n');
+        let attempt = with_lock_if_free(&store, Mode::Exclusive, Duration::ZERO, || {
+            compact_locked(&store, &mut stale, &buffer, false, 0)
+        })
+        .unwrap();
+        assert_eq!(attempt, Some(false), "the stale preparation was committed");
+        let read = read_store(&store, 202, DEFAULT_TTL_MS, 8).unwrap();
+        let mut paths: Vec<_> = read.rows.iter().map(|row| row.path.clone()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["new.rs", "old0.rs", "old1.rs", "old2.rs", "old3.rs", "old4.rs"],
+            "{read:?}"
+        );
+        assert_eq!(read.skipped, 0, "{read:?}");
+    }
+
+    /// Under the exclusive lock whatever follows the last newline is a dead
+    /// writer's fragment, so a repair leaves it out; and an append that finds
+    /// the file ending mid-line repairs first and then appends its own row.
+    #[test]
+    fn a_repair_drops_a_fragment_after_the_last_newline_and_the_append_keeps_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("gitpulse").join("file-claims.jsonl");
+        append_claim(&store, &claim("a.rs", 100), 8, DEFAULT_TTL_MS, 100).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&store).unwrap();
+        file.write_all(b"{\"source\":\"observed\",\"ses").unwrap();
+        drop(file);
+        assert!(ends_mid_line(&store));
+        append_claim(&store, &claim("b.rs", 101), 8, DEFAULT_TTL_MS, 101).unwrap();
+        assert!(!ends_mid_line(&store));
+        let read = read_store(&store, 102, DEFAULT_TTL_MS, 8).unwrap();
+        let paths: Vec<_> = read.rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!((paths, read.skipped), (vec!["a.rs", "b.rs"], 0));
     }
 
     /// M1. A full-size store compacts rarely: a compaction keeps half the cap,
