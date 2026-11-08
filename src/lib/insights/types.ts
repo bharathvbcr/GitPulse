@@ -61,6 +61,12 @@ export interface LiveSession {
    * "none the scan could see", not "started by a person".
    */
   parent_pid?: number;
+  /** The agent's own session id, when its registry named one. Hook claims join on it. */
+  session_id?: string;
+  /** Claude Code's `procStart` string; a worktree lock matches only when pid and this agree. */
+  proc_start?: string;
+  /** The cwd the registry recorded; differs from `cwd` for an isolation worktree. */
+  registry_cwd?: string;
 }
 
 /** A session nested under another in the same worktree. */
