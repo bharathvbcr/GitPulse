@@ -2022,30 +2022,42 @@ exec "$real" "$@"
         );
     }
 
-    /// A worktree path holding a newline must not split its listing record:
-    /// the second line below would read as that checkout's branch.
+    /// The pull request's own worktree may sit at a path holding a newline.
+    /// Without `-z` the listing splits that path at the newline, so a reuse
+    /// would report (and update in) a directory that does not exist.
     #[cfg(unix)]
     #[test]
-    fn a_worktree_path_with_a_newline_cannot_pose_as_the_pull_request_branch() {
+    fn a_pull_request_worktree_whose_path_holds_a_newline_is_reused_at_that_path() {
         with_pr_repo(
             "https://github.com/acme/gitpulse.git",
             false,
             false,
             |case| {
-                let odd = case
-                    .repo
-                    .parent()
-                    .unwrap()
-                    .join("odd\nbranch refs/heads/pr/7");
+                let odd = case.repo.parent().unwrap().join("odd\nspot");
                 crate::test_support::git_in(
                     &case.repo,
-                    &["worktree", "add", "--detach", odd.to_str().unwrap()],
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "pr/7",
+                        odd.to_str().unwrap(),
+                        "main",
+                    ],
                 );
-                let opened = open_at(&case.repo_s, 7, false, false).expect("open pr 7");
-                assert!(!opened.reused, "reused {}", opened.path);
+                let opened = open_at(&case.repo_s, 7, false, false).expect("reuse pr 7");
+                assert!(opened.reused);
                 assert_eq!(opened.branch, "pr/7");
-                assert_ne!(Path::new(&opened.path), odd.as_path());
-                assert!(Path::new(&opened.path).is_dir());
+                assert!(
+                    same_path(Path::new(&opened.path), &odd),
+                    "reported {:?}, not {:?}",
+                    opened.path,
+                    odd
+                );
+                // The engine refuses to run git in a directory whose name holds
+                // a newline, so the update fails; it says so instead of
+                // claiming success.
+                assert!(opened.update_error.is_some());
             },
         );
     }
