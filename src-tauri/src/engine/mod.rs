@@ -9,6 +9,8 @@ pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
 pub mod merge_tree;
+#[cfg(test)]
+mod merge_tree_tests;
 pub mod object_quarantine;
 pub mod portless;
 pub mod provenance;

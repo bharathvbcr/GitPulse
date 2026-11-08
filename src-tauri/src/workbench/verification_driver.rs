@@ -773,14 +773,33 @@ pub(crate) fn judge_candidate(
     if card.is_none() {
         return Err("The task does not exist.".into());
     }
-    let backend = HostBackend(host.clone());
+    judge_candidate_with(
+        &store,
+        &HostBackend(host.clone()),
+        task_id,
+        scratch,
+        candidate,
+        sleep,
+    )
+}
+
+/// [`judge_candidate`] against a store and a backend (the clock and the
+/// sidecar), so a test supplies both.
+pub(crate) fn judge_candidate_with(
+    store: &Store,
+    backend: &dyn Backend,
+    task_id: &str,
+    scratch: &Path,
+    candidate: &str,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<(), String> {
     let mut started = false;
-    let deadline = Instant::now() + WAIT_LIMIT;
+    let deadline = backend.now() + WAIT_LIMIT;
     loop {
         if backend.cancelled() {
             return Err("Verification stopped because GitPulse closed.".into());
         }
-        match gate::latest(&store, task_id) {
+        match gate::latest(store, task_id) {
             Err(why) => return Err(why),
             Ok(Some(record)) if verdict_covers(&record, candidate) => {
                 let scratch_text = scratch
@@ -810,10 +829,10 @@ pub(crate) fn judge_candidate(
             Ok(_) => {}
         }
         if !started {
-            run_at(&store, &backend, task_id, scratch, candidate).map_err(|error| error.message)?;
+            run_at(store, backend, task_id, scratch, candidate).map_err(|error| error.message)?;
             started = true;
         }
-        if Instant::now() >= deadline {
+        if backend.now() >= deadline {
             return Err(format!(
                 "Verification of {candidate} did not finish within {} minutes.",
                 WAIT_LIMIT.as_secs() / 60

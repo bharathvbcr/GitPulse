@@ -7,7 +7,7 @@
  * caller keeps the original and reports it as it always did.
  */
 
-import type { MergeTeardownError } from "./types";
+import type { MergeHeldReason, MergeTeardownError } from "./types";
 
 /** A merge-and-teardown that did not merge, carrying the host's typed reason. */
 export class MergeTeardownFailure extends Error {
@@ -52,7 +52,17 @@ export function readMergeTeardownError(cause: unknown): MergeTeardownError | nul
       return { code: "refused", message };
     case "candidate_failed":
       return isText(v.candidate) ? { code: "candidate_failed", message, candidate: v.candidate } : null;
+    case "write_tree_unavailable":
+      return { code: "write_tree_unavailable", message };
+    case "held":
+      return isHeldReason(v.reason) && (v.path === null || isText(v.path))
+        ? { code: "held", reason: v.reason, message, path: v.path }
+        : null;
     default:
       return null;
   }
+}
+
+function isHeldReason(value: unknown): value is MergeHeldReason {
+  return value === "checkout_dirty" || value === "checkout_unreadable" || value === "checkout_locked" || value === "commit_hooks";
 }

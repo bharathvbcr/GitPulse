@@ -10,6 +10,9 @@ const valid: MergeTeardownError[] = [
   { code: "squash_parked", message: "parked" },
   { code: "refused", message: "no" },
   { code: "candidate_failed", message: "the candidate failed", candidate: "abc" },
+  { code: "held", reason: "checkout_dirty", message: "main is dirty", path: "/repo" },
+  { code: "held", reason: "commit_hooks", message: "pre-commit is active", path: null },
+  { code: "write_tree_unavailable", message: "git is older than 2.38" },
 ];
 
 describe("readMergeTeardownError", () => {
@@ -39,6 +42,10 @@ describe("readMergeTeardownError", () => {
       { code: "conflict", message: "m", paths: ["a"], total: 1, rolled_back: true, rollback_error: null, candidate: 1 },
       { code: "candidate_failed", message: "m" },
       { code: "candidate_failed", message: "m", candidate: 1 },
+      { code: "held", reason: "checkout_dirty", message: "m" },
+      { code: "held", reason: "nope", message: "m", path: null },
+      { code: "held", reason: "checkout_dirty", message: "m", path: 3 },
+      { code: "write_tree_unavailable" },
       { code: "exploded", message: "m" },
       { message: "no code" },
     ]) expect(readMergeTeardownError(bad), JSON.stringify(bad)).toBeNull();

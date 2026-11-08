@@ -334,7 +334,17 @@ export type MergeTeardownError =
   /** Refused or failed before anything was merged. */
   | { code: "refused"; message: string }
   /** The candidate commit was built and rejected before the target moved. */
-  | { code: "candidate_failed"; message: string; candidate: string };
+  | { code: "candidate_failed"; message: string; candidate: string }
+  /**
+   * Nothing was merged or moved, and the lane was kept: a checkout that has the target checked out is dirty, locked
+   * or unreadable (`path` names it), or an active commit hook would be skipped by the object-database commit.
+   */
+  | { code: "held"; reason: MergeHeldReason; message: string; path: string | null }
+  /** The wave needs `merge-tree --write-tree` (git 2.38+) and this git lacks it. Nothing was merged. */
+  | { code: "write_tree_unavailable"; message: string };
+
+/** `engine::merge_tree::HeldReason`. */
+export type MergeHeldReason = "checkout_dirty" | "checkout_unreadable" | "checkout_locked" | "commit_hooks";
 
 /** `engine::worktree_hooks::WorktreeHooksConfig`. */
 export interface WorktreeHooksConfig {

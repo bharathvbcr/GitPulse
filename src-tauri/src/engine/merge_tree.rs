@@ -19,7 +19,8 @@ use crate::engine::object_quarantine::{
     parse_merge_tree_output, refuse_partial_clone, MergeOutcome, QuarantineError,
 };
 use crate::ipc_error::CommandError;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How this call decides whether `merge-tree` can write a tree.
@@ -92,18 +93,38 @@ pub(crate) fn fallback_note() -> String {
 /// commit, and may reject it before the target ref moves.
 pub(crate) type CandidateVerifier<'a> = dyn FnMut(&Path, &str) -> Result<(), String> + 'a;
 
-/// What the caller knows about the main checkout, read under the repository lock.
+/// Why a checkout that has the target branch checked out cannot be moved with
+/// it. Typed, so the wave can hold the task instead of halting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// A checkout with the target has uncommitted files.
+    CheckoutDirty,
+    /// A checkout with the target could not be read, so it is not known clean.
+    CheckoutUnreadable,
+    /// A checkout with the target has `index.lock` held by someone.
+    CheckoutLocked,
+    /// A repository hook the object-database commit would skip is active.
+    CommitHooks,
+}
+
+/// What stops one checkout from being moved.
+pub(crate) enum HolderProblem {
+    Dirty,
+    IndexLocked,
+    Unreadable(String),
+}
+
+/// A worktree (the main checkout or a linked one) that has the target branch
+/// checked out. Moving `refs/heads/<target>` moves its HEAD with it.
+pub(crate) struct CheckoutHolder {
+    pub path: PathBuf,
+    pub problem: Option<HolderProblem>,
+}
+
+/// Every checkout that has the target checked out, read under the repository lock.
 pub(crate) struct CheckoutTouch {
-    /// HEAD is the branch being integrated into.
-    pub on_target: bool,
-    /// The checkout has uncommitted user paths. Meaningful when `on_target`.
-    pub dirty: bool,
-    /// `.git/index.lock` is present. A checkout this call would detach or
-    /// sync cannot proceed while it is.
-    pub index_locked: bool,
-    /// `on_target` and the dirtiness could not be read. Fail closed before
-    /// moving the ref when this call would touch that checkout.
-    pub dirtiness_error: Option<String>,
+    pub holders: Vec<CheckoutHolder>,
 }
 
 /// Why the object-database integration did not move the target.
@@ -126,6 +147,17 @@ pub(crate) enum IntegrateFailure {
     /// This git rejected the write. The caller falls back or refuses.
     Unsupported {
         message: String,
+    },
+    /// A checkout that has the target is not safe to move. Nothing was moved.
+    Held {
+        reason: HeldReason,
+        message: String,
+        path: Option<String>,
+    },
+    /// The commit would skip these active repository hooks. The caller takes
+    /// the in-checkout merge, which runs them, or refuses.
+    CommitHooks {
+        hooks: Vec<String>,
     },
 }
 
@@ -213,6 +245,14 @@ pub(crate) fn prepare(
         // would also leave a parked squash message behind, which the
         // in-checkout path deletes instead of committing.
         return Ok(target_sha.to_string());
+    }
+    // `commit-tree` runs no hooks. The in-checkout merge ran pre-commit,
+    // pre-merge-commit and commit-msg (secret scanners live there), so a
+    // repository that has any of them active does not get its commit written
+    // behind them.
+    let hooks = active_commit_hooks(repo).map_err(refused)?;
+    if !hooks.is_empty() {
+        return Err(IntegrateFailure::CommitHooks { hooks });
     }
     let message = if squash {
         format!("Merge branch '{branch}' (squashed)")
@@ -421,14 +461,194 @@ fn conflict_message(branch: &str, target: &str, paths: &[String], total: usize) 
     )
 }
 
-/// Moves the target ref, then the checkout when that is safe.
+/// The hooks `git commit` and `git merge` would run on the commit this
+/// integration records, and `commit-tree` does not.
+const COMMIT_HOOKS: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
+
+/// The names in [`COMMIT_HOOKS`] that are active for `repo`: a regular file in
+/// the hooks directory git would use (`core.hooksPath` respected) with an
+/// executable bit. A directory that cannot be read is an error, not "none".
+pub(crate) fn active_commit_hooks(repo: &Path) -> Result<Vec<String>, CommandError> {
+    let spelled = git_text(repo, &["rev-parse", "--git-path", "hooks"])?;
+    let dir = repo.join(spelled.trim());
+    let mut active = Vec::new();
+    for name in COMMIT_HOOKS {
+        match std::fs::metadata(dir.join(name)) {
+            Ok(meta) if meta.is_file() && is_executable(&meta) => active.push(name.to_string()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CommandError::plain(format!(
+                    "The hook {name} in {} could not be checked ({error}), so nothing was merged.",
+                    dir.display()
+                )))
+            }
+        }
+    }
+    Ok(active)
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// What the panel says when it merged in the checkout because the object
+/// database would have skipped these hooks.
+pub(crate) fn hooks_fallback_note(hooks: &[String]) -> String {
+    format!(
+        "This repository has active {} hook(s), which an object-database commit would skip, \
+         so this lane was merged in the checkout.",
+        hooks.join(", ")
+    )
+}
+
+/// What the wave says when it will not skip those hooks. Nothing was merged.
+pub(crate) fn hooks_refusal_message(hooks: &[String]) -> String {
+    format!(
+        "This repository has active {} hook(s), which the object-database commit would skip. \
+         The wave will not land a commit behind them. Nothing was merged.",
+        hooks.join(", ")
+    )
+}
+
+fn no_checkout_note(target: &str) -> String {
+    format!(
+        "{CHECKOUT_NOT_ADVANCED}: no checkout has {target} checked out, so no files were changed."
+    )
+}
+
+/// Refuses, naming the first checkout with `target` that is not safe to move.
+fn refuse_unsafe_holders(target: &str, checkout: &CheckoutTouch) -> Result<(), IntegrateFailure> {
+    for holder in &checkout.holders {
+        let shown = holder.path.display().to_string();
+        let (reason, why) = match &holder.problem {
+            None => continue,
+            Some(HolderProblem::Dirty) => (
+                HeldReason::CheckoutDirty,
+                "has uncommitted files".to_string(),
+            ),
+            Some(HolderProblem::IndexLocked) => (
+                HeldReason::CheckoutLocked,
+                "has its index.lock held".to_string(),
+            ),
+            Some(HolderProblem::Unreadable(why)) => (
+                HeldReason::CheckoutUnreadable,
+                format!("could not be checked ({why})"),
+            ),
+        };
+        return Err(IntegrateFailure::Held {
+            reason,
+            message: format!(
+                "{target} is checked out in {shown}, which {why}. Moving {target} would change \
+                 that checkout underneath whoever is using it, so nothing was merged and nothing \
+                 was moved."
+            ),
+            path: Some(shown),
+        });
+    }
+    Ok(())
+}
+
+/// Brings one checkout's index and files from `from_tree` to `to_tree`. The
+/// index is refreshed first, so a file whose bytes are unchanged but whose
+/// mtime moved (an editor save) is not mistaken for a local edit.
+fn advance_checkout(
+    path: &Path,
+    from_tree: &str,
+    to_tree: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    let refresh = ["update-index", "-q", "--refresh"];
+    gate(&refresh)?;
+    git_text(path, &refresh)?;
+    let read = ["read-tree", "-m", "-u", from_tree, to_tree];
+    gate(&read)?;
+    git_text(path, &read).map(|_| ())
+}
+
+/// Whether the index of the checkout at `path` matches its HEAD.
+fn index_matches_head(path: &Path) -> bool {
+    git_captured(path, &["diff-index", "--cached", "--quiet", "HEAD"])
+        .map(|run| run.status_code == 0)
+        .unwrap_or(false)
+}
+
+/// Puts back what a failed [`advance_checkout`] left half done: the
+/// checkouts already advanced move back, then the ref returns to
+/// `target_sha` (a compare-and-swap from `candidate`, so a ref somebody else
+/// has since moved is left alone). Returns the sentence to report, which says
+/// so when something could not be restored.
+#[allow(clippy::too_many_arguments)]
+fn restore_after_failed_advance(
+    repo: &Path,
+    target: &str,
+    target_sha: &str,
+    candidate: &str,
+    failed: &CheckoutHolder,
+    advanced: &[&CheckoutHolder],
+    trees: (&str, &str),
+    why: &CommandError,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> String {
+    let (old_tree, new_tree) = trees;
+    let mut unresolved: Vec<String> = Vec::new();
+    for holder in advanced.iter().rev() {
+        if let Err(error) = advance_checkout(&holder.path, new_tree, old_tree, gate) {
+            unresolved.push(format!(
+                "{} could not be moved back ({})",
+                holder.path.display(),
+                error.message()
+            ));
+        }
+    }
+    let refname = format!("refs/heads/{target}");
+    let back = ["update-ref", refname.as_str(), target_sha, candidate];
+    if let Err(error) = gate(&back).and_then(|()| git_text(repo, &back)) {
+        unresolved.push(format!(
+            "{refname} could not be put back at {target_sha} ({})",
+            error.message()
+        ));
+    }
+    if !index_matches_head(&failed.path) {
+        unresolved.push(format!(
+            "the index of {} does not match its HEAD",
+            failed.path.display()
+        ));
+    }
+    let shown = failed.path.display();
+    if unresolved.is_empty() {
+        format!(
+            "The checkout {shown} could not be updated to the new {target} ({}), so {target} was \
+             put back at {target_sha} and nothing was merged.",
+            why.message()
+        )
+    } else {
+        format!(
+            "The checkout {shown} could not be updated to the new {target} ({}), and the \
+             restore was incomplete: {}. Run `git status` in each checkout named here before \
+             doing anything else; the lane was kept.",
+            why.message(),
+            unresolved.join("; ")
+        )
+    }
+}
+
+/// Moves the target ref, then every checkout that has it.
 ///
-/// The checkout is not updated with a merge. The ref is already at the
-/// candidate by then, and a merge would also succeed when the target had moved
-/// to a commit that still contains the old tip, which the compare-and-swap
-/// has already refused. A clean checkout that is on the target is synced with
-/// `read-tree` instead. A dirty one is detached first, so moving the branch
-/// does not rewrite its index, and it is left there with [`CHECKOUT_NOT_ADVANCED`].
+/// Before anything moves, each checkout with the target must be clean and
+/// readable; one that is not refuses the integration with a typed reason
+/// naming it. Nothing is detached: a live session keeps its HEAD. The ref
+/// moves by compare-and-swap, then each checkout's index and files follow with
+/// `read-tree` (not a merge: the CAS has already refused a target that moved).
+/// If one cannot follow, the others and the ref are put back and the failure
+/// says what could not be, so HEAD, index and files never silently disagree.
 pub(crate) fn land(
     repo: &Path,
     branch: &str,
@@ -439,32 +659,15 @@ pub(crate) fn land(
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<ObjectLanded, IntegrateFailure> {
     let moving = candidate != target_sha;
-    let touches = checkout.on_target && moving;
-    if touches && checkout.index_locked {
-        return Err(refused_text(format!(
-            "The main checkout's index.lock is held, so {target} was not updated and nothing was merged."
-        )));
+    if moving {
+        refuse_unsafe_holders(target, checkout)?;
     }
-    if touches {
-        if let Some(why) = &checkout.dirtiness_error {
-            return Err(refused_text(format!(
-                "The main checkout's uncommitted files could not be read ({why}), so nothing was merged."
-            )));
-        }
-    }
-
-    let mut detached = false;
-    if touches && checkout.dirty {
-        let detach = ["checkout", "--detach", "HEAD"];
-        gate(&detach).map_err(refused)?;
-        if let Err(error) = git_text(repo, &detach) {
-            return Err(refused_text(format!(
-                "Could not detach the main checkout before moving {target}, so nothing was merged: {}",
-                error.message()
-            )));
-        }
-        detached = true;
-    }
+    // Read before the ref moves: nothing after the CAS may fail for want of them.
+    let trees = if moving {
+        Some((tree_of(repo, target_sha)?, tree_of(repo, candidate)?))
+    } else {
+        None
+    };
 
     let refname = format!("refs/heads/{target}");
     let update = [
@@ -475,98 +678,39 @@ pub(crate) fn land(
     ];
     let update_args: Vec<&str> = update.iter().map(String::as_str).collect();
     if let Err(error) = gate(&update_args).and_then(|()| git_text(repo, &update_args)) {
-        let mut message = format!(
+        return Err(refused_text(format!(
             "{target} changed while {branch} was being integrated, so the update was refused and nothing was written to refs/heads/{target}: {}",
             error.message()
-        );
-        if detached {
-            match reattach(repo, target, gate) {
-                Ok(()) => {}
-                Err(why) => message.push_str(&format!(
-                    " The checkout was left detached: {}.",
-                    why.message()
-                )),
+        )));
+    }
+
+    if let Some((old_tree, new_tree)) = &trees {
+        let mut advanced: Vec<&CheckoutHolder> = Vec::new();
+        for holder in &checkout.holders {
+            if let Err(why) = advance_checkout(&holder.path, old_tree, new_tree, gate) {
+                return Err(refused_text(restore_after_failed_advance(
+                    repo,
+                    target,
+                    target_sha,
+                    candidate,
+                    holder,
+                    &advanced,
+                    (old_tree, new_tree),
+                    &why,
+                    gate,
+                )));
             }
+            advanced.push(holder);
         }
-        return Err(refused_text(message));
     }
-
-    if !moving {
-        let advanced = checkout.on_target && !checkout.dirty && checkout.dirtiness_error.is_none();
-        return Ok(ObjectLanded {
-            candidate_oid: candidate.to_string(),
-            checkout_advanced: advanced,
-            checkout_note: if advanced {
-                None
-            } else {
-                Some(idle_note(target, checkout))
-            },
-        });
-    }
-
-    if touches && !checkout.dirty {
-        let old_tree = tree_of(repo, target_sha)?;
-        let new_tree = tree_of(repo, candidate)?;
-        let read = [
-            "read-tree".to_string(),
-            "-m".to_string(),
-            "-u".to_string(),
-            old_tree,
-            new_tree,
-        ];
-        let read_args: Vec<&str> = read.iter().map(String::as_str).collect();
-        let synced = gate(&read_args).and_then(|()| git_text(repo, &read_args));
-        return Ok(match synced {
-            Ok(_) => ObjectLanded {
-                candidate_oid: candidate.to_string(),
-                checkout_note: None,
-                checkout_advanced: true,
-            },
-            Err(error) => ObjectLanded {
-                candidate_oid: candidate.to_string(),
-                checkout_advanced: false,
-                checkout_note: Some(format!(
-                    "{CHECKOUT_NOT_ADVANCED}: {target} moved to {candidate}, but the checkout could not be updated ({}).",
-                    error.message()
-                )),
-            },
-        });
-    }
-
-    let note = if detached {
-        format!(
-            "{CHECKOUT_NOT_ADVANCED}: the main checkout was left detached at the previous commit so uncommitted files were kept."
-        )
-    } else {
-        format!(
-            "{CHECKOUT_NOT_ADVANCED}: the main checkout is not on {target}, so its files were left as they were."
-        )
-    };
+    let held = !checkout.holders.is_empty();
     Ok(ObjectLanded {
         candidate_oid: candidate.to_string(),
-        checkout_advanced: false,
-        checkout_note: Some(note),
+        checkout_advanced: held,
+        checkout_note: if held {
+            None
+        } else {
+            Some(no_checkout_note(target))
+        },
     })
-}
-
-fn idle_note(target: &str, checkout: &CheckoutTouch) -> String {
-    if checkout.dirty {
-        format!(
-            "{CHECKOUT_NOT_ADVANCED}: the main checkout has uncommitted files and was left as it was."
-        )
-    } else {
-        format!(
-            "{CHECKOUT_NOT_ADVANCED}: the main checkout is not on {target}, so its files were left as they were."
-        )
-    }
-}
-
-fn reattach(
-    repo: &Path,
-    target: &str,
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
-) -> Result<(), CommandError> {
-    let args = ["checkout", target];
-    gate(&args)?;
-    git_text(repo, &args).map(|_| ())
 }

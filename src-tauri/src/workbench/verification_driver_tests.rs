@@ -7,8 +7,9 @@ use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
 use crate::ipc_error::CommandError;
 use crate::workbench::verification_driver::{
-    base_from_parent_read, decide, run_at, run_now, status, status_batch, target_of,
-    verdict_covers, verification_base, Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
+    base_from_parent_read, decide, judge_candidate_with, run_at, run_now, status, status_batch,
+    target_of, verdict_covers, verification_base, Backend, Driver, Facts, Report, Step, Target,
+    MAX_ACTIVE,
 };
 use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
@@ -1601,4 +1602,115 @@ fn git_text_head(repo: &std::path::Path) -> String {
         .unwrap()
         .trim()
         .to_string()
+}
+
+/// `judge_candidate` fails closed: only a settled pass of exactly the
+/// candidate lets the target ref move. Each of these is a way the wave could
+/// otherwise land a commit nobody verified.
+fn judge(
+    store: &Store,
+    fake: &Fake,
+    repo: &tempfile::TempDir,
+    id: &str,
+    candidate: &str,
+) -> (Result<(), String>, usize) {
+    let mut sleeps = 0usize;
+    let result = judge_candidate_with(store, fake, id, repo.path(), candidate, &mut |wait| {
+        sleeps += 1;
+        assert!(sleeps < 10_000, "the wait never ended");
+        fake.clock.set(fake.clock.get() + wait);
+    });
+    (result, sleeps)
+}
+
+#[test]
+fn a_settled_failure_of_the_candidate_is_refused_without_starting_another_run() {
+    let (_d, store, repo, id) = setup();
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "failed", "settled", &repo, &head));
+    let fake = Fake::new();
+    let (result, _) = judge(&store, &fake, &repo, &id, &head);
+    let why = result.unwrap_err();
+    assert!(why.contains("did not pass verification (failed)"), "{why}");
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_could_not_run_record_for_the_candidate_is_refused() {
+    let (_d, store, repo, id) = setup();
+    let head = head_of(&repo);
+    store_record(
+        &store,
+        &id,
+        &record(&id, "", STATE_COULD_NOT_RUN, &repo, &head),
+    );
+    let fake = Fake::new();
+    let (result, _) = judge(&store, &fake, &repo, &id, &head);
+    let why = result.unwrap_err();
+    assert!(why.contains("could not run"), "{why}");
+    assert!(fake.starts.borrow().is_empty());
+}
+
+/// No verdict ever arrives: the wait ends at its limit on the test clock with
+/// a refusal, after exactly one run was started.
+#[test]
+fn a_verification_that_never_settles_is_refused_at_the_deadline() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let head = head_of(&repo);
+    let fake = Fake::new();
+    let (result, sleeps) = judge(&store, &fake, &repo, &id, &head);
+    let why = result.unwrap_err();
+    assert!(why.contains("did not finish within 20 minutes"), "{why}");
+    assert_eq!(fake.starts.borrow().len(), 1);
+    assert!(sleeps > 1, "the wait did not poll");
+}
+
+/// A pass of some other commit (the lane tip, an older merge) does not cover
+/// the candidate: a run is started for the candidate and, with no verdict for
+/// it, the wait ends in a refusal.
+#[test]
+fn a_pass_for_a_different_commit_does_not_cover_the_candidate() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let head = head_of(&repo);
+    let other = "0".repeat(head.len());
+    store_record(
+        &store,
+        &id,
+        &record(&id, "passed", "settled", &repo, &other),
+    );
+    let fake = Fake::new();
+    let (result, _) = judge(&store, &fake, &repo, &id, &head);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(fake.starts.borrow().len(), 1, "no run for the candidate");
+    assert_eq!(fake.starts.borrow()[0]["head"], head);
+}
+
+#[test]
+fn a_settled_pass_of_the_candidate_is_accepted() {
+    let (_d, store, repo, id) = setup();
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
+    let fake = Fake::new();
+    let (result, _) = judge(&store, &fake, &repo, &id, &head);
+    assert_eq!(result, Ok(()));
+    assert!(fake.starts.borrow().is_empty());
+}
+
+#[test]
+fn a_host_that_is_closing_refuses_the_wait() {
+    let (_d, store, repo, id) = setup();
+    let head = head_of(&repo);
+    let fake = Fake::new();
+    fake.cancelled.set(true);
+    let (result, _) = judge(&store, &fake, &repo, &id, &head);
+    assert!(result.unwrap_err().contains("GitPulse closed"));
+    assert!(fake.starts.borrow().is_empty());
 }
