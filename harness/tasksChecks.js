@@ -3469,6 +3469,118 @@ if (params.has("check")) {
         tasks = tasks.map(task => task.id === draggedId ? { ...task, status: from.status, position: from.position } : task);
       }
 
+      {
+      guardStep = "long column: every loaded card is drawn";
+      // A column past 35 cards used to be windowed at a fixed row height
+      // (cfac83b3, undone by 8a611e6e): cards painted over each other, the drop
+      // slot was computed from the mounted cards only, and Home/End stopped at
+      // the mounted ends. These drive the real drop, keys and re-render with 60
+      // cards in one column, so none of it can come back unseen. The oracle is
+      // the fixture's own column order (position, id), never the DOM. Board
+      // order is on (pickOrder above), which is what makes a card movable.
+      const LONG = 60, STEP = 100, BASE = 100000;
+      const longTasks = Array.from({ length: LONG }, (_, i) => ({ ...makeTask(`task-${5000 + i}`, `Windowed review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"), position: BASE + i * STEP }));
+      const movers = [0, 1].map(i => makeTask(`task-${5100 + i}`, `Windowed mover ${i + 1}`, "repo-0", "backlog"));
+      const longId = i => longTasks[i].id;
+      const refreshLong = async () => { root.querySelector('button[aria-label="Refresh"]').click(); await settle(300); };
+      const reviewIds = () => [...root.querySelectorAll('[data-task-column="review"] [data-task-card]')].map(el => el.dataset.cardId);
+      const positionOf = id => tasks.find(task => task.id === id).position;
+      const fixtureOrder = () => tasks.filter(task => task.status === "review" && !task.archived && !deleted.has(task.id))
+        .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(task => task.id);
+      const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
+      const keyDown = (el, key) => el?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+      const mid = (a, b) => Math.floor((positionOf(a) + positionOf(b)) / 2);
+      const longStarted = Date.now();
+      try {
+        tasks.push(...longTasks, ...movers);
+        await refreshLong();
+        const loadAll = () => [...(root.querySelector('[data-task-column="review"]')?.querySelectorAll("button") ?? [])].find(el => /^Load all .* tasks$/.test(el.getAttribute("aria-label") ?? ""));
+        await wait(() => loadAll());
+        loadAll().click();
+        await wait(() => !loadAll()); await settle(300);
+        const order = fixtureOrder();
+        check(`a column past 35 cards draws every one of them (${reviewIds().length} drawn of ${order.length})`, order.length > 35 && reviewIds().length === order.length);
+        check("and draws them in the column's order", reviewIds().join() === order.join());
+        check("every drawn card is its own task (title and id agree)", reviewIds().every(id => card(id)?.textContent.includes(tasks.find(task => task.id === id)?.title)) && reviewIds().length > 0);
+
+        guardStep = "long column: Home and End";
+        const startCard = card(longId(30)) ?? card(order[Math.floor(order.length / 2)]);
+        startCard?.focus(); keyDown(document.activeElement, "End"); await settle();
+        check("End on a card in a long column focuses the column's last card", document.activeElement?.dataset?.cardId === order.at(-1));
+        keyDown(document.activeElement, "Home"); await settle();
+        check("Home focuses the column's first card", document.activeElement?.dataset?.cardId === order[0]);
+        card(longId(40))?.focus(); keyDown(document.activeElement, "ArrowDown"); await settle();
+        check("ArrowDown deep in the column moves to the next card in the column", document.activeElement?.dataset?.cardId === longId(41));
+
+        guardStep = "long column: re-render keeps each card's element";
+        const elements = new Map(order.map(id => [id, card(id)]));
+        tasks = tasks.map(task => task.id === longId(0) ? { ...task, position: BASE + (LONG + 5) * STEP, revision: task.revision + 1 } : task);
+        await refreshLong();
+        const reordered = await settled(() => reviewIds().join() === fixtureOrder().join() && reviewIds().indexOf(longId(0)) > reviewIds().indexOf(longId(59))); await settle(200);
+        const swapped = order.filter(id => card(id) === null || card(id) !== elements.get(id));
+        check(`a reordered column keeps the same element on the same card id${swapped.length ? ` (changed: ${swapped.slice(0, 5).join(", ")} of ${swapped.length})` : ""}`, reordered && swapped.length === 0);
+        check("and each card still shows its own task after the reorder", reviewIds().length === order.length && reviewIds().every(id => card(id).textContent.includes(tasks.find(task => task.id === id).title)));
+        tasks = tasks.filter(task => task.id !== longId(10));
+        await refreshLong();
+        await settled(() => !card(longId(10))); await settle(200);
+        check("removing one card leaves every other card's element in place",
+          reviewIds().length === order.length - 1 && order.filter(id => id !== longId(10)).every(id => card(id) !== null && card(id) === elements.get(id)));
+
+        // Press `draggedId`, release it on the upper half of `targetId` (scrolled
+        // into view, as a reader's drag would have it), and return what was written.
+        const pointer = (target, type, x, y) => target.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+          button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y,
+        }));
+        const dragBefore = async (draggedId, targetId) => {
+          if (!card(draggedId) || !card(targetId)) return null;
+          card(targetId).scrollIntoView({ block: "center" }); await settle(60);
+          const box = card(targetId).getBoundingClientRect(), grab = card(draggedId).getBoundingClientRect();
+          const x = box.left + box.width / 2, y = box.top + 2, before = writes.length;
+          pointer(card(draggedId), "pointerdown", grab.left + 10, grab.top + 10);
+          pointer(card(draggedId), "pointermove", x, y); await settle(80);
+          pointer(card(draggedId), "pointermove", x, y + 1); await settle(80);
+          pointer(document.body, "pointerup", x, y + 1);
+          await settled(() => writes.length > before); await settle(300);
+          return { write: writes.at(-1), count: writes.length - before };
+        };
+
+        guardStep = "long column: drop far down";
+        const far = await dragBefore(movers[0].id, longId(55));
+        check(`a card dropped on the 56th task of a ${LONG}-card column lands between its 55th and 56th, with one write`,
+          far !== null && far.count === 1 && far.write.id === movers[0].id && far.write.status === "review" && far.write.position === mid(longId(54), longId(55)));
+        await settled(() => reviewIds().includes(movers[0].id)); await settle(200);
+        check("and it is drawn at that slot once the board reloads",
+          reviewIds().indexOf(movers[0].id) > 0 && reviewIds()[reviewIds().indexOf(movers[0].id) - 1] === longId(54) && reviewIds()[reviewIds().indexOf(movers[0].id) + 1] === longId(55));
+
+        guardStep = "long column: drop within the column";
+        const within = await dragBefore(longId(1), longId(58));
+        check("a card dragged down its own column counts its slot without itself, over cards that were never near it",
+          within !== null && within.count === 1 && within.write.id === longId(1) && within.write.status === "review" && within.write.position === mid(longId(57), longId(58)));
+        await settled(() => reviewIds().indexOf(longId(1)) === reviewIds().indexOf(longId(58)) - 1); await settle(200);
+        check("and the card is drawn just before the card it was dropped on", reviewIds().indexOf(longId(1)) === reviewIds().indexOf(longId(58)) - 1);
+
+        guardStep = "long column: list layout";
+        await click("List view");
+        const listRows = () => [...root.querySelectorAll("[data-task-list] [data-task-card]")];
+        const listed = listRows().map(el => el.dataset.cardId);
+        const expectedRows = fixtureOrder();
+        check(`the list layout draws every loaded card past 35 rows (${listed.length} rows, ${expectedRows.length} loaded in Review)`, listed.length > 35 && expectedRows.every(id => listed.includes(id)));
+        listRows()[0]?.focus(); keyDown(document.activeElement, "End"); await settle();
+        check("End in the list focuses the list's last row", listRows().length > 0 && document.activeElement === listRows().at(-1));
+        const longMs = Date.now() - longStarted;
+        check(`the long-column checks fit their 25 s budget of the harness deadline (took ${longMs} ms)`, longMs < 25_000);
+      } catch (error) { check(`the long-column checks ran to the end (${error.message} at ${guardStep})`, false); }
+      finally {
+        // Whatever failed above, the fixture goes back as the later blocks expect it.
+        try {
+          if (root.querySelector("[data-task-list]")) await click("Board view");
+          tasks = tasks.filter(task => !task.title.startsWith("Windowed"));
+          await refreshLong();
+        } catch (error) { check(`the long-column fixture was put back (${error.message})`, false); }
+      }
+      }
+
       guardStep = "claims: editor subtasks and shortcuts";
       {
         card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
