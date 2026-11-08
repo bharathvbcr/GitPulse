@@ -2576,7 +2576,7 @@ mod tests {
     }
 
     /// Writes uniquely-named probe files into `probe_dir` until the debounce
-    /// pipeline delivers one settled callback, then quiesces via
+    /// pipeline delivers a callback that NAMES one of them, then quiesces via
     /// [`await_watcher_quiescence`] so the caller starts from an empty,
     /// genuinely idle channel.
     ///
@@ -2586,28 +2586,127 @@ mod tests {
     /// SinceNow epoch), so a single priming write can be silently lost and
     /// flake the test. Retrying fresh probe names until delivery — the cure
     /// already proven in `dead_repo_watch_stops_emitting_and_reaps_session` —
-    /// makes priming deterministic under load. Panics with the attempt count
-    /// only if nothing is ever delivered within `deadline`.
-    fn prime_watcher<T>(rx: &std::sync::mpsc::Receiver<T>, probe_dir: &Path, deadline: Duration) {
+    /// makes priming deterministic under load.
+    ///
+    /// Why the callback must name a probe rather than be any callback: the
+    /// caller's own setup (commit, stash, file writes) is announced too, and
+    /// when FSEvents delivers late that announcement is the first callback.
+    /// Treating it as proof of priming let the 2.1 s silence pass while the
+    /// probe, and anything queued behind the setup, was still in flight, and
+    /// those events then landed inside the caller's asserted-quiet window.
+    /// One FSEvents stream delivers in event order through one callback thread
+    /// and one FIFO channel into a single-threaded debounce loop, so a
+    /// callback naming a probe proves every write made before that probe has
+    /// already been delivered (this machine's fseventsd ordering is inferred
+    /// from Apple's per-stream event-id contract; the backend ignores the ids).
+    ///
+    /// Panics, naming the attempt count and every path it did see, only if no
+    /// probe is ever announced within `deadline`.
+    fn prime_watcher(
+        rx: &std::sync::mpsc::Receiver<RepoChangedPayload>,
+        probe_dir: &Path,
+        deadline: Duration,
+    ) {
+        prime_watcher_with(rx, deadline, |name| {
+            std::fs::write(probe_dir.join(name), "x").expect("write priming probe");
+        });
+    }
+
+    /// [`prime_watcher`] with the probe write injected, so the keyed wait can
+    /// be driven by a plain channel in a test.
+    fn prime_watcher_with(
+        rx: &std::sync::mpsc::Receiver<RepoChangedPayload>,
+        deadline: Duration,
+        mut write_probe: impl FnMut(&str),
+    ) {
         let overall = Instant::now() + deadline;
-        let mut n = 0u32;
-        loop {
-            std::fs::write(probe_dir.join(format!("watcher-prime-{n}.txt")), "x")
-                .expect("write priming probe");
-            n += 1;
-            if rx
-                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
-                .is_ok()
-            {
-                break;
+        let mut probes: Vec<String> = Vec::new();
+        let mut seen = std::collections::BTreeSet::<String>::new();
+        'primed: loop {
+            let name = format!("watcher-prime-{}.txt", probes.len());
+            write_probe(&name);
+            probes.push(name);
+            let attempt_ends = Instant::now() + DEBOUNCE_QUIET + Duration::from_millis(200);
+            // Earlier callbacks (the caller's setup) are consumed, not
+            // mistaken for the probe.
+            while let Some(left) = attempt_ends.checked_duration_since(Instant::now()) {
+                match rx.recv_timeout(left) {
+                    Ok(payload) => {
+                        if payload.change.paths.iter().any(|p| probes.contains(p)) {
+                            break 'primed;
+                        }
+                        seen.extend(payload.change.paths);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                        "watch loop hung up while priming after {} probe writes; saw paths {seen:?}",
+                        probes.len()
+                    ),
+                }
             }
             assert!(
                 Instant::now() < overall,
-                "watcher never delivered a priming callback after {n} probe writes within \
-                 {deadline:?}; the OS watch stream likely never installed"
+                "watcher never announced a priming probe after {} probe writes within \
+                 {deadline:?}; the OS watch stream likely never installed or delivery is \
+                 stalled. Paths announced meanwhile: {seen:?}",
+                probes.len()
             );
         }
         await_watcher_quiescence(rx);
+    }
+
+    fn announced(paths: &[&str]) -> RepoChangedPayload {
+        RepoChangedPayload {
+            path: "repo".into(),
+            change: RepoChange {
+                kinds: vec![ChangeKind::Worktree],
+                paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+                paths_truncated: false,
+            },
+        }
+    }
+
+    /// Deterministic, independent of fseventsd: the caller's own setup is
+    /// announced first and the probe only later (a late-delivering FSEvents).
+    /// Priming must not return on the setup callback — the probe, still in
+    /// flight past the 2.1 s silence, would otherwise land in the caller's
+    /// asserted-quiet window.
+    #[test]
+    fn prime_watcher_waits_for_its_own_probe_not_the_first_callback() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut late = None;
+        prime_watcher_with(&rx, PRIME_DEADLINE, |name| {
+            if name == "watcher-prime-0.txt" {
+                tx.send(announced(&["staged.txt", "tracked.txt"])).unwrap();
+                let tx = tx.clone();
+                // Past the old helper's DEBOUNCE_MAX_WAIT + 100 ms silence,
+                // inside the deadline.
+                late = Some(thread::spawn(move || {
+                    thread::sleep(DEBOUNCE_MAX_WAIT + Duration::from_millis(900));
+                    tx.send(announced(&["watcher-prime-0.txt"])).unwrap();
+                }));
+            }
+        });
+        // Primed means the probe was consumed and nothing is left in flight.
+        let straggler = rx.recv_timeout(Duration::from_millis(1500));
+        late.take().unwrap().join().unwrap();
+        assert!(
+            straggler.is_err(),
+            "priming returned before its own probe was delivered: {straggler:?}"
+        );
+    }
+
+    /// A stalled backend still fails loud, naming the attempts and the paths
+    /// it did see, rather than passing on someone else's callback.
+    #[test]
+    #[should_panic(expected = "Paths announced meanwhile: {\"staged.txt\"}")]
+    fn prime_watcher_fails_loud_when_only_foreign_paths_arrive() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        prime_watcher_with(&rx, Duration::from_millis(1200), |name| {
+            if name == "watcher-prime-0.txt" {
+                tx.send(announced(&["staged.txt"])).unwrap();
+            }
+        });
     }
 
     /// Debounce proof: 30 rapid top-level writes must settle into exactly one
@@ -3359,8 +3458,8 @@ mod tests {
         start_watch_inner(
             &state,
             work_path.to_string_lossy().into_owned(),
-            move |_| {
-                let _ = tx.send(());
+            move |payload| {
+                let _ = tx.send(payload);
             },
         )
         .expect("watch linked worktree");
