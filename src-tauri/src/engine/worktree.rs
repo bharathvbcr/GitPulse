@@ -7914,6 +7914,8 @@ some-future-field whatever
             },
         )
         .unwrap();
+        // `git hook list` runs only on a git that has it (2.54+), once per commit hook.
+        asked.retain(|a| !a.starts_with("hook list "));
         assert_eq!(asked.len(), 7, "{asked:?}");
         assert!(
             asked[0].starts_with("merge-tree --write-tree --name-only --no-messages -z "),
@@ -8844,6 +8846,8 @@ some-future-field whatever
             },
         )
         .unwrap();
+        // `git hook list` runs only on a git that has it (2.54+), once per commit hook.
+        asked.retain(|a| !a.starts_with("hook list "));
         assert_eq!(asked.len(), 7, "{asked:?}");
         assert!(
             asked[0].starts_with("merge-tree --write-tree --name-only --no-messages -z "),

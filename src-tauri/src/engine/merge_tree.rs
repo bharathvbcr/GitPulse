@@ -12,7 +12,7 @@
 //! has no `merge-tree` write. This module does not build that merge.
 
 use crate::engine::git_cli::{
-    git_captured, git_supports, git_text, without_lazy_fetch, MERGE_TREE_WRITE_TREE,
+    git_captured, git_supports, git_text, without_lazy_fetch, HOOK_LIST, MERGE_TREE_WRITE_TREE,
 };
 use crate::engine::git_writer::{is_full_oid, GitWriter};
 use crate::engine::object_quarantine::{
@@ -250,7 +250,7 @@ pub(crate) fn prepare(
     // pre-merge-commit and commit-msg (secret scanners live there), so a
     // repository that has any of them active does not get its commit written
     // behind them.
-    let hooks = active_commit_hooks(repo).map_err(refused)?;
+    let hooks = active_commit_hooks(repo, gate).map_err(refused)?;
     if !hooks.is_empty() {
         return Err(IntegrateFailure::CommitHooks { hooks });
     }
@@ -461,17 +461,43 @@ fn conflict_message(branch: &str, target: &str, paths: &[String], total: usize) 
     )
 }
 
-/// The hooks `git commit` and `git merge` would run on the commit this
-/// integration records, and `commit-tree` does not.
-const COMMIT_HOOKS: [&str; 3] = ["pre-commit", "pre-merge-commit", "commit-msg"];
+/// The hook events `git commit` and `git merge` run for the commit this
+/// integration records, any of which can abort it, and `commit-tree` runs none.
+const COMMIT_HOOKS: [&str; 4] = [
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+];
 
-/// The names in [`COMMIT_HOOKS`] that are active for `repo`: a regular file in
-/// the hooks directory git would use (`core.hooksPath` respected) with an
-/// executable bit. A directory that cannot be read is an error, not "none".
-pub(crate) fn active_commit_hooks(repo: &Path) -> Result<Vec<String>, CommandError> {
+/// The commit hooks that are active for `repo`, as git 2.54 would run them.
+/// [`active_commit_hooks_with`] with this git's own `hook list` support.
+pub(crate) fn active_commit_hooks(
+    repo: &Path,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<Vec<String>, CommandError> {
+    active_commit_hooks_with(repo, git_supports(HOOK_LIST), gate)
+}
+
+/// The names in [`COMMIT_HOOKS`] that are active for `repo`. Two sources, both
+/// fail closed:
+/// - the hooks directory git would use (`core.hooksPath` respected): a regular
+///   file with an executable bit. A directory that cannot be read is an error,
+///   not "none";
+/// - `git hook list <event>` when `hook_list` is set (git 2.54+), which also
+///   reports hooks defined in configuration with no file anywhere. Exit 0 lists
+///   hooks, exit 1 with "no hooks found" is none, and anything else (a failed
+///   run, another exit code) counts as hooks present.
+///
+/// Below 2.54 there are no config hooks, so the directory is the whole answer.
+pub(crate) fn active_commit_hooks_with(
+    repo: &Path,
+    hook_list: bool,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<Vec<String>, CommandError> {
     let spelled = git_text(repo, &["rev-parse", "--git-path", "hooks"])?;
     let dir = repo.join(spelled.trim());
-    let mut active = Vec::new();
+    let mut active: Vec<String> = Vec::new();
     for name in COMMIT_HOOKS {
         match std::fs::metadata(dir.join(name)) {
             Ok(meta) if meta.is_file() && is_executable(&meta) => active.push(name.to_string()),
@@ -484,8 +510,54 @@ pub(crate) fn active_commit_hooks(repo: &Path) -> Result<Vec<String>, CommandErr
                 )))
             }
         }
+        if hook_list {
+            if let Some(found) = listed_hook(repo, name, gate)? {
+                if !active.iter().any(|seen| seen.starts_with(name)) {
+                    active.push(found);
+                }
+            }
+        }
     }
     Ok(active)
+}
+
+/// `git hook list <event>` in `repo`: the event (with the reason, when git
+/// could not say) if anything may run for it, `None` when git says there is
+/// nothing.
+fn listed_hook(
+    repo: &Path,
+    event: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<Option<String>, CommandError> {
+    let args = ["hook", "list", event];
+    gate(&args)?;
+    let run = match git_captured(repo, &args) {
+        Ok(run) => run,
+        Err(error) => {
+            return Ok(Some(format!(
+                "{event} (git hook list could not run: {})",
+                error.message()
+            )))
+        }
+    };
+    Ok(classify_hook_list(
+        event,
+        run.status_code,
+        &String::from_utf8_lossy(&run.stderr),
+    ))
+}
+
+/// What `git hook list <event>` said: exit 0 lists hooks, exit 1 with "no hooks
+/// found" is none, anything else is hooks that may run (fail closed).
+pub(crate) fn classify_hook_list(event: &str, status: i32, stderr: &str) -> Option<String> {
+    match status {
+        0 => Some(event.to_string()),
+        1 if stderr.contains("no hooks found") => None,
+        code => Some(format!(
+            "{event} (git hook list exited {code}: {})",
+            stderr.trim()
+        )),
+    }
 }
 
 #[cfg(unix)]

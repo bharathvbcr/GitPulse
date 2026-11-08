@@ -347,12 +347,14 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
     let (dir, _lane) = lane_fixture();
     let repo = dir.path();
     write_hook(repo, "pre-commit", "#!/bin/sh\nexit 1\n", false);
-    assert!(crate::engine::merge_tree::active_commit_hooks(repo)
-        .unwrap()
-        .is_empty());
+    assert!(
+        crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all)
+            .unwrap()
+            .is_empty()
+    );
     write_hook(repo, "commit-msg", "#!/bin/sh\nexit 1\n", true);
     assert_eq!(
-        crate::engine::merge_tree::active_commit_hooks(repo).unwrap(),
+        crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all).unwrap(),
         ["commit-msg"]
     );
     let elsewhere = tempfile::tempdir().unwrap();
@@ -364,9 +366,11 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
             elsewhere.path().to_str().unwrap(),
         ],
     );
-    assert!(crate::engine::merge_tree::active_commit_hooks(repo)
-        .unwrap()
-        .is_empty());
+    assert!(
+        crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all)
+            .unwrap()
+            .is_empty()
+    );
     {
         use std::os::unix::fs::PermissionsExt;
         let hook = elsewhere.path().join("pre-merge-commit");
@@ -374,7 +378,7 @@ fn active_hooks_follow_the_executable_bit_and_hooks_path() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     assert_eq!(
-        crate::engine::merge_tree::active_commit_hooks(repo).unwrap(),
+        crate::engine::merge_tree::active_commit_hooks_with(repo, false, &mut allow_all).unwrap(),
         ["pre-merge-commit"]
     );
 }
