@@ -677,7 +677,23 @@ pub struct CollisionFacts {
 /// 3. a check that could not run, or could only half run, also renders no
 ///    decision — but says so out loud. Silence here would be indistinguishable
 ///    from (2), which is the failure this whole module is built to avoid.
+/// Claim-store findings for one path. They are notices. They never become
+/// `others`, so a declared claim is not itself a collision ask.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimNotices {
+    /// Holder and declared-run lines, already worded.
+    pub lines: Vec<String>,
+    /// The path is dirty in this shared worktree and no claim names anyone.
+    pub owner_unknown: bool,
+    /// The claim store could not be read. Empty means it was read.
+    pub store_error: String,
+}
+
 pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
+    collision_decision_with_claims(facts, &ClaimNotices::default())
+}
+
+pub fn collision_decision_with_claims(facts: &CollisionFacts, claims: &ClaimNotices) -> HookOutput {
     if !facts.ok {
         return HookOutput::notice(format!(
             "GitPulse collision check did NOT run for this edit: {}. \
@@ -687,17 +703,7 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
     }
 
     if facts.others.is_empty() {
-        // A partial scan that found nothing has not established anything. Say
-        // which half of the check is missing rather than implying a clean pass.
-        if !facts.partial.is_empty() {
-            return HookOutput::notice(format!(
-                "GitPulse collision check was INCOMPLETE for {}: {}. \
-                 Nothing was found, but not everything was looked at.",
-                or_unknown(&facts.target),
-                clause(&facts.partial)
-            ));
-        }
-        return HookOutput::silent();
+        return negative_claim_decision(facts, claims);
     }
 
     // A positive finding stands on its own evidence, so it is reported even
@@ -751,6 +757,52 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
         hook_specific_output: Some(decision(PRE_TOOL_USE, PermissionDecision::Ask, reason)),
         system_message: None,
     }
+}
+
+/// A negative dirty-file scan, plus whatever the claim store established.
+///
+/// A holder, a declared run, or an unknown owner is said out loud and is not
+/// an ask: a declared claim is "claimed by run X", and a dirty path nobody
+/// claimed is "owner unknown", not a collision. A store that could not be
+/// read is incomplete, never a silent clean pass.
+fn negative_claim_decision(facts: &CollisionFacts, claims: &ClaimNotices) -> HookOutput {
+    let mut gaps = Vec::new();
+    if !facts.partial.is_empty() {
+        gaps.push(facts.partial.clone());
+    }
+    if !claims.store_error.is_empty() {
+        gaps.push(format!(
+            "the claim store could not be read ({})",
+            claims.store_error
+        ));
+    }
+    let mut said = claims.lines.clone();
+    if claims.owner_unknown {
+        said.push(format!(
+            "{} is dirty here, owner unknown",
+            or_unknown(&facts.target)
+        ));
+    }
+    if said.is_empty() && gaps.is_empty() {
+        return HookOutput::silent();
+    }
+    if said.is_empty() {
+        return HookOutput::notice(format!(
+            "GitPulse collision check was INCOMPLETE for {}: {}. \
+             Nothing was found, but not everything was looked at.",
+            or_unknown(&facts.target),
+            clause(&gaps.join("; "))
+        ));
+    }
+    let mut message = format!(
+        "GitPulse: {} — {}.",
+        or_unknown(&facts.target),
+        said.join("; ")
+    );
+    if !gaps.is_empty() {
+        message.push_str(&format!(" The check was INCOMPLETE: {}.", gaps.join("; ")));
+    }
+    HookOutput::notice(message)
 }
 
 /// Closing sentence for a positive collision finding.
@@ -969,6 +1021,126 @@ fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
 /// on whichever thread `run` chooses (see [`command_gate_with`] for why).
 type WriteJob = Box<dyn FnOnce() -> harness::FileScopeCheck + Send>;
 
+/// An edit the guard may still let through, so the claim store can name who
+/// wrote it. Early refusals and calls with nothing to claim carry `None`.
+struct PendingClaim {
+    root: std::path::PathBuf,
+    path: String,
+}
+
+fn pending_claim(root: &Path, path: &str) -> PendingClaim {
+    PendingClaim {
+        root: root.to_path_buf(),
+        path: path.to_string(),
+    }
+}
+
+/// True when the host will still perform the write. An ask or a deny does not
+/// record a claim: the edit did not happen.
+fn lets_write_through(output: &HookOutput) -> bool {
+    output
+        .hook_specific_output
+        .as_ref()
+        .and_then(|specific| specific.permission_decision)
+        .is_none()
+}
+
+/// Reads the claim store for this edit. The collision scan's memo does not
+/// carry claims, and a failed read stays on `store_error` so the decision
+/// cannot look complete.
+fn claim_notices(root: &Path, risk: &CollisionRisk, target: &str, session_id: &str) -> ClaimNotices {
+    use crate::insights::claims::{self, ClaimSource};
+    let now = claims::now_ms();
+    let rows = match claims::read_for_worktree(root, now) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return ClaimNotices {
+                store_error: error,
+                ..ClaimNotices::default()
+            };
+        }
+    };
+    let wanted = claims::normalize_rel(target).unwrap_or_else(|_| target.to_string());
+    let mut covered = false;
+    let mut lines = Vec::new();
+    let mut seen_observed = std::collections::HashSet::new();
+    let mut seen_declared = std::collections::HashSet::new();
+    for claim in rows.iter().rev() {
+        if claim.path != wanted && claim.path != target {
+            continue;
+        }
+        covered = true;
+        match claim.source {
+            ClaimSource::Observed => {
+                let id = claim.session_id.as_deref().unwrap_or("");
+                if id.is_empty() || id == session_id || !seen_observed.insert(id.to_string()) {
+                    continue;
+                }
+                let age_s = now.saturating_sub(claim.ts_ms) / 1000;
+                lines.push(format!("holder: session {id}, {age_s} s ago"));
+            }
+            ClaimSource::Declared => {
+                let run = claim.run_id.as_deref().unwrap_or("");
+                // The run working in this checkout already knows its own plan.
+                // Another checkout is told before the file is dirty.
+                if run.is_empty()
+                    || same_path(&claim.worktree, root)
+                    || !seen_declared.insert(run.to_string())
+                {
+                    continue;
+                }
+                lines.push(format!("claimed by run {run}"));
+            }
+        }
+    }
+    let dirty_shared = risk.shared_worktrees.iter().any(|shared| {
+        same_path(&shared.path, root)
+            && shared
+                .files
+                .iter()
+                .any(|file| file == &wanted || file == target)
+    });
+    ClaimNotices {
+        lines,
+        owner_unknown: dirty_shared && !covered,
+        store_error: String::new(),
+    }
+}
+
+fn claim_write_incomplete(target: &str, error: &str) -> HookOutput {
+    HookOutput::notice(format!(
+        "GitPulse collision check was INCOMPLETE for {}: {}. \
+         Nothing was found, but not everything was looked at.",
+        or_unknown(target),
+        clause(&format!("the claim could not be recorded ({error})"))
+    ))
+}
+
+/// Records the observed claim only after bypass has been applied, and only
+/// when the write is going to happen. A failed append is said out loud.
+fn record_let_through(
+    input: &HookInput,
+    pending: Option<PendingClaim>,
+    output: HookOutput,
+) -> HookOutput {
+    let Some(pending) = pending else {
+        return output;
+    };
+    if input.session_id.is_empty() || !lets_write_through(&output) {
+        return output;
+    }
+    match crate::insights::claims::record_observed(
+        &pending.root,
+        &input.session_id,
+        &pending.path,
+        &input.cwd,
+        crate::insights::claims::now_ms(),
+    ) {
+        Ok(()) => output,
+        Err(error) => merge_outputs(output, claim_write_incomplete(&pending.path, &error)),
+    }
+}
+
 /// The collision guard with its wait bounded by `budget`: [`BUDGET`] in the
 /// hook, longer only for tests that judge what the scan finds rather than how
 /// long it may take.
@@ -977,37 +1149,54 @@ fn collision_guard_with(
     budget: Duration,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
 ) -> HookOutput {
-    under_bypass(input, collision_guard_decided(input, budget, run))
+    let (decided, pending) = collision_guard_decided(input, budget, run);
+    record_let_through(input, pending, under_bypass(input, decided))
 }
 
 /// [`collision_guard_with`] before the permission mode is applied.
+///
+/// The pending claim is `Some` only when this call has a repo-relative path
+/// and did not refuse the write on scope. The caller records it after bypass,
+/// and only if the final answer still lets the write through.
 fn collision_guard_decided(
     input: &HookInput,
     budget: Duration,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
-) -> HookOutput {
+) -> (HookOutput, Option<PendingClaim>) {
     let started = std::time::Instant::now();
     if input.file_path.is_empty() {
-        return HookOutput::notice(
-            "GitPulse collision check did NOT run: the tool call carried no file path.",
+        return (
+            HookOutput::notice(
+                "GitPulse collision check did NOT run: the tool call carried no file path.",
+            ),
+            None,
         );
     }
     if input.cwd.is_empty() {
-        return unchecked(&input.file_path, "the hook payload carried no cwd");
+        return (
+            unchecked(&input.file_path, "the hook payload carried no cwd"),
+            None,
+        );
     }
 
     let Some(root) = find_git_root(Path::new(&input.cwd)) else {
-        return unchecked(
-            &input.file_path,
-            &format!("{} is not inside a Git repository", input.cwd),
+        return (
+            unchecked(
+                &input.file_path,
+                &format!("{} is not inside a Git repository", input.cwd),
+            ),
+            None,
         );
     };
 
     let file = canonical_enough(Path::new(&input.file_path));
     let Some(target) = repo_relative(&root, &file) else {
-        return unchecked(
-            &input.file_path,
-            &format!("the path is not inside the worktree at {}", root.display()),
+        return (
+            unchecked(
+                &input.file_path,
+                &format!("the path is not inside the worktree at {}", root.display()),
+            ),
+            None,
         );
     };
 
@@ -1018,12 +1207,16 @@ fn collision_guard_decided(
         harness::check_file_in_scope(&scope_root, &scope_target, op)
     })) else {
         // The scope could not be read in time, so neither check ran: refusing
-        // would be a guess, and silence would read as a clean pass.
-        return HookOutput::notice(format!(
-            "GitPulse could not check this write against the task scope within {}s, and \
-             did not run the collision check either. It ran UNGATED.",
-            budget.as_secs()
-        ));
+        // would be a guess, and silence would read as a clean pass. The write
+        // still happens, so the claim is recorded.
+        return (
+            HookOutput::notice(format!(
+                "GitPulse could not check this write against the task scope within {}s, and \
+                 did not run the collision check either. It ran UNGATED.",
+                budget.as_secs()
+            )),
+            Some(pending_claim(&root, &target)),
+        );
     };
     let (scoped, unscoped) = match &scope {
         harness::FileScopeCheck::Judged(judged) => {
@@ -1033,7 +1226,7 @@ fn collision_guard_decided(
                 .as_ref()
                 .is_some_and(|specific| specific.permission_decision.is_some())
             {
-                return output;
+                return (output, None);
             }
             (output, judged.unscoped)
         }
@@ -1055,12 +1248,15 @@ fn collision_guard_decided(
         move || scan_collisions(&root_arg, &target, &deadline, !classified_here)
     });
     let Some(risk) = scanned else {
-        return merge_outputs(
-            scoped,
-            unchecked(
-                &target,
-                &format!("the scan did not finish within {}s", budget.as_secs()),
+        return (
+            merge_outputs(
+                scoped,
+                unchecked(
+                    &target,
+                    &format!("the scan did not finish within {}s", budget.as_secs()),
+                ),
             ),
+            Some(pending_claim(&root, &target)),
         );
     };
 
@@ -1084,8 +1280,12 @@ fn collision_guard_decided(
         facts.partial,
         risk.scanned_worktrees,
     );
-    let output = merge_outputs(scoped, collision_decision(&facts));
-    announce_unscoped(output, unscoped, Judged::Write, input)
+    let notices = claim_notices(&root, &risk, &target, &input.session_id);
+    let output = merge_outputs(scoped, collision_decision_with_claims(&facts, &notices));
+    (
+        announce_unscoped(output, unscoped, Judged::Write, input),
+        Some(pending_claim(&root, &target)),
+    )
 }
 
 /// How long before the hook's budget ends the collision scan stops starting
@@ -1834,6 +2034,57 @@ fn first_notice_in_session(session: &str, cwd: &str, why: &str) -> bool {
 
 /* ── 3. session-brief: SessionStart ───────────────────────────────────────── */
 
+/// How a shared worktree's dirty files are named in the brief.
+///
+/// Git does not record which of the sessions dirtied a file. A claim does.
+/// With none, the file is owner-unknown — not "open to all of them".
+fn shared_dirt_clause(snapshot: &InsightsSnapshot, shared: &insights::SharedWorktree) -> String {
+    if !shared.scanned {
+        return "its dirty files were NOT scanned".to_string();
+    }
+    let trunc = if shared.truncated {
+        " [list truncated]"
+    } else {
+        ""
+    };
+    let mut named = Vec::new();
+    for claim in &snapshot.collisions.file_claims {
+        if !shared.files.iter().any(|file| file == &claim.path) {
+            continue;
+        }
+        let who = match claim.source {
+            insights::claims::ClaimSource::Observed => claim
+                .session_id
+                .as_deref()
+                .map(|id| format!("{} holder: session {id}", claim.path)),
+            insights::claims::ClaimSource::Declared => claim
+                .run_id
+                .as_deref()
+                .map(|id| format!("{} claimed by run {id}", claim.path)),
+        };
+        if let Some(who) = who {
+            if !named.contains(&who) {
+                named.push(who);
+            }
+        }
+        if named.len() == 4 {
+            break;
+        }
+    }
+    if named.is_empty() {
+        format!(
+            "{} dirty file(s), owner unknown until an edit claim names one{trunc}",
+            shared.files.len()
+        )
+    } else {
+        format!(
+            "{} dirty file(s); {}{trunc}",
+            shared.files.len(),
+            named.join(", ")
+        )
+    }
+}
+
 /// The SessionStart brief, over a snapshot someone else gathered.
 ///
 /// `here` is the worktree the session actually started in, which is not
@@ -1977,24 +2228,18 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         ));
     }
     out.push_str(&live_sessions_lines(&snapshot.agents.live, here));
+    if !snapshot.collisions.claims_error.is_empty() {
+        out.push_str(&format!(
+            "file claims: UNAVAILABLE ({})\n",
+            or_unknown(&snapshot.collisions.claims_error)
+        ));
+    }
     for shared in &snapshot.collisions.shared_worktrees {
         out.push_str(&format!(
             "  ! {} live sessions share {}: {}\n",
             shared.sessions.len(),
             shared.path,
-            if shared.scanned {
-                format!(
-                    "{} dirty file(s) open to all of them{}",
-                    shared.files.len(),
-                    if shared.truncated {
-                        " [list truncated]"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                "its dirty files were NOT scanned".to_string()
-            }
+            shared_dirt_clause(snapshot, shared)
         ));
     }
 
@@ -2925,6 +3170,8 @@ mod tests {
             shared_worktrees: Vec::new(),
             sessions_ok: true,
             sessions_error: String::new(),
+            file_claims: Vec::new(),
+            claims_error: String::new(),
         }
     }
 
@@ -3579,6 +3826,8 @@ mod tests {
             shared_worktrees: Vec::new(),
             sessions_ok: true,
             sessions_error: String::new(),
+            file_claims: Vec::new(),
+            claims_error: String::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "a.txt", &|_| String::new());
         assert!(facts.ok, "one worktree was read, so the scan ran");
@@ -3640,6 +3889,8 @@ mod tests {
             shared_worktrees: Vec::new(),
             sessions_ok: true,
             sessions_error: String::new(),
+            file_claims: Vec::new(),
+            claims_error: String::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert!(!facts.ok);
@@ -3700,6 +3951,209 @@ mod tests {
             .system_message
             .unwrap_or_default()
             .contains("did NOT run"));
+    }
+
+    fn said(output: &HookOutput) -> String {
+        let mut parts = Vec::new();
+        if let Some(message) = &output.system_message {
+            parts.push(message.clone());
+        }
+        if let Some(specific) = &output.hook_specific_output {
+            if let Some(reason) = &specific.permission_decision_reason {
+                parts.push(reason.clone());
+            }
+            if let Some(context) = &specific.additional_context {
+                parts.push(context.clone());
+            }
+        }
+        parts.join("\n")
+    }
+
+    fn live_here(pid: u32) -> crate::insights::LiveSession {
+        crate::insights::LiveSession {
+            kind: "claude".into(),
+            pid,
+            entrypoint: String::new(),
+            status: String::new(),
+            cwd: String::new(),
+            tree: None,
+            run_id: None,
+            parent_pid: None,
+            session_id: None,
+            proc_start: None,
+            registry_cwd: None,
+        }
+    }
+
+    /// A declared claim is a notice. It does not turn a real dirty overlap
+    /// into a pass, and it does not become an ask by itself.
+    #[test]
+    fn a_declared_claim_never_counts_as_a_collision_by_itself() {
+        let claimed = ClaimNotices {
+            lines: vec!["claimed by run run-x".into()],
+            ..ClaimNotices::default()
+        };
+        let clean = CollisionFacts {
+            ok: true,
+            error: String::new(),
+            target: "a.rs".into(),
+            others: Vec::new(),
+            partial: String::new(),
+            entity: None,
+        };
+        let notice = collision_decision_with_claims(&clean, &claimed);
+        let text = said(&notice);
+        assert!(text.contains("claimed by run run-x"), "{text}");
+        assert!(notice
+            .hook_specific_output
+            .as_ref()
+            .and_then(|specific| specific.permission_decision)
+            .is_none());
+
+        let contended = CollisionFacts {
+            others: vec![CollisionOther {
+                worktree: "/other".into(),
+                branch: String::new(),
+                session: String::new(),
+                agent_kind: String::new(),
+            }],
+            ..clean
+        };
+        let ask = collision_decision_with_claims(&contended, &claimed);
+        assert_eq!(
+            ask.hook_specific_output
+                .and_then(|specific| specific.permission_decision),
+            Some(PermissionDecision::Ask)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_session_editing_a_claimed_path_is_told_the_first_sessions_name() {
+        let repo = crate::test_support::git_repo();
+        let file = repo.path().join("a.rs");
+        let cwd = repo.path().to_string_lossy().into_owned();
+        let mut first = edit_call(&cwd, &file.to_string_lossy());
+        first.session_id = "session-a".into();
+        let first_out = guard_here(&first);
+        assert!(
+            lets_write_through(&first_out),
+            "the first edit has to be let through: {:?}",
+            first_out.render()
+        );
+        let mut second = first.clone();
+        second.session_id = "session-b".into();
+        let second_out = guard_here(&second);
+        let text = said(&second_out);
+        assert!(!second_out.is_silent(), "{text}");
+        assert!(
+            text.contains("holder: session session-a"),
+            "{text}"
+        );
+        assert!(
+            second_out
+                .hook_specific_output
+                .as_ref()
+                .and_then(|specific| specific.permission_decision)
+                .is_none(),
+            "an observed claim is a notice, not an ask: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_claim_is_named_before_the_file_is_dirty() {
+        let repo = crate::test_support::git_repo();
+        let other = tempfile::tempdir().unwrap();
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
+        crate::insights::claims::declare(
+            &common,
+            "run-x",
+            other.path().to_str().unwrap(),
+            &["a.rs".to_string()],
+            crate::insights::claims::now_ms(),
+        )
+        .unwrap();
+        let file = repo.path().join("a.rs");
+        let mut call = edit_call(
+            &repo.path().to_string_lossy(),
+            &file.to_string_lossy(),
+        );
+        call.session_id = "session-b".into();
+        let output = guard_here(&call);
+        let text = said(&output);
+        assert!(text.contains("claimed by run run-x"), "{text}");
+        assert!(
+            output
+                .hook_specific_output
+                .as_ref()
+                .and_then(|specific| specific.permission_decision)
+                .is_none(),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_dirty_path_with_no_claim_is_owner_unknown_not_a_collision() {
+        let repo = crate::test_support::git_repo();
+        let mut risk = clean_risk(Vec::new());
+        risk.shared_worktree_files = 1;
+        risk.shared_worktrees = vec![crate::insights::SharedWorktree {
+            path: repo.path().to_string_lossy().into_owned(),
+            branch: Some("main".into()),
+            sessions: vec![live_here(1), live_here(2)],
+            files: vec!["a.rs".into()],
+            scanned: true,
+            truncated: false,
+        }];
+        let notices = claim_notices(repo.path(), &risk, "a.rs", "session-b");
+        assert!(notices.owner_unknown && notices.lines.is_empty(), "{notices:?}");
+        let facts = collision_facts(&risk, repo.path(), "a.rs", &no_sessions);
+        let output = collision_decision_with_claims(&facts, &notices);
+        let text = said(&output);
+        assert!(text.contains("a.rs is dirty here, owner unknown"), "{text}");
+        assert!(output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|specific| specific.permission_decision)
+            .is_none());
+
+        crate::insights::claims::record_observed(
+            repo.path(),
+            "session-a",
+            "a.rs",
+            &repo.path().to_string_lossy(),
+            crate::insights::claims::now_ms(),
+        )
+        .unwrap();
+        let held = claim_notices(repo.path(), &risk, "a.rs", "session-b");
+        assert!(!held.owner_unknown, "{held:?}");
+        assert!(
+            held.lines
+                .iter()
+                .any(|line| line.starts_with("holder: session session-a")),
+            "{held:?}"
+        );
+        let own = claim_notices(repo.path(), &risk, "a.rs", "session-a");
+        assert!(!own.owner_unknown && own.lines.is_empty(), "{own:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_claim_write_makes_the_check_incomplete_never_silent() {
+        let repo = crate::test_support::git_repo();
+        std::fs::write(repo.path().join(".git").join("gitpulse"), b"x").unwrap();
+        let file = repo.path().join("a.rs");
+        let mut call = edit_call(
+            &repo.path().to_string_lossy(),
+            &file.to_string_lossy(),
+        );
+        call.session_id = "session-a".into();
+        let output = guard_here(&call);
+        let text = said(&output);
+        assert!(!output.is_silent(), "{text}");
+        assert!(text.contains("INCOMPLETE"), "{text}");
     }
 
     /* ── path handling ────────────────────────────────────────────────────── */
@@ -5372,6 +5826,9 @@ done
             tree: None,
             run_id: None,
             parent_pid: None,
+            session_id: None,
+            proc_start: None,
+            registry_cwd: None,
         };
         let kind = |kind: &str, ok, sessions| LiveKindStatus {
             kind: kind.into(),
@@ -5412,7 +5869,9 @@ done
             "{brief}"
         );
         assert!(
-            brief.contains("! 2 live sessions share /repo: 2 dirty file(s) open to all of them"),
+            brief.contains(
+                "! 2 live sessions share /repo: 2 dirty file(s), owner unknown until an edit claim names one"
+            ),
             "{brief}"
         );
     }
@@ -5479,6 +5938,8 @@ done
             shared_worktrees: Vec::new(),
             sessions_ok: true,
             sessions_error: String::new(),
+            file_claims: Vec::new(),
+            claims_error: String::new(),
         };
         snapshot.ledger.recording = false;
         snapshot.ledger.recording_state = "unknown".to_string();

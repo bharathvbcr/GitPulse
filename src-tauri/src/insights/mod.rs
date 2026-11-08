@@ -3,8 +3,10 @@
 //! Assembles worktrees, agent sessions, working-tree changes, and overlapping
 //! dirty files into one snapshot. Every facet reports whether it could run:
 //! a check that did not run must never look like one that ran and found
-//! nothing. Nothing here mutates a repository.
+//! nothing. Nothing here updates a git ref, index, or worktree file. File
+//! claims are a sidecar under the common git directory; see [`claims`].
 
+pub mod claims;
 mod collision_memo;
 mod entity_collision;
 #[cfg(test)]
@@ -133,6 +135,20 @@ pub struct LiveSession {
     /// observation, though not necessarily one in this worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_pid: Option<u32>,
+    /// The agent's own session id, when its registry named one. Hook claims
+    /// join on this, not on the pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Claude Code's `procStart` string, the same text a worktree lock records.
+    /// A lock matches only when the pid and this string both agree, so a reused
+    /// pid cannot inherit the lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start: Option<String>,
+    /// The cwd the registry recorded. Process `cwd` stays the process table's
+    /// value; they differ for an isolation worktree whose process still sits
+    /// in the parent checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_cwd: Option<String>,
 }
 
 /// One session in the forest [`LiveWorktree::children`] holds.
@@ -333,6 +349,13 @@ pub struct CollisionRisk {
     pub sessions_ok: bool,
     /// Why `sessions_ok` is false: each kind that could not be observed.
     pub sessions_error: String,
+    /// Declared and observed file claims. Empty is "none" only when
+    /// `claims_error` is empty; a failed read is not an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_claims: Vec<claims::FileClaim>,
+    /// Why `file_claims` could not be read, or that the list was cut at its cap.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub claims_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +560,8 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
         shared_worktrees: Vec::new(),
         sessions_ok: false,
         sessions_error: error,
+        file_claims: Vec::new(),
+        claims_error: String::new(),
     }
 }
 
@@ -1934,6 +1959,8 @@ fn collision_from_list_reading(
         shared_worktrees,
         sessions_ok: live.ok,
         sessions_error: sessions_error(live),
+        file_claims: Vec::new(),
+        claims_error: String::new(),
     }
 }
 
@@ -2059,7 +2086,35 @@ pub fn collision_row_for_path(repo_path: &str, path: &str) -> CollisionRisk {
     let mut risk = collision_for_path(repo_path, path, None);
     risk.shared_worktrees.clear();
     risk.shared_worktree_files = 0;
+    attach_file_claims(&mut risk, repo_path, Some(path));
     risk
+}
+
+/// How many claim rows one answer keeps. This is the store cap: a shorter
+/// sample would let a wave treat the unread tail as unclaimed. The store
+/// already refuses to grow past it.
+const MAX_RETURNED_CLAIMS: usize = claims::DEFAULT_CAP;
+
+/// Fills `file_claims` from the sidecar. A missing store stays empty. A failed
+/// read sets `claims_error` and does not change `ok`: the porcelain scan and
+/// the claim store are different checks, and one failing must not look like
+/// the other succeeded or like neither ran.
+fn attach_file_claims(risk: &mut CollisionRisk, repo_path: &str, only: Option<&str>) {
+    let now = claims::now_ms();
+    match claims::read_for_worktree(Path::new(repo_path), now) {
+        Ok(mut rows) => {
+            if let Some(path) = only {
+                let wanted = claims::normalize_rel(path).unwrap_or_else(|_| path.to_string());
+                rows.retain(|claim| claim.path == wanted || claim.path == path);
+            }
+            if rows.len() > MAX_RETURNED_CLAIMS {
+                rows.truncate(MAX_RETURNED_CLAIMS);
+                risk.claims_error = format!("file claims truncated to {MAX_RETURNED_CLAIMS}");
+            }
+            risk.file_claims = rows;
+        }
+        Err(error) => risk.claims_error = error,
+    }
 }
 
 /// [`collision_for_path`] without the symbol verdict: who holds `path`, and how
@@ -2116,10 +2171,12 @@ fn collision_risk_observed(
     repo_path: &str,
     observation: &live_sessions::Observation,
 ) -> CollisionRisk {
-    match worktree::list_worktrees_lite(repo_path) {
+    let mut risk = match worktree::list_worktrees_lite(repo_path) {
         Ok(list) => collision_from_list(&list, &live_in(observation, &list), None),
         Err(error) => empty_collisions(error.into_message()),
-    }
+    };
+    attach_file_claims(&mut risk, repo_path, None);
+    risk
 }
 
 fn to_changed(file: &FileStatus) -> ChangedFile {
@@ -3496,6 +3553,67 @@ mod tests {
         fs::remove_dir_all(&wt).unwrap();
         let broken = dirty_elsewhere(repo);
         assert!(!broken.ok && !broken.worktrees[0].scanned, "{broken:?}");
+    }
+
+    /// CARD 1's path query carries the claim sidecar for that path. A declared
+    /// claim is not a dirty-file collision, and a store that cannot be read
+    /// sets `claims_error` without turning the porcelain scan into a failure.
+    #[test]
+    fn a_path_query_names_a_declared_claim_and_a_failed_store_stays_off_ok() {
+        let main = init_repo();
+        let repo = main.path();
+        let other = tempfile::tempdir().unwrap();
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo).unwrap();
+        claims::declare(
+            &common,
+            "run-x",
+            other.path().to_str().unwrap(),
+            &["a.rs".to_string()],
+            claims::now_ms(),
+        )
+        .unwrap();
+        let row = collision_row_for_path(repo.to_str().unwrap(), "a.rs");
+        assert!(row.ok, "{row:?}");
+        assert!(row.items.is_empty(), "a claim is not a dirty overlap: {row:?}");
+        assert!(row.shared_worktrees.is_empty(), "{row:?}");
+        assert!(row.claims_error.is_empty(), "{row:?}");
+        assert_eq!(row.file_claims.len(), 1, "{row:?}");
+        assert_eq!(row.file_claims[0].path, "a.rs");
+        assert_eq!(row.file_claims[0].run_id.as_deref(), Some("run-x"));
+        assert_eq!(row.file_claims[0].source, claims::ClaimSource::Declared);
+        let elsewhere = collision_row_for_path(repo.to_str().unwrap(), "other.rs");
+        assert!(elsewhere.file_claims.is_empty(), "{elsewhere:?}");
+
+        let mut many = Vec::new();
+        for index in 0..33 {
+            many.push(format!("f{index}.rs"));
+        }
+        claims::declare(
+            &common,
+            "run-x",
+            other.path().to_str().unwrap(),
+            &many,
+            claims::now_ms(),
+        )
+        .unwrap();
+        let wide = collision_risk(repo.to_str().unwrap());
+        assert!(wide.ok, "{wide:?}");
+        assert!(
+            wide.claims_error.is_empty(),
+            "every live claim is returned, up to the store cap: {wide:?}"
+        );
+        assert_eq!(wide.file_claims.len(), 34, "{wide:?}");
+        assert!(
+            wide.file_claims.iter().any(|claim| claim.path == "a.rs"),
+            "{wide:?}"
+        );
+
+        let blocked = init_repo();
+        fs::write(blocked.path().join(".git").join("gitpulse"), b"x").unwrap();
+        let failed = collision_row_for_path(blocked.path().to_str().unwrap(), "a.rs");
+        assert!(failed.ok, "the porcelain scan still ran: {failed:?}");
+        assert!(failed.file_claims.is_empty(), "{failed:?}");
+        assert!(!failed.claims_error.is_empty(), "{failed:?}");
     }
 
     #[test]

@@ -359,6 +359,42 @@ fn fold_description(description: &str, planned: &[String], repositories: &[Strin
     out
 }
 
+/// Repo-relative paths under a description's `## Planned files` list.
+///
+/// The board stores the card's planned files in the description (see
+/// [`fold_description`]), not in a column. Absolute paths, `..`, and anything
+/// the claim store would reject are skipped. At most 64 paths are returned.
+pub(crate) fn planned_paths(description: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_section = false;
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_section = heading.trim() == "Planned files";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        let Ok(path) = crate::insights::claims::normalize_rel(item.trim()) else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        if paths.len() >= 64 {
+            break;
+        }
+    }
+    paths
+}
+
 /// `YYYY-MM-DD` (placed at 12:00 UTC, which is that calendar day in every
 /// time zone from UTC−11 to UTC+11), or Unix seconds.
 pub(crate) fn parse_due(raw: Option<&str>) -> Result<Option<i64>, String> {

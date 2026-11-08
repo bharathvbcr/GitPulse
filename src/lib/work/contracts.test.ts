@@ -131,6 +131,20 @@ describe("validateWorkResponse", () => {
     expect(() => validateWorkResponse("cmd_collision_risk", bad)).toThrow(/contended_lines/);
   });
 
+  it("accepts file claims on a collision payload and rejects a claim that names no path", () => {
+    const risk = {
+      ok: true, truncated: false, error: "", overlapping_files: 0, worktrees_involved: 0,
+      scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, shared_worktree_files: 0,
+      shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [],
+      claims_error: "",
+      file_claims: [{ source: "declared", run_id: "run-x", path: "a.rs", worktree: "/other", ts_ms: 1 }],
+    };
+    expect(() => validateWorkResponse("cmd_collision_risk", risk)).not.toThrow();
+    const bad = structuredClone(risk);
+    delete (bad.file_claims[0] as { path?: string }).path;
+    expect(() => validateWorkResponse("cmd_collision_risk", bad)).toThrow(/invalid response/);
+  });
+
   it("rejects malformed non-object payloads with command-scoped error", () => {
     expect(() => validateWorkResponse("cmd_task_scopes", "not-an-object")).toThrow(
       "cmd_task_scopes: invalid response",
