@@ -2910,8 +2910,12 @@ mod tests {
         // 2. A .git-only write still triggers through the recursive watch.
         //    Retry-bounded for the same reason as above; each attempt uses a
         //    fresh name inside `.git` so no state carries between attempts.
-        //    `.git` writes are not listed in `paths`, so the announcement is
-        //    keyed on the GitState kind instead of a name.
+        //    `.git` writes are not listed in `paths`, so a probe cannot be
+        //    named: the predicate ignores it and ANY GitState callback
+        //    satisfies it, including a stray one from earlier setup. The
+        //    last-probe wait therefore adds nothing here; that is acceptable
+        //    only because nothing a stray callback could corrupt is asserted
+        //    afterwards.
         let payload = write_until_announced(
             &rx,
             PRIME_DEADLINE,
@@ -3473,6 +3477,10 @@ mod tests {
         // in this process also hold FSEvents/inotify watches. Primed through
         // the shared keyed wait: the silence asserted below must not be
         // broken by a probe still in flight.
+        assert!(
+            dir.path().join(".git").exists(),
+            "temp repo vanished before the watcher primed"
+        );
         prime_watcher(&rx, dir.path(), PRIME_DEADLINE);
 
         // Rename rather than unlink: macOS FSEvents can block `remove_dir_all`
