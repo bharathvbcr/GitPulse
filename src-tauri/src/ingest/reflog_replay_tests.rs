@@ -1328,8 +1328,8 @@ fn w9_ingest_files(repo: &str, files: &[W9File<'_>]) -> Vec<ledger::LedgerEvent>
     }
     crate::test_support::trust_repo(std::path::Path::new(repo));
     let serial = crate::test_support::env::env_serial();
-    let _env = crate::test_support::env::bind_env(&serial)
-        .set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", troot.path());
     ingest_reflog_into(repo, repo, 200);
     ingest_transcripts(repo);
     ledger::tail(repo, 0, 1000)
@@ -1475,12 +1475,28 @@ fn w9_real_transcript_the_first_call_of_a_message_still_links() {
         let mut calls: Vec<W9Call<'_>> = Vec::new();
         if calls_before == 1 {
             // An earlier message's call, then this message's first call.
-            calls.push(("msg_0", "tu_a", &repo, "ls", start - 2_000, start - 1_500, 0));
+            calls.push((
+                "msg_0",
+                "tu_a",
+                &repo,
+                "ls",
+                start - 2_000,
+                start - 1_500,
+                0,
+            ));
         }
         let message = "msg_1";
         calls.push((message, "tu_b", &repo, commit, start, start + 4_000, 0));
         if same_message_after {
-            calls.push((message, "tu_c", &repo, "echo done", start + 10, start + 20, 1));
+            calls.push((
+                message,
+                "tu_c",
+                &repo,
+                "echo done",
+                start + 10,
+                start + 20,
+                1,
+            ));
         }
         let rows = w9_ingest_message(&repo, "S_SAME", &calls);
         let commit_row = &rows[calls_before];
@@ -1503,9 +1519,17 @@ fn w9_real_transcript_a_resumed_copy_of_a_later_call_never_links() {
         let nested = dir.path().join("vendor").join("lib");
         std::fs::create_dir_all(&nested).unwrap();
         git_in(&nested, &["init", "-q", "-b", "main"]);
-        let nested_s = nested.canonicalize().unwrap().to_string_lossy().into_owned();
+        let nested_s = nested
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
-        git_at(dir.path(), &["commit", "--allow-empty", "-m", "person work"], now);
+        git_at(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "person work"],
+            now,
+        );
         let person = w9_head(&repo);
         let start = u64::try_from(now).unwrap() * 1000 + 200;
         let cd = format!("cd {nested_s} && true");

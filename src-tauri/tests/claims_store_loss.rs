@@ -6,6 +6,8 @@
 //! because the hook is one process per edit and the lock that matters is the
 //! file lock between processes, not a mutex.
 
+mod common;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -195,6 +197,7 @@ fn scenario(name: &str, pad: usize, torn: bool) {
 #[cfg(unix)]
 #[test]
 fn no_claim_is_lost_under_compaction_and_repair_with_long_rows() {
+    common::unmetered_spawns();
     scenario(
         "no_claim_is_lost_under_compaction_and_repair_with_long_rows",
         1700,
@@ -205,6 +208,7 @@ fn no_claim_is_lost_under_compaction_and_repair_with_long_rows() {
 #[cfg(unix)]
 #[test]
 fn no_claim_is_lost_under_compaction_and_repair_with_short_rows() {
+    common::unmetered_spawns();
     scenario(
         "no_claim_is_lost_under_compaction_and_repair_with_short_rows",
         100,
@@ -215,6 +219,7 @@ fn no_claim_is_lost_under_compaction_and_repair_with_short_rows() {
 #[cfg(unix)]
 #[test]
 fn a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_long_rows() {
+    common::unmetered_spawns();
     scenario(
         "a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_long_rows",
         1700,
@@ -225,6 +230,7 @@ fn a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_long_rows() {
 #[cfg(unix)]
 #[test]
 fn a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_short_rows() {
+    common::unmetered_spawns();
     scenario(
         "a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_short_rows",
         100,
@@ -238,6 +244,7 @@ fn a_crashed_writers_fragment_costs_at_most_the_row_after_it_with_short_rows() {
 #[cfg(unix)]
 #[test]
 fn a_lock_free_read_never_sees_nul_bytes_or_a_terminated_bad_line() {
+    common::unmetered_spawns();
     let name = "a_lock_free_read_never_sees_nul_bytes_or_a_terminated_bad_line";
     let big_cap = 1_000_000usize;
     if let Ok(store) = std::env::var("W9R4P_CHILD_STORE") {
@@ -314,6 +321,7 @@ fn a_lock_free_read_never_sees_nul_bytes_or_a_terminated_bad_line() {
 /// byte and every file as it was.
 #[test]
 fn a_read_creates_nothing() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     let read = read_store(&store, T0, DEFAULT_TTL_MS, DEFAULT_CAP).unwrap();
@@ -355,6 +363,7 @@ fn a_read_creates_nothing() {
 /// A torn line is closed and removed by the next append in a quiet store.
 #[test]
 fn a_torn_line_heals_on_the_next_append() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     fs::create_dir_all(store.parent().unwrap()).unwrap();
@@ -378,6 +387,7 @@ fn a_torn_line_heals_on_the_next_append() {
 /// the size limit first, so live claims inside the cap are dropped too.
 #[test]
 fn a_compaction_that_drops_live_claims_is_counted_by_the_next_read() {
+    common::unmetered_spawns();
     for (pad, fills_the_cap) in [(0usize, true), (300usize, false)] {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("gitpulse").join("file-claims.jsonl");

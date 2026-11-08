@@ -3,6 +3,8 @@
 //! environment variable, because the hook is one process per edit and the lock
 //! that matters is the file lock between processes, not a mutex.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -61,6 +63,7 @@ fn percentile(sorted: &[Duration], q: f64) -> Duration {
 #[cfg(unix)]
 #[test]
 fn concurrent_hook_processes_at_the_compaction_threshold_lose_no_claim() {
+    common::unmetered_spawns();
     if let Ok(store) = std::env::var("W9_CHILD_STORE") {
         let id: usize = std::env::var("W9_CHILD_ID").unwrap().parse().unwrap();
         let mut failed = 0;
@@ -153,6 +156,7 @@ fn concurrent_hook_processes_at_the_compaction_threshold_lose_no_claim() {
 /// the record.
 #[test]
 fn an_append_to_a_full_store_stays_far_under_the_lock_wait() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     fill_to_threshold(&store, DEFAULT_CAP);
@@ -198,6 +202,7 @@ fn torn_store(dir: &Path) -> std::path::PathBuf {
 /// threshold anywhere near.
 #[test]
 fn a_torn_line_is_healed_by_the_next_append_in_a_quiet_store() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = torn_store(dir.path());
     append_claim(
@@ -237,6 +242,7 @@ fn a_torn_line_is_healed_by_the_next_append_in_a_quiet_store() {
 /// and the read after that is clean.
 #[test]
 fn a_degraded_read_writes_nothing_and_the_next_append_repairs_it() {
+    common::unmetered_spawns();
     use std::hash::{DefaultHasher, Hash, Hasher};
     let hash = |path: &Path| {
         let mut hasher = DefaultHasher::new();
@@ -293,6 +299,7 @@ fn a_degraded_read_writes_nothing_and_the_next_append_repairs_it() {
 /// many times it is asked: the tools that call it are advertised read-only.
 #[test]
 fn a_degraded_read_leaves_the_file_byte_identical() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     append_claim(
@@ -317,6 +324,7 @@ fn a_degraded_read_leaves_the_file_byte_identical() {
 /// append 7,109 without any signal. It now drops by expiry and the cap only.
 #[test]
 fn a_compaction_keeps_every_live_claim_within_the_cap() {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");
     let mut most = 0usize;
@@ -353,6 +361,7 @@ fn a_compaction_keeps_every_live_claim_within_the_cap() {
 #[cfg(unix)]
 #[test]
 fn a_compaction_that_cannot_get_its_lock_still_records_the_claim() {
+    common::unmetered_spawns();
     use std::os::unix::io::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("gitpulse").join("file-claims.jsonl");

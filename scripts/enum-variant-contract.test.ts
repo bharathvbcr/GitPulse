@@ -47,6 +47,10 @@ const NO_TS_MIRROR = new Map<string, string>([
     "LandedAtSource",
     "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
   ],
+  [
+    "PrWorktreeRefusalCode",
+    "refusals stay typed in Rust until the command edge, which sends only the message (`From<PrWorktreeError> for CommandError`); the frontend never receives the code",
+  ],
   ["ManviActionKind", "activity labels are produced by the frontend, not parsed from the backend"],
   [
     "PermissionDecision",

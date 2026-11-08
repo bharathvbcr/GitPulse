@@ -198,9 +198,12 @@ export interface SharedWorktree {
   truncated: boolean;
 }
 
+/** `insights::claims::ClaimSource`. */
+export type ClaimSource = "declared" | "observed";
+
 /** One file claim. A declared claim names the run that planned the path. An observed claim names the session the edit hook let through. */
 export interface FileClaim {
-  source: "declared" | "observed";
+  source: ClaimSource;
   session_id?: string;
   run_id?: string;
   path: string;

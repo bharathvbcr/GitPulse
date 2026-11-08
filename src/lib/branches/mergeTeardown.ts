@@ -7,7 +7,7 @@
  * caller keeps the original and reports it as it always did.
  */
 
-import type { MergeHeldReason, MergeTeardownError } from "./types";
+import type { HeldReason, MergeTeardownError } from "./types";
 
 /** A merge-and-teardown that did not merge, carrying the host's typed reason. */
 export class MergeTeardownFailure extends Error {
@@ -63,6 +63,6 @@ export function readMergeTeardownError(cause: unknown): MergeTeardownError | nul
   }
 }
 
-function isHeldReason(value: unknown): value is MergeHeldReason {
+function isHeldReason(value: unknown): value is HeldReason {
   return value === "checkout_dirty" || value === "checkout_unreadable" || value === "checkout_locked" || value === "commit_hooks";
 }
