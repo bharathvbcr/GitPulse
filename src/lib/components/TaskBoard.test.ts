@@ -43,6 +43,16 @@ describe("TaskBoard source contracts", () => {
     expect(source).not.toContain("dataTransfer");
   });
 
+  // The behaviour is rendered in harness/tasksChecks.js ("long column" checks:
+  // 60 cards in one column, a drop far down it, Home/End, keyed re-render, and
+  // the list layout). This is only the fast tripwire for the cause: the board
+  // finds cards in the DOM (drop slot, Home/End, focus after a move), so a
+  // fixed-height window over its cards (cfac83b3, undone by 8a611e6e) must not return.
+  it("draws every loaded card: no windowing of columns or list", () => {
+    expect(source).not.toMatch(/import\s+VirtualList\b/);
+    expect(source).not.toContain("<VirtualList");
+  });
+
   it("asks through the in-app dialog, never the native confirm", () => {
     expect(source).not.toContain("window.confirm");
   });

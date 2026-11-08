@@ -8613,6 +8613,7 @@ mod tests {
             return;
         }
 
+        use crate::procguard::LockedSpawn;
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .env(CHILD_GUARD, "1")
             .env("CLAUDECODE", "1")
@@ -8622,7 +8623,7 @@ mod tests {
                 "terminal::tests::build_pty_command_strips_inherited_claude_code_recursion_vars_for_all_sessions",
                 "--nocapture",
             ])
-            .output()
+            .output_locked()
             .expect("spawn child test");
         assert!(
             output.status.success(),

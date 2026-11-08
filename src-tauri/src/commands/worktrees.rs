@@ -514,12 +514,12 @@ pub async fn cmd_inbox_read(
             agent_id.as_deref(),
             status.as_deref(),
         )?;
-        if let Some(ref tk) = thread_key
+        if let Some(tk) = thread_key
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            threads.retain(|t| t.thread_key == *tk);
+            threads.retain(|t| t.thread_key == tk);
         }
         let total = threads.len();
         let cap = limit.unwrap_or(100).clamp(1, 256);

@@ -265,7 +265,7 @@ fn hidden_tab_backpressure_sheds_buffer_without_terminating_process() {
     let (id, pid) = view.flood(dir.path(), "hidden_backpressure");
 
     // Mark the session as backgrounded/hidden
-    set_background_sessions(&view.state, &[id.clone()]);
+    set_background_sessions(&view.state, std::slice::from_ref(&id));
 
     // Check that session is listed
     let sessions = list_sessions(&view.state).unwrap();
@@ -467,7 +467,7 @@ fn hidden_tab_with_failing_sink_sheds_and_preserves_child() {
     assert!(alive(pid), "child must be alive initially");
 
     // Mark as hidden
-    set_background_sessions(&state, &[session.id.clone()]);
+    set_background_sessions(&state, std::slice::from_ref(&session.id));
 
     // Give it time to output multiple lines while delivery fails
     std::thread::sleep(Duration::from_millis(800));
@@ -523,7 +523,7 @@ fn child_sigkilled_on_hidden_tab_exits_cleanly() {
     assert!(alive(pid));
 
     // Mark hidden
-    set_background_sessions(&state, &[session.id.clone()]);
+    set_background_sessions(&state, std::slice::from_ref(&session.id));
 
     // Send SIGKILL directly to child process
     unsafe {
@@ -556,7 +556,7 @@ fn rapid_visibility_toggling_under_heavy_output_does_not_crash_or_wedge() {
     // Toggle background/foreground rapidly 20 times while shell is flooding
     for i in 0..20 {
         if i % 2 == 0 {
-            set_background_sessions(&view.state, &[id.clone()]);
+            set_background_sessions(&view.state, std::slice::from_ref(&id));
         } else {
             set_background_sessions(&view.state, &[]);
         }

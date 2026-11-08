@@ -7,6 +7,7 @@ use gitpulse_lib::engine::agent_bus::{
     answer_ask, list_inbox_threads, list_lanes, post_message, post_thread_message, read_messages,
     read_thread_messages, register_or_update_lane, release_lane, withdraw_ask, MAX_BUS_MESSAGES,
 };
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -269,7 +270,7 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
     // 1. Verify --version returns expected semver
     let output = Command::new(agy_path)
         .arg("--version")
-        .output()
+        .output_locked()
         .expect("run agy --version");
     assert!(output.status.success(), "agy --version failed");
     let version_str = String::from_utf8_lossy(&output.stdout);
@@ -281,7 +282,7 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
     // 2. Verify --help publishes required flags on stderr/stdout
     let help_output = Command::new(agy_path)
         .arg("--help")
-        .output()
+        .output_locked()
         .expect("run agy --help");
     let help_text = format!(
         "{}\n{}",
@@ -303,7 +304,7 @@ fn test_antigravity_cli_binary_and_argument_conformance() {
 
     // 3. Verify argument generator contract for Antigravity
     let test_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-    let generated_args = vec![
+    let generated_args = [
         "--mode".to_string(),
         "accept-edits".to_string(),
         "--conversation".to_string(),
