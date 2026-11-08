@@ -223,6 +223,8 @@ struct Row {
     /// `worktree_path` as stored; the anchor checkout's NULL is the empty string.
     worktree: String,
     is_command: bool,
+    /// The `action` column: for a reflog row, `reflog.<verb>` (see [`parse_entry`]).
+    action: String,
     session_id: Option<String>,
     object: Option<String>,
     outcome: String,
@@ -362,6 +364,7 @@ fn read_rows(conn: &Connection) -> Result<(Vec<Row>, Option<i64>), LedgerError> 
                 id: row.get(0)?,
                 worktree: text(row, 1)?.unwrap_or_default(),
                 is_command,
+                action: text(row, 2)?.unwrap_or_default(),
                 session_id: text(row, 3)?,
                 object: text(row, 4)?,
                 outcome: text(row, 5)?.unwrap_or_default(),
@@ -528,6 +531,10 @@ struct Command {
     placed: Placed,
     target: Target,
     shape: Shape,
+    /// The git run is not the whole command ([`is_whole_command`]): the
+    /// transcript's `ok` is the exit status of something else, so it says
+    /// nothing about whether the commit was made.
+    masked: bool,
 }
 
 /// The command rows that are, or may be, a commit-making run in their own
@@ -539,7 +546,9 @@ fn classify(rows: Vec<Row>, anchor: &str, seen: &mut HashMap<String, String>) ->
             let placed = place(row, anchor, seen);
             let object = placed.row.object.as_deref()?;
             let (target, shape) = read_command(object, Path::new(&placed.worktree));
+            let masked = !is_whole_command(object);
             (target != Target::Elsewhere).then_some(Command {
+                masked,
                 placed,
                 target,
                 shape,
@@ -558,18 +567,45 @@ struct Entry<'a> {
     tail: &'a str,
 }
 
-/// The message of a reflog row's `object` (`"<commit> <message>"`), parsed.
-fn parse_entry(object: &str) -> Option<Entry<'_>> {
-    let message = object.split_once(' ').map_or("", |(_, rest)| rest);
-    let (head, tail) = message.split_once(": ")?;
+/// A reflog row, parsed the way production writes it.
+///
+/// Ingest splits git's message (`%gs`) at its first colon: the head becomes the
+/// row's `action` (`reflog.` + the head folded to lowercase ASCII tokens, every
+/// other character `_`, see `ledger::action_segment`) and only what follows the
+/// colon is kept, in `object` (`"<commit> <tail>"`). So the verb and the step
+/// live in `action` alone: `commit (amend): m` is `reflog.commit__amend_` over
+/// `<commit> m`, `pull --rebase (pick): m` is `reflog.pull___rebase__pick_`,
+/// `cherry-pick: m` is `reflog.cherry_pick`, `merge feat: Merge made by ...` is
+/// `reflog.merge_feat`. A message with no colon is `reflog.action`.
+///
+/// The verb is the head's first word (`cherry_pick` is the one hyphenated verb a
+/// run can write); the step is the last parenthesised word, which the folding
+/// leaves as a trailing `_` after a `__`.
+fn parse_entry<'a>(action: &'a str, object: &'a str) -> Option<Entry<'a>> {
+    let head = action.strip_prefix("reflog.")?;
+    let (head, step) = match head
+        .strip_suffix('_')
+        .and_then(|inner| inner.rsplit_once("__"))
+    {
+        Some((head, step)) if !step.is_empty() => (head, Some(step)),
+        _ => (head, None),
+    };
+    let verb = if head == "cherry_pick" || head.starts_with("cherry_pick_") {
+        "cherry-pick"
+    } else {
+        head.split('_').next().unwrap_or("")
+    };
     Some(Entry {
-        verb: head.split([' ', '(']).next().unwrap_or(""),
-        step: head
-            .split_once('(')
-            .and_then(|(_, rest)| rest.strip_suffix(')')),
-        closes: head.ends_with("(finish)") || head.ends_with("(abort)"),
-        tail,
+        verb,
+        step,
+        closes: matches!(step, Some("finish" | "abort")),
+        tail: object.split_once(' ').map_or("", |(_, rest)| rest),
     })
+}
+
+/// [`parse_entry`] of a ledger row.
+fn entry_of(row: &Row) -> Option<Entry<'_>> {
+    parse_entry(&row.action, row.object.as_deref()?)
 }
 
 /// What a reflog entry did to the ref.
@@ -610,10 +646,7 @@ fn creates_commit(entry: &Entry<'_>) -> bool {
 
 /// Whether a reflog row is an origin entry (it made its commit).
 fn is_origin(row: &Row) -> bool {
-    row.object
-        .as_deref()
-        .and_then(parse_entry)
-        .is_some_and(|entry| creates_commit(&entry))
+    entry_of(row).is_some_and(|entry| creates_commit(&entry))
 }
 
 /// What came between a command and a commit's origin entry.
@@ -663,7 +696,7 @@ fn between(
     // A command can only have made an entry of a verb it writes: a `git pull`
     // that found nothing to pull made no entry, and a hand commit after it is
     // not its commit.
-    let this = entry.row.object.as_deref().and_then(parse_entry);
+    let this = entry_of(&entry.row);
     if !this.as_ref().is_some_and(|this| shape.writes(this.verb)) {
         return Between::Spent;
     }
@@ -697,7 +730,7 @@ fn between(
         {
             continue;
         }
-        let parsed = row.object.as_deref().and_then(parse_entry);
+        let parsed = entry_of(row);
         let origin = parsed.as_ref().is_some_and(creates_commit);
         let ours = parsed
             .as_ref()
@@ -807,6 +840,14 @@ fn link_one(
             Some(t) if (earliest..=latest).contains(&t) => {
                 if command.target == Target::Unknown {
                     target_unknown.push(row);
+                    continue;
+                }
+                // The call's recorded `ok` is the exit status of the whole
+                // line, which is not git's: a hook-rejected commit behind a
+                // pipe or `;` reads `ok`, and the commit in the window may be a
+                // person's. Never evidence for a link; it stays a candidate.
+                if command.masked {
+                    unobserved.push(row);
                     continue;
                 }
                 match between(command, t, entry, at, sha, reflogs) {
@@ -1110,6 +1151,57 @@ fn tokenize(command: &str) -> Option<(Vec<Vec<Word>>, bool)> {
         }
     }
     Some((segments, grouped))
+}
+
+/// Whether `command` is one simple command, nothing else, so that the Bash
+/// call's exit status is the git run's own.
+///
+/// Fails closed: any unquoted pipe, `;`, `&` (so `&&`, `||` chains and
+/// background runs), newline between commands, redirection, subshell, brace
+/// group, backtick, or `$(` / `$((` anywhere outside single quotes makes it
+/// false. A wrapper (`eval`, `sh -c`, `env`, `time`, `xargs`, `VAR=x git`,
+/// `! git`) is false because the first word must be `git` itself.
+fn is_whole_command(command: &str) -> bool {
+    let command = command.trim();
+    let Some(first) = command.split(is_boundary).next() else {
+        return false;
+    };
+    if first != "git" && !(first.starts_with('/') && first.ends_with("/git")) {
+        return false;
+    }
+    let mut chars = command.chars().peekable();
+    let mut word_start = true;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => loop {
+                if chars.next().is_none_or(|q| q == '\'') {
+                    break;
+                }
+            },
+            '"' => loop {
+                match chars.next() {
+                    None | Some('"') => break,
+                    Some('\\') => {
+                        chars.next();
+                    }
+                    Some('`') => return false,
+                    Some('$') if chars.peek() == Some(&'(') => return false,
+                    Some(_) => {}
+                }
+            },
+            '\\' => {
+                chars.next();
+            }
+            '$' if chars.peek() == Some(&'(') => return false,
+            ';' | '&' | '|' | '\n' | '\r' | '<' | '>' | '(' | ')' | '{' | '}' | '`' => {
+                return false;
+            }
+            '#' if word_start => break,
+            _ => {}
+        }
+        word_start = c.is_whitespace();
+    }
+    true
 }
 
 /// Whether any of `words` is `git` and a commit-making subcommand follows it

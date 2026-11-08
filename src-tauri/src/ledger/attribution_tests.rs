@@ -75,26 +75,39 @@ fn command_row_untimed(repo: &str, session: &str, text: &str, at: u64) {
     .expect("append untimed command");
 }
 
-/// A reflog row: what replay writes for a ref move, git's own second.
+/// A reflog row exactly as production ingest writes it
+/// (`ingest::ingest_reflogs`): git's message is split at its first colon, the
+/// head becomes the action (`reflog.` + `action_segment(head)`) and only the
+/// tail is kept, in `object` as `"<commit> <tail>"`. A message with no colon
+/// is `reflog.action` over the whole message (`git_reader::get_reflog`).
 fn reflog_row(repo: &str, worktree: Option<&str>, commit: &str, verb: &str, at: u64) {
     // A bare verb is a commit-making entry (`commit: work`); anything with a
     // colon is git's own message, as `git reflog --format=%gs` prints it.
-    let message = if verb.contains(':') {
+    let message = if verb.contains(':') || verb.contains(' ') {
         verb.to_string()
     } else {
         format!("{verb}: work")
     };
-    let mut action = action_segment(message.split(':').next().unwrap_or(""));
-    if !action.starts_with(|c: char| c.is_ascii_lowercase()) {
-        action = "move".into();
-    }
+    let (action, tail) = match message.find(':') {
+        Some(colon) => (
+            action_segment(message[..colon].trim()),
+            message[colon + 1..].trim().to_string(),
+        ),
+        None => ("action".to_string(), message.clone()),
+    };
+    // Ingest files an empty head under `move` (`ingest_reflogs`).
+    let action = if action.starts_with(|c: char| c.is_ascii_lowercase()) {
+        action
+    } else {
+        "move".to_string()
+    };
     append(Draft {
         repo_path: repo.into(),
         worktree_path: worktree.map(str::to_string),
         actor_kind: Some(ActorKind::System),
         actor_id: Some("reflog".into()),
         action: format!("reflog.{action}"),
-        object: Some(format!("{commit} {message}")),
+        object: Some(format!("{commit} {tail}")),
         outcome: Some(Outcome::Ok),
         after_ref: Some(commit.into()),
         event_stamp: Some(stamp(at, "reflog")),
@@ -309,7 +322,7 @@ fn an_amend_and_a_rebase_each_entry_links_to_the_session_that_ran_them() {
         &repo2,
         None,
         "S9",
-        &format!("cd {repo2} && git -C {repo2} rebase main"),
+        &format!("git -C {repo2} rebase main"),
         at,
         10_000,
     );
@@ -416,7 +429,7 @@ fn a_commit_the_ledger_never_replayed_is_not_called_unattributed() {
         repo_path: repo.clone(),
         actor_kind: Some(ActorKind::System),
         action: "reflog.commit".into(),
-        object: Some(format!("{} commit: x", sha(8))),
+        object: Some(format!("{} x", sha(8))),
         outcome: Some(Outcome::Ok),
         after_ref: Some(sha(8)),
         event_stamp: Some(stamp(t0(), "ingest")),
@@ -1637,7 +1650,7 @@ fn r2_cap_hidden_earlier_origin_of_same_commit() {
         "2026-01-01T00:00:00.000Z",
         "reflog.commit",
         None,
-        Some(&format!("{} commit: m", sha(1))),
+        Some(&format!("{} m", sha(1))),
         "ok",
         None,
         None,
@@ -1749,7 +1762,7 @@ fn a_hidden_origin_entry_of_the_same_commit_defeats_the_cap_proof() {
         "2026-01-01T00:00:00.000Z",
         "reflog.commit",
         None,
-        Some(&format!("{} commit: m", sha(1))),
+        Some(&format!("{} m", sha(1))),
         "ok",
         None,
         None,
@@ -1990,7 +2003,7 @@ fn an_entry_with_no_event_time_between_them_leaves_the_order_unknown() {
         repo_path: repo.clone(),
         actor_kind: Some(ActorKind::System),
         action: "reflog.commit".into(),
-        object: Some(format!("{} commit: other", sha(8))),
+        object: Some(format!("{} other", sha(8))),
         outcome: Some(Outcome::Ok),
         after_ref: Some(sha(8)),
         event_stamp: Some(stamp(at - 2 * SEC, "ingest")),
@@ -2417,4 +2430,153 @@ fn w7_nothing_to_commit_then_a_passing_step_credits_a_hand_commit() {
     reflog_row(&repo, None, &sha(1), "commit", at);
     let got = link(&repo, &sha(1));
     assert_ne!(got.session_id.as_deref(), Some("CODEX"), "WRONG LINK: {got:?}");
+}
+
+// ---- W9 w7: the verb is read from `action`, and only a whole command counts ----
+
+/// Production's rows, entry by entry: `action` carries the folded head and
+/// `object` only the tail. Every message form must classify the same as it
+/// did when the verb was read from a hand-built `object`.
+#[test]
+fn w9_entry_forms_are_read_from_the_production_action_column() {
+    for (action, object, origin) in [
+        ("reflog.commit", "m", true),
+        ("reflog.commit__initial_", "m", true),
+        ("reflog.commit__amend_", "m", true),
+        ("reflog.commit__merge_", "m", true),
+        ("reflog.cherry_pick", "m", true),
+        ("reflog.cherry_pick", "fast-forward", false),
+        ("reflog.cherry_pick__continue_", "m", true),
+        ("reflog.revert", "Revert \"x\"", true),
+        ("reflog.am", "m", true),
+        ("reflog.rebase__pick_", "m", true),
+        ("reflog.rebase__start_", "checkout main", false),
+        ("reflog.rebase__finish_", "returning to refs/heads/x", false),
+        (
+            "reflog.rebase__continue___finish_",
+            "returning to refs/heads/x",
+            false,
+        ),
+        ("reflog.pull___rebase__pick_", "m", true),
+        (
+            "reflog.pull___rebase__finish_",
+            "returning to refs/heads/main",
+            false,
+        ),
+        ("reflog.pull___rebase", "Fast-forward", false),
+        ("reflog.pull", "Merge made by the 'ort' strategy.", true),
+        ("reflog.pull", "Fast-forward", false),
+        (
+            "reflog.merge_feat",
+            "Merge made by the 'ort' strategy.",
+            true,
+        ),
+        ("reflog.merge_feat", "Fast-forward", false),
+        ("reflog.reset", "moving to commit: x", false),
+        ("reflog.checkout", "moving from a to b", false),
+        ("reflog.action", "update by push", false),
+        ("reflog.move", "", false),
+    ] {
+        let (_d, repo) = repo_dir();
+        append(Draft {
+            repo_path: repo.clone(),
+            actor_kind: Some(ActorKind::System),
+            actor_id: Some("reflog".into()),
+            action: action.into(),
+            object: Some(format!("{} {object}", sha(1))),
+            outcome: Some(Outcome::Ok),
+            after_ref: Some(sha(1)),
+            event_stamp: Some(stamp(t0(), "reflog")),
+            ..Draft::default()
+        })
+        .unwrap();
+        let basis = link(&repo, &sha(1)).basis;
+        assert_eq!(
+            basis != basis::NO_ORIGIN_ENTRY,
+            origin,
+            "{action} / {object}: {basis}"
+        );
+    }
+}
+
+/// A verb spelled into `object` by a message tail is not an entry's verb.
+#[test]
+fn w9_a_verb_inside_the_message_tail_does_not_make_an_origin() {
+    let (_d, repo) = repo_dir();
+    append(Draft {
+        repo_path: repo.clone(),
+        actor_kind: Some(ActorKind::System),
+        actor_id: Some("reflog".into()),
+        action: "reflog.reset".into(),
+        object: Some(format!("{} commit: made up", sha(1))),
+        outcome: Some(Outcome::Ok),
+        after_ref: Some(sha(1)),
+        event_stamp: Some(stamp(t0(), "reflog")),
+        ..Draft::default()
+    })
+    .unwrap();
+    assert_eq!(link(&repo, &sha(1)).basis, basis::NO_ORIGIN_ENTRY);
+}
+
+/// Every shape in which the git run is not the whole command is refused as
+/// evidence: the session stays a candidate, the answer is not a link.
+#[test]
+fn w9_a_commit_that_is_not_the_whole_command_is_never_linked() {
+    let refused = [
+        "git commit -m x | tail -3",
+        "git commit -m x 2>&1 | tail",
+        "git commit -m x; git status",
+        "git add -A; git commit -m x",
+        "git commit -m x && git push",
+        "git add -A && git commit -m x",
+        "git commit -m x || true",
+        "git commit -m x &",
+        "git commit -m x\ngit status",
+        "(git commit -m x)",
+        "{ git commit -m x; }",
+        "git commit -m \"$(cat msg)\"",
+        "git commit -m `cat msg`",
+        "git commit -m x > out.log",
+        "git commit -m x 2>&1",
+        "git commit -m x < /dev/null",
+        "eval 'git commit -m x'",
+        "sh -c 'git commit -m x'",
+        "bash -lc \"git commit -m x\"",
+        "env GIT_AUTHOR_NAME=a git commit -m x",
+        "time git commit -m x",
+        "! git commit -m x",
+        "echo $(git commit -m x)",
+    ];
+    for command in refused {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row(&repo, None, "AGENT", command, at - 3 * SEC);
+        reflog_row(&repo, None, &sha(1), "commit", at);
+        let got = link(&repo, &sha(1));
+        assert_eq!(got.session_id, None, "WRONG LINK for `{command}`: {got:?}");
+        assert!(
+            matches!(
+                got.basis,
+                basis::COMMAND_OUTCOME_UNKNOWN | basis::COMMAND_TARGET_UNKNOWN
+            ),
+            "`{command}`: {got:?}"
+        );
+    }
+    for command in [
+        "git commit -m x",
+        "git commit -m 'a; b | c && d'",
+        "git commit --amend --no-edit",
+        "git -c user.name=a commit -m \"x y\"",
+    ] {
+        let (_d, repo) = repo_dir();
+        let at = t0();
+        command_row(&repo, None, "AGENT", command, at - 3 * SEC);
+        reflog_row(&repo, None, &sha(1), "commit", at);
+        let got = link(&repo, &sha(1));
+        assert_eq!(
+            got.session_id.as_deref(),
+            Some("AGENT"),
+            "`{command}`: {got:?}"
+        );
+    }
 }

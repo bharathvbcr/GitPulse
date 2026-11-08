@@ -328,7 +328,7 @@ fn record_commit_run(repo: &str, commit: &str, commands: &[(&str, u64)], reflog_
         actor_kind: Some(ActorKind::System),
         actor_id: Some("reflog".into()),
         action: "reflog.commit".into(),
-        object: Some(format!("{commit} commit: x")),
+        object: Some(format!("{commit} x")),
         outcome: Some(Outcome::Ok),
         after_ref: Some(commit.into()),
         event_stamp: Some(stamp(reflog_at, "reflog")),
@@ -404,6 +404,9 @@ fn put_row(
 ) {
     use crate::ledger::{append, ids, ActorKind, Draft, EventStamp, Outcome};
     let is_command = kind == "command";
+    // A reflog row as ingest writes it: git's message split at its first
+    // colon, the head folded into the action and the tail kept in `object`.
+    let (head, tail) = message.split_once(':').unwrap_or(("action", message));
     append(Draft {
         repo_path: repo.into(),
         actor_kind: Some(if is_command {
@@ -415,12 +418,12 @@ fn put_row(
         action: if is_command {
             "session.command".into()
         } else {
-            "reflog.commit".to_string()
+            format!("reflog.{}", crate::ledger::action_segment(head.trim()))
         },
         object: Some(if is_command {
             message.to_string()
         } else {
-            format!("{commit} {message}")
+            format!("{commit} {}", tail.trim())
         }),
         outcome: Some(Outcome::Ok),
         after_ref: (!is_command).then(|| commit.to_string()),

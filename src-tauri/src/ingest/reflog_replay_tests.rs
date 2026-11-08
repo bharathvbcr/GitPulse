@@ -764,3 +764,97 @@ fn w7_conventional_revert_subject_is_credited_to_a_masked_failed_git_revert() {
     eprintln!("LINK {got:?}");
     assert_ne!(got.session_id.as_deref(), Some("S_AGENT"), "WRONG LINK: {got:?}");
 }
+
+// ---- W9 w7: end to end, real git -> real replay -> the attribution reader ----
+
+/// The commit HEAD names, as the reflog reader reports it (newest entry first).
+fn w9_head(repo: &str) -> String {
+    crate::engine::git_reader::GitReader::get_reflog(repo, 1)
+        .expect("reflog")
+        .first()
+        .expect("an entry")
+        .commit_id
+        .clone()
+}
+
+/// A real `git commit`, replayed by real ingest, and an agent's transcript row
+/// for a plain `git commit`: the link names the agent, on the inferred basis.
+/// Production writes the verb in the row's `action` and only the message tail
+/// in `object`; a reader that looks for the verb in `object` answers
+/// `no_origin_entry` here.
+#[test]
+fn w9_real_commit_replayed_by_ingest_links_to_the_agent_that_ran_it() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "fix: parser"],
+        now,
+    );
+    let sha = w9_head(&repo);
+    ingest_reflog_into(&repo, &repo, 200);
+    let at_ms = u64::try_from(now).unwrap() * 1000;
+    w7_command(
+        &repo,
+        None,
+        "S_REAL",
+        "git commit -m 'fix: parser'",
+        at_ms - 3_000,
+        4_000,
+    );
+
+    let row = reflog_rows(&repo)
+        .into_iter()
+        .find(|row| row.object.as_deref().is_some_and(|o| o.starts_with(&sha)))
+        .expect("the commit's reflog row");
+    assert_eq!(
+        row.action, "reflog.commit",
+        "the verb is in the action column"
+    );
+    assert_eq!(
+        row.object.as_deref(),
+        Some(format!("{sha} fix: parser").as_str())
+    );
+
+    let got = ledger::attribution::link_commits(&repo, std::slice::from_ref(&sha))
+        .remove(&sha)
+        .unwrap();
+    assert_eq!(got.session_id.as_deref(), Some("S_REAL"), "{got:?}");
+    assert_eq!(got.basis, ledger::attribution::basis::INFERRED, "{got:?}");
+}
+
+/// The same real commit, but the agent's line is `git commit ... | tail`: the
+/// transcript's `ok` is `tail`'s, so a person's commit made while the agent's
+/// hook ran must not be credited to the agent. The command stays a candidate
+/// (`command_outcome_unknown`), never a link.
+#[test]
+fn w9_real_commit_behind_a_masked_exit_status_is_not_linked() {
+    let (dir, repo) = seeded_repo();
+    let now = i64::try_from(ledger::ids::now_millis() / 1000).unwrap();
+    git_at(
+        dir.path(),
+        &["commit", "--allow-empty", "-m", "fix: parser"],
+        now,
+    );
+    let sha = w9_head(&repo);
+    ingest_reflog_into(&repo, &repo, 200);
+    let at_ms = u64::try_from(now).unwrap() * 1000;
+    w7_command(
+        &repo,
+        None,
+        "S_AGENT",
+        "git commit -m 'fix: parser' 2>&1 | tail -3",
+        at_ms - 3_000,
+        4_000,
+    );
+
+    let got = ledger::attribution::link_commits(&repo, std::slice::from_ref(&sha))
+        .remove(&sha)
+        .unwrap();
+    assert_eq!(got.session_id, None, "WRONG LINK: {got:?}");
+    assert_eq!(
+        got.basis,
+        ledger::attribution::basis::COMMAND_OUTCOME_UNKNOWN,
+        "{got:?}"
+    );
+}

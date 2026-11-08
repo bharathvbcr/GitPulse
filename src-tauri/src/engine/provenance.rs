@@ -2889,7 +2889,7 @@ mod batch_tests {
             actor_kind: Some(ActorKind::System),
             actor_id: Some("reflog".into()),
             action: "reflog.commit".into(),
-            object: Some(format!("{sha} commit: c")),
+            object: Some(format!("{sha} c")),
             outcome: Some(Outcome::Ok),
             after_ref: Some(sha.into()),
             event_stamp: Some(stamp(reflog_at, "reflog")),
