@@ -275,13 +275,21 @@ pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, IpcErr
 /// and the branch is anywhere else once the merge holds its lock, nothing is
 /// merged. The error is the typed [`MergeTeardownError`] (`{code, message,
 /// ...}`), so a caller can tell a conflict from a refusal.
+///
+/// `require_write_tree`: the wave sets this. Absent or false keeps the
+/// in-checkout fallback when this git cannot write a merge tree. When the
+/// wave sets it, `task_id` is the card whose candidate is verified before
+/// the target ref moves. The panel omits both.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_worktree_merge_teardown(
     repo_path: String,
     worktree_path: String,
     target_branch: Option<String>,
     squash: Option<bool>,
     expected_tip: Option<String>,
+    require_write_tree: Option<bool>,
+    task_id: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, MergeTeardownError> {
     let workbench = workbench.inner().clone();
@@ -294,6 +302,8 @@ pub async fn cmd_worktree_merge_teardown(
             target_branch.as_deref(),
             squash.unwrap_or(false),
             expected_tip.as_deref(),
+            require_write_tree.unwrap_or(false),
+            task_id.as_deref(),
             &|repo, argv| guard(repo, argv),
         ))
     })
@@ -302,6 +312,7 @@ pub async fn cmd_worktree_merge_teardown(
 }
 
 /// Body of [`cmd_worktree_merge_teardown`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_teardown_guarded(
     workbench: &crate::workbench::WorkbenchState,
     repo_path: &str,
@@ -309,6 +320,8 @@ pub(crate) fn merge_teardown_guarded(
     target_branch: Option<&str>,
     is_squash: bool,
     expected_tip: Option<&str>,
+    require_write_tree: bool,
+    task_id: Option<&str>,
     judge: WorktreeGate<'_>,
 ) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, MergeTeardownError> {
     // Before the merge, not only before the removal: merging a branch an
@@ -324,14 +337,39 @@ pub(crate) fn merge_teardown_guarded(
         policy.get_or_insert(verdict);
         Ok(())
     };
-    let result = crate::engine::worktree::merge_and_teardown_worktree(
-        repo_path,
-        worktree_path,
-        target_branch,
-        is_squash,
-        expected_tip,
-        &mut gate,
-    )?;
+    let result = if require_write_tree {
+        let task = task_id.unwrap_or("").to_string();
+        let host = workbench.clone();
+        let mut verify = move |scratch: &std::path::Path, candidate: &str| {
+            crate::workbench::verification_driver::judge_candidate(
+                &host,
+                &task,
+                scratch,
+                candidate,
+                &mut std::thread::sleep,
+            )
+        };
+        crate::engine::worktree::merge_and_teardown_verified(
+            repo_path,
+            worktree_path,
+            target_branch,
+            is_squash,
+            expected_tip,
+            true,
+            Some(&mut verify),
+            &mut gate,
+        )?
+    } else {
+        crate::engine::worktree::merge_and_teardown_requiring(
+            repo_path,
+            worktree_path,
+            target_branch,
+            is_squash,
+            expected_tip,
+            false,
+            &mut gate,
+        )?
+    };
     Ok(Guarded {
         policy: policy.ok_or_else(|| {
             MergeTeardownError::from(

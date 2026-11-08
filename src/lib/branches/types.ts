@@ -297,6 +297,14 @@ export interface MergeTeardownResult {
    * At most 17 short notes.
    */
   sweep_problems?: string[];
+  /** The commit the target ref points at when the merge was computed in the object database. */
+  candidate_oid?: string | null;
+  /** The main checkout's files were moved to that commit. */
+  checkout_advanced?: boolean;
+  /** This git has no merge-tree write, so the lane was merged in the checkout. */
+  checkout_fallback?: boolean;
+  /** Why the checkout was left where it was, or that the fallback ran. */
+  checkout_note?: string | null;
 }
 
 /**
@@ -316,7 +324,7 @@ export interface WorktreeRemoval {
  */
 export type MergeTeardownError =
   /** The merge conflicted. `rolled_back` false means the main checkout is still mid-merge (`rollback_error` says what is left). */
-  | { code: "conflict"; message: string; paths: string[]; total: number; rolled_back: boolean; rollback_error: string | null }
+  | { code: "conflict"; message: string; paths: string[]; total: number; rolled_back: boolean; rollback_error: string | null; candidate?: string | null }
   /** The branch is not at the commit that was checked; nothing was merged. */
   | { code: "moved"; message: string; branch: string; expected: string; actual: string }
   /** The worktree was cut from a branch or base the target no longer is. */
@@ -324,7 +332,19 @@ export type MergeTeardownError =
   /** A squash is staged in the main checkout and not committed. */
   | { code: "squash_parked"; message: string }
   /** Refused or failed before anything was merged. */
-  | { code: "refused"; message: string };
+  | { code: "refused"; message: string }
+  /** The candidate commit was built and rejected before the target moved. */
+  | { code: "candidate_failed"; message: string; candidate: string }
+  /**
+   * Nothing was merged or moved, and the lane was kept: a checkout that has the target checked out is dirty, locked
+   * or unreadable (`path` names it), or an active commit hook would be skipped by the object-database commit.
+   */
+  | { code: "held"; reason: MergeHeldReason; message: string; path: string | null }
+  /** The wave needs `merge-tree --write-tree` (git 2.38+) and this git lacks it. Nothing was merged. */
+  | { code: "write_tree_unavailable"; message: string };
+
+/** `engine::merge_tree::HeldReason`. */
+export type MergeHeldReason = "checkout_dirty" | "checkout_unreadable" | "checkout_locked" | "commit_hooks";
 
 /** `engine::worktree_hooks::WorktreeHooksConfig`. */
 export interface WorktreeHooksConfig {
@@ -390,6 +410,7 @@ export function worktreeSetupNotices(
     branch_error?: string | null;
     cleanup_error?: string | null;
     sweep_problems?: string[];
+    checkout_note?: string | null;
   },
   when: "create" | "merge" | "remove",
 ): string[] {
@@ -410,6 +431,7 @@ export function worktreeSetupNotices(
       : `The merge and teardown finished, but the post_merge hook did not: ${done.hook_error}`);
   }
   if (done.hook_notice) notices.push(done.hook_notice);
+  if (when === "merge" && done.checkout_note) notices.push(done.checkout_note);
   return notices;
 }
 

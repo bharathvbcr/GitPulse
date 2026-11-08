@@ -687,6 +687,166 @@ pub(crate) fn run_now(
     backend.start(params)
 }
 
+/// A settled pass whose head is exactly `candidate`. An older pass of the
+/// lane tip does not cover a merge commit built from it.
+pub(crate) fn verdict_covers(record: &Record, candidate: &str) -> bool {
+    record.state == "settled" && record.outcome == "passed" && record.head == candidate
+}
+
+/// Start `work.verify.task` against a detached scratch whose HEAD is
+/// `candidate`. The base is that commit's first parent, so the range is the
+/// merge itself. The task is loaded before any worker start: a missing task
+/// never reaches Manvi.
+pub(crate) fn run_at(
+    store: &Store,
+    backend: &dyn Backend,
+    id: &str,
+    scratch: &Path,
+    candidate: &str,
+) -> Result<Value, WorkbenchError> {
+    let card = intake::get_item(store, id)?
+        .ok_or_else(|| WorkbenchError::new("not_found", "The task does not exist."))?;
+    let identity = repository_identity(store, &card)?;
+    let scratch_text = scratch.to_str().ok_or_else(|| {
+        WorkbenchError::new("invalid_input", "The scratch checkout path is not UTF-8.")
+    })?;
+    let local = intake::resolve(scratch_text)?;
+    if local.identity != identity {
+        return Err(WorkbenchError::new(
+            "repository_unavailable",
+            "The scratch checkout belongs to another repository.",
+        ));
+    }
+    let head = backend
+        .head_of(&local.path)
+        .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
+    if head != candidate {
+        return Err(WorkbenchError::new(
+            "repository_unavailable",
+            format!("The scratch checkout is at {head}, not the candidate {candidate}."),
+        ));
+    }
+    let spec = format!("{head}^");
+    let parent = base_from_parent_read(
+        crate::engine::git_cli::git_text(
+            Path::new(&local.path),
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        ),
+        &head,
+    )
+    .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
+    let base = named_base(&local.path, &parent, &head)?;
+    let request = format!(
+        "candidate-{id}-{}-{}",
+        head.get(..12).unwrap_or(&head),
+        intake::now_millis()
+    );
+    let input = json!({
+        "id": id,
+        "request_id": request,
+        "worktree": local.path,
+        "base": base,
+        "head": head,
+    });
+    let params = gate::start_params(&input.to_string())?;
+    backend.start(params)
+}
+
+/// Wait until Manvi's newest record is a pass of `candidate`, judged in
+/// `scratch`. A missing or invalid task, a start that fails, a settled
+/// non-pass, or the wait expiring refuses. The caller adds that nothing was
+/// merged; this does not. An older pass of a different commit does not count.
+pub(crate) fn judge_candidate(
+    host: &WorkbenchState,
+    task_id: &str,
+    scratch: &Path,
+    candidate: &str,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<(), String> {
+    if !super::is_record_id(task_id) {
+        return Err("The wave did not name a task to verify.".into());
+    }
+    let path = host.profile_path().map_err(|error| error.message)?;
+    let store = Store::open(&path)
+        .map_err(|error| format!("The task store could not be opened: {error}"))?;
+    let card = intake::get_item(&store, task_id).map_err(|error| error.message)?;
+    if card.is_none() {
+        return Err("The task does not exist.".into());
+    }
+    judge_candidate_with(
+        &store,
+        &HostBackend(host.clone()),
+        task_id,
+        scratch,
+        candidate,
+        sleep,
+    )
+}
+
+/// [`judge_candidate`] against a store and a backend (the clock and the
+/// sidecar), so a test supplies both.
+pub(crate) fn judge_candidate_with(
+    store: &Store,
+    backend: &dyn Backend,
+    task_id: &str,
+    scratch: &Path,
+    candidate: &str,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<(), String> {
+    let mut started = false;
+    let deadline = backend.now() + WAIT_LIMIT;
+    loop {
+        if backend.cancelled() {
+            return Err("Verification stopped because GitPulse closed.".into());
+        }
+        match gate::latest(store, task_id) {
+            Err(why) => return Err(why),
+            Ok(Some(record)) if verdict_covers(&record, candidate) => {
+                let scratch_text = scratch
+                    .to_str()
+                    .ok_or_else(|| "The scratch checkout path is not UTF-8.".to_string())?;
+                let head =
+                    gate::current_head(scratch_text).map_err(|error| error.into_message())?;
+                if head != candidate {
+                    return Err(format!(
+                        "The scratch checkout moved to {head} after {candidate} was checked."
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(Some(record)) if record.head == candidate && candidate_terminal(&record) => {
+                let why = if record.state == STATE_COULD_NOT_RUN {
+                    "could not run"
+                } else if record.outcome.is_empty() {
+                    record.state.as_str()
+                } else {
+                    record.outcome.as_str()
+                };
+                return Err(format!(
+                    "The candidate {candidate} did not pass verification ({why})."
+                ));
+            }
+            Ok(_) => {}
+        }
+        if !started {
+            run_at(store, backend, task_id, scratch, candidate).map_err(|error| error.message)?;
+            started = true;
+        }
+        if backend.now() >= deadline {
+            return Err(format!(
+                "Verification of {candidate} did not finish within {} minutes.",
+                WAIT_LIMIT.as_secs() / 60
+            ));
+        }
+        sleep(SWEEP_PERIOD);
+    }
+}
+
+/// A record for this candidate that will not become a pass.
+fn candidate_terminal(record: &Record) -> bool {
+    record.state == STATE_COULD_NOT_RUN || (record.state == "settled" && record.outcome != "passed")
+}
+
 /// A base the caller named, accepted only as a commit id that is a strict
 /// ancestor of `head`: an empty range (base == head), or a base the checkout
 /// does not hold, would let a verification pass without judging anything.

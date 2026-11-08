@@ -348,8 +348,15 @@ export async function mergeAttemptWorktree(run: AttemptRef, options: { expectedT
  * can tell a conflict from a refusal; any other rejection passes through, and
  * so does the store's refusal when the repository changed while it waited.
  */
-async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, target: string, expectedTip: string, squash: boolean): Promise<MergeTeardownResult> {
-  const outcome = await repoStore.worktreeMergeTeardown({ worktreePath: cwd, targetBranch: target, squash, expectedTip }, mutationTarget, true);
+async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, target: string, expectedTip: string, squash: boolean, requireWriteTree = false, taskId?: string): Promise<MergeTeardownResult> {
+  const outcome = await repoStore.worktreeMergeTeardown({
+    worktreePath: cwd,
+    targetBranch: target,
+    squash,
+    expectedTip,
+    ...(requireWriteTree ? { requireWriteTree: true } : {}),
+    ...(taskId ? { taskId } : {}),
+  }, mutationTarget, true);
   if (outcome.ok && outcome.output) return outcome.output;
   const cause = failureOf(outcome);
   const failure = readMergeTeardownError(cause);
@@ -361,8 +368,9 @@ function mergedSentence(merged: MergeTeardownResult, squash: boolean): string {
   const landed = squash
     ? `Squashed ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch} as one commit`
     : `Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}`;
-  if (!merged.worktree_removed) return `${landed}; cleanup pending: ${merged.removal_error ?? "the worktree was not removed"}.`;
-  return `${landed}. The worktree was removed.`;
+  const note = merged.checkout_note ? ` ${merged.checkout_note}` : "";
+  if (!merged.worktree_removed) return `${landed}; cleanup pending: ${merged.removal_error ?? "the worktree was not removed"}.${note}`;
+  return `${landed}. The worktree was removed.${note}`;
 }
 
 /** What an unattended merge did: the commit it merged and the line the board shows. */
@@ -379,7 +387,7 @@ export interface VerifiedMerge { head: string; message: string; beforeOid: strin
  * session's work), or when a live attempt is working in the main checkout.
  * It never pushes: the host command it calls only merges and tears down.
  */
-export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string): Promise<VerifiedMerge> {
+export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string, taskId?: string): Promise<VerifiedMerge> {
   if (!expectedHead) throw new Error("No verified head was named, so nothing is merged.");
   const root = await mainCheckoutOf(run.cwd);
   const known = await repoStore.targetForPath(root, { open: false });
@@ -397,7 +405,8 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   // The head the verdict was reached for is the tip the host holds the merge to.
   const mutationTarget = await mainCheckoutTarget(root, known);
   // An unattended wave merge keeps the commits as the verdict saw them.
-  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead, false);
+  // The wave requires the object database. The panel omits the flag and can fall back.
+  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead, false, true, taskId);
   if (merged.worktree_removed) await closeStranded(run.cwd);
   const parts = [mergedSentence(merged, false)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
