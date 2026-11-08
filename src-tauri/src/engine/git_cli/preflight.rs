@@ -249,6 +249,11 @@ pub(crate) const SINCE_AS_FILTER: (u32, u32, u32) = (2, 37, 0);
 /// panel offers the write only at or above it.
 pub(crate) const COMMIT_GRAPH_CHANGED_PATHS: (u32, u32, u32) = (2, 27, 0);
 
+/// `git merge-tree --write-tree`. An optional row: lane integration uses it at
+/// or above 2.38 and keeps the in-checkout merge below that. It does not raise
+/// [`MIN_GIT_VERSION`], which is still the hard `git worktree list -z` floor.
+pub(crate) const MERGE_TREE_WRITE_TREE: (u32, u32, u32) = (2, 38, 0);
+
 /// The one per-feature capability table. Every feature minimum the engine
 /// checks, or that sets the app's floor, is a row here; callers hold the
 /// minimum through the named constants and ask [`git_supports`].
@@ -281,6 +286,11 @@ pub(crate) const GIT_FEATURES: &[GitFeature] = &[
     GitFeature {
         name: "--changed-paths (commit-graph)",
         min: COMMIT_GRAPH_CHANGED_PATHS,
+        hard: false,
+    },
+    GitFeature {
+        name: "merge-tree --write-tree",
+        min: MERGE_TREE_WRITE_TREE,
         hard: false,
     },
 ];
@@ -394,6 +404,11 @@ mod tests {
         assert_eq!(row("--since-as-filter").min, (2, 37, 0));
         assert_eq!(row("--changed-paths (commit-graph)").min, (2, 27, 0));
         assert!(!row("--changed-paths (commit-graph)").hard);
+        assert_eq!(row("merge-tree --write-tree").min, (2, 38, 0));
+        assert!(
+            !row("merge-tree --write-tree").hard,
+            "below 2.38 the in-checkout merge remains the fallback"
+        );
         assert_eq!(
             crate::engine::git_writer::COMMIT_GRAPH_CHANGED_PATHS_GIT,
             row("--changed-paths (commit-graph)").min,

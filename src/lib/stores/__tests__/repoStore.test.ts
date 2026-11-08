@@ -5064,7 +5064,7 @@ describe("file, worktree and branch-cleanup mutations (ft-d61584de)", () => {
       { cmd: "cmd_remove_worktree", args: { repoPath: "/r/a", targetPath: "/w", force: true } },
       { cmd: "cmd_lock_worktree", args: { repoPath: "/r/a", targetPath: "/w", reason: null } },
       { cmd: "cmd_unlock_worktree", args: { repoPath: "/r/a", targetPath: "/w" } },
-      { cmd: "cmd_worktree_merge_teardown", args: { repoPath: "/r/a", ...merge } },
+      { cmd: "cmd_worktree_merge_teardown", args: { repoPath: "/r/a", ...merge, requireWriteTree: false } },
       { cmd: "cmd_delete_branch", args: { repoPath: "/r/a", branchName: "feat", force: false } },
     ]);
     const kinds = action.mock.calls.map(([entry]) => entry.kind);

@@ -7,8 +7,8 @@ use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
 use crate::ipc_error::CommandError;
 use crate::workbench::verification_driver::{
-    base_from_parent_read, decide, run_now, status, status_batch, target_of, verification_base,
-    Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
+    base_from_parent_read, decide, run_at, run_now, status, status_batch, target_of,
+    verdict_covers, verification_base, Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
 };
 use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
@@ -1541,4 +1541,64 @@ fn a_head_read_the_gate_declined_stays_a_retryable_deferral_and_is_not_kept() {
             "the refusal was not kept as the answer"
         );
     });
+}
+
+#[test]
+fn verdict_covers_only_a_settled_pass_of_the_same_head() {
+    let pass = Record {
+        state: "settled".into(),
+        outcome: "passed".into(),
+        head: "abc".into(),
+        ..Record::default()
+    };
+    assert!(verdict_covers(&pass, "abc"));
+    for (state, outcome, head) in [
+        ("settled", "failed", "abc"),
+        ("settled", "degraded", "abc"),
+        ("running", "passed", "abc"),
+        ("settled", "passed", "other"),
+        ("could_not_run", "", "abc"),
+    ] {
+        let record = Record {
+            state: state.into(),
+            outcome: outcome.into(),
+            head: head.into(),
+            ..Record::default()
+        };
+        assert!(!verdict_covers(&record, "abc"), "{state} {outcome} {head}");
+    }
+}
+
+/// Manvi is pointed at the scratch checkout of the candidate, with that
+/// commit's parent as the base. Starting does not move a ref.
+#[test]
+fn run_at_starts_verification_of_the_scratch_candidate() {
+    let (_d, store, repo, id) = setup();
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let head = head_of(&repo);
+    let fake = Fake::new();
+    run_at(&store, &fake, &id, repo.path(), &head).unwrap();
+    assert_eq!(fake.starts.borrow().len(), 1);
+    let sent = fake.starts.borrow();
+    assert_eq!(sent[0]["head"], head);
+    let sent_worktree = std::path::Path::new(sent[0]["worktree"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(sent_worktree, repo.path().canonicalize().unwrap());
+    assert_ne!(sent[0]["base"], head);
+    assert_eq!(
+        git_text_head(repo.path()),
+        head,
+        "starting verification moved the checkout"
+    );
+}
+
+fn git_text_head(repo: &std::path::Path) -> String {
+    crate::engine::git_cli::git_text(repo, &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string()
 }

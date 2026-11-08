@@ -209,6 +209,26 @@ describe("a wave end to end against a fake sidecar", () => {
     expect(w.merged).toEqual([]);
   });
 
+  it("holds a rejected candidate and merges the rest, and halts the wave when merge-tree cannot write", async () => {
+    const rejected: MergeTeardownError = { code: "candidate_failed", message: "The candidate abc failed verification (y.ts calls foo). Nothing was merged.", candidate: "abc" };
+    const held = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeFailure: (id) => (id === "b" ? rejected : null) });
+    const heldDone = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, held.deps)).finished;
+    expect(heldDone.state).toBe("done");
+    expect(phases(heldDone)).toEqual({ a: "merged", b: "held", c: "merged" });
+    expect(held.merged).toEqual(["a", "c"]);
+    expect(heldDone.members[1]!.detail).toMatch(/failed verification/);
+
+    const refused: MergeTeardownError = { code: "refused", message: "This git is older than 2.38, so merge-tree --write-tree is unavailable. The wave will not merge in the checkout. Nothing was merged." };
+    const w = world({ candidates: [[task("a"), task("b"), task("c")], [task("d")]], scopes: { a: ["a"], b: ["b"], c: ["c"], d: ["d"] }, mergeFailure: (id) => (id === "b" ? refused : null) });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(phases(done)).toEqual({ a: "merged", b: "held", c: "held" });
+    expect(done.members[2]!.detail).toBe("not merged: merge-tree --write-tree is unavailable pending");
+    expect(w.merged).toEqual(["a"]);
+    expect(w.launched).toEqual(["a", "b", "c"]);
+    expect(done.note).toMatch(/merge-tree --write-tree/);
+  });
+
   it("holds only that task on any other refusal, and merges the rest", async () => {
     for (const refusal of [{ code: "moved", message: "feature moved", branch: "b", expected: "e", actual: "a" }, { code: "refused", message: "nope" }] as MergeTeardownError[]) {
       const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeFailure: (id) => (id === "b" ? refusal : null) });

@@ -370,7 +370,7 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
             .expect_err("a worktree was removed under a running agent")
             .into_message();
     let merge = crate::commands::merge_teardown_guarded(
-        &state, repo_path, lane_path, None, false, None, &gate,
+        &state, repo_path, lane_path, None, false, None, false, None, &gate,
     )
     .expect_err("a worktree was merged away under a running agent")
     .to_string();
@@ -389,6 +389,142 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     agent.wait().unwrap();
     crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate).unwrap();
     assert!(!lane.exists());
+}
+
+fn allow_merge(_repo: &str, _argv: &[&str]) -> Result<crate::harness::PolicyVerdict, String> {
+    use crate::harness::{PolicyStatus, PolicyVerdict};
+    Ok(PolicyVerdict {
+        status: PolicyStatus::Allowed,
+        checked: true,
+        target: String::new(),
+        rule: String::new(),
+        severity: String::new(),
+        reason: String::new(),
+        demoted: String::new(),
+        grant_id: String::new(),
+        granted_by: String::new(),
+        widened: String::new(),
+        degraded: Vec::new(),
+        task_id: String::new(),
+        detail: String::new(),
+        detail_code: String::new(),
+    })
+}
+
+/// A repository, a `feature-x` lane with `feature.txt`, and that lane's tip.
+/// The profile database sits beside the repository so the checkout stays clean.
+fn lane_fixture(
+    diverge: bool,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git_global(&["init", "-b", "main", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
+    git_text(&repo, &["config", "user.email", "test@gitpulse.local"]).unwrap();
+    git_text(&repo, &["config", "user.name", "GitPulse Tester"]).unwrap();
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git_text(&repo, &["add", "README.md"]).unwrap();
+    git_text(&repo, &["commit", "-m", "initial"]).unwrap();
+    let lane = dir.path().join("lane");
+    crate::engine::worktree::add_worktree_extended(
+        repo.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("feature-x"),
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&lane);
+    std::fs::write(lane.join("feature.txt"), "lane\n").unwrap();
+    git_text(&lane, &["add", "feature.txt"]).unwrap();
+    git_text(&lane, &["commit", "-m", "feature"]).unwrap();
+    if diverge {
+        std::fs::write(repo.join("main-only.txt"), "main\n").unwrap();
+        git_text(&repo, &["add", "main-only.txt"]).unwrap();
+        git_text(&repo, &["commit", "-m", "main moves"]).unwrap();
+    }
+    let tip = git_text(&lane, &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    (dir, repo, lane, tip)
+}
+
+/// A combined tree with no task to verify is not merged. The checkout, the
+/// lane, and the scratch list stay as they were.
+#[test]
+fn a_wave_merge_of_an_unverified_candidate_is_refused() {
+    let (dir, repo, lane, tip) = lane_fixture(true);
+    let profile = dir.path().join("profile.sqlite");
+    let _store = dc_store::Store::open(&profile).unwrap();
+    let state = host(&profile);
+    let before = git_text(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let porcelain = git_text(&repo, &["status", "--porcelain"]).unwrap();
+    let err = crate::commands::merge_teardown_guarded(
+        &state,
+        repo.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("main"),
+        false,
+        Some(&tip),
+        true,
+        Some("ft-missing"),
+        &allow_merge,
+    )
+    .unwrap_err();
+    let crate::engine::worktree::MergeTeardownError::CandidateFailed { message, .. } = err else {
+        panic!("{err:?}");
+    };
+    assert!(message.contains("does not exist"), "{message}");
+    assert_eq!(git_text(&repo, &["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(
+        git_text(&repo, &["status", "--porcelain"]).unwrap(),
+        porcelain
+    );
+    assert!(!repo.join("feature.txt").exists());
+    assert!(lane.is_dir());
+    let listed = git_text(&repo, &["worktree", "list", "--porcelain"]).unwrap();
+    assert!(!listed.contains("gitpulse-candidate"), "{listed}");
+    assert!(!repo.join(".git").join("MERGE_HEAD").exists());
+}
+
+/// A fast-forward of the already-verified tip does not wait on Manvi, so a
+/// missing task still lands.
+#[test]
+fn a_fast_forward_of_the_verified_tip_lands_without_a_task_record() {
+    let (dir, repo, lane, tip) = lane_fixture(false);
+    let profile = dir.path().join("profile.sqlite");
+    let _store = dc_store::Store::open(&profile).unwrap();
+    let state = host(&profile);
+    let merged = crate::commands::merge_teardown_guarded(
+        &state,
+        repo.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("main"),
+        false,
+        Some(&tip),
+        true,
+        Some("ft-missing"),
+        &allow_merge,
+    )
+    .unwrap();
+    assert_eq!(
+        git_text(&repo, &["rev-parse", "refs/heads/main"])
+            .unwrap()
+            .trim(),
+        tip
+    );
+    assert!(repo.join("feature.txt").exists());
+    assert!(!lane.exists());
+    assert!(merged.output.worktree_removed);
 }
 
 /// The defect: removal asked only the run rows, so an agent typed into a plain

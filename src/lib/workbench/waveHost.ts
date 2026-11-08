@@ -170,7 +170,8 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       return own.head;
     },
     merge: async ({ runId, cwd, head }) => {
-      const merged = await mergeVerifiedAttempt({ id: runId, cwd, state: "exited", expires_at: 0 }, head);
+      const taskId = (await getTaskRun(runId)).task_id;
+      const merged = await mergeVerifiedAttempt({ id: runId, cwd, state: "exited", expires_at: 0 }, head, taskId || undefined);
       return { message: merged.message, beforeOid: merged.beforeOid, afterOid: merged.afterOid };
     },
     mainState: async (signal) => {

@@ -22,9 +22,11 @@
 //! through alternates (a partial clone, whose missing blobs git would fetch
 //! *into the quarantine*) is the caller's to refuse before getting here.
 //!
-//! Users: the `tree` route of `gitpulse_landed` today; the conflict engine and
-//! the object-database integration are meant to import this module rather than
-//! write a second quarantine.
+//! Users: the `tree` route of `gitpulse_landed` today, and the conflict engine.
+//! Lane integration reuses [`parse_merge_tree_output`] and writes the merged
+//! tree into the repository's own object database: a tree that exists only in
+//! this quarantine cannot be committed there, and the quarantine is deleted
+//! with this value.
 
 use crate::engine::git_cli::{
     git_captured, git_captured_quarantined, git_text_with_timeout, is_run_timeout,
@@ -210,41 +212,57 @@ impl ObjectQuarantine {
             ],
             deadline,
         )?;
-        // Bytes, not text: a path git names need not be UTF-8, and a lossy
-        // conversion would make two different names the same string.
-        let mut fields = run.stdout.split(|byte| *byte == 0);
-        let tree = String::from_utf8_lossy(fields.next().unwrap_or_default());
-        let tree = tree.trim();
-        match run.status_code {
-            0 | 1 if is_object_name(tree) => {
-                if run.status_code == 0 {
-                    return Ok(MergeOutcome::Clean {
-                        tree: tree.to_string(),
-                    });
-                }
-                let named: Vec<String> = fields
-                    .filter(|path| !path.is_empty())
-                    .map(render_path)
-                    .collect();
-                // A conflict that names no path is not an answer a caller can
-                // act on, and it is not a clean merge either.
-                if named.is_empty() {
-                    return Err(QuarantineError::Git(
-                        "git merge-tree reported a conflict and named no path".into(),
-                    ));
-                }
-                let paths_total = named.len();
-                Ok(MergeOutcome::Conflicted {
+        parse_merge_tree_output(
+            &run.stdout,
+            run.status_code,
+            &String::from_utf8_lossy(&run.stderr),
+        )
+    }
+}
+
+/// Parses `git merge-tree --write-tree --name-only --no-messages -z`.
+///
+/// Shared by the quarantine (a tree that is thrown away) and by lane
+/// integration (a tree written into the repository's own object database).
+/// Exit 0 is a clean merge, exit 1 is a conflict, and a git that rejects the
+/// option is [`QuarantineError::Unsupported`].
+pub(crate) fn parse_merge_tree_output(
+    stdout: &[u8],
+    status_code: i32,
+    stderr: &str,
+) -> Result<MergeOutcome, QuarantineError> {
+    let stderr = stderr.trim();
+    // Bytes, not text: a path git names need not be UTF-8, and a lossy
+    // conversion would make two different names the same string.
+    let mut fields = stdout.split(|byte| *byte == 0);
+    let tree = String::from_utf8_lossy(fields.next().unwrap_or_default());
+    let tree = tree.trim();
+    match status_code {
+        0 | 1 if is_object_name(tree) => {
+            if status_code == 0 {
+                return Ok(MergeOutcome::Clean {
                     tree: tree.to_string(),
-                    paths: named.into_iter().take(MAX_CONFLICT_PATHS).collect(),
-                    paths_total,
-                })
+                });
             }
-            _ => Err(classify_failure(
-                run.status_code,
-                String::from_utf8_lossy(&run.stderr).trim(),
-            )),
+            let named: Vec<String> = fields
+                .filter(|path| !path.is_empty())
+                .map(render_path)
+                .collect();
+            // A conflict that names no path is not an answer a caller can
+            // act on, and it is not a clean merge either.
+            if named.is_empty() {
+                return Err(QuarantineError::Git(
+                    "git merge-tree reported a conflict and named no path".into(),
+                ));
+            }
+            let paths_total = named.len();
+            Ok(MergeOutcome::Conflicted {
+                tree: tree.to_string(),
+                paths: named.into_iter().take(MAX_CONFLICT_PATHS).collect(),
+                paths_total,
+            })
         }
+        _ => Err(classify_failure(status_code, stderr)),
     }
 }
 
