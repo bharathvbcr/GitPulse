@@ -172,6 +172,8 @@ mockIPCWithEvents(async (cmd, args) => {
     return result;
   }
   if (fixtureRepoCommands[cmd]) { repoCommandCalls.push(cmd); return fixtureRepoCommands[cmd](args); }
+  // The Agent Inbox's snapshot (commands/worktrees.rs `InboxSnapshot`): no threads, no claimed lanes.
+  if (cmd === "cmd_inbox_read") return { ok: true, repo_path: args.repoPath, threads: [], lanes: [], total: 0 };
   if (cmd === "cmd_ai_status") {
     return {
       harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
