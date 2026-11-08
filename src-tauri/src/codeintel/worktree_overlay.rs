@@ -1065,12 +1065,18 @@ pub(super) fn is_sparse_worktree(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What the spawn-gate report calls the `rev-parse` launches [`head_sha_of`]
+/// makes.
+pub(crate) const HEAD_SHA_SOURCE: &str = "codeintel.overlay.head_sha";
+
 fn head_sha_of(repo: &Path) -> Option<String> {
-    git_captured(repo, &["rev-parse", "--verify", "HEAD"])
-        .ok()
-        .filter(|run| run.status_code == 0)
-        .map(|run| String::from_utf8_lossy(&run.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    crate::engine::git_cli::with_spawn_source(HEAD_SHA_SOURCE, || {
+        git_captured(repo, &["rev-parse", "--verify", "HEAD"])
+    })
+    .ok()
+    .filter(|run| run.status_code == 0)
+    .map(|run| String::from_utf8_lossy(&run.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// Evaluates source freshness of a stacked `worktree` against `anchor_store`'s
@@ -2034,6 +2040,18 @@ mod tests {
             out.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn head_sha_of_attributes_its_rev_parse_to_its_own_source() {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let before = crate::engine::git_cli::rev_parse_launches_from(HEAD_SHA_SOURCE);
+        assert!(head_sha_of(repo.path()).is_some(), "the head must resolve");
+        assert!(
+            crate::engine::git_cli::rev_parse_launches_from(HEAD_SHA_SOURCE) > before,
+            "head_sha_of's rev-parse was not attributed to {HEAD_SHA_SOURCE}"
         );
     }
 

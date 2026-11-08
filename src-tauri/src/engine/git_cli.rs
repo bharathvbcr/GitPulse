@@ -120,8 +120,14 @@ fn has_bare_layout(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir()
 }
 
+/// What the spawn-gate report calls the `rev-parse` launches [`resolve_repo`]
+/// makes.
+pub(crate) const RESOLVE_REPO_SOURCE: &str = "git_cli.resolve_repo";
+
 fn rev_parse_is_bare(path: &Path) -> bool {
-    match git_text(path, &["rev-parse", "--is-bare-repository"]) {
+    match with_spawn_source(RESOLVE_REPO_SOURCE, || {
+        git_text(path, &["rev-parse", "--is-bare-repository"])
+    }) {
         Ok(text) => text.trim().eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -3228,6 +3234,44 @@ pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T
     body()
 }
 
+/// The source of a spawn no caller named.
+pub(crate) const UNATTRIBUTED_SOURCE: &str = "unattributed";
+
+thread_local! {
+    /// The call site the current thread's spawns are attributed to in the gate
+    /// report. Same shape as [`ADMISSION`]: a forward-only context the runner
+    /// reads at admission, which is why it is not threaded through every
+    /// runner signature the way the error is (see `CommandError`).
+    static SPAWN_SOURCE: Cell<&'static str> = const { Cell::new(UNATTRIBUTED_SOURCE) };
+}
+
+/// `git rev-parse` children the process-wide gate has admitted under `source`.
+#[cfg(test)]
+pub(crate) fn rev_parse_launches_from(source: &str) -> u64 {
+    spawn_gate().rev_parse_launches_from(source)
+}
+
+/// The call site the current thread's spawns are attributed to. A body that
+/// hops threads (`thread::scope`, a pool) must carry it across with
+/// [`with_spawn_source`], exactly as it carries [`current_admission`].
+pub(crate) fn current_spawn_source() -> &'static str {
+    SPAWN_SOURCE.get()
+}
+
+/// Runs `body` with its spawns attributed to `source` (a fixed call-site name,
+/// never user data), restoring the previous source on return, error and
+/// unwinding. The innermost scope wins.
+pub(crate) fn with_spawn_source<T>(source: &'static str, body: impl FnOnce() -> T) -> T {
+    struct Restore(&'static str);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPAWN_SOURCE.set(self.0);
+        }
+    }
+    let _restore = Restore(SPAWN_SOURCE.replace(source));
+    body()
+}
+
 thread_local! {
     /// Depth of [`with_background_band`] scopes on this thread.
     static BAND_FORCED: Cell<u32> = const { Cell::new(0) };
@@ -3580,6 +3624,10 @@ struct GateState {
 #[derive(Default)]
 struct LabelCounts {
     counts: HashMap<String, u64>,
+    /// `git rev-parse` admissions by the call site that asked
+    /// ([`with_spawn_source`]), bounded like `counts`. Sources are `&'static
+    /// str` names chosen in code, never paths or ref names.
+    rev_parse_sources: HashMap<&'static str, u64>,
 }
 
 impl LabelCounts {
@@ -3587,6 +3635,54 @@ impl LabelCounts {
     const OTHER: &'static str = "other";
     /// Labels printed per report; the rest are summed into one figure.
     const REPORTED: usize = 8;
+    /// Distinct rev-parse sources kept; the rest count under [`Self::OTHER`].
+    const MAX_SOURCES: usize = 32;
+    /// Sources printed per report; the rest are summed into `rest=`.
+    const REPORTED_SOURCES: usize = 5;
+    /// The label (as [`report_label`] reduces it) whose launches are
+    /// attributed to a source.
+    const SOURCED_LABEL: &'static str = "git rev-parse";
+
+    /// [`Self::note`], and for a `git rev-parse` also the call site behind it.
+    fn note_sourced(&mut self, label: &str, source: &'static str) {
+        self.note(label);
+        if report_label(label) != Self::SOURCED_LABEL {
+            return;
+        }
+        let source = if !self.rev_parse_sources.contains_key(source)
+            && self.rev_parse_sources.len() >= Self::MAX_SOURCES
+        {
+            Self::OTHER
+        } else {
+            source
+        };
+        *self.rev_parse_sources.entry(source).or_insert(0) += 1;
+    }
+
+    /// `rev-parse by: a.b=9 c=4 unattributed=2 rest=1`, largest first, ties by
+    /// name; empty when no rev-parse was admitted.
+    fn sources_report(&self) -> String {
+        if self.rev_parse_sources.is_empty() {
+            return String::new();
+        }
+        let mut rows: Vec<(&&str, &u64)> = self.rev_parse_sources.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(Self::REPORTED_SOURCES)
+            .map(|(source, count)| format!("{source}={count}"))
+            .collect();
+        let rest: u64 = rows
+            .iter()
+            .skip(Self::REPORTED_SOURCES)
+            .map(|(_, count)| **count)
+            .sum();
+        if rest == 0 {
+            format!("rev-parse by: {}", shown.join(" "))
+        } else {
+            format!("rev-parse by: {} rest={rest}", shown.join(" "))
+        }
+    }
 
     fn note(&mut self, label: &str) {
         let key = report_label(label);
@@ -4133,20 +4229,28 @@ impl SpawnGate {
 
     /// The `top: ...` attribution line, rendered under a brief lock.
     fn label_report(&self) -> String {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_label
-            .report()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let top = state.by_label.report();
+        let sources = state.by_label.sources_report();
+        if sources.is_empty() {
+            top
+        } else {
+            format!("{top} | {sources}")
+        }
     }
 
-    /// Attributes one admitted child to its label for the gate report.
+    /// Attributes one admitted child to its label, and its rev-parse launches
+    /// to the call site on this thread ([`current_spawn_source`]), for the gate
+    /// report.
     fn note_admitted_label(&self, label: &str) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_label
-            .note(label);
+            .note_sourced(label, current_spawn_source());
     }
 
     fn note_coalesced(&self, class: Admission) {
@@ -4166,6 +4270,18 @@ impl SpawnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counters = &mut state.counters[class.index()];
         counters.coalesced = counters.coalesced.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    fn rev_parse_launches_from(&self, source: &str) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_label
+            .rev_parse_sources
+            .get(source)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -6731,6 +6847,153 @@ mod tests {
     }
 
     #[test]
+    fn rev_parse_report_names_the_top_five_sources_in_order() {
+        let mut counts = super::LabelCounts::default();
+        assert_eq!(counts.sources_report(), "", "no rev-parse, no line");
+        let launches: [(&'static str, u64); 7] = [
+            ("a.small", 1),
+            ("b.big", 9),
+            ("c.mid", 4),
+            ("d.tie", 4),
+            ("e.low", 2),
+            (super::UNATTRIBUTED_SOURCE, 6),
+            ("f.tiny", 1),
+        ];
+        for (source, n) in launches {
+            for _ in 0..n {
+                counts.note_sourced("git rev-parse --verify HEAD", source);
+            }
+        }
+        // Other commands are never attributed, whatever their source.
+        for _ in 0..50 {
+            counts.note_sourced("git status", "b.big");
+        }
+        assert_eq!(
+            counts.sources_report(),
+            "rev-parse by: b.big=9 unattributed=6 c.mid=4 d.tie=4 e.low=2 rest=2"
+        );
+        assert_eq!(counts.counts["git rev-parse"], 27, "label totals unchanged");
+        assert!(
+            counts.report().starts_with("top: git status=50 "),
+            "{}",
+            counts.report()
+        );
+    }
+
+    #[test]
+    fn rev_parse_sources_are_bounded_and_overflow_is_counted() {
+        const NAMES: [&str; 40] = [
+            "s00", "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11",
+            "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23",
+            "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31", "s32", "s33", "s34", "s35",
+            "s36", "s37", "s38", "s39",
+        ];
+        let mut counts = super::LabelCounts::default();
+        for name in NAMES {
+            counts.note_sourced("git rev-parse", name);
+        }
+        assert!(counts.rev_parse_sources.len() <= super::LabelCounts::MAX_SOURCES + 1);
+        assert_eq!(counts.rev_parse_sources.values().sum::<u64>(), 40);
+        assert_eq!(
+            counts.rev_parse_sources["other"], 8,
+            "32 kept, 8 overflowed"
+        );
+        // A source already kept still counts under its own name when full.
+        counts.note_sourced("git rev-parse", "s00");
+        assert_eq!(counts.rev_parse_sources["s00"], 2);
+    }
+
+    #[test]
+    fn spawn_source_is_unattributed_unset_nests_and_restores_after_a_panic() {
+        assert_eq!(super::current_spawn_source(), super::UNATTRIBUTED_SOURCE);
+        super::with_spawn_source("outer", || {
+            assert_eq!(super::current_spawn_source(), "outer");
+            super::with_spawn_source("inner", || {
+                assert_eq!(super::current_spawn_source(), "inner");
+            });
+            assert_eq!(super::current_spawn_source(), "outer");
+            let unwound = std::panic::catch_unwind(|| {
+                super::with_spawn_source("doomed", || panic!("body unwinds"));
+            });
+            assert!(unwound.is_err());
+            assert_eq!(super::current_spawn_source(), "outer", "restored on unwind");
+            // A new thread starts unattributed: a hop must re-enter the scope.
+            let hopped = std::thread::spawn(super::current_spawn_source)
+                .join()
+                .unwrap();
+            assert_eq!(hopped, super::UNATTRIBUTED_SOURCE);
+        });
+        assert_eq!(super::current_spawn_source(), super::UNATTRIBUTED_SOURCE);
+    }
+
+    /// Interleaved A/B, min of 9 rounds: a scope plus the report bookkeeping
+    /// against the bookkeeping alone. A spawn costs milliseconds; the bound is
+    /// 5 us per spawn, far above what a thread-local swap and a map bump cost.
+    #[test]
+    fn spawn_source_tagging_adds_negligible_per_spawn_overhead() {
+        // 20k x 9 rounds x 2 arms keeps this near 2 s in a debug build; the
+        // 5 us bound is ~100x what the swap and map bump cost.
+        const N: u32 = 20_000;
+        let time = |tagged: bool| {
+            let mut counts = super::LabelCounts::default();
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                if tagged {
+                    super::with_spawn_source("bench.site", || {
+                        counts.note_sourced("git rev-parse", super::current_spawn_source());
+                    });
+                } else {
+                    counts.note_sourced("git rev-parse", super::UNATTRIBUTED_SOURCE);
+                }
+            }
+            std::hint::black_box(&counts);
+            started.elapsed()
+        };
+        let (mut plain, mut tagged) = (Duration::MAX, Duration::MAX);
+        for _ in 0..9 {
+            plain = plain.min(time(false));
+            tagged = tagged.min(time(true));
+        }
+        let extra = tagged.saturating_sub(plain) / N;
+        println!("spawn-source A/B min-of-9 x {N}: plain {plain:?} tagged {tagged:?} extra {extra:?}/spawn");
+        assert!(extra < Duration::from_micros(5), "{extra:?} per spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_rev_parse_is_attributed_to_the_scope_it_ran_under() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(4)));
+        let run = |label: &str, source: Option<&'static str>| {
+            let mut cmd = Command::new("/usr/bin/true");
+            let go = |cmd: &mut Command| {
+                run_with_gate(
+                    cmd,
+                    label,
+                    Duration::from_secs(10),
+                    None,
+                    1024,
+                    &mut (),
+                    gate,
+                )
+                .expect("spawn");
+            };
+            match source {
+                Some(source) => super::with_spawn_source(source, || go(&mut cmd)),
+                None => go(&mut cmd),
+            }
+        };
+        run("git rev-parse", Some("one.site"));
+        run("git rev-parse", Some("one.site"));
+        run("git rev-parse", Some("two.site"));
+        run("git rev-parse", None);
+        run("git log", Some("one.site"));
+        assert_eq!(
+            gate.label_report(),
+            "top: git rev-parse=4 git log=1 | rev-parse by: one.site=2 two.site=1 unattributed=1"
+        );
+    }
+
+    #[test]
     fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
         let gate = super::SpawnGate::with_rate(8, 4, 4);
         let mut held = Vec::new();
@@ -7998,6 +8261,18 @@ mod tests {
             dir.path().canonicalize().unwrap().to_string_lossy()
         );
         assert!(!resolved.name.is_empty());
+    }
+
+    #[test]
+    fn resolve_repo_attributes_its_rev_parse_to_its_own_source() {
+        let dir = init_test_repo(false);
+        let before = super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE);
+        resolve_repo(&dir.path().to_string_lossy()).expect("resolve");
+        assert!(
+            super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE) > before,
+            "resolve_repo's rev-parse was not attributed to {}",
+            super::RESOLVE_REPO_SOURCE
+        );
     }
 
     #[test]

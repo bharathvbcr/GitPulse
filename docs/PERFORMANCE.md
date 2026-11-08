@@ -2593,3 +2593,26 @@ The 20 ms lock wait was not widened. Why it holds now: appends take a shared loc
 Not measured: the target of under 1 ms per append is met at p99 for the append alone in this build (0.2 ms), but the whole hook also reads the store twice (attribution and notices), each a lock-free read and parse of up to about 2 MiB; that read was not timed separately.
 
 Round 3 (same lane): compaction now keeps every live row up to the cap (4,096 live rows after the stress run, where the half-cap compaction left about 2,340), and the new file is written before the exclusive lock is taken, so the lock covers a read of a short tail, one small write and a rename. Three more runs of the same tests, debug build, machine under load: 0 of 300 appends failed in each; single-process append at a full store p50 77 to 94 us, p99 0.21 to 1.6 ms, max 62 to 72 ms (the one compaction). A read is a lock-free parse of up to about 2 MiB: 28 to 59 ms in a debug build per the reviewer, not measured in release, and listed as a follow-up.
+
+## 2026-11-08: steady `git rev-parse` rate, and who spends it (ft-cd18575e943d4aa0b55bc2df720bcc79)
+
+What: the steady-state rate of `git rev-parse` launches with the verification driver holding 23 cards, before and after the head and base reads moved onto `ref_cache` (merged at `a1e1bc02`).
+
+Where: the 2026-10-17 lane measurement from the card log (recorded here from that log; this build was not re-measured on 2026-11-08). The motivating export came from installed build 836adcf7 (1.4.0): `rev-parse=2,217,369` of about 2.42M launches, and between 04:32:35 and 04:42:35 (600 s) the counter rose by 4,521, about 7.5/s.
+
+| | before | after |
+| --- | --- | --- |
+| steady `rev-parse` launches per second, 23 cards | 7.65/s | 0.38/s |
+
+Method: the driver sweeps every `SWEEP_PERIOD` (3 s) and `settle()` reads each card's head once per sweep, so 23 cards over 3 s is 23 / 3 = 7.67/s, which matches the 7.5/s in the export. The lane run counted `git rev-parse` children launched over 60 s, two rounds, over 23 cards, then divided by the window. After the change the cost is one launch per card per cache TTL (a stamp younger than 3 s is never stored, so a hit is never stale). The target is at most 1/s; it was met in the lane. It has not been measured on an installed build; that re-measure stays open.
+
+How to read the new field: the periodic gate line now ends with the call sites behind the `git rev-parse` total.
+
+    WARN [spawn_gate] reactive admitted=... | background shed=... | top: git rev-parse=N git worktree=... | rev-parse by: verification_gate.current_head=A graph.refs.detached_head=B unattributed=C rest=D
+
+- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `git_cli::with_spawn_source`, never a path or ref name.
+- `unattributed` is a launch whose caller set no source. The share that is unattributed is the share still not accounted for; tag the biggest caller next.
+- At most 32 distinct sources are kept; beyond that, new ones count under `other`.
+- The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.
+- Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing of its own, so the leader's source is credited and the joiner's is not.
+- A thread that hops (`thread::scope`, a pool) starts `unattributed`; carry the source across with `with_spawn_source(current_spawn_source(), ...)`, as `current_admission()` is carried.

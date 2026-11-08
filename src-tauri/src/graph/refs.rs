@@ -13,7 +13,7 @@
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo, with_spawn_source};
 use crate::engine::git_reader::REFS_TAG_CAP;
 use crate::graph::ref_scope::{self, HiddenHistory, RefScope};
 
@@ -279,7 +279,9 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
     // A detached HEAD points at a commit no branch names; without this the
     // graph shows no "you are here" at all.
     if current_branch.is_empty() {
-        if let Ok(head) = git_text(&repo, &["rev-parse", "HEAD"]) {
+        if let Ok(head) = with_spawn_source("graph.refs.detached_head", || {
+            git_text(&repo, &["rev-parse", "HEAD"])
+        }) {
             let head = head.trim().to_string();
             if !head.is_empty() {
                 decorations.push(RefDecoration {
