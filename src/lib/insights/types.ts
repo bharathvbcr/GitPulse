@@ -61,6 +61,12 @@ export interface LiveSession {
    * "none the scan could see", not "started by a person".
    */
   parent_pid?: number;
+  /** The agent's own session id, when its registry named one. Hook claims join on it. */
+  session_id?: string;
+  /** Claude Code's `procStart` string; a worktree lock matches only when pid and this agree. */
+  proc_start?: string;
+  /** The cwd the registry recorded; differs from `cwd` for an isolation worktree. */
+  registry_cwd?: string;
 }
 
 /** A session nested under another in the same worktree. */
@@ -186,6 +192,17 @@ export interface SharedWorktree {
   truncated: boolean;
 }
 
+/** One file claim. A declared claim names the run that planned the path. An observed claim names the session the edit hook let through. */
+export interface FileClaim {
+  source: "declared" | "observed";
+  session_id?: string;
+  run_id?: string;
+  path: string;
+  worktree: string;
+  ts_ms: number;
+  cwd?: string;
+}
+
 export interface CollisionRisk {
   ok: boolean;
   error: string;
@@ -204,6 +221,13 @@ export interface CollisionRisk {
   /** False when some agent kind could not be observed; empty `shared_worktrees` is then not clean. */
   sessions_ok: boolean;
   sessions_error: string;
+  /**
+   * Declared and observed claims for this repository. Omitted when empty.
+   * Empty means none only when `claims_error` is also empty.
+   */
+  file_claims?: FileClaim[];
+  /** Set when the claim store was not read, or the list was cut. Omitted when empty. */
+  claims_error?: string;
 }
 
 export interface InsightsSnapshot {

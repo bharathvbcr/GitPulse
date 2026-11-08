@@ -148,6 +148,11 @@ export interface WaveDeps {
   mainState(signal: AbortSignal): Promise<MainState>;
   /** Writes the record durably; a failure stops the wave. */
   persist(record: WaveRecord): Promise<void>;
+  /**
+   * Paths already claimed by a run or a session. Absent means none were read.
+   * A claim holds a member back; it is not called a collision.
+   */
+  heldPaths?(signal: AbortSignal): Promise<readonly { path: string; holder: string }[]>;
   now(): number;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   id(): string;
@@ -191,14 +196,29 @@ function scopeKey(path: string, options: PathIdentityOptions): string | null {
   return !key || key === ".." || key.startsWith("../") ? null : key;
 }
 
+/** One path the two lists share, in the spelling of `theirs`, or null when they do not meet. */
+function overlappingPath(mine: readonly string[], theirs: readonly string[], options: PathIdentityOptions): string | null {
+  const left = mine.map((raw) => ({ raw, key: scopeKey(raw, options) }));
+  const right = theirs.map((raw) => ({ raw, key: scopeKey(raw, options) }));
+  for (const x of left) for (const y of right) {
+    if (!x.key || !y.key) continue;
+    if (x.key === "." || y.key === "." || x.key === y.key || x.key.startsWith(`${y.key}/`) || y.key.startsWith(`${x.key}/`)) return y.raw;
+  }
+  return null;
+}
+
 export interface BatchPlan { chosen: Candidate[]; skipped: { id: string; title: string; reason: string }[] }
 
 /**
- * The first `n` candidates, in rank order, whose scopes do not collide. A
- * candidate with no readable scope is admitted only first, and then nothing
- * else is admitted beside it, so unknown never reads as disjoint.
+ * The first `n` candidates, in rank order, whose scopes do not collide and
+ * whose files are not already claimed. A candidate with no readable scope is
+ * admitted only first, and then nothing else is admitted beside it, so unknown
+ * never reads as disjoint — unless `held` is non-empty, in which case an
+ * unknown scope is refused and the reason names a claimed path. Overlap
+ * between two members names the path. A held path is "claimed by" its holder,
+ * not a collision.
  */
-export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions()): BatchPlan {
+export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions(), held: readonly { path: string; holder: string }[] = []): BatchPlan {
   const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [];
   // A scope with any entry that cannot be read is an unknown scope, which runs alone.
   const known = (id: string) => {
@@ -209,12 +229,23 @@ export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<
     if (chosen.length >= n) break;
     if (excluded.has(candidate.id) || chosen.some((c) => c.id === candidate.id)) continue;
     const mine = known(candidate.id);
+    if (mine.length === 0 && held.length > 0) {
+      skipped.push({ id: candidate.id, title: candidate.title, reason: `${held[0].path} is claimed by ${held[0].holder}` });
+      continue;
+    }
     const clash = chosen.find((other) => {
       const theirs = known(other.id);
       return mine.length === 0 || theirs.length === 0 || scopesOverlap(mine, theirs, options);
     });
     if (clash) {
-      skipped.push({ id: candidate.id, title: candidate.title, reason: mine.length === 0 || known(clash.id).length === 0 ? `its file scope is unknown next to "${clash.title}"` : `its files overlap "${clash.title}"` });
+      const unknown = mine.length === 0 || known(clash.id).length === 0;
+      const path = unknown ? null : overlappingPath(scopes.get(candidate.id) ?? [], scopes.get(clash.id) ?? [], options);
+      skipped.push({ id: candidate.id, title: candidate.title, reason: unknown ? `its file scope is unknown next to "${clash.title}"` : path ? `its files overlap "${clash.title}" on ${path}` : `its files overlap "${clash.title}"` });
+      continue;
+    }
+    const claim = held.find((row) => scopesOverlap(mine, [row.path], options));
+    if (claim) {
+      skipped.push({ id: candidate.id, title: candidate.title, reason: `${claim.path} is claimed by ${claim.holder}` });
       continue;
     }
     chosen.push(candidate);
@@ -346,7 +377,8 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     const open = ranked.filter((c) => !excluded.has(c.id));
     if (open.length === 0) { await save({ state: "done", note: "No further task is ready to start." }); return false; }
     const scopes = await deps.scopes(open.map((c) => c.id), abort.signal);
-    const plan = planBatch(open, scopes, record.n, excluded);
+    const held = deps.heldPaths ? await deps.heldPaths(abort.signal) : [];
+    const plan = planBatch(open, scopes, record.n, excluded, hostOptions(), held);
     const members = plan.chosen.map((c) => member(c, deps));
     const note = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
     await save({
