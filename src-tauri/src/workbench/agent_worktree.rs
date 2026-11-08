@@ -1101,6 +1101,67 @@ mod tests {
         assert_eq!(porcelain.trim(), "", "seeding dirtied the lane");
     }
 
+    /// The rebind rewrites only the lane copy's LATEST generation row; every
+    /// historical row keeps the donor root, so its overflow chain stays
+    /// CoW-shared. With one generation "latest == lane" cannot tell
+    /// `WHERE id = MAX(id)` from an unconditional UPDATE, so the donor gets a
+    /// second generation first.
+    #[test]
+    fn seeded_lane_rebinds_only_the_latest_generation_row() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let _devmap = crate::devmap::cli::bind_test_binary(
+            bin_dir
+                .path()
+                .join("no-devmap")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let anchor_dir = indexed_checkout();
+        let donor_db = devmap_query::paths::store_path(anchor_dir.path());
+        {
+            let conn = rusqlite::Connection::open(&donor_db).unwrap();
+            conn.execute(
+                "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
+                 SELECT created_at + 1.0, head_sha, analysis_json, repo_root FROM generations",
+                [],
+            )
+            .unwrap();
+        }
+        let made = provision_with(
+            anchor_dir.path().to_str().unwrap(),
+            "d15c0000-multigen",
+            "Multi generation lane",
+            false,
+            &with_reader(plenty),
+        )
+        .expect("an indexed checkout must still give a lane");
+        let lane_canon = Path::new(&made.path).canonicalize().unwrap();
+        let donor_canon = anchor_dir.path().canonicalize().unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            devmap_query::paths::store_path(&lane_canon),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, repo_root FROM generations ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(rows.len() >= 2, "{rows:?}");
+        let (latest, historical) = rows.split_last().unwrap();
+        assert_eq!(Path::new(&latest.1).canonicalize().unwrap(), lane_canon);
+        for (id, root) in historical {
+            assert_eq!(
+                Path::new(root).canonicalize().unwrap(),
+                donor_canon,
+                "historical generation {id} was rewritten in the lane"
+            );
+        }
+    }
+
     #[test]
     fn slugs_are_branch_and_path_safe_and_bounded() {
         assert_eq!(

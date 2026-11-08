@@ -3865,7 +3865,11 @@ pub(crate) mod tests {
     /// need this.
     pub(crate) fn commit_and_stamp_head(repo: &Path) -> String {
         let git = |args: &[&str]| -> String {
-            let output = std::process::Command::new("git")
+            // `pin_git` strips every inherited `GIT_*` variable and pins the
+            // config, so a neighbour test's scoped `GIT_WORK_TREE` cannot
+            // redirect these commands away from the fixture.
+            let mut command = std::process::Command::new("git");
+            command
                 .args([
                     "-c",
                     "user.name=Fixture",
@@ -3874,9 +3878,9 @@ pub(crate) mod tests {
                 ])
                 .args(["-c", "commit.gpgsign=false"])
                 .args(args)
-                .current_dir(repo)
-                .output_locked()
-                .expect("spawn git");
+                .current_dir(repo);
+            crate::test_support::pin_git(&mut command);
+            let output = command.output_locked().expect("spawn git");
             assert!(
                 output.status.success(),
                 "git {args:?} failed: {}",
