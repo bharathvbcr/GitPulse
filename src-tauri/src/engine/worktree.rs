@@ -15467,3 +15467,82 @@ mod worktree_list_porcelain_tests {
         );
     }
 }
+
+/// Adversarial attacks on ft-b7a499bf (adversary, wave 2).
+#[cfg(test)]
+mod scan_once_adversarial_tests {
+    use super::*;
+    use crate::engine::ref_cache::ManualClock;
+    use crate::test_support::env::{bind_env, env_serial};
+    use crate::test_support::{git_in, repo_with_worktrees};
+    use std::sync::Arc;
+
+    /// Runs the shortstat through the stamp twice, `change` between them, and
+    /// says how many times the measurement ran and whether the second answer
+    /// differs from a fresh measurement.
+    fn measured_twice(dir: &Path, clock: &ManualClock, change: impl FnOnce()) -> (usize, bool) {
+        let status: Arc<str> = Arc::from(" M seed.txt\0");
+        let runs = std::cell::Cell::new(0usize);
+        let measure = || {
+            runs.set(runs.get() + 1);
+            measure_diff_stat(dir)
+        };
+        let first = diff_stamp::through(dir, &status, &ScanPass::now(), measure);
+        assert!(first.is_some());
+        change();
+        clock.advance(crate::engine::ref_cache::racy_window() + Duration::from_secs(1));
+        let second = diff_stamp::through(dir, &status, &ScanPass::now(), measure);
+        (runs.get(), second != measure_diff_stat(dir))
+    }
+
+    /// A user-level attributes file (`$XDG_CONFIG_HOME/git/attributes`, which
+    /// git reads for every diff) is an input of `git diff HEAD --shortstat`
+    /// that the stamp does not carry: `-diff` turns the line counts into a
+    /// binary summary.
+    #[test]
+    fn a_user_attributes_file_edit_is_not_served_a_stale_shortstat() {
+        let serial = env_serial();
+        let clock = ManualClock::install();
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = bind_env(&serial)
+            .set("HOME", home.path())
+            .set("XDG_CONFIG_HOME", home.path());
+        let attributes = home.path().join("git").join("attributes");
+        let (runs, stale) = measured_twice(&dir, &clock, || {
+            std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+            std::fs::write(&attributes, "seed.txt -diff\n").unwrap();
+        });
+        assert_eq!(runs, 2, "the attributes file changed, the stamp did not");
+        assert!(!stale, "a stale shortstat was served");
+    }
+
+    /// Same, through `core.attributesFile`: the config that names the file is
+    /// stamped, the file it names is not.
+    #[test]
+    fn an_edit_to_the_file_core_attributes_file_names_is_not_served_stale() {
+        let _serial = env_serial();
+        let clock = ManualClock::install();
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let attributes = outside.path().join("attrs");
+        std::fs::write(&attributes, "# nothing yet\n").unwrap();
+        git_in(
+            &dir,
+            &[
+                "config",
+                "core.attributesFile",
+                attributes.to_str().unwrap(),
+            ],
+        );
+        let (runs, stale) = measured_twice(&dir, &clock, || {
+            std::fs::write(&attributes, "seed.txt -diff\n").unwrap();
+        });
+        assert_eq!(runs, 2, "the named file changed, the stamp did not");
+        assert!(!stale, "a stale shortstat was served");
+    }
+}
