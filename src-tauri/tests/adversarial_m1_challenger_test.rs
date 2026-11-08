@@ -73,7 +73,7 @@ fn test_adversarial_oversized_message_bodies() {
     // 4. Multibyte UTF-8 near the 16 KiB boundary
     // "🦀" is 4 bytes. 16380 bytes of 'a' + "🦀" = 16384 bytes (OK)
     let mut utf8_boundary_ok = "a".repeat(16380);
-    utf8_boundary_ok.push_str("🦀");
+    utf8_boundary_ok.push('🦀');
     assert_eq!(utf8_boundary_ok.len(), 16384);
     assert!(post_thread_message(
         repo_path,
@@ -88,7 +88,7 @@ fn test_adversarial_oversized_message_bodies() {
 
     // 16381 bytes of 'a' + "🦀" = 16385 bytes (FAIL)
     let mut utf8_boundary_err = "a".repeat(16381);
-    utf8_boundary_err.push_str("🦀");
+    utf8_boundary_err.push('🦀');
     assert_eq!(utf8_boundary_err.len(), 16385);
     assert!(post_thread_message(
         repo_path,
@@ -184,7 +184,7 @@ fn test_adversarial_ring_buffer_300_messages_wrapping_and_monotonicity() {
     // Since i % 5 was used, there are 5 active thread keys: thread-0, thread-1, thread-2, thread-3, thread-4
     assert_eq!(threads.len(), 5);
     for t in threads {
-        assert!(t.messages.len() > 0);
+        assert!(!t.messages.is_empty());
         // Latest sequence must be between 296 and 300
         assert!(t.latest_msg.seq >= 296 && t.latest_msg.seq <= 300);
     }
