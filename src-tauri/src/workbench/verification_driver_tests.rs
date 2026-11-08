@@ -1323,7 +1323,26 @@ fn repeated_head_and_base_reads_of_an_unchanged_worktree_launch_git_at_most_once
 /// the head and the base each name their own call site, so the next export
 /// shows who is spending instead of an anonymous `git rev-parse`.
 #[test]
-fn verification_head_and_base_reads_are_attributed_in_the_gate_report() {
+fn verification_head_reads_are_attributed_in_the_gate_report() {
+    use crate::engine::git_cli::rev_parse_launches_from;
+    let _held = crate::engine::ref_cache::retention();
+    let repo = crate::test_support::git_repo();
+    let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let path = repo.path().to_str().unwrap();
+    let heads = rev_parse_launches_from(gate::CURRENT_HEAD_SOURCE);
+    gate::current_head(path).unwrap();
+    assert!(
+        rev_parse_launches_from(gate::CURRENT_HEAD_SOURCE) > heads,
+        "the head read was not attributed to {}",
+        gate::CURRENT_HEAD_SOURCE
+    );
+}
+
+/// The base, asked for without going through `current_head`, so its own tag is
+/// the only thing that can attribute it.
+#[test]
+fn verification_base_reads_are_attributed_in_the_gate_report() {
     use crate::engine::git_cli::rev_parse_launches_from;
     use crate::workbench::verification_driver::VERIFICATION_BASE_SOURCE;
     let _held = crate::engine::ref_cache::retention();
@@ -1331,15 +1350,11 @@ fn verification_head_and_base_reads_are_attributed_in_the_gate_report() {
     let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
     git(&["commit", "-q", "--allow-empty", "-m", "one"]);
     git(&["commit", "-q", "--allow-empty", "-m", "two"]);
-    let path = repo.path().to_str().unwrap();
-    let heads = rev_parse_launches_from(gate::CURRENT_HEAD_SOURCE);
+    let head = crate::engine::git_cli::git_text(repo.path(), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_owned();
     let bases = rev_parse_launches_from(VERIFICATION_BASE_SOURCE);
-    let head = gate::current_head(path).unwrap();
-    assert!(
-        rev_parse_launches_from(gate::CURRENT_HEAD_SOURCE) > heads,
-        "the head read was not attributed to {}",
-        gate::CURRENT_HEAD_SOURCE
-    );
     verification_base(repo.path(), &head).unwrap();
     assert!(
         rev_parse_launches_from(VERIFICATION_BASE_SOURCE) > bases,

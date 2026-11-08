@@ -2613,5 +2613,6 @@ How to read the new field: the periodic gate line now ends with the call sites b
 - `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `git_cli::with_spawn_source`, never a path or ref name.
 - `unattributed` is a launch whose caller set no source. The share that is unattributed is the share still not accounted for; tag the biggest caller next.
 - At most 32 distinct sources are kept; beyond that, new ones count under `other`.
-- Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing and is not in the counts, so the source is the leader's.
+- The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.
+- Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing of its own, so the leader's source is credited and the joiner's is not.
 - A thread that hops (`thread::scope`, a pool) starts `unattributed`; carry the source across with `with_spawn_source(current_spawn_source(), ...)`, as `current_admission()` is carried.

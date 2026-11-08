@@ -120,8 +120,14 @@ fn has_bare_layout(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir()
 }
 
+/// What the spawn-gate report calls the `rev-parse` launches [`resolve_repo`]
+/// makes.
+pub(crate) const RESOLVE_REPO_SOURCE: &str = "git_cli.resolve_repo";
+
 fn rev_parse_is_bare(path: &Path) -> bool {
-    match git_text(path, &["rev-parse", "--is-bare-repository"]) {
+    match with_spawn_source(RESOLVE_REPO_SOURCE, || {
+        git_text(path, &["rev-parse", "--is-bare-repository"])
+    }) {
         Ok(text) => text.trim().eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -8253,6 +8259,18 @@ mod tests {
             dir.path().canonicalize().unwrap().to_string_lossy()
         );
         assert!(!resolved.name.is_empty());
+    }
+
+    #[test]
+    fn resolve_repo_attributes_its_rev_parse_to_its_own_source() {
+        let dir = init_test_repo(false);
+        let before = super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE);
+        resolve_repo(&dir.path().to_string_lossy()).expect("resolve");
+        assert!(
+            super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE) > before,
+            "resolve_repo's rev-parse was not attributed to {}",
+            super::RESOLVE_REPO_SOURCE
+        );
     }
 
     #[test]
