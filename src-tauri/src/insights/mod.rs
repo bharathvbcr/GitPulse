@@ -3574,7 +3574,10 @@ mod tests {
         .unwrap();
         let row = collision_row_for_path(repo.to_str().unwrap(), "a.rs");
         assert!(row.ok, "{row:?}");
-        assert!(row.items.is_empty(), "a claim is not a dirty overlap: {row:?}");
+        assert!(
+            row.items.is_empty(),
+            "a claim is not a dirty overlap: {row:?}"
+        );
         assert!(row.shared_worktrees.is_empty(), "{row:?}");
         assert!(row.claims_error.is_empty(), "{row:?}");
         assert_eq!(row.file_claims.len(), 1, "{row:?}");

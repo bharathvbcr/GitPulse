@@ -145,15 +145,15 @@ pub fn last_claimed_cwd<'a>(rows: &'a [FileClaim], session_id: &str) -> Option<&
 /// is empty. Anything else the store could not do is an error.
 pub fn read_for_worktree(worktree: &Path, now_ms: u64) -> Result<Vec<FileClaim>, String> {
     let common = git_common(worktree)?;
-    read_store(
-        &store_path(&common),
-        now_ms,
-        DEFAULT_TTL_MS,
-        DEFAULT_CAP,
-    )
+    read_store(&store_path(&common), now_ms, DEFAULT_TTL_MS, DEFAULT_CAP)
 }
 
-pub fn read_store(store: &Path, now_ms: u64, ttl_ms: u64, cap: usize) -> Result<Vec<FileClaim>, String> {
+pub fn read_store(
+    store: &Path,
+    now_ms: u64,
+    ttl_ms: u64,
+    cap: usize,
+) -> Result<Vec<FileClaim>, String> {
     with_lock(store, false, || {
         let rows = load_lines(store)?;
         Ok(trim(rows, now_ms, ttl_ms, cap))
@@ -365,7 +365,9 @@ fn with_lock<T>(
     // One store is touched by the hook and by a launch. The mutex covers this
     // process; the lock file covers the others. Both are released on drop.
     static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _local = LOCAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _local = LOCAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _file = acquire(store, create)?;
     body()
 }
@@ -485,14 +487,12 @@ mod tests {
             .unwrap()
             .lines()
             .filter(|line| !line.is_empty())
-            .map(|line| {
-                serde_json::from_str::<FileClaim>(line)
-                    .unwrap()
-                    .path
-            })
+            .map(|line| serde_json::from_str::<FileClaim>(line).unwrap().path)
             .collect();
         assert!(
-            on_disk.len() <= cap && !on_disk.iter().any(|path| path == "a.rs") && on_disk.iter().any(|path| path == "c.rs"),
+            on_disk.len() <= cap
+                && !on_disk.iter().any(|path| path == "a.rs")
+                && on_disk.iter().any(|path| path == "c.rs"),
             "on disk {on_disk:?}"
         );
         let expired = read_store(&store, 1_200 + ttl + 1, ttl, cap).unwrap();
@@ -503,7 +503,9 @@ mod tests {
     fn a_missing_store_is_empty_and_an_unwritable_store_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope").join("file-claims.jsonl");
-        assert!(read_store(&missing, 1, DEFAULT_TTL_MS, 4).unwrap().is_empty());
+        assert!(read_store(&missing, 1, DEFAULT_TTL_MS, 4)
+            .unwrap()
+            .is_empty());
         let blocker = dir.path().join("not-a-directory");
         fs::write(&blocker, b"x").unwrap();
         let store = blocker.join("file-claims.jsonl");

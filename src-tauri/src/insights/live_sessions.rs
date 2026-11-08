@@ -600,7 +600,9 @@ fn read_small(path: &Path, cap: u64) -> Result<String, ()> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|_| ())?;
     let mut buf = String::new();
-    file.take(cap + 1).read_to_string(&mut buf).map_err(|_| ())?;
+    file.take(cap + 1)
+        .read_to_string(&mut buf)
+        .map_err(|_| ())?;
     if buf.len() as u64 > cap {
         return Err(());
     }
@@ -632,7 +634,9 @@ pub(crate) fn parse_lock_reason(text: &str) -> Option<(u32, Option<String>)> {
     }
     let after = rest[at + marker.len()..].strip_suffix(')')?;
     let (pid_text, start) = match after.split_once(" start ") {
-        Some((pid, start)) if !start.is_empty() && start.len() <= 255 => (pid, Some(start.to_string())),
+        Some((pid, start)) if !start.is_empty() && start.len() <= 255 => {
+            (pid, Some(start.to_string()))
+        }
         Some(_) => return None,
         None => (after, None),
     };
@@ -910,11 +914,7 @@ mod tests {
         fs::create_dir_all(&main).unwrap();
         fs::create_dir_all(&lane).unwrap();
         fs::create_dir_all(&admin).unwrap();
-        fs::write(
-            lane.join(".git"),
-            format!("gitdir: {}\n", admin.display()),
-        )
-        .unwrap();
+        fs::write(lane.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         let start = "Thu Nov  5 17:58:03 2026";
         fs::write(
             admin.join("locked"),

@@ -862,9 +862,7 @@ mod tests {
             )
             .unwrap();
         let input = prepare(&root).to_string();
-        let result = state
-            .request("runs.prepare_terminal", &input)
-            .unwrap();
+        let result = state.request("runs.prepare_terminal", &input).unwrap();
         assert_eq!(result["item"]["state"], "prepared");
         let common = result["item"]["git_common_dir"].as_str().unwrap();
         let store = Path::new(common).join("gitpulse").join("file-claims.jsonl");

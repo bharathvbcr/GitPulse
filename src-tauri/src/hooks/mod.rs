@@ -667,16 +667,6 @@ pub struct CollisionFacts {
     pub entity: Option<crate::insights::EntityCollisionVerdict>,
 }
 
-/// The collision-guard contract, over facts someone else gathered.
-///
-/// Three outcomes, and the whole point is that they are three and not two:
-///
-/// 1. a contended file escalates to the user with `ask`;
-/// 2. a clean, complete check says nothing at all, so the user's own permission
-///    rules decide;
-/// 3. a check that could not run, or could only half run, also renders no
-///    decision — but says so out loud. Silence here would be indistinguishable
-///    from (2), which is the failure this whole module is built to avoid.
 /// Claim-store findings for one path. They are notices. They never become
 /// `others`, so a declared claim is not itself a collision ask.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -689,6 +679,16 @@ pub struct ClaimNotices {
     pub store_error: String,
 }
 
+/// The collision-guard contract, over facts someone else gathered.
+///
+/// Three outcomes, and the whole point is that they are three and not two:
+///
+/// 1. a contended file escalates to the user with `ask`;
+/// 2. a clean, complete check says nothing at all, so the user's own permission
+///    rules decide;
+/// 3. a check that could not run, or could only half run, also renders no
+///    decision — but says so out loud. Silence here would be indistinguishable
+///    from (2), which is the failure this whole module is built to avoid.
 pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
     collision_decision_with_claims(facts, &ClaimNotices::default())
 }
@@ -1048,7 +1048,12 @@ fn lets_write_through(output: &HookOutput) -> bool {
 /// Reads the claim store for this edit. The collision scan's memo does not
 /// carry claims, and a failed read stays on `store_error` so the decision
 /// cannot look complete.
-fn claim_notices(root: &Path, risk: &CollisionRisk, target: &str, session_id: &str) -> ClaimNotices {
+fn claim_notices(
+    root: &Path,
+    risk: &CollisionRisk,
+    target: &str,
+    session_id: &str,
+) -> ClaimNotices {
     use crate::insights::claims::{self, ClaimSource};
     let now = claims::now_ms();
     let rows = match claims::read_for_worktree(root, now) {
@@ -4046,10 +4051,7 @@ mod tests {
         let second_out = guard_here(&second);
         let text = said(&second_out);
         assert!(!second_out.is_silent(), "{text}");
-        assert!(
-            text.contains("holder: session session-a"),
-            "{text}"
-        );
+        assert!(text.contains("holder: session session-a"), "{text}");
         assert!(
             second_out
                 .hook_specific_output
@@ -4075,10 +4077,7 @@ mod tests {
         )
         .unwrap();
         let file = repo.path().join("a.rs");
-        let mut call = edit_call(
-            &repo.path().to_string_lossy(),
-            &file.to_string_lossy(),
-        );
+        let mut call = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
         call.session_id = "session-b".into();
         let output = guard_here(&call);
         let text = said(&output);
@@ -4108,7 +4107,10 @@ mod tests {
             truncated: false,
         }];
         let notices = claim_notices(repo.path(), &risk, "a.rs", "session-b");
-        assert!(notices.owner_unknown && notices.lines.is_empty(), "{notices:?}");
+        assert!(
+            notices.owner_unknown && notices.lines.is_empty(),
+            "{notices:?}"
+        );
         let facts = collision_facts(&risk, repo.path(), "a.rs", &no_sessions);
         let output = collision_decision_with_claims(&facts, &notices);
         let text = said(&output);
@@ -4145,10 +4147,7 @@ mod tests {
         let repo = crate::test_support::git_repo();
         std::fs::write(repo.path().join(".git").join("gitpulse"), b"x").unwrap();
         let file = repo.path().join("a.rs");
-        let mut call = edit_call(
-            &repo.path().to_string_lossy(),
-            &file.to_string_lossy(),
-        );
+        let mut call = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
         call.session_id = "session-a".into();
         let output = guard_here(&call);
         let text = said(&output);
