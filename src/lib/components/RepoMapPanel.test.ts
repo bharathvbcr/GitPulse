@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { compile } from "svelte/compiler";
+import { settleMapBeforeStatus } from "./RepoMapPanel.svelte";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "RepoMapPanel.svelte"), "utf8");
@@ -296,6 +297,94 @@ describe("RepoMapPanel map view tablist", () => {
     expect(chain).toBeGreaterThan(panel);
     // Nothing but the panel's own opening tag sits between them.
     expect(template.slice(panel, chain)).not.toMatch(/\{#if/);
+  });
+});
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+describe("RepoMapPanel map reload does not wait on devmap status", () => {
+  it("applies the map while the status invoke is still stalled", async () => {
+    const status = deferred<string>();
+    const applied: string[] = [];
+    const done = settleMapBeforeStatus({
+      map: Promise.resolve({ area: "NEWER-MAP-AREA" }),
+      status: status.promise,
+      isCurrent: () => true,
+      onMap: (result) => {
+        applied.push(result.status === "fulfilled" ? result.value.area : "rejected");
+      },
+      onStatus: () => {
+        applied.push("status");
+      },
+    });
+    await done;
+    expect(applied).toEqual(["NEWER-MAP-AREA"]);
+    status.resolve("fresh");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applied).toEqual(["NEWER-MAP-AREA", "status"]);
+  }, 1000);
+
+  it("a superseded reload does not apply after the newer map has settled", async () => {
+    let generation = 0;
+    const start = () => {
+      const token = ++generation;
+      const map = deferred<{ area: string }>();
+      const status = deferred<string>();
+      const applied: string[] = [];
+      const done = settleMapBeforeStatus({
+        map: map.promise,
+        status: status.promise,
+        isCurrent: () => token === generation,
+        onMap: (result) => {
+          if (result.status === "fulfilled") applied.push(result.value.area);
+        },
+        onStatus: () => {
+          applied.push("status");
+        },
+      });
+      return { map, status, applied, done };
+    };
+    const first = start();
+    const newer = start();
+    newer.map.resolve({ area: "NEWER-MAP-AREA" });
+    await newer.done;
+    expect(newer.applied).toEqual(["NEWER-MAP-AREA"]);
+    first.map.resolve({ area: "STALE-MAP-AREA" });
+    first.status.resolve("old");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(first.applied).toEqual([]);
+    expect(newer.applied).toEqual(["NEWER-MAP-AREA"]);
+    newer.status.resolve("fresh");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(newer.applied).toEqual(["NEWER-MAP-AREA", "status"]);
+    expect(first.applied).toEqual([]);
+  }, 1000);
+
+  it("clears loading from the map settlement, not from the status probe", () => {
+    const reload = source.slice(
+      source.indexOf("async function reload("),
+      source.indexOf("async function reloadGraph("),
+    );
+    expect(reload).toContain("settleMapBeforeStatus(");
+    expect(reload).not.toContain("Promise.all");
+    const onMap = reload.indexOf("onMap(mapResult)");
+    const onStatus = reload.indexOf("onStatus(statusResult)");
+    expect(onMap).toBeGreaterThan(-1);
+    expect(onStatus).toBeGreaterThan(onMap);
+    expect(reload.slice(onMap, onStatus)).toContain("loading = false");
+    expect(reload.slice(onStatus)).not.toContain("loading");
   });
 });
 
