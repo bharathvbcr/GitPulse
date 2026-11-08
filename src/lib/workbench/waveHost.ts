@@ -25,7 +25,7 @@ import { startPreparedAttempt } from "./taskTerminal";
 import { getVerification, runVerification } from "./verification";
 import { supportsManaged } from "./vocabulary";
 import { createWavePersister, findActiveWave, type WaveTaskApi } from "./waveStore";
-import { resumeWave, startWave, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
+import { resumeWave, startWave, type Held, type HeldRead, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
 import type { TaskSuggestions } from "./client";
 
 /** `work.verify.task` can take minutes; a verdict still `running` after this is reported as such, never trusted. */
@@ -94,24 +94,31 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Claims the planner must hold a member back for. An unreadable or cut list
- * throws: returning nothing would co-schedule over claims that were not read.
- * The holder wording is what `planBatch` puts after "claimed by".
+ * Claims the planner tells a person about. They hold nothing back, so a claim
+ * store that could not be read, was cut, or named a holder it could not read is
+ * said in `unreadable` and the batch still plans: refusing a wave over an
+ * advisory sidecar would be a policy nobody asked for. The holder wording is
+ * what `planBatch` puts after "claimed by".
  */
-export function heldFromRisk(risk: Pick<CollisionRisk, "file_claims" | "claims_error">): { path: string; holder: string }[] {
+export function heldFromRisk(risk: Pick<CollisionRisk, "file_claims" | "claims_error" | "claims_truncated" | "claims_total">): HeldRead {
+  const problems: string[] = [];
   const error = (risk.claims_error ?? "").trim();
-  if (error) throw new Error(`file claims could not be read (${error})`);
-  return (risk.file_claims ?? []).map((claim) => {
+  if (error) problems.push(error);
+  if (risk.claims_truncated) problems.push(`only the newest ${(risk.file_claims ?? []).length} of ${risk.claims_total ?? "more"} claims were returned`);
+  const held: Held[] = [];
+  for (const claim of risk.file_claims ?? []) {
     const holder = claim.source === "declared" && claim.run_id
       ? `run ${claim.run_id}`
       : claim.source === "observed" && claim.session_id
         ? `session ${claim.session_id}`
         : "";
     if (!claim.path || !holder) {
-      throw new Error(`file claims could not be read (a claim on ${claim.path || "an unnamed path"} named no holder)`);
+      problems.push(`a claim on ${claim.path || "an unnamed path"} named no holder`);
+      continue;
     }
-    return { path: claim.path, holder };
-  });
+    held.push({ path: claim.path, holder });
+  }
+  return problems.length ? { held, unreadable: problems.join("; ") } : { held };
 }
 
 export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"], maxPriority?: number): Promise<WaveDeps> {
@@ -128,7 +135,15 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       const found = await stoppable(loadTaskScopes(invoke, checkout, ids), signal);
       return new Map(Object.values(found).map((scope) => [scope.id, [...scope.planned_files, ...scope.agent_appended_files]]));
     },
-    heldPaths: async (signal) => heldFromRisk(await stoppable(getCollisionRisk(checkout), signal)),
+    heldPaths: async (signal) => {
+      try {
+        return heldFromRisk(await stoppable(getCollisionRisk(checkout), signal));
+      } catch (cause) {
+        // A stop ends the wave; any other failure is claims not read, said in the note.
+        if (signal.aborted) throw cause;
+        return { held: [], unreadable: cause instanceof Error ? cause.message : String(cause) };
+      }
+    },
     launch: async (taskId, ids, signal) => {
       // The provider the person last chose when it can be supervised, else Claude; never bypass, which is acknowledged afresh on every launch.
       const saved = get(interfaceStore).taskHandoff;

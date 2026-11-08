@@ -1133,6 +1133,8 @@ mod tests {
             sessions_error: String::new(),
             file_claims: Vec::new(),
             claims_error: String::new(),
+            claims_total: 0,
+            claims_truncated: false,
         }
     }
 

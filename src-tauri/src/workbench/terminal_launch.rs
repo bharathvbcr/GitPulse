@@ -410,7 +410,24 @@ fn record_declared_claims(state: &WorkbenchState, input: &Preparation, prepared:
     }) else {
         return;
     };
-    let paths = super::intake::planned_paths(task["item"]["description"].as_str().unwrap_or(""));
+    match crate::insights::claims::admitted(Path::new(&input.repo_path)) {
+        Ok(true) => {}
+        // An untrusted repository gets no claim files under its `.git`.
+        Ok(false) => return,
+        Err(error) => {
+            log::warn!(
+                target: "workbench",
+                "declared file claims were not recorded for {}: trust could not be read ({error})",
+                input.id
+            );
+            return;
+        }
+    }
+    let paths = super::intake::declared_paths(
+        &input.repo_path,
+        &input.task_id,
+        task["item"]["description"].as_str().unwrap_or(""),
+    );
     if paths.is_empty() {
         return;
     }

@@ -677,6 +677,9 @@ pub struct ClaimNotices {
     pub owner_unknown: bool,
     /// The claim store could not be read. Empty means it was read.
     pub store_error: String,
+    /// The store was read, with unreadable lines skipped. Rows found still
+    /// count, but the check was not complete.
+    pub store_degraded: String,
 }
 
 /// The collision-guard contract, over facts someone else gathered.
@@ -774,6 +777,12 @@ fn negative_claim_decision(facts: &CollisionFacts, claims: &ClaimNotices) -> Hoo
         gaps.push(format!(
             "the claim store could not be read ({})",
             claims.store_error
+        ));
+    }
+    if !claims.store_degraded.is_empty() {
+        gaps.push(format!(
+            "the claim store was degraded ({})",
+            claims.store_degraded
         ));
     }
     let mut said = claims.lines.clone();
@@ -1056,8 +1065,8 @@ fn claim_notices(
 ) -> ClaimNotices {
     use crate::insights::claims::{self, ClaimSource};
     let now = claims::now_ms();
-    let rows = match claims::read_for_worktree(root, now) {
-        Ok(rows) => rows,
+    let read = match claims::read_for_worktree(root, now) {
+        Ok(read) => read,
         Err(error) => {
             return ClaimNotices {
                 store_error: error,
@@ -1065,6 +1074,13 @@ fn claim_notices(
             };
         }
     };
+    // An untrusted repository has no claims and no claim notices: the hook
+    // neither reads nor writes under its `.git`.
+    if read.untrusted {
+        return ClaimNotices::default();
+    }
+    let store_degraded = read.degraded().unwrap_or_default();
+    let rows = read.rows;
     let wanted = claims::normalize_rel(target).unwrap_or_else(|_| target.to_string());
     let mut covered = false;
     let mut lines = Vec::new();
@@ -1109,6 +1125,7 @@ fn claim_notices(
         lines,
         owner_unknown: dirty_shared && !covered,
         store_error: String::new(),
+        store_degraded,
     }
 }
 
@@ -3177,6 +3194,8 @@ mod tests {
             sessions_error: String::new(),
             file_claims: Vec::new(),
             claims_error: String::new(),
+            claims_total: 0,
+            claims_truncated: false,
         }
     }
 
@@ -3272,6 +3291,7 @@ mod tests {
                     sessions: 0,
                     kinds: Vec::new(),
                     worktrees: Vec::new(),
+                    attribution_error: String::new(),
                 },
                 truncated: false,
             },
@@ -3833,6 +3853,8 @@ mod tests {
             sessions_error: String::new(),
             file_claims: Vec::new(),
             claims_error: String::new(),
+            claims_total: 0,
+            claims_truncated: false,
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "a.txt", &|_| String::new());
         assert!(facts.ok, "one worktree was read, so the scan ran");
@@ -3896,6 +3918,8 @@ mod tests {
             sessions_error: String::new(),
             file_claims: Vec::new(),
             claims_error: String::new(),
+            claims_total: 0,
+            claims_truncated: false,
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert!(!facts.ok);
@@ -4144,8 +4168,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_claim_write_makes_the_check_incomplete_never_silent() {
+        use std::os::unix::fs::PermissionsExt;
         let repo = crate::test_support::git_repo();
-        std::fs::write(repo.path().join(".git").join("gitpulse"), b"x").unwrap();
+        // Only the write is broken: the store exists and reads as empty, but it
+        // cannot be opened for append. A store that cannot be read at all would
+        // make the check incomplete through the read, hiding a write that was
+        // silently dropped.
+        let dir = repo.path().join(".git").join("gitpulse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("file-claims.jsonl");
+        std::fs::write(&store, b"").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&store)
+            .is_ok()
+        {
+            eprintln!("skipped: this user can write a read-only file (root)");
+            return;
+        }
         let file = repo.path().join("a.rs");
         let mut call = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
         call.session_id = "session-a".into();
@@ -4153,6 +4194,70 @@ mod tests {
         let text = said(&output);
         assert!(!output.is_silent(), "{text}");
         assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("the claim could not be recorded"), "{text}");
+        assert!(
+            !text.contains("could not be read"),
+            "the read was fine: {text}"
+        );
+    }
+
+    /// A torn line in the store does not stop claims. The check says it ran on a
+    /// degraded store, and the append that follows closes the torn line so the
+    /// store reads clean again once a compaction drops it.
+    #[cfg(unix)]
+    #[test]
+    fn a_torn_claim_line_is_said_out_loud_and_does_not_stop_the_next_claim() {
+        let repo = crate::test_support::git_repo();
+        let common = crate::engine::git_cli::resolve_git_common_dir(repo.path()).unwrap();
+        let store = crate::insights::claims::store_path(&common);
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, b"{\"source\":\"observed\",\"sess").unwrap();
+        let file = repo.path().join("a.rs");
+        let mut call = edit_call(&repo.path().to_string_lossy(), &file.to_string_lossy());
+        call.session_id = "session-a".into();
+        let output = guard_here(&call);
+        let text = said(&output);
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("1 unreadable claim line skipped"), "{text}");
+        assert!(
+            !text.contains("could not be recorded"),
+            "the append must succeed: {text}"
+        );
+        let read = crate::insights::claims::read_for_worktree(
+            repo.path(),
+            crate::insights::claims::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(read.rows.len(), 1, "{read:?}");
+        assert_eq!(read.skipped, 1, "{read:?}");
+    }
+
+    /// Security. The hook runs in every repository an agent edits. In one
+    /// GitPulse does not trust it creates nothing under `.git` and says nothing
+    /// about claims.
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_repository_gets_no_claim_files_and_no_claim_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(dir.path(), &["--no-pager", "init", "-q"]);
+        let file = dir.path().join("a.rs");
+        let mut call = edit_call(&dir.path().to_string_lossy(), &file.to_string_lossy());
+        call.session_id = "session-a".into();
+        let output = guard_here(&call);
+        let text = said(&output);
+        assert!(
+            !dir.path().join(".git").join("gitpulse").exists(),
+            "an untrusted repository's .git was written to: {text}"
+        );
+        for word in [
+            "holder",
+            "owner unknown",
+            "claimed by",
+            "claim store",
+            "claim could not",
+        ] {
+            assert!(!text.contains(word), "{word:?} in {text}");
+        }
     }
 
     /* ── path handling ────────────────────────────────────────────────────── */
@@ -5851,6 +5956,7 @@ done
                 children: Vec::new(),
                 children_truncated: false,
             }],
+            attribution_error: String::new(),
         };
         snapshot.collisions.shared_worktrees = vec![SharedWorktree {
             path: "/repo".into(),
@@ -5939,6 +6045,8 @@ done
             sessions_error: String::new(),
             file_claims: Vec::new(),
             claims_error: String::new(),
+            claims_total: 0,
+            claims_truncated: false,
         };
         snapshot.ledger.recording = false;
         snapshot.ledger.recording_state = "unknown".to_string();

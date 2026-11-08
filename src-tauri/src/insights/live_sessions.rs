@@ -438,8 +438,16 @@ pub(crate) struct WorktreeLock {
 /// parent checkout, so the process cwd alone files that session on main.
 pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) -> LiveSessionFacet {
     let locks = read_worktree_locks(worktree_paths);
-    let claims = load_claims(worktree_paths);
-    attribute_with(observation, worktree_paths, &locks, &claims)
+    let (claims, problems) = load_claims(worktree_paths);
+    let mut facet = attribute_with(observation, worktree_paths, &locks, &claims);
+    if !problems.is_empty() {
+        // Attribution fell back to the registry or process cwd for whatever
+        // the claims would have said, so the facet is not "observed
+        // completely and verifiably".
+        facet.ok = false;
+        facet.attribution_error = format!("hook claims not read in full: {}", problems.join("; "));
+    }
+    facet
 }
 
 pub(crate) fn attribute_with(
@@ -503,6 +511,7 @@ pub(crate) fn attribute_with(
         sessions,
         kinds,
         worktrees,
+        attribution_error: String::new(),
     }
 }
 
@@ -512,7 +521,12 @@ fn owner_of<'a>(
     locks: &[WorktreeLock],
     claims: &[super::claims::FileClaim],
 ) -> Option<&'a str> {
-    if let Some(locked) = locks.iter().find(|lock| lock_matches(session, lock)) {
+    // One parent CLI that started several isolation agents has one pid and one
+    // start across all their locks, so "the lock names this session" is true of
+    // every lane at once. That is no evidence for any one of them: the session
+    // is not moved, and the rest of the order decides.
+    let mut matching = locks.iter().filter(|lock| lock_matches(session, lock));
+    if let (Some(locked), None) = (matching.next(), matching.next()) {
         if let Some((path, _)) = roots.iter().find(|(path, _)| path == &locked.worktree) {
             return Some(path.as_str());
         }
@@ -646,27 +660,48 @@ pub(crate) fn parse_lock_reason(text: &str) -> Option<(u32, Option<String>)> {
     Some((pid_text.parse().ok()?, start))
 }
 
-fn load_claims(worktree_paths: &[String]) -> Vec<super::claims::FileClaim> {
+/// The hook claims of every repository in `worktree_paths`, and why any of them
+/// could not be read in full. A repository GitPulse does not trust has no
+/// claims to read; a store that failed, or was read with unreadable lines
+/// skipped, is a problem the caller reports, never an empty list.
+fn load_claims(worktree_paths: &[String]) -> (Vec<super::claims::FileClaim>, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
+    let mut problems = Vec::new();
     let now = super::claims::now_ms();
     for path in worktree_paths.iter().take(16) {
         let Ok(common) = crate::engine::git_cli::resolve_git_common_dir(Path::new(path)) else {
+            // A listed worktree whose git dir cannot be resolved (pruned, or
+            // gone from disk) has no store of its own to read.
             continue;
         };
         if !seen.insert(common.clone()) {
             continue;
         }
-        if let Ok(found) = super::claims::read_store(
+        match super::claims::admitted(Path::new(path)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                problems.push(format!("trust for {path} could not be read ({error})"));
+                continue;
+            }
+        }
+        match super::claims::read_store(
             &super::claims::store_path(&common),
             now,
             super::claims::DEFAULT_TTL_MS,
             super::claims::DEFAULT_CAP,
         ) {
-            rows.extend(found);
+            Ok(read) => {
+                if let Some(degraded) = read.degraded() {
+                    problems.push(format!("{}: {degraded}", common.display()));
+                }
+                rows.extend(read.rows);
+            }
+            Err(error) => problems.push(error),
         }
     }
-    rows
+    (rows, problems)
 }
 
 /// How deep [`nest`] descends. Real agent trees are a few levels (Manvi bounds
@@ -777,6 +812,7 @@ pub(crate) fn unattributed(error: &str) -> LiveSessionFacet {
         sessions: 0,
         kinds,
         worktrees: Vec::new(),
+        attribution_error: String::new(),
     }
 }
 
@@ -1011,6 +1047,70 @@ mod tests {
             Some(lane.path()),
             "{facet:?}"
         );
+    }
+
+    /// One parent CLI started two isolation agents: both locks name its pid and
+    /// start. That is no evidence for either lane, so the session stays where
+    /// its cwd puts it. Before, the first lock listed took it.
+    #[test]
+    fn two_locks_naming_one_session_move_it_to_neither_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        let start = "Thu Nov  5 17:58:03 2026";
+        let mut listing = vec![main.to_string_lossy().into_owned()];
+        for lane in ["lane-a", "lane-b"] {
+            let checkout = root.path().join(lane);
+            let admin = root.path().join(format!("admin-{lane}"));
+            fs::create_dir_all(&checkout).unwrap();
+            fs::create_dir_all(&admin).unwrap();
+            fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", admin.display()),
+            )
+            .unwrap();
+            fs::write(
+                admin.join("locked"),
+                format!("claude agent {lane} (pid 42 start {start})\n"),
+            )
+            .unwrap();
+            listing.push(checkout.to_string_lossy().into_owned());
+        }
+        assert_eq!(read_worktree_locks(&listing).len(), 2);
+        let mut session = session_at(42, &main);
+        session.proc_start = Some(start.into());
+        let facet = attribute(&observation_of(session), &listing);
+        assert_eq!(
+            owner_of_pid(&facet, 42).map(Path::new),
+            Some(main.as_path()),
+            "{facet:?}"
+        );
+    }
+
+    /// A claim store the attribution could not read in full is said on the
+    /// facet, and `ok` drops: before, `if let Ok` made it an empty claim list.
+    #[test]
+    fn an_unreadable_claim_store_marks_attribution_degraded() {
+        let repo = crate::test_support::git_repo();
+        let main = repo.path().to_path_buf();
+        let common = crate::engine::git_cli::resolve_git_common_dir(&main).unwrap();
+        let store = super::super::claims::store_path(&common);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, b"{\"source\":\"obs").unwrap();
+        let listing = vec![main.to_string_lossy().into_owned()];
+        let facet = attribute(&observation_of(session_at(7, &main)), &listing);
+        assert!(!facet.ok, "{facet:?}");
+        assert!(
+            facet.attribution_error.contains("1 unreadable claim line"),
+            "{facet:?}"
+        );
+        // The session is still attributed, by what could be read.
+        assert_eq!(owner_of_pid(&facet, 7).map(Path::new), Some(main.as_path()));
+
+        let clean = crate::test_support::git_repo();
+        let clean_listing = vec![clean.path().to_string_lossy().into_owned()];
+        let facet = attribute(&observation_of(session_at(8, clean.path())), &clean_listing);
+        assert!(facet.attribution_error.is_empty(), "{facet:?}");
     }
 
     #[test]

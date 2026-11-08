@@ -1000,3 +1000,57 @@ fn delete_retry_after_an_unrelated_edit_is_still_a_conflict() {
         delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None).unwrap_err();
     assert_eq!(error.code, "revision_conflict");
 }
+
+/// This feature's own card lists its planned files with annotations and, for
+/// one of them, backticks. A declared claim has to land on the file, not on the
+/// annotated spelling nobody will ever edit.
+#[test]
+fn planned_paths_reads_an_annotated_card_the_way_the_planner_does() {
+    let description = "One mechanism.\n\n## Planned files\n\
+        - src-tauri/src/hooks/mod.rs\n\
+        - src-tauri/src/insights/claims.rs (new, bounded store)\n\
+        - plugins/gitpulse/skills/gitpulse-collisions/SKILL.md\n\
+        - src-tauri/src/workbench/intake.rs (read planned_files of live runs)\n\
+        - `src/lib/workbench/waveLaunch.ts` (planBatch reads claims)\n\
+        - the hook, wherever it ends up\n\
+        - /etc/passwd\n\
+        - ../outside\n\n## Related repositories\n- other";
+    assert_eq!(
+        planned_paths(description),
+        [
+            "src-tauri/src/hooks/mod.rs",
+            "src-tauri/src/insights/claims.rs",
+            "plugins/gitpulse/skills/gitpulse-collisions/SKILL.md",
+            "src-tauri/src/workbench/intake.rs",
+            "src/lib/workbench/waveLaunch.ts",
+        ]
+    );
+}
+
+/// One source of planned files: the structured scope the wave planner reads.
+/// The Markdown list is only the fallback for a card with no structured scope.
+#[test]
+fn declared_paths_prefer_the_structured_scope_and_fall_back_to_the_card() {
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let description = "## Planned files\n- from_card.rs";
+    assert_eq!(
+        declared_paths(repo_path, "TASK-1", description),
+        ["from_card.rs"],
+        "no store: the card's list"
+    );
+    let db = crate::tasks::store_path(repo_path);
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let store = dc_store::Store::open(&db).unwrap();
+    crate::tasks::plant_task::plant(
+        &store,
+        "TASK-1",
+        "in_progress",
+        r#"{"planned_files":[{"path":"src/scoped.rs","allowed_change":"modify"}]}"#,
+    );
+    assert_eq!(
+        declared_paths(repo_path, "TASK-1", description),
+        ["src/scoped.rs"],
+        "the structured scope is the source when there is one"
+    );
+}

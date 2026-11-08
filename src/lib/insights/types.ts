@@ -104,6 +104,12 @@ export interface LiveSessionFacet {
   sessions: number;
   kinds: LiveKindStatus[];
   worktrees: LiveWorktree[];
+  /**
+   * Set when attribution by worktree lock or hook claim could not be read in
+   * full, so a session may be filed under its process cwd. Omitted when empty;
+   * `ok` is false while it is set.
+   */
+  attribution_error?: string;
 }
 
 export interface AgentSummary {
@@ -226,8 +232,15 @@ export interface CollisionRisk {
    * Empty means none only when `claims_error` is also empty.
    */
   file_claims?: FileClaim[];
-  /** Set when the claim store was not read, or the list was cut. Omitted when empty. */
+  /**
+   * Set when the claim store was not read, or read with unreadable lines
+   * skipped. Omitted when empty. A cut list is said by `claims_truncated`.
+   */
   claims_error?: string;
+  /** How many claims matched before `file_claims` was cut to its cap. Omitted when it was not cut. */
+  claims_total?: number;
+  /** True when `file_claims` holds only the newest rows up to its cap. Omitted when it was not cut. */
+  claims_truncated?: boolean;
 }
 
 export interface InsightsSnapshot {

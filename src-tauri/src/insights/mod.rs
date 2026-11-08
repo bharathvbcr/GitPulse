@@ -211,6 +211,11 @@ pub struct LiveSessionFacet {
     pub kinds: Vec<LiveKindStatus>,
     /// Worktrees with at least one live session.
     pub worktrees: Vec<LiveWorktree>,
+    /// Set when attribution by worktree lock or hook claim could not be read
+    /// in full, so a session may be filed under its process cwd. `ok` is false
+    /// while it is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attribution_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,9 +358,21 @@ pub struct CollisionRisk {
     /// `claims_error` is empty; a failed read is not an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_claims: Vec<claims::FileClaim>,
-    /// Why `file_claims` could not be read, or that the list was cut at its cap.
+    /// Why `file_claims` could not be read in full: a store that failed to
+    /// open, or one read with unreadable lines skipped.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub claims_error: String,
+    /// How many claims matched before `file_claims` was cut to
+    /// [`MAX_RETURNED_CLAIMS`]. Zero when it was not cut.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub claims_total: u32,
+    /// True when `file_claims` holds only the newest rows up to its cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claims_truncated: bool,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +579,8 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
         sessions_error: error,
         file_claims: Vec::new(),
         claims_error: String::new(),
+        claims_total: 0,
+        claims_truncated: false,
     }
 }
 
@@ -1104,7 +1123,7 @@ fn snapshot_observed(
         ),
     };
 
-    let collisions = match &listed {
+    let mut collisions = match &listed {
         Ok(list) => {
             if clock.expired() {
                 deadline_expired = true;
@@ -1117,6 +1136,11 @@ fn snapshot_observed(
         }
         Err(error) => empty_collisions(error.message().to_string()),
     };
+    // The session brief and `gitpulse_insights` read claims from here: without
+    // this a shared dirty file always reads "owner unknown".
+    if listed.is_ok() {
+        attach_file_claims(&mut collisions, repo_path, None);
+    }
 
     let main_worktree = worktrees.items.iter().find(|w| w.is_main);
     let branch = main_worktree.and_then(|w| w.branch.clone());
@@ -1961,6 +1985,8 @@ fn collision_from_list_reading(
         sessions_error: sessions_error(live),
         file_claims: Vec::new(),
         claims_error: String::new(),
+        claims_total: 0,
+        claims_truncated: false,
     }
 }
 
@@ -2090,26 +2116,35 @@ pub fn collision_row_for_path(repo_path: &str, path: &str) -> CollisionRisk {
     risk
 }
 
-/// How many claim rows one answer keeps. This is the store cap: a shorter
-/// sample would let a wave treat the unread tail as unclaimed. The store
-/// already refuses to grow past it.
-const MAX_RETURNED_CLAIMS: usize = claims::DEFAULT_CAP;
+/// How many claim rows one answer carries. The store holds up to
+/// [`claims::DEFAULT_CAP`], and a wave no longer reads this list to hold
+/// anything back, so an answer stays a bounded size: past this the newest rows
+/// are kept, `claims_truncated` is set and `claims_total` says how many matched.
+pub(crate) const MAX_RETURNED_CLAIMS: usize = 256;
 
 /// Fills `file_claims` from the sidecar. A missing store stays empty. A failed
 /// read sets `claims_error` and does not change `ok`: the porcelain scan and
 /// the claim store are different checks, and one failing must not look like
-/// the other succeeded or like neither ran.
+/// the other succeeded or like neither ran. A store read with unreadable lines
+/// skipped keeps its rows and says so in `claims_error`; a list cut at its cap
+/// says so in `claims_truncated` and `claims_total`.
 fn attach_file_claims(risk: &mut CollisionRisk, repo_path: &str, only: Option<&str>) {
     let now = claims::now_ms();
     match claims::read_for_worktree(Path::new(repo_path), now) {
-        Ok(mut rows) => {
+        Ok(read) => {
+            if let Some(degraded) = read.degraded() {
+                risk.claims_error = degraded;
+            }
+            let mut rows = read.rows;
             if let Some(path) = only {
                 let wanted = claims::normalize_rel(path).unwrap_or_else(|_| path.to_string());
                 rows.retain(|claim| claim.path == wanted || claim.path == path);
             }
             if rows.len() > MAX_RETURNED_CLAIMS {
-                rows.truncate(MAX_RETURNED_CLAIMS);
-                risk.claims_error = format!("file claims truncated to {MAX_RETURNED_CLAIMS}");
+                risk.claims_total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+                risk.claims_truncated = true;
+                // Rows are oldest first: the newest are the ones kept.
+                rows.drain(0..rows.len() - MAX_RETURNED_CLAIMS);
             }
             risk.file_claims = rows;
         }
@@ -3089,6 +3124,116 @@ mod tests {
         // The layout count still sees no agent worktree, which is exactly why
         // it cannot stand for the number of running sessions.
         assert_eq!(snap.agents.sessions, 0);
+    }
+
+    /// M2. The snapshot is what `gitpulse_insights` returns and what the
+    /// session brief reads. It used to build its collisions without the claim
+    /// store, so a shared dirty file always read "owner unknown" even with a
+    /// claim naming its holder.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_snapshot_carries_claims_and_the_session_brief_names_the_holder() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::write(main.path().join("shared.txt"), "edited").unwrap();
+        let registry = tempfile::TempDir::new().unwrap();
+        let _first = simulate_session(registry.path(), main.path());
+        fs::create_dir_all(main.path().join("src")).unwrap();
+        let _second = simulate_session(registry.path(), &main.path().join("src"));
+        let observation = live_sessions::observe_with(
+            Some(registry.path()),
+            &crate::workbench::process_birth::running_since,
+        );
+        let before = snapshot_observed(
+            repo,
+            SNAPSHOT_DEADLINE,
+            MAX_SNAPSHOT_WORKTREES,
+            &observation,
+        );
+        let brief = crate::hooks::session_brief(&before, repo, "startup");
+        assert!(brief.contains("owner unknown"), "{brief}");
+
+        claims::record_observed(
+            main.path(),
+            "session-holder",
+            "shared.txt",
+            repo,
+            claims::now_ms(),
+        )
+        .unwrap();
+        let snap = snapshot_observed(
+            repo,
+            SNAPSHOT_DEADLINE,
+            MAX_SNAPSHOT_WORKTREES,
+            &observation,
+        );
+        assert_eq!(
+            snap.collisions.file_claims.len(),
+            1,
+            "{:?}",
+            snap.collisions
+        );
+        assert!(
+            snap.collisions.claims_error.is_empty(),
+            "{:?}",
+            snap.collisions
+        );
+        let brief = crate::hooks::session_brief(&snap, repo, "startup");
+        assert!(
+            brief.contains("shared.txt holder: session session-holder"),
+            "{brief}"
+        );
+        assert!(!brief.contains("owner unknown"), "{brief}");
+    }
+
+    /// M6. The repo-wide answer is bounded: past the cap the newest claims are
+    /// kept, `claims_truncated` is set and `claims_total` says how many there
+    /// were. A path query is already narrow and is not cut by the repo's total.
+    #[test]
+    fn the_repo_wide_claim_list_is_capped_and_says_so() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        let total = MAX_RETURNED_CLAIMS + 44;
+        let now = claims::now_ms();
+        for index in 0..total {
+            claims::record_observed(
+                main.path(),
+                &format!("session-{}", index % 5),
+                &format!("src/file_{index:04}.rs"),
+                repo,
+                now - (total - index) as u64,
+            )
+            .unwrap();
+        }
+        let risk = collision_risk_observed(repo, &Vec::new());
+        assert!(risk.claims_truncated, "{} claims", risk.file_claims.len());
+        assert_eq!(risk.claims_total as usize, total);
+        assert_eq!(risk.file_claims.len(), MAX_RETURNED_CLAIMS);
+        assert_eq!(
+            risk.file_claims.last().map(|claim| claim.path.as_str()),
+            Some(format!("src/file_{:04}.rs", total - 1).as_str()),
+            "the newest rows are the ones kept"
+        );
+        let row = collision_row_for_path(repo, "src/file_0000.rs");
+        assert!(
+            !row.claims_truncated && row.file_claims.len() == 1,
+            "{row:?}"
+        );
+    }
+
+    /// M6. One session editing one file again and again is one claim.
+    #[test]
+    fn repeated_edits_of_one_file_are_one_claim_in_the_answer() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        let now = claims::now_ms();
+        for offset in 0..30u64 {
+            claims::record_observed(main.path(), "session-a", "a.rs", repo, now - 100 + offset)
+                .unwrap();
+        }
+        let risk = collision_risk_observed(repo, &Vec::new());
+        assert_eq!(risk.file_claims.len(), 1, "{:?}", risk.file_claims);
+        assert!(!risk.claims_truncated);
     }
 
     #[cfg(unix)]

@@ -143,6 +143,9 @@ describe("validateWorkResponse", () => {
     const bad = structuredClone(risk);
     delete (bad.file_claims[0] as { path?: string }).path;
     expect(() => validateWorkResponse("cmd_collision_risk", bad)).toThrow(/invalid response/);
+    expect(() => validateWorkResponse("cmd_collision_risk", { ...risk, claims_total: 900, claims_truncated: true })).not.toThrow();
+    expect(() => validateWorkResponse("cmd_collision_risk", { ...risk, claims_total: "many" })).toThrow(/invalid response/);
+    expect(() => validateWorkResponse("cmd_collision_risk", { ...risk, claims_truncated: "yes" })).toThrow(/invalid response/);
   });
 
   it("rejects malformed non-object payloads with command-scoped error", () => {
