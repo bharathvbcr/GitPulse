@@ -54,6 +54,25 @@ fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
         .contains("stdin"));
 }
 
+/// A host that ignores the exec form's `args` starts the hook with none. That
+/// must block (exit 2, reason on stderr), never read as an allow.
+#[test]
+fn hook_with_no_subcommand_blocks_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .stdin(Stdio::null())
+        .output_locked()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no subcommand"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn hook_identity_answers_without_waiting_for_stdin() {
     // `npm run mcp:doctor` asks the installed binary who it is. Every other
@@ -185,7 +204,9 @@ fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging()
 #[test]
 fn argument_errors_keep_their_exit_contract_when_stderr_is_closed() {
     for (binary, expected) in [
-        (env!("CARGO_BIN_EXE_gitpulse-hook"), 0),
+        // No subcommand: the hook blocks (2) rather than allow, since a host
+        // that ignored the exec form's `args` would start it bare.
+        (env!("CARGO_BIN_EXE_gitpulse-hook"), 2),
         (env!("CARGO_BIN_EXE_gitpulsed"), 2),
     ] {
         let dir = tempfile::tempdir().unwrap();
