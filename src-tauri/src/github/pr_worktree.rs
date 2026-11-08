@@ -17,7 +17,7 @@ use crate::engine::git_writer::validate_ref_name;
 use crate::engine::worktree::{
     add_worktree_argv_configured, add_worktree_configured, parse_worktree_list_porcelain,
     prune_worktree_argv, remove_worktree_argv, resolve_worktree_path_for_branch,
-    worktree_list_porcelain_argv, WorktreeCreated,
+    worktree_list_porcelain_argv, DevmapMode, WorktreeCreated,
 };
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,9 @@ pub fn open_pull_request_worktree(
         false,
         cow_caches,
         run_hooks,
-        false,
+        // A PR worktree is a review checkout: no DevMap seeding, as before the
+        // engine took a mode.
+        DevmapMode::None,
         None,
         &mut refuse_sparse,
     ) {
@@ -287,6 +289,7 @@ pub fn open_pull_request_worktree(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reuse_worktree(
     repo: &Path,
     repo_key: &str,
@@ -1382,7 +1385,7 @@ exec "$real" "$@"
                 let gate = |repo: &str, argv: &[&str]| {
                     if argv.first() == Some(&"git")
                         && argv.get(1) == Some(&"worktree")
-                        && argv.iter().any(|arg| *arg == "add")
+                        && argv.contains(&"add")
                     {
                         return Err("worktree add refused".into());
                     }
@@ -1512,11 +1515,11 @@ exec "$real" "$@"
                 let gate = move |repo: &str, argv: &[&str]| {
                     let adding = argv.first() == Some(&"git")
                         && argv.get(1) == Some(&"worktree")
-                        && argv.iter().any(|arg| *arg == "add");
-                    if adding && argv.iter().any(|arg| *arg == "pr/9") {
+                        && argv.contains(&"add");
+                    if adding && argv.contains(&"pr/9") {
                         return Err("worktree add refused".into());
                     }
-                    if adding && argv.iter().any(|arg| *arg == "pr/7") {
+                    if adding && argv.contains(&"pr/7") {
                         crate::test_support::git_in(
                             Path::new(repo),
                             &["branch", "pr/7", foreign.as_str()],
