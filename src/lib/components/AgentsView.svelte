@@ -17,7 +17,8 @@
    * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, ChevronDown, ChevronRight, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { Bot, ChevronDown, ChevronRight, CircleAlert, FolderOpen, Inbox, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import AgentInbox from "./AgentInbox.svelte";
   import { tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -31,7 +32,7 @@
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
   import { explainError, getTaskRun } from "../workbench/client";
-  import { openTaskForRun } from "../workbench/taskOpen";
+  import { openTaskForRun, requestTaskOpen } from "../workbench/taskOpen";
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentDirectories } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
@@ -67,6 +68,8 @@
   const hidden = $derived(new Set($interfaceStore.agentsHiddenColumns));
   const compact = $derived($interfaceStore.agentsCompact);
   const filter = $derived(isAgentFilter($interfaceStore.agentsFilter) ? $interfaceStore.agentsFilter : "all");
+  let activeView = $state<"plane" | "inbox">("plane");
+  const activeRepoPath = $derived($agentsRepositoryScope || $repoStore.currentPath || "");
 
   const terminals = $derived($terminalSessions.map((record) => {
     const activity = record.sessionId ? $sessionActivity.get(record.sessionId) : undefined;
@@ -192,6 +195,14 @@
     }
   }
 
+  async function openInboxTask(taskId: string) {
+    try {
+      requestTaskOpen(taskId);
+    } catch (cause) {
+      toastStore.error(`This ask's task could not be opened: ${explainError(cause)}`);
+    }
+  }
+
   function openCheckout(row: AgentRow) {
     if (!row.checkoutPath) return;
     interfaceStore.setGlobalSurface("repository");
@@ -312,6 +323,25 @@
           <h1 class="text-sm font-semibold text-textPrimary">Agents</h1>
           <p class="text-[11px] text-textMuted truncate" data-testid="agents-headline">{headline}</p>
         </div>
+        <div class="ml-4 flex items-center gap-1 bg-surface/50 p-0.5 rounded-md border border-border">
+          <button
+            type="button"
+            class="px-2 py-0.5 text-[11px] font-medium rounded transition-colors {activeView === 'plane' ? 'bg-accent text-white' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => (activeView = "plane")}
+            data-testid="agents-view-mode-plane"
+          >
+            Plane
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 text-[11px] font-medium rounded transition-colors flex items-center gap-1.5 {activeView === 'inbox' ? 'bg-accent text-white' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => (activeView = "inbox")}
+            data-testid="agents-view-mode-inbox"
+          >
+            <Inbox size={12} />
+            <span>Inbox</span>
+          </button>
+        </div>
       </div>
       <div class="flex items-center gap-1.5 shrink-0">
         <button
@@ -399,8 +429,13 @@
     </div>
   </header>
 
-  {#if notes.length > 0}
-    <ul class="shrink-0 border-b border-border px-4 py-2 flex flex-col gap-1" data-testid="agents-gaps">
+  {#if activeView === "inbox"}
+    <div class="flex-1 min-h-0 min-w-0 p-3 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
+      <AgentInbox repoPath={activeRepoPath} embedded={true} onopenTask={openInboxTask} />
+    </div>
+  {:else}
+    {#if notes.length > 0}
+      <ul class="shrink-0 border-b border-border px-4 py-2 flex flex-col gap-1" data-testid="agents-gaps">
       {#each notes as gap, index (`${gap.kind}:${gap.repoPath}:${index}`)}
         <li class="flex items-start gap-2 text-[11px] text-textSecondary" role="status">
           <CircleAlert size={12} class="shrink-0 mt-0.5 text-amber-500" />
@@ -566,4 +601,5 @@
       </table>
     {/if}
   </div>
+  {/if}
 </div>

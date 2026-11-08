@@ -660,6 +660,11 @@ tool_args! {
         parent_task_id: Option<String> = task_ref_spec(
             "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from gitpulse_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
         ),
+        subtasks: Option<Vec<String>> = Spec::bytes_array(
+            "Subtask titles to decompose this task into; each will be created with parent set to this task",
+            32,
+            ft::MAX_TASK_TITLE,
+        ),
     }
 }
 
@@ -881,6 +886,11 @@ tool_args! {
             1,
             256,
         ),
+        thread_key: Option<String> = Spec::bytes(
+            "Optional thread key/slug grouping messages into a persistent conversation or ask",
+            1,
+            80,
+        ),
     }
 }
 
@@ -902,8 +912,89 @@ tool_args! {
             1,
             crate::engine::agent_bus::MAX_BUS_MESSAGES as u64,
         ),
+        thread_key: Option<String> = Spec::bytes(
+            "Optional thread key to filter messages within a specific thread",
+            1,
+            80,
+        ),
     }
 }
+
+tool_args! {
+    struct InboxPostArgs {
+        repo_path: String = repo_spec(),
+        from_agent: String = Spec::bytes("Sender agent identifier", 1, 128),
+        thread_key: String = Spec::bytes("Unique thread slug/key for persistent conversation", 1, 80),
+        kind: Option<String> = Spec::bytes("Message kind: ask, note, or reply (default 'ask')", 1, 64),
+        title: Option<String> = Spec::bytes("Concise title or summary", 1, 128),
+        body: String = Spec::bytes(
+            "Message or ask body (Markdown or JSON structured ask)",
+            1,
+            crate::engine::agent_bus::MAX_MESSAGE_BODY_BYTES,
+        ),
+        to_agent: Option<String> = Spec::bytes(
+            "Optional recipient agent identifier (null for broadcast/developer)",
+            1,
+            128,
+        ),
+        branch: Option<String> = Spec::bytes("Optional branch name", 1, 256),
+    }
+}
+
+tool_args! {
+    struct InboxReadArgs {
+        repo_path: String = repo_spec(),
+        thread_key: Option<String> = Spec::bytes("Optional thread key to filter specific conversation", 1, 80),
+        status: Option<String> = Spec::bytes("Status filter: 'open', 'answered', 'withdrawn', or 'all'", 1, 32),
+        agent_id: Option<String> = Spec::bytes("Optional agent filter", 1, 128),
+        limit: Option<u32> = Spec::int("Maximum number of threads to return (default 100)", 1, 256),
+    }
+}
+
+tool_args! {
+    struct InboxWithdrawArgs {
+        repo_path: String = repo_spec(),
+        from_agent: String = Spec::bytes("Agent withdrawing the ask", 1, 128),
+        thread_key: String = Spec::bytes("Thread key of the ask to withdraw", 1, 80),
+        reason: String = Spec::bytes("Reason for withdrawing the ask", 1, 600),
+    }
+}
+
+const KICKOFF_PROVIDERS: &[&str] = &["claude", "agy", "codex"];
+
+tool_args! {
+    struct KickoffAgentArgs {
+        repo_path: String = repo_spec(),
+        from_agent: String = Spec::bytes("Orchestrator or sender agent identifier", 1, 128),
+        to_agent: String = Spec::bytes("Target worker agent identifier to kick off", 1, 128),
+        task_id: String = task_ref_spec("Board task or subtask id to delegate to the target agent"),
+        provider: Option<String> = Spec::one_of(
+            "Agent harness provider ('claude', 'agy', or 'codex')",
+            KICKOFF_PROVIDERS,
+        ),
+        branch: Option<String> = Spec::bytes(
+            "Target branch for the worker lane (defaults to feat/<task_id>)",
+            1,
+            256,
+        ),
+        instructions: Option<String> = Spec::bytes(
+            "Detailed handoff instructions or context for the worker",
+            1,
+            8_192,
+        ),
+        claimed_files: Option<Vec<String>> = Spec::bytes_array(
+            "Pre-edit file paths reserved for this worker lane",
+            64,
+            512,
+        ),
+        claimed_symbols: Option<Vec<String>> = Spec::bytes_array(
+            "Symbols reserved for this worker lane",
+            64,
+            256,
+        ),
+    }
+}
+
 
 tool_args! {
     struct WorktreeOverlaySyncArgs {
@@ -1867,6 +1958,132 @@ fn build_tools() -> Vec<Value> {
                 ]
             }),
         ),
+        mutating_tool(
+            "gitpulse_inbox_post",
+            "Post message or ask to agent inbox thread",
+            "Post a structured ask (decide, do, answer, review) or update message to a persistent inbox thread",
+            InboxPostArgs::properties(),
+            &InboxPostArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "thread_key": { "type": "string" },
+                    "message": { "type": "object" }
+                },
+                "required": ["ok", "thread_key", "message"]
+            }),
+            false,
+        ),
+        tool(
+            "gitpulse_inbox_read",
+            "Read agent inbox threads and asks",
+            "Read persistent inbox threads, open asks, and message timelines across agents and developers",
+            InboxReadArgs::properties(),
+            &InboxReadArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "threads": { "type": "array" },
+                    "total": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["ok", "repo_path", "threads", "total"]
+            }),
+        ),
+        mutating_tool(
+            "gitpulse_inbox_withdraw",
+            "Withdraw open agent ask",
+            "Cancel or withdraw an outstanding structured ask when resolved independently",
+            InboxWithdrawArgs::properties(),
+            &InboxWithdrawArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "thread_key": { "type": "string" },
+                    "message": { "type": "object" }
+                },
+                "required": ["ok", "thread_key", "message"]
+            }),
+            false,
+        ),
+        mutating_tool(
+            "gitpulse_kickoff_agent",
+            "Kick off or delegate a task to another agent lane",
+            "Delegate a task or decomposed subtask to another agent (claude, agy, or codex), moving the board task to in_progress if present, registering pre-edit lane claims, and posting a structured handoff thread on the coordination bus",
+            KickoffAgentArgs::properties(),
+            &KickoffAgentArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "task_id": { "type": "string" },
+                    "task_updated": { "type": "boolean" },
+                    "provider": { "type": "string", "enum": ["claude", "agy", "codex"] },
+                    "to_agent": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "thread_key": { "type": "string" },
+                    "claim": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": { "type": "string" },
+                            "branch": { "type": "string" },
+                            "worktree_path": { "type": ["string", "null"] },
+                            "sparse_cone": { "type": "array", "items": { "type": "string" } },
+                            "claimed_files": { "type": "array", "items": { "type": "string" } },
+                            "claimed_symbols": { "type": "array", "items": { "type": "string" } },
+                            "updated_at_ms": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": [
+                            "agent_id", "branch", "worktree_path", "sparse_cone",
+                            "claimed_files", "claimed_symbols", "updated_at_ms"
+                        ]
+                    },
+                    "claim_conflicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_a": { "type": "string" },
+                                "branch_a": { "type": "string" },
+                                "agent_b": { "type": "string" },
+                                "branch_b": { "type": "string" },
+                                "overlapping_files": { "type": "array", "items": { "type": "string" } },
+                                "overlapping_symbols": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": [
+                                "agent_a", "branch_a", "agent_b", "branch_b",
+                                "overlapping_files", "overlapping_symbols"
+                            ]
+                        }
+                    },
+                    "message": {
+                        "type": "object",
+                        "properties": {
+                            "seq": { "type": "integer", "minimum": 1 },
+                            "from_agent": { "type": "string" },
+                            "to_agent": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "body": { "type": "string" },
+                            "branch": { "type": ["string", "null"] },
+                            "created_at_ms": { "type": "integer", "minimum": 0 },
+                            "thread_key": { "type": ["string", "null"] }
+                        },
+                        "required": [
+                            "seq", "from_agent", "to_agent", "kind", "body",
+                            "branch", "created_at_ms"
+                        ]
+                    }
+                },
+                "required": [
+                    "ok", "task_id", "task_updated", "provider", "to_agent",
+                    "branch", "thread_key", "claim", "claim_conflicts", "message"
+                ]
+            }),
+            false,
+        ),
         tool(
             "gitpulse_worktree_radar",
             "Parallel agent 3-layer collision radar",
@@ -2529,7 +2746,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 None => format!("gp-{}", ft::slugify(&a.title)),
             };
             let task = intake::ExternalTask {
-                key,
+                key: key.clone(),
                 title: a.title,
                 description: a.description.unwrap_or_default(),
                 status: a.status,
@@ -2548,14 +2765,59 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let reviewed = a.reviewed_related.unwrap_or_default();
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            intake::add_task(
+            let mut result = intake::add_task(
                 &store,
                 &a.repo_path,
                 task,
                 a.overwrite.unwrap_or(false),
                 &reviewed,
             )
-            .map_err(workbench_message)
+            .map_err(workbench_message)?;
+
+            if let Some(subtasks) = a.subtasks {
+                let mut created_subtasks = Vec::new();
+                let mut created_sibling_ids: Vec<String> = Vec::new();
+                let parent_ref = result
+                    .get("item_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&key);
+                for (idx, sub_title) in subtasks.into_iter().enumerate() {
+                    let sub_key = format!("{}-sub-{}", key, idx + 1);
+                    let sub_task = intake::ExternalTask {
+                        key: sub_key,
+                        title: sub_title,
+                        description: String::new(),
+                        status: Some("ready".to_string()),
+                        priority: None,
+                        severity: None,
+                        kind: Some("subtask".to_string()),
+                        owner: None,
+                        due: None,
+                        labels: Vec::new(),
+                        acceptance_criteria: Vec::new(),
+                        planned_files: Vec::new(),
+                        repositories: Vec::new(),
+                        logs: None,
+                        parent: Some(parent_ref.to_string()),
+                    };
+                    let sub_res = intake::add_task(
+                        &store,
+                        &a.repo_path,
+                        sub_task,
+                        false,
+                        &created_sibling_ids,
+                    )
+                    .map_err(workbench_message)?;
+                    if let Some(sub_id) = sub_res.get("item_id").and_then(|v| v.as_str()) {
+                        created_sibling_ids.push(sub_id.to_string());
+                    }
+                    created_subtasks.push(sub_res);
+                }
+                if let Value::Object(ref mut map) = result {
+                    map.insert("subtasks".to_string(), Value::Array(created_subtasks));
+                }
+            }
+            Ok(result)
         }
         "gitpulse_import_tasks" => {
             let a: ImportTasksArgs = parse(name, arguments)?;
@@ -3160,10 +3422,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .map_err(CommandError::into_message)?;
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
             let kind = a.kind.as_deref().unwrap_or("note");
-            let message = crate::engine::agent_bus::post_message(
+            let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
                 &a.from_agent,
                 a.to_agent.as_deref(),
+                a.thread_key.as_deref(),
                 kind,
                 &a.body,
                 a.branch.as_deref(),
@@ -3176,8 +3439,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_worktree_inbox" => {
             let a: WorktreeInboxArgs = parse(name, arguments)?;
-            let mut page = crate::engine::agent_bus::read_messages(
+            let mut page = crate::engine::agent_bus::read_thread_messages(
                 &a.repo_path,
+                a.thread_key.as_deref(),
                 a.agent_id.as_deref(),
                 a.since_seq.unwrap_or(0),
             )
@@ -3194,6 +3458,178 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "latest_seq": page.latest_seq,
                 "dropped_before_seq": page.dropped_before_seq,
                 "has_more": has_more
+            }))
+        }
+        "gitpulse_inbox_post" => {
+            let a: InboxPostArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let kind = a.kind.as_deref().unwrap_or("ask");
+            let effective_body = if let Some(title) =
+                a.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+            {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&a.body) {
+                    if let Some(obj) = val.as_object_mut() {
+                        if !obj.contains_key("title") {
+                            obj.insert("title".to_string(), json!(title));
+                        }
+                        serde_json::to_string(&val).unwrap_or_else(|_| a.body.clone())
+                    } else {
+                        a.body.clone()
+                    }
+                } else {
+                    json!({
+                        "title": title,
+                        "text": a.body
+                    })
+                    .to_string()
+                }
+            } else {
+                a.body.clone()
+            };
+            let message = crate::engine::agent_bus::post_thread_message(
+                &a.repo_path,
+                &a.from_agent,
+                a.to_agent.as_deref(),
+                Some(&a.thread_key),
+                kind,
+                &effective_body,
+                a.branch.as_deref(),
+            )
+            .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "thread_key": a.thread_key,
+                "message": message
+            }))
+        }
+        "gitpulse_inbox_read" => {
+            let a: InboxReadArgs = parse(name, arguments)?;
+            let mut threads = crate::engine::agent_bus::list_inbox_threads(
+                &a.repo_path,
+                a.agent_id.as_deref(),
+                a.status.as_deref(),
+            )
+            .map_err(CommandError::into_message)?;
+            if let Some(ref tk) = a.thread_key {
+                threads.retain(|t| &t.thread_key == tk);
+            }
+            let total = threads.len();
+            let cap = a.limit.map(|l| l as usize).unwrap_or(100);
+            if threads.len() > cap {
+                threads.truncate(cap);
+            }
+            Ok(json!({
+                "ok": true,
+                "repo_path": a.repo_path,
+                "threads": threads,
+                "total": total
+            }))
+        }
+        "gitpulse_inbox_withdraw" => {
+            let a: InboxWithdrawArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let message = crate::engine::agent_bus::withdraw_ask(
+                &a.repo_path,
+                &a.from_agent,
+                &a.thread_key,
+                &a.reason,
+            )
+            .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "thread_key": a.thread_key,
+                "message": message
+            }))
+        }
+        "gitpulse_kickoff_agent" => {
+            let a: KickoffAgentArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let provider = a.provider.as_deref().unwrap_or("claude");
+            let branch = a
+                .branch
+                .clone()
+                .unwrap_or_else(|| format!("feat/{}", ft::slugify(&a.task_id)));
+
+            let mut task_updated = false;
+            if let Ok(Some(store)) = open_task_profile(false) {
+                let summary = format!(
+                    "Kicked off to {} ({}) on branch {} by {}",
+                    a.to_agent, provider, branch, a.from_agent
+                );
+                if intake::complete_task(
+                    &store,
+                    &a.repo_path,
+                    &a.task_id,
+                    "in_progress",
+                    None,
+                    Some(&summary),
+                    None,
+                )
+                .is_ok()
+                {
+                    task_updated = true;
+                }
+            }
+
+            let (claim, claim_conflicts) =
+                crate::engine::agent_bus::register_or_update_lane_with_conflicts(
+                    &a.repo_path,
+                    &a.to_agent,
+                    &branch,
+                    None,
+                    &[],
+                    a.claimed_files.as_deref().unwrap_or(&[]),
+                    a.claimed_symbols.as_deref().unwrap_or(&[]),
+                )
+                .map_err(CommandError::into_message)?;
+
+            let mut slug = ft::slugify(&a.task_id);
+            if slug.len() > 64 {
+                slug.truncate(64);
+            }
+            let thread_key = format!("handoff-{slug}");
+            let handoff_body = json!({
+                "ask_type": "do",
+                "title": format!("Delegated Task {}: {} ({})", a.task_id, a.to_agent, provider),
+                "task_id": a.task_id,
+                "provider": provider,
+                "branch": branch,
+                "steps": [
+                    a.instructions
+                        .as_deref()
+                        .unwrap_or("Execute delegated task inside claimed files and report status.")
+                ],
+                "claimed_files": claim.claimed_files,
+                "claimed_symbols": claim.claimed_symbols,
+            });
+            let message = crate::engine::agent_bus::post_thread_message(
+                &a.repo_path,
+                &a.from_agent,
+                Some(&a.to_agent),
+                Some(&thread_key),
+                "ask",
+                &handoff_body.to_string(),
+                Some(&branch),
+            )
+            .map_err(CommandError::into_message)?;
+
+            Ok(json!({
+                "ok": true,
+                "task_id": a.task_id,
+                "task_updated": task_updated,
+                "provider": provider,
+                "to_agent": a.to_agent,
+                "branch": branch,
+                "thread_key": thread_key,
+                "claim": claim,
+                "claim_conflicts": claim_conflicts,
+                "message": message,
             }))
         }
         "gitpulse_worktree_radar" => {
@@ -4320,6 +4756,9 @@ mod tests {
                             | "gitpulse_worktree_release"
                             | "gitpulse_worktree_send_message"
                             | "gitpulse_worktree_overlay_sync"
+                            | "gitpulse_inbox_post"
+                            | "gitpulse_inbox_withdraw"
+                            | "gitpulse_kickoff_agent"
                     ),
                     "unexpected mutating tool {name}"
                 );
@@ -5155,6 +5594,14 @@ mod tests {
             "one coordination message receipt, no list",
         ),
         (
+            "gitpulse_inbox_post",
+            "one inbox post receipt, no list",
+        ),
+        (
+            "gitpulse_inbox_withdraw",
+            "one inbox ask withdrawal receipt, no list",
+        ),
+        (
             "gitpulse_worktree_overlay_sync",
             "one worktree overlay sync report, no list",
         ),
@@ -5596,6 +6043,41 @@ mod tests {
             }),
             &mut validated,
         );
+        call_writer(
+            "gitpulse_inbox_post",
+            json!({
+                "repo_path": wt_repo,
+                "from_agent": "agent-alpha",
+                "thread_key": "probe-thread",
+                "kind": "ask",
+                "body": "Should we refactor the module?",
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_inbox_withdraw",
+            json!({
+                "repo_path": wt_repo,
+                "from_agent": "agent-alpha",
+                "thread_key": "probe-thread",
+                "reason": "Resolved by direct implementation",
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_kickoff_agent",
+            json!({
+                "repo_path": wt_repo,
+                "from_agent": "agent-alpha",
+                "to_agent": "worker-agy",
+                "task_id": "gp-subtask-1",
+                "provider": "agy",
+                "branch": "main",
+                "instructions": "Implement the ACP adapter subtask",
+                "claimed_files": ["src/lib.rs"],
+            }),
+            &mut validated,
+        );
         git(&["-C", &wt_merge_path, "add", "feature.txt"]);
         git(&[
             "-C",
@@ -5655,7 +6137,11 @@ mod tests {
                 &mut validated,
             );
         }
-        for name in ["gitpulse_worktree_inbox", "gitpulse_worktree_radar"] {
+        for name in [
+            "gitpulse_worktree_inbox",
+            "gitpulse_worktree_radar",
+            "gitpulse_inbox_read",
+        ] {
             let tool = tools()
                 .into_iter()
                 .find(|tool| tool["name"] == name)
@@ -7482,6 +7968,18 @@ mod tests {
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "body": "probe" }),
             ),
             (
+                "gitpulse_inbox_post",
+                json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "body": "probe" }),
+            ),
+            (
+                "gitpulse_inbox_withdraw",
+                json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "reason": "probe" }),
+            ),
+            (
+                "gitpulse_kickoff_agent",
+                json!({ "repo_path": repo, "from_agent": "agent-untrusted", "to_agent": "worker-1", "task_id": "gp-probe" }),
+            ),
+            (
                 "gitpulse_worktree_overlay_sync",
                 json!({ "repo_path": repo }),
             ),
@@ -8350,6 +8848,10 @@ mod tests {
             ("gitpulse_worktree_release", WorktreeReleaseArgs),
             ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
             ("gitpulse_worktree_inbox", WorktreeInboxArgs),
+            ("gitpulse_inbox_post", InboxPostArgs),
+            ("gitpulse_inbox_read", InboxReadArgs),
+            ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
+            ("gitpulse_kickoff_agent", KickoffAgentArgs),
             ("gitpulse_worktree_radar", RepoArgs),
             ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
             ("gitpulse_codeintel_search", SearchArgs),
@@ -8463,6 +8965,10 @@ mod tests {
                 ("gitpulse_worktree_release", WorktreeReleaseArgs),
                 ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
                 ("gitpulse_worktree_inbox", WorktreeInboxArgs),
+                ("gitpulse_inbox_post", InboxPostArgs),
+                ("gitpulse_inbox_read", InboxReadArgs),
+                ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
+                ("gitpulse_kickoff_agent", KickoffAgentArgs),
                 ("gitpulse_worktree_radar", RepoArgs),
                 ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
                 ("gitpulse_codeintel_search", SearchArgs),
@@ -9642,6 +10148,169 @@ mod tests {
             let (err, out) = tool_json("gitpulse_worktree_create", args);
             assert!(err, "{branch}/{base:?} must be refused: {out}");
         }
+    }
+
+    #[test]
+    fn test_task_subtask_decomposition_and_inbox_mcp_lifecycle() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+
+        // 1. Test task decomposition into subtasks via gitpulse_add_task
+        let (err, parent_task) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "parent-epic",
+                "title": "Build Agent Inbox and Task Rollup",
+                "status": "in_progress",
+                "subtasks": [
+                    "Design UI components",
+                    "Wire agent bus ring buffer",
+                    "Add Linear board rollup"
+                ]
+            }),
+        );
+        assert!(!err, "failed to add parent task: {parent_task}");
+        assert_eq!(parent_task["outcome"], "created");
+        let subtasks = parent_task["subtasks"].as_array().expect("subtasks array");
+        assert_eq!(subtasks.len(), 3);
+        assert_eq!(subtasks[0]["task_id"], "parent-epic-sub-1");
+        assert_eq!(subtasks[0]["title"], "Design UI components");
+        assert_eq!(subtasks[1]["task_id"], "parent-epic-sub-2");
+        assert_eq!(subtasks[2]["task_id"], "parent-epic-sub-3");
+
+        // 2. Test posting an inbox ask via gitpulse_inbox_post
+        let (err, posted) = tool_json(
+            "gitpulse_inbox_post",
+            json!({
+                "repo_path": repo,
+                "from_agent": "claude-subagent",
+                "thread_key": "thread-spec-review",
+                "kind": "ask",
+                "body": serde_json::json!({
+                    "ask_type": "decide",
+                    "question": "Choose database engine",
+                    "options": ["SQLite", "JSON Lines"]
+                }).to_string()
+            }),
+        );
+        assert!(!err, "failed to post inbox ask: {posted}");
+        assert_eq!(posted["thread_key"], "thread-spec-review");
+        assert_eq!(posted["message"]["thread_key"], "thread-spec-review");
+
+        // 3. Test reading inbox threads via gitpulse_inbox_read
+        let (err, inbox) = tool_json(
+            "gitpulse_inbox_read",
+            json!({
+                "repo_path": repo,
+                "status": "open"
+            }),
+        );
+        assert!(!err, "failed to read inbox: {inbox}");
+        let threads = inbox["threads"].as_array().expect("threads array");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["thread_key"], "thread-spec-review");
+        assert_eq!(threads[0]["status"], "open");
+        assert_eq!(threads[0]["ask_type"], "decide");
+
+        // 4. Test withdrawing ask via gitpulse_inbox_withdraw
+        let (err, withdrawn) = tool_json(
+            "gitpulse_inbox_withdraw",
+            json!({
+                "repo_path": repo,
+                "from_agent": "claude-subagent",
+                "thread_key": "thread-spec-review",
+                "reason": "Specification updated by architect"
+            }),
+        );
+        assert!(!err, "failed to withdraw ask: {withdrawn}");
+        assert_eq!(withdrawn["thread_key"], "thread-spec-review");
+        assert_eq!(withdrawn["message"]["kind"], "withdraw");
+
+        // 5. Verify thread status transitioned to withdrawn
+        let (err, inbox_withdrawn) = tool_json(
+            "gitpulse_inbox_read",
+            json!({
+                "repo_path": repo,
+                "status": "withdrawn"
+            }),
+        );
+        assert!(!err, "failed to read withdrawn inbox: {inbox_withdrawn}");
+        let withdrawn_threads = inbox_withdrawn["threads"].as_array().expect("withdrawn threads");
+        assert_eq!(withdrawn_threads.len(), 1);
+        assert_eq!(withdrawn_threads[0]["status"], "withdrawn");
+    }
+
+    #[test]
+    fn test_kickoff_agent_decomposes_claims_lane_and_posts_handoff() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+
+        let (err, parent) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "agy-managed-epic",
+                "title": "Implement ACP managed session adapter",
+                "description": "Wire JSON-RPC 2.0 ACP v1 handshake, permission modes, and resumption.",
+                "subtasks": [
+                    "Add executable wrapper bypass check",
+                    "Implement ACP session/new and session/load",
+                    "Add adversarial callback and refusal tests"
+                ]
+            }),
+        );
+        assert!(!err, "gitpulse_add_task failed: {parent}");
+        let subs = parent["subtasks"].as_array().expect("subtasks array");
+        assert_eq!(subs.len(), 3);
+        let sub_key = subs[0]["task_id"].as_str().expect("subtask key");
+
+        let (err, kickoff) = tool_json(
+            "gitpulse_kickoff_agent",
+            json!({
+                "repo_path": repo,
+                "from_agent": "claude-coordinator",
+                "to_agent": "agy-worker-1",
+                "task_id": sub_key,
+                "provider": "agy",
+                "branch": "feat/agy-managed",
+                "instructions": "Implement wrapper bypass check and verify with unit tests.",
+                "claimed_files": ["manvi/codingagent/agy.go", "manvi/codingagent/executable.go"]
+            }),
+        );
+        assert!(!err, "gitpulse_kickoff_agent failed: {kickoff}");
+        assert_eq!(kickoff["ok"], true);
+        assert_eq!(kickoff["task_id"], sub_key);
+        assert_eq!(kickoff["task_updated"], true);
+        assert_eq!(kickoff["provider"], "agy");
+        assert_eq!(kickoff["to_agent"], "agy-worker-1");
+        assert_eq!(kickoff["claim"]["agent_id"], "agy-worker-1");
+        assert_eq!(kickoff["claim"]["branch"], "feat/agy-managed");
+
+        let thread_key = kickoff["thread_key"].as_str().expect("thread_key");
+        let (err, inbox) = tool_json(
+            "gitpulse_inbox_read",
+            json!({
+                "repo_path": repo,
+                "agent_id": "agy-worker-1",
+                "status": "open"
+            }),
+        );
+        assert!(!err, "gitpulse_inbox_read failed: {inbox}");
+        let threads = inbox["threads"].as_array().expect("threads");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["thread_key"], thread_key);
+        assert_eq!(threads[0]["ask_type"], "do");
+        assert_eq!(threads[0]["from_agent"], "claude-coordinator");
+        assert_eq!(threads[0]["to_agent"], "agy-worker-1");
+
+        let lanes = crate::engine::agent_bus::list_lanes(&repo).expect("list_lanes");
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].agent_id, "agy-worker-1");
+        assert_eq!(
+            lanes[0].claimed_files,
+            vec!["manvi/codingagent/agy.go", "manvi/codingagent/executable.go"]
+        );
     }
 }
 

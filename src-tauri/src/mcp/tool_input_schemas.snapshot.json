@@ -633,6 +633,15 @@
         "maxLength": 32,
         "type": "string"
       },
+      "subtasks": {
+        "description": "Subtask titles to decompose this task into; each will be created with parent set to this task",
+        "items": {
+          "maxLength": 300,
+          "type": "string"
+        },
+        "maxItems": 32,
+        "type": "array"
+      },
       "task_id": {
         "description": "Stable key for this task (letters, digits, '-', '_', '.'), e.g. 'gp-auth-flow'. Defaults to 'gp-' plus the title's slug.",
         "maxLength": 96,
@@ -1011,6 +1020,141 @@
     ],
     "type": "object"
   },
+  "gitpulse_inbox_post": {
+    "additionalProperties": false,
+    "properties": {
+      "body": {
+        "description": "Message or ask body (Markdown or JSON structured ask) (at most 16384 UTF-8 bytes)",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "branch": {
+        "description": "Optional branch name (at most 256 UTF-8 bytes)",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "from_agent": {
+        "description": "Sender agent identifier (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kind": {
+        "description": "Message kind: ask, note, or reply (default 'ask') (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_key": {
+        "description": "Unique thread slug/key for persistent conversation (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": {
+        "description": "Concise title or summary (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to_agent": {
+        "description": "Optional recipient agent identifier (null for broadcast/developer) (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from_agent",
+      "thread_key",
+      "body"
+    ],
+    "type": "object"
+  },
+  "gitpulse_inbox_read": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_id": {
+        "description": "Optional agent filter (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum number of threads to return (default 100)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "status": {
+        "description": "Status filter: 'open', 'answered', 'withdrawn', or 'all' (at most 32 UTF-8 bytes)",
+        "maxLength": 32,
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_key": {
+        "description": "Optional thread key to filter specific conversation (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_inbox_withdraw": {
+    "additionalProperties": false,
+    "properties": {
+      "from_agent": {
+        "description": "Agent withdrawing the ask (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "reason": {
+        "description": "Reason for withdrawing the ask (at most 600 UTF-8 bytes)",
+        "maxLength": 600,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_key": {
+        "description": "Thread key of the ask to withdraw (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from_agent",
+      "thread_key",
+      "reason"
+    ],
+    "type": "object"
+  },
   "gitpulse_insights": {
     "additionalProperties": false,
     "properties": {
@@ -1023,6 +1167,82 @@
     },
     "required": [
       "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_kickoff_agent": {
+    "additionalProperties": false,
+    "properties": {
+      "branch": {
+        "description": "Target branch for the worker lane (defaults to feat/<task_id>) (at most 256 UTF-8 bytes)",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "claimed_files": {
+        "description": "Pre-edit file paths reserved for this worker lane",
+        "items": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "claimed_symbols": {
+        "description": "Symbols reserved for this worker lane",
+        "items": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "from_agent": {
+        "description": "Orchestrator or sender agent identifier (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "instructions": {
+        "description": "Detailed handoff instructions or context for the worker (at most 8192 UTF-8 bytes)",
+        "maxLength": 8192,
+        "minLength": 1,
+        "type": "string"
+      },
+      "provider": {
+        "description": "Agent harness provider ('claude', 'agy', or 'codex')",
+        "enum": [
+          "claude",
+          "agy",
+          "codex"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "task_id": {
+        "description": "Board task or subtask id to delegate to the target agent (at most 128 characters)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to_agent": {
+        "description": "Target worker agent identifier to kick off (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from_agent",
+      "to_agent",
+      "task_id"
     ],
     "type": "object"
   },
@@ -1461,6 +1681,12 @@
         "maximum": 9007199254740991,
         "minimum": 0,
         "type": "integer"
+      },
+      "thread_key": {
+        "description": "Optional thread key to filter messages within a specific thread (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
       }
     },
     "required": [
@@ -1666,6 +1892,12 @@
       "repo_path": {
         "description": "Absolute path to a git repository",
         "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_key": {
+        "description": "Optional thread key/slug grouping messages into a persistent conversation or ask (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
         "minLength": 1,
         "type": "string"
       },

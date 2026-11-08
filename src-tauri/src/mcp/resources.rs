@@ -775,6 +775,9 @@ mod tests {
                 "gitpulse_worktree_claim",
                 "gitpulse_worktree_release",
                 "gitpulse_worktree_send_message",
+                "gitpulse_inbox_post",
+                "gitpulse_inbox_withdraw",
+                "gitpulse_kickoff_agent",
                 "gitpulse_worktree_overlay_sync"
             ])
         );

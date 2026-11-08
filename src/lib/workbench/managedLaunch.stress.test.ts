@@ -134,13 +134,17 @@ describe("prepared-attempt expiry under hostile and boundary clocks", () => {
 
 describe("managed provider vocabulary under hostile input", () => {
   it("admits the adapter set and nothing that merely looks like it", () => {
-    expect([...MANAGED_PROVIDERS].sort()).toEqual(["claude", "codex"]);
+    expect([...MANAGED_PROVIDERS].sort()).toEqual(["agy", "claude", "codex"]);
     const lookalikes = [
       ...POLLUTION,
       "",
       " ",
       "CODEX",
       "Codex",
+      "AGY",
+      "Agy",
+      "antigravity",
+      "agy ",
       "codex ",
       " codex",
       "codexx",

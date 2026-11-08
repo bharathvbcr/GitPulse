@@ -796,7 +796,18 @@
                   <label>Labels
                     <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
                   </label>
-                  <TaskRelations bind:checklist={draft.checklist} bind:links={draft.links} taskId={current?.id ?? null} disabled={enhancementBusy} onchange={() => { dirty = true; }} />
+                  <TaskRelations
+                    bind:checklist={draft.checklist}
+                    bind:links={draft.links}
+                    taskId={current?.id ?? null}
+                    task={current}
+                    acceptanceCriteria={criteriaList}
+                    repositories={known}
+                    {openTabs}
+                    repositoryPath={$repoStore.currentPath ?? ""}
+                    disabled={enhancementBusy}
+                    onchange={() => { dirty = true; }}
+                  />
                   {#if current}
                     <div class="notifications-row">
                       <p class="notifications-label">Notifications (profile-wide; mute this task)</p>

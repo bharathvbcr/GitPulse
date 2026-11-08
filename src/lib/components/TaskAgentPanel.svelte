@@ -549,7 +549,7 @@
   {@const mayMutate = canAct(run.id, inflight, mutationHolder, true)}
   {@const working = inflight[run.id]}
   {@const slotNote = slotHeldNote(run.id, inflight, mutationHolder)}
-  {@const hasMutating = offer.ownWorktree || canRelease(run) || (run.provider === "claude" && RESUMABLE.includes(run.state)) || (run.kind === "managed" && ["prepared", "starting"].includes(run.state) && !expired) || (view.waiting?.role === "attempt" && view.waiting.reason === "trust")}
+  {@const hasMutating = offer.ownWorktree || canRelease(run) || ((run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state)) || (run.kind === "managed" && ["prepared", "starting"].includes(run.state) && !expired) || (view.waiting?.role === "attempt" && view.waiting.reason === "trust")}
   <article class="run" class:is-live={holding} data-tone={holding ? row.tone : null} data-testid="agent-run" data-run-id={run.id} data-run-state={run.state}>
     <div class="run-head">
       <strong>{PROVIDER_LABELS[run.provider] ?? run.provider}</strong>
@@ -653,9 +653,8 @@
       {#if run.kind === "managed"}
         {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => resumeManaged(run)} disabled={!mayMutate}>Start or recover managed launch</button>{/if}
         {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" type="button" onclick={() => stopManaged(run)} disabled={!free}>Stop managed run</button>{/if}
-        <button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={!free}>View output and settings</button>
-      {/if}
-      {#if run.provider === "claude" && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={!mayMutate} title="Starts a Claude Code tab in this attempt's checkout that continues its conversation, in the same permission mode. You stay on this task.">Resume conversation</button>{/if}
+        <button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={!free}>View output and settings</button>{/if}
+      {#if (run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={!mayMutate} title={`Starts ${run.provider === "agy" ? "an Antigravity" : "a Claude Code"} tab in this attempt's checkout that continues its conversation, in the same permission mode. You stay on this task.`}>Resume conversation</button>{/if}
       {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={!free}>Cancel preparation</button>{/if}
       <button class="gp-btn" type="button" onclick={() => openCheckout(run)} disabled={!free} data-testid="agent-open-checkout" title={`Opens ${run.cwd} as the active repository tab. Starts nothing.`}>Open checkout</button>
       {#if offer.review}<button class="gp-btn" type="button" onclick={() => review(run)} disabled={!free} data-testid="agent-review" title={`Opens ${run.cwd} on its uncommitted changes.`}>Review changes</button>{/if}

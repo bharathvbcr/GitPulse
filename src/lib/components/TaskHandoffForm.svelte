@@ -240,7 +240,7 @@
     touchedCheckout = true;
     provisionWorktree = pending.worktree === true;
     acknowledged = pending.acknowledge_bypass;
-    settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode });
+    settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode, keepWarm: settings.keepWarm });
     note = "This attempt's earlier preparation was never answered. Retry it, or discard it to start over.";
   });
   $effect(() => {
@@ -549,6 +549,18 @@
     </fieldset>
   {/if}
   <p class="meta">These are requested settings. {settings.kind === "managed" ? `Manvi verifies the effective ${PROVIDER_LABELS[settings.provider]} settings before sending the task.` : "The provider handles requests in its own terminal."}</p>
+  {#if settings.kind === "managed"}
+    <label class="ack">
+      <input
+        type="checkbox"
+        data-testid="handoff-keep-warm"
+        checked={settings.keepWarm === true}
+        disabled={locked}
+        onchange={(e) => choose({ keepWarm: e.currentTarget.checked })}
+      />
+      Keep session warm for follow-ups (park managed session between turns for multi-turn collaboration)
+    </label>
+  {/if}
   {#if settings.permission === "bypass"}
     <label class="ack">
       <input type="checkbox" bind:checked={acknowledged} disabled={locked} />

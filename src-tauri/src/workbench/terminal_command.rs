@@ -757,13 +757,13 @@ pub(super) fn is_terminal_provider(provider: &str) -> bool {
 ///
 /// Strictly smaller than [`is_terminal_provider`], and it is smaller for a
 /// mechanical reason rather than a policy one: a managed run needs an adapter
-/// in the harness that speaks that provider's own session protocol. Grok and
-/// Antigravity have none, so admitting them here would hand their output to a
-/// reader written for someone else's wire format. This list is the mirror of
-/// the harness's own `codingagent.ManagedProviders`; the two are checked
-/// against each other by `managed-provider-parity-contract`.
+/// in the harness that speaks that provider's own session protocol. Grok has
+/// none, so admitting it here would hand its output to a reader written for
+/// someone else's wire format. This list is the mirror of the harness's own
+/// `codingagent.ManagedProviders`; the two are checked against each other by
+/// `managed-provider-parity-contract`.
 pub(super) fn is_managed_provider(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude")
+    matches!(provider, "codex" | "claude" | "agy")
 }
 
 pub(super) fn program(provider: &str) -> Result<String, WorkbenchError> {
@@ -1172,8 +1172,17 @@ pub(super) fn arguments(
     match provider {
         "codex" => args.extend(["--cd".into(), cwd.into()]),
         "grok" => args.extend(["--cwd".into(), cwd.into()]),
-        // Antigravity ignores positional arguments as prompts.
-        "agy" => args.push("--prompt-interactive".into()),
+        "agy" => {
+            // `agy --conversation <id>` resumes an existing conversation; passing a
+            // fresh attempt UUID prints `warning: conversation "<id>" not found`.
+            if let Some(dir) = extras.brief_dir {
+                let dir = dir
+                    .to_str()
+                    .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
+                args.extend(["--add-dir".into(), dir.into()]);
+            }
+            args.push("--prompt-interactive".into());
+        }
         "claude" => {
             if let Some(id) = extras.run_id.filter(|id| is_canonical_uuid(id)) {
                 args.extend(["--session-id".into(), id.into()]);
@@ -1720,7 +1729,7 @@ mod tests {
             assert!(!args.iter().any(|a| a == "--session-id"), "{id}: {args:?}");
         }
         // Only Claude is handed these; the others would not know them.
-        for provider in ["codex", "grok", "agy"] {
+        for provider in ["codex", "grok"] {
             let args = super::arguments(
                 provider,
                 "edit",
@@ -3334,5 +3343,29 @@ mod hook_launch_tests {
     fn no_flags_and_no_arguments_stay_no_arguments() {
         let none = with_launch_flags(Some("claude"), &LaunchOptions::default(), None).unwrap();
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn agy_task_attempt_arguments_omit_resume_only_conversation_and_include_prompt_interactive() {
+        const AGY_RUN: &str = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+        let dir = tempfile::tempdir().unwrap();
+        let brief_path = dir.path().join("task-brief.md");
+        std::fs::write(&brief_path, "brief content").unwrap();
+        let extras = super::Extras {
+            run_id: Some(AGY_RUN),
+            brief_dir: Some(dir.path()),
+            launch: LaunchOptions::default(),
+        };
+        let argv = super::arguments("agy", "edit", false, "/work/repo", &brief_path, &extras).unwrap();
+        assert!(argv.contains(&"--mode".to_string()));
+        assert!(argv.contains(&"accept-edits".to_string()));
+        assert!(!argv.contains(&"--conversation".to_string()));
+        assert!(argv.contains(&"--add-dir".to_string()));
+        let dir_pos = argv.iter().position(|a| a == "--add-dir").unwrap();
+        assert_eq!(argv[dir_pos + 1], dir.path().to_str().unwrap());
+        assert!(argv.contains(&"--prompt-interactive".to_string()));
+        let prompt_pos = argv.iter().position(|a| a == "--prompt-interactive").unwrap();
+        assert!(prompt_pos + 1 < argv.len());
+        assert!(argv[prompt_pos + 1].contains("Read the UTF-8 task brief at"));
     }
 }

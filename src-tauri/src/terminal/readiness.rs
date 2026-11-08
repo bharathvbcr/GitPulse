@@ -292,7 +292,12 @@ fn kqueue_wait(kq: &OwnedFd, timeout: Duration) -> io::Result<Woke> {
     };
     for event in &events[..ready as usize] {
         if event.flags & libc::EV_ERROR != 0 {
-            return Err(io::Error::from_raw_os_error(event.data as i32));
+            let err = event.data as i32;
+            if event.filter == libc::EVFILT_PROC && err == libc::ESRCH {
+                woke.exited = true;
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(err));
         }
         match event.filter {
             // Includes `EV_EOF`: the read that follows reports the hangup.

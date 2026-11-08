@@ -2120,6 +2120,7 @@ pub fn add_worktree(
     if let Some(created_path) =
         try_add_worktree_cow_macos(&repo, target_path, new_branch, start_point, detach)?
     {
+        propagate_claude_account_marker(&repo, Path::new(&created_path));
         return Ok(created_path);
     }
 
@@ -2135,7 +2136,98 @@ pub fn add_worktree(
         args.push(start);
     }
     git_text(&repo, &args)?;
+    propagate_claude_account_marker(&repo, Path::new(target_path));
     Ok(target_path.to_string())
+}
+
+const CLAUDE_ACCOUNT_FILE: &str = ".claude-account";
+const CLAUDE_ACCOUNT_EXCLUDE_MARKER: &str =
+    "# GitPulse: Claude seat marker (local per-checkout, never committed)";
+const MAX_CLAUDE_ACCOUNT_BYTES: u64 = 256;
+const MAX_CLAUDE_SEAT_LEN: usize = 128;
+
+fn read_validated_claude_account(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    if meta.len() == 0 || meta.len() > MAX_CLAUDE_ACCOUNT_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() as u64 > MAX_CLAUDE_ACCOUNT_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let trimmed = text.trim_ascii();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_CLAUDE_SEAT_LEN
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Propagates a regular, non-symlink `.claude-account` seat file into a newly
+/// created linked worktree after confirming `$GIT_COMMON_DIR/info/exclude`
+/// hides `/.claude-account`, so `git status --porcelain` stays clean in both
+/// main and linked checkouts without ever touching tracked `.gitignore`.
+fn propagate_claude_account_marker(source_repo: &Path, new_worktree: &Path) {
+    use std::io::Write;
+
+    let common_anchor_file = crate::engine::git_cli::resolve_git_common_dir(source_repo)
+        .ok()
+        .filter(|common| common.file_name().is_some_and(|n| n == ".git"))
+        .and_then(|common| common.parent().map(|root| root.join(CLAUDE_ACCOUNT_FILE)));
+    let direct = source_repo.join(CLAUDE_ACCOUNT_FILE);
+    let source_is_linked_worktree = source_repo.join(".git").is_file();
+
+    let raw = if source_is_linked_worktree {
+        common_anchor_file
+            .as_deref()
+            .and_then(read_validated_claude_account)
+            .or_else(|| read_validated_claude_account(&direct))
+    } else {
+        read_validated_claude_account(&direct).or_else(|| {
+            common_anchor_file
+                .as_deref()
+                .and_then(read_validated_claude_account)
+        })
+    };
+    let Some(bytes) = raw else {
+        return;
+    };
+
+    let dst = new_worktree.join(CLAUDE_ACCOUNT_FILE);
+    match std::fs::symlink_metadata(&dst) {
+        Ok(_) => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+
+    let exclude = crate::devmap::init::ensure_file_excluded(
+        new_worktree,
+        CLAUDE_ACCOUNT_FILE,
+        CLAUDE_ACCOUNT_EXCLUDE_MARKER,
+    );
+    if !exclude.is_clean() {
+        return;
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(&dst) {
+        let _ = file.write_all(&bytes);
+        let _ = file.flush();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -6134,7 +6226,10 @@ fn add_sparse_worktree_zero_copy_optional_branch(
         })();
 
         match setup {
-            Ok(sha) => sha,
+            Ok(sha) => {
+                propagate_claude_account_marker(&repo, target);
+                sha
+            }
             Err(err) => {
                 // Roll back, judging each undo like any other write, and say
                 // what is still there when an undo is refused or fails.
@@ -14052,6 +14147,226 @@ some-future-field whatever
         assert!(
             lease_path.is_file(),
             "expected stack_lease.json at {lease_path:?}"
+        );
+    }
+
+    #[test]
+    fn add_worktree_propagates_claude_account_marker_with_clean_git_status_and_info_exclude() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let main = sandbox.path().join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        git_in(&main, &["config", "user.name", "Test"]);
+        git_in(&main, &["config", "user.email", "test@example.com"]);
+        crate::test_support::trust_repo(&main);
+
+        std::fs::write(main.join("src/lib.rs"), "pub fn ok() -> bool { true }\n").unwrap();
+        git_in(&main, &["add", "."]);
+        git_in(&main, &["commit", "-m", "init"]);
+
+        // Pin seat in main checkout without a tracked .gitignore.
+        std::fs::write(main.join(".claude-account"), "chandra\n").unwrap();
+
+        let wt1 = sandbox.path().join("sibling-wt-one");
+        add_worktree(
+            main.to_str().unwrap(),
+            wt1.to_str().unwrap(),
+            Some("feat/seat-one"),
+            None,
+            false,
+        )
+        .expect("add_worktree wt1");
+
+        // Second worktree branched from wt1 (linked-to-linked) also tests info/exclude idempotency.
+        let wt2 = sandbox.path().join("sibling-wt-two");
+        add_worktree(
+            wt1.to_str().unwrap(),
+            wt2.to_str().unwrap(),
+            Some("feat/seat-two"),
+            None,
+            false,
+        )
+        .expect("add_worktree wt2");
+
+        // Sparse worktree path must also inherit the seat cleanly.
+        let wt_sparse = sandbox.path().join("sibling-wt-sparse");
+        add_sparse_worktree_zero_copy_optional_branch(
+            main.to_str().unwrap(),
+            wt_sparse.to_str().unwrap(),
+            Some("feat/seat-sparse"),
+            None,
+            false,
+            &["src".to_string()],
+            false,
+            false,
+            &mut |_| Ok(()),
+        )
+        .expect("add_sparse_worktree");
+
+        for checkout in [&main, &wt1, &wt2, &wt_sparse] {
+            assert_eq!(
+                std::fs::read_to_string(checkout.join(".claude-account")).unwrap(),
+                "chandra\n",
+                "expected .claude-account in {}",
+                checkout.display()
+            );
+            assert!(
+                !checkout.join(".gitignore").exists(),
+                "must never create or touch .gitignore in {}",
+                checkout.display()
+            );
+            let status = crate::engine::git_cli::git_captured(checkout, &["status", "--porcelain"])
+                .expect("git status");
+            assert_eq!(
+                String::from_utf8_lossy(&status.stdout).trim(),
+                "",
+                "git status --porcelain must stay 100% clean in {}",
+                checkout.display()
+            );
+        }
+
+        let common = crate::engine::git_cli::resolve_git_common_dir(&main).unwrap();
+        let exclude = std::fs::read_to_string(common.join("info/exclude")).unwrap();
+        let count = exclude
+            .lines()
+            .filter(|line| line.trim() == "/.claude-account")
+            .count();
+        assert_eq!(
+            count, 1,
+            "info/exclude must list /.claude-account once: {exclude}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_worktree_refuses_to_propagate_symlink_oversized_or_malformed_claude_account() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let main = sandbox.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        git_in(&main, &["config", "user.name", "Test"]);
+        git_in(&main, &["config", "user.email", "test@example.com"]);
+        crate::test_support::trust_repo(&main);
+
+        std::fs::write(main.join("README.md"), "# test\n").unwrap();
+        git_in(&main, &["add", "."]);
+        git_in(&main, &["commit", "-m", "init"]);
+
+        let secret = sandbox.path().join("outside-secret");
+        std::fs::write(&secret, "chandra\n").unwrap();
+
+        // 1. Symlink .claude-account -> refused
+        std::os::unix::fs::symlink(&secret, main.join(".claude-account")).unwrap();
+        let wt_sym = sandbox.path().join("wt-sym");
+        add_worktree(
+            main.to_str().unwrap(),
+            wt_sym.to_str().unwrap(),
+            Some("feat/sym"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(wt_sym.join(".claude-account").symlink_metadata().is_err());
+        std::fs::remove_file(main.join(".claude-account")).unwrap();
+
+        // 2. Oversized (> 256 bytes) .claude-account -> refused
+        std::fs::write(main.join(".claude-account"), "a".repeat(300)).unwrap();
+        let wt_big = sandbox.path().join("wt-big");
+        add_worktree(
+            main.to_str().unwrap(),
+            wt_big.to_str().unwrap(),
+            Some("feat/big"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!wt_big.join(".claude-account").exists());
+
+        // 3. Malformed token (path traversal / multi-token) -> refused
+        for bad in ["../evil\n", "two words\n", "\n"] {
+            std::fs::write(main.join(".claude-account"), bad).unwrap();
+            let slug = format!("wt-bad-{}", bad.len());
+            let wt_bad = sandbox.path().join(&slug);
+            add_worktree(
+                main.to_str().unwrap(),
+                wt_bad.to_str().unwrap(),
+                Some(&format!("feat/{slug}")),
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(!wt_bad.join(".claude-account").exists(), "bad={bad:?}");
+        }
+    }
+
+    #[test]
+    fn add_worktree_propagates_rotated_main_seat_and_excludes_at_older_start_point() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let main = sandbox.path().join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        git_in(&main, &["config", "user.name", "Test"]);
+        git_in(&main, &["config", "user.email", "test@example.com"]);
+        crate::test_support::trust_repo(&main);
+
+        std::fs::write(main.join("src/lib.rs"), "pub fn v1() -> u32 { 1 }\n").unwrap();
+        git_in(&main, &["add", "."]);
+        git_in(&main, &["commit", "-m", "v1 without gitignore"]);
+        let v1_sha = String::from_utf8(
+            crate::engine::git_cli::git_captured(&main, &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Later commit on main adds a tracked .gitignore ignoring .claude-account.
+        std::fs::write(main.join(".gitignore"), ".claude-account\n").unwrap();
+        git_in(&main, &["add", ".gitignore"]);
+        git_in(&main, &["commit", "-m", "v2 with gitignore"]);
+
+        std::fs::write(main.join(".claude-account"), "chandra\n").unwrap();
+
+        // Create wt_old at v1_sha (where .gitignore does NOT exist).
+        // Because wt_old lacks .gitignore, info/exclude MUST be populated so wt_old stays clean!
+        let wt_old = sandbox.path().join("wt-old");
+        add_worktree(
+            main.to_str().unwrap(),
+            wt_old.to_str().unwrap(),
+            Some("feat/from-v1"),
+            Some(&v1_sha),
+            false,
+        )
+        .expect("add_worktree at v1_sha");
+
+        assert_eq!(
+            std::fs::read_to_string(wt_old.join(".claude-account")).unwrap(),
+            "chandra\n"
+        );
+        let status_old = crate::engine::git_cli::git_captured(&wt_old, &["status", "--porcelain"])
+            .expect("git status in wt_old");
+        assert_eq!(
+            String::from_utf8_lossy(&status_old.stdout).trim(),
+            "",
+            "wt_old at older start_point without .gitignore must still have clean git status"
+        );
+
+        // Rotate seat in main checkout from chandra -> work, then create wt_from_linked using wt_old as repo_path.
+        std::fs::write(main.join(".claude-account"), "work\n").unwrap();
+        let wt_from_linked = sandbox.path().join("wt-from-linked");
+        add_worktree(
+            wt_old.to_str().unwrap(),
+            wt_from_linked.to_str().unwrap(),
+            Some("feat/rotated-seat"),
+            None,
+            false,
+        )
+        .expect("add_worktree from linked worktree after main seat rotation");
+        assert_eq!(
+            std::fs::read_to_string(wt_from_linked.join(".claude-account")).unwrap(),
+            "work\n",
+            "new worktree created from linked worktree must inherit rotated canonical seat from main checkout"
         );
     }
 }

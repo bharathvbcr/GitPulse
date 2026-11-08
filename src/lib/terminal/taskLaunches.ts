@@ -104,8 +104,8 @@ function requestKey(request: TaskTerminalRequest): string {
 }
 
 export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
-  if (request.resume && (request.provider !== "claude" || !isSessionId(request.resume.sessionId))) {
-    throw new Error("Only a Claude Code conversation with a valid session id can be resumed.");
+  if (request.resume && ((request.provider !== "claude" && request.provider !== "agy") || !isSessionId(request.resume.sessionId))) {
+    throw new Error("Only a Claude Code or Antigravity conversation with a valid session id can be resumed.");
   }
   if (request.attach && (request.resume || !/^[\w-]{1,128}$/.test(request.attach.sessionId))) {
     throw new Error("That terminal session cannot be shown.");

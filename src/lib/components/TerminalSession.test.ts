@@ -79,6 +79,15 @@ describe("TerminalSession hosted conversation records", () => {
     expect(source).toContain("attach: attachTo, resumeId, args: cfg.args,");
     expect(source).not.toContain("withSessionId(");
   });
+
+  it("forgets absent conversations in settleHosted and offers signal-exit recovery for fresh agy tabs", () => {
+    const settleBody = source.slice(
+      source.indexOf("function settleHosted("),
+      source.indexOf("async function resumeEnded()"),
+    );
+    expect(settleBody).toContain("hostedClaude.forget(conversation);");
+    expect(settleBody).toContain("unindexedExitOffer(");
+  });
 });
 
 describe("TerminalSession PTY contracts", () => {

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 109 contracts over
- * 277 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 112 contracts over
+ * 284 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -317,6 +317,10 @@ export const CONTRACTS = Object.freeze([
   // dropped field would silently stop saying so.
   { label: "degraded-subsystems", rustPath: rust("supervisor.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["Degraded"] },
   { label: "daemon-status", rustPath: rust("daemon_lock.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["DaemonStatus"] },
+  // Agent Inbox & Coordination Bus IPC contracts.
+  { label: "agent-bus", rustPath: rust("engine", "agent_bus.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["AgentLaneClaim", "AgentBusMessage", "AgentInboxThread"] },
+  { label: "agent-inbox-ipc", rustPath: rust("commands", "worktrees.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxSnapshot", "InboxMessageReceipt"] },
+  { label: "agent-inbox-decompose", rustPath: rust("workbench.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxDecomposeSubtask", "InboxDecomposeReceipt"] },
 ]);
 
 /**

@@ -135,7 +135,7 @@
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
-  import { conversationForStart, hostedClaude, resumers, settleConversation, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
+  import { AGY_CONTINUE_SENTINEL, conversationForStart, hostedClaude, resolveTranscriptAnswer, resumers, settleConversation, unindexedExitOffer, type ExitFacts, type ResumeOutcome } from "../terminal/hostedAgent";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
     effectiveMode,
@@ -708,7 +708,12 @@
     // front of these at spawn so they can never land behind Claude Code's
     // `-- <text>` and be read as prompt — and so a task attempt, which never
     // passes through here, gets the same ones.
-    const args = resume ? resumeArgs(resume.sessionId, takeResumePrompt()) : agentPromptArgs(kind, initialPrompt) ?? [];
+    const prompt = takeResumePrompt();
+    const args = resume
+      ? (kind === "agy"
+          ? ["--conversation", resume.sessionId, ...(agentPromptArgs("agy", prompt) ?? [])]
+          : resumeArgs(resume.sessionId, prompt))
+      : agentPromptArgs(kind, initialPrompt) ?? [];
     return kind === "shell" ? {} : { program: kind, args };
   }
   /**
@@ -783,22 +788,31 @@
   function settleHosted(end: ExitFacts | "closed", terminalId: string | null) {
     const conversation = hostedId;
     hostedLive = false;
-    if (!conversation) return;
+    if (!conversation) {
+      const fallback = !taskRunId && launcher === "agy"
+        ? unindexedExitOffer("agy", null, end)
+        : null;
+      if (fallback && terminalId) {
+        resumeOffer = fallback;
+        offerTerminal = terminalId;
+        resumers.register(terminalId, resumeEnded);
+      }
+      return;
+    }
     if (!settleConversation(hostedClaude, conversation, end) || !terminalId) return;
     void checkTranscripts([conversation]).then((answers) => {
       // A restart, a new process or this view going away while the check ran:
       // the offer belongs to a session that is no longer this tab's.
       if (disposed || hostedId !== conversation || nativeSessionId !== terminalId || hostedLive) return;
       const answer = answers.get(conversation) ?? { state: "unknown" as const, reason: "no answer" };
-      if (answer.state === "found") {
-        resumeOffer = conversation;
+      if (answer.state === "absent") hostedClaude.forget(conversation);
+      const resolved = resolveTranscriptAnswer(hostedClaude, conversation, launcher === "agy" ? "agy" : "claude", answer);
+      if (resolved.offer) {
+        resumeOffer = resolved.offer;
         offerTerminal = terminalId;
         resumers.register(terminalId, resumeEnded);
-      } else if (answer.state === "absent") {
-        transcriptNote = "Claude Code saved no conversation for this session, so there is nothing to resume.";
-        hostedClaude.forget(conversation);
       } else {
-        transcriptNote = `Could not check whether Claude Code saved this conversation: ${answer.reason ?? "unknown"}`;
+        transcriptNote = resolved.note;
       }
     });
   }
@@ -863,10 +877,12 @@
           // takeover keeps whatever is on record for its PTY and records
           // nothing (`conversationForStart`). A task attempt's run id is its
           // session id, assigned by the backend.
-          if (launcher === "claude" && !taskRunId) {
+          if ((launcher === "claude" || launcher === "agy") && !taskRunId) {
+            const provider = launcher === "agy" ? "agy" : "claude";
             const decided = conversationForStart(hostedClaude, {
               attach: attachTo, resumeId, args: cfg.args,
-              record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now() },
+              record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now(), provider },
+              provider,
             });
             cfg.args = decided.args;
             hostedId = decided.sessionId;
@@ -1773,7 +1789,7 @@
           <span class="text-textMuted text-[11px]" data-testid="terminal-resume-unavailable">{transcriptNote}</span>
         {/if}
         {#if resumeOffer}
-          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title="Relaunch this Claude Code conversation with --resume, in the same directory and permission mode">
+          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title={launcher === "agy" ? (resumeOffer === AGY_CONTINUE_SENTINEL ? "Relaunch Antigravity's latest conversation in this workspace with --continue" : "Relaunch this Antigravity conversation with --conversation, in the same directory and permission mode") : "Relaunch this Claude Code conversation with --resume, in the same directory and permission mode"}>
             <RotateCw size={12} /> Resume
           </button>
         {/if}

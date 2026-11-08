@@ -122,8 +122,8 @@ function installedManagedProviders(): { providers: string[] } | { skipped: strin
 describe("managed provider parity", () => {
   const renderer: AgentProvider[] = [...MANAGED_PROVIDERS].sort();
 
-  it("offers a managed lane for Codex and Claude Code, and for nothing else", () => {
-    expect(renderer).toEqual(["claude", "codex"]);
+  it("offers a managed lane for Codex, Claude Code, and Antigravity, and for nothing else", () => {
+    expect(renderer).toEqual(["agy", "claude", "codex"]);
     for (const provider of PROVIDER_CHOICES) {
       expect(supportsManaged(provider)).toBe(renderer.includes(provider));
     }

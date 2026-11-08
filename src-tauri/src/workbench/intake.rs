@@ -1261,12 +1261,54 @@ fn add_task_once(
             let related = related_open_tasks(store, repository_id, &own, task)?;
             // The parent the call names was read by naming it: a subtask
             // shares its parent's words, and being held back for that would
-            // make a subtask impossible to file.
+            // make a subtask impossible to file. Sibling subtasks sharing the same
+            // parent are similarly part of the same work decomposition and are exempt.
+            let same_parent_ids: std::collections::HashSet<String> =
+                if let Some(parent) = parent_item.as_deref() {
+                    let candidate_ids: Vec<&str> = related
+                        .tasks
+                        .iter()
+                        .filter_map(|t| t["item_id"].as_str())
+                        .collect();
+                    if !candidate_ids.is_empty() {
+                        super::lineage::read(store, &json!({"ids": candidate_ids}).to_string())
+                            .ok()
+                            .and_then(|val| val.get("items").cloned())
+                            .and_then(|items| items.as_object().cloned())
+                            .map(|items_map| {
+                                items_map
+                                    .into_iter()
+                                    .filter_map(|(id, info)| {
+                                        if info.get("parent_item_id").and_then(Value::as_str)
+                                            == Some(parent)
+                                        {
+                                            Some(id)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        std::collections::HashSet::new()
+                    }
+                } else {
+                    std::collections::HashSet::new()
+                };
+
             let unreviewed: Vec<&Value> = related
                 .tasks
                 .iter()
                 .filter(|t| !is_reviewed(t, reviewed_related))
                 .filter(|t| t["item_id"].as_str() != parent_item.as_deref())
+                .filter(|t| {
+                    if let Some(id) = t["item_id"].as_str() {
+                        !same_parent_ids.contains(id)
+                    } else {
+                        true
+                    }
+                })
                 .collect();
             if !unreviewed.is_empty() {
                 let listed: Vec<String> = unreviewed

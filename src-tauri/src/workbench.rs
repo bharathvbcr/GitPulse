@@ -1244,6 +1244,157 @@ pub async fn cmd_workbench_relink_repository(
     Ok(response.to_string())
 }
 
+#[derive(Debug, Serialize)]
+pub struct InboxDecomposeSubtask {
+    pub item_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InboxDecomposeReceipt {
+    pub ok: bool,
+    pub item_id: String,
+    pub thread_key: String,
+    pub subtasks: Vec<InboxDecomposeSubtask>,
+    pub inbox_message: crate::engine::agent_bus::AgentBusMessage,
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_inbox_decompose_task(
+    state: State<'_, WorkbenchState>,
+    app: tauri::AppHandle,
+    repo_path: String,
+    title: String,
+    description: Option<String>,
+    subtasks: Vec<String>,
+    assign_agent: Option<String>,
+    branch: Option<String>,
+) -> Result<InboxDecomposeReceipt, WorkbenchError> {
+    if repo_path.len() > 16_384 || title.trim().is_empty() || subtasks.len() > 32 {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Task decomposition request is empty or exceeds bounds.",
+        ));
+    }
+    let reservation = state.admit().await?;
+    let state = state.inner().clone();
+    let (parent_res, receipt) = tauri::async_runtime::spawn_blocking(move || {
+        let _reservation = reservation;
+        state.with_store(|store| {
+            let now_suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 100_000;
+            let base_slug = crate::tasks::file_tasks::slugify(&title);
+            let key = format!("gp-{base_slug}-{now_suffix}");
+            let parent_task = intake::ExternalTask {
+                key: key.clone(),
+                title: title.clone(),
+                description: description.clone().unwrap_or_default(),
+                status: Some("in_progress".to_string()),
+                priority: Some(2),
+                severity: None,
+                kind: Some("task".to_string()),
+                owner: assign_agent.clone(),
+                due: None,
+                labels: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                planned_files: Vec::new(),
+                repositories: Vec::new(),
+                logs: None,
+                parent: None,
+            };
+            let parent_res = intake::add_task(store, &repo_path, parent_task, false, &[])?;
+            let parent_id = parent_res
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&key)
+                .to_string();
+
+            let mut created_subtasks = Vec::new();
+            let mut sibling_ids = Vec::new();
+            let clean_subs: Vec<String> = subtasks
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            for (idx, sub_title) in clean_subs.iter().enumerate() {
+                let sub_key = format!("{key}-sub-{}", idx + 1);
+                let sub_task = intake::ExternalTask {
+                    key: sub_key.clone(),
+                    title: sub_title.clone(),
+                    description: String::new(),
+                    status: Some("ready".to_string()),
+                    priority: Some(2),
+                    severity: None,
+                    kind: Some("subtask".to_string()),
+                    owner: assign_agent.clone(),
+                    due: None,
+                    labels: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                    planned_files: Vec::new(),
+                    repositories: Vec::new(),
+                    logs: None,
+                    parent: Some(parent_id.clone()),
+                };
+                let sub_res =
+                    intake::add_task(store, &repo_path, sub_task, false, &sibling_ids)?;
+                let sub_item_id = sub_res
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&sub_key)
+                    .to_string();
+                sibling_ids.push(sub_item_id.clone());
+                created_subtasks.push(InboxDecomposeSubtask {
+                    item_id: sub_item_id,
+                    title: sub_title.clone(),
+                    status: sub_res
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ready")
+                        .to_string(),
+                });
+            }
+
+            let thread_key = format!("task-{parent_id}");
+            let handoff_payload = json!({
+                "ask_type": "do",
+                "title": format!("Task Breakdown: {title}"),
+                "task_id": parent_id,
+                "steps": clean_subs,
+                "summary": description.unwrap_or_default(),
+            });
+            let bus_msg = crate::engine::agent_bus::post_thread_message(
+                &repo_path,
+                "developer",
+                assign_agent.as_deref(),
+                Some(&thread_key),
+                "ask",
+                &handoff_payload.to_string(),
+                branch.as_deref(),
+            )
+            .map_err(|e| WorkbenchError::new("bus_error", e.into_message()))?;
+
+            let receipt = InboxDecomposeReceipt {
+                ok: true,
+                item_id: parent_id,
+                thread_key,
+                subtasks: created_subtasks,
+                inbox_message: bus_msg,
+            };
+            Ok((parent_res, receipt))
+        })
+    })
+    .await
+    .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))??;
+    announce(&app, &parent_res);
+    Ok(receipt)
+}
+
 #[cfg(test)]
 #[path = "workbench/profile_owner_tests.rs"]
 mod profile_owner_tests;

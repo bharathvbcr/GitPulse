@@ -185,6 +185,10 @@
     "allow-cmd-hygiene-cancel",
     "allow-cmd-hygiene-execute",
     "allow-cmd-hygiene-prepare",
+    "allow-cmd-inbox-decompose-task",
+    "allow-cmd-inbox-post",
+    "allow-cmd-inbox-read",
+    "allow-cmd-inbox-withdraw",
     "allow-cmd-insights-snapshot",
     "allow-cmd-lappi-settings",
     "allow-cmd-lappi-settings-save",
@@ -314,6 +318,7 @@
     "allow-cmd-worktree-cow-sync",
     "allow-cmd-worktree-merge-teardown",
     "allow-cmd-worktree-routes",
+    "allow-cmd-worktree-send-message",
     "allow-cmd-worktree-task",
     "allow-cmd-write-file-content",
     "allow-cmd-create-file"

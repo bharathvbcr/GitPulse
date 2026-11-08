@@ -730,6 +730,96 @@ pub(crate) fn session_host<R: tauri::Runtime>(
     Arc::new(SessionHost { app: app.clone() })
 }
 
+/// Deterministic Graft notification key (`[A-Za-z0-9._:-]{1,128}`) for an Agent
+/// Inbox `thread_key`. Including a 64-bit FNV-1a suffix guarantees two distinct
+/// `thread_key` strings (e.g. `feat/auth` vs `feat_auth` or UTF-8 keys) never
+/// alias to the same held Graft notification slot.
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+pub(crate) fn inbox_graft_key(thread_key: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in thread_key.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let mut clean = String::with_capacity(thread_key.len().min(64));
+    for byte in thread_key.bytes().take(64) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-') {
+            clean.push(byte as char);
+        } else {
+            clean.push('_');
+        }
+    }
+    if clean.is_empty() {
+        clean.push_str("thread");
+    }
+    format!("gitpulse.inbox.{clean}.{hash:016x}")
+}
+
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+fn extract_ask_summary(body: &str) -> String {
+    let raw = if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        ["title", "question", "summary", "action", "target", "text"]
+            .iter()
+            .find_map(|field| {
+                parsed
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                parsed
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| body.trim().to_owned())
+    } else {
+        body.trim().to_owned()
+    };
+
+    if raw.len() <= 512 {
+        return raw;
+    }
+    let mut end = 512;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &raw[..end])
+}
+
+/// Forwards new Agent Inbox structured asks to Graft's local notification socket
+/// and retracts held asks when a thread receives a reply, answer, or withdrawal.
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+pub(crate) fn sync_graft_inbox_message(msg: &crate::engine::agent_bus::AgentBusMessage) {
+    let Some(thread_key) = msg
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let key = inbox_graft_key(thread_key);
+    match msg.kind.as_str() {
+        "ask" => {
+            let heading = format!("Agent Ask ({})", msg.from_agent);
+            let summary = extract_ask_summary(&msg.body);
+            graft::post(&key, &heading, &summary, true);
+        }
+        "reply" | "answer" | "withdraw" | "withdrawn" => {
+            graft::remove(&[key]);
+        }
+        _ => {}
+    }
+}
+
+
 pub(super) fn native_request(
     host: &WorkbenchState,
     method: &str,
@@ -1382,4 +1472,64 @@ mod tests {
             "claim_consumed"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbox_ask_posts_and_withdraws_via_graft_socket_without_key_collision() {
+        use super::graft::fake_server_tests::{FakeGraft, Reply};
+        use super::{inbox_graft_key, sync_graft_inbox_message};
+        use crate::engine::agent_bus::AgentBusMessage;
+        use crate::test_support::coverage_relaxed;
+        use crate::test_support::env::{bind_env, env_serial};
+
+        assert_ne!(inbox_graft_key("feat/auth"), inbox_graft_key("feat_auth"));
+        assert!(inbox_graft_key("🚀-thread-with-spaces and/slashes").len() <= 128);
+
+        let serial = env_serial();
+        let fake = FakeGraft::start(Reply::Line(r#"{"ok":true,"sent":true}"#.into()));
+        let _env = bind_env(&serial).set("GRAFT_NOTIFY_SOCKET", fake.path());
+
+        let ask = AgentBusMessage {
+            seq: 1,
+            from_agent: "claude-worker".into(),
+            to_agent: Some("developer".into()),
+            kind: "ask".into(),
+            body: r#"{"ask_type":"decide","question":"Use WAL mode for index?"}"#.into(),
+            branch: Some("feat/inbox".into()),
+            created_at_ms: 1000,
+            thread_key: Some("feat/inbox-wal".into()),
+        };
+        sync_graft_inbox_message(&ask);
+
+        let post_line = fake
+            .next_request(coverage_relaxed(Duration::from_secs(3)))
+            .expect("ask offered to Graft");
+        let post_json: Value = serde_json::from_slice(&post_line).unwrap();
+        let expected_key = inbox_graft_key("feat/inbox-wal");
+        assert_eq!(post_json["op"], "post");
+        assert_eq!(post_json["key"], expected_key);
+        assert_eq!(post_json["title"], "Agent Ask (claude-worker)");
+        assert_eq!(post_json["text"], "Use WAL mode for index?");
+        assert_eq!(post_json["silent"], false);
+
+        let reply = AgentBusMessage {
+            seq: 2,
+            from_agent: "developer".into(),
+            to_agent: Some("claude-worker".into()),
+            kind: "reply".into(),
+            body: "Yes, use WAL".into(),
+            branch: Some("feat/inbox".into()),
+            created_at_ms: 2000,
+            thread_key: Some("feat/inbox-wal".into()),
+        };
+        sync_graft_inbox_message(&reply);
+
+        let rm_line = fake
+            .next_request(coverage_relaxed(Duration::from_secs(3)))
+            .expect("reply offered remove to Graft");
+        let rm_json: Value = serde_json::from_slice(&rm_line).unwrap();
+        assert_eq!(rm_json["op"], "remove");
+        assert_eq!(rm_json["key"], expected_key);
+    }
 }
+

@@ -117,3 +117,13 @@ describe("one action in flight no longer freezes every card", () => {
     expect(taking).toEqual(["Discarding", "Merging", "Releasing", "Resuming", "Resuming", "Trusting"]);
   });
 });
+
+describe("TaskAgentPanel Resume conversation supports both Claude Code and Antigravity", () => {
+  it("gates both the mutating slot check and Resume conversation button on claude or agy", () => {
+    expect(source).not.toContain('run.provider === "claude" && RESUMABLE.includes(run.state)');
+    expect(source).toContain('(run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state)');
+    const resumeBtnMatches = source.match(/\(run\.provider === "claude" \|\| run\.provider === "agy"\) && RESUMABLE\.includes\(run\.state\)/g) ?? [];
+    expect(resumeBtnMatches.length).toBe(2);
+  });
+});
+

@@ -1456,6 +1456,10 @@ fn sidecar_ambient_env(
         "COMPUTERNAME",
         "NUMBER_OF_PROCESSORS",
         "PROCESSOR_ARCHITECTURE",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "ANTIGRAVITY_HOME",
+        "CODEX_HOME",
     ];
     const SECRET_SUFFIXES: &[&str] = &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSPHRASE"];
     vars.filter(|(name, _)| {
@@ -3935,6 +3939,10 @@ done
             ("HOME", "/h"),
             ("LC_ALL", "C"),
             ("XDG_CONFIG_HOME", "/x"),
+            ("CLAUDE_CONFIG_DIR", "/h/.claude-work"),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/h/.claude-work"),
+            ("ANTIGRAVITY_HOME", "/h/.gemini/antigravity"),
+            ("CODEX_HOME", "/h/.codex"),
             ("SSH_AUTH_SOCK", "/s"),
             ("HTTPS_PROXY", "http://p"),
             ("MANVI_LOG", "debug"),
@@ -3943,6 +3951,8 @@ done
             ("AWS_SECRET_ACCESS_KEY", "a"),
             ("OPENAI_API_KEY", "o"),
             ("ANTHROPIC_API_KEY", "c"),
+            ("ANTHROPIC_AUTH_TOKEN", "tok"),
+            ("GEMINI_API_KEY", "g"),
             ("GIT_DIR", "/elsewhere"),
         ];
         let kept: Vec<String> = sidecar_ambient_env(
@@ -3959,6 +3969,10 @@ done
                 "HOME",
                 "LC_ALL",
                 "XDG_CONFIG_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                "ANTIGRAVITY_HOME",
+                "CODEX_HOME",
                 "SSH_AUTH_SOCK",
                 "HTTPS_PROXY",
                 "MANVI_LOG"

@@ -180,7 +180,18 @@ describe("startPreparedAttempt", () => {
     const launchManaged = vi.fn(async (id: string) => run(id, { kind: "managed", state: "running", session_id: "m" }));
     const h = harness(queuedStart("started"), { launchManaged });
     expect(await startPreparedAttempt(run("m", { kind: "managed" }), {}, h.deps)).toMatchObject({ ok: true, run: { state: "running" } });
+    expect(launchManaged).toHaveBeenLastCalledWith("m");
     expect(get(attemptNotices).get("m")?.phase).toBe("running");
+
+    expect(
+      await startPreparedAttempt(
+        run("m-warm", { kind: "managed", provider: "agy" }),
+        { remember: { provider: "agy", kind: "managed", permission: "ask", keepWarm: true } },
+        h.deps,
+      ),
+    ).toMatchObject({ ok: true, run: { state: "running" } });
+    expect(launchManaged).toHaveBeenLastCalledWith("m-warm", { maxContinuations: 8 });
+
     launchManaged.mockRejectedValueOnce(new Error("Manvi is not installed"));
     const failed = await startPreparedAttempt(run("n", { kind: "managed" }), {}, h.deps);
     expect(failed.ok).toBe(false);

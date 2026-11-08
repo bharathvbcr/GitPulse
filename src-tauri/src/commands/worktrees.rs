@@ -483,6 +483,173 @@ pub(super) fn worktree_ai_summary(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct InboxSnapshot {
+    pub ok: bool,
+    pub repo_path: String,
+    pub threads: Vec<crate::engine::agent_bus::AgentInboxThread>,
+    pub lanes: Vec<crate::engine::agent_bus::AgentLaneClaim>,
+    pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InboxMessageReceipt {
+    pub ok: bool,
+    pub thread_key: Option<String>,
+    pub message: crate::engine::agent_bus::AgentBusMessage,
+}
+
+/// Reads persistent Agent Inbox threads plus active registered agent lanes.
+#[tauri::command(async)]
+pub async fn cmd_inbox_read(
+    repo_path: String,
+    agent_id: Option<String>,
+    status: Option<String>,
+    thread_key: Option<String>,
+    limit: Option<usize>,
+) -> Result<InboxSnapshot, IpcError> {
+    off_thread(move || {
+        let mut threads = crate::engine::agent_bus::list_inbox_threads(
+            &repo_path,
+            agent_id.as_deref(),
+            status.as_deref(),
+        )?;
+        if let Some(ref tk) = thread_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            threads.retain(|t| t.thread_key == *tk);
+        }
+        let total = threads.len();
+        let cap = limit.unwrap_or(100).clamp(1, 256);
+        if threads.len() > cap {
+            threads.truncate(cap);
+        }
+        let lanes = crate::engine::agent_bus::list_lanes(&repo_path)?;
+        Ok(InboxSnapshot {
+            ok: true,
+            repo_path,
+            threads,
+            lanes,
+            total,
+        })
+    })
+    .await
+}
+
+/// Posts a structured Vespin ask (`decide`, `do`, `answer`, `review`) or thread
+/// update onto `<git-common-dir>/gitpulse/lanes/messages.json`.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_inbox_post(
+    repo_path: String,
+    from_agent: String,
+    to_agent: Option<String>,
+    thread_key: String,
+    kind: Option<String>,
+    title: Option<String>,
+    body: String,
+    branch: Option<String>,
+) -> Result<InboxMessageReceipt, IpcError> {
+    off_thread(move || {
+        crate::repository_trust::require(std::path::Path::new(&repo_path))?;
+        crate::engine::git_cli::mark_user_action(&repo_path);
+        let effective_kind = kind.as_deref().unwrap_or("ask");
+        let effective_body = if let Some(title_str) =
+            title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+        {
+            if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(obj) = parsed.as_object_mut() {
+                    if !obj.contains_key("title") {
+                        obj.insert(
+                            "title".to_string(),
+                            serde_json::Value::String(title_str.to_string()),
+                        );
+                    }
+                    serde_json::to_string(&parsed).unwrap_or_else(|_| body.clone())
+                } else {
+                    body.clone()
+                }
+            } else {
+                serde_json::json!({
+                    "title": title_str,
+                    "text": body,
+                })
+                .to_string()
+            }
+        } else {
+            body
+        };
+        let message = crate::engine::agent_bus::post_thread_message(
+            &repo_path,
+            &from_agent,
+            to_agent.as_deref(),
+            Some(&thread_key),
+            effective_kind,
+            &effective_body,
+            branch.as_deref(),
+        )?;
+        Ok(InboxMessageReceipt {
+            ok: true,
+            thread_key: Some(thread_key),
+            message,
+        })
+    })
+    .await
+}
+
+/// Posts a reply or direct/broadcast coordination message onto `messages.json`.
+#[tauri::command(async)]
+pub async fn cmd_worktree_send_message(
+    repo_path: String,
+    from_agent: String,
+    to_agent: Option<String>,
+    thread_key: Option<String>,
+    kind: Option<String>,
+    body: String,
+    branch: Option<String>,
+) -> Result<InboxMessageReceipt, IpcError> {
+    off_thread(move || {
+        crate::repository_trust::require(std::path::Path::new(&repo_path))?;
+        crate::engine::git_cli::mark_user_action(&repo_path);
+        let effective_kind = kind.as_deref().unwrap_or("note");
+        let message = crate::engine::agent_bus::post_thread_message(
+            &repo_path,
+            &from_agent,
+            to_agent.as_deref(),
+            thread_key.as_deref(),
+            effective_kind,
+            &body,
+            branch.as_deref(),
+        )?;
+        Ok(InboxMessageReceipt {
+            ok: true,
+            thread_key: message.thread_key.clone(),
+            message,
+        })
+    })
+    .await
+}
+
+/// Withdraws an open structured ask in `thread_key`.
+#[tauri::command(async)]
+pub async fn cmd_inbox_withdraw(
+    repo_path: String,
+    from_agent: String,
+    thread_key: String,
+    reason: String,
+) -> Result<InboxMessageReceipt, IpcError> {
+    off_thread(move || {
+        crate::repository_trust::require(std::path::Path::new(&repo_path))?;
+        crate::engine::git_cli::mark_user_action(&repo_path);
+        let message =
+            crate::engine::agent_bus::withdraw_ask(&repo_path, &from_agent, &thread_key, &reason)?;
+        Ok(InboxMessageReceipt {
+            ok: true,
+            thread_key: Some(thread_key),
+            message,
+        })
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

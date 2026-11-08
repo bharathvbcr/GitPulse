@@ -353,6 +353,14 @@ describe("the ops GitPulse names are served", () => {
     expect(contract.ops.optional).toContain(op![1]);
     // What GitPulse reads back is a subset of what Manvi answers.
     expect(declared("ManagedContinueResult")).toEqual(expect.arrayContaining(["state", "request_id", "turn", "max_turns", "idle_deadline"]));
+
+    const prepAt = managedRs.indexOf("pub(crate) fn prepare_params(");
+    expect(prepAt, "prepare_params not found").toBeGreaterThanOrEqual(0);
+    const prepRest = managedRs.slice(prepAt);
+    const prepKeys = paramKeys(prepRest.slice(0, prepRest.search(/\n\}\n/)));
+    expect(prepKeys).toEqual(expect.arrayContaining(["id", "request_id", "expected_revision", "max_continuations"]));
+    expect(undeclared(prepKeys, "ManagedPrepareParams")).toEqual([]);
+    expect(missingRequired(prepKeys, "ManagedPrepareParams")).toEqual([]);
   });
 
   it("what GitPulse sends work.scan.* and work.enhancements.refine is declared, and the root is always sent", () => {

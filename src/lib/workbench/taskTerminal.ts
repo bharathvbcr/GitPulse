@@ -327,7 +327,7 @@ export type ResumeDisposition = "background" | "show";
  * the reason rather than a tab that opens only to say "No conversation found".
  */
 export async function resumeTaskConversation(
-  run: Pick<TaskRun, "id" | "task_title">,
+  run: Pick<TaskRun, "id" | "task_title"> & { provider?: TaskRun["provider"] },
   disposition: ResumeDisposition = "background",
   /**
    * A first message for the resumed conversation: `claude --resume <id> -- <text>`
@@ -340,7 +340,7 @@ export async function resumeTaskConversation(
 ): Promise<{ outcome: TaskTerminalOutcome } | { outcome: "unavailable"; reason: string }> {
   if (prompt !== undefined) {
     try {
-      agentPromptArgs("claude", prompt);
+      agentPromptArgs(run.provider ?? "claude", prompt);
     } catch (cause) {
       return { outcome: "unavailable", reason: explainError(cause) };
     }
@@ -362,7 +362,7 @@ export async function resumeTaskConversation(
   const request: TaskTerminalRequest = {
     runId: run.id,
     repoPath: place.root,
-    provider: "claude",
+    provider: conversation.provider ?? run.provider ?? "claude",
     title: run.task_title,
     resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id, ...(prompt !== undefined ? { prompt } : {}) },
     ...(place.startDir ? { startDir: place.startDir } : {}),
@@ -433,9 +433,11 @@ const EXPIRY_GRACE_MS = 5_000;
 /** Bound on any one watch, whatever the run says its expiry is. */
 const MAX_WATCH_MS = 15 * 60_000;
 
+export const DEFAULT_MANAGED_CONTINUATIONS = 8;
+
 export interface PreparedAttemptDeps {
   startTerminal: (run: TaskRun) => Promise<AttemptStart>;
-  launchManaged: (runId: string) => Promise<TaskRun>;
+  launchManaged: (runId: string, options?: { maxContinuations?: number }) => Promise<TaskRun>;
   remember: (settings: HandoffSettings) => void;
   show: (run: TaskRun) => Promise<unknown>;
   toast: {
@@ -451,7 +453,7 @@ export interface PreparedAttemptDeps {
 
 const DEPS: PreparedAttemptDeps = {
   startTerminal: startTaskTerminal,
-  launchManaged: (runId) => bounded(launchManagedRun(runId)),
+  launchManaged: (runId, options) => bounded(launchManagedRun(runId, options)),
   remember: (settings) => interfaceStore.setTaskHandoff(settings),
   show: showTaskTerminal,
   toast: toastStore,
@@ -498,7 +500,7 @@ export function watchedAttempts(): string[] {
  */
 export async function startPreparedAttempt(
   run: TaskRun,
-  options: { remember?: HandoffSettings } = {},
+  options: { remember?: HandoffSettings; maxContinuations?: number } = {},
   deps: PreparedAttemptDeps = DEPS,
 ): Promise<PreparedAttemptResult> {
   if (options.remember) {
@@ -509,14 +511,25 @@ export async function startPreparedAttempt(
     deps.remember(settings.permission === "bypass" ? { ...settings, permission: defaultHandoff().permission } : settings);
   }
   const label = PROVIDER_LABELS[run.provider] ?? run.provider;
-  if (run.kind === "managed") return startManaged(run, label, deps);
+  if (run.kind === "managed") {
+    const maxContinuations =
+      options.maxContinuations ?? (options.remember?.keepWarm === true ? DEFAULT_MANAGED_CONTINUATIONS : 0);
+    return startManaged(run, label, maxContinuations, deps);
+  }
   return startTerminal(run, label, deps);
 }
 
-async function startManaged(run: TaskRun, label: string, deps: PreparedAttemptDeps): Promise<PreparedAttemptResult> {
+async function startManaged(
+  run: TaskRun,
+  label: string,
+  maxContinuations: number,
+  deps: PreparedAttemptDeps,
+): Promise<PreparedAttemptResult> {
   noteAttempt(run.id, "starting", `Starting managed ${label}…`, deps.now());
   try {
-    const started = await deps.launchManaged(run.id);
+    const started = maxContinuations > 0
+      ? await deps.launchManaged(run.id, { maxContinuations })
+      : await deps.launchManaged(run.id);
     if (started.state === "running") {
       noteAttempt(run.id, "running", `Managed ${label} is running.`, deps.now());
       deps.toast.success(`Managed ${label} started.`);

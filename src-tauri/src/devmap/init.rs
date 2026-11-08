@@ -230,6 +230,32 @@ pub(crate) fn ensure_dir_excluded(repo: &Path, relative: &str, marker: &str) -> 
     )
 }
 
+/// Keep a root-level file (`filename`, no slashes) out of `git status` via
+/// `$GIT_COMMON_DIR/info/exclude`, verified with `git check-ignore` and never
+/// touching tracked `.gitignore`.
+pub(crate) fn ensure_file_excluded(repo: &Path, filename: &str, marker: &str) -> ExcludeOutcome {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || marker.contains('\n')
+        || !marker.starts_with('#')
+    {
+        return ExcludeOutcome::Refused {
+            reason: format!("`{filename}` is not a plain root-level file name"),
+        };
+    }
+    exclude_verified(
+        repo,
+        StateDirPaths {
+            query: filename.to_string(),
+            pattern: format!("/{filename}"),
+        },
+        marker,
+    )
+}
+
 fn exclude_verified(repo: &Path, paths: StateDirPaths, marker: &str) -> ExcludeOutcome {
     match ignore_source(repo, &paths.query) {
         Ok(Some(source)) => return ExcludeOutcome::AlreadyIgnored { source },

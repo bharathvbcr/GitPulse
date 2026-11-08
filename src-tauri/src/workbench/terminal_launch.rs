@@ -293,7 +293,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     {
         return Err(WorkbenchError::new(
             "unsupported_operation",
-            "Managed launches require Codex or Claude Code and an attempt identity of at most 100 characters.",
+            "Managed launches require Codex, Claude Code, or Antigravity and an attempt identity of at most 100 characters.",
         ));
     }
     // Held across the whole build, hook included, so a retry of this attempt

@@ -36,6 +36,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub const MAX_ACTIVE_LANES: usize = 64;
 pub const MAX_CLAIMED_ITEMS: usize = 128;
 pub const MAX_BUS_MESSAGES: usize = 256;
+pub const MAX_PINNED_OPEN_ASKS: usize = 64;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_ODB_RADAR_PAIRS: usize = 32;
 pub const MAX_RADAR_CONFLICTS_PER_LAYER: usize = 128;
@@ -71,6 +72,8 @@ pub struct AgentBusMessage {
     pub body: String,
     pub branch: Option<String>,
     pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -86,6 +89,20 @@ pub struct AgentInboxPage {
     pub messages: Vec<AgentBusMessage>,
     pub latest_seq: u64,
     pub dropped_before_seq: u64,
+}
+
+/// Grouped conversation thread and structured ask status modeled on Vespin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInboxThread {
+    pub thread_key: String,
+    pub title: String,
+    pub status: String,
+    pub ask_type: Option<String>,
+    pub latest_msg: AgentBusMessage,
+    pub messages: Vec<AgentBusMessage>,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub updated_at_ms: u64,
 }
 
 /// Pre-edit file or symbol claim collision between two parallel agent lanes.
@@ -668,11 +685,12 @@ pub fn list_lanes(repo_path: &str) -> Result<Vec<AgentLaneClaim>, CommandError> 
     })
 }
 
-/// Posts a bounded agent-to-agent coordination message (broadcast when `to_agent` is `None`).
-pub fn post_message(
+/// Posts a bounded agent-to-agent coordination message with an optional thread key.
+pub fn post_thread_message(
     repo_path: &str,
     from_agent: &str,
     to_agent: Option<&str>,
+    thread_key: Option<&str>,
     kind: &str,
     body: &str,
     branch: Option<&str>,
@@ -680,6 +698,10 @@ pub fn post_message(
     let from = sanitize_token("from_agent", from_agent, 128)?;
     let to = match to_agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(target) => Some(sanitize_token("to_agent", target, 128)?),
+        None => None,
+    };
+    let t_key = match thread_key.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(k) => Some(sanitize_token("thread_key", k, 80)?),
         None => None,
     };
     let msg_kind = sanitize_token("kind", kind, 64)?;
@@ -713,14 +735,43 @@ pub fn post_message(
             body: trimmed_body.to_string(),
             branch: msg_branch,
             created_at_ms: now_epoch_ms(),
+            thread_key: t_key,
         };
         state.messages.push(msg.clone());
         if state.messages.len() > MAX_BUS_MESSAGES {
-            let excess = state.messages.len() - MAX_BUS_MESSAGES;
-            if let Some(last_dropped) = state.messages.get(excess - 1) {
-                state.dropped_before_seq = last_dropped.seq.saturating_add(1);
+            let mut open_ask_seq_by_thread: HashMap<String, u64> = HashMap::new();
+            for existing in &state.messages {
+                let key = existing
+                    .thread_key
+                    .clone()
+                    .unwrap_or_else(|| format!("msg-{}", existing.seq));
+                if existing.kind == "ask" {
+                    open_ask_seq_by_thread.insert(key, existing.seq);
+                } else if matches!(
+                    existing.kind.as_str(),
+                    "reply" | "answer" | "withdraw" | "withdrawn"
+                ) {
+                    open_ask_seq_by_thread.remove(&key);
+                }
             }
-            state.messages.drain(0..excess);
+            let mut pinned_vec: Vec<u64> = open_ask_seq_by_thread.into_values().collect();
+            pinned_vec.sort_unstable();
+            let pinned_seqs: BTreeSet<u64> = pinned_vec
+                .into_iter()
+                .rev()
+                .take(MAX_PINNED_OPEN_ASKS)
+                .collect();
+
+            while state.messages.len() > MAX_BUS_MESSAGES {
+                let evict_idx = state
+                    .messages
+                    .iter()
+                    .position(|m| !pinned_seqs.contains(&m.seq))
+                    .unwrap_or(0);
+                let dropped = state.messages.remove(evict_idx);
+                state.dropped_before_seq =
+                    state.dropped_before_seq.max(dropped.seq.saturating_add(1));
+            }
         }
 
         let bytes = serde_json::to_vec_pretty(&state)
@@ -731,13 +782,32 @@ pub fn post_message(
 
         Ok(msg)
     })
+    .inspect(|persisted| {
+        #[cfg(not(test))]
+        crate::workbench::notifications::sync_graft_inbox_message(persisted);
+        #[cfg(test)]
+        let _ = persisted;
+    })
+}
+
+/// Posts a bounded agent-to-agent coordination message (broadcast when `to_agent` is `None`).
+pub fn post_message(
+    repo_path: &str,
+    from_agent: &str,
+    to_agent: Option<&str>,
+    kind: &str,
+    body: &str,
+    branch: Option<&str>,
+) -> Result<AgentBusMessage, CommandError> {
+    post_thread_message(repo_path, from_agent, to_agent, None, kind, body, branch)
 }
 
 /// Reads coordination messages addressed to `agent_id` (plus broadcasts where
 /// `to_agent` is `None`), or all messages when `agent_id` is `None`, strictly
-/// after `since_seq`.
-pub fn read_messages(
+/// after `since_seq`, optionally filtered by `thread_key`.
+pub fn read_thread_messages(
     repo_path: &str,
+    thread_key: Option<&str>,
     agent_id: Option<&str>,
     since_seq: u64,
 ) -> Result<AgentInboxPage, CommandError> {
@@ -745,6 +815,7 @@ pub fn read_messages(
         Some(a) => Some(sanitize_token("agent_id", a, 128)?),
         None => None,
     };
+    let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState =
@@ -754,6 +825,10 @@ pub fn read_messages(
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
+            .filter(|m| match &t_filter {
+                Some(tk) => m.thread_key.as_deref() == Some(*tk),
+                None => true,
+            })
             .filter(|m| match (&target_filter, &m.to_agent) {
                 (None, _) => true,
                 (Some(_), None) => true, // broadcast reaches every agent
@@ -766,6 +841,182 @@ pub fn read_messages(
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
         })
+    })
+}
+
+/// Reads coordination messages addressed to `agent_id` (plus broadcasts where
+/// `to_agent` is `None`), or all messages when `agent_id` is `None`, strictly
+/// after `since_seq`.
+pub fn read_messages(
+    repo_path: &str,
+    agent_id: Option<&str>,
+    since_seq: u64,
+) -> Result<AgentInboxPage, CommandError> {
+    read_thread_messages(repo_path, None, agent_id, since_seq)
+}
+
+/// Withdraws an open structured ask under `thread_key`.
+pub fn withdraw_ask(
+    repo_path: &str,
+    from_agent: &str,
+    thread_key: &str,
+    reason: &str,
+) -> Result<AgentBusMessage, CommandError> {
+    let clean_thread_key = sanitize_token("thread_key", thread_key, 80)?;
+    let clean_reason = sanitize_token("reason", reason, 600)?;
+    let body = serde_json::json!({
+        "status": "withdrawn",
+        "reason": clean_reason,
+    })
+    .to_string();
+    post_thread_message(repo_path, from_agent, None, Some(&clean_thread_key), "withdraw", &body, None)
+}
+
+/// Posts a developer or agent reply/answer to a thread or structured ask under `thread_key`.
+pub fn answer_ask(
+    repo_path: &str,
+    from_agent: &str,
+    thread_key: &str,
+    answer_body: &str,
+) -> Result<AgentBusMessage, CommandError> {
+    let clean_thread_key = sanitize_token("thread_key", thread_key, 80)?;
+    post_thread_message(repo_path, from_agent, None, Some(&clean_thread_key), "reply", answer_body, None)
+}
+
+/// Lists aggregated inbox threads grouped by `thread_key` (or message sequence),
+/// resolving status, latest ask, and reply timeline modeled on Vespin.
+pub fn list_inbox_threads(
+    repo_path: &str,
+    agent_id: Option<&str>,
+    status_filter: Option<&str>,
+) -> Result<Vec<AgentInboxThread>, CommandError> {
+    let target_filter = match agent_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => Some(sanitize_token("agent_id", a, 128)?),
+        None => None,
+    };
+    let clean_status = status_filter.map(str::trim).filter(|s| !s.is_empty() && *s != "all");
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let state: MessagesState =
+            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+
+        let mut thread_map: HashMap<String, Vec<AgentBusMessage>> = HashMap::new();
+        for msg in state.messages {
+            let key = msg
+                .thread_key
+                .clone()
+                .unwrap_or_else(|| format!("msg-{}", msg.seq));
+            thread_map.entry(key).or_default().push(msg);
+        }
+
+        let mut threads = Vec::new();
+        for (key, mut msgs) in thread_map {
+            msgs.sort_by_key(|m| m.seq);
+
+            if let Some(want) = &target_filter {
+                let touches_agent = msgs.iter().any(|m| {
+                    &m.from_agent == want
+                        || m.to_agent.as_deref() == Some(want.as_str())
+                        || m.to_agent.is_none()
+                });
+                if !touches_agent {
+                    continue;
+                }
+            }
+
+            let from_agent = match msgs.first() {
+                Some(m) => m.from_agent.clone(),
+                None => continue,
+            };
+            let to_agent = match msgs.first() {
+                Some(m) => m.to_agent.clone(),
+                None => continue,
+            };
+            let first_body = match msgs.first() {
+                Some(m) => m.body.clone(),
+                None => continue,
+            };
+            let latest = match msgs.last() {
+                Some(m) => m.clone(),
+                None => continue,
+            };
+
+            let mut status = "settled".to_string();
+            let mut ask_type = None;
+            let mut ask_title = None;
+
+            for msg in &msgs {
+                if msg.kind == "ask" {
+                    status = "open".to_string();
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.body) {
+                        if let Some(t) = val.get("ask_type").and_then(|v| v.as_str()) {
+                            ask_type = Some(t.to_string());
+                        }
+                        if let Some(q) = val
+                            .get("question")
+                            .or_else(|| val.get("title"))
+                            .or_else(|| val.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            ask_title = Some(q.to_string());
+                        }
+                    }
+                } else if msg.kind == "reply" || msg.kind == "answer" {
+                    status = "answered".to_string();
+                } else if msg.kind == "withdraw" || msg.kind == "withdrawn" {
+                    status = "withdrawn".to_string();
+                }
+            }
+
+            if let Some(want_st) = clean_status {
+                if status != want_st {
+                    continue;
+                }
+            }
+
+            let title = ask_title.unwrap_or_else(|| {
+                let b = first_body.trim();
+                if b.starts_with('{') {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(b) {
+                        if let Some(q) = val
+                            .get("question")
+                            .or_else(|| val.get("title"))
+                            .or_else(|| val.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            return q.to_string();
+                        }
+                    }
+                }
+                if b.chars().count() > 60 {
+                    let end = b
+                        .char_indices()
+                        .nth(57)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(b.len());
+                    format!("{}…", &b[..end])
+                } else if !b.is_empty() {
+                    b.to_string()
+                } else {
+                    key.clone()
+                }
+            });
+
+            threads.push(AgentInboxThread {
+                thread_key: key,
+                title,
+                status,
+                ask_type,
+                latest_msg: latest.clone(),
+                messages: msgs,
+                from_agent,
+                to_agent,
+                updated_at_ms: latest.created_at_ms,
+            });
+        }
+
+        threads.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        Ok(threads)
     })
 }
 
@@ -1582,5 +1833,154 @@ mod tests {
         assert!(tally.truncated);
         let tally = scan_worktree_overlays(&scan_seam, |_| Ok(DirtyNodeScan::default()));
         assert!(!tally.truncated);
+    }
+
+    #[test]
+    fn test_threaded_messages_and_inbox_lifecycle_with_vespin_asks() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        // 1. Post a structured ask (decide) under thread "db-migration"
+        let ask_body = serde_json::json!({
+            "ask_type": "decide",
+            "question": "Use SQLite or JSON?",
+            "options": ["SQLite", "JSON"]
+        }).to_string();
+
+        let m1 = post_thread_message(
+            anchor,
+            "claude-worker-1",
+            Some("orchestrator"),
+            Some("db-migration"),
+            "ask",
+            &ask_body,
+            Some("feat/migration"),
+        ).unwrap();
+        assert_eq!(m1.seq, 1);
+        assert_eq!(m1.thread_key.as_deref(), Some("db-migration"));
+
+        // 2. Read thread messages
+        let thread_page = read_thread_messages(anchor, Some("db-migration"), None, 0).unwrap();
+        assert_eq!(thread_page.messages.len(), 1);
+        assert_eq!(thread_page.messages[0].thread_key.as_deref(), Some("db-migration"));
+
+        // 3. List inbox threads: verify status is open and ask_type is decide
+        let threads_open = list_inbox_threads(anchor, None, Some("open")).unwrap();
+        assert_eq!(threads_open.len(), 1);
+        assert_eq!(threads_open[0].thread_key, "db-migration");
+        assert_eq!(threads_open[0].status, "open");
+        assert_eq!(threads_open[0].ask_type.as_deref(), Some("decide"));
+        assert_eq!(threads_open[0].title, "Use SQLite or JSON?");
+        assert_eq!(threads_open[0].messages.len(), 1);
+
+        // 4. Answer the ask
+        let m2 = answer_ask(
+            anchor,
+            "human-dev",
+            "db-migration",
+            "Selected option: SQLite",
+        ).unwrap();
+        assert_eq!(m2.seq, 2);
+        assert_eq!(m2.kind, "reply");
+        assert_eq!(m2.thread_key.as_deref(), Some("db-migration"));
+
+        // Verify thread status transitioned to answered
+        let threads_answered = list_inbox_threads(anchor, None, Some("answered")).unwrap();
+        assert_eq!(threads_answered.len(), 1);
+        assert_eq!(threads_answered[0].status, "answered");
+        assert_eq!(threads_answered[0].messages.len(), 2);
+
+        // Filter open threads: should be 0 now
+        let threads_open_now = list_inbox_threads(anchor, None, Some("open")).unwrap();
+        assert_eq!(threads_open_now.len(), 0);
+
+        // 5. Post another ask in a separate thread and withdraw it
+        let ask2_body = serde_json::json!({
+            "ask_type": "do",
+            "question": "Run manual database seed",
+            "steps": ["Create test tables", "Seed admin user"]
+        }).to_string();
+
+        let m3 = post_thread_message(
+            anchor,
+            "claude-worker-2",
+            None,
+            Some("db-seed"),
+            "ask",
+            &ask2_body,
+            None,
+        ).unwrap();
+        assert_eq!(m3.seq, 3);
+
+        let m4 = withdraw_ask(
+            anchor,
+            "claude-worker-2",
+            "db-seed",
+            "Resolved automatically via migration script",
+        ).unwrap();
+        assert_eq!(m4.seq, 4);
+        assert_eq!(m4.kind, "withdraw");
+
+        // Verify thread status is withdrawn
+        let threads_withdrawn = list_inbox_threads(anchor, None, Some("withdrawn")).unwrap();
+        assert_eq!(threads_withdrawn.len(), 1);
+        assert_eq!(threads_withdrawn[0].thread_key, "db-seed");
+        assert_eq!(threads_withdrawn[0].status, "withdrawn");
+
+        // Verify total threads in "all"
+        let all_threads = list_inbox_threads(anchor, None, None).unwrap();
+        assert_eq!(all_threads.len(), 2);
+    }
+
+    #[test]
+    fn test_inbox_threads_multibyte_utf8_truncation_without_panic() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        // 1. Emoji 🚀 (4 bytes: 55..59)
+        let body_emoji = format!("{}🚀{}", "A".repeat(55), "tail_exceeding_sixty_characters_limit");
+        post_thread_message(anchor, "agent-1", None, Some("t-emoji"), "note", &body_emoji, None).unwrap();
+
+        // 2. CJK character 中 (3 bytes: 56..59)
+        let body_cjk = format!("{}中{}", "B".repeat(56), "tail_exceeding_sixty_characters_limit");
+        post_thread_message(anchor, "agent-2", None, Some("t-cjk"), "note", &body_cjk, None).unwrap();
+
+        // 3. Accented character é (2 bytes: 56..58)
+        let body_accent = format!("{}é{}", "C".repeat(56), "tail_exceeding_sixty_characters_limit");
+        post_thread_message(anchor, "agent-3", None, Some("t-accent"), "note", &body_accent, None).unwrap();
+
+        // 4. Boundary cases: 60 chars and 61 chars
+        let body_60 = "D".repeat(60);
+        post_thread_message(anchor, "agent-4", None, Some("t-60"), "note", &body_60, None).unwrap();
+
+        let body_61 = "E".repeat(61);
+        post_thread_message(anchor, "agent-5", None, Some("t-61"), "note", &body_61, None).unwrap();
+
+        let threads = list_inbox_threads(anchor, None, None).expect("must not panic on multi-byte UTF-8");
+        assert_eq!(threads.len(), 5);
+
+        let t_emoji = threads.iter().find(|t| t.thread_key == "t-emoji").unwrap();
+        assert!(t_emoji.title.ends_with('…'));
+        assert_eq!(t_emoji.title.chars().count(), 58);
+        assert!(t_emoji.title.contains('🚀'));
+
+        let t_cjk = threads.iter().find(|t| t.thread_key == "t-cjk").unwrap();
+        assert!(t_cjk.title.ends_with('…'));
+        assert_eq!(t_cjk.title.chars().count(), 58);
+        assert!(t_cjk.title.contains('中'));
+
+        let t_accent = threads.iter().find(|t| t.thread_key == "t-accent").unwrap();
+        assert!(t_accent.title.ends_with('…'));
+        assert_eq!(t_accent.title.chars().count(), 58);
+        assert!(t_accent.title.contains('é'));
+
+        let t_60 = threads.iter().find(|t| t.thread_key == "t-60").unwrap();
+        assert_eq!(t_60.title, "D".repeat(60));
+
+        let t_61 = threads.iter().find(|t| t.thread_key == "t-61").unwrap();
+        assert_eq!(t_61.title, format!("{}…", "E".repeat(57)));
+        assert_eq!(t_61.title.chars().count(), 58);
     }
 }

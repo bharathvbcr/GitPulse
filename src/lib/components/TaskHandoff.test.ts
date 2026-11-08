@@ -255,4 +255,16 @@ describe("the agent handoff has one implementation", () => {
     const body = panel.slice(panel.indexOf("function schedule()"));
     expect(body.slice(0, body.indexOf("async function refresh"))).not.toMatch(/expires_at[^\n]*Date\.now\(\)/);
   });
+
+  it("exposes an opt-in multi-turn warm session toggle on managed handoffs and preserves keepWarm across pending restoration", () => {
+    expect(form).toContain('data-testid="handoff-keep-warm"');
+    expect(form).toContain("Keep session warm for follow-ups");
+    expect(form).toContain("choose({ keepWarm:");
+    expect(form).toContain(
+      'settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode, keepWarm: settings.keepWarm });'
+    );
+  });
 });
+
+
+

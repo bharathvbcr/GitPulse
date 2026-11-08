@@ -63,9 +63,9 @@ export const PROVIDER_LABELS: Record<AgentProvider, string> = {
  * The providers a *managed* run may use.
  *
  * The limit is mechanical, not editorial: a managed run needs an adapter in
- * the harness that speaks that provider's own session protocol, and only Codex
- * and Claude Code have one. Widening this list without writing that adapter
- * would hand a run to a reader built for a different wire format.
+ * the harness that speaks that provider's own session protocol, and Codex,
+ * Claude Code, and Antigravity have one. Widening this list without writing
+ * that adapter would hand a run to a reader built for a different wire format.
  *
  * It lives here, beside `AGENT_PROVIDERS`, because both the wire-response
  * guards in `client.ts` and the handoff surfaces in `taskHandoff.ts` have to
@@ -77,7 +77,7 @@ export const PROVIDER_LABELS: Record<AgentProvider, string> = {
  * harness, and the four are checked against each other by
  * `managed-provider-parity-contract`.
  */
-export const MANAGED_PROVIDERS = ["codex", "claude"] as const satisfies readonly AgentProvider[];
+export const MANAGED_PROVIDERS = ["codex", "claude", "agy"] as const satisfies readonly AgentProvider[];
 
 /** A provider a managed run may use — the type derived from that one list. */
 export type ManagedProvider = (typeof MANAGED_PROVIDERS)[number];

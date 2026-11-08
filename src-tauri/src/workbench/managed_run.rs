@@ -11,8 +11,19 @@ struct Identity {
     id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchInput {
+    id: String,
+    #[serde(default)]
+    max_continuations: Option<u32>,
+}
+
 /// Managed-run identities are shorter than the general record identifier.
 const MAX_MANAGED_ID_BYTES: usize = 100;
+
+/// Upper bound on multi-turn continuations, matching Manvi's `codingagent.MaxContinuations`.
+pub(crate) const MAX_MANAGED_CONTINUATIONS: u32 = 8;
 
 fn valid_id(value: &str) -> bool {
     super::is_record_id_within(value, MAX_MANAGED_ID_BYTES)
@@ -34,6 +45,52 @@ fn parse(input: &str) -> Result<String, WorkbenchError> {
         ));
     }
     Ok(input.id)
+}
+
+fn parse_launch(input: &str) -> Result<(String, Option<u32>), WorkbenchError> {
+    if input.len() > 1024 {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Managed control exceeds 1 KiB.",
+        ));
+    }
+    let parsed: LaunchInput = serde_json::from_str(input)
+        .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+    if !valid_id(&parsed.id) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Select a saved managed attempt.",
+        ));
+    }
+    let max_continuations = match parsed.max_continuations {
+        None | Some(0) => None,
+        Some(n) if n <= MAX_MANAGED_CONTINUATIONS => Some(n),
+        Some(_) => {
+            return Err(WorkbenchError::new(
+                "invalid_input",
+                format!(
+                    "Managed follow-ups may be at most {MAX_MANAGED_CONTINUATIONS} turns."
+                ),
+            ))
+        }
+    };
+    Ok((parsed.id, max_continuations))
+}
+
+/// Parameters sent to `work.runs.managed.prepare`, kept in one function so
+/// `scripts/serve-ops-contract.test.ts` checks them against `ManagedPrepareParams`.
+pub(crate) fn prepare_params(id: &str, max_continuations: Option<u32>) -> Value {
+    let request_id = format!("managed_launch_{id}");
+    let expected_revision = terminal_launch::PREPARED_REVISION;
+    let mut params = json!({
+        "id": id,
+        "request_id": request_id,
+        "expected_revision": expected_revision,
+    });
+    if let Some(n) = max_continuations.filter(|n| *n > 0) {
+        params["max_continuations"] = json!(n);
+    }
+    params
 }
 
 fn saved(state: &WorkbenchState, id: &str) -> Result<Value, WorkbenchError> {
@@ -64,7 +121,8 @@ struct Prepared {
 pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
     // Refused rather than waited for: a managed launch blocks for the
     // provider's whole startup, and the caller can retry.
-    let _launch = state.0.managed_launches.try_enter(&parse(input)?)?;
+    let (id, _) = parse_launch(input)?;
+    let _launch = state.0.managed_launches.try_enter(&id)?;
     launch_with(
         state,
         input,
@@ -155,7 +213,7 @@ fn launch_with(
     mut call: impl FnMut(&str, Value) -> Result<Value, WorkbenchError>,
     observe: impl FnOnce(u32) -> Result<String, String>,
 ) -> Result<Value, WorkbenchError> {
-    let id = parse(input)?;
+    let (id, max_continuations) = parse_launch(input)?;
     let row = saved(state, &id)?;
     if row["item"]["state"] != "prepared" && row["item"]["state"] != "starting" {
         // Retrying a lost result reads the same attempt; it never starts another.
@@ -168,7 +226,7 @@ fn launch_with(
     // consumed claim; only the owning live Manvi session can recover this call.
     let prepared = match call(
         "work.runs.managed.prepare",
-        json!({"id":id,"request_id":format!("managed_launch_{id}"),"expected_revision":terminal_launch::PREPARED_REVISION}),
+        prepare_params(&id, max_continuations),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return Err(release_unclaimed(state, &id, error)),
@@ -473,6 +531,7 @@ mod tests {
         let (variable, supply) = match provider {
             "codex" => ("GITPULSE_WORKBENCH_TEST_CODEX", "MANVI_CODEX_BINARY"),
             "claude" => ("GITPULSE_WORKBENCH_TEST_CLAUDE", "MANVI_CLAUDE_BINARY"),
+            "agy" => ("GITPULSE_WORKBENCH_TEST_AGY", "MANVI_AGY_BINARY"),
             other => panic!("no managed adapter for {other}"),
         };
         let agent = std::fs::canonicalize(
@@ -610,13 +669,15 @@ mod tests {
     #[test]
     fn managed_controls_accept_every_provider_with_an_adapter_and_refuse_the_rest() {
         for (provider, kind, expected) in [
-            // Both managed adapters must get past `saved` and be refused only
+            // Every managed adapter must get past `saved` and be refused only
             // because the attempt has no process running yet.
             ("codex", "managed", "invalid_state"),
             ("claude", "managed", "invalid_state"),
+            ("agy", "managed", "invalid_state"),
             // A terminal attempt belongs to a different adapter whichever
             // provider it names, and must never reach the managed controls.
             ("claude", "external_terminal", "run_kind_mismatch"),
+            ("agy", "external_terminal", "run_kind_mismatch"),
             ("grok", "external_terminal", "run_kind_mismatch"),
         ] {
             let label = format!("{provider}/{kind}");
@@ -1179,5 +1240,542 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.code, "run_kind_mismatch");
+    }
+
+    #[test]
+    fn managed_launch_forwards_bounded_max_continuations_and_omits_zero_default() {
+        let pid = std::process::id();
+        let birth = process_birth::read(pid).unwrap();
+        for (label, raw_input, expected_cont) in [
+            ("default-omitted", r#"{"id":"run"}"#, None),
+            ("explicit-zero", r#"{"id":"run","max_continuations":0}"#, None),
+            ("warm-eight", r#"{"id":"run","max_continuations":8}"#, Some(8_u64)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, _) = prepared_attempt(dir.path(), "claude");
+            let mut seen_prepare = None;
+            let result = launch_with(
+                &state,
+                raw_input,
+                |op, params| match op {
+                    "work.runs.managed.prepare" => {
+                        seen_prepare = Some(params);
+                        state.with_store(|store| {
+                            query(
+                                store,
+                                "runs.claim",
+                                &json!({"id":"run","request_id":"claim","expected_revision":1,"kind":"managed","owner_id":"owner","session_id":"session"}).to_string(),
+                            )
+                        })?;
+                        Ok(json!({"protocol_version":2,"id":"run","owner_id":"owner","session_id":"session","process_id":pid,"phase":"awaiting_activation"}))
+                    }
+                    "work.runs.managed.activate" => state.with_store(|store| {
+                        query(
+                            store,
+                            "runs.started",
+                            &json!({"id":"run","request_id":"started","expected_revision":2,"owner_id":"owner","session_id":"session","process_id":params["process_id"],"process_start":params["process_start"]}).to_string(),
+                        )
+                    }),
+                    other => panic!("{label}: unexpected op {other}"),
+                },
+                |_| Ok(birth.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {} {}", e.code, e.message));
+            assert_eq!(result["item"]["state"], "running", "{label}");
+            let prepare_params = seen_prepare.expect("prepare called");
+            assert_eq!(prepare_params["id"], "run", "{label}");
+            assert_eq!(prepare_params["request_id"], "managed_launch_run", "{label}");
+            assert_eq!(prepare_params["expected_revision"], 1, "{label}");
+            assert_eq!(
+                prepare_params.get("max_continuations").and_then(Value::as_u64),
+                expected_cont,
+                "{label}: {prepare_params}"
+            );
+        }
+
+        // Out-of-bounds max_continuations on launch and any max_continuations on stop are rejected pre-spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent/profile.sqlite");
+        let state = WorkbenchState(Arc::new(super::super::Inner {
+            path: Some(path.clone()),
+            ..Default::default()
+        }));
+        for bad_launch in [
+            r#"{"id":"run","max_continuations":9}"#,
+            r#"{"id":"run","max_continuations":33}"#,
+            r#"{"id":"run","max_continuations":-1}"#,
+            r#"{"id":"run","max_continuations":"8"}"#,
+        ] {
+            assert_eq!(
+                state.request("runs.launch_managed", bad_launch).unwrap_err().code,
+                "invalid_input",
+                "{bad_launch}"
+            );
+        }
+        assert_eq!(
+            state
+                .request("runs.stop_managed", r#"{"id":"run","max_continuations":2}"#)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_manvi_single_turn_finishes_while_warm_claude_and_agy_runs_park_continue_and_resume() {
+        use crate::harness::sidecar::{bind_test_binary, test_serial};
+        use std::os::unix::fs::PermissionsExt;
+
+        let find_bin = |env_key: &str, bin_name: &str| -> Option<std::path::PathBuf> {
+            if let Ok(explicit) = std::env::var(env_key) {
+                let p = std::path::PathBuf::from(explicit);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            let path_var = std::env::var_os("PATH")?;
+            std::env::split_paths(&path_var)
+                .map(|dir| dir.join(bin_name))
+                .find(|candidate| candidate.is_file())
+        };
+        let Some(manvi_path) = find_bin("GITPULSE_WORKBENCH_TEST_MANVI", "manvi") else {
+            return;
+        };
+        let Some(dcstore_path) = find_bin("GITPULSE_WORKBENCH_TEST_DCSTORE", "dc-store") else {
+            return;
+        };
+        let manvi_bin = std::fs::canonicalize(manvi_path).unwrap();
+        let dcstore_bin = std::fs::canonicalize(dcstore_path).unwrap();
+
+        let serial = test_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path().join("home");
+        let default_claude = fake_home.join(".claude");
+        let seat_chandra = fake_home.join(".claude-chandra");
+        let agy_cli_home = fake_home.join(".gemini/antigravity-cli");
+        let agy_conv_dir = agy_cli_home.join("conversations");
+        std::fs::create_dir_all(&default_claude).unwrap();
+        std::fs::create_dir_all(&seat_chandra).unwrap();
+        std::fs::create_dir_all(&agy_conv_dir).unwrap();
+        std::fs::write(
+            fake_home.join(".claude-accounts"),
+            "chandra ~/.claude-chandra\n",
+        )
+        .unwrap();
+        std::fs::write(
+            default_claude.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"personal@example.com"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seat_chandra.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"chandra@example.com"}}"#,
+        )
+        .unwrap();
+
+        let node_claude = dir.path().join("claude-node-mock");
+        std::fs::write(
+            &node_claude,
+            r#"#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  process.stdout.write("2.1.319 (Claude Code)\n");
+  process.exit(0);
+}
+let session = "";
+for (let i = 0; i < args.length - 1; i++) {
+  if (args[i] === "--session-id" || args[i] === "--resume") session = args[i + 1];
+}
+let mode = "default";
+for (let i = 0; i < args.length - 1; i++) {
+  if (args[i] === "--permission-mode") mode = args[i + 1];
+}
+const cwd = process.cwd();
+let turn = 0;
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.type === "control_request") {
+    process.stdout.write(JSON.stringify({
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: msg.request_id,
+        response: {
+          pid: process.pid,
+          current_permission_mode: mode,
+          account: { apiProvider: "firstParty", subscriptionType: "Claude Max" },
+          session_state: "idle"
+        }
+      }
+    }) + "\n");
+  } else if (msg.type === "user") {
+    turn += 1;
+    const cfgDir = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME, ".claude");
+    const encoded = cwd.replace(/[^A-Za-z0-9]/g, "-");
+    const projDir = path.join(cfgDir, "projects", encoded);
+    fs.mkdirSync(projDir, { recursive: true });
+    fs.writeFileSync(path.join(projDir, `${session}.jsonl`), "{}\n");
+    const content = msg.message && Array.isArray(msg.message.content)
+      ? msg.message.content.map((c) => c.text || "").join("")
+      : String((msg.message && msg.message.content) || "");
+    const reply = `CLAUDE_TURN_${turn}:${content.slice(0, 40)}`;
+    process.stdout.write(JSON.stringify({
+      type: "system",
+      subtype: "init",
+      session_id: session,
+      cwd,
+      model: "claude-sonnet-5",
+      permissionMode: mode,
+      claude_code_version: "2.1.319",
+      tools: ["Bash"],
+      uuid: `u-init-${turn}`
+    }) + "\n");
+    process.stdout.write(JSON.stringify({
+      type: "assistant",
+      session_id: session,
+      message: { id: `msg_t${turn}`, role: "assistant", content: [{ type: "text", text: reply }] },
+      uuid: `u-msg-${turn}`
+    }) + "\n");
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      session_id: session,
+      result: reply,
+      terminal_reason: "completed",
+      uuid: `u-res-${turn}`
+    }) + "\n");
+  }
+});
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&node_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let node_agy = dir.path().join("agy-node-mock");
+        std::fs::write(
+            &node_agy,
+            r#"#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const sessionId = "11111111-2222-4333-8444-555555555555";
+let currentMode = "default";
+let turn = 0;
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentInfo: { name: "Antigravity ACP Server", version: "1.5.3" },
+        agentCapabilities: { loadSession: true }
+      }
+    }) + "\n");
+  } else if (msg.method === "session/new") {
+    const convDir = path.join(process.env.HOME, ".gemini", "antigravity-cli", "conversations");
+    fs.mkdirSync(convDir, { recursive: true });
+    fs.writeFileSync(path.join(convDir, `${sessionId}.pb`), "proto");
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId,
+        models: { currentModelId: "gemini-4-argon-medium" },
+        modes: {
+          currentModeId: currentMode,
+          availableModes: [{ id: "default" }, { id: "accept-edits" }, { id: "plan" }]
+        }
+      }
+    }) + "\n");
+  } else if (msg.method === "session/set_mode") {
+    currentMode = msg.params.modeId;
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\n");
+  } else if (msg.method === "session/prompt") {
+    turn += 1;
+    const text = (msg.params && msg.params.prompt && msg.params.prompt[0] && msg.params.prompt[0].text) || "";
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `AGY_TURN_${turn}:${text.slice(0, 40)}\n` }
+        }
+      }
+    }) + "\n");
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: { stopReason: "end_turn" }
+    }) + "\n");
+  }
+});
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&node_agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
+        let wrapper = dir.path().join("managed-manvi");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport HOME={}\nexport MANVI_STORE_BINARY={}\nexport MANVI_CLAUDE_BINARY={}\nexport MANVI_AGY_BINARY={}\nexec {} \"$@\"\n",
+                quote(&fake_home),
+                quote(&dcstore_bin),
+                quote(&node_claude),
+                quote(&node_agy),
+                quote(&manvi_bin),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _binary = bind_test_binary(&serial, wrapper.to_str().unwrap());
+
+        let host = WorkbenchState(Arc::new(super::super::Inner {
+            path: Some(dir.path().join("profile.sqlite")),
+            ..Default::default()
+        }));
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let root = dir.path().join("checkout");
+            git_global(&["init", root.to_str().unwrap()]).unwrap();
+            crate::test_support::trust_repo(&root);
+            std::fs::write(root.join(".git/info/exclude"), ".claude-account\n").unwrap();
+            std::fs::write(root.join(".claude-account"), "chandra\n").unwrap();
+
+            host.register(root.to_str().unwrap(), "repo", "register")
+                .unwrap();
+            host.request(
+                "items.put",
+                &json!({
+                    "id": "task",
+                    "request_id": "task",
+                    "expected_revision": 0,
+                    "title": "Verify single-turn vs multi-turn managed sessions",
+                    "description": "Inspect the repository cleanly.",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo"
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            // (a) Single-turn default launch (`max_continuations` omitted) finishes immediately after Turn 1.
+            host.request(
+                "runs.prepare_managed",
+                &json!({
+                    "id": "claude-single",
+                    "request_id": "prep-single",
+                    "task_id": "task",
+                    "source_revision": 1,
+                    "repository_id": "repo",
+                    "repository_revision": 1,
+                    "provider": "claude",
+                    "permission_mode": "inspect",
+                    "repo_path": root
+                })
+                .to_string(),
+            )
+            .unwrap();
+            host.request("runs.launch_managed", r#"{"id":"claude-single"}"#)
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let single_end = loop {
+                let row = host.request("runs.get", r#"{"id":"claude-single"}"#).unwrap();
+                if row["item"]["state"] != "running" {
+                    break row;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "single-turn managed run stayed parked instead of finishing"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            assert_eq!(single_end["item"]["state"], "exited");
+            assert_eq!(single_end["item"]["provider_state"], "completed");
+            assert!(single_end["item"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("CLAUDE_TURN_1:"));
+
+            // (b) Multi-turn warm launch (`max_continuations: 2`) parks after Turn 1 and accepts live Turn 2 for both Claude (pinned seat) and Antigravity.
+            let mailbox = crate::agent_mailbox::Mailbox::new(dir.path().join("agent-mailbox"));
+            let claude_configs =
+                super::super::conversation::config_dirs_in(None, None, None, Some(&fake_home));
+            let agy_homes =
+                super::super::conversation::antigravity_homes_in(None, Some(&fake_home));
+
+            for (provider, run_id, turn1_marker, follow_up_msg, turn2_marker) in [
+                (
+                    "claude",
+                    "claude-warm",
+                    "CLAUDE_TURN_1:",
+                    "Follow up turn two",
+                    "CLAUDE_TURN_2:Follow up turn two",
+                ),
+                (
+                    "agy",
+                    "agy-warm",
+                    "AGY_TURN_1:",
+                    "Antigravity turn two",
+                    "AGY_TURN_2:Antigravity turn two",
+                ),
+            ] {
+                host.request(
+                    "runs.prepare_managed",
+                    &json!({
+                        "id": run_id,
+                        "request_id": format!("prep-{run_id}"),
+                        "task_id": "task",
+                        "source_revision": 1,
+                        "repository_id": "repo",
+                        "repository_revision": 1,
+                        "provider": provider,
+                        "permission_mode": "inspect",
+                        "repo_path": root
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                host.request(
+                    "runs.launch_managed",
+                    &json!({"id": run_id, "max_continuations": 2}).to_string(),
+                )
+                .unwrap();
+
+                let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let preview = loop {
+                    let p = host
+                        .request(
+                            "runs.send_to_agent",
+                            &json!({
+                                "id": run_id,
+                                "text": follow_up_msg,
+                                "request_id": format!("req-{run_id}"),
+                                "confirm": false
+                            })
+                            .to_string(),
+                        )
+                        .unwrap();
+                    if p["route"] == "managed" && p["managed_state"] == "parked" {
+                        break p;
+                    }
+                    assert!(
+                        std::time::Instant::now() < park_deadline,
+                        "{provider} warm run never parked for Turn 2; last preview: {p}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                assert_eq!(preview["turn"], 1, "{provider}: {preview}");
+                assert_eq!(preview["max_turns"], 3, "{provider}: {preview}");
+                let after_t1 = host
+                    .request("runs.get", &json!({"id": run_id}).to_string())
+                    .unwrap();
+                assert_eq!(after_t1["item"]["state"], "running", "{provider}");
+                assert!(
+                    after_t1["item"]["output"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(turn1_marker),
+                    "{provider} missing {turn1_marker}: {after_t1}"
+                );
+
+                // Deliver Turn 2 over live Route::Managed!
+                let delivered = host
+                    .request(
+                        "runs.send_to_agent",
+                        &json!({
+                            "id": run_id,
+                            "text": follow_up_msg,
+                            "request_id": format!("req-{run_id}"),
+                            "confirm": true,
+                            "expect_route": "managed"
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                assert_eq!(delivered["sent"], true, "{provider}: {delivered}");
+                assert_eq!(delivered["status"], "delivered", "{provider}: {delivered}");
+                assert_eq!(delivered["turn"], 2, "{provider}: {delivered}");
+
+                let t2_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let row = host
+                        .request("runs.get", &json!({"id": run_id}).to_string())
+                        .unwrap();
+                    if row["item"]["output"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(turn2_marker)
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < t2_deadline,
+                        "{provider} Turn 2 output never arrived: {row}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // Stop the warm session, wait for it to end, and verify Route::Resume finds the seat / agy transcript!
+                host.request("runs.stop_managed", &json!({"id": run_id}).to_string())
+                    .unwrap();
+                let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let row = host
+                        .request("runs.get", &json!({"id": run_id}).to_string())
+                        .unwrap();
+                    if row["item"]["state"] != "running" {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < stop_deadline,
+                        "{provider} run did not stop: {row}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                let resume_preview = super::super::send_to_agent::send_with_homes(
+                    &host,
+                    &json!({
+                        "id": run_id,
+                        "text": "After session ended",
+                        "request_id": format!("resume-{run_id}"),
+                        "confirm": false
+                    })
+                    .to_string(),
+                    &mailbox,
+                    &claude_configs,
+                    &agy_homes,
+                    |_, _| panic!("ended run called Manvi"),
+                )
+                .unwrap();
+                assert_eq!(
+                    resume_preview["route"], "resume",
+                    "{provider} ended run did not route to resume: {resume_preview}"
+                );
+            }
+        }));
+        host.shutdown();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

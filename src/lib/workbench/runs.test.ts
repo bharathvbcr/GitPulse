@@ -25,15 +25,24 @@ describe("task attempt transport", () => {
     expect(await launchManagedRun("run")).toMatchObject(managed);
     expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.launch_managed",input:'{"id":"run"}'});
     // A provider with no adapter in the harness, not merely a different one:
-    // Claude Code is a managed provider now, and a receipt naming it must be
-    // accepted rather than read as a foreign one.
-    for (const change of [{id:"other"},{kind:"external_terminal"},{provider:"grok"},{provider:"agy"}]) {
+    // Claude Code and Antigravity are managed providers now, and a receipt
+    // naming either must be accepted rather than read as a foreign one.
+    for (const change of [{id:"other"},{kind:"external_terminal"},{provider:"grok"}]) {
       native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,...change}}));
       await expect(launchManagedRun("run")).rejects.toMatchObject({code:"protocol_error"});
     }
-    for (const provider of ["codex","claude"]) {
+    for (const provider of ["codex","claude","agy"]) {
       native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,provider}}));
       expect(await launchManagedRun("run")).toMatchObject({provider});
+    }
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,provider:"claude"}}));
+    expect(await launchManagedRun("run", { maxContinuations: 8 })).toMatchObject({provider:"claude"});
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.launch_managed",input:'{"id":"run","max_continuations":8}'});
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,provider:"agy"}}));
+    expect(await launchManagedRun("run", { maxContinuations: 0 })).toMatchObject({provider:"agy"});
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.launch_managed",input:'{"id":"run"}'});
+    for (const bad of [-1, 9, 1.5, Number.NaN]) {
+      await expect(launchManagedRun("run", { maxContinuations: bad })).rejects.toMatchObject({code:"invalid_input"});
     }
     native.mockResolvedValueOnce('{"ok":true}');
     await stopManagedRun("run");
@@ -164,9 +173,11 @@ describe("resuming a conversation", () => {
     native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:true,session_id:SESSION,cwd:"/checkout",permission_mode:"inspect",reason:"saved"}));
     expect(await findConversation("run")).toEqual({resumable:true,sessionId:SESSION,cwd:"/checkout",mode:"inspect",reason:"saved"});
     expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.conversation",input:'{"id":"run"}'});
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:true,provider:"agy",session_id:SESSION,cwd:"/checkout",permission_mode:"inspect",reason:"Antigravity saved this conversation."}));
+    expect(await findConversation("run")).toEqual({resumable:true,provider:"agy",sessionId:SESSION,cwd:"/checkout",mode:"inspect",reason:"Antigravity saved this conversation."});
     native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:false,reason:"Claude Code has no saved conversation for this attempt."}));
     expect(await findConversation("run")).toEqual({resumable:false,reason:"Claude Code has no saved conversation for this attempt."});
-    for (const change of [{session_id:"run"},{session_id:null},{permission_mode:"everything"},{cwd:7},{resumable:"yes"},{ok:false}]) {
+    for (const change of [{session_id:"run"},{session_id:null},{permission_mode:"everything"},{provider:"unknown"},{cwd:7},{resumable:"yes"},{ok:false}]) {
       native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:true,session_id:SESSION,cwd:"/checkout",permission_mode:"edit",reason:"saved",...change}));
       await expect(findConversation("run")).rejects.toMatchObject({code:"protocol_error"});
     }

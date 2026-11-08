@@ -40,6 +40,8 @@ export interface HandoffSettings {
   provider: AgentProvider;
   kind: RunKind;
   permission: PermissionMode;
+  /** Opt-in multi-turn managed session parking (`max_continuations > 0`). */
+  keepWarm?: boolean;
 }
 
 export interface CheckoutCandidate {
@@ -94,7 +96,12 @@ export function sanitizeHandoff(value: unknown): HandoffSettings {
   const permission = PERMISSION_MODES.includes(raw.permission as PermissionMode) && raw.permission !== "bypass"
     ? (raw.permission as PermissionMode)
     : base.permission;
-  return { provider, kind, permission };
+  return {
+    provider,
+    kind,
+    permission,
+    ...(kind === "managed" && raw.keepWarm === true ? { keepWarm: true } : {}),
+  };
 }
 
 /**
@@ -122,14 +129,18 @@ export function handoffFromTarget(
     provider: target.provider,
     kind: target.kind,
     permission: remembered.permission,
+    ...(remembered.keepWarm === true ? { keepWarm: true } : {}),
   });
 }
 
 /** Keeps a settings object coherent after one field changes. */
 export function reconcileHandoff(settings: HandoffSettings): HandoffSettings {
+  const kind = supportsManaged(settings.provider) ? settings.kind : "external_terminal";
+  const { keepWarm, ...rest } = settings;
   return {
-    ...settings,
-    kind: supportsManaged(settings.provider) ? settings.kind : "external_terminal",
+    ...rest,
+    kind,
+    ...(kind === "managed" && keepWarm === true ? { keepWarm: true } : {}),
   };
 }
 

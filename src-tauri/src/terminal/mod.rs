@@ -840,6 +840,23 @@ fn build_pty_command(
     if let Some(ref path) = child_path {
         cmd.env("PATH", path);
     }
+    // Strip parent Claude Code recursion markers on every PTY session (shells
+    // and agent tabs alike) before caller `env` overrides are applied, so a
+    // GitPulse or gitpulse-ptyd started inside a Claude Code shell never blocks
+    // terminal-spun `claude` with a nested-session error.
+    let inherited_claude_vars: Vec<String> = cmd
+        .iter_full_env_as_str()
+        .filter(|(k, _)| {
+            k.eq_ignore_ascii_case("CLAUDECODE")
+                || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+        })
+        .map(|(k, _)| k.to_owned())
+        .collect();
+    for key in inherited_claude_vars {
+        cmd.env_remove(key);
+    }
+    cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
@@ -2341,7 +2358,15 @@ pub(crate) fn start_session(
             // handled here and never ends it.
             let mut deliver = |data: &[u8], failure: &mut Option<String>| {
                 let n = data.len();
-                let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
+                let stall = if hidden.load(Ordering::Relaxed) {
+                    Duration::from_millis(
+                        output_stall_ms
+                            .load(Ordering::Acquire)
+                            .max(DEFAULT_OUTPUT_STALL.as_millis() as u64 * 4),
+                    )
+                } else {
+                    Duration::from_millis(output_stall_ms.load(Ordering::Acquire))
+                };
                 // Kept before it is routed, whatever the route: a view that
                 // takes this session over later is shown it. Held until the
                 // chunk is sent, so a takeover's replay cannot land between
@@ -2405,7 +2430,14 @@ pub(crate) fn start_session(
                 });
                 drop(kept);
                 if let Err(error) = delivery {
-                    if !dead_flag.swap(true, Ordering::SeqCst) {
+                    if hidden.load(Ordering::Relaxed) {
+                        if output_flow.shed(n) {
+                            thread_events.loss(TerminalLossPayload {
+                                id: sid_for_thread.clone(),
+                                message: SHED_NOTICE.into(),
+                            });
+                        }
+                    } else if !dead_flag.swap(true, Ordering::SeqCst) {
                         *failure = Some(error);
                         output_flow.stop();
                         if let Err(error) =
@@ -8525,6 +8557,78 @@ mod tests {
                 .as_deref()
                 .is_some_and(|t| t.starts_with("session:term-")),
             "launched through the PTY seam: {session:?}"
+        );
+    }
+
+    #[test]
+    fn build_pty_command_strips_inherited_claude_code_recursion_vars_for_all_sessions() {
+        const CHILD_GUARD: &str = "GITPULSE_TEST_CHILD_CLAUDECODE_CHECK";
+        if std::env::var_os(CHILD_GUARD).is_some() {
+            assert_eq!(std::env::var("CLAUDECODE").as_deref(), Ok("1"));
+            assert_eq!(
+                std::env::var("CLAUDE_CODE_ENTRYPOINT").as_deref(),
+                Ok("cli")
+            );
+            let home = tempfile::tempdir().unwrap();
+            let proc_env = PtyEnv::from_process();
+            for (program, is_shell) in [("/bin/zsh", true), ("claude", false)] {
+                let cmd = build_pty_command(program, is_shell, None, None, home.path(), &proc_env).cmd;
+                let leaked: Vec<(String, String)> = cmd
+                    .iter_full_env_as_str()
+                    .filter(|(k, _)| {
+                        k.eq_ignore_ascii_case("CLAUDECODE")
+                            || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+                    })
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect();
+                assert!(
+                    leaked.is_empty(),
+                    "{program} (is_shell={is_shell}) leaked parent Claude recursion vars: {leaked:?}"
+                );
+            }
+            let explicit = HashMap::from([
+                ("CLAUDECODE".to_string(), "explicit-caller".to_string()),
+                (
+                    "CLAUDE_CODE_ENTRYPOINT".to_string(),
+                    "explicit-ep".to_string(),
+                ),
+            ]);
+            let overridden = build_pty_command(
+                "claude",
+                false,
+                None,
+                Some(&explicit),
+                home.path(),
+                &proc_env,
+            )
+            .cmd;
+            assert_eq!(
+                env_of(&overridden, "CLAUDECODE").as_deref(),
+                Some("explicit-caller")
+            );
+            assert_eq!(
+                env_of(&overridden, "CLAUDE_CODE_ENTRYPOINT").as_deref(),
+                Some("explicit-ep")
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_GUARD, "1")
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .args([
+                "--exact",
+                "terminal::tests::build_pty_command_strips_inherited_claude_code_recursion_vars_for_all_sessions",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn child test");
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

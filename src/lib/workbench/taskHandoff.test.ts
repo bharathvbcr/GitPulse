@@ -68,11 +68,13 @@ describe("sanitizeHandoff", () => {
     expect(sanitizeHandoff({ provider: "grok", kind: "managed", permission: "ask" }).kind)
       .toBe("external_terminal");
     expect(supportsManaged("grok")).toBe(false);
-    expect(supportsManaged("agy")).toBe(false);
-    // Both adapters that exist are restored as managed.
+    // All three adapters in the harness are restored as managed.
     expect(supportsManaged("codex")).toBe(true);
     expect(supportsManaged("claude")).toBe(true);
+    expect(supportsManaged("agy")).toBe(true);
     expect(sanitizeHandoff({ provider: "claude", kind: "managed", permission: "ask" }).kind)
+      .toBe("managed");
+    expect(sanitizeHandoff({ provider: "agy", kind: "managed", permission: "ask" }).kind)
       .toBe("managed");
   });
 
@@ -92,20 +94,22 @@ describe("sanitizeHandoff", () => {
     }).reason).toMatch(/Grok supports terminal handoffs only/);
   });
 
-  it("treats Antigravity as a first-class terminal-only provider", () => {
+  it("supports Antigravity for both terminal and managed handoffs", () => {
     expect(isAgentProvider("agy")).toBe(true);
-    expect(supportsManaged("agy")).toBe(false);
+    expect(supportsManaged("agy")).toBe(true);
     expect(sanitizeHandoff({ provider: "agy", kind: "managed", permission: "edit" }))
-      .toEqual({ provider: "agy", kind: "external_terminal", permission: "edit" });
+      .toEqual({ provider: "agy", kind: "managed", permission: "edit" });
     expect(describeHandoff({ provider: "agy", kind: "external_terminal", permission: "ask" }))
       .toBe("Antigravity · terminal");
+    expect(describeHandoff({ provider: "agy", kind: "managed", permission: "ask" }))
+      .toBe("Antigravity · managed");
     expect(handoffGate({
       checkout: "/work/GitPulse",
       settings: { provider: "agy", kind: "managed", permission: "ask" },
       acknowledgedBypass: false,
       dirty: false,
       busy: false,
-    }).reason).toMatch(/Antigravity supports terminal handoffs only/);
+    }).ok).toBe(true);
   });
 
   it("keeps a settings object coherent when the provider changes under it", () => {
@@ -113,6 +117,7 @@ describe("sanitizeHandoff", () => {
       .toEqual({ provider: "grok", kind: "external_terminal", permission: "ask" });
     expect(reconcileHandoff({ provider: "codex", kind: "managed", permission: "ask" }).kind).toBe("managed");
     expect(reconcileHandoff({ provider: "claude", kind: "managed", permission: "ask" }).kind).toBe("managed");
+    expect(reconcileHandoff({ provider: "agy", kind: "managed", permission: "ask" }).kind).toBe("managed");
   });
 
   it("describes a handoff in one readable phrase", () => {
@@ -120,6 +125,22 @@ describe("sanitizeHandoff", () => {
       .toBe("Claude Code · terminal");
     expect(describeHandoff({ provider: "codex", kind: "managed", permission: "ask" }))
       .toBe("Codex · managed");
+  });
+
+  it("preserves opt-in keepWarm only on managed handoffs and omits it by default", () => {
+    expect(defaultHandoff()).not.toHaveProperty("keepWarm");
+    expect(sanitizeHandoff({ provider: "claude", kind: "managed", permission: "ask", keepWarm: true }))
+      .toEqual({ provider: "claude", kind: "managed", permission: "ask", keepWarm: true });
+    expect(sanitizeHandoff({ provider: "agy", kind: "managed", permission: "edit", keepWarm: true }))
+      .toEqual({ provider: "agy", kind: "managed", permission: "edit", keepWarm: true });
+    expect(sanitizeHandoff({ provider: "claude", kind: "managed", permission: "ask", keepWarm: false }))
+      .toEqual({ provider: "claude", kind: "managed", permission: "ask" });
+    expect(sanitizeHandoff({ provider: "claude", kind: "external_terminal", permission: "ask", keepWarm: true }))
+      .toEqual({ provider: "claude", kind: "external_terminal", permission: "ask" });
+    expect(reconcileHandoff({ provider: "claude", kind: "external_terminal", permission: "ask", keepWarm: true }))
+      .toEqual({ provider: "claude", kind: "external_terminal", permission: "ask" });
+    expect(reconcileHandoff({ provider: "grok", kind: "managed", permission: "ask", keepWarm: true }))
+      .toEqual({ provider: "grok", kind: "external_terminal", permission: "ask" });
   });
 });
 

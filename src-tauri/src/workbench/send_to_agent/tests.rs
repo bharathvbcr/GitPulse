@@ -132,7 +132,7 @@ fn an_ended_claude_attempt_resumes_only_with_evidence_of_a_saved_conversation() 
         panic!("an unchecked conversation was resumed");
     };
     assert!(reason.starts_with("Could not check"), "{reason}");
-    // Only Claude Code conversations can be resumed.
+    // Only Claude Code and Antigravity conversations can be resumed.
     let Route::Unavailable { reason } = decide(
         &run("managed", "codex", "exited", SESSION),
         never_listening,
@@ -142,7 +142,7 @@ fn an_ended_claude_attempt_resumes_only_with_evidence_of_a_saved_conversation() 
         panic!("a codex run was resumed");
     };
     assert!(
-        reason.contains("only a Claude Code conversation"),
+        reason.contains("only a Claude Code or Antigravity conversation"),
         "{reason}"
     );
 }
@@ -773,3 +773,336 @@ fn the_not_listening_preview_names_no_unobserved_cause_as_the_cause() {
         "{reason}"
     );
 }
+
+#[test]
+fn ended_antigravity_attempts_route_to_resume_when_saved_conversation_exists() {
+    for (state, kind) in [
+        ("exited", "external_terminal"),
+        ("failed", "external_terminal"),
+        ("cancelled", "external_terminal"),
+        ("exited", "managed"),
+    ] {
+        let agy_found = json!({
+            "ok": true,
+            "resumable": true,
+            "provider": "agy",
+            "session_id": SESSION,
+            "cwd": "/checkout",
+            "permission_mode": "inspect"
+        });
+        let route = decide(
+            &run(kind, "agy", state, SESSION),
+            never_listening,
+            || agy_found.clone(),
+            no_manvi,
+        );
+        assert_eq!(
+            route,
+            Route::Resume {
+                found: agy_found.clone()
+            },
+            "agy/{kind}/{state}"
+        );
+        let preview = route.preview();
+        assert_eq!(preview["route"], "resume");
+        assert!(
+            preview["reason"].as_str().unwrap().contains("Antigravity"),
+            "{preview}"
+        );
+    }
+}
+
+#[test]
+fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with() {
+    const CLAUDE_MANAGED_THREAD: &str = "0b7d4e2a-91c3-4f6e-8a2d-5c4b3a291e70";
+    const AGY_TERM_ID: &str = "11111111-2222-4333-8444-555555555555";
+    const AGY_MANAGED_THREAD: &str = "22222222-3333-4444-8555-666666666666";
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root) = host(dir.path());
+    let mailbox = mailbox(dir.path());
+
+    let fake_home = dir.path().join("fake-home");
+    let seat_dir = dir.path().join("seats").join("work-seat");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    std::fs::create_dir_all(&seat_dir).unwrap();
+    std::fs::write(
+        fake_home.join(".claude-accounts"),
+        format!("work {}\n", seat_dir.display()),
+    )
+    .unwrap();
+
+    // 1. Ended Claude terminal attempt whose transcript is ONLY in `.claude-accounts` seat, not `~/.claude`.
+    prepare(&state, &root, "runs.prepare_terminal", SESSION, "claude");
+    claim(&state, SESSION, None);
+    state
+        .with_store(|store| {
+            query(
+                store,
+                "runs.started",
+                &json!({"id":SESSION,"request_id":"start-claude-term","expected_revision":2,"owner_id":"owner","session_id":format!("session-{SESSION}"),"process_id":4242,"process_start":"birth-1"}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.finish",
+                &json!({"id":SESSION,"request_id":"finish-claude-term","expected_revision":3,"owner_id":"owner","session_id":format!("session-{SESSION}"),"outcome":"exited","reason":"done","exit_code":0}).to_string(),
+            )
+        })
+        .unwrap();
+
+    let claude_configs = conversation::config_dirs_in(None, None, None, Some(&fake_home));
+    let agy_homes = conversation::antigravity_homes_in(None, Some(&fake_home));
+
+    // Before writing the seat transcript, resume must be unavailable.
+    let before = send_with_homes(
+        &state,
+        &ask(SESSION, "Follow up on seat", "req-seat-0", false, None),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(before["route"], "unavailable", "{before}");
+
+    // Write transcript ONLY into the `.claude-accounts` seat directory.
+    let seat_proj = seat_dir.join("projects").join("-checkout");
+    std::fs::create_dir_all(&seat_proj).unwrap();
+    std::fs::write(seat_proj.join(format!("{SESSION}.jsonl")), b"{}\n").unwrap();
+
+    let preview = send_with_homes(
+        &state,
+        &ask(SESSION, "Follow up on seat", "req-seat-1", false, None),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(preview["route"], "resume", "{preview}");
+    assert_eq!(preview["session_id"], SESSION);
+    assert!(preview["reason"].as_str().unwrap().contains("Claude Code"));
+
+    let confirmed = send_with_homes(
+        &state,
+        &ask(SESSION, "Follow up on seat", "req-seat-1", true, Some("resume")),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(confirmed["action"], "open_resume");
+
+    // 2. Ended Claude managed attempt with `provider_thread_id` saved in `.claude-accounts` seat.
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+    let eff_cfg = json!({"cwd": canonical_root, "sandbox": {"type": "none"}}).to_string();
+    prepare(&state, &root, "runs.prepare_managed", "claude-mgd", "claude");
+    claim(&state, "claude-mgd", Some("managed"));
+    state
+        .with_store(|store| {
+            query(
+                store,
+                "runs.started",
+                &json!({"id":"claude-mgd","request_id":"start-claude-mgd","expected_revision":2,"owner_id":"owner","session_id":"session-claude-mgd","process_id":4243,"process_start":"birth-2"}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"claude-mgd","request_id":"ready-claude-mgd","expected_revision":3,"owner_id":"owner","session_id":"session-claude-mgd","provider_thread_id":CLAUDE_MANAGED_THREAD,"provider_state":"ready","effective_configuration":eff_cfg,"output":"","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"claude-mgd","request_id":"running-claude-mgd","expected_revision":4,"owner_id":"owner","session_id":"session-claude-mgd","provider_thread_id":CLAUDE_MANAGED_THREAD,"provider_turn_id":"turn-1","provider_state":"running","effective_configuration":eff_cfg,"output":"done","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"claude-mgd","request_id":"proto-claude-mgd","expected_revision":5,"owner_id":"owner","session_id":"session-claude-mgd","provider_thread_id":CLAUDE_MANAGED_THREAD,"provider_turn_id":"turn-1","provider_state":"completed","effective_configuration":eff_cfg,"output":"done","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.finish",
+                &json!({"id":"claude-mgd","request_id":"finish-claude-mgd","expected_revision":6,"owner_id":"owner","session_id":"session-claude-mgd","outcome":"exited","reason":"done","exit_code":0}).to_string(),
+            )
+        })
+        .unwrap();
+    std::fs::write(
+        seat_proj.join(format!("{CLAUDE_MANAGED_THREAD}.jsonl")),
+        b"{}\n",
+    )
+    .unwrap();
+    let mgd_preview = send_with_homes(
+        &state,
+        &ask("claude-mgd", "Continue managed Claude", "req-seat-2", false, None),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(mgd_preview["route"], "resume", "{mgd_preview}");
+    assert_eq!(mgd_preview["session_id"], CLAUDE_MANAGED_THREAD);
+
+    // 3. Ended Antigravity terminal attempt with `.db` conversation in `~/.gemini/antigravity/conversations`.
+    prepare(&state, &root, "runs.prepare_terminal", AGY_TERM_ID, "agy");
+    claim(&state, AGY_TERM_ID, None);
+    state
+        .with_store(|store| {
+            query(
+                store,
+                "runs.started",
+                &json!({"id":AGY_TERM_ID,"request_id":"start-agy-term","expected_revision":2,"owner_id":"owner","session_id":format!("session-{AGY_TERM_ID}"),"process_id":4244,"process_start":"birth-3"}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.finish",
+                &json!({"id":AGY_TERM_ID,"request_id":"finish-agy-term","expected_revision":3,"owner_id":"owner","session_id":format!("session-{AGY_TERM_ID}"),"outcome":"exited","reason":"done","exit_code":0}).to_string(),
+            )
+        })
+        .unwrap();
+    let agy_ide_conv = fake_home
+        .join(".gemini")
+        .join("antigravity")
+        .join("conversations");
+    std::fs::create_dir_all(&agy_ide_conv).unwrap();
+    std::fs::write(
+        agy_ide_conv.join(format!("{AGY_TERM_ID}.db")),
+        b"SQLite format 3\0",
+    )
+    .unwrap();
+    let agy_term_preview = send_with_homes(
+        &state,
+        &ask(AGY_TERM_ID, "Resume Antigravity terminal", "req-agy-1", false, None),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(agy_term_preview["route"], "resume", "{agy_term_preview}");
+    assert_eq!(agy_term_preview["session_id"], AGY_TERM_ID);
+    assert!(agy_term_preview["reason"].as_str().unwrap().contains("Antigravity"));
+
+    // 4. Ended Antigravity managed attempt with `.pb` conversation in `~/.gemini/antigravity-cli/conversations`.
+    prepare(&state, &root, "runs.prepare_managed", "agy-mgd", "agy");
+    claim(&state, "agy-mgd", Some("managed"));
+    state
+        .with_store(|store| {
+            query(
+                store,
+                "runs.started",
+                &json!({"id":"agy-mgd","request_id":"start-agy-mgd","expected_revision":2,"owner_id":"owner","session_id":"session-agy-mgd","process_id":4245,"process_start":"birth-4"}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"agy-mgd","request_id":"ready-agy-mgd","expected_revision":3,"owner_id":"owner","session_id":"session-agy-mgd","provider_thread_id":AGY_MANAGED_THREAD,"provider_state":"ready","effective_configuration":eff_cfg,"output":"","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"agy-mgd","request_id":"running-agy-mgd","expected_revision":4,"owner_id":"owner","session_id":"session-agy-mgd","provider_thread_id":AGY_MANAGED_THREAD,"provider_turn_id":"turn-1","provider_state":"running","effective_configuration":eff_cfg,"output":"done","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.protocol",
+                &json!({"id":"agy-mgd","request_id":"proto-agy-mgd","expected_revision":5,"owner_id":"owner","session_id":"session-agy-mgd","provider_thread_id":AGY_MANAGED_THREAD,"provider_turn_id":"turn-1","provider_state":"completed","effective_configuration":eff_cfg,"output":"done","output_truncated":false}).to_string(),
+            )?;
+            query(
+                store,
+                "runs.finish",
+                &json!({"id":"agy-mgd","request_id":"finish-agy-mgd","expected_revision":6,"owner_id":"owner","session_id":"session-agy-mgd","outcome":"exited","reason":"done","exit_code":0}).to_string(),
+            )
+        })
+        .unwrap();
+    let agy_cli_conv = fake_home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    std::fs::create_dir_all(&agy_cli_conv).unwrap();
+    std::fs::write(
+        agy_cli_conv.join(format!("{AGY_MANAGED_THREAD}.pb")),
+        b"\x0a\x04turn",
+    )
+    .unwrap();
+    let agy_mgd_confirmed = send_with_homes(
+        &state,
+        &ask("agy-mgd", "Resume Antigravity managed", "req-agy-2", true, Some("resume")),
+        &mailbox,
+        &claude_configs,
+        &agy_homes,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(agy_mgd_confirmed["route"], "resume", "{agy_mgd_confirmed}");
+    assert_eq!(agy_mgd_confirmed["session_id"], AGY_MANAGED_THREAD);
+    assert_eq!(agy_mgd_confirmed["action"], "open_resume");
+}
+
+#[test]
+fn warm_managed_run_transitions_from_managed_route_to_resume_after_idle_expiry() {
+    let claude_found = json!({
+        "ok": true,
+        "resumable": true,
+        "provider": "claude",
+        "session_id": SESSION,
+        "cwd": "/checkout",
+        "permission_mode": "inspect"
+    });
+    let agy_found = json!({
+        "ok": true,
+        "resumable": true,
+        "provider": "agy",
+        "session_id": SESSION,
+        "cwd": "/checkout",
+        "permission_mode": "inspect"
+    });
+
+    for (provider, found) in [("claude", claude_found), ("agy", agy_found)] {
+        // While warm (state == "running" in dc-store and Manvi status == "parked" after Turn 1),
+        // decide() selects Route::Managed.
+        let warm_route = decide(
+            &run("managed", provider, "running", SESSION),
+            never_listening,
+            || found.clone(),
+            || {
+                Ok(json!({
+                    "ok": true,
+                    "state": "parked",
+                    "turn": 1,
+                    "max_turns": 9
+                }))
+            },
+        );
+        assert_eq!(
+            warm_route,
+            Route::Managed {
+                state: "parked".into(),
+                turn: 1,
+                max_turns: 9,
+            },
+            "{provider} warm parked route"
+        );
+
+        // Once Manvi's idle budget expires and finishes the run (state == "exited" in dc-store),
+        // decide() seamlessly transitions to Route::Resume using the saved conversation!
+        let expired_route = decide(
+            &run("managed", provider, "exited", SESSION),
+            never_listening,
+            || found.clone(),
+            no_manvi,
+        );
+        assert_eq!(
+            expired_route,
+            Route::Resume {
+                found: found.clone()
+            },
+            "{provider} idle-expired route"
+        );
+    }
+}
+
+
+

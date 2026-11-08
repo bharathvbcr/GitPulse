@@ -233,9 +233,9 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
     tab.attachSessionId = task.attach.sessionId;
     tab.name = task.title;
   } else if (task?.resume) {
-    // A plain Claude Code tab, not the attempt's: the attempt ended and its
+    // A plain agent tab, not the attempt's: the attempt ended and its
     // record is final, so this session is the reader's own continuation.
-    if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;
+    if ((launcher !== "claude" && launcher !== "agy") || !isSessionId(task.resume.sessionId)) return state;
     tab.resume = { ...task.resume, runId: task.runId };
     tab.name = `${task.title} (resumed)`;
   } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }

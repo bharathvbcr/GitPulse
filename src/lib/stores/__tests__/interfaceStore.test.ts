@@ -1097,18 +1097,24 @@ describe("remembered agent handoff", () => {
   });
 
   it("refuses to remember a managed connection the provider does not offer", () => {
-    interfaceStore.setTaskHandoff({ provider: "agy", kind: "managed", permission: "edit" });
+    interfaceStore.setTaskHandoff({ provider: "grok", kind: "managed", permission: "edit" });
     expect(get(interfaceStore).taskHandoff).toEqual({
-      provider: "agy",
+      provider: "grok",
       kind: "external_terminal",
       permission: "edit",
     });
   });
 
-  it("remembers a managed connection for a provider that does offer one", () => {
+  it("remembers a managed connection for providers that offer one", () => {
     interfaceStore.setTaskHandoff({ provider: "claude", kind: "managed", permission: "edit" });
     expect(get(interfaceStore).taskHandoff).toEqual({
       provider: "claude",
+      kind: "managed",
+      permission: "edit",
+    });
+    interfaceStore.setTaskHandoff({ provider: "agy", kind: "managed", permission: "edit" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "agy",
       kind: "managed",
       permission: "edit",
     });

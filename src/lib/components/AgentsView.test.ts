@@ -83,4 +83,10 @@ describe("AgentsView", () => {
     expect(source).not.toMatch(/\bsetInterval\(/);
     expect(source).toContain("const stopClock = createAdaptiveTimer(() => {");
   });
+
+  it("wires onopenTask on the embedded AgentInbox to requestTaskOpen", () => {
+    expect(source).toContain("requestTaskOpen");
+    expect(source).toMatch(/<AgentInbox[^>]*onopenTask=\{openInboxTask\}/);
+  });
 });
+

@@ -640,8 +640,23 @@ export async function prepareTaskRun(input: RunPreparation): Promise<TaskRun> {
   if (run.kind !== kind || run.id !== input.id || run.task_id !== input.task_id || run.source_revision !== input.source_revision || run.repository_id !== input.repository_id || run.provider !== input.provider || run.permission_mode !== input.permission_mode || run.state !== "prepared") return invalid();
   return run;
 }
-export async function launchManagedRun(id: string): Promise<TaskRun> {
-  const run = record(await request("runs.launch_managed", {id}), taskRun);
+export const MAX_MANAGED_CONTINUATIONS = 8;
+export async function launchManagedRun(
+  id: string,
+  options?: { maxContinuations?: number },
+): Promise<TaskRun> {
+  const max = options?.maxContinuations;
+  if (
+    max !== undefined &&
+    (!Number.isInteger(max) || max < 0 || max > MAX_MANAGED_CONTINUATIONS)
+  ) {
+    throw new WorkbenchError(
+      "invalid_input",
+      `Managed follow-ups may be at most ${MAX_MANAGED_CONTINUATIONS} turns.`,
+    );
+  }
+  const body = max && max > 0 ? { id, max_continuations: max } : { id };
+  const run = record(await request("runs.launch_managed", body), taskRun);
   return run.id === id && run.kind === "managed" && supportsManaged(run.provider) ? run : invalid();
 }
 export async function stopManagedRun(id: string): Promise<void> {
@@ -732,23 +747,26 @@ export async function releaseTaskRun(id: string): Promise<RunRelease> {
   if (run.id !== id || (raw.released && (run.state !== "exited" || !run.outcome_uncertain))) return invalid();
   return { released: raw.released, reason: text(raw.reason), run };
 }
+export const RESUMABLE_PROVIDERS = ["claude", "agy"] as const;
+export type ResumableProvider = (typeof RESUMABLE_PROVIDERS)[number];
 export type RunConversation =
-  | { resumable: true; sessionId: string; cwd: string; mode: PermissionMode; reason: string }
+  | { resumable: true; provider?: ResumableProvider; sessionId: string; cwd: string; mode: PermissionMode; reason: string }
   | { resumable: false; reason: string };
 /**
- * Whether an ended attempt's Claude Code conversation can be resumed. The host
- * answers from the transcript Claude Code saved, so `resumable` is evidence,
- * not an inference from the attempt's id; `reason` says what it found either
- * way, including "could not check".
+ * Whether an ended attempt's Claude Code or Antigravity conversation can be
+ * resumed. The host answers from the transcript saved on disk, so `resumable`
+ * is evidence, not an inference from the attempt's id; `reason` says what it
+ * found either way, including "could not check".
  */
 export async function findConversation(id: string): Promise<RunConversation> {
   const raw = object(await request("runs.conversation", { id }));
   if (raw.ok !== true || typeof raw.resumable !== "boolean") return invalid();
   if (!raw.resumable) return { resumable: false, reason: text(raw.reason) };
   const mode = PERMISSION_MODES.find((mode) => mode === raw.permission_mode) ?? invalid();
+  const provider = raw.provider === undefined ? undefined : (RESUMABLE_PROVIDERS.find((p) => p === raw.provider) ?? invalid());
   const sessionId = text(raw.session_id);
   if (!isSessionId(sessionId)) return invalid();
-  return { resumable: true, sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
+  return { resumable: true, ...(provider ? { provider } : {}), sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
 }
 /** The ways a message to an attempt's agent can go. `unavailable` is a route with a reason, not an error. */
 export const SEND_ROUTES = ["mailbox", "resume", "managed", "unavailable"] as const;

@@ -43,8 +43,9 @@ pub(super) fn judge(
     transcript: impl FnOnce(&str) -> Transcript,
 ) -> Value {
     let refuse = |reason: &str| json!({"ok":true,"resumable":false,"reason":reason});
-    if run["provider"] != "claude" {
-        return refuse("Only a Claude Code conversation can be resumed from GitPulse.");
+    let provider = run["provider"].as_str().unwrap_or_default();
+    if provider != "claude" && provider != "agy" {
+        return refuse("Only a Claude Code or Antigravity conversation can be resumed from GitPulse.");
     }
     let state = run["state"].as_str().unwrap_or_default();
     if matches!(state, "prepared" | "starting" | "running" | "unresolved") {
@@ -60,8 +61,21 @@ pub(super) fn judge(
         _ => run["id"].as_str(),
     }
     .filter(|id| is_canonical_uuid(id));
+    let (found_reason, absent_reason, session_missing_reason) = if provider == "agy" {
+        (
+            "Antigravity saved this conversation.",
+            "Antigravity has no saved conversation for this attempt.",
+            "This attempt has no Antigravity session id to resume.",
+        )
+    } else {
+        (
+            "Claude Code saved this conversation.",
+            "Claude Code has no saved conversation for this attempt.",
+            "This attempt has no Claude Code session id to resume.",
+        )
+    };
     let Some(session) = session else {
-        return refuse("This attempt has no Claude Code session id to resume.");
+        return refuse(session_missing_reason);
     };
     if !checkout_exists {
         return refuse("The checkout this conversation ran in no longer exists.");
@@ -71,11 +85,12 @@ pub(super) fn judge(
             "ok": true,
             "resumable": true,
             "session_id": session,
+            "provider": provider,
             "cwd": run["cwd"],
             "permission_mode": run["permission_mode"],
-            "reason": "Claude Code saved this conversation.",
+            "reason": found_reason,
         }),
-        Transcript::Absent => refuse("Claude Code has no saved conversation for this attempt."),
+        Transcript::Absent => refuse(absent_reason),
         Transcript::Unknown(why) => json!({
             "ok": true,
             "resumable": false,
@@ -84,8 +99,10 @@ pub(super) fn judge(
     }
 }
 
-/// Claude Code's configuration directory: `CLAUDE_CONFIG_DIR`, else
-/// `~/.claude`.
+/// Claude Code's default configuration directory (`CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`). Production resume checks must use [`claude_config_dirs`] +
+/// [`search_claude_configs`] so `.claude-accounts/<seat>` transcripts are found.
+#[cfg(test)]
 pub(crate) fn claude_home() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -96,16 +113,53 @@ pub(crate) fn claude_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".claude"))
 }
 
+/// Antigravity configuration directories: `ANTIGRAVITY_HOME`, plus both the
+/// IDE (`~/.gemini/antigravity`) and standalone CLI (`~/.gemini/antigravity-cli`)
+/// homes under `HOME` / `USERPROFILE`.
+pub(crate) fn antigravity_homes() -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
+    antigravity_homes_in(var("ANTIGRAVITY_HOME").map(PathBuf::from), home.as_deref())
+}
+
+pub(crate) fn antigravity_homes_in(
+    agy_home: Option<PathBuf>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(explicit) = agy_home {
+        candidates.push(explicit);
+    }
+    if let Some(home) = home {
+        let gemini = home.join(".gemini");
+        candidates.push(gemini.join("antigravity"));
+        candidates.push(gemini.join("antigravity-cli"));
+    }
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for dir in candidates {
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(dir);
+        }
+    }
+    out
+}
+
 /// Every Claude Code configuration directory this account may be running
 /// sessions under, and whether the list is known to be complete.
 ///
 /// `CLAUDE_CONFIG_DIR` points one launch at one directory, and people with
-/// several accounts keep one per account (`~/.claude-work`, `~/.claude-lab`).
-/// A reader that looked only at the current process's directory counted 5 of
-/// 15 live sessions on a real machine while reporting itself healthy, so the
-/// candidates are: `CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS` (a PATH-style
-/// list for directories outside the conventions), `~/.claude`, the XDG
-/// `claude` directory, and every `~/.claude-*` directory.
+/// several accounts keep one per account (`~/.claude-work`, `~/.claude-lab`,
+/// or seat mappings in `~/.claude-accounts`). A reader that looked only at the
+/// current process's directory counted 5 of 15 live sessions on a real machine
+/// while reporting itself healthy, so the candidates are: `CLAUDE_CONFIG_DIR`,
+/// `GITPULSE_CLAUDE_CONFIG_DIRS` (a PATH-style list for directories outside the
+/// conventions), `~/.claude`, the XDG `claude` directory, every `~/.claude-*`
+/// directory, and every seat target declared in `~/.claude-accounts`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeConfigDirs {
     pub dirs: Vec<PathBuf>,
@@ -181,6 +235,30 @@ pub(crate) fn config_dirs_in(
                 ));
             }
         }
+        let accounts_path = home.join(".claude-accounts");
+        if let Ok(contents) = std::fs::read_to_string(&accounts_path) {
+            for raw_line in contents.lines().take(256) {
+                let line = raw_line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let Some(_seat) = parts.next() else { continue };
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                let raw_dir = rest.trim().trim_matches('"').trim_matches('\'');
+                if raw_dir.is_empty() {
+                    continue;
+                }
+                let expanded = if let Some(stripped) = raw_dir.strip_prefix("~/") {
+                    home.join(stripped)
+                } else {
+                    PathBuf::from(raw_dir)
+                };
+                if expanded.is_absolute() {
+                    candidates.push(expanded);
+                }
+            }
+        }
     } else if let Some(xdg) = xdg_config_home {
         candidates.push(xdg.join("claude"));
     }
@@ -225,6 +303,66 @@ pub(super) fn search(home: &Path, session: &str) -> Transcript {
     Transcript::Absent
 }
 
+/// Looks for `<home>/conversations/<session>.db` or `<session>.pb` (standalone CLI).
+pub(super) fn search_antigravity(home: &Path, session: &str) -> Transcript {
+    let conv_dir = home.join("conversations");
+    let mut first_unknown: Option<String> = None;
+    for ext in ["db", "pb"] {
+        let candidate = conv_dir.join(format!("{session}.{ext}"));
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => {
+                if meta.len() == 0 {
+                    continue;
+                }
+                match std::fs::File::open(&candidate) {
+                    Ok(_) => return Transcript::Found,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        if first_unknown.is_none() {
+                            first_unknown = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                if first_unknown.is_none() {
+                    first_unknown = Some(err.to_string());
+                }
+            }
+        }
+    }
+    if let Some(why) = first_unknown {
+        Transcript::Unknown(why)
+    } else {
+        Transcript::Absent
+    }
+}
+
+pub(super) fn search_antigravity_homes(homes: &[PathBuf], session: &str) -> Transcript {
+    if homes.is_empty() {
+        return Transcript::Unknown("no home directory to find Antigravity's in".into());
+    }
+    let mut first_unknown: Option<String> = None;
+    for home in homes {
+        match search_antigravity(home, session) {
+            Transcript::Found => return Transcript::Found,
+            Transcript::Absent => {}
+            Transcript::Unknown(why) => {
+                if first_unknown.is_none() {
+                    first_unknown = Some(why);
+                }
+            }
+        }
+    }
+    if let Some(why) = first_unknown {
+        Transcript::Unknown(why)
+    } else {
+        Transcript::Absent
+    }
+}
+
 /// Most ids one [`transcripts`] call answers: an incident's whole list
 /// (`MAX_INCIDENT_SESSIONS` in the renderer's `incident.ts`).
 pub(crate) const MAX_TRANSCRIPT_QUERIES: usize = 512;
@@ -249,6 +387,35 @@ pub struct ConversationTranscript {
 ///
 /// Every id must be a canonical session id; anything else is refused whole,
 /// because it can only come from a caller that is not the renderer's own.
+/// Searches every Claude Code configuration directory in `configs` (`~/.claude`,
+/// `~/.config/claude`, `~/.claude-*`, `~/.claude-accounts`, `CLAUDE_CONFIG_DIR`,
+/// `GITPULSE_CLAUDE_CONFIG_DIRS`), preserving `Transcript::Unknown` whenever a
+/// directory could not be read or the config-directory list itself is incomplete or empty.
+pub(super) fn search_claude_configs(configs: &ClaudeConfigDirs, session: &str) -> Transcript {
+    let mut first_unknown: Option<String> = None;
+    for dir in &configs.dirs {
+        match search(dir, session) {
+            Transcript::Found => return Transcript::Found,
+            Transcript::Absent => {}
+            Transcript::Unknown(why) => {
+                if first_unknown.is_none() {
+                    first_unknown = Some(why);
+                }
+            }
+        }
+    }
+    if let Some(why) = first_unknown {
+        return Transcript::Unknown(why);
+    }
+    if let Some(err) = &configs.error {
+        return Transcript::Unknown(err.clone());
+    }
+    if configs.dirs.is_empty() {
+        return Transcript::Unknown("no home directory to find Claude Code's in".into());
+    }
+    Transcript::Absent
+}
+
 pub(crate) fn transcripts(session_ids: &[String]) -> Result<Vec<ConversationTranscript>, String> {
     if session_ids.len() > MAX_TRANSCRIPT_QUERIES {
         return Err(format!(
@@ -257,15 +424,28 @@ pub(crate) fn transcripts(session_ids: &[String]) -> Result<Vec<ConversationTran
     }
     if let Some(bad) = session_ids.iter().find(|id| !is_canonical_uuid(id)) {
         let shown: String = bad.chars().take(64).collect();
-        return Err(format!("{shown:?} is not a Claude Code session id."));
+        return Err(format!("{shown:?} is not a valid session id."));
     }
-    let home = claude_home();
+    let configs = claude_config_dirs();
+    let agy_homes = antigravity_homes();
     Ok(session_ids
         .iter()
         .map(|session| {
-            let found = match &home {
-                Some(home) => search(home, session),
-                None => Transcript::Unknown("no home directory to find Claude Code's in".into()),
+            let claude_res = search_claude_configs(&configs, session);
+            let found = match claude_res {
+                Transcript::Found => Transcript::Found,
+                _ if agy_homes.is_empty() => claude_res,
+                _ => match search_antigravity_homes(&agy_homes, session) {
+                    Transcript::Found => Transcript::Found,
+                    Transcript::Absent => claude_res,
+                    agy_unknown @ Transcript::Unknown(_) => {
+                        if matches!(claude_res, Transcript::Absent) {
+                            agy_unknown
+                        } else {
+                            claude_res
+                        }
+                    }
+                },
             };
             answer(session, found)
         })
@@ -306,9 +486,15 @@ pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, Workben
     let checkout_exists = run["cwd"]
         .as_str()
         .is_some_and(|cwd| Path::new(cwd).is_dir());
-    Ok(judge(run, checkout_exists, |session| match claude_home() {
-        Some(home) => search(&home, session),
-        None => Transcript::Unknown("no home directory to find Claude Code's in".into()),
+    let provider = run["provider"].as_str().unwrap_or("claude");
+    Ok(judge(run, checkout_exists, |session| {
+        if provider == "agy" {
+            let homes = antigravity_homes();
+            search_antigravity_homes(&homes, session)
+        } else {
+            let configs = claude_config_dirs();
+            search_claude_configs(&configs, session)
+        }
     }))
 }
 
@@ -470,4 +656,117 @@ mod tests {
         assert!(transcripts(&vec![ID.to_string(); MAX_TRANSCRIPT_QUERIES + 1]).is_err());
         assert!(transcripts(&[]).unwrap().is_empty());
     }
+
+    #[test]
+    fn an_ended_agy_attempt_with_a_saved_transcript_resumes_in_its_own_mode() {
+        let mut run = ended();
+        run["provider"] = json!("agy");
+        let mut asked = None;
+        let answer = judge(&run, true, |session| {
+            asked = Some(session.to_owned());
+            Transcript::Found
+        });
+        assert_eq!(asked.as_deref(), Some(ID));
+        assert_eq!(answer["resumable"], true);
+        assert_eq!(answer["session_id"], ID);
+        assert_eq!(answer["provider"], "agy");
+        assert_eq!(answer["cwd"], "/checkout");
+        assert_eq!(answer["permission_mode"], "inspect");
+        assert_eq!(answer["reason"], "Antigravity saved this conversation.");
+    }
+
+    #[test]
+    fn antigravity_transcript_is_found_when_db_file_exists() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+        let conv_dir = home.path().join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+
+        // 0-byte file must be treated as Absent
+        let db_file = conv_dir.join(format!("{ID}.db"));
+        std::fs::write(&db_file, b"").unwrap();
+        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Absent);
+
+        // Valid non-empty file is Found
+        std::fs::write(&db_file, b"SQLite format 3\0").unwrap();
+        assert_eq!(super::search_antigravity(home.path(), ID), Transcript::Found);
+
+        // Unreadable file reports Unknown error
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(matches!(super::search_antigravity(home.path(), ID), Transcript::Unknown(_)));
+            std::fs::set_permissions(&db_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    #[test]
+    fn multi_account_claude_config_dirs_finds_transcripts_in_sibling_profiles_and_preserves_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let sibling = home.path().join(".claude-work");
+        let proj = sibling.join("projects").join("-Users-a-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{ID}.jsonl")), b"{}\n").unwrap();
+
+        let configs = super::config_dirs_in(None, None, None, Some(home.path()));
+        assert_eq!(super::search_claude_configs(&configs, ID), Transcript::Found);
+        assert_eq!(super::search_claude_configs(&configs, THREAD), Transcript::Absent);
+
+        // Empty config directory set (no HOME/USERPROFILE) reports Unknown, never Absent.
+        let empty = super::ClaudeConfigDirs::default();
+        assert!(matches!(
+            super::search_claude_configs(&empty, ID),
+            Transcript::Unknown(_)
+        ));
+
+        // Partial home listing error reports Unknown when absent from listed dirs,
+        // while still returning Found when a listed dir holds the transcript.
+        let mut partial = configs.clone();
+        partial.error = Some("home truncated".into());
+        assert_eq!(super::search_claude_configs(&partial, ID), Transcript::Found);
+        assert_eq!(
+            super::search_claude_configs(&partial, THREAD),
+            Transcript::Unknown("home truncated".into())
+        );
+    }
+
+    #[test]
+    fn claude_accounts_file_and_standalone_agy_cli_pb_transcripts_are_discovered() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let home = sandbox.path().join("home");
+        let external_seat = sandbox.path().join("seats").join("enterprise-seat");
+        let proj = external_seat.join("projects").join("-Users-a-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(proj.join(format!("{ID}.jsonl")), b"{}\n").unwrap();
+        std::fs::write(
+            home.join(".claude-accounts"),
+            format!(
+                "# seat mapping\nenterprise {}\nrelative ~/custom-seat\n",
+                external_seat.display()
+            ),
+        )
+        .unwrap();
+
+        let configs = super::config_dirs_in(None, None, None, Some(&home));
+        assert_eq!(super::search_claude_configs(&configs, ID), Transcript::Found);
+        assert!(configs.dirs.contains(&home.join("custom-seat")));
+
+        // Standalone Antigravity CLI stores `.pb` transcripts under `~/.gemini/antigravity-cli/conversations/`.
+        let agy_cli_conv = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations");
+        std::fs::create_dir_all(&agy_cli_conv).unwrap();
+        let pb_file = agy_cli_conv.join(format!("{THREAD}.pb"));
+        std::fs::write(&pb_file, b"").unwrap();
+        let agy_homes = super::antigravity_homes_in(None, Some(&home));
+        assert_eq!(super::search_antigravity_homes(&agy_homes, THREAD), Transcript::Absent);
+
+        std::fs::write(&pb_file, b"\x0a\x04turn").unwrap();
+        assert_eq!(super::search_antigravity_homes(&agy_homes, THREAD), Transcript::Found);
+    }
 }
+

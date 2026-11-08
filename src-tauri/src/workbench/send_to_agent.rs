@@ -98,13 +98,22 @@ impl Route {
                     "No GitPulse hook is waiting on this agent's Claude Code session right now, and GitPulse cannot see why (it may be mid-turn, idle too long, or running a hook build without deliver). The message is held for two hours and is shown only if a hook on this session picks it up."
                 },
             }),
-            Self::Resume { found } => json!({
-                "route": "resume",
-                "session_id": found["session_id"],
-                "cwd": found["cwd"],
-                "permission_mode": found["permission_mode"],
-                "reason": "This attempt has ended and Claude Code saved its conversation. Sending resumes it in a new tab, in the attempt's own permission mode, with this message as its first prompt.",
-            }),
+            Self::Resume { found } => {
+                let agent = if found["provider"] == "agy" {
+                    "Antigravity"
+                } else {
+                    "Claude Code"
+                };
+                json!({
+                    "route": "resume",
+                    "session_id": found["session_id"],
+                    "cwd": found["cwd"],
+                    "permission_mode": found["permission_mode"],
+                    "reason": format!(
+                        "This attempt has ended and {agent} saved its conversation. Sending resumes it in a new tab, in the attempt's own permission mode, with this message as its first prompt."
+                    ),
+                })
+            }
             Self::Managed {
                 state,
                 turn,
@@ -137,7 +146,7 @@ fn unavailable(reason: impl Into<String>) -> Route {
 /// Which route a message to this attempt would take.
 ///
 /// `listening` says whether a hook is waiting on a session; `resumable` is
-/// `conversation::judge` for the run (called only for an ended Claude attempt);
+/// `conversation::judge` for the run (called only for an ended Claude or Antigravity attempt);
 /// `managed_status` is the status read of a live managed run (called only for
 /// one). Each is a closure so a test can answer them and a route that needs
 /// none of them asks none: no check is made that the answer would not use.
@@ -220,9 +229,9 @@ pub(super) fn decide(
 }
 
 fn resume_or(provider: &str, resumable: impl FnOnce() -> Value) -> Route {
-    if provider != "claude" {
+    if !matches!(provider, "claude" | "agy") {
         return unavailable(
-            "This attempt has ended, and only a Claude Code conversation can be resumed from GitPulse.",
+            "This attempt has ended, and only a Claude Code or Antigravity conversation can be resumed from GitPulse.",
         );
     }
     let found = resumable();
@@ -279,6 +288,19 @@ pub(super) fn send_with(
     state: &WorkbenchState,
     input: &str,
     mailbox: &Mailbox,
+    call: impl FnMut(&str, Value) -> Result<Value, WorkbenchError>,
+) -> Result<Value, WorkbenchError> {
+    let claude_configs = conversation::claude_config_dirs();
+    let agy_homes = conversation::antigravity_homes();
+    send_with_homes(state, input, mailbox, &claude_configs, &agy_homes, call)
+}
+
+pub(super) fn send_with_homes(
+    state: &WorkbenchState,
+    input: &str,
+    mailbox: &Mailbox,
+    claude_configs: &conversation::ClaudeConfigDirs,
+    agy_homes: &[std::path::PathBuf],
     mut call: impl FnMut(&str, Value) -> Result<Value, WorkbenchError>,
 ) -> Result<Value, WorkbenchError> {
     let request = parse(input)?;
@@ -293,16 +315,14 @@ pub(super) fn send_with(
             let checkout_exists = run["cwd"]
                 .as_str()
                 .is_some_and(|cwd| std::path::Path::new(cwd).is_dir());
-            conversation::judge(
-                run,
-                checkout_exists,
-                |session| match conversation::claude_home() {
-                    Some(home) => conversation::search(&home, session),
-                    None => conversation::Transcript::Unknown(
-                        "no home directory to find Claude Code's in".into(),
-                    ),
-                },
-            )
+            let provider = run["provider"].as_str().unwrap_or("claude");
+            conversation::judge(run, checkout_exists, |session| {
+                if provider == "agy" {
+                    conversation::search_antigravity_homes(agy_homes, session)
+                } else {
+                    conversation::search_claude_configs(claude_configs, session)
+                }
+            })
         },
         || managed_run::follow_up_with(state, &id, None, None, &mut call),
     );
