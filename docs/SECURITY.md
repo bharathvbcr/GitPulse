@@ -606,8 +606,10 @@ is built to have no way back in:
 - **Its own storage.** Each session uses a non-persistent data store, so a page
   on the app's own dev origin cannot read GitPulse's localStorage or cookies,
   and nothing is written to disk.
-- **No popups, no downloads, at most 8 sessions**, and every session is closed
-  when the main page reloads.
+- **At most 8 sessions**, and every session is closed when the main page
+  reloads (both tested). New-window requests are denied and no download
+  handler is installed, so wry cancels downloads; both are configuration
+  (`browser/pane.rs`), not yet exercised by a test.
 - **Page text is data.** The URL and title a page reports are capped in the
   backend, and the title goes through the tab-title sanitizer.
 

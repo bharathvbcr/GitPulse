@@ -32,6 +32,12 @@
 //!    which is what the frontend's placement assumes.
 //! 9. **Reload.** A main-page reload closes every pane, through GitPulse's own
 //!    `desktop::handle_page_load`.
+//! 10. **The real commands.** `cmd_browser_*`, registered as `lib.rs` does,
+//!    are called from the main page through Tauri's IPC under GitPulse's own
+//!    capability grants, with a `tab-N` id: open, move, hide, navigate and
+//!    reload work; a remote URL, an unknown step, a bad id, impossible bounds
+//!    and an unknown session are refused with the reason; the page events
+//!    arrive through the event plugin; close is idempotent.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
@@ -722,6 +728,134 @@ mod mac {
             reloaded == Ok(1) && closed,
             format!("reload: the pane open before a main-page reload is closed by it (open before: {reloaded:?}, all closed: {closed})"),
         );
+
+        // 10. The real commands, called the way the frontend calls them:
+        //     through Tauri's IPC from the main page, under GitPulse's own
+        //     capability grants, with an id in the shape `tabs.ts` makes, and
+        //     with the page events heard through the event plugin.
+        let child = format!("http://127.0.0.1:{other_port}/child");
+        let script = format!(
+            r#"(async () => {{
+  const inv = window.__TAURI_INTERNALS__.invoke;
+  const r = {{ who: 'ipc', events: [] }};
+  const handler = window.__TAURI_INTERNALS__.transformCallback((e) => r.events.push(e.payload));
+  await inv('plugin:event|listen', {{ event: 'browser-pane', target: {{ kind: 'Any' }}, handler }});
+  const step = async (name, cmd, args) => {{
+    try {{ await inv(cmd, args); r[name] = 'ok'; }} catch (e) {{ r[name] = 'error: ' + String((e && e.message) || e); }}
+  }};
+  const id = 'tab-7';
+  await step('open', 'cmd_browser_open', {{ id, url: '{child}', bounds: {{ x: 5, y: 6, width: 210, height: 120 }} }});
+  await new Promise((done) => setTimeout(done, 1500));
+  await step('bounds', 'cmd_browser_set_bounds', {{ id, bounds: {{ x: 7, y: 8, width: 200, height: 100 }} }});
+  await step('hide', 'cmd_browser_set_visible', {{ id, visible: false }});
+  await step('navigate', 'cmd_browser_navigate', {{ id, url: '{child}?again' }});
+  await step('remote', 'cmd_browser_navigate', {{ id, url: 'https://example.com/' }});
+  await step('go', 'cmd_browser_go', {{ id, to: 'reload' }});
+  await step('badGo', 'cmd_browser_go', {{ id, to: 'home' }});
+  await step('badId', 'cmd_browser_open', {{ id: '../x', url: '{child}', bounds: {{ x: 0, y: 0, width: 1, height: 1 }} }});
+  await step('badBounds', 'cmd_browser_set_bounds', {{ id, bounds: {{ x: 0, y: 0, width: -1, height: 1 }} }});
+  await step('missing', 'cmd_browser_set_visible', {{ id: 'tab-404', visible: true }});
+  await new Promise((done) => setTimeout(done, 1000));
+  await fetch('/report', {{ method: 'POST', body: JSON.stringify(r) }});
+}})()"#
+        );
+        let sent = on_main(app, move |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            main.eval(script).map_err(|e| e.to_string())
+        });
+        match sent.and_then(|()| report(main_reports, "ipc")) {
+            Ok(r) => {
+                check.fact(format!("ipc steps: {}", serde_json::json!({
+                    "open": r["open"], "bounds": r["bounds"], "hide": r["hide"], "navigate": r["navigate"],
+                    "remote": r["remote"], "go": r["go"], "badGo": r["badGo"], "badId": r["badId"],
+                    "badBounds": r["badBounds"], "missing": r["missing"],
+                })));
+                let ok = |name: &str| r[name] == "ok";
+                let refused = |name: &str, says: &str| {
+                    r[name]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("error") && s.contains(says))
+                };
+                check.that(ok("open") && ok("bounds") && ok("hide") && ok("navigate") && ok("go"), "ipc: open, set_bounds, set_visible, navigate and go are granted and succeed from the app's page");
+                check.that(
+                    refused("remote", "local development servers only"),
+                    format!(
+                        "ipc: navigate to a remote URL is refused with the reason (got {})",
+                        r["remote"]
+                    ),
+                );
+                check.that(
+                    r["badGo"].as_str().is_some_and(|s| s.starts_with("error")),
+                    format!(
+                        "ipc: an unknown history step is refused (got {})",
+                        r["badGo"]
+                    ),
+                );
+                check.that(
+                    refused("badId", "browser session id"),
+                    format!(
+                        "ipc: an id that is not a plain token is refused (got {})",
+                        r["badId"]
+                    ),
+                );
+                check.that(
+                    refused("badBounds", "size"),
+                    format!(
+                        "ipc: impossible bounds are refused (got {})",
+                        r["badBounds"]
+                    ),
+                );
+                check.that(
+                    refused("missing", "not open"),
+                    format!(
+                        "ipc: a command to a session that is not open says so (got {})",
+                        r["missing"]
+                    ),
+                );
+                let events = r["events"].as_array().cloned().unwrap_or_default();
+                check.that(
+                    events.iter().any(|e| e["id"] == "tab-7" && e["kind"] == "loaded")
+                        && events.iter().any(|e| e["id"] == "tab-7" && e["kind"] == "title" && e["title"] == "child"),
+                    format!("ipc: the page's load and title reach the app's page as browser-pane events ({} heard)", events.len()),
+                );
+            }
+            Err(e) => check.that(false, format!("ipc: {e}")),
+        }
+        let state = on_main(app, |_| {
+            let view = pane_view("tab-7")?;
+            let hidden: bool = unsafe { msg_send![view, isHidden] };
+            let bounds = browser::with_webview("tab-7", |w| w.bounds())
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let (at, size) = (
+                bounds.position.to_logical::<f64>(1.0),
+                bounds.size.to_logical::<f64>(1.0),
+            );
+            let url = browser::with_webview("tab-7", |w| w.url())
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((hidden, (at.x, at.y, size.width, size.height), url))
+        });
+        match state {
+            Ok((hidden, at, url)) => check.that(
+                hidden && at == (7.0, 8.0, 200.0, 100.0) && url.ends_with("/child?again"),
+                format!("ipc: the pane the commands drove is hidden, at 7,8 200x100, on the navigated URL (hidden {hidden}, at {at:?}, url {url})"),
+            ),
+            Err(e) => check.that(false, format!("ipc: the pane the commands opened: {e}")),
+        }
+        let closed = on_main(app, |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            main.eval("window.__TAURI_INTERNALS__.invoke('cmd_browser_close', { id: 'tab-7' }).then(() => window.__TAURI_INTERNALS__.invoke('cmd_browser_close', { id: 'tab-7' })).then(() => fetch('/report', { method: 'POST', body: JSON.stringify({ who: 'ipc-close', ok: true }) }), (e) => fetch('/report', { method: 'POST', body: JSON.stringify({ who: 'ipc-close', ok: false, error: String(e) }) }))")
+                .map_err(|e| e.to_string())
+        })
+        .and_then(|()| report(main_reports, "ipc-close"));
+        check.that(
+            closed.as_ref().is_ok_and(|r| r["ok"] == true)
+                && on_main(app, |_| browser::open_count()) == 0,
+            format!(
+                "ipc: close removes the pane, and closing it again is not an error ({closed:?})"
+            ),
+        );
         check
     }
 
@@ -761,6 +895,15 @@ mod mac {
             .manage(gitpulse_lib::desktop::DesktopState::default())
             .manage(gitpulse_lib::terminal::TerminalSessions::default())
             .on_page_load(gitpulse_lib::desktop::handle_page_load)
+            // The browser commands as `lib.rs` registers them (step 10).
+            .invoke_handler(tauri::generate_handler![
+                gitpulse_lib::browser::commands::cmd_browser_open,
+                gitpulse_lib::browser::commands::cmd_browser_set_bounds,
+                gitpulse_lib::browser::commands::cmd_browser_set_visible,
+                gitpulse_lib::browser::commands::cmd_browser_navigate,
+                gitpulse_lib::browser::commands::cmd_browser_go,
+                gitpulse_lib::browser::commands::cmd_browser_close,
+            ])
             .setup(move |app| {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;
                 Ok(())
