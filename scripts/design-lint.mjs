@@ -47,6 +47,8 @@
  *      utility (text-/bg-/border-/ring-... but not sizes, alignment, widths or
  *      arbitrary values). Applies to `.ts` strings too. Misses `text-white`,
  *      `bg-black` (not palette names) and colors built by string concatenation.
+ *      The copy vocabulary (`src/lib/ui/copy/`) is exempt: it quotes banned
+ *      class spellings in its notes.
  *   4  literals: `#hex` and `rgb(12 34 56)`/`hsl(...)` literals in `.svelte`
  *      markup attributes, mustaches and `<style>` declaration values. In
  *      `<style>` and `style=` any position counts; elsewhere the hex must be a
@@ -820,6 +822,19 @@ const COLOR_FN = /(?<![\w-])(?:rgb|rgba|hsl|hsla)\(\s*\d/g;
 
 const OWNERS_OF_MOTION = /^src\/lib\/(?:motion\/|ui\/transitions\.ts$)/;
 
+/**
+ * The copy vocabulary (`src/lib/ui/copy/`) is the one place that NAMES the
+ * terms and class spellings the rules ban, as data and in prose: its voice
+ * note on exclamation marks quotes Tailwind's important suffix with a real
+ * palette class (`border-red-500/60!`). Rule 3 therefore does not read this
+ * directory. The exemption is deliberately narrow: this one rule, this one
+ * directory (an anchored prefix, so `src/lib/ui/copyright/` and
+ * `src/lib/components/ui/copy/` are still linted). It is not a baseline bump:
+ * the baseline counts what the rules see, and these files are not meant to be
+ * seen by rule 3 at all.
+ */
+const OWNERS_OF_COPY = /^src\/lib\/ui\/copy\//;
+
 // ---------------------------------------------------------------------------
 // Rule 15 helpers.
 // ---------------------------------------------------------------------------
@@ -965,6 +980,7 @@ export const RULES = [
     ts: true,
     css: false,
     run(m, report) {
+      if (OWNERS_OF_COPY.test(m.file)) return;
       eachToken(m, (t) => {
         if (PALETTE_UTIL.test(t.util)) report(t.start, `${t.raw}: Tailwind palette color, use a role token (text-ok/warn/danger/info/unknown, text-accent, text-textMuted)`);
         else if (t.variants.includes("dark") && isColorUtil(t.util)) report(t.start, `${t.raw}: dark: color pair, role tokens already follow the theme`);

@@ -11,7 +11,10 @@ import { BAKED_SPRINGS } from "./springs.generated";
  * in-app setting can only add reduction.
  */
 
-export type DurationToken = "instant" | "fast" | "base" | "slow" | "emphasis";
+/** Every duration token, in ascending order. The type below derives from this tuple, so the map keyed by it cannot omit or add one. */
+export const DURATION_TOKENS = Object.freeze(["instant", "fast", "base", "slow", "emphasis"] as const);
+
+export type DurationToken = (typeof DURATION_TOKENS)[number];
 
 /** Hover tint and press / scrim and fade / pop, menu, view switch / dialog, sheet, dock / splash hand-off. */
 export const DURATION_MS: Readonly<Record<DurationToken, number>> = Object.freeze({
@@ -38,7 +41,10 @@ export const EXIT_MS: Readonly<Record<DurationToken, number>> = Object.freeze({
   emphasis: Math.min(DURATION_MS.emphasis / 2, EXIT_CAP_MS),
 });
 
-export type EasingToken = "spatialFast" | "spatial" | "spatialSlow" | "effect" | "exit";
+/** Every easing token. The type derives from this tuple, so the map keyed by it cannot omit or add one. */
+export const EASING_TOKENS = Object.freeze(["spatialFast", "spatial", "spatialSlow", "effect", "exit"] as const);
+
+export type EasingToken = (typeof EASING_TOKENS)[number];
 
 /**
  * Value of `--mac-liquid-ease` in app.css. Engines without CSS `linear()` fall
@@ -66,11 +72,6 @@ export const EASING_FALLBACK: Readonly<Record<EasingToken, string>> = Object.fre
   effect: LIQUID_EASE_FALLBACK,
   exit: EXIT_EASE,
 });
-
-export const DURATION_TOKENS: readonly DurationToken[] = Object.freeze(
-  Object.keys(DURATION_MS) as DurationToken[],
-);
-export const EASING_TOKENS: readonly EasingToken[] = Object.freeze(Object.keys(EASING) as EasingToken[]);
 
 /** Duration in ms, or 0 when the user (system or in-app) asked for less motion. */
 export function motionMs(token: DurationToken, media?: MediaMatch | null): number {

@@ -85,6 +85,18 @@ describe("design-lint rules: one positive and one negative fixture each", () => 
     expect(lintSource("src/lib/ui/transitions.ts", fixture("rule-10.positive.ts.txt")).filter((v) => v.rule === 10)).toEqual([]);
   });
 
+  it("rule 3 leaves the copy vocabulary alone, and the exemption stays inside that directory", () => {
+    const src = 'export const note = "Tailwind important suffix (border-red-500/60!) does not match";\n';
+    const rule3 = (file: string) => lintSource(file, src).filter((v) => v.rule === 3);
+    expect(rule3("src/lib/ui/copy/vocabulary.ts")).toEqual([]);
+    expect(rule3("src/lib/ui/copy/nested/other.ts")).toEqual([]);
+    for (const leak of ["src/lib/ui/copyright/vocabulary.ts", "src/lib/ui/other.ts", "src/lib/components/ui/copy/vocabulary.ts", "src/lib/ui/color/oklch.ts"]) {
+      expect(rule3(leak), leak).toHaveLength(1);
+    }
+    // Only rule 3 is exempt: another rule still reads the directory.
+    expect(lintSource("src/lib/ui/copy/x.ts", 'export const d = { duration: 300 };\n').filter((v) => v.rule === 10)).toHaveLength(1);
+  });
+
   it("TypeScript files run no rule but 3 and 10", () => {
     const ts = lintSource("src/lib/x.ts", 'export const c = "text-[10px] border-t z-50 rounded-3xl text-amber-400 uppercase tracking-wide";\n');
     expect([...new Set(ts.map((v) => v.rule))]).toEqual([3]);
