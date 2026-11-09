@@ -31,6 +31,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
+pub(crate) mod clone_size;
 pub mod commit_graph;
 pub mod hygiene;
 pub mod repo_tuning;
@@ -1330,6 +1332,13 @@ struct FoundArtifact {
     abs: PathBuf,
     /// Bytes attributed to THIS scope only, not to nested ones.
     bytes: u64,
+    /// Of those, the bytes no clone or snapshot shares: what deleting the scope
+    /// frees now. Only files whose private size was read are in it.
+    #[cfg(target_os = "macos")]
+    private_bytes: u64,
+    /// Files in this scope whose private size could not be read.
+    #[cfg(target_os = "macos")]
+    private_unread: u64,
     /// This tree was enumerated to the end. Starts false and is only set once
     /// the subtree has been walked and its budget came back unexhausted, so a
     /// scope the walk never finished keeps the honest answer.
@@ -1402,9 +1411,30 @@ impl ArtifactCollector {
             kind,
             abs: abs.to_path_buf(),
             bytes: 0,
+            #[cfg(target_os = "macos")]
+            private_bytes: 0,
+            #[cfg(target_os = "macos")]
+            private_unread: 0,
             complete: false,
         });
         self.open.push(self.found.len() - 1);
+    }
+
+    /// Records what deleting the file at `path` would free, in the scope
+    /// [`Self::on_file`] attributed its logical length to. A file whose private
+    /// size cannot be read is counted, never assumed private or shared.
+    #[cfg(target_os = "macos")]
+    fn on_file_private(&mut self, bytes: u64, path: &Path) {
+        if bytes == 0 {
+            return;
+        }
+        let Some(&top) = self.open.last() else {
+            return;
+        };
+        match clone_size::private_size(path) {
+            Some(private) => self.found[top].private_bytes += private,
+            None => self.found[top].private_unread += 1,
+        }
     }
 
     fn on_file(&mut self, bytes: u64) {
@@ -1532,6 +1562,8 @@ fn walk_worktree(
 
                 if !is_dup {
                     ctx.collector.on_file(logical_len);
+                    #[cfg(target_os = "macos")]
+                    ctx.collector.on_file_private(logical_len, &entry.path());
                     total += logical_len;
                     ctx.large_collector.consider(logical_len, &child_rel);
                 }
@@ -1873,13 +1905,50 @@ fn gitdir_target(raw: Vec<u8>) -> Option<PathBuf> {
     }
 }
 
+/// What an artifact's reclaim figure measures. `ArtifactDir::bytes` stays the
+/// logical length (it orders and bounds the cleaner's candidates); this decides
+/// what the audit may call reclaimable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimSizing {
+    /// Every file's clone-private size was read; the total is what deleting
+    /// the directory frees now.
+    Private(u64),
+    /// This many files' private size could not be read, so the logical length
+    /// is only an upper bound.
+    PrivateUnread(u64),
+    /// The platform cannot report clone sharing; the logical length stands,
+    /// labelled as logical.
+    Logical,
+}
+
+impl FoundArtifact {
+    fn sizing(&self) -> ReclaimSizing {
+        #[cfg(target_os = "macos")]
+        {
+            if self.private_unread == 0 {
+                ReclaimSizing::Private(self.private_bytes)
+            } else {
+                ReclaimSizing::PrivateUnread(self.private_unread)
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            ReclaimSizing::Logical
+        }
+    }
+}
+
 /// Builds the reclaim audit from measurements the scan already took.
 ///
 /// Everything here is derived, not re-walked — the audit costs one extra
 /// `read_dir` of `.git/worktrees` and nothing else. An audit that doubled the
 /// scan time would not be run often enough to matter.
+///
+/// `sizing` says, per artifact path, what its bytes mean; a path it does not
+/// name is sized as logical.
 fn build_reclaim(
     artifacts: &[ArtifactDir],
+    sizing: &HashMap<String, ReclaimSizing>,
     git: &GitStorage,
     branches: &BranchStorageSummary,
     large_files: &[LargeFile],
@@ -1903,11 +1972,39 @@ fn build_reclaim(
             ArtifactKind::Build => ReclaimCategory::BuildOutput,
             ArtifactKind::Cache => ReclaimCategory::Cache,
         };
+        // What the figure is: clone-private bytes where the volume reports
+        // them, otherwise the logical length, named as such.
+        let (bytes, confidence, size_note) = match sizing
+            .get(&artifact.path)
+            .copied()
+            .unwrap_or(ReclaimSizing::Logical)
+        {
+            ReclaimSizing::Private(private) => (
+                private,
+                ReclaimConfidence::Measured,
+                format!(
+                    "Reclaimable bytes are clone-private: {} of {} logical bytes would be freed now, the rest is shared with a clone or snapshot. A point-in-time reading.",
+                    private, artifact.bytes
+                ),
+            ),
+            ReclaimSizing::PrivateUnread(files) => (
+                artifact.bytes,
+                ReclaimConfidence::Estimated,
+                format!(
+                    "Logical size, an upper bound: how much of it a clone or snapshot shares could not be read for {files} file(s)."
+                ),
+            ),
+            ReclaimSizing::Logical => (
+                artifact.bytes,
+                ReclaimConfidence::Measured,
+                "Logical size: whether a clone or snapshot shares it is not readable on this platform, so deleting it may free less.".to_string(),
+            ),
+        };
         items.push(ReclaimItem {
             category,
             label: artifact.path.clone(),
-            bytes: artifact.bytes,
-            confidence: ReclaimConfidence::Measured,
+            bytes,
+            confidence,
             // Committed content is not regenerable output any more, whatever
             // the directory is named: deleting it changes the working tree.
             safety: if committed || protected || unknown || incomplete {
@@ -1948,6 +2045,10 @@ fn build_reclaim(
                 None
             },
         });
+        if let Some(item) = items.last_mut() {
+            item.detail.push(' ');
+            item.detail.push_str(&size_note);
+        }
     }
 
     for (name, bytes) in orphaned_admin {
@@ -2251,8 +2352,14 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
         || git_truncated
         || git_budget.truncated
         || wt_truncated;
+    let sizing: HashMap<String, ReclaimSizing> = collector
+        .found
+        .iter()
+        .map(|found| (found.rel.to_string_lossy().into_owned(), found.sizing()))
+        .collect();
     let (reclaim, reclaim_summary) = build_reclaim(
         &artifacts,
+        &sizing,
         &git_storage,
         &branches,
         &large_files,
@@ -2504,6 +2611,7 @@ mod tests {
     fn an_unexamined_artifact_is_not_disposable() {
         let (unknown, _) = build_reclaim(
             &[artifact("my-build-output", true, false)],
+            &HashMap::new(),
             &GitStorage::default(),
             &branches(),
             &[],
@@ -2525,6 +2633,7 @@ mod tests {
 
         let (measured, _) = build_reclaim(
             &[artifact("my-build-output", false, true)],
+            &HashMap::new(),
             &GitStorage::default(),
             &branches(),
             &[],
@@ -2709,6 +2818,153 @@ mod tests {
         assert_eq!(collector.found.len(), 1);
         assert_eq!(collector.found[0].rel, "coverage");
         assert_eq!(collector.found[0].bytes, 300);
+    }
+
+    /// An APFS directory clone of `src` at `dst` (what `cp -c -R` makes).
+    #[cfg(target_os = "macos")]
+    fn clone_dir(src: &Path, dst: &Path) {
+        let src = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+        let dst = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        // SAFETY: both are valid NUL-terminated strings.
+        let status = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+        assert_eq!(status, 0, "clonefile: {}", io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_directory_is_not_reported_as_fully_reclaimable() {
+        const LEN: usize = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let payload: Vec<u8> = (0..LEN)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+            .collect();
+        for dir in ["target", ".next"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("blob.bin"), &payload).unwrap();
+        }
+        std::fs::File::open(root.join("target/blob.bin"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        // `node_modules` is an APFS clone of `target`: same logical bytes,
+        // shared blocks. `.next` is an independent copy.
+        clone_dir(&root.join("target"), &root.join("node_modules"));
+
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
+            root,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            &mut seen,
+            &mut seen_dirs,
+        );
+        walk_worktree(&mut ctx, root, 0, &mut budget);
+
+        let sizing_of = |rel: &str| {
+            let found = collector
+                .found
+                .iter()
+                .find(|found| found.rel == rel)
+                .unwrap_or_else(|| panic!("{rel} not found"));
+            assert_eq!(
+                found.bytes, LEN as u64,
+                "{rel}: logical length is unchanged"
+            );
+            found.sizing()
+        };
+        let ReclaimSizing::Private(shared) = sizing_of("node_modules") else {
+            panic!("a clone's private size is readable on APFS");
+        };
+        let ReclaimSizing::Private(owner) = sizing_of("target") else {
+            panic!("a clone source's private size is readable on APFS");
+        };
+        let ReclaimSizing::Private(alone) = sizing_of(".next") else {
+            panic!("an unshared tree's private size is readable on APFS");
+        };
+        assert!(
+            shared < LEN as u64 / 8 && owner < LEN as u64 / 8,
+            "blocks shared by two trees free nothing when one is deleted: clone {shared}, source {owner}"
+        );
+        assert!(
+            alone >= LEN as u64 / 2,
+            "a tree nothing shares frees about its logical length: {alone}"
+        );
+
+        // And the audit says so: the clone's reclaim figure is its private
+        // bytes, Measured, while `ArtifactDir::bytes` (which orders the
+        // cleaner's candidates) stays logical.
+        let dir = ArtifactDir {
+            path: "node_modules".into(),
+            bytes: LEN as u64,
+            kind: ArtifactKind::Build,
+            unignored: false,
+            tracked_files: 0,
+            checks_unexamined: false,
+            scan_complete: true,
+        };
+        let sizing = HashMap::from([("node_modules".to_string(), ReclaimSizing::Private(shared))]);
+        let (items, _) = build_reclaim(
+            &[dir],
+            &sizing,
+            &GitStorage::default(),
+            &BranchStorageSummary::default(),
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(items[0].bytes, shared);
+        assert_eq!(items[0].confidence, ReclaimConfidence::Measured);
+        assert!(
+            items[0].detail.contains("clone-private"),
+            "{}",
+            items[0].detail
+        );
+    }
+
+    #[test]
+    fn a_size_that_cannot_be_read_as_private_is_an_upper_bound_not_reclaimable() {
+        let dir = ArtifactDir {
+            path: "target".into(),
+            bytes: 9_000,
+            kind: ArtifactKind::Build,
+            unignored: false,
+            tracked_files: 0,
+            checks_unexamined: false,
+            scan_complete: true,
+        };
+        let sizing = HashMap::from([("target".to_string(), ReclaimSizing::PrivateUnread(3))]);
+        let (items, summary) = build_reclaim(
+            &[dir],
+            &sizing,
+            &GitStorage::default(),
+            &BranchStorageSummary::default(),
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(items[0].bytes, 9_000);
+        assert_eq!(items[0].confidence, ReclaimConfidence::Estimated);
+        assert_eq!(
+            summary.reclaimable_bytes, 0,
+            "an upper bound is not reclaimable"
+        );
+        assert_eq!(summary.estimated_bytes, 9_000);
+        assert!(
+            items[0].detail.contains("upper bound"),
+            "{}",
+            items[0].detail
+        );
     }
 
     #[cfg(unix)]
@@ -3146,6 +3402,7 @@ mod tests {
         let whole = artifact("other-target", false, false);
         let (items, summary) = build_reclaim(
             &[half, whole],
+            &HashMap::new(),
             &GitStorage::default(),
             &branches(),
             &[],
