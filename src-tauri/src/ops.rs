@@ -1,8 +1,9 @@
 //! High-signal repository operations used by the MANVI Ops surface.
 //!
 //! Read-only planning lives here; mutations continue through `GitWriter` and
-//! the command gate. Cleanup plans are conservative: only local branches Git
-//! itself reports as merged into the default branch are eligible.
+//! the command gate. Cleanup plans are conservative: only local branches the
+//! dead-branch scan's own rule (`deadbranch::classify_merge`) calls merged into
+//! the default branch are eligible.
 
 use crate::ipc_error::CommandError;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
+use crate::engine::deadbranch::{
+    classify_merge, default_tree_of, is_ancestry_merged, needs_tree_check, tree_merge_verdicts,
+    TreeMerge,
+};
 use crate::engine::git_cli::{git_captured, git_text, validate_repo, BoundedRun};
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::{BranchInfo, GitReader};
@@ -156,20 +161,6 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
         .ok_or_else(|| "Could not determine the repository's default branch".to_string())?;
 
     validate_ref_name(&default.name)?;
-    let merged_output = git_text(
-        &repo,
-        &[
-            "branch",
-            "--format=%(refname:short)",
-            "--merged",
-            &default.name,
-        ],
-    )?;
-    let merged: HashSet<&str> = merged_output
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
 
     let worktrees = crate::engine::worktree::read_worktree_entries(&repo)?;
     let checked_out_elsewhere: HashSet<&str> = worktrees
@@ -177,17 +168,54 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
         .filter_map(|entry| entry.branch.as_deref())
         .filter(|name| *name != current.name)
         .collect();
+    let is_protected = |branch: &BranchInfo| {
+        branch.is_current
+            || branch.is_default
+            || checked_out_elsewhere.contains(branch.name.as_str())
+    };
+
+    // "Merged" is the dead-branch scan's own rule (`classify_merge`), not a
+    // second one: by ancestry, or by a tree comparison for squash and rebase
+    // merges. A comparison that cannot run leaves the branch unmerged, and a
+    // gone upstream is only reported, never taken for a merge.
+    let pending: Vec<&BranchInfo> = local
+        .iter()
+        .copied()
+        .filter(|b| !is_protected(b) && !is_ancestry_merged(b) && needs_tree_check(b))
+        .collect();
+    let tree_verdicts: HashMap<&str, TreeMerge> =
+        match default_tree_of(&repo, &default.tip_commit_id) {
+            Some(default_tree) if !pending.is_empty() => {
+                let tips: Vec<(&str, &str)> = pending
+                    .iter()
+                    .map(|b| (b.name.as_str(), b.tip_commit_id.as_str()))
+                    .collect();
+                pending
+                    .iter()
+                    .map(|b| b.name.as_str())
+                    .zip(tree_merge_verdicts(
+                        &repo,
+                        &default.tip_commit_id,
+                        &default_tree,
+                        &tips,
+                    ))
+                    .collect()
+            }
+            _ => HashMap::new(),
+        };
 
     let mut candidates = Vec::new();
     let mut protected_branches = 0usize;
     let mut unmerged_branches = 0usize;
     for branch in &local {
-        if branch.is_current
-            || branch.is_default
-            || checked_out_elsewhere.contains(branch.name.as_str())
-        {
+        if is_protected(branch) {
             protected_branches += 1;
-        } else if merged.contains(branch.name.as_str()) {
+        } else if classify_merge(
+            is_ancestry_merged(branch),
+            tree_verdicts.get(branch.name.as_str()),
+        )
+        .merged
+        {
             candidates.push(BranchCleanupCandidate {
                 name: branch.name.clone(),
                 tip_commit_id: branch.tip_commit_id.clone(),
@@ -651,6 +679,9 @@ mod tests {
         commit_file(dir.path(), "merged.txt", "merged", "fix: merged work");
         git(dir.path(), &["switch", "main"]);
         git(dir.path(), &["merge", "--ff-only", "merged-work"]);
+        // The default branch moves past the merged branch: a branch sitting at
+        // the default's own tip is not merged (see `is_ancestry_merged`).
+        commit_file(dir.path(), "next.txt", "next", "feat: main moves on");
 
         git(dir.path(), &["switch", "-c", "unmerged-work"]);
         commit_file(
@@ -672,6 +703,124 @@ mod tests {
             40,
             "ops panel restore needs the tip on every candidate"
         );
+    }
+
+    /// A branch whose upstream is gone: tracked `origin/<name>`, which then
+    /// vanished from the remote.
+    fn make_upstream_gone(path: &Path, branch: &str) {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        git(path, &["update-ref", &remote_ref, branch]);
+        git(
+            path,
+            &[
+                "branch",
+                &format!("--set-upstream-to=origin/{branch}"),
+                branch,
+            ],
+        );
+        git(path, &["update-ref", "-d", &remote_ref]);
+    }
+
+    /// One repository, five branches, and the two surfaces that decide what is
+    /// merged (the ops cleanup plan and the dead-branch scan): they must agree
+    /// on every one, and an upstream that is gone must never decide it.
+    #[test]
+    fn the_ops_plan_and_the_deadbranch_scan_agree_on_what_is_merged() {
+        use crate::engine::deadbranch::{scan_stale_branches, DeadbranchConfig};
+
+        let dir = tempfile::tempdir().expect("temp repo");
+        let path = dir.path();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["remote", "add", "origin", "./nowhere.git"]);
+        commit_file(path, "base.txt", "base", "feat: initial");
+
+        // Ancestry-merged: merged with a merge commit, main moved past it.
+        git(path, &["switch", "-c", "ancestry-merged"]);
+        commit_file(path, "a.txt", "a", "feat: a");
+        git(path, &["switch", "main"]);
+        git(
+            path,
+            &["merge", "--no-ff", "-m", "merge a", "ancestry-merged"],
+        );
+
+        // Gone upstream, unpushed work, never merged.
+        git(path, &["switch", "-c", "gone-ahead"]);
+        commit_file(path, "ahead.txt", "ahead", "feat: unpushed");
+        git(path, &["switch", "main"]);
+        make_upstream_gone(path, "gone-ahead");
+
+        // Gone upstream, squash-merged: the change is in main, the commits are not.
+        git(path, &["switch", "-c", "gone-squash"]);
+        commit_file(path, "squash.txt", "squash", "feat: squashed");
+        git(path, &["switch", "main"]);
+        git(path, &["merge", "--squash", "gone-squash"]);
+        git(path, &["commit", "-m", "feat: squashed (#1)"]);
+        make_upstream_gone(path, "gone-squash");
+
+        // Unrelated work, upstream intact.
+        git(path, &["switch", "-c", "unrelated"]);
+        commit_file(path, "other.txt", "other", "feat: other");
+        git(path, &["switch", "main"]);
+
+        // At main's own tip with nothing ahead: a fresh branch, not a merged one.
+        git(path, &["branch", "same-tip"]);
+
+        let repo = path.to_str().expect("utf8 path");
+        let plan = branch_cleanup_plan(repo).expect("plan");
+        let ops_merged: std::collections::BTreeSet<String> =
+            plan.candidates.iter().map(|c| c.name.clone()).collect();
+
+        let scan = scan_stale_branches(
+            repo,
+            &DeadbranchConfig {
+                days_threshold: 0,
+                merged_only: false,
+                ..DeadbranchConfig::default()
+            },
+        )
+        .expect("scan");
+        let scan_merged: std::collections::BTreeSet<String> = scan
+            .branches
+            .iter()
+            .filter(|b| b.is_merged && !b.is_protected && !b.is_current_or_worktree)
+            .map(|b| b.name.clone())
+            .collect();
+
+        let expected: std::collections::BTreeSet<String> =
+            ["ancestry-merged", "gone-squash"].map(String::from).into();
+        assert_eq!(ops_merged, expected, "ops::branch_cleanup_plan");
+        assert_eq!(scan_merged, expected, "deadbranch scan");
+
+        let by_name = |name: &str| {
+            scan.branches
+                .iter()
+                .find(|b| b.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the scan"))
+        };
+        let gone_ahead = by_name("gone-ahead");
+        assert!(gone_ahead.upstream_gone);
+        assert!(
+            !gone_ahead.is_merged && !gone_ahead.merged_by_tree,
+            "unpushed work behind a deleted upstream is not merged (so it is not pre-selected)"
+        );
+        let gone_squash = by_name("gone-squash");
+        assert!(gone_squash.upstream_gone && gone_squash.is_merged && gone_squash.merged_by_tree);
+        let same_tip = by_name("same-tip");
+        assert!(!same_tip.is_merged && !same_tip.upstream_gone);
+        assert!(!by_name("unrelated").is_merged);
+        assert!(!by_name("ancestry-merged").merged_by_tree);
+        assert_eq!(
+            scan.merged_count, 2,
+            "merged_count counts only merged branches, not gone upstreams"
+        );
+        assert_eq!(scan.squash_merged_count, 1);
+        let gone_in_plan: Vec<&str> = plan
+            .candidates
+            .iter()
+            .filter(|c| c.upstream_gone)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(gone_in_plan, vec!["gone-squash"]);
     }
 
     #[test]

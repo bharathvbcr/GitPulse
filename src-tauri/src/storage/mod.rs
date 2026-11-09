@@ -1741,8 +1741,10 @@ fn branch_summary(repo_path: &str) -> BranchStorageSummary {
         .map(|b| b.name.clone())
         .collect();
 
-    // Reuse MANVI's conservative cleanup plan so the two surfaces can never
-    // disagree about what is safely deletable.
+    // Reuse the ops cleanup plan, which applies the dead-branch scan's own
+    // merge rule (`deadbranch::classify_merge`): this panel, the ops panel and
+    // the cleanup modal count the same branches as merged. A gone upstream is
+    // counted above as a fact about the remote, never as a merge.
     match crate::ops::branch_cleanup_plan(repo_path) {
         Ok(plan) => {
             summary.merged_stale_count = plan.candidates.len();

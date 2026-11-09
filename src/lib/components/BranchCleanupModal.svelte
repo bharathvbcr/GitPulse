@@ -21,6 +21,7 @@
     filterStaleBranches,
     formatBackupTimestamp,
     formatBranchAge,
+    preselectMerged,
     severityBadge,
   } from "../branches/deadbranch";
   import type {
@@ -140,14 +141,9 @@
       scanResult = res;
       scanTarget = target;
 
-      // By default select all un-protected, non-worktree candidate branches that are merged
-      const nextSelected = new Set<string>();
-      for (const b of res.branches) {
-        if (!b.is_protected && !b.is_current_or_worktree && b.is_merged) {
-          nextSelected.add(b.name);
-        }
-      }
-      selectedNames = nextSelected;
+      // By default select the un-protected, non-worktree branches that are merged.
+      // A gone upstream alone is not merged, so it is not pre-selected.
+      selectedNames = preselectMerged(res.branches);
     } catch (err: unknown) {
       if (seq !== scanSeq) return;
       actionBanner = {
@@ -569,6 +565,11 @@
                   {:else}
                     <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
                       Unmerged
+                    </span>
+                  {/if}
+                  {#if branch.upstream_gone && !branch.is_merged}
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-rose-500/10 text-rose-300 border border-rose-500/20" title="The upstream was deleted, but nothing shows this branch's commits reached the default branch">
+                      Upstream gone
                     </span>
                   {/if}
                 </div>

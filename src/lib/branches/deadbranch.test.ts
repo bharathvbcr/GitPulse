@@ -3,6 +3,7 @@ import {
   filterStaleBranches,
   formatBackupTimestamp,
   formatBranchAge,
+  preselectMerged,
   severityBadge,
 } from "./deadbranch";
 import type { StaleBranchInfo } from "./types";
@@ -15,6 +16,7 @@ function sampleBranch(overrides: Partial<StaleBranchInfo> = {}): StaleBranchInfo
     severity: "moderate",
     is_merged: false,
     merged_by_tree: false,
+    upstream_gone: false,
     is_remote: false,
     is_protected: false,
     is_wip: false,
@@ -26,6 +28,25 @@ function sampleBranch(overrides: Partial<StaleBranchInfo> = {}): StaleBranchInfo
     ...overrides,
   };
 }
+
+describe("deadbranch pre-selection", () => {
+  it("pre-selects merged branches and never one whose only signal is a gone upstream", () => {
+    const merged = sampleBranch({ name: "merged", is_merged: true });
+    const squashed = sampleBranch({
+      name: "gone-squash",
+      is_merged: true,
+      merged_by_tree: true,
+      upstream_gone: true,
+    });
+    const goneAhead = sampleBranch({ name: "gone-ahead", is_merged: false, upstream_gone: true });
+    const protectedBranch = sampleBranch({ name: "main", is_merged: true, is_protected: true });
+    const inUse = sampleBranch({ name: "wt", is_merged: true, is_current_or_worktree: true });
+
+    expect(
+      [...preselectMerged([merged, squashed, goneAhead, protectedBranch, inUse])].sort(),
+    ).toEqual(["gone-squash", "merged"]);
+  });
+});
 
 describe("deadbranch frontend helpers", () => {
   it("formats branch ages properly", () => {

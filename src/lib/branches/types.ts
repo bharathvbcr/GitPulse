@@ -40,6 +40,8 @@ export interface StaleBranchInfo {
   severity: DeadbranchSeverity;
   is_merged: boolean;
   merged_by_tree: boolean;
+  /** The tracked upstream no longer exists. A fact about the remote, not evidence of a merge. */
+  upstream_gone: boolean;
   is_remote: boolean;
   is_protected: boolean;
   is_wip: boolean;
