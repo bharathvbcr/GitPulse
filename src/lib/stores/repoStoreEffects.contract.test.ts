@@ -1,7 +1,12 @@
 import { readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { get } from "svelte/store";
 import { describe, expect, it } from "vitest";
+import { filterPathsByFileQuery, parseFileQuery } from "../files/fileQuery";
+import { mergeListedAndStatusPaths } from "../files/fileStatus";
+import { memoryStorage } from "../repos/persist";
+import { createRepoStore, type InvokeFn } from "./repoStore";
 import { codeOnly, svelteFiles } from "./sourceScan";
 
 /**
@@ -53,6 +58,73 @@ function effectStoreReads(source: string): EffectRead[] {
   }
   return reads;
 }
+
+/**
+ * The Code view's file tree is rebuilt whenever the array feeding it changes
+ * identity, so the chain from `repoStore.statuses` to `buildFileTree` must
+ * hand the same array down while nothing in it changed. vitest does not run
+ * `$derived`, so the chain is checked where it is written: each link's
+ * identity, the store's own `statuses` identity, and the panel's source.
+ */
+describe("file tree array identity", () => {
+  const listed = ["a.ts", "src/b.ts"];
+
+  it("merging no new status path hands back the listing itself", () => {
+    expect(mergeListedAndStatusPaths(listed, [])).toBe(listed);
+    expect(mergeListedAndStatusPaths(listed, ["a.ts", "src/b.ts"])).toBe(listed);
+    expect(mergeListedAndStatusPaths(listed, ["new.ts"])).not.toBe(listed);
+  });
+
+  it("an unfiltered query hands back the paths themselves", () => {
+    expect(filterPathsByFileQuery(listed, parseFileQuery("")).paths).toBe(listed);
+    expect(filterPathsByFileQuery(listed, parseFileQuery("b")).paths).not.toBe(listed);
+  });
+
+  it("a selection publish keeps the statuses array; a status change replaces it", async () => {
+    let statuses = [{ path: "a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 }];
+    const invoke: InvokeFn = async (cmd, args) => {
+      switch (cmd) {
+        case "cmd_resolve_repo": return { path: String(args?.repoPath), name: "r", is_bare: false } as never;
+        case "cmd_list_branches": return [] as never;
+        case "cmd_get_status": return statuses as never;
+        case "cmd_list_tags": return { tags: [], truncated: false } as never;
+        case "cmd_stash_list": return { entries: [], truncated: false } as never;
+        case "cmd_repo_operation": return null as never;
+        case "cmd_watch_repo": return String(args?.repoPath) as never;
+        case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_set_recent_menu": return undefined as never;
+        default: throw new Error(`unexpected command ${cmd}`);
+      }
+    };
+    const store = createRepoStore({
+      invoke,
+      storage: memoryStorage(),
+      caseInsensitive: true,
+      graph: { showRepo: () => {}, loadGraph: async () => {}, evict: () => {} },
+    });
+    await store.openRepo("/r/identity");
+    const before = get(store).statuses;
+    expect(before).toHaveLength(1);
+
+    store.selectFilePath("a.ts");
+    expect(get(store).selectedFilePath).toBe("a.ts");
+    expect(get(store).statuses).toBe(before);
+
+    statuses = [...statuses, { path: "b.ts", status_code: "??", is_staged: false, is_conflicted: false, additions: 0, deletions: 0 }];
+    await store.refresh("/r/identity", "status");
+    expect(get(store).statuses).not.toBe(before);
+    expect(get(store).statuses).toHaveLength(2);
+  });
+
+  it("FileTreePanel feeds its derived chain from one identity-stable statuses read", () => {
+    const panel = readFileSync(join(SRC, "lib", "components", "files", "FileTreePanel.svelte"), "utf8");
+    const script = codeOnly(/<script\b[^>]*>([\s\S]*?)<\/script>/.exec(panel)?.[1] ?? "");
+    expect(script).toMatch(/const statuses = \$derived\(\$repoStore\.statuses\)/);
+    // A fresh array built straight from the whole store defeats it: a derived
+    // that maps `$repoStore.statuses` is a new array on every publish.
+    expect(script).not.toMatch(/\$repoStore\.statuses\s*\.\s*map\(/);
+    expect(script.match(/\$derived\(\s*statusPathKey\(statuses\)\s*\)/)).not.toBeNull();
+  });
+});
 
 describe("effects never read $repoStore", () => {
   it("finds a read in an effect, and nothing in comments, strings or outside effects", () => {

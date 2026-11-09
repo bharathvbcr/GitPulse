@@ -179,7 +179,7 @@ export function matchesFileQuery(path: string, query: FileQuery): boolean {
 export const DEFAULT_FILTER_MAX_MILLIS = 200;
 
 export interface FilteredPaths {
-  paths: string[];
+  paths: readonly string[];
   /**
    * True when the wall-clock budget stopped the scan before the end, so
    * `paths` is a prefix of the answer rather than the answer. The explorer
@@ -210,7 +210,8 @@ export function filterPathsByFileQuery(
   options: { maxMillis?: number } = {},
 ): FilteredPaths {
   if (query.error) return { paths: [], truncated: false };
-  if (query.kind === "all" && !query.ext) return { paths: [...paths], truncated: false };
+  // The input itself, not a copy: see `mergeListedAndStatusPaths`.
+  if (query.kind === "all" && !query.ext) return { paths, truncated: false };
   const deadline = Date.now() + Math.max(1, options.maxMillis ?? DEFAULT_FILTER_MAX_MILLIS);
   const kept: string[] = [];
   for (let i = 0; i < paths.length; i += 1) {

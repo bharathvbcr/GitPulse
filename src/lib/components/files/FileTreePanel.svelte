@@ -142,16 +142,22 @@
     selectedIndex = -1;
   }, 120);
 
+  // The store publishes a fresh object on every change, but keeps the
+  // `statuses` array itself until the statuses change. A derived that returns
+  // the same array does not notify, so everything below recomputes on a status
+  // change and not on a file click, a loading flag or a background tab.
+  const statuses = $derived($repoStore.statuses);
+
   let statusMap = $derived.by(() => {
     const map = new Map<string, FileStatus>();
-    for (const status of $repoStore.statuses) {
+    for (const status of statuses) {
       map.set(status.path, status);
     }
     return map;
   });
 
   let statusCounts = $derived.by(() => {
-    const summary = summarizeStatuses($repoStore.statuses);
+    const summary = summarizeStatuses(statuses);
     return {
       modified: summary.unstaged,
       staged: summary.staged,
@@ -160,7 +166,7 @@
     };
   });
 
-  let dirtyDirs = $derived.by(() => dirtyAncestorCounts($repoStore.statuses.map((s) => s.path)));
+  let dirtyDirs = $derived.by(() => dirtyAncestorCounts(statuses.map((s) => s.path)));
 
   let parsedQuery = $derived.by(() => parseFileQuery(debouncedQuery));
 
@@ -217,7 +223,7 @@
   // flag and error. The repository key, this membership string and HEAD
   // (see `currentHeadTip`) compare by value, so the listing below reloads only
   // when the repository, the set of dirty paths, or HEAD changes.
-  const statusMembership = $derived(statusPathKey($repoStore.statuses));
+  const statusMembership = $derived(statusPathKey(statuses));
 
   // A new repository starts with every folder expanded again.
   $effect(() => {
@@ -249,7 +255,7 @@
   let listedPaths = $derived.by(() =>
     mergeListedAndStatusPaths(
       files,
-      $repoStore.statuses.map((s) => s.path),
+      statuses.map((s) => s.path),
     ),
   );
 
