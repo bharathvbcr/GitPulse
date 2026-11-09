@@ -1,4 +1,5 @@
-#[cfg(test)]
+// Unix only: it writes `#!/bin/sh` wrappers and sets `PermissionsExt` modes.
+#[cfg(all(test, unix))]
 mod adv_w3gb2_tests;
 // macOS only: the QoS classes and the `ps -o pri` band readings it asserts are
 // Darwin's, and `pools::current_thread_qos` exists only there.

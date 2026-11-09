@@ -3523,7 +3523,7 @@ fn run_terminal_inner(
     let is_git = is_git_program(program);
     let should_gate = is_git || manvi_action.is_some();
     let (policy_verdict, gated) = if should_gate {
-        match guard_command(repo_path, &arg_refs) {
+        match guard_command(repo_path, &judged_argv(&arg_refs, is_git)) {
             Ok(verdict) => (Some(verdict), true),
             Err(refusal) => {
                 // Return honest refusal/failure if blocked or gate failed.
@@ -3576,6 +3576,21 @@ fn run_terminal_inner(
         }),
         Err(e) => Err(e),
     }
+}
+
+/// The argv the command gate and the ledger judge. A spelling of git the
+/// console accepts (`GIT.EXE`, `/usr/bin/GIT`, `git.cmd`) is judged as `git`:
+/// the review gate and the ledger's action names match the literal `git`, so
+/// the raw spelling would be gated but read as a non-git command by both. The
+/// program that is spawned stays the one the caller named.
+fn judged_argv<'a>(args: &[&'a str], is_git: bool) -> Vec<&'a str> {
+    let mut judged = args.to_vec();
+    if is_git {
+        if let Some(program) = judged.first_mut() {
+            *program = "git";
+        }
+    }
+    judged
 }
 
 fn validate_argv_bounds(args: &[String]) -> Result<(), String> {
@@ -7703,14 +7718,23 @@ mod tests {
             std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             let program = stub.to_str().unwrap().to_string();
-            match run_terminal(
-                repo.path().to_str().unwrap(),
-                &[program, "status".into()],
-                Some(5),
-            ) {
+            let repo_str = repo.path().to_str().unwrap();
+            let cursor = crate::ledger::latest_cursor(repo_str).unwrap_or(0);
+            let result = run_terminal(repo_str, &[program, "status".into()], Some(5));
+            // Whatever the gate decided, what it judged and the ledger recorded
+            // is `git status`, never the caller's spelling of the program.
+            for judged in judged_rows(repo_str, cursor) {
+                assert_eq!(judged[0], "git", "{name}: the gate judged {judged:?}");
+            }
+            match result {
                 Ok(run) => {
                     assert!(run.gated, "{name} ran ungated");
                     assert!(run.policy.is_some(), "{name} carries no verdict");
+                    assert_eq!(
+                        judged_rows(repo_str, cursor).len(),
+                        1,
+                        "{name}: one gate row for the run"
+                    );
                 }
                 Err(err) => {
                     let message = err.message();
@@ -7723,6 +7747,109 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The argv of every gate row the ledger holds past `cursor`, with its action.
+    #[cfg(unix)]
+    fn judged_rows(repo: &str, cursor: i64) -> Vec<Vec<String>> {
+        crate::ledger::tail(repo, cursor, 1_000)
+            .expect("ledger tail")
+            .into_iter()
+            .filter_map(|row| row.argv_json)
+            .map(|json| serde_json::from_str::<Vec<String>>(&json).expect("argv_json is an argv"))
+            .collect()
+    }
+
+    #[test]
+    fn the_gate_is_handed_git_for_every_spelling_of_git_and_nothing_else_is_rewritten() {
+        for program in [
+            "git",
+            "GIT.EXE",
+            "/usr/bin/GIT",
+            "C:\\Git\\cmd\\git.cmd",
+            "git.",
+        ] {
+            let args = [program, "merge", "topic"];
+            assert_eq!(
+                judged_argv(&args, is_git_program(program)),
+                ["git", "merge", "topic"],
+                "{program}"
+            );
+        }
+        let args = ["gh", "pr", "merge"];
+        assert_eq!(judged_argv(&args, is_git_program("gh")), args);
+    }
+
+    /// A console run of `GIT.EXE merge <attempt branch>` reaches the review
+    /// gate and the ledger as the git merge it is, not as an unknown command
+    /// that happens to be gated. The stub stands in for the executable, so a
+    /// run that was not refused would spawn it and succeed.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_lowercase_git_merge_of_an_attempt_reaches_the_review_gate_and_the_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let config_lock = crate::test_support::env::env_serial();
+        let config = TempDir::new().unwrap();
+        let _env = crate::test_support::env::bind_env(&config_lock)
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                config.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+        let profile = TempDir::new().unwrap();
+        let _profile =
+            crate::workbench::review::use_test_profile(&profile.path().join("profile.sqlite"));
+        let repo = crate::test_support::git_repo();
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "a.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "base"]);
+        crate::test_support::git_in(
+            repo.path(),
+            &["switch", "-q", "-c", "gitpulse/fix-1234abcd"],
+        );
+        std::fs::write(repo.path().join("b.txt"), "b").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "b.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "agent"]);
+        crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+        crate::test_support::trust_repo(repo.path());
+        let repo_str = repo.path().to_str().unwrap();
+        crate::tool_config::set_review_gate(
+            Some(&crate::harness::review::common_dir(repo.path()).unwrap()),
+            Some(true),
+        )
+        .unwrap();
+        let bin = TempDir::new().unwrap();
+        for name in ["GIT.EXE", "GIT"] {
+            let stub = bin.path().join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cursor = crate::ledger::latest_cursor(repo_str).unwrap_or(0);
+            let result = run_terminal(
+                repo_str,
+                &[
+                    stub.to_str().unwrap().to_string(),
+                    "merge".into(),
+                    "gitpulse/fix-1234abcd".into(),
+                ],
+                Some(5),
+            );
+            let message = result.expect_err(&format!(
+                "{name}: landing an attempt with no review must be refused by the review gate"
+            ));
+            assert!(
+                message.message().contains("gitpulse/fix-1234abcd"),
+                "{name}: {}",
+                message.message()
+            );
+            let rows = crate::ledger::tail(repo_str, cursor, 1_000).unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.action == "git.merge")
+                .unwrap_or_else(|| panic!("{name}: no git.merge row in {rows:?}"));
+            let argv: Vec<String> =
+                serde_json::from_str(row.argv_json.as_deref().unwrap()).unwrap();
+            assert_eq!(argv[..2], ["git", "merge"], "{name}");
         }
     }
 

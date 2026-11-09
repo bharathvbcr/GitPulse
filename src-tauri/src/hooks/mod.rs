@@ -1236,6 +1236,9 @@ fn collision_guard_decided(
     // owns the file, the one the scope, the collision scan and the claim are
     // about. They are the same unless the file lies in another checkout.
     let here = root;
+    // Set when the file's nested checkout could not be read, so it was judged
+    // as the session's own file; said beside whatever the judgement returns.
+    let mut owner_note: Option<String> = None;
     let (root, target, other, nested) = match owning_checkout(&here, &file) {
         Owner::Here(target) => (here.clone(), target, None, None),
         Owner::Elsewhere {
@@ -1255,9 +1258,25 @@ fn collision_guard_decided(
                 None,
             );
         }
+        // The nested checkout's owner could not be read, but the file lies
+        // under the session's own checkout: judge it there, as it was judged
+        // before nested checkouts were resolved, and keep the note visible.
+        Owner::Unresolved {
+            why,
+            nested_in_here: Some(target),
+        } => {
+            owner_note = Some(format!(
+                "GitPulse could not read the checkout that owns {} ({why}); it was judged as a file of the session's own checkout.",
+                input.file_path
+            ));
+            (here.clone(), target, None, None)
+        }
         // The file's own checkout could not be established, so it was not
         // judged, and the notice says so rather than reading as a clean pass.
-        Owner::Unresolved(why) => {
+        Owner::Unresolved {
+            why,
+            nested_in_here: None,
+        } => {
             return (
                 unchecked(
                     &input.file_path,
@@ -1268,6 +1287,10 @@ fn collision_guard_decided(
         }
     };
 
+    let with_note = |output: HookOutput| match &owner_note {
+        Some(note) => merge_outputs(HookOutput::notice(note.clone()), output),
+        None => output,
+    };
     let root_arg = root.to_string_lossy().into_owned();
     let here_arg = here.to_string_lossy().into_owned();
     let op = write_op(&input.tool_name, &file);
@@ -1287,11 +1310,11 @@ fn collision_guard_decided(
         // would be a guess, and silence would read as a clean pass. The write
         // still happens, so the claim is recorded.
         return (
-            HookOutput::notice(format!(
+            with_note(HookOutput::notice(format!(
                 "GitPulse could not check this write against the task scope within {}s, and \
                  did not run the collision check either. It ran UNGATED.",
                 budget.as_secs()
-            )),
+            ))),
             Some(pending_claim(&root, &target)),
         );
     };
@@ -1303,7 +1326,7 @@ fn collision_guard_decided(
                 .as_ref()
                 .is_some_and(|specific| specific.permission_decision.is_some())
             {
-                return (output, None);
+                return (with_note(output), None);
             }
             (output, judged.unscoped)
         }
@@ -1326,13 +1349,13 @@ fn collision_guard_decided(
     });
     let Some(risk) = scanned else {
         return (
-            merge_outputs(
+            with_note(merge_outputs(
                 scoped,
                 unchecked(
                     &target,
                     &format!("the scan did not finish within {}s", budget.as_secs()),
                 ),
-            ),
+            )),
             Some(pending_claim(&root, &target)),
         );
     };
@@ -1370,7 +1393,7 @@ fn collision_guard_decided(
         ..pending_claim(&root, &target)
     };
     (
-        announce_unscoped(output, unscoped, Judged::Write, input),
+        with_note(announce_unscoped(output, unscoped, Judged::Write, input)),
         Some(pending),
     )
 }
@@ -1438,7 +1461,13 @@ enum Owner {
     /// Not inside any Git repository.
     NoRepo,
     /// The owner or the family could not be established.
-    Unresolved(String),
+    Unresolved {
+        why: String,
+        /// Set when the file also lies physically under the session's
+        /// checkout: its path there, so the write can still be judged by the
+        /// session's own plan.
+        nested_in_here: Option<String>,
+    },
 }
 
 /// Resolves the checkout that owns `file` (already canonical through its
@@ -1466,11 +1495,10 @@ fn owning_checkout(here: &Path, file: &Path) -> Owner {
     }
     let nested_in_here = repo_relative(here, file);
     let Some(target) = repo_relative(&root, file) else {
-        return Owner::Unresolved(format!(
-            "{} is not a file inside {}",
-            file.display(),
-            root.display()
-        ));
+        return Owner::Unresolved {
+            why: format!("{} is not a file inside {}", file.display(), root.display()),
+            nested_in_here,
+        };
     };
     let common = |repo: &Path| -> Result<PathBuf, String> {
         crate::engine::git_cli::resolve_git_common_dir(repo)
@@ -1484,7 +1512,10 @@ fn owning_checkout(here: &Path, file: &Path) -> Owner {
             same_family: mine == theirs,
             nested_in_here,
         },
-        (Err(why), _) | (_, Err(why)) => Owner::Unresolved(why),
+        (Err(why), _) | (_, Err(why)) => Owner::Unresolved {
+            why,
+            nested_in_here,
+        },
     }
 }
 
@@ -8159,6 +8190,56 @@ done
             let text = rendered(&output);
             assert_eq!(decision_of(&output), None, "{text}");
             assert!(text.contains("did NOT run"), "{text}");
+        }
+
+        /// A directory under the session's checkout whose `.git` cannot be read
+        /// (a leftover `.claude/worktrees/x`): the layout of every case below.
+        fn unreadable_nested(repo: &str, gitfile: &str) -> String {
+            let dir = Path::new(repo).join(".claude/worktrees/x");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".git"), gitfile).unwrap();
+            dir.canonicalize().unwrap().to_string_lossy().into_owned()
+        }
+
+        /// A write under the session's checkout into a nested directory whose
+        /// own checkout cannot be read is judged as the session's own file: a
+        /// task-bound session is refused what its plan does not name, as it was
+        /// before nested checkouts were resolved.
+        #[test]
+        fn a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout() {
+            for gitfile in [
+                "gitdir: /nowhere\n",
+                "no gitdir prefix here\n",
+                "gitdir: /nowhere/.git/worktrees/x\n",
+            ] {
+                let farm = farm_bound(false, true, 0);
+                let nested = unreadable_nested(&farm.repo, gitfile);
+                let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/foo.rs")));
+                let text = output.render().unwrap_or_default();
+                assert_eq!(
+                    decision_of(&output),
+                    Some(PermissionDecision::Deny),
+                    "{gitfile:?}: {text}"
+                );
+                assert!(
+                    text.contains("could not read the checkout"),
+                    "{gitfile:?}: {text}"
+                );
+            }
+        }
+
+        /// The same layout for a session with no task: the collision scan runs
+        /// on the session's own checkout, not the "did NOT run" notice, and the
+        /// unreadable owner stays visible.
+        #[test]
+        fn an_unbound_session_still_scans_for_a_write_into_an_unreadable_nested_checkout() {
+            let farm = farm_bound(false, false, 0);
+            let nested = unreadable_nested(&farm.repo, "gitdir: /nowhere\n");
+            let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/foo.rs")));
+            let text = output.render().unwrap_or_default();
+            assert_eq!(decision_of(&output), None, "{text}");
+            assert!(!text.contains("did NOT run"), "{text}");
+            assert!(text.contains("could not read the checkout"), "{text}");
         }
 
         /// Git spawns per guarded edit: in-root versus outside-root.

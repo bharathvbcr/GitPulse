@@ -216,6 +216,14 @@ describe("ManviOpsPanel cleanup runs against the repository it asked about", () 
     expect(body).not.toMatch(/\$repoStore\.currentPath !== repo\) break/);
   });
 
+  it("deletes tree-merged branches through the gated clean with a backup, never -d or -D by hand", () => {
+    const body = functionBody(source, "cleanBranches");
+    expect(body).toContain("splitBranchCleanup(selected, selectedBranches)");
+    expect(body).toContain("repoStore.deadbranchClean(");
+    expect(body).toMatch(/byTree\.map\(\(c\) => c\.name\),\s*false,\s*true,\s*target/);
+    expect(body).not.toContain("deleteBranch(candidate.name, true");
+  });
+
   it("offers every Undo through the one owner and never restores by hand", () => {
     expect(functionBody(source, "cleanBranches")).toContain("offerBranchUndo(");
     expect(source).not.toContain("repoStore.createBranch(");

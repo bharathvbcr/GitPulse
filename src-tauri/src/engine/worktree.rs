@@ -2420,7 +2420,10 @@ struct ScanPass {
     /// the question.
     not_before: Instant,
     mono: Instant,
+    /// Read only by the shortstat stamp, which exists on unix alone.
+    #[cfg(unix)]
     wall: std::time::SystemTime,
+    #[cfg(unix)]
     racy: Duration,
     real: Instant,
 }
@@ -2430,7 +2433,9 @@ impl ScanPass {
         Self {
             not_before,
             mono: crate::engine::ref_cache::mono_now(),
+            #[cfg(unix)]
             wall: crate::engine::ref_cache::wall_now(),
+            #[cfg(unix)]
             racy: crate::engine::ref_cache::racy_window(),
             real: Instant::now(),
         }
@@ -2444,6 +2449,7 @@ impl ScanPass {
         self.mono + self.real.elapsed()
     }
 
+    #[cfg(unix)]
     fn wall_now(&self) -> std::time::SystemTime {
         self.wall + self.real.elapsed()
     }
@@ -2478,7 +2484,9 @@ impl ScanPass {
 ///   successes are kept, and at most [`MAX_DIFF_STAMPS`] at once.
 mod diff_stamp {
     use super::{ScanPass, WorktreeDiffStat};
-    use crate::engine::ref_cache::{user_config_paths, ChangeStamp};
+    #[cfg(unix)]
+    use crate::engine::ref_cache::user_config_paths;
+    use crate::engine::ref_cache::ChangeStamp;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -2486,8 +2494,11 @@ mod diff_stamp {
 
     pub(super) const DIFF_STAMP_TTL: Duration = Duration::from_secs(60);
     pub(super) const MAX_DIFF_STAMPS: usize = 64;
+    #[cfg(unix)]
     const MAX_STAMPED_PATHS: usize = 1024;
 
+    // Built only by the unix `capture`; elsewhere `capture` yields `None`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[derive(Debug, PartialEq, Eq)]
     pub(super) struct DiffStamp {
         head: String,

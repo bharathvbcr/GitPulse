@@ -3,7 +3,9 @@ import {
   formatReleaseDate,
   releaseTagSuggestion,
   summarizeCommitReview,
+  splitBranchCleanup,
   summarizeReleases,
+  type BranchCleanupCandidate,
   type CommitReviewReport,
   type ReleaseInfo,
 } from "./model";
@@ -65,5 +67,30 @@ describe("MANVI ops helpers", () => {
     };
 
     expect(summarizeCommitReview(report)).toBe("Reviewed all 3 outgoing commits.");
+  });
+});
+
+describe("branch cleanup delete route", () => {
+  const candidate = (name: string, merged_by_tree: boolean): BranchCleanupCandidate => ({
+    name,
+    tip_commit_id: `${name}-tip`,
+    last_summary: "",
+    last_author: "",
+    last_commit_timestamp: 0,
+    upstream_gone: false,
+    merged_by_tree,
+  });
+
+  it("sends a tree-merged branch to the gated clean and an ancestry-merged one to -d", () => {
+    const all = [candidate("anc", false), candidate("sq", true), candidate("anc2", false)];
+    const route = splitBranchCleanup(all, ["sq", "anc"]);
+    expect(route.ancestry.map((c) => c.name)).toEqual(["anc"]);
+    expect(route.byTree.map((c) => c.name)).toEqual(["sq"]);
+  });
+
+  it("never routes a branch that was not selected", () => {
+    const route = splitBranchCleanup([candidate("sq", true), candidate("anc", false)], []);
+    expect(route.ancestry).toEqual([]);
+    expect(route.byTree).toEqual([]);
   });
 });

@@ -38,6 +38,10 @@ pub struct BranchCleanupCandidate {
     pub last_author: String,
     pub last_commit_timestamp: i64,
     pub upstream_gone: bool,
+    /// Merged only because its tree is already in the default branch (a squash
+    /// or rebase merge): `git branch -d` refuses it, so it is deleted through
+    /// the gated dead-branch clean, which re-proves the merge before `-D`.
+    pub merged_by_tree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,12 +210,15 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
     for branch in &local {
         if is_protected(branch) {
             protected_branches += 1;
-        } else if classify_merge(
-            is_ancestry_merged(branch),
-            tree_verdicts.get(branch.name.as_str()).copied(),
-        )
-        .merged
-        {
+        } else {
+            let class = classify_merge(
+                is_ancestry_merged(branch),
+                tree_verdicts.get(branch.name.as_str()).copied(),
+            );
+            if !class.merged {
+                unmerged_branches += 1;
+                continue;
+            }
             candidates.push(BranchCleanupCandidate {
                 name: branch.name.clone(),
                 tip_commit_id: branch.tip_commit_id.clone(),
@@ -219,9 +226,8 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
                 last_author: branch.last_author.clone(),
                 last_commit_timestamp: branch.last_commit_timestamp,
                 upstream_gone: branch.is_gone,
+                merged_by_tree: class.by_tree,
             });
-        } else {
-            unmerged_branches += 1;
         }
     }
     candidates.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1296,6 +1302,33 @@ mod tests {
             Vec::<String>::new(),
             "documented limit: a later rewrite of the squashed file hides the squash (unmerged, safe side)"
         );
+    }
+
+    #[test]
+    fn a_squash_merged_branch_is_flagged_by_tree_and_an_ancestry_merged_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["branch", "anc"]);
+        git(p, &["switch", "-c", "sq"]);
+        commit_file(p, "s.txt", "s", "feat: s");
+        git(p, &["switch", "main"]);
+        git(p, &["merge", "--squash", "sq"]);
+        git(p, &["commit", "-m", "feat: s (#1)"]);
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        let by_tree = |name: &str| {
+            plan.candidates
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not planned: {:?}", names(&plan)))
+                .merged_by_tree
+        };
+        assert!(
+            by_tree("sq"),
+            "squash-merged: git branch -d would refuse it"
+        );
+        assert!(!by_tree("anc"), "ancestry-merged: plain -d deletes it");
     }
 
     #[test]
