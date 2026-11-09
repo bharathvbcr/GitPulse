@@ -116,7 +116,10 @@
         cmd_set_recent_menu: () => null,
         cmd_last_fetch_at: () => null,
         cmd_note_tab_activated: () => null,
-        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        // Wire shape of `CommitGraphPayload` (src/lib/stores/graphStore.ts). The
+        // old `nodes`/`edges` shape made History show a raw "reading 'map'"
+        // TypeError whenever the page was opened by hand.
+        cmd_get_commit_graph: () => ({ rows: [], head_id: null, refs: [], has_more: false }),
         cmd_workspace_sync: () => ({ repos: [] }),
         cmd_devcouncil_init: (a) => ({
           repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
