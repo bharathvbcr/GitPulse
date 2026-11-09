@@ -246,6 +246,10 @@ pub struct BranchStorageSummary {
     /// Local branches already merged into the default branch — deletable
     /// weight, deliberately identical to MANVI's conservative cleanup plan.
     pub merged_stale_count: usize,
+    /// Unmerged local branches whose squash/rebase comparison did not run, so
+    /// `merged_stale_count` may undercount (the plan's `unchecked_branches`).
+    #[serde(default)]
+    pub merged_unchecked_count: usize,
     /// Local branches whose upstream no longer exists on the remote.
     pub gone_upstream_count: usize,
     pub sample_merged_stale: Vec<String>,
@@ -1741,11 +1745,14 @@ fn branch_summary(repo_path: &str) -> BranchStorageSummary {
         .map(|b| b.name.clone())
         .collect();
 
-    // Reuse MANVI's conservative cleanup plan so the two surfaces can never
-    // disagree about what is safely deletable.
+    // Reuse the ops cleanup plan, which applies the dead-branch scan's own
+    // merge rule (`deadbranch::classify_merge`): this panel, the ops panel and
+    // the cleanup modal count the same branches as merged. A gone upstream is
+    // counted above as a fact about the remote, never as a merge.
     match crate::ops::branch_cleanup_plan(repo_path) {
         Ok(plan) => {
             summary.merged_stale_count = plan.candidates.len();
+            summary.merged_unchecked_count = plan.unchecked_branches;
             summary.sample_merged_stale = plan
                 .candidates
                 .iter()
@@ -2441,6 +2448,7 @@ mod tests {
             local_count: 0,
             remote_tracking_count: 0,
             merged_stale_count: 0,
+            merged_unchecked_count: 0,
             gone_upstream_count: 0,
             sample_merged_stale: Vec::new(),
             sample_gone_upstream: Vec::new(),

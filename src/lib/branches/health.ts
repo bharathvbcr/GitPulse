@@ -90,7 +90,9 @@ export function branchHealth(
       code: "gone",
       level: "attention",
       title: "Upstream gone",
-      detail: `The upstream ${branch.upstream ?? "branch"} no longer exists on the remote. It was probably deleted after merging.`,
+      detail:
+        `The upstream ${branch.upstream ?? "branch"} no longer exists on the remote. ` +
+        "That does not show this branch was merged: check its commits before deleting it.",
     };
   }
 
@@ -110,7 +112,14 @@ export function branchHealth(
   //    Squash and rebase merges are not visible here — that verdict comes from
   //    the dead-branch scan (`StaleBranchInfo.merged_by_tree`), which is the
   //    path that actually runs `git merge-tree`.
-  if (branch.commits_ahead_of_base === 0 && branch.compared_to) {
+  //    The same rule as the backend's `is_ancestry_merged`: the base has moved
+  //    past the branch. One sitting at the base's own tip is as likely a fresh
+  //    branch as a finished one, so it is not called merged.
+  if (
+    branch.commits_ahead_of_base === 0 &&
+    branch.commits_behind_base > 0 &&
+    branch.compared_to
+  ) {
     return {
       code: "merged",
       level: "info",

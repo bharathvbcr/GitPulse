@@ -197,6 +197,7 @@ fn backup_creation_and_restoration_roundtrip() {
         severity: "stale".to_string(),
         is_merged: true,
         merged_by_tree: false,
+        upstream_gone: false,
         is_remote: false,
         is_protected: false,
         is_wip: false,
