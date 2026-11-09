@@ -1398,7 +1398,10 @@
     <!-- `ml-auto` pins Open, its menu and the workspace actions to the
          strip's right edge at every window width, wherever the tabs end. The
          tab list itself stays shrink-wrapped (no flex-1), so its overflow cue
-         marks the last tab rather than empty space. -->
+         marks the last tab rather than empty space.
+         Open and its menu arrow are one split pill: Open's square right edge
+         is the divider, the arrow drops its own left border, and `-ml-1.5`
+         takes back the strip's gap between them. -->
     <button
       type="button"
       title="Open repository"
@@ -1406,13 +1409,13 @@
       data-testid="open-repo-tab"
       data-tour="repository"
       onclick={() => onOpen?.()}
-      class="gp-btn py-1! px-2.5! shrink-0 ml-auto"
+      class="gp-btn h-[26px] py-0! pl-2.5! pr-2! shrink-0 ml-auto rounded-r-none! active:transform-none!"
     >
       <Plus size={13} class="text-accent" />
       <span>Open</span>
     </button>
 
-    <div class="relative shrink-0" data-recents-menu>
+    <div class="relative shrink-0 -ml-1.5" data-recents-menu>
       <button
         bind:this={recentsTriggerEl}
         type="button"
@@ -1425,7 +1428,8 @@
           menu = null;
           recentsOpen = !recentsOpen;
         }}
-        class="gp-icon-btn p-1! h-full"
+        data-testid="open-repo-menu"
+        class="gp-btn h-[26px] py-0! px-1.5! rounded-l-none! border-l-0! active:transform-none!"
       >
         <ChevronDown size={13} />
       </button>
