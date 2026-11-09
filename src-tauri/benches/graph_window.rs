@@ -63,7 +63,7 @@ fn history(count: usize) -> Vec<RawCommitNode> {
     while next > 0 && commits.len() < count {
         // A merge at `next`: first parent next-4, second parent the tip of a
         // side branch next-3 -> next-2 -> next-1 whose root is next-4.
-        if next > 5 && next % 12 == 0 {
+        if next > 5 && next.is_multiple_of(12) {
             commits.push(node(
                 next,
                 vec![format!("{:040x}", next - 4), format!("{:040x}", next - 1)],

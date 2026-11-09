@@ -453,7 +453,7 @@ pub(super) fn commit_graph_page(
             )
         };
         let (history, head, refs, default_branch, hidden) = std::thread::scope(|scope| {
-            let history = (!probe_first).then(|| scope.spawn(&walk));
+            let history = (!probe_first).then(|| scope.spawn(walk));
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
@@ -613,7 +613,7 @@ pub(super) fn commit_graph_page(
         // retried) as it is when the walk runs inline.
         let history = match history {
             Some(history) => history,
-            None => std::thread::scope(|scope| scope.spawn(&walk).join()),
+            None => std::thread::scope(|scope| scope.spawn(walk).join()),
         };
         let history = match history {
             Ok(history) => history,
