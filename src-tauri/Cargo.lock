@@ -1562,6 +1562,7 @@ dependencies = [
  "tokio",
  "tree-sitter",
  "tree-sitter-javascript",
+ "wry",
 ]
 
 [[package]]

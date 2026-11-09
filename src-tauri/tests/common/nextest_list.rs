@@ -11,7 +11,7 @@
 //! entire run. Running is already right: the name and flags it passes are
 //! ignored the same way `cargo test`'s are.
 //!
-//! Declared by `#[path]` in the five `harness = false` targets only, not from
+//! Declared by `#[path]` in the `harness = false` targets only, not from
 //! `common/mod.rs`, so no other test crate compiles it.
 
 /// Answers a `--list` query for the single test `name` and returns `true`, or

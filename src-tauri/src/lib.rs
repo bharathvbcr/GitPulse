@@ -11,6 +11,7 @@ mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
 pub mod analyzer;
+pub mod browser;
 pub mod ci_local;
 pub mod codeintel;
 pub mod commands;
@@ -190,6 +191,10 @@ pub fn run() {
                 let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
                 procguard::set_shutdown_hook(move || teardown::run(&terminals));
             }
+            // M0 browser pane, behind GITPULSE_BROWSER_PANE_URL. Setup runs on
+            // the main thread after the config windows are built.
+            #[cfg(target_os = "macos")]
+            browser::open_from_env(app.handle());
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
             // MCP and gitpulsed do not run this path and stay read-only.
