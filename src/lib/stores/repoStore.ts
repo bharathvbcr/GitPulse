@@ -263,6 +263,16 @@ const REPOSITORY_CHANGED = "The repository changed while this was waiting; nothi
  * staged/unstaged split moves, or the file disappears). After these, the open
  * selection is refetched so the pane stops displaying pre-mutation content.
  */
+/**
+ * `runMutating` options for a mutation that rewrites the index or worktree
+ * bytes and cannot move a ref: stage, unstage, patch staging, discard. Its
+ * refresh is the status facet, the same one the watcher schedules for a
+ * `worktree` or `index` change, so branches and the graph window are not
+ * reloaded. A mutation that can move a ref (commit, checkout, merge, reset,
+ * stash, ...) must not use this.
+ */
+const WORKTREE_ONLY = { facet: "status" } as const satisfies { facet: HydrationFacet };
+
 const REFETCH_SELECTION_KINDS = new Set([
   "stage",
   "unstage",
@@ -3081,6 +3091,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     stageFile: async (filePath: string) =>
       runMutating("stage", filePath, (path) =>
         invokeFn("cmd_stage_file", { repoPath: path, filePath }),
+        WORKTREE_ONLY,
       ),
     unstageFile: async (filePath: string) => {
       const session = activeSession();
@@ -3089,7 +3100,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const filePaths = file ? indexSelectionPaths([file], "unstage") : [filePath];
       return runMutating("unstage", filePath, (path) => filePaths.length > 1
         ? invokeFn("cmd_change_index", { repoPath: path, filePaths, action: "unstage" })
-        : invokeFn("cmd_unstage_file", { repoPath: path, filePath }), { session });
+        : invokeFn("cmd_unstage_file", { repoPath: path, filePath }), { session, ...WORKTREE_ONLY });
     },
     stageSelectivePatch: async (
       filePatch: FilePatch,
@@ -3098,6 +3109,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (isStaging) {
         return runMutating("stage-patch", filePatch.new_path, (path) =>
           invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch }),
+          WORKTREE_ONLY,
         );
       } else {
         return runMutating("unstage-patch", filePatch.new_path, (path) =>
@@ -3105,6 +3117,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             repoPath: path,
             filePatch,
           }),
+          WORKTREE_ONLY,
         );
       }
     },
@@ -3113,7 +3126,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     discardChanges: async (filePath: string, target?: MutationTarget | null) =>
       runMutating("discard", filePath, (path) =>
         invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
-        { target },
+        { target, ...WORKTREE_ONLY },
       ),
     commit: async (message: string, amend: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
@@ -3939,11 +3952,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const finishActivity = beginMutation(session.path, `${kind}-all`);
     try {
       const outcome = await runMutating(`${kind}-all`, `${filePaths.length} paths`, (path) =>
-        invokeFn("cmd_change_index", { repoPath: path, filePaths, action: kind }), { session, trackActivity: false });
+        invokeFn("cmd_change_index", { repoPath: path, filePaths, action: kind }), { session, trackActivity: false, ...WORKTREE_ONLY });
       // Native batches can stop after a completed chunk. Keep activity alive
       // through recovery and retain the diagnostic after hydration.
       if (!outcome.ok) {
-        await store.refresh(session.path);
+        await store.refresh(session.path, "status");
         applyToSession(session.id, session.generation, { error: outcome.error ?? "Index update failed" });
       }
       return outcome;

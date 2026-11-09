@@ -2980,6 +2980,72 @@ describe("repoStore ignore-whitespace preference", () => {
   });
 });
 
+describe("repoStore index and worktree mutations refresh the status facet only", () => {
+  const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
+  const unit = async () => undefined as never;
+  const mixed = [
+    { path: "a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 },
+    { path: "b.ts", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 },
+  ];
+  type Store = ReturnType<typeof makeStore>["store"];
+
+  async function afterMutation(mutate: (store: Store) => Promise<unknown>, extra: Partial<Record<string, InvokeFn>> = {}) {
+    let recording = false;
+    const calls: string[] = [];
+    const base = makeInvoke({
+      cmd_get_status: async () => mixed as never,
+      cmd_stage_file: unit,
+      cmd_unstage_file: unit,
+      cmd_change_index: unit,
+      cmd_stage_selective_patch: unit,
+      cmd_unstage_selective_patch: unit,
+      cmd_discard_changes: unit,
+      cmd_checkout_branch: unit,
+      ...extra,
+    });
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (recording) calls.push(cmd);
+      return base(cmd, args);
+    };
+    const { store, graph } = makeStore(invoke);
+    await store.openRepo("/r/status-only");
+    const loadedBefore = graph.loaded.length;
+    recording = true;
+    await mutate(store);
+    return { calls, graphLoads: graph.loaded.length - loadedBefore };
+  }
+
+  it.each([
+    ["stageFile", (s: Store) => s.stageFile("a.ts")],
+    ["unstageFile", (s: Store) => s.unstageFile("b.ts")],
+    ["stage patch", (s: Store) => s.stageSelectivePatch(patch, true)],
+    ["unstage patch", (s: Store) => s.stageSelectivePatch(patch, false)],
+    ["stageAll", (s: Store) => s.stageAll()],
+    ["unstageAll", (s: Store) => s.unstageAll()],
+    ["discard", (s: Store) => s.discardChanges("a.ts")],
+  ])("%s reloads statuses but neither branches nor the graph window", async (_name, mutate) => {
+    const { calls, graphLoads } = await afterMutation(mutate);
+    expect(calls).toContain("cmd_get_status");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(graphLoads).toBe(0);
+  });
+
+  it("a mutation that can move a ref still reloads branches and the graph window", async () => {
+    const { calls, graphLoads } = await afterMutation((s) => s.checkoutBranch("feature"));
+    expect(calls).toContain("cmd_list_branches");
+    expect(graphLoads).toBe(1);
+  });
+
+  it("a failed bulk index change recovers with the status facet only", async () => {
+    const { calls, graphLoads } = await afterMutation((s) => s.stageAll(), {
+      cmd_change_index: async () => { throw new Error("Index update stopped: index.lock"); },
+    });
+    expect(calls).toContain("cmd_get_status");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(graphLoads).toBe(0);
+  });
+});
+
 describe("repoStore post-mutation selection refetch", () => {
   const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
   const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
@@ -3196,27 +3262,32 @@ describe("repoStore background-refresh flicker hardening", () => {
 
   it("stageAll runs exactly one refresh cycle regardless of file count", async () => {
     let branchListings = 0;
+    let statusReads = 0;
     const invoke = makeInvoke({
       cmd_list_branches: async () => {
         branchListings += 1;
         return snapshotFor("/r/bulk").branches as never;
       },
-      cmd_get_status: async () =>
-        [1, 2, 3].map((n) => ({
+      cmd_get_status: async () => {
+        statusReads += 1;
+        return [1, 2, 3].map((n) => ({
           path: `f${n}.ts`,
           status_code: "M",
           is_staged: false,
           is_conflicted: false,
           additions: 1,
           deletions: 0,
-        })) as never,
+        })) as never;
+      },
     });
     const { store } = makeStore(invoke);
-    await store.openRepo("/r/bulk"); // hydration listing #1
+    await store.openRepo("/r/bulk"); // hydration: status read #1, branch listing #1
     await store.stageAll();
     // Pre-fix this was 1 + N (one full refresh per staged file): each cycle
-    // flipped the spinner and re-rendered the sidebar N times in a row.
-    expect(branchListings).toBe(2);
+    // flipped the spinner and re-rendered the sidebar N times in a row. Now
+    // one status refresh and no branch listing: the index cannot move a ref.
+    expect(statusReads).toBe(2);
+    expect(branchListings).toBe(1);
   });
 
   it("settles a no-change stats drain without extra publishes", async () => {
