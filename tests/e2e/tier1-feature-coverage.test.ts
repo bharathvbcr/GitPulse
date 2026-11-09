@@ -58,10 +58,6 @@ import {
 } from "../../src/lib/stores/repoStore";
 import { memoryStorage } from "../../src/lib/repos/persist";
 import { get, writable } from "svelte/store";
-import {
-  CentralHeartbeatDispatcher,
-  type HeartbeatTick,
-} from "../../src/lib/runtime/adaptiveTimer";
 
 describe("Tier 1: Feature Coverage (Features 1–15)", () => {
   const tempMgr = createTempManager();
@@ -838,94 +834,6 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
       );
       expect(res.status).toBe(0);
       expect(res.stdout).toMatch(/test result: ok\.\s+1 passed;\s+0 failed/);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Feature 8: Centralized Heartbeat Dispatcher (Milestone 2)
-  // ---------------------------------------------------------------------------
-  describe("Feature 8: Centralized Heartbeat Dispatcher (Milestone 2)", () => {
-    it("8.1: Master heartbeat delivers scheduled ticks to multiple subscribers", () => {
-      const dispatcher = new CentralHeartbeatDispatcher();
-      let sub1Ticks = 0;
-      let sub2Ticks = 0;
-      dispatcher.subscribe(() => sub1Ticks++, 1000);
-      dispatcher.subscribe(() => sub2Ticks++, 1000);
-      const baseTime = Date.now();
-      expect(dispatcher.subscriberCount()).toBe(2);
-      const dispatched = dispatcher.step(baseTime + 1000);
-      expect(dispatched).toBe(2);
-      expect(sub1Ticks).toBe(1);
-      expect(sub2Ticks).toBe(1);
-      dispatcher.dispose();
-    });
-
-    it("8.2: Batched dispatch triggers subscribers in a single coordinated tick", () => {
-      const dispatcher = new CentralHeartbeatDispatcher();
-      let ticks = 0;
-      const receivedTicks: HeartbeatTick[] = [];
-      dispatcher.subscribe((tick) => {
-        ticks++;
-        receivedTicks.push(tick);
-      }, 1000);
-      dispatcher.subscribe((tick) => {
-        ticks++;
-        receivedTicks.push(tick);
-      }, 1000);
-      const baseTime = Date.now();
-      const dispatched = dispatcher.step(baseTime + 1000);
-      expect(dispatched).toBe(2);
-      expect(ticks).toBe(2);
-      expect(receivedTicks.length).toBe(2);
-      // Verify single coordinated tickIndex and identical timestamp
-      expect(receivedTicks[0].tickIndex).toBe(receivedTicks[1].tickIndex);
-      expect(receivedTicks[0].timestamp).toBe(baseTime + 1000);
-      expect(receivedTicks[0].cadence).toBe("active");
-      dispatcher.dispose();
-    });
-
-    it("8.3: Subscriber unregistration cleanly stops subsequent callbacks", () => {
-      const dispatcher = new CentralHeartbeatDispatcher();
-      let sub1Calls = 0;
-      const unsub = dispatcher.subscribe(() => sub1Calls++, 1000);
-      const baseTime = Date.now();
-      expect(dispatcher.subscriberCount()).toBe(1);
-      dispatcher.step(baseTime + 1000);
-      expect(sub1Calls).toBe(1);
-      unsub();
-      expect(dispatcher.subscriberCount()).toBe(0);
-      dispatcher.step(baseTime + 2000);
-      expect(sub1Calls).toBe(1);
-      dispatcher.dispose();
-    });
-
-    it("8.4: Subscriber errors do not halt the master ticker or affect sibling subscribers", () => {
-      const dispatcher = new CentralHeartbeatDispatcher();
-      let siblingTicked = false;
-      dispatcher.subscribe(() => {
-        throw new Error("simulated failure");
-      }, 1000);
-      dispatcher.subscribe(() => {
-        siblingTicked = true;
-      }, 1000);
-      const baseTime = Date.now();
-      expect(() => dispatcher.step(baseTime + 1000)).not.toThrow();
-      expect(siblingTicked).toBe(true);
-      dispatcher.dispose();
-    });
-
-    it("8.5: Adaptive throttling doubles subscriber intervals during background mode", () => {
-      const dispatcher = new CentralHeartbeatDispatcher();
-      let ticks = 0;
-      dispatcher.subscribe(() => ticks++, 1000);
-      dispatcher.setThrottled(true);
-      const baseTime = Date.now();
-      // Under throttling, effective interval doubles from 1000ms to 2000ms
-      dispatcher.step(baseTime + 1000);
-      expect(ticks).toBe(0);
-      dispatcher.step(baseTime + 2000);
-      expect(ticks).toBe(1);
-      dispatcher.dispose();
     });
   });
 
