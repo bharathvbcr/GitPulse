@@ -32,7 +32,7 @@ function hits(rule: number, name: string, as?: string): Violation[] {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** rule -> [positive count, svelte negative file exists] */
-const SVELTE_RULES: Record<number, number> = { 1: 4, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5 };
+const SVELTE_RULES: Record<number, number> = { 1: 4, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10 };
 
 describe("design-lint rules: one positive and one negative fixture each", () => {
   for (const [rule, expected] of Object.entries(SVELTE_RULES)) {
@@ -85,16 +85,10 @@ describe("design-lint rules: one positive and one negative fixture each", () => 
     expect(lintSource("src/lib/ui/transitions.ts", fixture("rule-10.positive.ts.txt")).filter((v) => v.rule === 10)).toEqual([]);
   });
 
-  it("rule 3 leaves the copy vocabulary alone, and the exemption stays inside that directory", () => {
-    const src = 'export const note = "Tailwind important suffix (border-red-500/60!) does not match";\n';
-    const rule3 = (file: string) => lintSource(file, src).filter((v) => v.rule === 3);
-    expect(rule3("src/lib/ui/copy/vocabulary.ts")).toEqual([]);
-    expect(rule3("src/lib/ui/copy/nested/other.ts")).toEqual([]);
-    for (const leak of ["src/lib/ui/copyright/vocabulary.ts", "src/lib/ui/other.ts", "src/lib/components/ui/copy/vocabulary.ts", "src/lib/ui/color/oklch.ts"]) {
-      expect(rule3(leak), leak).toHaveLength(1);
-    }
-    // Only rule 3 is exempt: another rule still reads the directory.
-    expect(lintSource("src/lib/ui/copy/x.ts", 'export const d = { duration: 300 };\n').filter((v) => v.rule === 10)).toHaveLength(1);
+  it("rule 3 reads the copy vocabulary like any other file: it holds no palette class", () => {
+    const real = readFileSync(fileURLToPath(new URL("../src/lib/ui/copy/vocabulary.ts", import.meta.url)), "utf8");
+    expect(lintSource("src/lib/ui/copy/vocabulary.ts", real).filter((v) => v.rule === 3)).toEqual([]);
+    expect(lintSource("src/lib/ui/copy/vocabulary.ts", 'export const n = "border-red-500/60!";\n').filter((v) => v.rule === 3)).toHaveLength(1);
   });
 
   it("TypeScript files run no rule but 3 and 10", () => {
@@ -166,26 +160,104 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
 });
 
 describe("design-lint registry", () => {
-  it("has one entry per rule 1-13 and 15, and none for 14 (owned by the vocabulary lane)", () => {
-    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]);
+  it("has one entry per rule 1-15, rule 14 being the single banned-terms entry", () => {
+    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     expect(new Set(RULES.map((r) => r.name)).size).toBe(RULES.length);
     for (const r of RULES) expect(r.summary).not.toBe("");
+    expect(RULES.filter((r) => r.id === 14).map((r) => r.name)).toEqual(["banned-ui-terms"]);
+  });
+});
+
+describe("design-lint rule 14: banned UI terms", () => {
+  const rule14 = (src: string, file = "src/lib/x.svelte") => lintSource(file, src).filter((v) => v.rule === 14);
+
+  it("reads exactly the vocabulary's BANNED_UI_TERMS, and nothing from the retired-verb or voice lists", () => {
+    const found = rule14("<p>It will reload and you must click Click here! Fetch it successfully</p>");
+    expect(found.map((v) => v.message)).toEqual([expect.stringContaining("successfully")]);
+    // RETIRED_VERB_TERMS / VOICE_TERMS words ("reload", "!") are not rule 14.
+    expect(rule14("<p>Reload now!</p>")).toEqual([]);
   });
 
-  it("takes rule 14 as a single entry", () => {
-    const banned = {
-      id: 14,
-      name: "banned-terms",
-      summary: "banned copy term",
-      svelte: true,
-      ts: false,
-      css: false,
-      run(m: { userStrings: { start: number; text: string }[] }, report: (offset: number, message: string) => void) {
-        for (const s of m.userStrings) if (/\bsidecar\b/.test(s.text)) report(s.start, "sidecar");
-      },
+  it("names the hit, the listed term and the replacement, at the position of the match", () => {
+    const [hit] = rule14("<p>\n  Last attempt</p>");
+    expect(hit).toMatchObject({ rule: 14, line: 2, col: 8 });
+    expect(hit.message).toBe('"attempt" (attempt): say "run"');
+  });
+
+  it("reports every occurrence in a text node, and each entry that matches the same words", () => {
+    expect(rule14("<p>An attempt, then another attempt</p>")).toHaveLength(2);
+    expect(rule14("<p>The repo map</p>").map((v) => v.message.match(/\(([^)]+)\)/)?.[1])).toEqual(["repo map", "repo"]);
+  });
+
+  it("is case sensitive where the vocabulary is (MANVI yes, Manvi no) and not where it is not", () => {
+    expect(rule14("<p>MANVI policy</p>")).toHaveLength(1);
+    expect(rule14("<p>Manvi policy</p>")).toEqual([]);
+    expect(rule14("<p>Options</p><p>options</p>")).toHaveLength(1);
+    expect(rule14("<p>ATTEMPT</p>")).toHaveLength(1);
+  });
+
+  it("does not see code: bare identifiers and property access, a script, an import path or a comment", () => {
+    const src = [
+      '<script lang="ts">',
+      '  import { x } from "$lib/projects/attempt-store";',
+      '  const label = "Retry attempt";',
+      "</script>",
+      "<!-- the attempt lane -->",
+      "<p>{attempt} {run.attempt.lane} {project} {harness?.repo}</p>",
+    ].join("\n");
+    expect(rule14(src)).toEqual([]);
+  });
+
+  it("reads the string literals of a mustache in text or in a display attribute", () => {
+    expect(rule14('<p>{cond ? "Retry attempt" : "Done"}</p>')).toHaveLength(1);
+    expect(rule14('<p>{cond ? `an attempt on ${x}` : "none"}</p>')).toHaveLength(1);
+    expect(rule14('<a title={x ? "Open repo" : "Close"}>y</a>')).toHaveLength(1);
+    expect(rule14('<Panel heading={x || "No project"} />')).toHaveLength(1);
+    expect(rule14('<a class={x ? "attempt" : ""} href={"/repo"} id={"lane"} data-testid={"attempt"}>y</a>')).toEqual([]);
+  });
+
+  it("skips the mustache strings that are code: comparisons, call arguments, block tags, handlers", () => {
+    expect(rule14('<p>{kind === "attempt" ? "Done" : "Open"}</p>')).toEqual([]);
+    expect(rule14('<p>{"attempt" == kind ? "Done" : "Open"} {kind !== "lane"}</p>')).toEqual([]);
+    expect(rule14('<p>{invoke("devmap_status")} {f(a, "attempt")}</p>')).toEqual([]);
+    expect(rule14('{#if kind === "lane"}<p>x</p>{:else if kind === "attempt"}<p>y</p>{/if}')).toEqual([]);
+    expect(rule14('<Row onTools={() => open("devmap")} onclick={() => go("project")} />')).toEqual([]);
+    // A grouping paren is not a call, and copy next to a comparison is still copy.
+    expect(rule14('<p>{(busy ? "Retry attempt" : "Done")}</p>')).toHaveLength(1);
+    expect(rule14('<p>{kind === "x" ? "Retry attempt" : "Done"}</p>')).toHaveLength(1);
+  });
+
+  it("does not read data-testid or other data-* hooks, on elements or components, but does read data-tip", () => {
+    expect(rule14('<button data-testid="attempt-retry"></button><Row data-testid="project lane" data-x="harness" />')).toEqual([]);
+    expect(rule14('<span data-tip="Open the project"></span>')).toHaveLength(1);
+    expect(rule14('<span data-tooltip="Open the project"></span>')).toHaveLength(1);
+  });
+
+  it("reads the display attributes of an element and any prop of a component, not class, href or id", () => {
+    expect(rule14('<a title="attempt" aria-label="lane" placeholder="project" alt="harness" label="MANVI"></a>')).toHaveLength(5);
+    expect(rule14('<Panel heading="attempt" caption="lane"></Panel>')).toHaveLength(2);
+    expect(rule14('<a class="attempt lane" href="/project/repo" id="harness"></a>')).toEqual([]);
+  });
+
+  it("is a .svelte rule: TypeScript and CSS files never run it", () => {
+    expect(lintSource("src/lib/x.ts", 'export const t = "Retry attempt";\n').filter((v) => v.rule === 14)).toEqual([]);
+    expect(lintSource("src/app.css", ".attempt { content: 'attempt'; }\n").filter((v) => v.rule === 14)).toEqual([]);
+  });
+
+  it("the linter and the vocabulary agree: every listed term is a hit in text, via the shared list", async () => {
+    const { BANNED_UI_TERMS } = await import("../src/lib/ui/copy/vocabulary");
+    const samples: Record<string, string> = {
+      "code graph": "code graph", "repo map": "repo map", codeintel: "codeintel", devmap: "devmap", MANVI: "MANVI",
+      harness: "harness", sidecar: "sidecar", posture: "posture", attempt: "attempt", lane: "lane",
+      "linked checkout": "linked checkout", ticket: "ticket", repo: "repo", project: "project", Preferences: "Preferences",
+      Options: "Options", "min rung": "min rung", rung: "rung", "ledger record": "ledger record", "generation N": "generation 12",
+      is_fresh: "is_fresh", "snake_case identifier": "some_name", successfully: "successfully", Oops: "Oops",
     };
-    const found = lintSource("src/lib/x.svelte", "<p>The sidecar is down</p>", [...RULES, banned] as never);
-    expect(found.filter((v) => v.rule === 14)).toHaveLength(1);
+    for (const t of BANNED_UI_TERMS) {
+      expect(samples[t.term], `a sample for ${t.term}`).toBeDefined();
+      const messages = rule14(`<p>${samples[t.term]}</p>`).map((v) => v.message);
+      expect(messages.some((m) => m.includes(`(${t.term})`)), t.term).toBe(true);
+    }
   });
 });
 

@@ -361,7 +361,7 @@ export const VOICE_TERMS: readonly BannedTerm[] = [
     term: "exclamation mark",
     pattern: /(?<![\w/-])[A-Za-z][A-Za-z']*!(?=\s|$|["'<])|\)!(?=\s|$|["'<])/,
     use: "A period",
-    note: "Voice rule: no exclamation marks. Matches a plain word (letters and apostrophes) or a closing parenthesis followed by ! and then a space, end or quote, so !==, !x, {#if !a} and Tailwind's important suffix (border-red-500/60!) do not match. A TypeScript non-null assertion on a plain identifier followed by a space (value! ) would.",
+    note: "Voice rule: no exclamation marks. Matches a plain word (letters and apostrophes) or a closing parenthesis followed by ! and then a space, end or quote, so !==, !x, {#if !a} and Tailwind's important suffix on a class (a border-color utility ending in /60!) do not match. A TypeScript non-null assertion on a plain identifier followed by a space (value! ) would.",
   },
   {
     term: "British spelling",

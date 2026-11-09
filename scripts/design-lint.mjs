@@ -2,9 +2,10 @@
 /**
  * design-lint: the mechanical half of docs/design/UI_RULES.md section 1.
  *
- * It implements rules 1-13 and 15. Rule 14 (banned copy terms) is owned by the
- * vocabulary lane (`BANNED_UI_TERMS` in src/lib/ui/copy/vocabulary.ts); the
- * registry below (`RULES`) is a flat array, so wiring it is one entry.
+ * It implements rules 1-15. Rule 14 (banned copy terms) reads the list owned
+ * by the vocabulary (`BANNED_UI_TERMS` in src/lib/ui/copy/vocabulary.ts); it is
+ * one entry in the flat `RULES` registry below. That list is a .ts file, which
+ * node loads by type stripping (node 22.18+ / 24+; the repo runs node 26).
  *
  * RATCHET. `--baseline` records per-rule, per-file violation counts in
  * scripts/design-lint.baseline.json together with the commit they were taken
@@ -47,8 +48,6 @@
  *      utility (text-/bg-/border-/ring-... but not sizes, alignment, widths or
  *      arbitrary values). Applies to `.ts` strings too. Misses `text-white`,
  *      `bg-black` (not palette names) and colors built by string concatenation.
- *      The copy vocabulary (`src/lib/ui/copy/`) is exempt: it quotes banned
- *      class spellings in its notes.
  *   4  literals: `#hex` and `rgb(12 34 56)`/`hsl(...)` literals in `.svelte`
  *      markup attributes, mustaches and `<style>` declaration values. In
  *      `<style>` and `style=` any position counts; elsewhere the hex must be a
@@ -95,6 +94,29 @@
  *      literals of a `.svelte` file. Spread (`...args`) is code, not a string,
  *      so it is never seen; strings passed to `console.*` are skipped. Misses
  *      user text assembled in a `.ts` file (the rule is `.svelte` only).
+ *   14 banned UI terms: every `BANNED_UI_TERMS` pattern (and only that list;
+ *      `RETIRED_VERB_TERMS` and `VOICE_TERMS` are separate lists and are not
+ *      read) over `.svelte` text a person sees: markup text nodes, the display
+ *      attributes of rule 13 (title, aria-label, placeholder, alt, label, ...,
+ *      on elements and component props alike), and the string literals inside
+ *      a mustache in a text position or in such an attribute
+ *      (`{busy ? "Retry attempt" : "Done"}`, `title={x ? "Open repo" : "Close"}`).
+ *      Within a mustache a string is CODE, not copy, and skipped, when it is an
+ *      operand of ==, ===, != or !== (`kind === "attempt"`), an argument of a
+ *      call (`invoke("devmap_status")`, `mapFailureMessage("no_cli")`), or sits
+ *      in a block tag (`{#if}`, `{:else if}`, `{@const}`) or an event-handler
+ *      prop (`onTools={() => ...}`). NOT seen: `<script>` strings (imports,
+ *      invoke names, paths; rule 13 does read those, rule 14 does not),
+ *      comments, `class`/`style`, and `data-*` attributes (`data-testid`;
+ *      `data-tip`/`data-tooltip` are display and are read). Blind spots: copy
+ *      passed to a call (`plural(n, "file")`) is skipped with the other
+ *      arguments; copy assembled in script is not seen; component props that
+ *      carry a non-copy value as plain text (`only="devmap"`,
+ *      `field="max_live_runs"`) count, as they do for rule 13. The patterns are
+ *      text approximations (see each entry note in the vocabulary), so
+ *      "project" in a noun phrase the glossary allows and the snake_case shape
+ *      in prose are candidates, not proof. When two entries match the same
+ *      words ("repo map" and "repo") each reports once.
  *   15 reduced motion: in src/app.css, every class that animates (an
  *      `animation`/`transition` declaration other than `none`, or an `@apply`
  *      of `transition*`/`animate-*`) must be named in both the
@@ -115,6 +137,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { BANNED_UI_TERMS } from "../src/lib/ui/copy/vocabulary.ts";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -130,7 +153,7 @@ export const APP_CSS = "src/app.css";
  * @typedef {{ type: "text" | "expr", start: number, end: number }} Seg
  * @typedef {{ tag: number, tagName: string, name: string, nameStart: number, segs: Seg[] }} Attr
  * @typedef {{ text: string, start: number, css: boolean }} ColorRegion
- * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][] }} Model
+ * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][] }} Model
  * @typedef {{ rule: number, file: string, line: number, col: number, message: string }} Violation
  * @typedef {(offset: number, message: string) => void} Report
  * @typedef {{ id: number, name: string, summary: string, svelte: boolean, ts: boolean, css: boolean, run: (m: Model, report: Report) => void }} Rule
@@ -630,7 +653,7 @@ function stringSource(s) {
 export function buildModel(file, src) {
   const kind = kindOf(file);
   /** @type {Model} */
-  const m = { file, kind, src, clean: src, classSources: [], decls: [], cssRules: [], userStrings: [], colorRegions: [], codeRegions: [] };
+  const m = { file, kind, src, clean: src, classSources: [], decls: [], cssRules: [], userStrings: [], copyStrings: [], colorRegions: [], codeRegions: [] };
   if (kind === "css") {
     m.clean = blank(src, cssCommentRanges(src));
     m.cssRules = parseCss(m.clean, 0).rules;
@@ -724,20 +747,76 @@ export function buildModel(file, src) {
   for (const e of p.exprs) m.colorRegions.push({ text: clean.slice(e.start, e.end), start: e.start, css: false });
 
   // Rule 13 text: markup text nodes, display attributes, JS strings.
-  for (const t of p.texts) m.userStrings.push({ start: t.start, end: t.end, text: clean.slice(t.start, t.end) });
+  // Rule 14 reads the markup ones: text a person sees, plus the string literals
+  // of a mustache in a text position or in a display attribute (below), minus
+  // the ones that are code (isCodeOperand), never `<script>` strings.
+  for (const t of p.texts) {
+    const lit = { start: t.start, end: t.end, text: clean.slice(t.start, t.end) };
+    m.userStrings.push(lit);
+    m.copyStrings.push(lit);
+  }
+  /** Mustache bodies whose string literals are copy: see below. @type {[number, number][]} */
+  const copyRanges = [];
+  // A mustache in a text position is copy unless it is a block or tag form
+  // ({#if x === "a"}, {:else if}, {/each}, {@html}, {@const}): those hold code.
+  for (const e of p.exprs) if (!/^\s*[#:/@]/.test(clean.slice(e.start, e.end))) copyRanges.push([e.start, e.end]);
   for (const a of p.attrs) {
     const component = /^[A-Z]/.test(a.tagName);
     if (CLASS_ATTR.test(a.name) || a.name === "style" || a.name.includes(":")) continue;
     if (!(DISPLAY_ATTRS.test(a.name) || (component && !NON_DISPLAY_PROPS.test(a.name)))) continue;
-    for (const sg of a.segs) if (sg.type === "text") m.userStrings.push({ start: sg.start, end: sg.end, text: clean.slice(sg.start, sg.end) });
+    // A test hook or other data-* attribute on a component is an identifier, not copy.
+    const identifier = /^data-/i.test(a.name) && !/^data-(?:tip|tip-guide|tooltip)$/i.test(a.name);
+    for (const sg of a.segs) {
+      if (sg.type === "expr") {
+        if (!identifier && !EVENT_PROP.test(a.name)) copyRanges.push([sg.start, sg.end]);
+        continue;
+      }
+      const lit = { start: sg.start, end: sg.end, text: clean.slice(sg.start, sg.end) };
+      m.userStrings.push(lit);
+      if (!identifier) m.copyStrings.push(lit);
+    }
   }
   for (const s of [...scriptJs.strings, ...p.markupJs.strings]) {
-    if (/console\.\w+\(\s*[`'"]?$/.test(src.slice(Math.max(0, s.start - 40), s.start))) continue;
+    if (CONSOLE_ARG.test(src.slice(Math.max(0, s.start - 40), s.start))) continue;
     m.userStrings.push(s);
+  }
+  for (const s of p.markupJs.strings) {
+    if (CONSOLE_ARG.test(src.slice(Math.max(0, s.start - 40), s.start))) continue;
+    const body = copyRanges.find(([a, b]) => s.start >= a && s.end <= b);
+    if (body && !isCodeOperand(src, body, s)) m.copyStrings.push(s);
   }
   return m;
 }
 
+/** `onTools={() => ...}`, `onclick={...}`: a handler is code (and `only` is not one). */
+const EVENT_PROP = /^on(?:[A-Z:]|(?!ly$)[a-z]+$)/;
+
+/**
+ * Whether a string literal inside a mustache body is code rather than copy:
+ * an operand of an equality test (`x === "allow_once"`, `"a" == x`), or an
+ * argument of a call (`mapFailureMessage("no_cli")`, `openSetupWizard("devmap")`).
+ * A parenthesised group (`(a ? "x" : "y")`) is not a call. Blind spot: a copy
+ * string passed to a call (`plural(n, "file")`) is therefore not seen.
+ * @param {string} src @param {[number, number]} body @param {Lit} s
+ */
+function isCodeOperand(src, body, s) {
+  const before = src.slice(body[0], s.start).replace(/["'`]$/, "");
+  const after = src.slice(s.end).replace(/^["'`]/, "");
+  if (/(?:===|!==|==|!=)\s*$/.test(before)) return true;
+  if (/^\s*(?:===|!==|==|!=)/.test(after.slice(0, 12))) return true;
+  let depth = 0;
+  for (let i = before.length - 1; i >= 0; i--) {
+    const c = before[i];
+    if (c === ")" || c === "]") depth++;
+    else if (c === "(") {
+      if (depth > 0) depth--;
+      else return /[\w$)\]]\s*$/.test(before.slice(0, i));
+    }
+  }
+  return false;
+}
+
+const CONSOLE_ARG = /console\.\w+\(\s*[`'"]?$/;
 const DENY_COLOR_ATTRS = /^(?:href|xlink:href|id|for|name|src|action|form|list|target|popovertarget|aria-controls|aria-labelledby|aria-describedby|aria-owns|aria-activedescendant|style)$/;
 const DISPLAY_ATTRS = /^(?:title|placeholder|alt|label|aria-label|aria-description|aria-placeholder|aria-valuetext|aria-roledescription|data-tip|data-tip-guide|data-tooltip|tooltip|text|message|hint|description|heading|subtitle|caption|summary|legend)$/i;
 const NON_DISPLAY_PROPS = /^(?:id|href|src|name|key|type|role|rel|target|d|viewBox|for|pattern|autocomplete|inputmode|value|icon|variant|size|tone|kind|mode)$/;
@@ -823,17 +902,14 @@ const COLOR_FN = /(?<![\w-])(?:rgb|rgba|hsl|hsla)\(\s*\d/g;
 const OWNERS_OF_MOTION = /^src\/lib\/(?:motion\/|ui\/transitions\.ts$)/;
 
 /**
- * The copy vocabulary (`src/lib/ui/copy/`) is the one place that NAMES the
- * terms and class spellings the rules ban, as data and in prose: its voice
- * note on exclamation marks quotes Tailwind's important suffix with a real
- * palette class (`border-red-500/60!`). Rule 3 therefore does not read this
- * directory. The exemption is deliberately narrow: this one rule, this one
- * directory (an anchored prefix, so `src/lib/ui/copyright/` and
- * `src/lib/components/ui/copy/` are still linted). It is not a baseline bump:
- * the baseline counts what the rules see, and these files are not meant to be
- * seen by rule 3 at all.
+ * `BANNED_UI_TERMS` with the global flag `matchAll` needs (the vocabulary's
+ * patterns carry none, so they stay stateless for every other reader).
  */
-const OWNERS_OF_COPY = /^src\/lib\/ui\/copy\//;
+const GLOBAL_BANNED_TERMS = BANNED_UI_TERMS.map((t) => ({
+  term: t.term,
+  use: t.use,
+  pattern: new RegExp(t.pattern.source, t.pattern.flags.includes("g") ? t.pattern.flags : `${t.pattern.flags}g`),
+}));
 
 // ---------------------------------------------------------------------------
 // Rule 15 helpers.
@@ -980,7 +1056,6 @@ export const RULES = [
     ts: true,
     css: false,
     run(m, report) {
-      if (OWNERS_OF_COPY.test(m.file)) return;
       eachToken(m, (t) => {
         if (PALETTE_UTIL.test(t.util)) report(t.start, `${t.raw}: Tailwind palette color, use a role token (text-ok/warn/danger/info/unknown, text-accent, text-textMuted)`);
         else if (t.variants.includes("dark") && isColorUtil(t.util)) report(t.start, `${t.raw}: dark: color pair, role tokens already follow the theme`);
@@ -1182,6 +1257,23 @@ export const RULES = [
           // The separator argument of split/join/indexOf/... is code, not copy.
           if (s.text === "..." && /\.(?:split|join|indexOf|lastIndexOf|includes|startsWith|endsWith|replace|replaceAll)\(\s*$/.test(m.src.slice(Math.max(0, s.start - 40), s.start - 1))) continue;
           report(at, "'...' in user-visible text: use the single character '…'");
+        }
+      }
+    },
+  },
+  {
+    id: 14,
+    name: "banned-ui-terms",
+    summary: "banned product vocabulary in user-visible .svelte text",
+    svelte: true,
+    ts: false,
+    css: false,
+    run(m, report) {
+      for (const s of m.copyStrings) {
+        for (const term of GLOBAL_BANNED_TERMS) {
+          for (const hit of s.text.matchAll(term.pattern)) {
+            report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`);
+          }
         }
       }
     },
@@ -1431,7 +1523,7 @@ function git(root, args) {
 export function usage() {
   return formatUsage({
     name: "design-lint",
-    summary: "Check UI_RULES section 1 (rules 1-13, 15) against a per-rule, per-file baseline that may only go down.",
+    summary: "Check UI_RULES section 1 (rules 1-15) against a per-rule, per-file baseline that may only go down.",
     flags: [
       { flag: "--baseline", description: "write scripts/design-lint.baseline.json from the current tree and HEAD" },
       { flag: "--allow-dirty", description: "with --baseline: accept uncommitted changes under src/" },
