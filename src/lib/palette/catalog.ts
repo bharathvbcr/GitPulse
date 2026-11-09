@@ -8,7 +8,8 @@ import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
-import { LAUNCHERS } from "../terminal/tabs";
+import { SESSION_TYPES } from "../terminal/tabs";
+import { hostPlatform } from "../stores/platformStore";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
 
@@ -76,15 +77,21 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     // launcher dropdown and the + beside it. Naming each launcher here makes
     // "give me Claude in this repository" one phrase, and it works whether or
     // not the dock is already showing.
-    ...LAUNCHERS.map((launcher) => ({
+    ...SESSION_TYPES.map((launcher) => ({
       id: `terminal-new-${launcher.kind}`,
       label: launcher.kind === "shell"
         ? "New Terminal Session — a shell in this repository"
-        : `New ${launcher.label} Session — in this repository`,
-      keywords: `terminal shell session new ${launcher.label}`,
+        : launcher.kind === "browser"
+          ? "New Browser Session — a local dev server in the terminal dock"
+          : `New ${launcher.label} Session — in this repository`,
+      keywords: launcher.kind === "browser"
+        ? "terminal session new browser web page localhost dev server preview inspect"
+        : `terminal shell session new ${launcher.label}`,
       category: "Workspace",
       icon: Terminal,
-      disabledReason: unavailable,
+      disabledReason: launcher.kind === "browser" && !get(hostPlatform).browser_sessions
+        ? "Browser sessions are available on macOS only for now."
+        : unavailable,
       action: async () => {
         // The palette captured `state` when it was built; refuse rather than
         // start a shell in whichever repository is in front NOW.

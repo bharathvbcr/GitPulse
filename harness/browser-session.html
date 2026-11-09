@@ -1,0 +1,218 @@
+<!doctype html>
+<html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Browser session verification</title></head>
+<body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
+<script type="module">
+  import { mockIPCWithEvents, adoptOutput } from "./tauriMocks";
+  import "../src/app.css";
+  import { createChecks } from "./checks.ts";
+
+  // What is real: the terminal panel, the browser session component, the
+  // placement and occlusion rules, the address bar and the session-type menu.
+  // What is a fixture: the backend, which records every browser command it is
+  // sent, and the page events it would emit.
+  const params = new URLSearchParams(location.search);
+  const calls = [];
+  const spawns = [];
+  const errors = [];
+  let openFails = null;
+  const show = () => { document.getElementById("result").textContent = JSON.stringify({ calls: calls.length, spawns: spawns.length, errors }, null, 1); };
+  addEventListener("error", e => { errors.push(e.message); show(); });
+  addEventListener("unhandledrejection", e => { errors.push(String(e.reason)); show(); });
+  try { localStorage.removeItem("gitpulse.browser.lastAddress"); } catch {}
+
+  mockIPCWithEvents(async (cmd, args) => {
+    if (cmd.startsWith("cmd_browser_")) {
+      calls.push({ cmd, args: structuredClone(args) }); show();
+      if (cmd === "cmd_browser_open" && openFails) { const why = openFails; openFails = null; throw why; }
+      return null;
+    }
+    switch (cmd) {
+      case "cmd_host_platform": return { os: "macos", dock_hiding: true, browser_sessions: true };
+      case "cmd_terminal_spawn": {
+        const id = `fixture-${spawns.length + 1}`;
+        spawns.push(id); adoptOutput(id, args); show();
+        return { id, cwd: args.repoPath, shell: "/bin/zsh" };
+      }
+      case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_write": case "cmd_terminal_kill": return null;
+      case "cmd_terminal_detach": return true;
+      case "cmd_terminal_sessions": return [];
+      case "cmd_terminal_context": return { process: "zsh", busy: false, jobs: false, cwd: "/fixture/GitPulse", repo_dir: "" };
+      case "cmd_agent_defaults": throw new Error("Unimplemented fixture: cmd_agent_defaults");
+      default: throw new Error(`Unimplemented fixture: ${cmd}`);
+    }
+  });
+
+  const { mount, tick } = await import("svelte");
+  const { emit } = await import("@tauri-apps/api/event");
+  const { loadHostPlatform } = await import("../src/lib/stores/platformStore.ts");
+  const { applyUiScale } = await import("../src/lib/ui/uiScale.ts");
+  await loadHostPlatform();
+  const Host = (await import("./BrowserSessionHost.svelte")).default;
+  mount(Host, { target: document.getElementById("app") });
+  const host = () => Reflect.get(window, "__gpBrowserHost");
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const wait = async (done, what, ms = 4000) => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) { if (done()) return; await sleep(20); }
+    throw new Error(`timed out waiting for ${what}`);
+  };
+  const seen = el => el && el.getClientRects().length > 0;
+  const byLabel = name => [...document.querySelectorAll(`[aria-label="${name}"]`)].find(seen);
+  const byText = (selector, text) => [...document.querySelectorAll(selector)].find(el => seen(el) && el.textContent.trim() === text);
+  const session = () => [...document.querySelectorAll("[data-browser-session]")].find(seen);
+  const placeholder = () => session()?.querySelector("[data-browser-host]");
+  const of = name => calls.filter(c => c.cmd === name);
+  const lastVisible = () => of("cmd_browser_set_visible").at(-1)?.args.visible;
+  const near = (a, b) => Math.abs(a - b) < 1;
+  const sameRect = (bounds, rect, zoom = 1) => near(bounds.x, rect.left * zoom) && near(bounds.y, rect.top * zoom) && near(bounds.width, rect.width * zoom) && near(bounds.height, rect.height * zoom);
+  const type = async (value) => {
+    const input = byLabel("Address");
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+  };
+
+  const run = async () => {
+    const { results, check, stopped } = createChecks();
+    try {
+      await wait(() => byLabel("New session type"), "the terminal panel");
+
+      // ---- the session type -------------------------------------------------
+      byLabel("New session type").click();
+      await wait(() => byText("[role=option]", "Browser"), "the session-type menu");
+      check("The session-type menu offers Browser on a host that reports browser sessions", () => byText("[role=option]", "Browser"));
+      byText("[role=option]", "Browser").click();
+      await tick();
+      check("Choosing it makes Browser the next session type", () => byLabel("New session type").textContent.trim() === "Browser");
+      const spawnsBefore = spawns.length;
+      byLabel("New Browser session").click();
+      await wait(() => session(), "a browser tab");
+      const id = session().dataset.browserSession;
+      check("+ opens a browser tab, labelled Browser, and starts no process", () => byText("[role=tab]", "Browser") && spawns.length === spawnsBefore);
+      check("Nothing is opened before an address is given", () => of("cmd_browser_open").length === 0);
+      check("The address bar offers a local default", () => byLabel("Address").value === "http://localhost:3000/");
+      check("Find and Clear scrollback are off on a browser tab", () => byLabel("Find in terminal").disabled && byLabel("Clear scrollback").disabled);
+
+      // ---- opening ----------------------------------------------------------
+      await type("5173");
+      byText("button", "Open").click();
+      await wait(() => of("cmd_browser_open").length === 1 || session().querySelector("[data-testid=browser-session-error]"), "the open command");
+      check(`Opening raised no error${session().querySelector("[data-testid=browser-session-error]") ? ` (${session().querySelector("[data-testid=browser-session-error]").textContent.trim()})` : ""}`, () => !session().querySelector("[data-testid=browser-session-error]"));
+      const open = of("cmd_browser_open")[0].args;
+      check("A bare port opens http://localhost on it, under the tab's id", () => open.url === "http://localhost:5173" && open.id === id);
+      check("It opens over the tab's content area, in window points", () => sameRect(open.bounds, placeholder().getBoundingClientRect()));
+      await tick();
+      check("The open button becomes Go and history is enabled", () => byText("button", "Go") && !byLabel("Back").disabled);
+
+      // ---- what the page reports --------------------------------------------
+      await emit("browser-pane", { id, kind: "loading", url: "http://localhost:5173/" });
+      await emit("browser-pane", { id, kind: "loaded", url: "http://localhost:5173/home" });
+      await emit("browser-pane", { id, kind: "title", title: "My App" });
+      await emit("browser-pane", { id: "someone-else", kind: "title", title: "Not this tab" });
+      await wait(() => byText("[role=tab]", "My App"), "the page title on the tab");
+      check("The page's title names the tab, and another session's does not", () => byText("[role=tab]", "My App") && !byText("[role=tab]", "Not this tab"));
+      check("The address bar follows the page", () => byLabel("Address").value === "http://localhost:5173/home");
+      await emit("browser-pane", { id, kind: "refused", url: "https://example.com/" });
+      await wait(() => session().querySelector("[data-testid=browser-session-error]"), "the refusal");
+      check("A refused navigation is said, with the address", () => session().querySelector("[data-testid=browser-session-error]").textContent.includes("Blocked https://example.com/"));
+      session().querySelector("[data-testid=browser-session-error] button").click();
+      await tick();
+
+      // ---- navigation -------------------------------------------------------
+      await type("localhost:4000/x");
+      byText("button", "Go").click();
+      await wait(() => of("cmd_browser_navigate").length === 1, "the navigate command");
+      check("A new address navigates the open page", () => of("cmd_browser_navigate")[0].args.url === "http://localhost:4000/x" && of("cmd_browser_open").length === 1);
+      byLabel("Back").click(); byLabel("Forward").click(); byLabel("Reload").click();
+      await wait(() => of("cmd_browser_go").length === 3, "the history commands");
+      check("Back, forward and reload are sent in order", () => of("cmd_browser_go").map(c => c.args.to).join() === "back,forward,reload");
+
+      // ---- placement ---------------------------------------------------------
+      host().setWidth(700);
+      await wait(() => sameRect(of("cmd_browser_set_bounds").at(-1)?.args.bounds ?? { x: -1, y: -1, width: -1, height: -1 }, placeholder().getBoundingClientRect()), "new bounds after a resize");
+      check("A narrower panel moves the page to the new area", () => near(of("cmd_browser_set_bounds").at(-1).args.bounds.width, placeholder().getBoundingClientRect().width));
+      await applyUiScale(1.25, { setZoom: async () => {}, root: { style: { setProperty: () => {} } } });
+      await wait(() => sameRect(of("cmd_browser_set_bounds").at(-1).args.bounds, placeholder().getBoundingClientRect(), 1.25), "bounds at a 1.25 page zoom");
+      check("Under page zoom the page is placed in zoomed points", () => sameRect(of("cmd_browser_set_bounds").at(-1).args.bounds, placeholder().getBoundingClientRect(), 1.25));
+      await applyUiScale(1, { setZoom: async () => {}, root: { style: { setProperty: () => {} } } });
+      await wait(() => sameRect(of("cmd_browser_set_bounds").at(-1).args.bounds, placeholder().getBoundingClientRect()), "bounds back at no zoom");
+
+      // ---- when it shows ------------------------------------------------------
+      const cover = document.createElement("div");
+      cover.setAttribute("role", "dialog");
+      cover.style.cssText = "position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.4)";
+      document.body.append(cover);
+      await wait(() => lastVisible() === false, "the page to hide under a dialog");
+      check("A dialog drawn over the page hides it, and says why", () => lastVisible() === false && session().querySelector("[data-testid=browser-session-covered]"));
+      cover.remove();
+      await wait(() => lastVisible() === true, "the page to come back");
+      check("It shows again when the dialog closes", () => lastVisible() === true);
+
+      const corner = document.createElement("div");
+      const rect = placeholder().getBoundingClientRect();
+      corner.style.cssText = `position:fixed;left:${rect.right - 30}px;top:${rect.bottom - 30}px;width:60px;height:60px;z-index:70`;
+      document.body.append(corner);
+      await wait(() => lastVisible() === false, "the page to hide under a corner overlay");
+      check("An overlay over just a corner hides it too", () => lastVisible() === false);
+      corner.remove();
+      await wait(() => lastVisible() === true, "the page to come back after the corner");
+
+      byText("button", "Console").click();
+      await wait(() => lastVisible() === false, "the page to hide in Console");
+      check("Console mode hides it", () => lastVisible() === false);
+      byText("button", "Shell").click();
+      await wait(() => lastVisible() === true, "the page to return in Shell");
+      check("Shell mode shows it again", () => lastVisible() === true);
+
+      host().setVisible(false);
+      await wait(() => lastVisible() === false, "the page to hide with the dock");
+      check("A hidden dock or repository hides it", () => lastVisible() === false);
+      host().setVisible(true);
+      await wait(() => lastVisible() === true, "the page to return with the dock");
+
+      const shellTab = [...document.querySelectorAll("[role=tab]")].find(el => seen(el) && el.textContent.trim() !== "My App");
+      shellTab.click();
+      await wait(() => lastVisible() === false, "the page to hide behind another tab");
+      check("Another tab in front hides it", () => lastVisible() === false);
+      byText("[role=tab]", "My App").click();
+      await wait(() => lastVisible() === true, "the page to return with its tab");
+      check("Its own tab brings it back", () => lastVisible() === true);
+      check("Visibility was only ever sent when it changed", () => of("cmd_browser_set_visible").every((c, i, all) => i === 0 || c.args.visible !== all[i - 1].args.visible));
+
+      // ---- closing ------------------------------------------------------------
+      byLabel("Close My App").click();
+      await wait(() => of("cmd_browser_close").some(c => c.args.id === id), "the close command");
+      await tick();
+      check("× closes the page without a question, and the tab goes", () => !document.querySelector("[role=alertdialog], [role=dialog]") && !byText("[role=tab]", "My App"));
+
+      // ---- a refused open ---------------------------------------------------
+      byLabel("New Browser session").click();
+      await wait(() => session(), "a second browser tab");
+      const second = session().dataset.browserSession;
+      check("A new session's id is its own", () => second !== id);
+      openFails = "Browser sessions open local development servers only: \"https://example.com/\" is not a loopback address";
+      await type("https://example.com/");
+      byText("button", "Open").click();
+      await wait(() => session().querySelector("[data-testid=browser-session-error]"), "the refused open");
+      check("A refused open is shown in the session, which stays unopened", () => session().querySelector("[data-testid=browser-session-error]").textContent.includes("not a loopback address") && byText("button", "Open"));
+      check("Nothing is shown or moved for a page that never opened", () => !of("cmd_browser_set_visible").some(c => c.args.id === second) && !of("cmd_browser_set_bounds").some(c => c.args.id === second));
+      await type("3001");
+      byText("button", "Open").click();
+      await wait(() => of("cmd_browser_open").some(c => c.args.id === second && c.args.url === "http://localhost:3001"), "the retried open");
+
+      // ---- the panel going away -------------------------------------------
+      host().setMounted(false);
+      await wait(() => of("cmd_browser_close").some(c => c.args.id === second), "the close on unmount");
+      check("Unmounting the panel closes its open pages", () => of("cmd_browser_close").some(c => c.args.id === second));
+      check(`No browser runtime errors${errors.length ? ` (${errors.join(" | ")})` : ""}`, () => errors.length === 0);
+    } catch (error) {
+      stopped(error);
+    } finally {
+      show();
+      document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ calls: calls.map(c => c.cmd), spawns }) })));
+      if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    }
+  };
+  if (params.has("check")) await run();
+</script></body></html>

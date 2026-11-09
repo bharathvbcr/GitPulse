@@ -19,11 +19,14 @@
 //! 4. **Another origin.** The pane navigates to a second loopback server that
 //!    is not `devUrl` and must still have no route. (The pane refuses
 //!    non-loopback URLs, so a real remote origin cannot be loaded here.)
-//! 5. **Policy wiring.** A navigation to a non-loopback URL is cancelled.
+//! 5. **Policy wiring.** A navigation to a non-loopback URL is cancelled, and
+//!    reported as refused. The page's loads and title were reported too.
 //! 6. **Close.** The view leaves the window and is deallocated, and repeated
 //!    open/close cycles leave no views behind.
-//! 7. **Startup flag.** `GITPULSE_BROWSER_PANE_URL` opens nothing for a remote
-//!    URL and the right 40% of the window for a loopback one.
+//! 7. **Two at once.** Two panes, on the devUrl origin and another, are both
+//!    in the window and both without a route; ids are unique and the count is
+//!    capped at `MAX_PANES`; `close_all` (what a main-page reload runs) takes
+//!    every one back out.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
@@ -54,7 +57,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use gitpulse_lib::browser::{self, Bounds};
+    use gitpulse_lib::browser::{self, Bounds, EventSink, PageEvent, PaneEvent};
     use objc2::msg_send;
     use objc2::rc::Weak;
     use objc2::runtime::AnyObject;
@@ -63,11 +66,15 @@ mod mac {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tauri::{AppHandle, Manager, RunEvent};
     use wry::WebViewExtMacOS;
 
-    const DEADLINE: Duration = Duration::from_secs(90);
+    const DEADLINE: Duration = Duration::from_secs(120);
+    /// The pane most steps act on.
+    const A: &str = "pane-a";
+    const B: &str = "pane-b";
     const REPORT_WAIT: Duration = Duration::from_secs(20);
 
     /// One page for every probe; `data-who` says which side it is.
@@ -215,9 +222,9 @@ mod mac {
         }
     }
 
-    /// The pane's native view as a plain object pointer.
-    fn pane_view() -> Result<*mut AnyObject, String> {
-        browser::with_webview(|webview| {
+    /// A pane's native view as a plain object pointer.
+    fn pane_view(id: &str) -> Result<*mut AnyObject, String> {
+        browser::with_webview(id, |webview| {
             objc2::rc::Retained::as_ptr(&webview.webview()) as *mut AnyObject
         })
         .map_err(|e| e.to_string())
@@ -315,13 +322,18 @@ mod mac {
             Err(e) => check.that(false, format!("control: {e}")),
         }
 
-        // 2. The pane, same window, same (devUrl) origin.
+        // 2. The pane, same window, same (devUrl) origin. Its page events are
+        //    collected for step 5.
+        let events: Arc<Mutex<Vec<PaneEvent>>> = Arc::default();
+        let collected = events.clone();
+        let sink: EventSink = Arc::new(move |event| collected.lock().unwrap().push(event));
         let child_url = format!("{dev_origin}child");
         let opened = on_main(app, move |app| {
             let main = app.get_webview_window("main").expect("main window");
             let baseline = subview_count(content_view(&main));
             browser::open(
                 &main,
+                A,
                 &child_url,
                 Bounds {
                     x: 40.0,
@@ -329,6 +341,7 @@ mod mac {
                     width: 320.0,
                     height: 240.0,
                 },
+                Some(sink),
             )
             .map(|()| baseline)
             .map_err(|e| e.to_string())
@@ -364,33 +377,36 @@ mod mac {
             let main = app.get_webview_window("main").expect("main window");
             let content = content_view(&main);
             let ns_window = main.ns_window().unwrap().cast::<AnyObject>();
-            let view = pane_view()?;
+            let view = pane_view(A)?;
             let (in_window, superview): (*mut AnyObject, *mut AnyObject) =
                 unsafe { (msg_send![view, window], msg_send![view, superview]) };
-            let bounds = browser::with_webview(|w| w.bounds())
+            let bounds = browser::with_webview(A, |w| w.bounds())
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             let at = (
                 bounds.position.to_logical::<f64>(1.0),
                 bounds.size.to_logical::<f64>(1.0),
             );
-            browser::set_bounds(Bounds {
-                x: 10.0,
-                y: 20.0,
-                width: 200.0,
-                height: 150.0,
-            })
+            browser::set_bounds(
+                A,
+                Bounds {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 200.0,
+                    height: 150.0,
+                },
+            )
             .map_err(|e| e.to_string())?;
-            let moved = browser::with_webview(|w| w.bounds())
+            let moved = browser::with_webview(A, |w| w.bounds())
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             let moved = (
                 moved.position.to_logical::<f64>(1.0),
                 moved.size.to_logical::<f64>(1.0),
             );
-            browser::set_visible(false).map_err(|e| e.to_string())?;
+            browser::set_visible(A, false).map_err(|e| e.to_string())?;
             let hidden: bool = unsafe { msg_send![view, isHidden] };
-            browser::set_visible(true).map_err(|e| e.to_string())?;
+            browser::set_visible(A, true).map_err(|e| e.to_string())?;
             let shown: bool = unsafe { !msg_send![view, isHidden] };
             Ok::<_, String>((
                 in_window == ns_window,
@@ -428,7 +444,7 @@ mod mac {
         // 4. A second loopback origin that is not devUrl.
         let other = format!("http://127.0.0.1:{other_port}/child");
         let loaded = on_main(app, move |_| {
-            browser::with_webview(|w| w.load_url(&other))
+            browser::with_webview(A, |w| w.load_url(&other))
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())
         });
@@ -454,7 +470,7 @@ mod mac {
         let title = |app: &AppHandle| {
             let (sent, received) = mpsc::channel();
             let scheduled = on_main(app, move |_| {
-                browser::with_webview(|w| {
+                browser::with_webview(A, |w| {
                     w.evaluate_script_with_callback("document.title", move |title| {
                         let _ = sent.send(title);
                     })
@@ -467,7 +483,7 @@ mod mac {
         };
         let before = title(app);
         let _ = on_main(app, |_| {
-            browser::with_webview(|w| w.load_url("data:text/html,<title>refused</title>"))
+            browser::with_webview(A, |w| w.load_url("data:text/html,<title>refused</title>"))
                 .map(|_| ())
         });
         let committed = crate::hermetic_env::wait_until(Duration::from_millis(1500), || {
@@ -478,13 +494,33 @@ mod mac {
             !committed && before.is_some() && before == after,
             format!("policy: a non-loopback (data:) navigation is cancelled (title before {before:?}, after {after:?})"),
         );
+        let seen = events.lock().unwrap().clone();
+        let of_a =
+            |want: &dyn Fn(&PageEvent) -> bool| seen.iter().any(|e| e.id == A && want(&e.event));
+        check.that(
+            of_a(&|e| matches!(e, PageEvent::Refused { url } if url.starts_with("data:"))),
+            "events: the refused navigation was reported as refused",
+        );
+        check.that(
+            of_a(&|e| matches!(e, PageEvent::Loaded { url } if url.ends_with(&format!("{other_port}/child")))),
+            "events: the second origin's load was reported as loaded",
+        );
+        check.that(
+            of_a(&|e| matches!(e, PageEvent::Loading { .. })),
+            "events: a load was reported as started",
+        );
+        check.that(
+            of_a(&|e| matches!(e, PageEvent::Title { title } if title == "child")),
+            "events: the page's title was reported",
+        );
+        check.fact(format!("{} page events from pane A", seen.len()));
 
         // 6. Close: the view leaves the window; cycles leave nothing behind.
         let closed = on_main(app, move |app| {
             let main = app.get_webview_window("main").expect("main window");
-            let view = pane_view()?;
+            let view = pane_view(A)?;
             DEPARTED.with(|slot| *slot.borrow_mut() = Some(Weak::new(unsafe { &*view })));
-            browser::close().map_err(|e| e.to_string())?;
+            browser::close(A).map_err(|e| e.to_string())?;
             let superview: *mut AnyObject = unsafe { msg_send![view, superview] };
             let after_close = subview_count(content_view(&main));
             Ok::<_, String>((superview.is_null(), after_close))
@@ -506,25 +542,17 @@ mod mac {
             "close: the native WKWebView is deallocated (its weak reference clears within 5 s)",
         );
 
+        // about:blank, so no cycle's page can post a report that a later step
+        // would take for its own.
         let cycles = 5;
-        let url = format!("http://127.0.0.1:{other_port}/child");
+        let url = "about:blank";
         let counts = on_main(app, move |app| {
             let main = app.get_webview_window("main").expect("main window");
             let content = content_view(&main);
             let mut counts = Vec::new();
             for _ in 0..cycles {
-                browser::open(
-                    &main,
-                    &url,
-                    Bounds {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 100.0,
-                        height: 100.0,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-                browser::close().map_err(|e| e.to_string())?;
+                browser::open(&main, "cycle", url, SMALL, None).map_err(|e| e.to_string())?;
+                browser::close("cycle").map_err(|e| e.to_string())?;
                 counts.push(subview_count(content));
             }
             Ok::<_, String>(counts)
@@ -537,58 +565,108 @@ mod mac {
             Err(e) => check.that(false, format!("open/close cycles: {e}")),
         }
         check.that(
-            !on_main(app, |_| browser::is_open()),
+            on_main(app, |_| browser::open_count()) == 0,
             "close: no pane is open after the cycles",
         );
 
-        // 7. The startup flag: a remote URL opens nothing; a loopback one
-        //    opens the pane over the right 40% of the main window.
-        // Through the env owner, so the change is serialized and restored.
-        let serial = crate::hermetic_env::env_serial();
-        let remote_flag = crate::hermetic_env::bind_env(&serial)
-            .set("GITPULSE_BROWSER_PANE_URL", "https://example.com/");
-        let remote = on_main(app, |app| {
-            browser::open_from_env(app);
-            browser::is_open()
-        });
-        drop(remote_flag);
-        check.that(
-            !remote,
-            "flag: a non-loopback GITPULSE_BROWSER_PANE_URL opens no pane",
-        );
-        let loopback_flag = crate::hermetic_env::bind_env(&serial).set(
-            "GITPULSE_BROWSER_PANE_URL",
+        // 7. Two panes at once, on the devUrl origin and on another.
+        let (url_a, url_b) = (
+            format!("{dev_origin}child"),
             format!("http://127.0.0.1:{other_port}/child"),
         );
-        let flagged = on_main(app, |app| {
-            browser::open_from_env(app);
+        let both = on_main(app, move |app| {
             let main = app.get_webview_window("main").expect("main window");
-            let scale = main.scale_factor().unwrap();
-            let size = main.inner_size().unwrap().to_logical::<f64>(scale);
-            let bounds = browser::with_webview(|w| w.bounds())
-                .map_err(|e| e.to_string())?
+            browser::open(&main, A, &url_a, SMALL, None).map_err(|e| e.to_string())?;
+            browser::open(&main, B, &url_b, Bounds { x: 120.0, ..SMALL }, None)
                 .map_err(|e| e.to_string())?;
-            let (at, extent) = (
-                bounds.position.to_logical::<f64>(1.0),
-                bounds.size.to_logical::<f64>(1.0),
-            );
-            browser::close().map_err(|e| e.to_string())?;
+            let content = content_view(&main);
+            let (a, b) = (pane_view(A)?, pane_view(B)?);
+            let (above_a, above_b): (*mut AnyObject, *mut AnyObject) =
+                unsafe { (msg_send![a, superview], msg_send![b, superview]) };
             Ok::<_, String>((
-                (at.x, at.y, extent.width, extent.height),
-                (size.width, size.height),
+                above_a == content && above_b == content && a != b,
+                subview_count(content),
             ))
         });
-        drop(loopback_flag);
-        drop(serial);
-        match flagged {
-            Ok(((x, y, w, h), (width, height))) => check.that(
-                (x - width * 0.6).abs() < 1.0 && y == 0.0 && (w - width * 0.4).abs() < 1.0 && (h - height).abs() < 1.0,
-                format!("flag: a loopback URL opens the pane at the right 40% of a {width}x{height} window (got {x},{y} {w}x{h})"),
+        match both {
+            Ok((placed, count)) => {
+                check.that(
+                    placed,
+                    "two panes: both are distinct views under the content view",
+                );
+                check.that(
+                    count == baseline + 2,
+                    format!(
+                        "two panes: the content view holds {} subviews (got {count})",
+                        baseline + 2
+                    ),
+                );
+            }
+            Err(e) => check.that(false, format!("two panes: {e}")),
+        }
+        for (side, reports, who) in [
+            ("pane A (devUrl origin)", main_reports, "child"),
+            ("pane B (second origin)", other_reports, "child"),
+        ] {
+            match report(reports, who) {
+                Ok(r) => no_route(&mut check, &format!("two panes, {side}"), &r),
+                Err(e) => check.that(false, format!("two panes, {side}: {e}")),
+            }
+        }
+
+        // The id is unique and the count is capped.
+        let refusals = on_main(app, move |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            let duplicate = browser::open(&main, A, "about:blank", SMALL, None);
+            let mut opened = browser::open_count();
+            let mut index = 0;
+            while opened < browser::MAX_PANES {
+                browser::open(&main, &format!("cap-{index}"), "about:blank", SMALL, None)
+                    .map_err(|e| e.to_string())?;
+                index += 1;
+                opened = browser::open_count();
+            }
+            let over = browser::open(&main, "one-too-many", "about:blank", SMALL, None);
+            Ok::<_, String>((
+                matches!(duplicate, Err(browser::BrowserError::AlreadyOpen)),
+                matches!(over, Err(browser::BrowserError::TooMany)),
+                opened,
+            ))
+        });
+        match refusals {
+            Ok((duplicate, over, opened)) => {
+                check.that(duplicate, "ids: a second pane under an open id is refused");
+                check.that(over, format!("cap: a pane past {opened} open is refused"));
+            }
+            Err(e) => check.that(false, format!("cap: {e}")),
+        }
+
+        // What a main-page reload runs (`desktop::handle_page_load`).
+        let cleared = on_main(app, move |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            let closed = browser::close_all().map_err(|e| e.to_string())?;
+            Ok::<_, String>((
+                closed,
+                browser::open_count(),
+                subview_count(content_view(&main)),
+            ))
+        });
+        match cleared {
+            Ok((closed, left, count)) => check.that(
+                closed == browser::MAX_PANES && left == 0 && count == baseline,
+                format!("close_all: closed {closed} of {} panes, {left} left, {count} subviews (want {baseline})", browser::MAX_PANES),
             ),
-            Err(e) => check.that(false, format!("flag: a loopback GITPULSE_BROWSER_PANE_URL opens the pane: {e}")),
+            Err(e) => check.that(false, format!("close_all: {e}")),
         }
         check
     }
+
+    const SMALL: Bounds = Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: 100.0,
+        height: 100.0,
+    };
 
     pub fn run() {
         std::thread::spawn(|| {

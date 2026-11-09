@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import { isSessionId, type LauncherKind } from "./tabs";
+import { isSessionId, type LauncherKind, type SessionKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 
@@ -20,7 +20,7 @@ export function isPromptLauncher(value: unknown): value is PromptLauncher {
  */
 
 /** Interactive CLIs that accept an initial prompt. No shell interpolation. */
-export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string[] | null {
+export function agentPromptArgs(launcher: SessionKind, prompt?: string): string[] | null {
   if (prompt === undefined) return null;
   if (!isPromptLauncher(launcher)) {
     throw new Error("Initial prompts require Claude Code, Codex, Grok, or Antigravity");
@@ -57,7 +57,7 @@ interface LaunchRequest {
    * request, open a tab and report capacity refusals, and `agentPromptArgs`
    * already returns "no arguments" for a promptless launch of any kind.
    */
-  launcher: LauncherKind;
+  launcher: SessionKind;
   /** Absent for a plain session; a literal CLI argument when present. */
   prompt?: string;
   complete(error?: string): void;
@@ -91,7 +91,7 @@ export function createTerminalLaunchRequests() {
     forget(id: string) {
       sessions.update(rows => rows.filter(row => row.id !== id));
     },
-    async request(repoPath: string, launcher: LauncherKind, prompt?: string, signal?: AbortSignal): Promise<void> {
+    async request(repoPath: string, launcher: SessionKind, prompt?: string, signal?: AbortSignal): Promise<void> {
       if (!repoPath.trim()) throw new Error("Open a repository before starting a terminal session");
       // Validates here, at the boundary, so a bad prompt is refused before a
       // panel is asked to open a tab for it. A promptless launch returns null

@@ -56,6 +56,7 @@ export type HostOS = "macos" | "windows" | "linux" | "unknown";
 export interface HostPlatform {
   readonly os: string;
   readonly dock_hiding: boolean;
+  readonly browser_sessions: boolean;
 }
 
 /** The same facts with `os` narrowed to a host this app knows how to address. */
@@ -63,6 +64,8 @@ export interface HostProfile {
   readonly os: HostOS;
   /** Whether the Dock/taskbar icon can be hidden for menu-bar-only mode. */
   readonly dock_hiding: boolean;
+  /** Whether browser sessions (a dev server's page in the terminal dock) are built in. */
+  readonly browser_sessions: boolean;
 }
 
 export function isHostOS(value: unknown): value is HostOS {
@@ -99,7 +102,7 @@ export function hostOSFromUserAgent(
  * capability claimed and is refined once `cmd_host_platform` answers.
  */
 export function fallbackHostPlatform(): HostProfile {
-  return { os: hostOSFromUserAgent(), dock_hiding: false };
+  return { os: hostOSFromUserAgent(), dock_hiding: false, browser_sessions: false };
 }
 
 /** Parses the `cmd_host_platform` envelope, falling back on anything unexpected. */
@@ -110,5 +113,5 @@ export function parseHostPlatform(value: unknown): HostProfile {
   // read as "unknown" rather than silently inheriting the webview's guess,
   // which would claim a platform the backend just contradicted.
   const os = isHostOS(raw.os) ? raw.os : "unknown";
-  return { os, dock_hiding: raw.dock_hiding === true };
+  return { os, dock_hiding: raw.dock_hiding === true, browser_sessions: raw.browser_sessions === true };
 }

@@ -39,6 +39,7 @@
     ChevronLeft,
     ChevronRight,
     ChevronsUpDown,
+    Globe,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -46,6 +47,7 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
+  import BrowserSession from "./BrowserSession.svelte";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
@@ -53,8 +55,9 @@
   import { forgetEndedTail } from "../terminal/endedBuffer";
   import ScrollCue from "./ScrollCue.svelte";
   import {
-    LAUNCHERS,
     activateTab,
+    offeredSessionKind,
+    sessionTypesFor,
     canOpenTab,
     MAX_STRIP_TABS,
     closeTab,
@@ -71,7 +74,7 @@
     tabLabel,
     terminalTabChord,
     terminalTabDestination,
-    type LauncherKind,
+    type SessionKind,
     type TabState,
   } from "../terminal/tabs";
   import {
@@ -197,7 +200,18 @@
   const activeId = $derived(tabState.activeId);
   const activeTitle = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.title);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
-  let nextLauncher = $state<LauncherKind>(get(interfaceStore).terminalLauncher);
+  /**
+   * Browser tabs, apart from `sessions` on purpose: a browser runs no process,
+   * so every terminal-only action (find, scrollback, output, context) reaches
+   * `sessions[id]`, finds nothing for a browser tab, and does nothing.
+   */
+  let browsers = $state<Record<string, BrowserSession | undefined>>({});
+  /** The session types this host can open; browser sessions are macOS-only. */
+  const sessionTypes = $derived(sessionTypesFor($hostPlatform.browser_sessions));
+  /** What the reader chose last; shown as `nextLauncher` once this host is known to offer it. */
+  let chosenLauncher = $state<SessionKind>(get(interfaceStore).terminalLauncher);
+  const nextLauncher = $derived(offeredSessionKind(chosenLauncher, $hostPlatform.browser_sessions));
+  const activeIsBrowser = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.launcher === "browser");
   let splitIds = $state<[string, string] | null>(null);
   let tabOptions = $state(false);
   let sessionListOpen = $state(false);
@@ -223,6 +237,22 @@
   const capacityTitle = $derived(canCreate ? "New terminal session" : stripFull
     ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
     : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
+  /**
+   * A browser session holds a tab but no process slot, so only the strip
+   * bounds it here; the backend caps open pages (`browser::MAX_PANES`) and
+   * says so in the session if that is what stops it.
+   */
+  function canCreateKind(kind: SessionKind): boolean {
+    if (kind !== "browser") return canCreate;
+    return !stripFull && $hostPlatform.browser_sessions;
+  }
+  function capacityTitleFor(kind: SessionKind): string {
+    if (kind !== "browser") return capacityTitle;
+    if (!$hostPlatform.browser_sessions) return "Browser sessions are available on macOS only for now";
+    return stripFull
+      ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
+      : "New browser session — a local dev server's page";
+  }
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
   const tabExtras = $derived.by(() => {
@@ -234,7 +264,7 @@
   });
   const filteredTabs = $derived(filterTerminalTabs(tabState.tabs, sessionQuery, tabExtras));
   const filteredSessions = $derived(filterSessionRecords($terminalSessions, sessionListQuery));
-  const filteredLaunchers = $derived(filterLaunchers(LAUNCHERS, launcherQuery));
+  const filteredLaunchers = $derived(filterLaunchers(sessionTypes, launcherQuery));
   /**
    * Compact overlay, not an in-flow chrome row. A full-width `terminal-popover`
    * shoved the PTY down by the height of the type list. The other chrome
@@ -276,14 +306,14 @@
 
   function openLauncherMenu() {
     launcherQuery = "";
-    launcherHighlight = Math.max(0, LAUNCHERS.findIndex((launcher) => launcher.kind === nextLauncher));
+    launcherHighlight = Math.max(0, sessionTypes.findIndex((launcher) => launcher.kind === nextLauncher));
     closeChrome();
     launcherMenuOpen = true;
     void tick().then(() => launcherSearchInput?.focus());
   }
 
-  function chooseLauncher(kind: LauncherKind) {
-    nextLauncher = kind;
+  function chooseLauncher(kind: SessionKind) {
+    chosenLauncher = kind;
     interfaceStore.setTerminalLauncher(kind);
     launcherMenuOpen = false;
   }
@@ -490,8 +520,8 @@
     }
   }
 
-  function newTab(launcher: LauncherKind, initialPrompt?: string): boolean {
-    if (!repoPath || !canCreate) return false;
+  function newTab(launcher: SessionKind, initialPrompt?: string): boolean {
+    if (!repoPath || !canCreateKind(launcher)) return false;
     focusTabStrip = false;
     tabState = openTab(tabState, launcher, initialPrompt);
     if (splitIds && activeId) splitIds = [splitIds[0], activeId];
@@ -504,7 +534,7 @@
    * repository, which is the only place a session may start. An agent CLI
    * treats its working directory as the project root, so it keeps the root.
    */
-  async function openBeside(launcher: LauncherKind): Promise<boolean> {
+  async function openBeside(launcher: SessionKind): Promise<boolean> {
     const fromId = tabState.activeId;
     // An unreadable context offers no directory, so the tab starts at the root.
     const read = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
@@ -544,7 +574,7 @@
       // Close ends the process here, explicitly. Dropping the tab only
       // unmounts it, and an unmount keeps whatever is still running.
       try {
-        await sessions[id]?.close();
+        await (sessions[id] ?? browsers[id])?.close();
       } catch (error: unknown) {
         sessionError = formatError(error);
         return;
@@ -559,6 +589,8 @@
   async function confirmClose(id: string): Promise<boolean> {
     const tab = tabState.tabs.find((candidate) => candidate.id === id);
     if (!tab) return false;
+    // A browser session runs no job to interrupt; its page closes with it.
+    if (tab.launcher === "browser") return true;
     const status = tabStatuses[id];
     const agent = tab.launcher === "shell" ? null : {
       name: launcherLabel(tab.launcher),
@@ -591,10 +623,10 @@
         reveal() {
           mode = "shell";
           selectTab(id);
-          void tick().then(() => sessions[id]?.reveal());
+          void tick().then(() => revealTab(id));
         },
       });
-      claimed.complete(opened ? undefined : capacityTitle);
+      claimed.complete(opened ? undefined : capacityTitleFor(claimed.launcher));
     });
   });
 
@@ -645,6 +677,13 @@
     unread = new Set([...unread].filter((key) => key !== id));
     const { [id]: _gone, ...rest } = sessions;
     sessions = rest;
+    const { [id]: _page, ...pages } = browsers;
+    browsers = pages;
+  }
+
+  /** Brings a tab's session forward: the terminal's grid, or the browser's page. */
+  function revealTab(id: string) {
+    (sessions[id] ?? browsers[id])?.reveal();
   }
 
   function handleChord(event: KeyboardEvent): boolean {
@@ -669,7 +708,7 @@
     if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || shortcutsOpen || sessionSearchOpen || launcherMenuOpen)) {
       closeChrome();
       event.preventDefault(); event.stopPropagation();
-      if (activeId) sessions[activeId]?.reveal();
+      if (activeId) revealTab(activeId);
       return;
     }
     if (handleChord(event)) return;
@@ -714,7 +753,7 @@
     void tick().then(() => {
       if (!visible || mode !== "shell" || activeId !== id) return;
       // Looked up once the tab has mounted, outside the effect's tracking.
-      sessions[id]?.reveal();
+      revealTab(id);
       if (focusTabStrip) tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
     });
   });
@@ -967,8 +1006,8 @@
         </button>
       </div>
       {#if mode === "shell"}
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsBrowser} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsBrowser} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
       {/if}
       {#if mode === "console" && executions.length > 0}
         <button
@@ -1082,6 +1121,9 @@
       <span>A new shell opens in the directory of the shell beside it. Closing a running job, or pasting several lines into a shell that would run each one, asks first.</span>
       <span>Find session searches this repository's tabs. All terminal sessions searches across repositories.</span>
       <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
+      {#if $hostPlatform.browser_sessions}
+        <span>A Browser session opens a local dev server (localhost only) in its own browser with no access to GitPulse. While its page has focus it takes the keys, so these shortcuts work once you click the address bar or the tab strip.</span>
+      {/if}
     </div>
   {/if}
 
@@ -1161,7 +1203,7 @@
             <ChevronDown size={11} />
           </button>
         </div>
-        <button type="button" class="gp-icon-btn" data-terminal-new disabled={!repoPath || !canCreate} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
+        <button type="button" class="gp-icon-btn" data-terminal-new disabled={!repoPath || !canCreateKind(nextLauncher)} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitleFor(nextLauncher)}><Plus size={14} /></button>
       </div>
     </div>
 
@@ -1242,9 +1284,11 @@
         <button type="submit" class="gp-btn py-1!">Rename</button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={tabState.tabs.at(-1)?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, 1))}><ChevronRight size={13} /></button>
-        <select aria-label="Terminal output actions" onchange={outputAction} class="bg-surface border border-border rounded px-1 py-1 text-xs">
-          <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
-        </select>
+        {#if !activeIsBrowser}
+          <select aria-label="Terminal output actions" onchange={outputAction} class="bg-surface border border-border rounded px-1 py-1 text-xs">
+            <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
+          </select>
+        {/if}
       </form>
     {/if}
     <div class="terminal-panes flex-1 min-h-0 relative" class:hidden={mode !== "shell"}>
@@ -1255,9 +1299,16 @@
       {:else if tabState.tabs.length === 0}
         <div class="h-full flex flex-col items-center justify-center gap-3 text-textMuted text-xs">
           <span>No sessions open.</span>
-          <button type="button" class="gp-btn py-1! text-[11px]!" onclick={() => newTab("shell")}>
-            <SquareTerminal size={12} /> New shell
-          </button>
+          <div class="flex items-center gap-2">
+            <button type="button" class="gp-btn py-1! text-[11px]!" onclick={() => newTab("shell")}>
+              <SquareTerminal size={12} /> New shell
+            </button>
+            {#if $hostPlatform.browser_sessions}
+              <button type="button" class="gp-btn py-1! text-[11px]!" data-terminal-new-browser onclick={() => newTab("browser")} title={capacityTitleFor("browser")}>
+                <Globe size={12} /> New browser
+              </button>
+            {/if}
+          </div>
         </div>
       {:else}
         {#each tabState.tabs as tab (tab.id)}
@@ -1274,6 +1325,14 @@
             aria-labelledby={`terminal-tab-${tab.id}`}
             aria-label={tabLabel(tab)}
           >
+            {#if tab.launcher === "browser"}
+            <BrowserSession
+              bind:this={browsers[tab.id]}
+              tabId={tab.id}
+              onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
+              onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
+            />
+            {:else}
             <TerminalSession
               taskRunId={tab.taskRunId}
               resume={tab.resume}
@@ -1291,12 +1350,13 @@
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
-              revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => sessions[tab.id]?.reveal()); }}
+              revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
               confirmCloseSelf={() => confirmClose(tab.id)}
               title={tab.name}
               onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
               onActivity={() => { if (paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
+            {/if}
           </div>
         {/each}
       {/if}

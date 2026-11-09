@@ -257,6 +257,20 @@ pub fn handle_page_load<R: Runtime>(
     if detached > 0 {
         log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
     }
+    // Browser panes are native views the old page laid out. Nothing on the new
+    // page knows them, so left open they would sit over it with no tab, no
+    // address bar and no way to close them. Scheduled rather than run here so
+    // it lands on the main thread wherever this callback is called from.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = webview.app_handle().run_on_main_thread(|| {
+        match crate::browser::close_all() {
+            Ok(0) => {}
+            Ok(closed) => log::info!(target: "browser", "page reloaded; {closed} browser session(s) closed"),
+            Err(error) => log::warn!(target: "browser", "page reloaded; browser sessions were not closed: {error}"),
+        }
+    }) {
+        log::warn!(target: "browser", "page reloaded; closing browser sessions was not scheduled: {error}");
+    }
 }
 
 impl DesktopState {
@@ -620,20 +634,28 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
 /// whole process goes with it. The caller's channel would also never be
 /// answered. Only the message is kept; the panic hook has already logged the
 /// payload and the backtrace.
-fn unwind_to_error(update: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+fn unwind_to_error<T>(update: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(update))
-        .unwrap_or_else(|_| Err("The native menu update panicked and was abandoned".to_string()))
+        .unwrap_or_else(|_| Err("The main-thread update panicked and was abandoned".to_string()))
 }
 
-async fn on_main_thread<R: Runtime, F>(app: AppHandle<R>, update: F) -> Result<(), String>
+/// Runs `update` on the main thread (AppKit's, for anything that touches
+/// native views or menus) and waits, off the async runtime, for its answer.
+/// The native menu and the browser sessions (`browser::commands`) both go
+/// through here.
+pub(crate) async fn on_main_thread<R: Runtime, T, F>(
+    app: AppHandle<R>,
+    update: F,
+) -> Result<T, String>
 where
-    F: FnOnce(&AppHandle<R>) -> Result<(), String> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&AppHandle<R>) -> Result<T, String> + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let handle = app.clone();
     app.run_on_main_thread(move || {
         if sender.send(unwind_to_error(|| update(&handle))).is_err() {
-            log::warn!(target: "desktop", "Native menu caller disconnected");
+            log::warn!(target: "desktop", "A main-thread caller disconnected before its answer");
         }
     })
     .map_err(|error| error.to_string())?;
@@ -642,7 +664,7 @@ where
     })
     .await
     .map_err(|error| error.to_string())?
-    .map_err(|error| format!("Native menu update did not finish: {error}"))?
+    .map_err(|error| format!("The main-thread update did not finish: {error}"))?
 }
 
 #[tauri::command]
@@ -896,9 +918,10 @@ mod tests {
             .manage(DesktopState::default())
             .build(crate::context())
             .unwrap();
-        let outcome = tauri::async_runtime::block_on(on_main_thread(app.handle().clone(), |_| {
-            panic!("the menu rebuild hit an impossible state")
-        }));
+        let outcome = tauri::async_runtime::block_on(on_main_thread(
+            app.handle().clone(),
+            |_| -> Result<(), String> { panic!("the menu rebuild hit an impossible state") },
+        ));
         let message = outcome.expect_err("a panicking update cannot have succeeded");
         assert!(message.contains("panicked"), "unexpected error: {message}");
         let fine = tauri::async_runtime::block_on(on_main_thread(app.handle().clone(), |_| Ok(())));

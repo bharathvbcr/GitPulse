@@ -23,10 +23,38 @@ export const LAUNCHERS: readonly { kind: LauncherKind; label: string }[] = [
   { kind: "agy", label: "Antigravity" },
 ];
 
+/**
+ * What a tab of the terminal dock can be: a process ({@link LauncherKind}) or
+ * a browser session, which shows a local dev server's page in a native view
+ * (`BrowserSession.svelte`) and runs no process. `LauncherKind` stays the
+ * process-only type, since settings, agent defaults and the session registry
+ * are all about processes.
+ */
+export type SessionKind = LauncherKind | "browser";
+
+/** Every session type, in the order the new-session menu lists them. */
+export const SESSION_TYPES: readonly { kind: SessionKind; label: string }[] = [
+  ...LAUNCHERS,
+  { kind: "browser", label: "Browser" },
+];
+
+/**
+ * The session types this host can open. `browserSessions` is the backend's
+ * capability report (`HostPlatform.browser_sessions`), never a guess from the
+ * OS name.
+ */
+export function sessionTypesFor(browserSessions: boolean): readonly { kind: SessionKind; label: string }[] {
+  return browserSessions ? SESSION_TYPES : LAUNCHERS;
+}
+
+/** A stored or requested kind this host can open, or `shell`. */
+export function offeredSessionKind(kind: unknown, browserSessions: boolean): SessionKind {
+  return sessionTypesFor(browserSessions).find((type) => type.kind === kind)?.kind ?? "shell";
+}
 
 export interface TerminalTab {
   id: string;
-  launcher: LauncherKind;
+  launcher: SessionKind;
   /**
    * What the running program last called itself (an OSC 0/2 title), or null
    * while it has said nothing. Null is not "no title" — it is "nothing has
@@ -131,8 +159,8 @@ export interface TabState {
   activeId: string | null;
 }
 
-export function launcherLabel(kind: LauncherKind): string {
-  return LAUNCHERS.find((l) => l.kind === kind)?.label ?? kind;
+export function launcherLabel(kind: SessionKind): string {
+  return SESSION_TYPES.find((l) => l.kind === kind)?.label ?? kind;
 }
 
 /**
@@ -154,11 +182,11 @@ function nextTabId(): string {
   return `tab-${sequence}`;
 }
 
-export function createTab(launcher: LauncherKind, initialPrompt?: string): TerminalTab {
+export function createTab(launcher: SessionKind, initialPrompt?: string): TerminalTab {
   return { id: nextTabId(), launcher, title: null, ...(initialPrompt === undefined ? {} : { initialPrompt }) };
 }
 
-export function initialState(launcher: LauncherKind = "shell", task?: TaskLaunch): TabState {
+export function initialState(launcher: SessionKind = "shell", task?: TaskLaunch): TabState {
   return openTab({ tabs: [], activeId: null }, launcher, task);
 }
 
@@ -220,7 +248,10 @@ export function paneOnScreen({ visible, mode, splitIds, activeId, tabId }: PaneV
  * Silent refusal is the caller's cue to have disabled the control already;
  * this returning the same object is what makes "nothing happened" checkable.
  */
-export function openTab(state: TabState, launcher: LauncherKind, launch?: string | TaskLaunch): TabState {
+export function openTab(state: TabState, launcher: SessionKind, launch?: string | TaskLaunch): TabState {
+  // A browser session runs no process, so it has nothing to hand a prompt or
+  // a task attempt to.
+  if (launcher === "browser" && launch !== undefined) return state;
   const task = typeof launch === "object" ? launch : undefined;
   if (task) {
     const existing = tabFor(state, task);

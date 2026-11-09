@@ -191,10 +191,6 @@ pub fn run() {
                 let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
                 procguard::set_shutdown_hook(move || teardown::run(&terminals));
             }
-            // M0 browser pane, behind GITPULSE_BROWSER_PANE_URL. Setup runs on
-            // the main thread after the config windows are built.
-            #[cfg(target_os = "macos")]
-            browser::open_from_env(app.handle());
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
             // MCP and gitpulsed do not run this path and stay read-only.
@@ -390,6 +386,12 @@ pub fn run() {
             workbench::cmd_workbench_launch_terminal,
             workbench::cmd_inbox_decompose_task,
             host_platform::cmd_host_platform,
+            browser::commands::cmd_browser_open,
+            browser::commands::cmd_browser_set_bounds,
+            browser::commands::cmd_browser_set_visible,
+            browser::commands::cmd_browser_navigate,
+            browser::commands::cmd_browser_go,
+            browser::commands::cmd_browser_close,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,

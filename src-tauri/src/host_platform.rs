@@ -26,6 +26,10 @@ pub struct HostPlatform {
     /// See [`crate::desktop::DOCK_HIDING`] — the activation-policy path exists
     /// only on macOS, so every other host must not be offered the toggle.
     pub dock_hiding: bool,
+    /// Whether browser sessions (a local dev server's page in the terminal
+    /// dock) are compiled in. See [`crate::browser::SUPPORTED`]: the native
+    /// hosting exists only on macOS so far.
+    pub browser_sessions: bool,
 }
 
 impl HostPlatform {
@@ -33,6 +37,7 @@ impl HostPlatform {
         Self {
             os: std::env::consts::OS,
             dock_hiding: crate::desktop::DOCK_HIDING,
+            browser_sessions: crate::browser::SUPPORTED,
         }
     }
 }
@@ -69,6 +74,16 @@ mod tests {
         );
     }
 
+    /// Browser sessions are advertised exactly where their native hosting is
+    /// compiled (`browser::pane` is macOS-only).
+    #[test]
+    fn browser_sessions_track_the_macos_hosting_path() {
+        assert_eq!(
+            HostPlatform::detect().browser_sessions,
+            cfg!(target_os = "macos")
+        );
+    }
+
     /// The wire shape the frontend parses. Renaming a field silently turns the
     /// gate it feeds into `undefined`, which is falsy — a feature would vanish
     /// on every platform rather than fail loudly.
@@ -81,6 +96,10 @@ mod tests {
             object.contains_key("dock_hiding"),
             "missing dock_hiding: {json}"
         );
-        assert_eq!(object.len(), 2, "unexpected extra fields: {json}");
+        assert!(
+            object.contains_key("browser_sessions"),
+            "missing browser_sessions: {json}"
+        );
+        assert_eq!(object.len(), 3, "unexpected extra fields: {json}");
     }
 }
