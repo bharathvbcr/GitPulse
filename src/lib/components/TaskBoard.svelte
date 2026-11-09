@@ -2534,8 +2534,10 @@
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repo:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
-          <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
-          <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
+          <!-- inline-flex: an icon is a block-level svg, so without it the
+               label wrapped under the icon and doubled the header's height. -->
+          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
+          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
         </div>
         {#if initialized}<AutomaticEnhancements {active} compact />{/if}
         {#if initialized}
@@ -3084,9 +3086,10 @@
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
-  /* A rounded card inset in the board, like the columns beside it, rather
-     than a strip ruled off by a full-height line. */
-  .navigator{width:188px;flex-shrink:0;margin:10px 0 10px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:14px;padding:10px 8px;overflow:auto}
+  /* A rounded card that fills the board's left edge, top to bottom, with no
+     gutter: its corners meet the pane's own rounded corners, the same rule
+     as the app sidebar beside it. */
+  .navigator{width:188px;flex-shrink:0;margin:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:14px;padding:10px 8px;overflow:auto}
   .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;background:transparent}
   .navigator button:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
