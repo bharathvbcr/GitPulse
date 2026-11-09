@@ -1220,18 +1220,30 @@ fn collision_guard_decided(
         );
     };
 
-    let file = canonical_through_existing(Path::new(&input.file_path));
+    let file = match canonical_enough(Path::new(&input.file_path)) {
+        Ok(file) => file,
+        Err(why) => {
+            return (
+                unchecked(
+                    &input.file_path,
+                    &format!("the path could not be resolved: {why}"),
+                ),
+                None,
+            );
+        }
+    };
     // `here` is the checkout the session works in; `root` is the checkout that
     // owns the file, the one the scope, the collision scan and the claim are
     // about. They are the same unless the file lies in another checkout.
     let here = root;
-    let (root, target, other) = match owning_checkout(&here, &file) {
-        Owner::Here(target) => (here.clone(), target, None),
+    let (root, target, other, nested) = match owning_checkout(&here, &file) {
+        Owner::Here(target) => (here.clone(), target, None, None),
         Owner::Elsewhere {
             root,
             target,
             same_family,
-        } => (root, target, Some(same_family)),
+            nested_in_here,
+        } => (root, target, Some(same_family), nested_in_here),
         // Outside every Git repository: nothing to judge it against, said as
         // it always was.
         Owner::NoRepo => {
@@ -1267,6 +1279,7 @@ fn collision_guard_decided(
             &scope_root,
             &scope_target,
             same_family,
+            nested.as_deref(),
             op,
         ),
     })) else {
@@ -1417,6 +1430,10 @@ enum Owner {
         /// The two checkouts are the main checkout and linked worktrees of one
         /// repository (they share a common Git directory).
         same_family: bool,
+        /// Set when the file also lies physically under the session's
+        /// checkout (a nested worktree, submodule or repository): its path
+        /// there, which is how it used to be judged.
+        nested_in_here: Option<String>,
     },
     /// Not inside any Git repository.
     NoRepo,
@@ -1427,20 +1444,27 @@ enum Owner {
 /// Resolves the checkout that owns `file` (already canonical through its
 /// existing ancestors; the file itself may not exist yet).
 ///
-/// A file under the session's checkout is judged as it always was, so nothing
-/// that was judged there is judged less. Only a file outside it is looked up:
-/// the nearest enclosing checkout, then whether it shares a repository with the
-/// session's by their canonical common Git directories.
+/// The owner is the NEAREST enclosing checkout: the first directory, walking up
+/// from the file's nearest existing ancestor, that holds a `.git` entry (a
+/// directory or a gitdir file), so a worktree, submodule or repository nested
+/// under the session's checkout is its own checkout, not the session's. That
+/// walk is filesystem-only. The owner is the session's checkout (canonical
+/// compare) is judged as it always was; otherwise whether the two share a
+/// repository is decided by their canonical common Git directories.
 fn owning_checkout(here: &Path, file: &Path) -> Owner {
-    if let Some(target) = repo_relative(here, file) {
-        return Owner::Here(target);
-    }
     let Some(dir) = file.ancestors().skip(1).find(|dir| dir.is_dir()) else {
         return Owner::NoRepo;
     };
     let Some(root) = find_git_root(dir) else {
         return Owner::NoRepo;
     };
+    if root == here {
+        return match repo_relative(here, file) {
+            Some(target) => Owner::Here(target),
+            None => Owner::NoRepo,
+        };
+    }
+    let nested_in_here = repo_relative(here, file);
     let Some(target) = repo_relative(&root, file) else {
         return Owner::Unresolved(format!(
             "{} is not a file inside {}",
@@ -1458,26 +1482,10 @@ fn owning_checkout(here: &Path, file: &Path) -> Owner {
             root,
             target,
             same_family: mine == theirs,
+            nested_in_here,
         },
         (Err(why), _) | (_, Err(why)) => Owner::Unresolved(why),
     }
-}
-
-/// [`canonical_enough`] for a path whose parent may not exist either: the
-/// nearest existing ancestor is canonicalised and the rest re-joined, so a new
-/// file in a new directory of a checkout compares against that checkout's
-/// canonical root (macOS `/var` against `/private/var`).
-fn canonical_through_existing(path: &Path) -> PathBuf {
-    let exact = canonical_enough(path);
-    if exact != path || path.exists() {
-        return exact;
-    }
-    for ancestor in path.ancestors().skip(1) {
-        if let (Ok(real), Ok(rest)) = (ancestor.canonicalize(), path.strip_prefix(ancestor)) {
-            return real.join(rest);
-        }
-    }
-    exact
 }
 
 /// The write-gate operation a file tool performs, in the harness's words.
@@ -3139,23 +3147,58 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// The canonical form of a path that may not exist yet.
+/// How many symbolic links in a row a not-yet-existing write target is followed
+/// through. A chain longer than this is refused, never judged.
+const MAX_LINK_HOPS: usize = 8;
+
+/// The canonical form of a path that may not exist yet, where it will land.
 ///
-/// `Write` creates files, so the target frequently has no inode. Canonicalising
-/// the parent and re-joining the name resolves the symlinks that matter (on
-/// macOS `/tmp` is `/private/tmp`, and a raw prefix comparison against the
-/// worktree root would miss every path under it).
-fn canonical_enough(path: &Path) -> PathBuf {
-    if let Ok(real) = path.canonicalize() {
-        return real;
+/// `Write` creates files, so the target frequently has no inode, and its
+/// parent directories may not exist either. The nearest existing ancestor is
+/// canonicalised and the rest re-joined (on macOS `/tmp` is `/private/tmp`, and
+/// a raw prefix comparison against a worktree root would miss every path
+/// under it). A final component that is a dangling symbolic link is followed
+/// with `read_link` (a relative target against the link's own directory, up to
+/// [`MAX_LINK_HOPS`]), because `Write` through it creates the file at the
+/// target, which may be in another checkout. A chain that does not end is an
+/// error, so the caller says it did not judge rather than judging a wrong path.
+fn canonical_enough(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    for _ in 0..=MAX_LINK_HOPS {
+        if let Ok(real) = current.canonicalize() {
+            return Ok(real);
+        }
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return Ok(canonical_through_existing(&current));
+        }
+        let target = std::fs::read_link(&current).map_err(|error| {
+            format!("{} could not be read as a link: {error}", current.display())
+        })?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            let dir = current.parent().unwrap_or_else(|| Path::new("/"));
+            canonical_through_existing(dir).join(target)
+        };
     }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => match parent.canonicalize() {
-            Ok(real) => real.join(name),
-            Err(_) => path.to_path_buf(),
-        },
-        _ => path.to_path_buf(),
+    Err(format!(
+        "{} passes through more than {MAX_LINK_HOPS} symbolic links",
+        path.display()
+    ))
+}
+
+/// `path` with its nearest existing ancestor canonicalised and the remainder
+/// re-joined unchanged.
+fn canonical_through_existing(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let (Ok(real), Ok(rest)) = (ancestor.canonicalize(), path.strip_prefix(ancestor)) {
+            return real.join(rest);
+        }
     }
+    path.to_path_buf()
 }
 
 /// `file` as a `/`-separated path relative to `root`, or `None` if it is
@@ -6040,6 +6083,80 @@ done
         assert!(!rendered.contains("did NOT run"), "{rendered}");
     }
 
+    /// An independent repository cloned under the session's checkout.
+    #[cfg(unix)]
+    fn nested_repository(parent: &str) -> String {
+        use crate::test_support::git_in;
+        let inner = Path::new(parent).join("vendor/inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        git_in(&inner, &["init", "-b", "main"]);
+        std::fs::write(inner.join("seed.txt"), "seed").unwrap();
+        git_in(&inner, &["add", "seed.txt"]);
+        git_in(&inner, &["commit", "-m", "seed"]);
+        inner.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    /// A repository nested under the cwd checkout owns its own files: one that
+    /// holds the file dirty is named, where it used to be judged as the cwd
+    /// checkout's `vendor/inner/seed.txt`.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_repository_that_holds_the_file_dirty_is_asked_about_naming_it() {
+        let farm = farm_bound(false, false, 0);
+        let inner = nested_repository(&farm.repo);
+        std::fs::write(Path::new(&inner).join("seed.txt"), "theirs").unwrap();
+        let output = guard_here(&edit_call(&farm.repo, &format!("{inner}/seed.txt")));
+        assert!(asks(&output), "{:?}", output.render());
+        assert!(
+            reason_of(&output).contains("vendor/inner"),
+            "{}",
+            reason_of(&output)
+        );
+    }
+
+    /// Owning a nested repository separately never frees a write the cwd
+    /// checkout's plan refused at that path: the session's scope is applied to
+    /// it first, as it was before the nested repository was its own owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_bound_session_is_still_refused_a_write_into_a_nested_repository_outside_its_plan() {
+        let farm = farm_bound(false, true, 0);
+        let inner = nested_repository(&farm.repo);
+        let serial = crate::harness::sidecar::test_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
+        let output = guard_here(&edit_call(&farm.repo, &format!("{inner}/x.rs")));
+        let rendered = output.render().unwrap_or_default();
+        assert_eq!(
+            decision_of(&output),
+            Some(PermissionDecision::Deny),
+            "{rendered}"
+        );
+        assert!(rendered.contains("scope.unplanned"), "{rendered}");
+    }
+
+    /// A symlink chain that never ends is refused with a notice, never judged.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_longer_than_the_hop_bound_is_a_visible_notice() {
+        let farm = farm_bound(false, true, 1);
+        let lane = bound_lane(&farm, 0);
+        let dir = Path::new(&lane);
+        for n in 0..=MAX_LINK_HOPS + 1 {
+            let next = if n == MAX_LINK_HOPS + 1 {
+                "end-missing".to_string()
+            } else {
+                format!("link{}", n + 1)
+            };
+            std::os::unix::fs::symlink(dir.join(next), dir.join(format!("link{n}"))).unwrap();
+        }
+        let output = guard_here(&edit_call(&lane, &format!("{lane}/link0")));
+        let rendered = output.render().unwrap_or_default();
+        assert_eq!(decision_of(&output), None, "{rendered}");
+        assert!(rendered.contains("did NOT run"), "{rendered}");
+        assert!(rendered.contains("symbolic links"), "{rendered}");
+    }
+
     /// [B-agents-01] A path outside every Git repository keeps the notice it
     /// always had, word for word.
     #[cfg(unix)]
@@ -7976,7 +8093,10 @@ done
             let farm = farm_bound(false, true, 0);
             let nested = nested_worktree(&farm.repo, "x");
             crate::ledger::bindings::bind(&farm.repo, &nested, "TASK-HOOK").unwrap();
-            let output = guard_here(&edit_call(&nested, &format!("{}/src/planned.rs", farm.repo)));
+            let output = guard_here(&edit_call(
+                &nested,
+                &format!("{}/src/planned.rs", farm.repo),
+            ));
             assert_eq!(decision_of(&output), Some(PermissionDecision::Deny));
             assert!(rendered(&output).contains(harness::SCOPE_OTHER_CHECKOUT));
         }
@@ -7998,7 +8118,10 @@ done
         fn a_new_file_in_a_new_directory_of_the_main_checkout_is_fenced() {
             let farm = farm_bound(false, true, 1);
             let lane = bound_lane(&farm, 0);
-            let output = guard_here(&edit_call(&lane, &format!("{}/no/such/dir/f.rs", farm.repo)));
+            let output = guard_here(&edit_call(
+                &lane,
+                &format!("{}/no/such/dir/f.rs", farm.repo),
+            ));
             assert_eq!(decision_of(&output), Some(PermissionDecision::Deny));
             assert!(rendered(&output).contains(harness::SCOPE_OTHER_CHECKOUT));
         }
@@ -8009,7 +8132,10 @@ done
         fn a_dotdot_escape_through_missing_directories_is_not_read_as_own_checkout() {
             let farm = farm_bound(false, true, 1);
             let lane = bound_lane(&farm, 0);
-            let sneaky = format!("{lane}/nope/../../../{}/src/planned.rs", farm.repo.trim_start_matches('/'));
+            let sneaky = format!(
+                "{lane}/nope/../../../{}/src/planned.rs",
+                farm.repo.trim_start_matches('/')
+            );
             let output = guard_here(&edit_call(&lane, &sneaky));
             let text = rendered(&output);
             assert!(
@@ -8048,7 +8174,10 @@ done
             let outroot = spawn_cost(&farm.dirs, &marks);
             // Measured on this lane: 3 (1 worktree list, 2 status) each.
             assert_eq!(inroot.total(), 3, "{inroot:?}");
-            assert!(outroot.total() <= inroot.total(), "{outroot:?} vs {inroot:?}");
+            assert!(
+                outroot.total() <= inroot.total(),
+                "{outroot:?} vs {inroot:?}"
+            );
         }
 
         /// A case-variant spelling of a file in a sibling that holds it dirty
@@ -8068,7 +8197,6 @@ done
     mod adv_break {
         use super::adv_held::nested_worktree;
         use super::*;
-        use crate::test_support::git_in;
 
         fn text(output: &HookOutput) -> String {
             output.render().unwrap_or_default()
@@ -8085,7 +8213,11 @@ done
             std::fs::write(Path::new(&nested).join("seed.txt"), "theirs").unwrap();
             let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/seed.txt")));
             assert!(asks(&output), "silent or wrong: {}", text(&output));
-            assert!(text(&output).contains("adv-x") || text(&output).contains("x"), "{}", text(&output));
+            assert!(
+                text(&output).contains("adv-x") || text(&output).contains("x"),
+                "{}",
+                text(&output)
+            );
         }
 
         /// An unbound session editing a file of a bound nested worktree is held
@@ -8101,7 +8233,12 @@ done
             let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
             std::fs::create_dir_all(Path::new(&nested).join("docs")).unwrap();
             let output = guard_here(&edit_call(&lane, &format!("{nested}/docs/other.md")));
-            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
+            assert_eq!(
+                decision_of(&output),
+                Some(PermissionDecision::Deny),
+                "{}",
+                text(&output)
+            );
         }
 
         /// A task-bound session in the main checkout writing into a nested
@@ -8111,8 +8248,17 @@ done
             let farm = farm_bound(false, true, 0);
             let nested = nested_worktree(&farm.repo, "x");
             let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/src/planned.rs")));
-            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
-            assert!(text(&output).contains(harness::SCOPE_OTHER_CHECKOUT), "{}", text(&output));
+            assert_eq!(
+                decision_of(&output),
+                Some(PermissionDecision::Deny),
+                "{}",
+                text(&output)
+            );
+            assert!(
+                text(&output).contains(harness::SCOPE_OTHER_CHECKOUT),
+                "{}",
+                text(&output)
+            );
         }
 
         /// A dangling symlink inside the bound lane whose target is a not yet
@@ -8131,8 +8277,17 @@ done
             let link = format!("{lane}/src/planned.rs");
             std::os::unix::fs::symlink(format!("{}/src/planned.rs", farm.repo), &link).unwrap();
             let output = guard_here(&edit_call(&lane, &link));
-            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
-            assert!(text(&output).contains(harness::SCOPE_OTHER_CHECKOUT), "{}", text(&output));
+            assert_eq!(
+                decision_of(&output),
+                Some(PermissionDecision::Deny),
+                "{}",
+                text(&output)
+            );
+            assert!(
+                text(&output).contains(harness::SCOPE_OTHER_CHECKOUT),
+                "{}",
+                text(&output)
+            );
         }
     }
 }

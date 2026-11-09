@@ -283,8 +283,20 @@ pub(crate) fn check_file_in_other_checkout(
     owner_root: &str,
     owner_target: &str,
     same_family: bool,
+    nested_in_session: Option<&str>,
     op: &str,
 ) -> FileScopeCheck {
+    // A repository nested under the session's checkout (a submodule or an
+    // independent clone) used to be judged by the session's own plan at its
+    // path there. It still is, first, so owning it separately can only add a
+    // refusal; the owner's own binding is then asked as well.
+    if let (false, Some(nested)) = (same_family, nested_in_session) {
+        if let FileScopeCheck::Judged(judged) = check_file_in_scope(session_root, nested, op) {
+            if judged.verdict.blocks() || judged.verdict.gate_failed() {
+                return FileScopeCheck::Judged(judged);
+            }
+        }
+    }
     if same_family {
         match hook_scope(session_root) {
             HookScope::Declared(scope) => {

@@ -3622,7 +3622,10 @@ pub(crate) fn normalized_program(program: &str) -> String {
 /// are.
 fn is_git_program(program: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    normalized_program(name) == "git"
+    // Windows resolves `git.` and `git ` to `git.exe`, so trailing dots and
+    // spaces are not part of the name. Unix has no such rule; gating there is
+    // over-gating, which fails closed.
+    normalized_program(name.trim_end_matches(['.', ' '])) == "git"
 }
 
 fn has_parent_or_absolute_path(value: &str) -> bool {
@@ -7658,6 +7661,11 @@ mod tests {
             "git.cmd",
             "git.bat",
             "C:\\Git\\cmd\\GIT.CMD",
+            "git.",
+            "git ",
+            "git.exe.",
+            "/usr/bin/git. ",
+            "GIT...",
         ] {
             assert!(is_git_program(program), "{program} must be gated as git");
         }
@@ -7677,21 +7685,43 @@ mod tests {
     }
 
     /// The console runs the argv a caller hands it, so the routing is checked
-    /// through the real entry: a git spelling that names an installed binary
-    /// (`GIT` resolves on a case-insensitive filesystem) must come back gated
-    /// or refused, never spawned ungated.
+    /// through the real entry. Each spelling names a real executable (a stub
+    /// that exits 0), so the spawn succeeds and the only open question is the
+    /// routing: the outcome must be a gated run carrying its verdict, or a
+    /// refusal naming why. Any other error, or an ungated run, fails the test.
+    #[cfg(unix)]
     #[test]
     fn a_case_variant_of_git_is_never_spawned_ungated() {
-        let dir = TempDir::new().unwrap();
-        init_test_repo(dir.path());
-        for program in ["GIT", "Git", "git.exe", "git.cmd", "git.bat", "GIT.EXE"] {
-            if let Ok(run) = run_terminal(
-                dir.path().to_str().unwrap(),
-                &[program.into(), "status".into()],
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TempDir::new().unwrap();
+        init_test_repo(repo.path());
+        let bin = TempDir::new().unwrap();
+        for name in [
+            "GIT", "Git", "GIT.EXE", "git.cmd", "git.bat", "git.", "Git.Exe",
+        ] {
+            let stub = bin.path().join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let program = stub.to_str().unwrap().to_string();
+            match run_terminal(
+                repo.path().to_str().unwrap(),
+                &[program, "status".into()],
                 Some(5),
             ) {
-                assert!(run.gated, "{program} ran ungated");
-                assert!(run.policy.is_some(), "{program} carries no verdict");
+                Ok(run) => {
+                    assert!(run.gated, "{name} ran ungated");
+                    assert!(run.policy.is_some(), "{name} carries no verdict");
+                }
+                Err(err) => {
+                    let message = err.message();
+                    assert!(
+                        message.contains("policy")
+                            || message.contains("blocked")
+                            || message.contains("refused")
+                            || message.contains("MANVI"),
+                        "{name}: an unexpected error, not a gate refusal: {message}"
+                    );
+                }
             }
         }
     }
