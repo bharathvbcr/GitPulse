@@ -24,6 +24,14 @@
       // repository now showing. A remount produces a new node, so identity is
       // the mount count; nothing in production is instrumented for this.
       const params = new URLSearchParams(location.search);
+      // `?fill`: for looking at the app by hand. The shell sizes itself to
+      // the viewport (`h-screen w-screen`), so on a window wider or taller
+      // than the 1280×900 stage the stage's overflow clip cut the app off
+      // mid-pane. The checks below measure against the fixed stage, so it
+      // stays the default.
+      if (params.has("fill")) {
+        Object.assign(document.getElementById("app").style, { width: "100vw", height: "100vh" });
+      }
       const errors = [];
       const unexpected = [];
       addEventListener("error", (event) => errors.push(event.message));
