@@ -680,11 +680,24 @@
           await repoStore.openRepo(API, { activate: false });
           interfaceStore.setStackWorktreeTabs(true);
           await settle();
-          // A few tabs, so a spacer that grew would show as a gap. With none left
-          // to overflow the strip, Open must sit right where the last tab ends.
-          check("Open sits right beside the last tab instead of after a growing spacer", () => {
-            const gap = $('[data-testid="open-repo-tab"]').getBoundingClientRect().left - strip().lastElementChild.getBoundingClientRect().right;
-            return strip().scrollWidth <= strip().clientWidth + 1 && gap >= 0 && gap < 24;
+          // A few tabs, so the strip does not overflow and there is free space
+          // between the last tab and the bar's end. Open, its menu and the
+          // workspace actions are pinned to the right edge across that space;
+          // the tab list itself must not grow into it, or its overflow cue
+          // would sit over empty space instead of the last tab.
+          check("Open and the workspace actions sit at the bar's right edge, the tab list stays its own width", () => {
+            const openBtn = $('[data-testid="open-repo-tab"]');
+            const bar = openBtn.parentElement;
+            const barBox = bar.getBoundingClientRect();
+            const padRight = parseFloat(getComputedStyle(bar).paddingRight);
+            const pinnedRight = Math.max(...[...bar.children]
+              .filter((el) => !el.classList.contains("sr-only") && el.getBoundingClientRect().width > 0)
+              .map((el) => el.getBoundingClientRect().right));
+            const listEnd = strip().lastElementChild.getBoundingClientRect().right;
+            return strip().scrollWidth <= strip().clientWidth + 1
+              && Math.abs(barBox.right - padRight - pinnedRight) < 1.5
+              && strip().getBoundingClientRect().right - listEnd < 2
+              && openBtn.getBoundingClientRect().left - listEnd > 24;
           });
 
           // ---- many more repositories than the watch pool ----------------

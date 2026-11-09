@@ -1395,6 +1395,10 @@
       </div>
     {/if}
 
+    <!-- `ml-auto` pins Open, its menu and the workspace actions to the
+         strip's right edge at every window width, wherever the tabs end. The
+         tab list itself stays shrink-wrapped (no flex-1), so its overflow cue
+         marks the last tab rather than empty space. -->
     <button
       type="button"
       title="Open repository"
@@ -1402,7 +1406,7 @@
       data-testid="open-repo-tab"
       data-tour="repository"
       onclick={() => onOpen?.()}
-      class="gp-btn py-1! px-2.5! shrink-0"
+      class="gp-btn py-1! px-2.5! shrink-0 ml-auto"
     >
       <Plus size={13} class="text-accent" />
       <span>Open</span>
