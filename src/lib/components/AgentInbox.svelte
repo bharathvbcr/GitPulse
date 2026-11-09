@@ -1594,9 +1594,30 @@
     overflow: hidden;
   }
 
+  /* Embedded in the Agents pane it is part of that pane, not a panel laid on
+     it: the pane's own background shows through, the outer box goes, and the
+     toolbar and thread list take the pane's divider tone rather than an
+     opaque surface of their own. That opaque surface read as a darker slab
+     with a different contrast from the rest of the app. */
   .agent-inbox.embedded {
-    border: 1px solid rgb(var(--c-border, 45 50 65));
-    border-radius: 8px;
+    background: transparent;
+    border-radius: 0;
+    min-height: 0;
+  }
+
+  .agent-inbox.embedded .inbox-toolbar {
+    background: transparent;
+    border-bottom-color: rgb(var(--c-border) / 0.65);
+    padding: 8px 14px;
+  }
+
+  .agent-inbox.embedded .threads-pane {
+    background: transparent;
+    border-right-color: rgb(var(--c-border) / 0.65);
+  }
+
+  .agent-inbox.embedded .thread-detail-pane {
+    background: transparent;
   }
 
   /* Toolbar */

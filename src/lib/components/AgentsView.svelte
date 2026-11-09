@@ -457,7 +457,8 @@
   {/if}
 
   {#if activeView === "inbox"}
-    <div class="flex-1 min-h-0 min-w-0 p-3 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
+    <!-- No inset: the Inbox spans the pane like the Plane's table does. -->
+    <div class="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
       <AgentInbox repoPath={activeRepoPath} embedded={true} onopenTask={openInboxTask} />
     </div>
   {:else}
