@@ -643,6 +643,16 @@ describe("macOS material", () => {
     expect(tokens).not.toContain("gp-gpu");
   });
 
+  it("runs the workspace pane flush to the status bar", () => {
+    // An 8px bottom margin was a band of the shell's hue between every view
+    // and the status bar. The right-hand margin stays; the vertical moat does
+    // not, and neither does a block border that would redraw that edge.
+    const rule = css.match(/html\.macos \.gp-workspace \{([^}]+)\}/);
+    expect(rule?.[1]).toMatch(/margin:\s*0 8px 0 0;/);
+    expect(rule?.[1]).not.toMatch(/margin:\s*8px/);
+    expect(rule?.[1]).toMatch(/border-block-width:\s*0;/);
+  });
+
   it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
     const rule = css.match(
       /html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/,
