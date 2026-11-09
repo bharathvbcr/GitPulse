@@ -1,0 +1,29 @@
+@utility gp-fancy {
+  @apply inline-flex transition-colors duration-150;
+}
+
+.listed {
+  animation: gp-spin 1s linear infinite;
+}
+
+.unlisted {
+  transition: opacity 120ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html :is(.listed, .only-media) {
+    animation: none !important;
+  }
+
+  html :is(.transition-colors) {
+    transition: none !important;
+  }
+}
+
+html[data-motion="reduced"] :is(.listed, .only-attr) {
+  animation: none !important;
+}
+
+html[data-motion="reduced"] :is(.transition-colors) {
+  transition: none !important;
+}

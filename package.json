@@ -35,6 +35,7 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json && bun run typecheck",
     "typecheck": "node node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit",
+    "design:lint": "node scripts/design-lint.mjs",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
     "check:types": "node scripts/check-coverage-types.mjs",
     "check:release": "node scripts/check-release-version.mjs",

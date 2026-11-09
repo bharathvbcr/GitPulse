@@ -1,0 +1,42 @@
+/* an animation named in a comment: .commented { animation: x 1s } */
+.listed {
+  animation: gp-spin 1s linear infinite;
+}
+
+.static {
+  color: red;
+  transition: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-motion="reduced"]) .gated {
+    animation: gp-fade 200ms both;
+  }
+}
+
+@keyframes gp-spin {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html :is(.listed, .animate-pulse) {
+    animation: none !important;
+  }
+
+  html :is(.transition-colors, [class*="transition-["]) {
+    transition: none !important;
+  }
+}
+
+html[data-motion="reduced"] :is(.listed, .animate-pulse) {
+  animation: none !important;
+}
+
+html[data-motion="reduced"] :is(.transition-colors, [class*="transition-["]) {
+  transition: none !important;
+}
