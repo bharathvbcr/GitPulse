@@ -27,6 +27,9 @@
 //!    in the window and both without a route; ids are unique and the count is
 //!    capped at `MAX_PANES`; `close_all` (what a main-page reload runs) takes
 //!    every one back out.
+//! 8. **Coordinates.** One CSS pixel of the main page times its zoom is one
+//!    point of the content area the panes are placed in, at zoom 1 and 1.25,
+//!    which is what the frontend's placement assumes.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
@@ -657,6 +660,47 @@ mod mac {
                 format!("close_all: closed {closed} of {} panes, {left} left, {count} subviews (want {baseline})", browser::MAX_PANES),
             ),
             Err(e) => check.that(false, format!("close_all: {e}")),
+        }
+
+        // 8. The frontend places a pane at its CSS rectangle times the page
+        //    zoom (`browserSession.toWindowPoints`). That holds only if one CSS
+        //    pixel of the main page, times its zoom, is one point of the
+        //    window's content area, which the pane is positioned in. Measured
+        //    here on GitPulse's own window config, at no zoom and at 1.25.
+        let content = on_main(app, |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            let scale = main.scale_factor().map_err(|e| e.to_string())?;
+            let size = main
+                .inner_size()
+                .map_err(|e| e.to_string())?
+                .to_logical::<f64>(scale);
+            Ok::<_, String>((size.width, size.height))
+        });
+        for zoom in [1.0_f64, 1.25] {
+            let who = format!("zoom-{zoom}");
+            let asked = who.clone();
+            let sent = on_main(app, move |app| {
+                let main = app.get_webview_window("main").expect("main window");
+                main.set_zoom(zoom).map_err(|e| e.to_string())?;
+                main.eval(format!(
+                    "setTimeout(() => fetch('/report', {{ method: 'POST', body: JSON.stringify({{ who: '{asked}', w: innerWidth, h: innerHeight }}) }}), 300)"
+                ))
+                .map_err(|e| e.to_string())
+            });
+            match (&content, sent.and_then(|()| report(main_reports, &who))) {
+                (Ok((width, height)), Ok(r)) => {
+                    let (w, h) = (
+                        r["w"].as_f64().unwrap_or(-1.0),
+                        r["h"].as_f64().unwrap_or(-1.0),
+                    );
+                    check.that(
+                        (w * zoom - width).abs() <= 1.0 && (h * zoom - height).abs() <= 1.0,
+                        format!("zoom {zoom}: the main page's {w}x{h} CSS px × {zoom} is the {width}x{height}-point content area"),
+                    );
+                }
+                (Err(e), _) => check.that(false, format!("zoom {zoom}: {e}")),
+                (_, Err(e)) => check.that(false, format!("zoom {zoom}: {e}")),
+            }
         }
         check
     }
