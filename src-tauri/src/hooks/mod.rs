@@ -8062,4 +8062,77 @@ done
             assert!(asks(&output), "{}", rendered(&output));
         }
     }
+
+    /// Adversarial breaks of the owning-checkout fence (lane W3-L1).
+    #[cfg(unix)]
+    mod adv_break {
+        use super::adv_held::nested_worktree;
+        use super::*;
+        use crate::test_support::git_in;
+
+        fn text(output: &HookOutput) -> String {
+            output.render().unwrap_or_default()
+        }
+
+        /// Session in the main checkout, file in a linked worktree nested under
+        /// it that holds the file dirty: the owner is the nested worktree, so
+        /// the edit is asked about naming it. The owner is resolved by path
+        /// prefix, so it is judged as main's own `.claude/worktrees/x/seed.txt`.
+        #[test]
+        fn adv_nested_worktree_dirty_file_is_asked_about_naming_it() {
+            let farm = farm_bound(false, false, 0);
+            let nested = nested_worktree(&farm.repo, "x");
+            std::fs::write(Path::new(&nested).join("seed.txt"), "theirs").unwrap();
+            let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/seed.txt")));
+            assert!(asks(&output), "silent or wrong: {}", text(&output));
+            assert!(text(&output).contains("adv-x") || text(&output).contains("x"), "{}", text(&output));
+        }
+
+        /// An unbound session editing a file of a bound nested worktree is held
+        /// to that worktree's binding (docs/other.md is out of plan).
+        #[test]
+        fn adv_nested_bound_worktree_is_judged_by_its_own_binding() {
+            let farm = farm_bound(false, true, 1);
+            let lane = farm.sibling_dirs[0].to_string_lossy().into_owned();
+            let nested = nested_worktree(&lane, "y");
+            crate::ledger::bindings::bind(&farm.repo, &nested, "TASK-HOOK").unwrap();
+            let serial = crate::harness::sidecar::test_serial();
+            let dir = tempfile::tempdir().unwrap();
+            let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
+            std::fs::create_dir_all(Path::new(&nested).join("docs")).unwrap();
+            let output = guard_here(&edit_call(&lane, &format!("{nested}/docs/other.md")));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
+        }
+
+        /// A task-bound session in the main checkout writing into a nested
+        /// linked worktree is another checkout: scope.other_checkout.
+        #[test]
+        fn adv_bound_main_session_writing_into_nested_worktree_is_other_checkout() {
+            let farm = farm_bound(false, true, 0);
+            let nested = nested_worktree(&farm.repo, "x");
+            let output = guard_here(&edit_call(&farm.repo, &format!("{nested}/src/planned.rs")));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
+            assert!(text(&output).contains(harness::SCOPE_OTHER_CHECKOUT), "{}", text(&output));
+        }
+
+        /// A dangling symlink inside the bound lane whose target is a not yet
+        /// existing file of the main checkout: `Write` follows it and creates
+        /// the file in main. The path canonicalises to the lane, so the lane's
+        /// plan is applied to it.
+        #[test]
+        fn adv_dangling_symlink_into_main_checkout_is_fenced() {
+            let farm = farm_bound(false, true, 1);
+            let lane = bound_lane(&farm, 0);
+            let serial = crate::harness::sidecar::test_serial();
+            let dir = tempfile::tempdir().unwrap();
+            let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
+            std::fs::create_dir_all(Path::new(&lane).join("src")).unwrap();
+            std::fs::create_dir_all(Path::new(&farm.repo).join("src")).unwrap();
+            let link = format!("{lane}/src/planned.rs");
+            std::os::unix::fs::symlink(format!("{}/src/planned.rs", farm.repo), &link).unwrap();
+            let output = guard_here(&edit_call(&lane, &link));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny), "{}", text(&output));
+            assert!(text(&output).contains(harness::SCOPE_OTHER_CHECKOUT), "{}", text(&output));
+        }
+    }
 }
