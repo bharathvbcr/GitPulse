@@ -7,8 +7,8 @@
 mod common;
 
 use gitpulse_lib::engine::agent_bus::{
-    answer_ask, list_inbox_threads, post_thread_message, read_messages,
-    read_thread_messages, withdraw_ask, MAX_BUS_MESSAGES, MAX_MESSAGE_BODY_BYTES,
+    answer_ask, list_inbox_threads, post_thread_message, read_messages, read_thread_messages,
+    withdraw_ask, MAX_BUS_MESSAGES, MAX_MESSAGE_BODY_BYTES,
 };
 use gitpulse_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 use serde_json::{json, Value};
@@ -80,7 +80,8 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     .unwrap_err();
     assert!(
         err.message().contains("empty"),
-        "Expected empty body rejection, got: {}", err.message()
+        "Expected empty body rejection, got: {}",
+        err.message()
     );
 
     // 2. Whitespace-only body must be rejected
@@ -96,7 +97,8 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     .unwrap_err();
     assert!(
         err_ws.message().contains("empty"),
-        "Expected whitespace body rejection, got: {}", err_ws.message()
+        "Expected whitespace body rejection, got: {}",
+        err_ws.message()
     );
 
     // 3. Null byte in body must be rejected
@@ -112,7 +114,8 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     .unwrap_err();
     assert!(
         err_null.message().contains("empty"),
-        "Expected null byte rejection, got: {}", err_null.message()
+        "Expected null byte rejection, got: {}",
+        err_null.message()
     );
 
     // 4. Empty from_agent must be rejected
@@ -128,14 +131,16 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     .unwrap_err();
     assert!(
         err_agent.message().contains("empty"),
-        "Expected empty from_agent rejection, got: {}", err_agent.message()
+        "Expected empty from_agent rejection, got: {}",
+        err_agent.message()
     );
 
     // 5. Empty reason in withdraw must be rejected
     let err_reason = withdraw_ask(repo_path, "agent-1", "thread-1", "").unwrap_err();
     assert!(
         err_reason.message().contains("empty"),
-        "Expected empty reason rejection, got: {}", err_reason.message()
+        "Expected empty reason rejection, got: {}",
+        err_reason.message()
     );
 
     // 6. Non-empty thread_key validation in withdraw_ask
@@ -190,7 +195,8 @@ fn test_agent_bus_payload_boundaries() {
     .unwrap_err();
     assert!(
         err_body.message().contains("exceeds maximum of"),
-        "Expected payload limit rejection, got: {}", err_body.message()
+        "Expected payload limit rejection, got: {}",
+        err_body.message()
     );
 
     // 3. Thread key max length 80 chars
@@ -214,12 +220,13 @@ fn test_agent_bus_payload_boundaries() {
         Some(&excess_tk),
         "ask",
         "valid",
-        None
+        None,
     )
     .unwrap_err();
     assert!(
         err_tk.message().contains("exceeds maximum length of 80"),
-        "Expected thread_key limit rejection, got: {}", err_tk.message()
+        "Expected thread_key limit rejection, got: {}",
+        err_tk.message()
     );
 
     // 4. from_agent max length 128 chars
@@ -243,14 +250,15 @@ fn test_agent_bus_payload_boundaries() {
         Some("thread-1"),
         "ask",
         "valid",
-        None
+        None,
     )
     .unwrap_err();
     assert!(
         err_agent
             .message()
             .contains("exceeds maximum length of 128"),
-        "Expected from_agent limit rejection, got: {}", err_agent.message()
+        "Expected from_agent limit rejection, got: {}",
+        err_agent.message()
     );
 
     // 5. withdraw reason max length 600 chars
@@ -263,7 +271,8 @@ fn test_agent_bus_payload_boundaries() {
         err_reason
             .message()
             .contains("exceeds maximum length of 600"),
-        "Expected reason limit rejection, got: {}", err_reason.message()
+        "Expected reason limit rejection, got: {}",
+        err_reason.message()
     );
 }
 
@@ -305,7 +314,8 @@ fn test_agent_bus_nonexistent_thread_and_filtering() {
     .expect("post thread-B");
 
     // Filter by agent_id
-    let alpha_threads = list_inbox_threads(repo_path, Some("agent-alpha"), None).expect("list alpha");
+    let alpha_threads =
+        list_inbox_threads(repo_path, Some("agent-alpha"), None).expect("list alpha");
     assert_eq!(alpha_threads.len(), 1);
     assert_eq!(alpha_threads[0].thread_key, "thread-A");
 
@@ -426,7 +436,10 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
             "body": "Valid message"
         }),
     );
-    assert!(is_err_tk, "Expected error on 81 char thread_key, got: {resp_tk}");
+    assert!(
+        is_err_tk,
+        "Expected error on 81 char thread_key, got: {resp_tk}"
+    );
 
     // 3. gitpulse_inbox_withdraw with oversized reason must report isError
     let (is_err_rs, resp_rs) = mcp_call(
@@ -438,7 +451,10 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
             "reason": "r".repeat(601)
         }),
     );
-    assert!(is_err_rs, "Expected error on 601 char reason, got: {resp_rs}");
+    assert!(
+        is_err_rs,
+        "Expected error on 601 char reason, got: {resp_rs}"
+    );
 
     // 4. Successful gitpulse_inbox_post lifecycle
     let (err_post, post_res) = mcp_call(
@@ -513,7 +529,10 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
             ]
         }),
     );
-    assert!(!err_task, "Failed to add parent task with subtasks: {task_res}");
+    assert!(
+        !err_task,
+        "Failed to add parent task with subtasks: {task_res}"
+    );
     assert_eq!(task_res["task_id"], "parent-epic-test");
     let subtasks = task_res["subtasks"].as_array().expect("subtasks array");
     assert_eq!(subtasks.len(), 3);
@@ -534,10 +553,16 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
             ]
         }),
     );
-    assert!(!err_child, "Failed to add nested grandchild task: {child_res}");
+    assert!(
+        !err_child,
+        "Failed to add nested grandchild task: {child_res}"
+    );
     let child_subtasks = child_res["subtasks"].as_array().expect("child subtasks");
     assert_eq!(child_subtasks.len(), 1);
-    assert_eq!(child_subtasks[0]["task_id"], "parent-epic-test-sub-1-child-sub-1");
+    assert_eq!(
+        child_subtasks[0]["task_id"],
+        "parent-epic-test-sub-1-child-sub-1"
+    );
 
     // 9. EMPIRICAL HYPOTHESIS TEST: Sibling subtasks with overlapping title words!
     // What if parent task has subtasks with shared words (e.g. "Build login UI" and "Build login API")?
@@ -554,8 +579,14 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
         }),
     );
     assert!(!err_overlap, "Call failed: {overlap_res}");
-    let overlap_subtasks = overlap_res["subtasks"].as_array().expect("overlap subtasks");
-    assert_eq!(overlap_subtasks.len(), 2, "Both overlap subtasks must be created");
+    let overlap_subtasks = overlap_res["subtasks"]
+        .as_array()
+        .expect("overlap subtasks");
+    assert_eq!(
+        overlap_subtasks.len(),
+        2,
+        "Both overlap subtasks must be created"
+    );
     assert_eq!(overlap_subtasks[0]["task_id"], "epic-overlap-test-sub-1");
     assert_eq!(overlap_subtasks[1]["task_id"], "epic-overlap-test-sub-2");
 
@@ -577,9 +608,16 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
     );
     assert!(!err_5, "Call failed: {res_5}");
     let subtasks_5 = res_5["subtasks"].as_array().expect("subtasks_5");
-    assert_eq!(subtasks_5.len(), 5, "All 5 domain subtasks must be created without drops");
+    assert_eq!(
+        subtasks_5.len(),
+        5,
+        "All 5 domain subtasks must be created without drops"
+    );
     for i in 1..=5 {
-        assert_eq!(subtasks_5[i - 1]["task_id"], format!("auth-refactor-epic-sub-{}", i));
+        assert_eq!(
+            subtasks_5[i - 1]["task_id"],
+            format!("auth-refactor-epic-sub-{}", i)
+        );
     }
 
     // 11. gitpulse_inbox_post with title parameter incorporated into body & read
@@ -606,4 +644,3 @@ fn test_mcp_inbox_tools_and_add_task_validation() {
     assert_eq!(title_threads.len(), 1);
     assert_eq!(title_threads[0]["title"], "Database Engine Choice");
 }
-

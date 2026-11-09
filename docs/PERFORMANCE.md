@@ -2386,6 +2386,36 @@ By wall time the fifth is `worktree --porcelain -z` (36 x 373 ms total).
 - Phase 2 was **not started**. The card's gate says to stop when the hot spawns are not reads that can be answered safely in-process. The hot ones here are working-tree scans, which depend on the index and the file system and not on refs or the commit graph, and the ref reads that are left are cheap (2 to 9 ms) after the ref cache. Removing all of them would save at most about 0.4% of idle wall and 8% of active wall.
 - Where the time is: the worktree listing and the snapshot each scan every worktree. Making that scan once per refresh, or skipping worktrees whose index and HEAD stamps have not moved, is the lever; neither is a ref read. Recommended as its own card.
 
+## 2026-11-08: one status per worktree per pass, shortstat skipped by a stamp (ft-b7a499bf, wave 2)
+
+The profile above named the lever: the listing, the snapshot, the collision scan and `get_status` each read every worktree. Now one owner reads each worktree (`status_cell` in `engine/worktree.rs`) and `diff --shortstat` is skipped when a stamp proves nothing it depends on moved (`diff_stamp`, same file). Bench: the same `git_inprocess_reads` (18 worktrees, 17 linked and dirty, 12 refreshes after a warm-up) and `command_timings`.
+
+**Method.** One release bench build; "before" is that modified build with reuse disabled by a temporary environment switch (`status_cell` always leads, `diff_stamp` never skips; the switch was removed before the commit), not a build of the unmodified base; "after" is the same binary without the switch. The "before" counts reproduce the 2026-11-06 table (38 status and 17 shortstat per refresh), which is the check that the switch restores the old behaviour. One run each; host load 14 to 24 on 18 cores, so times are for ranking and counts are exact.
+
+| scenario | before: status / refresh | after | before: shortstat / refresh | after |
+| --- | --- | --- | --- | --- |
+| idle (12 refreshes) | 456 / 12 = 38 | 444 / 12 = 37 | 204 / 12 = 17 | 0 in two of three runs; 17 in the third (one refresh's worth: the warm-up ended inside the 3 s racy window, so the first counted refresh measured and stamped) |
+| active (a commit, a rewritten file and a moved branch in main per cycle) | 456 / 12 = 38 | 444 / 12 = 37 | 204 / 12 = 17 | 17 over the 12 refreshes (inferred: the first counted refresh, whose files were still inside the 3 s racy window; not broken down) |
+
+Processes per refresh: idle 59.6 to 41.3 (44.5 in the run that measured once), active 90.0 to 73.3 (74.8 in the repeat). The first after run showed idle `status` at 92.8 ms each against 40.5 ms in its active phase; two interleaved repeats (before, after, before, after, load 13 to 16) gave 30.9 and 35.1 ms before and 32.9 and 33.6 ms after, so the 92.8 ms was host load (24 on 18 cores during that run), not the change. Status falls by one because a snapshot used to read the main checkout twice (`get_status`, then its row); it does not fall further because each of the refresh's calls (`get_status`, the Full listing, the snapshot) is a separate caller that asked after the previous one finished, and a read is only ever handed to a caller that asked before it began. Skipping status for an unchanged worktree is not delivered: with today's non-recursive root watcher nothing proves a worktree unchanged (a deeper edit surfaces only as an index or ref write), and ft-c242f35b / ft-28c58695 refused a HEAD and index stamp for the same reason. It needs a recursive per-worktree watcher, a bounded reuse window the caller opts into, or gix (AC4), an owner decision.
+
+`command_timings` (min of 15, load 0.8x before and 1.3x after, so the after column is the harder one):
+
+| row | counter before to after | min before | min after |
+| --- | --- | --- | --- |
+| `insights snapshot` | `git_processes` 27 to 26 | 250.7 ms | 247.2 ms |
+| `list_worktrees full` | `git_processes` 42 to 42 (the counted pass is the first Full listing of a fresh fixture, so it is cold) | 474.8 ms | 234.8 ms |
+
+This change takes the snapshot from N+1 to N status reads (27 to 26 processes in the bench). The committed baseline for `insights snapshot` `git_processes` stays at 21: the gap to what the bench measures (and `facets_ok` 10 against 7, plus the `catch_up` and `pulse unsigned 500` time rows) is drift that predates this change and is tracked on ft-f069aa42; the baseline must not absorb it, so those rows still fail `bench-compare` as they did before. The 27 above came from a build with reuse disabled by a temporary switch, not from a build of the base. `list_worktrees full` keeps its counter at 42 on purpose: the counted pass is the first Full listing of a fresh fixture, whose files are inside the racy window, so it measures every worktree; the timed samples that follow are warm and skip the shortstat, so the row's counter describes the cold listing and its time the warm one. A warm-up before the counted pass would make the counter depend on the 3 s window, which is why it was not added.
+
+**What keeps a stale answer from being served.**
+
+- A shared status read is reused only if it *began* at or after the caller's `not_before`, which is by default the moment its pass asked. A read already running when a caller arrives is never its answer (`a_listing_already_reading_is_never_handed_to_a_later_caller` still holds). The hook-path collision memo passes `now - 5 s`, as its own memo did, and re-reads the worktrees a positive names with `not_before = now`. `merge_and_teardown`'s safety check keeps the default.
+- Cells are keyed by canonical path and admission class, hold one answer of at most 256 KiB, are capped at 512 and evict a removed worktree first. A failure, a refusal and a deadline cut are never kept; a failure reaches only the callers waiting on that read.
+- The shortstat stamp holds HEAD's commit (read from the files, no process), the pass's status bytes, the index, every changed path's device, inode, size, mtime and ctime (both sides of a rename) and the repository and user config, plus the attributes files git reads for every diff (the repository's `info/attributes`, `$XDG_CONFIG_HOME/git/attributes` and its `~/.config` default, and each file `core.attributesFile` names; a config that sets the key in a form that cannot be read with certainty measures every time). It is captured before the diff and again after, kept only if equal, and refused while any timestamp is inside `ref_cache`'s racy window. A directory among the changed paths (a submodule), an unreadable or unexplained-absent path, a non-UTF-8 name, an untracked `.gitattributes`, a reftable store, more than 1,024 changed paths or a non-unix target measure every time. Entries live 60 s and are capped at 64. Files a config `include`s are not stamped; the 60 s bound is what covers them, as in `ref_cache`.
+- A read with no caller deadline that ends at git's own 90 s limit ends every waiter on it with the same error at the same moment; only a cut that was a caller's deadline is retried by the next waiter.
+- `changed_paths_only` (a pathspec-limited status) is a different question and is not routed through the cell.
+
 ## 2026-11-06: repository tuning thresholds (ft-6b68be32)
 
 The Storage panel may offer, and on a click apply, three changes: `core.untrackedCache`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
@@ -2593,3 +2623,26 @@ The 20 ms lock wait was not widened. Why it holds now: appends take a shared loc
 Not measured: the target of under 1 ms per append is met at p99 for the append alone in this build (0.2 ms), but the whole hook also reads the store twice (attribution and notices), each a lock-free read and parse of up to about 2 MiB; that read was not timed separately.
 
 Round 3 (same lane): compaction now keeps every live row up to the cap (4,096 live rows after the stress run, where the half-cap compaction left about 2,340), and the new file is written before the exclusive lock is taken, so the lock covers a read of a short tail, one small write and a rename. Three more runs of the same tests, debug build, machine under load: 0 of 300 appends failed in each; single-process append at a full store p50 77 to 94 us, p99 0.21 to 1.6 ms, max 62 to 72 ms (the one compaction). A read is a lock-free parse of up to about 2 MiB: 28 to 59 ms in a debug build per the reviewer, not measured in release, and listed as a follow-up.
+
+## 2026-11-08: steady `git rev-parse` rate, and who spends it (ft-cd18575e943d4aa0b55bc2df720bcc79)
+
+What: the steady-state rate of `git rev-parse` launches with the verification driver holding 23 cards, before and after the head and base reads moved onto `ref_cache` (merged at `a1e1bc02`).
+
+Where: the 2026-10-17 lane measurement from the card log (recorded here from that log; this build was not re-measured on 2026-11-08). The motivating export came from installed build 836adcf7 (1.4.0): `rev-parse=2,217,369` of about 2.42M launches, and between 04:32:35 and 04:42:35 (600 s) the counter rose by 4,521, about 7.5/s.
+
+| | before | after |
+| --- | --- | --- |
+| steady `rev-parse` launches per second, 23 cards | 7.65/s | 0.38/s |
+
+Method: the driver sweeps every `SWEEP_PERIOD` (3 s) and `settle()` reads each card's head once per sweep, so 23 cards over 3 s is 23 / 3 = 7.67/s, which matches the 7.5/s in the export. The lane run counted `git rev-parse` children launched over 60 s, two rounds, over 23 cards, then divided by the window. After the change the cost is one launch per card per cache TTL (a stamp younger than 3 s is never stored, so a hit is never stale). The target is at most 1/s; it was met in the lane. It has not been measured on an installed build; that re-measure stays open.
+
+How to read the new field: the periodic gate line now ends with the call sites behind the `git rev-parse` total.
+
+    WARN [spawn_gate] reactive admitted=... | background shed=... | top: git rev-parse=N git worktree=... | rev-parse by: verification_gate.current_head=A graph.refs.detached_head=B unattributed=C rest=D
+
+- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `git_cli::with_spawn_source`, never a path or ref name.
+- `unattributed` is a launch whose caller set no source. The share that is unattributed is the share still not accounted for; tag the biggest caller next.
+- At most 32 distinct sources are kept; beyond that, new ones count under `other`.
+- The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.
+- Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing of its own, so the leader's source is credited and the joiner's is not.
+- A thread that hops (`thread::scope`, a pool) starts `unattributed`; carry the source across with `with_spawn_source(current_spawn_source(), ...)`, as `current_admission()` is carried.

@@ -561,20 +561,34 @@ pub enum StatusRead {
 /// on what it started. Handed down through every stage of a pass, so each
 /// stage asks the same clock rather than being given its own slice of it.
 #[derive(Clone, Copy, Debug)]
-pub struct ScanDeadline(Instant);
+pub struct ScanDeadline {
+    /// When the pass the deadline belongs to began: the moment its caller
+    /// asked, which is what a status read shared inside the pass is measured
+    /// against ([`status_cell`]).
+    start: Instant,
+    end: Instant,
+}
 
 impl ScanDeadline {
     /// The deadline `budget` after `start`.
     pub fn after(start: Instant, budget: Duration) -> Self {
-        Self(start.checked_add(budget).unwrap_or(start))
+        Self {
+            start,
+            end: start.checked_add(budget).unwrap_or(start),
+        }
     }
 
     pub fn expired(&self) -> bool {
-        Instant::now() >= self.0
+        Instant::now() >= self.end
     }
 
     pub fn remaining(&self) -> Duration {
-        self.0.saturating_duration_since(Instant::now())
+        self.end.saturating_duration_since(Instant::now())
+    }
+
+    /// When the pass began.
+    pub fn started(&self) -> Instant {
+        self.start
     }
 }
 
@@ -868,8 +882,11 @@ pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError
 /// must not turn one insights call into an unbounded allocation.
 pub const MAX_CHANGED_PATHS: usize = 256;
 
-/// The one `git status --porcelain -z` read of a worktree, which both the
-/// dirty-file scan and the changed-path scan go through.
+/// The spawn behind every `git status --porcelain -z` read of a worktree.
+/// An unfiltered read is made only by [`status_cell`], which is the one owner
+/// of "what status says about this worktree"; the pathspec-limited read
+/// ([`changed_paths_only`]) is a different question with a different answer
+/// and spawns here directly.
 ///
 /// With a `deadline`, a read that has not started by then does not start, and
 /// one in flight is given the time left (at least [`STATUS_GRACE`]) rather
@@ -880,13 +897,19 @@ pub const MAX_CHANGED_PATHS: usize = 256;
 /// name never widen them; `icase` too when the volume ignores case): the
 /// answer to "is this file dirty here" without walking the rest of the tree's
 /// changes.
-fn read_porcelain(
+fn spawn_porcelain(
     dir: &Path,
     deadline: Option<&ScanDeadline>,
     only: Option<OnlyPaths<'_>>,
 ) -> Result<String, CommandError> {
     #[cfg(test)]
-    status_probes::fire(dir);
+    {
+        status_probes::fire(dir);
+        // Stands in for a hung git ending at its own time limit.
+        if only.is_none() && status_probes::forced_timeout(dir) {
+            return Err("git status timed out after 0.3s".to_string().into());
+        }
+    }
     let magic = match only {
         Some(only) if only.ignore_case => ":(literal,icase)",
         _ => ":(literal)",
@@ -902,9 +925,338 @@ fn read_porcelain(
         args.extend(specs.iter().map(String::as_str));
     }
     match deadline {
+        // The unfiltered read is the one an identical caller may share while
+        // it is still queued at the spawn gate.
+        None if only.is_none() => crate::engine::git_cli::git_text_shared(dir, &args),
         None => git_text(dir, &args),
         Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string().into()),
         Some(deadline) => git_text_with_timeout(dir, &args, deadline.remaining().max(STATUS_GRACE)),
+    }
+}
+
+/// The status of `dir` as of some moment no earlier than `not_before`, from
+/// the worktree's [`status_cell`]: shared with every other reader of the same
+/// worktree in the same admission class, and spawned at most once for all of
+/// them.
+pub(crate) fn read_status_since(
+    dir: &Path,
+    deadline: Option<&ScanDeadline>,
+    not_before: Instant,
+) -> Result<PorcelainRead, CommandError> {
+    status_cell::read(dir, deadline, not_before)
+}
+
+pub(crate) use status_cell::PorcelainRead;
+
+/// How long ago `dir`'s status was last read and kept in the cell it is shared
+/// through, in the caller's admission class. `None` when no read is kept.
+pub(crate) fn status_age(dir: &Path) -> Option<Duration> {
+    status_cell::age(dir)
+}
+
+/// Cells kept at once, across every worktree of every repository.
+#[cfg(test)]
+pub(crate) const STATUS_CELL_CAP: usize = status_cell::MAX_CELLS;
+
+/// The one owner of "what `git status` says about this worktree".
+///
+/// Every consumer used to spawn its own: the worktree listing, the insights
+/// snapshot (twice for the main checkout), the collision scan and `get_status`
+/// each read all of the worktrees, one after another, so a refresh paid for
+/// each worktree about twice. They now ask here, and a worktree is read once
+/// for all of them.
+///
+/// The rule that keeps this from handing anyone old news: a read is reused
+/// only when it **started** at or after the moment the caller says it is not
+/// willing to look further back than (`not_before`). A caller's default is the
+/// moment it asked (the start of its pass), so it gets nothing it could not
+/// have got by reading itself, and a read already under way when it arrives is
+/// never handed to it (that read may not have seen what changed just before
+/// the caller asked). A caller that has a longer tolerance, the hook-path
+/// collision memo's five seconds, says so.
+///
+/// - A cell is keyed by canonical worktree path and admission class, as the
+///   listing flights are: a background reader never serves a user-facing one,
+///   and the other way round.
+/// - One read at a time per cell. Callers that arrive while one runs wait on
+///   it (bounded by their own deadline) and take its answer if it began late
+///   enough for them, otherwise read after it.
+/// - A failed read, a refused one and one cut by a deadline are never kept. A
+///   failure is handed only to the callers that were waiting on that very
+///   read, and a deadline's cut to nobody: it was the leader's clock.
+/// - Bounded: [`MAX_CELLS`] cells, a cell keeps one answer, and an answer past
+///   [`MAX_KEPT_BYTES`] reaches only the callers waiting on its read.
+/// - Trust is checked before the cell is consulted, as at the spawn.
+mod status_cell {
+    use super::{spawn_porcelain, ScanDeadline, DEADLINE_PASSED};
+    use crate::engine::git_cli::{current_admission, is_timed_out, Admission};
+    use crate::ipc_error::CommandError;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError};
+    use std::time::{Duration, Instant};
+
+    pub(super) const MAX_CELLS: usize = 512;
+    /// The most one cell keeps. A status of a thousand changed files is a few
+    /// tens of kilobytes; a bigger one is read again.
+    const MAX_KEPT_BYTES: usize = 256 * 1024;
+
+    /// One status read and when it began.
+    #[derive(Clone, Debug)]
+    pub(crate) struct PorcelainRead {
+        pub(crate) bytes: Arc<str>,
+        /// Taken before the child was spawned, so everything the read saw
+        /// happened at or after it.
+        pub(crate) started: Instant,
+        /// This caller's own read made it, rather than another's.
+        pub(crate) led: bool,
+    }
+
+    struct Fill {
+        started: Instant,
+        /// The leader ran under a caller's deadline, so a timeout it reports
+        /// is that caller's clock; without one it is git's own limit, which
+        /// every waiter would hit too.
+        deadline_bound: bool,
+        result: OnceLock<Result<PorcelainRead, CommandError>>,
+    }
+
+    #[derive(Default)]
+    struct State {
+        held: Option<PorcelainRead>,
+        filling: Option<Arc<Fill>>,
+    }
+
+    #[derive(Default)]
+    struct Cell {
+        state: Mutex<State>,
+        done: Condvar,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Key {
+        dir: PathBuf,
+        class: Admission,
+    }
+
+    #[derive(Default)]
+    struct Table {
+        cells: HashMap<Key, (u64, Arc<Cell>)>,
+        tick: u64,
+    }
+
+    fn table() -> &'static Mutex<Table> {
+        static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(Table::default()))
+    }
+
+    fn key_for(dir: &Path) -> Key {
+        Key {
+            dir: dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+            class: current_admission(),
+        }
+    }
+
+    fn cell_for(key: &Key) -> Arc<Cell> {
+        let mut table = table().lock().unwrap_or_else(PoisonError::into_inner);
+        table.tick += 1;
+        let tick = table.tick;
+        if let Some((touched, cell)) = table.cells.get_mut(key) {
+            *touched = tick;
+            return Arc::clone(cell);
+        }
+        if table.cells.len() >= MAX_CELLS {
+            evict_one(&mut table.cells);
+        }
+        let cell = Arc::new(Cell::default());
+        table.cells.insert(key.clone(), (tick, Arc::clone(&cell)));
+        cell
+    }
+
+    /// Drops one cell that is not being read: a worktree that is gone first,
+    /// then the one asked about longest ago.
+    fn evict_one(cells: &mut HashMap<Key, (u64, Arc<Cell>)>) {
+        let idle = |cell: &Arc<Cell>| match cell.state.try_lock() {
+            Ok(state) => state.filling.is_none(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().filling.is_none(),
+            Err(TryLockError::WouldBlock) => false,
+        };
+        let victim = cells
+            .iter()
+            .filter(|(_, (_, cell))| idle(cell))
+            .min_by_key(|(key, (touched, _))| (key.dir.exists(), *touched))
+            .map(|(key, _)| key.clone());
+        if let Some(victim) = victim {
+            cells.remove(&victim);
+        }
+    }
+
+    fn forget(key: &Key) {
+        table()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cells
+            .remove(key);
+    }
+
+    pub(super) fn age(dir: &Path) -> Option<Duration> {
+        let key = key_for(dir);
+        let cell = {
+            let table = table().lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&table.cells.get(&key)?.1)
+        };
+        let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.held.as_ref().map(|held| held.started.elapsed())
+    }
+
+    /// Whether an error is this caller's or somebody's clock running out,
+    /// which no other caller should inherit.
+    fn is_a_cut(error: &CommandError) -> bool {
+        error.message() == DEADLINE_PASSED || is_timed_out(error.message())
+    }
+
+    /// A read that ran out of git's own time limit, as opposed to a deadline
+    /// that was never given the chance to start it.
+    fn is_a_hang(error: &CommandError) -> bool {
+        error.message() != DEADLINE_PASSED && is_timed_out(error.message())
+    }
+
+    pub(super) fn read(
+        dir: &Path,
+        deadline: Option<&ScanDeadline>,
+        not_before: Instant,
+    ) -> Result<PorcelainRead, CommandError> {
+        crate::repository_trust::require(dir)?;
+        let key = key_for(dir);
+        let cell = cell_for(&key);
+        let outcome = read_in(&cell, dir, deadline, not_before);
+        if outcome.is_err() && !dir.is_dir() {
+            // A worktree that was removed leaves no cell behind.
+            forget(&key);
+        }
+        outcome
+    }
+
+    /// Publishes a fill's outcome and frees the cell, also when the leader
+    /// panics, so no caller is left waiting on a read that is not running.
+    struct Settle<'a> {
+        cell: &'a Cell,
+        fill: &'a Arc<Fill>,
+        settled: bool,
+    }
+
+    impl Settle<'_> {
+        fn finish(mut self, outcome: Result<PorcelainRead, CommandError>) {
+            self.publish(outcome);
+        }
+
+        fn publish(&mut self, outcome: Result<PorcelainRead, CommandError>) {
+            self.settled = true;
+            let mut state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match &outcome {
+                Ok(read) if read.bytes.len() <= MAX_KEPT_BYTES => {
+                    state.held = Some(read.clone());
+                }
+                // A caller's own clock ran out: nothing was learned about the
+                // worktree, so what is kept stands.
+                Err(error) if is_a_cut(error) => {}
+                // Too big to keep, or failed: what was kept is not trusted
+                // past a read that could not be made.
+                _ => state.held = None,
+            }
+            let _ = self.fill.result.set(outcome);
+            if state
+                .filling
+                .as_ref()
+                .is_some_and(|running| Arc::ptr_eq(running, self.fill))
+            {
+                state.filling = None;
+            }
+            self.cell.done.notify_all();
+        }
+    }
+
+    impl Drop for Settle<'_> {
+        fn drop(&mut self) {
+            if !self.settled {
+                self.publish(Err("the shared status read ended without a result".into()));
+            }
+        }
+    }
+
+    fn read_in(
+        cell: &Cell,
+        dir: &Path,
+        deadline: Option<&ScanDeadline>,
+        not_before: Instant,
+    ) -> Result<PorcelainRead, CommandError> {
+        let mut state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let fill = loop {
+            if let Some(held) = &state.held {
+                if held.started >= not_before {
+                    return Ok(held.clone());
+                }
+            }
+            let Some(running) = state.filling.clone() else {
+                let fill = Arc::new(Fill {
+                    started: Instant::now(),
+                    deadline_bound: deadline.is_some(),
+                    result: OnceLock::new(),
+                });
+                state.filling = Some(Arc::clone(&fill));
+                break fill;
+            };
+            while running.result.get().is_none() {
+                state = match deadline {
+                    None => cell
+                        .done
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Some(deadline) => {
+                        if deadline.expired() {
+                            return Err(DEADLINE_PASSED.to_string().into());
+                        }
+                        cell.done
+                            .wait_timeout(state, deadline.remaining())
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                };
+            }
+            // Only a read that began late enough for this caller is its
+            // answer; otherwise the cell is free for it to read after.
+            if running.started >= not_before {
+                match running.result.get() {
+                    Some(Ok(read)) => return Ok(read.clone()),
+                    Some(Err(error)) if !is_a_cut(error) => return Err(error.clone()),
+                    // A hung git ends every waiter at the same moment it ends
+                    // the leader, not one 90 s after another. Only a cut that
+                    // was a caller's deadline is retried.
+                    Some(Err(error)) if !running.deadline_bound && is_a_hang(error) => {
+                        return Err(error.clone());
+                    }
+                    _ => {}
+                }
+            }
+        };
+        drop(state);
+
+        let settle = Settle {
+            cell,
+            fill: &fill,
+            settled: false,
+        };
+        let outcome = spawn_porcelain(dir, deadline, None).map(|text| PorcelainRead {
+            bytes: Arc::from(text),
+            started: fill.started,
+            led: false,
+        });
+        settle.finish(outcome.clone());
+        outcome.map(|read| PorcelainRead { led: true, ..read })
     }
 }
 
@@ -979,6 +1331,40 @@ pub(crate) mod status_probes {
     static PROBES: Mutex<Vec<(u64, Vec<PathBuf>, Probe)>> = Mutex::new(Vec::new());
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    static FORCED_TIMEOUTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Whether the unfiltered status read of `dir` is to end as a git timeout.
+    pub(super) fn forced_timeout(dir: &Path) -> bool {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        FORCED_TIMEOUTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&canonical)
+    }
+
+    /// Runs `body` with every unfiltered status read of `dir` ending as a git
+    /// timeout (after any probe has run).
+    pub(crate) fn with_forced_timeout<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let mut forced = FORCED_TIMEOUTS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(at) = forced.iter().position(|dir| *dir == self.0) {
+                    forced.remove(at);
+                }
+            }
+        }
+        FORCED_TIMEOUTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(canonical.clone());
+        let _remove = Remove(canonical);
+        body()
+    }
+
     pub(super) fn fire(dir: &Path) {
         let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         let hits: Vec<Probe> = PROBES
@@ -1037,12 +1423,43 @@ pub fn changed_paths_within(
     worktree_path: &str,
     deadline: Option<&ScanDeadline>,
 ) -> Result<(Vec<String>, bool), CommandError> {
+    let not_before = deadline.map_or_else(Instant::now, ScanDeadline::started);
+    changed_paths_since(worktree_path, deadline, not_before)
+        .map(|read| (read.paths, read.truncated))
+}
+
+/// The changed paths of one worktree, and how old the read they came from is.
+#[derive(Debug, Clone)]
+pub struct ChangedPaths {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    /// How long ago the status read began: zero for one made for this call.
+    pub age: Duration,
+}
+
+/// [`changed_paths_within`] that accepts a status read of this worktree begun
+/// at or after `not_before`, from whoever made it (see [`status_cell`]).
+/// `Instant::now()` asks for a read of the caller's own.
+pub fn changed_paths_since(
+    worktree_path: &str,
+    deadline: Option<&ScanDeadline>,
+    not_before: Instant,
+) -> Result<ChangedPaths, CommandError> {
     let repo = validate_repo(worktree_path)?;
     if !repo.is_dir() {
         return Err(format!("worktree path is not a directory: {}", repo.display()).into());
     }
-    let stdout = read_porcelain(&repo, deadline, None)?;
-    Ok(bounded_status_paths(stdout.as_bytes()))
+    let read = read_status_since(&repo, deadline, not_before)?;
+    let (paths, truncated) = bounded_status_paths(read.bytes.as_bytes());
+    Ok(ChangedPaths {
+        paths,
+        truncated,
+        age: if read.led {
+            Duration::ZERO
+        } else {
+            read.started.elapsed()
+        },
+    })
 }
 
 /// [`changed_paths_within`] for one path: the entries of a pathspec-limited
@@ -1061,7 +1478,7 @@ pub fn changed_paths_only(
     let nested = nested_repository_ancestors(&repo, path);
     let mut asked: Vec<&str> = vec![path];
     asked.extend(nested.iter().map(String::as_str));
-    let stdout = read_porcelain(
+    let stdout = spawn_porcelain(
         &repo,
         deadline,
         Some(OnlyPaths {
@@ -1523,7 +1940,7 @@ pub fn list_worktrees_scanned(
     depth: ScanDepth,
 ) -> Result<Vec<WorktreeInfo>, CommandError> {
     if depth == ScanDepth::Listing {
-        return scan_listing(repo_path, depth);
+        return scan_listing(repo_path, depth, Instant::now());
     }
     // Validated before joining, so a refusal is this caller's own answer.
     let repo = validate_repo(repo_path)?;
@@ -1540,6 +1957,7 @@ pub fn list_worktrees_scanned(
             Some(open) => {
                 let mut state = open.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.depth = state.depth.max(depth);
+                state.latest_arrival = Instant::now();
                 drop(state);
                 (Arc::clone(open), false, None)
             }
@@ -1563,7 +1981,7 @@ pub fn list_worktrees_scanned(
         }
         None => std::thread::sleep(gather_window()),
     }
-    let depth = {
+    let (depth, latest_arrival) = {
         let mut lanes = flight_lanes()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1571,7 +1989,7 @@ pub fn list_worktrees_scanned(
         lane.open = None;
         lane.running = Some(Arc::clone(&flight));
         let state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.depth
+        (state.depth, state.latest_arrival)
     };
 
     /// Publishes whatever the leader ended with and frees the lane, so a
@@ -1611,7 +2029,9 @@ pub fn list_worktrees_scanned(
         flight: &flight,
         outcome: None,
     };
-    let outcome = scan_listing(repo_path, depth);
+    // Every caller sharing this listing had arrived by `latest_arrival`, so a
+    // status read begun after it is no older than any of their questions.
+    let outcome = scan_listing(repo_path, depth, latest_arrival);
     #[cfg(test)]
     before_publish_hook();
     land.outcome = Some(outcome.clone());
@@ -1645,6 +2065,8 @@ struct Flight {
 
 struct FlightState {
     depth: ScanDepth,
+    /// When the last caller asked, the leader or a joiner.
+    latest_arrival: Instant,
     result: Option<Result<Vec<WorktreeInfo>, CommandError>>,
 }
 
@@ -1653,6 +2075,7 @@ impl Flight {
         Self {
             state: Mutex::new(FlightState {
                 depth,
+                latest_arrival: Instant::now(),
                 result: None,
             }),
             done: Condvar::new(),
@@ -1713,8 +2136,13 @@ fn before_publish_hook() {
 }
 
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
-fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, CommandError> {
+fn scan_listing(
+    repo_path: &str,
+    depth: ScanDepth,
+    not_before: Instant,
+) -> Result<Vec<WorktreeInfo>, CommandError> {
     let repo = validate_repo(repo_path)?;
+    let pass = ScanPass::asked_at(not_before);
     let parsed = read_worktree_entries(&repo)?;
     if depth == ScanDepth::Listing {
         return Ok(parsed
@@ -1765,7 +2193,7 @@ fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, 
         base.routes = Some(PortlessSnapshot::load());
     }
     let mut metrics = scan_in_waves(&scan_targets, class, None, |idx| {
-        scan_worktree(&repo, &parsed[idx], depth, &base, None)
+        scan_worktree(&repo, &parsed[idx], depth, &base, None, &pass)
     });
 
     Ok(parsed
@@ -1874,6 +2302,7 @@ pub fn scan_dirty(info: &mut WorktreeInfo) {
             ScanDepth::Dirty,
             &Base::none(),
             None,
+            &ScanPass::now(),
         )
     };
     info.dirty_files = scan.dirty;
@@ -1911,6 +2340,9 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
         })
         .collect();
     let class = crate::engine::git_cli::current_admission();
+    // The pass began when its clock did, so a status any stage of it read since
+    // (the main checkout's, for one) is this stage's answer too.
+    let pass = ScanPass::asked_at(deadline.started());
     let mut scans = scan_in_waves(&targets, class, Some(deadline), |idx| {
         // The repository path is read only at `Full` depth.
         scan_worktree(
@@ -1919,6 +2351,7 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
             ScanDepth::Dirty,
             &Base::none(),
             Some(deadline),
+            &pass,
         )
     });
     let mut cut = 0;
@@ -1975,12 +2408,383 @@ fn head_is_born(head: &str) -> bool {
         && head.bytes().any(|b| b != b'0')
 }
 
+/// What one pass over a repository's worktrees shares between its stages and
+/// its worker threads: how far back a status read may reach, and the clock
+/// readings a shortstat stamp is judged on. Taken on the thread that starts the
+/// pass, because the clock a test installs is that thread's own and the worker
+/// threads of a wave would not see it.
+#[derive(Clone, Copy)]
+struct ScanPass {
+    /// The status of a worktree is taken from any read that began at or after
+    /// this: the moment the pass's caller asked, so a read is never older than
+    /// the question.
+    not_before: Instant,
+    mono: Instant,
+    /// Read only by the shortstat stamp, which exists on unix alone.
+    #[cfg(unix)]
+    wall: std::time::SystemTime,
+    #[cfg(unix)]
+    racy: Duration,
+    real: Instant,
+}
+
+impl ScanPass {
+    fn asked_at(not_before: Instant) -> Self {
+        Self {
+            not_before,
+            mono: crate::engine::ref_cache::mono_now(),
+            #[cfg(unix)]
+            wall: crate::engine::ref_cache::wall_now(),
+            #[cfg(unix)]
+            racy: crate::engine::ref_cache::racy_window(),
+            real: Instant::now(),
+        }
+    }
+
+    fn now() -> Self {
+        Self::asked_at(Instant::now())
+    }
+
+    fn mono_now(&self) -> Instant {
+        self.mono + self.real.elapsed()
+    }
+
+    #[cfg(unix)]
+    fn wall_now(&self) -> std::time::SystemTime {
+        self.wall + self.real.elapsed()
+    }
+}
+
+/// `git diff HEAD --shortstat` of a worktree, skipped when everything it is a
+/// function of is provably what it was the last time it ran.
+///
+/// The measurement is a function of HEAD's commit, the index, the files git
+/// reports as changed, and the config and attributes that shape a diff. A
+/// stamp holds an identity for each (HEAD oid, the pass's status bytes
+/// byte-for-byte, the index, every changed path's device, inode, size, mtime
+/// and ctime including both sides of a rename, the repository's and the user's
+/// config), and the previous answer is reused only when all of them match.
+///
+/// What keeps a stale answer from being served:
+///
+/// - The stamp is captured before the diff runs and again after it, and the
+///   answer is kept only when the two are equal: a write that raced the child
+///   leaves no entry.
+/// - Every timestamp in it must be older than the racy window (the one
+///   `ref_cache` uses): two writes inside one timestamp tick cannot be told
+///   apart, and ctime is what catches an edit that restored mtime and size.
+/// - A stamp that cannot be proven yields no skip and no entry: a changed path
+///   that is a directory (a submodule, whose own commits move nothing here), a
+///   path that is unreadable or absent without a deletion to explain it, a name
+///   that is not UTF-8, an untracked `.gitattributes`, a HEAD that is not a
+///   plain loose or packed ref, more changed paths than [`MAX_STAMPED_PATHS`],
+///   a file system without a change time, any platform that is not unix.
+/// - An entry lives [`DIFF_STAMP_TTL`] whatever the stamp says, which bounds
+///   the inputs no stamp sees (files a config `include`s). Only measured
+///   successes are kept, and at most [`MAX_DIFF_STAMPS`] at once.
+mod diff_stamp {
+    use super::{ScanPass, WorktreeDiffStat};
+    #[cfg(unix)]
+    use crate::engine::ref_cache::user_config_paths;
+    use crate::engine::ref_cache::ChangeStamp;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    use std::time::{Duration, Instant};
+
+    pub(super) const DIFF_STAMP_TTL: Duration = Duration::from_secs(60);
+    pub(super) const MAX_DIFF_STAMPS: usize = 64;
+    #[cfg(unix)]
+    const MAX_STAMPED_PATHS: usize = 1024;
+
+    // Built only by the unix `capture`; elsewhere `capture` yields `None`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct DiffStamp {
+        head: String,
+        status: Arc<str>,
+        index: Option<ChangeStamp>,
+        files: Vec<(String, Option<ChangeStamp>)>,
+        config: Vec<(PathBuf, Option<ChangeStamp>)>,
+    }
+
+    struct Kept {
+        stamp: DiffStamp,
+        stat: WorktreeDiffStat,
+        stored: Instant,
+    }
+
+    fn table() -> &'static Mutex<HashMap<PathBuf, Kept>> {
+        static TABLE: OnceLock<Mutex<HashMap<PathBuf, Kept>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn key(dir: &Path) -> PathBuf {
+        dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+    }
+
+    /// The measurement for `dir`, from memory when the stamp proves it, else
+    /// from `measure` (kept when it succeeded and nothing moved meanwhile).
+    pub(super) fn through(
+        dir: &Path,
+        status: &Arc<str>,
+        pass: &ScanPass,
+        measure: impl FnOnce() -> Option<WorktreeDiffStat>,
+    ) -> Option<WorktreeDiffStat> {
+        let key = key(dir);
+        let Some(before) = DiffStamp::capture(dir, status, pass) else {
+            forget(&key);
+            return measure();
+        };
+        {
+            let table = table().lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(kept) = table.get(&key) {
+                let young = pass
+                    .mono_now()
+                    .checked_duration_since(kept.stored)
+                    .is_some_and(|age| age < DIFF_STAMP_TTL);
+                if young && kept.stamp == before {
+                    return Some(kept.stat.clone());
+                }
+            }
+        }
+        let measured = measure();
+        match &measured {
+            Some(stat) if DiffStamp::capture(dir, status, pass).as_ref() == Some(&before) => {
+                let mut table = table().lock().unwrap_or_else(PoisonError::into_inner);
+                if table.len() >= MAX_DIFF_STAMPS && !table.contains_key(&key) {
+                    let oldest = table
+                        .iter()
+                        .min_by_key(|(_, kept)| kept.stored)
+                        .map(|(key, _)| key.clone());
+                    if let Some(oldest) = oldest {
+                        table.remove(&oldest);
+                    }
+                }
+                table.insert(
+                    key,
+                    Kept {
+                        stamp: before,
+                        stat: stat.clone(),
+                        stored: pass.mono_now(),
+                    },
+                );
+            }
+            _ => forget(&key),
+        }
+        measured
+    }
+
+    fn forget(key: &Path) {
+        table()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+    }
+
+    impl DiffStamp {
+        #[cfg(not(unix))]
+        pub(super) fn capture(_dir: &Path, _status: &Arc<str>, _pass: &ScanPass) -> Option<Self> {
+            None
+        }
+
+        #[cfg(unix)]
+        pub(super) fn capture(dir: &Path, status: &Arc<str>, pass: &ScanPass) -> Option<Self> {
+            let (private, common) = crate::repository_trust::git_directories(dir).ok()?;
+            let head = head_oid(&private, &common)?;
+            let rows = changed_rows(status.as_bytes())?;
+            let mut files = Vec::with_capacity(rows.len());
+            for (path, may_be_absent) in rows {
+                let full = dir.join(&path);
+                match std::fs::symlink_metadata(&full) {
+                    Ok(meta) if meta.is_dir() => return None,
+                    Ok(meta) => files.push((path, Some(ChangeStamp::of(&meta)))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && may_be_absent => {
+                        files.push((path, None));
+                    }
+                    Err(_) => return None,
+                }
+            }
+            let index = ChangeStamp::at(&private.join("index"));
+            let mut config_paths = vec![
+                common.join("config"),
+                private.join("config.worktree"),
+                common.join("info").join("attributes"),
+            ];
+            config_paths.extend(user_config_paths());
+            // Attributes files git reads for every diff besides the worktree's
+            // own: the user's, wherever `XDG_CONFIG_HOME` puts it (or its
+            // `~/.config` default), and the one `core.attributesFile` names.
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+                config_paths.push(PathBuf::from(xdg).join("git").join("attributes"));
+            }
+            if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+                config_paths.push(
+                    PathBuf::from(home)
+                        .join(".config")
+                        .join("git")
+                        .join("attributes"),
+                );
+            }
+            let named = named_attributes_files(&config_paths)?;
+            config_paths.extend(named);
+            let config: Vec<(PathBuf, Option<ChangeStamp>)> = config_paths
+                .into_iter()
+                .map(|path| {
+                    let identity = ChangeStamp::at(&path);
+                    (path, identity)
+                })
+                .collect();
+
+            let wall = pass.wall_now();
+            let settled = |identity: &ChangeStamp| {
+                identity
+                    .newest_timestamp()
+                    .and_then(|newest| wall.duration_since(newest).ok())
+                    .is_some_and(|age| age >= pass.racy)
+            };
+            let all_settled = files
+                .iter()
+                .filter_map(|(_, identity)| identity.as_ref())
+                .chain(index.as_ref())
+                .chain(config.iter().filter_map(|(_, identity)| identity.as_ref()))
+                .all(settled);
+            all_settled.then_some(Self {
+                head,
+                status: Arc::clone(status),
+                index,
+                files,
+                config,
+            })
+        }
+    }
+
+    /// The files `core.attributesFile` names in any of `configs`, to be stamped
+    /// beside them. `None` (unprovable) when a config sets the key in a form
+    /// read here with doubt: no `=`, a relative path, or a value carrying a
+    /// quote, escape or comment character. A config that cannot be read is
+    /// also unprovable; one that is absent has no key.
+    #[cfg(unix)]
+    fn named_attributes_files(configs: &[PathBuf]) -> Option<Vec<PathBuf>> {
+        let mut named = Vec::new();
+        for config in configs {
+            let text = match std::fs::read_to_string(config) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                let lower = line.to_ascii_lowercase();
+                let Some(rest) = lower.strip_prefix("attributesfile") else {
+                    continue;
+                };
+                if !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
+                    continue;
+                }
+                let value = line["attributesfile".len()..].trim_start();
+                let value = value.strip_prefix('=')?.trim();
+                if value.is_empty() || value.contains(['"', '\\', '#', ';']) {
+                    return None;
+                }
+                let path = match value.strip_prefix("~/") {
+                    Some(tail) => PathBuf::from(std::env::var_os("HOME")?).join(tail),
+                    None => PathBuf::from(value),
+                };
+                if !path.is_absolute() {
+                    return None;
+                }
+                named.push(path);
+            }
+        }
+        Some(named)
+    }
+
+    /// The paths a shortstat of HEAD depends on, from `status --porcelain -z`,
+    /// each with whether its absence is explained by a deletion or a rename.
+    /// Untracked and ignored rows are not in a diff of HEAD (their appearance
+    /// changes the status bytes, which are in the stamp). `None` is
+    /// unprovable.
+    #[cfg(unix)]
+    fn changed_rows(bytes: &[u8]) -> Option<Vec<(String, bool)>> {
+        let mut rows = Vec::new();
+        let mut i = 0usize;
+        let field = |from: usize| -> Option<(String, usize)> {
+            let n = bytes[from..].iter().position(|&b| b == 0)?;
+            let text = std::str::from_utf8(&bytes[from..from + n]).ok()?;
+            Some((text.to_string(), from + n + 1))
+        };
+        while i + 3 <= bytes.len() {
+            let (x, y) = (bytes[i] as char, bytes[i + 1] as char);
+            let (path, next) = field(i + 3)?;
+            i = next;
+            if x == '?' && y == '?' {
+                // A `.gitattributes` that is not tracked changes how tracked
+                // files diff, and its own edits move no status byte.
+                if path.rsplit('/').next() == Some(".gitattributes") {
+                    return None;
+                }
+                continue;
+            }
+            if x == '!' {
+                continue;
+            }
+            rows.push((path, x == 'D' || y == 'D'));
+            if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+                let (origin, next) = field(i)?;
+                i = next;
+                rows.push((origin, true));
+            }
+            if rows.len() > MAX_STAMPED_PATHS {
+                return None;
+            }
+        }
+        Some(rows)
+    }
+
+    /// HEAD's commit read from files, without a process: a detached oid, or a
+    /// branch's loose or packed ref. `None` for anything else (an unborn
+    /// branch, a symbolic ref chain, a reftable store).
+    #[cfg(unix)]
+    fn head_oid(private: &Path, common: &Path) -> Option<String> {
+        let head = std::fs::read_to_string(private.join("HEAD")).ok()?;
+        let head = head.trim();
+        let Some(name) = head.strip_prefix("ref: ") else {
+            return is_oid(head).then(|| head.to_string());
+        };
+        if name.is_empty()
+            || name.starts_with('/')
+            || name.split('/').any(|part| part.is_empty() || part == "..")
+            || name.contains('\0')
+        {
+            return None;
+        }
+        for dir in [private, common] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+                let text = text.trim();
+                return is_oid(text).then(|| text.to_string());
+            }
+        }
+        let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+        packed.lines().find_map(|line| {
+            let (oid, refname) = line.split_once(' ')?;
+            (refname == name && is_oid(oid)).then(|| oid.to_string())
+        })
+    }
+
+    #[cfg(unix)]
+    fn is_oid(text: &str) -> bool {
+        matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
 fn scan_worktree(
     repo: &Path,
     entry: &ParsedWorktree,
     depth: ScanDepth,
     base: &Base,
     deadline: Option<&ScanDeadline>,
+    pass: &ScanPass,
 ) -> WorktreeScan {
     let dir = Path::new(&entry.path);
     if !dir.is_dir() {
@@ -1995,8 +2799,8 @@ fn scan_worktree(
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
     let failures = crate::engine::git_cli::process_failures();
-    let status = match read_porcelain(dir, deadline, None) {
-        Ok(status) => status,
+    let status = match read_status_since(dir, deadline, pass.not_before) {
+        Ok(read) => read.bytes,
         Err(reason) if reason == DEADLINE_PASSED => return WorktreeScan::cut_off(),
         Err(reason) => {
             return WorktreeScan {
@@ -2043,7 +2847,7 @@ fn scan_worktree(
             // a listing are clean. An unborn or unknown HEAD is measured.
             Some(WorktreeDiffStat::default())
         } else {
-            measure_diff_stat(dir)
+            diff_stamp::through(dir, &status, pass, || measure_diff_stat(dir))
         },
         divergence,
         routes: match &base.routes {
@@ -7018,7 +7822,14 @@ some-future-field whatever
             ..ParsedWorktree::default()
         };
         let before = diff_spawns_in(&repo);
-        let scan = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None);
+        let scan = scan_worktree(
+            &repo,
+            &entry,
+            ScanDepth::Full,
+            &Base::none(),
+            None,
+            &ScanPass::now(),
+        );
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(diff_spawns_in(&repo), before + 1);
     }
@@ -7063,7 +7874,14 @@ some-future-field whatever
         };
         let repo = plain(main.path());
         let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
-            scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None)
+            scan_worktree(
+                &repo,
+                &entry,
+                ScanDepth::Full,
+                &Base::none(),
+                None,
+                &ScanPass::now(),
+            )
         });
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(scan.diff_stat, None);
@@ -7073,7 +7891,14 @@ some-future-field whatever
             "{note}"
         );
         assert!(note.contains("forced by test"), "{note}");
-        let whole = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none(), None);
+        let whole = scan_worktree(
+            &repo,
+            &entry,
+            ScanDepth::Full,
+            &Base::none(),
+            None,
+            &ScanPass::now(),
+        );
         assert_eq!(whole.note, None);
         assert!(whole.diff_stat.is_some());
     }
@@ -14125,6 +14950,9 @@ some-future-field whatever
         let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
         let repo_dir = anchor_fixture.path().to_path_buf();
         crate::test_support::trust_repo(&repo_dir);
+        // A stacked base must come from a committed checkout (BaseKey::new
+        // refuses a non-commit head_sha), so the fixture gets a real commit.
+        crate::codeintel::tests::commit_and_stamp_head(&repo_dir);
 
         let wt = sandbox.path().join("wt-stacked");
         let created = add_worktree_with_devmap(
@@ -14371,6 +15199,431 @@ some-future-field whatever
     }
 }
 
+/// ft-b7a499bf: a worktree is read once per pass, and a shortstat is skipped
+/// only when a stamp proves nothing it depends on moved.
+#[cfg(test)]
+mod scan_once_tests {
+    use super::*;
+    use crate::engine::git_cli::spawn_log::spawns_in;
+    use crate::engine::ref_cache::ManualClock;
+    use crate::test_support::{git_in, repo_with_worktrees};
+
+    fn plain(path: &Path) -> PathBuf {
+        crate::engine::git_cli::canonicalize_plain(path).unwrap()
+    }
+
+    fn spawned(cwds: &[PathBuf], needle: &str) -> usize {
+        cwds.iter()
+            .flat_map(|cwd| spawns_in(cwd))
+            .filter(|argv| argv.iter().any(|arg| arg == needle))
+            .count()
+    }
+
+    fn everywhere(root: &Path, linked: &[PathBuf]) -> Vec<PathBuf> {
+        let mut cwds = linked.to_vec();
+        cwds.push(root.to_path_buf());
+        cwds
+    }
+
+    fn change_every_worktree(linked: &[PathBuf]) {
+        for dir in linked {
+            std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        }
+    }
+
+    fn gathering(root: &Path) -> bool {
+        let key = FlightKey {
+            repo: validate_repo(root.to_str().unwrap()).unwrap(),
+            class: crate::engine::git_cli::current_admission(),
+        };
+        let lanes = flight_lanes().lock().unwrap();
+        lanes.get(&key).is_some_and(|lane| lane.open.is_some())
+    }
+
+    /// The snapshot's main-checkout status, its rows and its collision scan are
+    /// one read of each worktree: N worktrees, N statuses (it was N + 1, the
+    /// main checkout twice).
+    #[test]
+    fn a_snapshot_spawns_one_status_per_worktree() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = plain(main.path());
+        change_every_worktree(&linked);
+        let cwds = everywhere(&root, &linked);
+        let before = spawned(&cwds, "status");
+        let snapshot = crate::insights::snapshot(root.to_str().unwrap());
+        assert!(snapshot.collisions.ok, "{:?}", snapshot.collisions);
+        assert_eq!(
+            spawned(&cwds, "status") - before,
+            cwds.len(),
+            "one status per worktree"
+        );
+    }
+
+    /// A full listing and a snapshot that overlap read each worktree once
+    /// between them: the one that reads first serves the other, because its read
+    /// began after both had asked (it was 2N + 1).
+    #[test]
+    fn a_full_listing_and_a_snapshot_in_flight_together_share_each_status() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = plain(main.path());
+        change_every_worktree(&linked);
+        let cwds = everywhere(&root, &linked);
+        let before = spawned(&cwds, "status");
+        let path = root.to_str().unwrap().to_string();
+        let listing = std::thread::spawn(move || {
+            GATHER_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(400))));
+            list_worktrees(&path)
+        });
+        let started = Instant::now();
+        while !gathering(&root) {
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "never gathered"
+            );
+            std::thread::yield_now();
+        }
+        let snapshot = crate::insights::snapshot(root.to_str().unwrap());
+        let listed = listing.join().unwrap().expect("listing");
+        assert!(snapshot.collisions.ok, "{:?}", snapshot.collisions);
+        assert!(
+            listed[1..].iter().all(|w| w.dirty_files == Some(1)),
+            "{listed:?}"
+        );
+        assert_eq!(
+            spawned(&cwds, "status") - before,
+            cwds.len(),
+            "one status per worktree between the two"
+        );
+    }
+
+    /// Two full listings further apart than the racy window: the second runs no
+    /// `diff --shortstat`, the stamp proving nothing moved. The clock is the
+    /// one `ref_cache` injects, so no test sleeps three seconds.
+    #[test]
+    fn an_unchanged_worktree_is_not_diffed_again_once_it_is_older_than_the_racy_window() {
+        // The stamp reads HOME and XDG_CONFIG_HOME: no test may rebind them
+        // under this one.
+        let _serial = crate::test_support::env::env_serial();
+        let clock = ManualClock::install();
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = plain(main.path());
+        change_every_worktree(&linked);
+        let first = list_worktrees(root.to_str().unwrap()).expect("first");
+        assert_eq!(spawned(&linked, "--shortstat"), linked.len());
+        clock.advance(crate::engine::ref_cache::racy_window() + Duration::from_secs(1));
+        let second = list_worktrees(root.to_str().unwrap()).expect("second");
+        assert_eq!(
+            spawned(&linked, "--shortstat"),
+            linked.len(),
+            "the second listing diffed again"
+        );
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+    }
+
+    /// Whatever changes a diff, the next listing says what a fresh measurement
+    /// says, and the stamp skips the measurement only on the steps that
+    /// changed nothing.
+    #[test]
+    fn the_listing_always_agrees_with_a_fresh_measurement_across_every_kind_of_change() {
+        let _serial = crate::test_support::env::env_serial();
+        let clock = ManualClock::install();
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let root = plain(main.path());
+        let dir = linked[0].clone();
+        let seed = dir.join("seed.txt");
+        std::fs::write(&seed, "seed\nx\n").unwrap();
+        type Step = (&'static str, Box<dyn Fn()>);
+        let steps: Vec<Step> = vec![
+            ("first measurement", Box::new(|| {})),
+            ("untouched", Box::new(|| {})),
+            ("same size, mtime restored", {
+                let seed = seed.clone();
+                Box::new(move || {
+                    let mtime = std::fs::metadata(&seed).unwrap().modified().unwrap();
+                    std::fs::write(&seed, "seed\ny\n").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&seed)
+                        .unwrap()
+                        .set_modified(mtime)
+                        .unwrap();
+                })
+            }),
+            ("another size", {
+                let seed = seed.clone();
+                Box::new(move || std::fs::write(&seed, "seed\nyy\nzz\n").unwrap())
+            }),
+            ("an untracked file", {
+                let dir = dir.clone();
+                Box::new(move || std::fs::write(dir.join("loose.txt"), "x").unwrap())
+            }),
+            ("an index-only add", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["add", "seed.txt"]))
+            }),
+            ("a commit", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["commit", "-q", "-m", "next"]))
+            }),
+            ("an edit after it", {
+                let seed = seed.clone();
+                Box::new(move || std::fs::write(&seed, "seed\nyy\nzz\nmore\n").unwrap())
+            }),
+            ("the branch moved under HEAD", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["update-ref", "refs/heads/agent/00", "HEAD~1"]))
+            }),
+            ("a rename", {
+                let dir = dir.clone();
+                Box::new(move || {
+                    git_in(&dir, &["mv", "seed.txt", "moved.txt"]);
+                    std::fs::write(dir.join("moved.txt"), "seed\nmoved\n").unwrap();
+                })
+            }),
+            ("settled again", Box::new(|| {})),
+        ];
+        let mut skipped = 0;
+        let mut trace = Vec::new();
+        for (label, step) in steps {
+            step();
+            let before = spawned(std::slice::from_ref(&dir), "--shortstat");
+            let listed = list_worktrees(root.to_str().unwrap()).expect("list");
+            let measured_by_listing = spawned(std::slice::from_ref(&dir), "--shortstat") - before;
+            let wt = listed
+                .iter()
+                .find(|w| Path::new(&w.path) == dir)
+                .expect("listed");
+            assert_eq!(wt.scan_note, None, "{label}");
+            assert_eq!(wt.diff_stat, measure_diff_stat(&dir), "{label}");
+            trace.push((label, measured_by_listing));
+            // Time passes between listings: the injected clock stands still
+            // otherwise, and a later pass would read as older than an entry
+            // an earlier one stored.
+            clock.advance(Duration::from_secs(1));
+            if measured_by_listing == 0 && wt.dirty_files != Some(0) {
+                skipped += 1;
+            }
+        }
+        assert!(
+            skipped >= 1,
+            "the stamp never skipped: the test proves nothing ({trace:?})"
+        );
+    }
+
+    /// A stamp that cannot be proven never skips and is never kept.
+    #[test]
+    fn an_unprovable_stamp_measures_every_time() {
+        let _serial = crate::test_support::env::env_serial();
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("f.txt"), "f").unwrap();
+        let status: Arc<str> = Arc::from(" M seed.txt\0");
+        let stat = Some(WorktreeDiffStat::default());
+        let measures = |status: &Arc<str>, dir: &Path, times: usize| {
+            let pass = ScanPass::now();
+            let mut ran = 0;
+            for _ in 0..times {
+                diff_stamp::through(dir, status, &pass, || {
+                    ran += 1;
+                    stat.clone()
+                });
+            }
+            ran
+        };
+
+        // Control: with settled timestamps and nothing in the way, the second
+        // ask is served from the stamp.
+        {
+            let clock = ManualClock::install();
+            let _ = clock.now();
+            assert_eq!(measures(&status, &dir, 2), 1, "control");
+        }
+        // Racy: a file written inside the window cannot be told from a later
+        // write in the same tick.
+        {
+            let clock = ManualClock::install();
+            let soon = clock.now() + Duration::from_secs(10);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("seed.txt"))
+                .unwrap()
+                .set_modified(soon)
+                .unwrap();
+            assert_eq!(measures(&status, &dir, 2), 2, "racy");
+        }
+        let _clock = ManualClock::install();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("seed.txt"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        // A changed path that cannot be read.
+        let unreadable: Arc<str> = Arc::from(" M sub/f.txt\0");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sub = dir.join("sub");
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let ran = measures(&unreadable, &dir, 2);
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(ran, 2, "an unreadable path");
+        }
+        // A changed path that is a directory (a submodule's own commits move
+        // nothing in this worktree).
+        let nested: Arc<str> = Arc::from(" M sub\0");
+        assert_eq!(measures(&nested, &dir, 2), 2, "a directory row");
+        // An untracked attributes file changes how tracked files diff.
+        let attributes: Arc<str> = Arc::from("?? .gitattributes\0 M seed.txt\0");
+        assert_eq!(measures(&attributes, &dir, 2), 2, "untracked attributes");
+        // A worktree that is gone.
+        let gone = main.path().join("no-such-worktree");
+        assert_eq!(measures(&status, &gone, 2), 2, "a missing directory");
+        // A deletion explains an absent path; nothing else does.
+        std::fs::remove_file(dir.join("sub").join("f.txt")).unwrap();
+        let deleted: Arc<str> = Arc::from(" D sub/f.txt\0");
+        assert_eq!(measures(&deleted, &dir, 2), 1, "a deleted path is provable");
+        let vanished: Arc<str> = Arc::from(" M sub/f.txt\0");
+        assert_eq!(
+            measures(&vanished, &dir, 2),
+            2,
+            "an absent path with no deletion"
+        );
+    }
+
+    /// Two states that differ only in HEAD's commit, or only in the ctime of a
+    /// changed file, have different stamps.
+    #[test]
+    fn a_stamp_sees_a_moved_head_and_an_edit_that_kept_size_and_mtime() {
+        let _serial = crate::test_support::env::env_serial();
+        let _clock = ManualClock::install();
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let seed = dir.join("seed.txt");
+        std::fs::write(&seed, "seed\nchanged\n").unwrap();
+        let status: Arc<str> = Arc::from(" M seed.txt\0");
+        let capture = || diff_stamp::DiffStamp::capture(&dir, &status, &ScanPass::now());
+
+        let base = capture().expect("a provable stamp");
+        assert_eq!(capture().as_ref(), Some(&base), "stable while untouched");
+
+        let mtime = std::fs::metadata(&seed).unwrap().modified().unwrap();
+        std::fs::write(&seed, "seed\nCHANGED\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&seed)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let edited = capture().expect("a provable stamp");
+        assert_ne!(edited, base, "same size and mtime, new ctime");
+
+        // A new commit on the checked-out branch by plumbing: neither the
+        // index nor a file moves, only the branch under HEAD.
+        let next = git_text(
+            &dir,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "moves HEAD only",
+            ],
+        )
+        .unwrap();
+        git_in(&dir, &["update-ref", "refs/heads/agent/00", next.trim()]);
+        let moved = capture().expect("a provable stamp");
+        assert_ne!(
+            moved, edited,
+            "same status bytes and files, new HEAD commit"
+        );
+    }
+
+    /// One status per worktree whatever the number of asks inside one pass, and
+    /// a read begun before a caller asked is never its answer.
+    #[test]
+    fn a_status_read_is_reused_only_if_it_began_after_the_ask() {
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let early = Instant::now();
+        let first = read_status_since(&dir, None, early).unwrap();
+        assert!(first.led);
+        let again = read_status_since(&dir, None, early).unwrap();
+        assert!(!again.led, "a read since the ask is shared");
+        assert_eq!(again.started, first.started);
+        let later = read_status_since(&dir, None, Instant::now()).unwrap();
+        assert!(
+            later.led,
+            "a read that began before the ask is not its answer"
+        );
+        assert_eq!(spawned(std::slice::from_ref(&dir), "status"), 2);
+    }
+
+    /// A failure is not kept: once the worktree is back the next ask reads it.
+    #[test]
+    fn a_failed_read_is_never_kept() {
+        let (main, _parent, _linked) = repo_with_worktrees(0);
+        let root = plain(main.path());
+        let early = Instant::now();
+        let probe = |_: &Path| {};
+        let ok = status_probes::with_probe(std::slice::from_ref(&root), probe, || {
+            read_status_since(&root, None, early)
+        });
+        assert!(ok.is_ok());
+        let expired = ScanDeadline::after(Instant::now(), Duration::ZERO);
+        let cut = read_status_since(&root, Some(&expired), Instant::now());
+        assert!(cut.is_err());
+        assert!(
+            read_status_since(&root, None, Instant::now()).is_ok(),
+            "the cut left no failure behind"
+        );
+    }
+
+    /// A deadline-less read that ends at git's own time limit ends every caller
+    /// waiting on it, together: six waiters on a hung worktree used to retry one
+    /// after another and finish at six times the limit.
+    #[test]
+    fn callers_waiting_on_a_hung_read_fail_with_it_together() {
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let early = Instant::now();
+        let started = Instant::now();
+        let hang = Duration::from_millis(300);
+        let results = status_probes::with_probe(
+            std::slice::from_ref(&dir),
+            move |_| std::thread::sleep(hang),
+            || {
+                status_probes::with_forced_timeout(&dir, || {
+                    std::thread::scope(|scope| {
+                        let waiters: Vec<_> = (0..6)
+                            .map(|_| scope.spawn(|| read_status_since(&dir, None, early)))
+                            .collect();
+                        waiters
+                            .into_iter()
+                            .map(|waiter| waiter.join().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+            },
+        );
+        let took = started.elapsed();
+        for result in &results {
+            let error = result.as_ref().expect_err("the read hung");
+            assert!(error.message().contains("timed out"), "{error:?}");
+        }
+        assert!(
+            took < crate::test_support::coverage_relaxed(hang * 3),
+            "six waiters took {took:?} for a {hang:?} hang: they retried one at a time"
+        );
+    }
+}
+
 #[cfg(test)]
 mod worktree_list_porcelain_tests {
     use super::worktree_list_porcelain_argv;
@@ -14381,5 +15634,84 @@ mod worktree_list_porcelain_tests {
             worktree_list_porcelain_argv(),
             vec!["git", "worktree", "list", "--porcelain", "-z"]
         );
+    }
+}
+
+/// Adversarial attacks on ft-b7a499bf (adversary, wave 2).
+#[cfg(test)]
+mod scan_once_adversarial_tests {
+    use super::*;
+    use crate::engine::ref_cache::ManualClock;
+    use crate::test_support::env::{bind_env, env_serial};
+    use crate::test_support::{git_in, repo_with_worktrees};
+    use std::sync::Arc;
+
+    /// Runs the shortstat through the stamp twice, `change` between them, and
+    /// says how many times the measurement ran and whether the second answer
+    /// differs from a fresh measurement.
+    fn measured_twice(dir: &Path, clock: &ManualClock, change: impl FnOnce()) -> (usize, bool) {
+        let status: Arc<str> = Arc::from(" M seed.txt\0");
+        let runs = std::cell::Cell::new(0usize);
+        let measure = || {
+            runs.set(runs.get() + 1);
+            measure_diff_stat(dir)
+        };
+        let first = diff_stamp::through(dir, &status, &ScanPass::now(), measure);
+        assert!(first.is_some());
+        change();
+        clock.advance(crate::engine::ref_cache::racy_window() + Duration::from_secs(1));
+        let second = diff_stamp::through(dir, &status, &ScanPass::now(), measure);
+        (runs.get(), second != measure_diff_stat(dir))
+    }
+
+    /// A user-level attributes file (`$XDG_CONFIG_HOME/git/attributes`, which
+    /// git reads for every diff) is an input of `git diff HEAD --shortstat`
+    /// that the stamp does not carry: `-diff` turns the line counts into a
+    /// binary summary.
+    #[test]
+    fn a_user_attributes_file_edit_is_not_served_a_stale_shortstat() {
+        let serial = env_serial();
+        let clock = ManualClock::install();
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = bind_env(&serial)
+            .set("HOME", home.path())
+            .set("XDG_CONFIG_HOME", home.path());
+        let attributes = home.path().join("git").join("attributes");
+        let (runs, stale) = measured_twice(&dir, &clock, || {
+            std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+            std::fs::write(&attributes, "seed.txt -diff\n").unwrap();
+        });
+        assert_eq!(runs, 2, "the attributes file changed, the stamp did not");
+        assert!(!stale, "a stale shortstat was served");
+    }
+
+    /// Same, through `core.attributesFile`: the config that names the file is
+    /// stamped, the file it names is not.
+    #[test]
+    fn an_edit_to_the_file_core_attributes_file_names_is_not_served_stale() {
+        let _serial = env_serial();
+        let clock = ManualClock::install();
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let attributes = outside.path().join("attrs");
+        std::fs::write(&attributes, "# nothing yet\n").unwrap();
+        git_in(
+            &dir,
+            &[
+                "config",
+                "core.attributesFile",
+                attributes.to_str().unwrap(),
+            ],
+        );
+        let (runs, stale) = measured_twice(&dir, &clock, || {
+            std::fs::write(&attributes, "seed.txt -diff\n").unwrap();
+        });
+        assert_eq!(runs, 2, "the named file changed, the stamp did not");
+        assert!(!stale, "a stale shortstat was served");
     }
 }

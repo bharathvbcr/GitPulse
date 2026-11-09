@@ -319,6 +319,10 @@ describe("SettingsModal MCP / Agent Plugins", () => {
     expect(source).toContain('copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")');
     expect(source).toContain('copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")');
     expect(source).toContain("disabled={!mcpInfo.hooks_config_json}");
+    // Windows deciding hooks block a missing binary through `onFailure`, which
+    // Claude Code honours from 2.1.295; the floor is stated beside the copy.
+    expect(source).toContain('data-testid="hooks-version-floor"');
+    expect(source).toContain("Claude Code 2.1.295 or later");
     expect(source).not.toContain("plugin_mcp_json");
     expect(source).toContain("not reachable.");
     expect(source).toContain("hook_on_path");

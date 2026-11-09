@@ -995,7 +995,6 @@ tool_args! {
     }
 }
 
-
 tool_args! {
     struct WorktreeOverlaySyncArgs {
         repo_path: String = repo_spec(),
@@ -3466,28 +3465,27 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .map_err(CommandError::into_message)?;
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
             let kind = a.kind.as_deref().unwrap_or("ask");
-            let effective_body = if let Some(title) =
-                a.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
-            {
-                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&a.body) {
-                    if let Some(obj) = val.as_object_mut() {
-                        if !obj.contains_key("title") {
-                            obj.insert("title".to_string(), json!(title));
+            let effective_body =
+                if let Some(title) = a.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&a.body) {
+                        if let Some(obj) = val.as_object_mut() {
+                            if !obj.contains_key("title") {
+                                obj.insert("title".to_string(), json!(title));
+                            }
+                            serde_json::to_string(&val).unwrap_or_else(|_| a.body.clone())
+                        } else {
+                            a.body.clone()
                         }
-                        serde_json::to_string(&val).unwrap_or_else(|_| a.body.clone())
                     } else {
-                        a.body.clone()
+                        json!({
+                            "title": title,
+                            "text": a.body
+                        })
+                        .to_string()
                     }
                 } else {
-                    json!({
-                        "title": title,
-                        "text": a.body
-                    })
-                    .to_string()
-                }
-            } else {
-                a.body.clone()
-            };
+                    a.body.clone()
+                };
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
                 &a.from_agent,
@@ -5593,10 +5591,7 @@ mod tests {
             "gitpulse_worktree_send_message",
             "one coordination message receipt, no list",
         ),
-        (
-            "gitpulse_inbox_post",
-            "one inbox post receipt, no list",
-        ),
+        ("gitpulse_inbox_post", "one inbox post receipt, no list"),
         (
             "gitpulse_inbox_withdraw",
             "one inbox ask withdrawal receipt, no list",
@@ -10236,7 +10231,9 @@ mod tests {
             }),
         );
         assert!(!err, "failed to read withdrawn inbox: {inbox_withdrawn}");
-        let withdrawn_threads = inbox_withdrawn["threads"].as_array().expect("withdrawn threads");
+        let withdrawn_threads = inbox_withdrawn["threads"]
+            .as_array()
+            .expect("withdrawn threads");
         assert_eq!(withdrawn_threads.len(), 1);
         assert_eq!(withdrawn_threads[0]["status"], "withdrawn");
     }
@@ -10309,7 +10306,10 @@ mod tests {
         assert_eq!(lanes[0].agent_id, "agy-worker-1");
         assert_eq!(
             lanes[0].claimed_files,
-            vec!["manvi/codingagent/agy.go", "manvi/codingagent/executable.go"]
+            vec![
+                "manvi/codingagent/agy.go",
+                "manvi/codingagent/executable.go"
+            ]
         );
     }
 }

@@ -819,7 +819,6 @@ pub(crate) fn sync_graft_inbox_message(msg: &crate::engine::agent_bus::AgentBusM
     }
 }
 
-
 pub(super) fn native_request(
     host: &WorkbenchState,
     method: &str,
@@ -1532,4 +1531,3 @@ mod tests {
         assert_eq!(rm_json["key"], expected_key);
     }
 }
-

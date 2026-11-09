@@ -941,11 +941,11 @@ impl GitReader {
 
     pub fn head_id(repo_path: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
-        Ok(
-            ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])?
-                .trim()
-                .to_string(),
-        )
+        Ok(git_cli::with_spawn_source("git_reader.head_id", || {
+            ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])
+        })?
+        .trim()
+        .to_string())
     }
 
     /// Short name of the repository's default branch: the primary remote's
@@ -1214,14 +1214,34 @@ impl GitReader {
     pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
-        Self::get_status_with_budget(repo_path, UntrackedBudget::SHIPPED)
+        Self::get_status_since(repo_path, Instant::now())
+    }
+
+    /// [`Self::get_status`] that takes the raw status from any read of this
+    /// worktree begun at or after `not_before`, whoever made it: the stages of
+    /// one pass share a read of each worktree (see
+    /// [`crate::engine::worktree`]'s status cell).
+    pub fn get_status_since(
+        repo_path: &str,
+        not_before: Instant,
+    ) -> Result<Vec<FileStatus>, CommandError> {
+        Self::get_status_in(repo_path, UntrackedBudget::SHIPPED, not_before)
     }
 
     /// [`Self::get_status`] with `untracked` as the most it may read to count
     /// untracked files' lines; a row past it carries a warning instead.
+    #[cfg(test)]
     fn get_status_with_budget(
         repo_path: &str,
         untracked: UntrackedBudget,
+    ) -> Result<Vec<FileStatus>, CommandError> {
+        Self::get_status_in(repo_path, untracked, Instant::now())
+    }
+
+    fn get_status_in(
+        repo_path: &str,
+        untracked: UntrackedBudget,
+        not_before: Instant,
     ) -> Result<Vec<FileStatus>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
@@ -1230,7 +1250,7 @@ impl GitReader {
         // than collapsed into directory roots. `GIT_OPTIONAL_LOCKS=0` is set
         // on every git child, so this status does not rewrite the index and
         // re-trigger the watcher.
-        let stdout = git_text_shared(&repo, Self::STATUS_ARGV)?;
+        let stdout = crate::engine::worktree::read_status_since(&repo, None, not_before)?.bytes;
         let records = parse_status_records(stdout.as_bytes());
         // Each numstat is read only for the rows below that look it up, so a
         // tree with nothing staged never needs the cached one, and a clean

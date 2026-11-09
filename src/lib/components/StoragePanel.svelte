@@ -752,6 +752,9 @@
             <span><span class="font-semibold text-textPrimary">{report.branches.local_count}</span> <span class="text-textMuted">local</span></span>
             <span><span class="font-semibold text-textPrimary">{report.branches.remote_tracking_count}</span> <span class="text-textMuted">remote-tracking</span></span>
             <span><span class="font-semibold text-amber-300">{report.branches.merged_stale_count}</span> <span class="text-textMuted">merged-stale</span></span>
+            {#if report.branches.merged_unchecked_count > 0}
+              <span class="text-amber-300" title="Their squash/rebase comparison did not run, so merged-stale may undercount">{report.branches.merged_unchecked_count} not checked for squash merges</span>
+            {/if}
             <span><span class="font-semibold text-rose-300">{report.branches.gone_upstream_count}</span> <span class="text-textMuted">upstream gone</span></span>
             {#if report.branches.merged_stale_count > 0}
               <button type="button" onclick={openManviCleanup} class="gp-btn py-0.5! ml-auto" title="Review the conservative cleanup plan in the MANVI view">

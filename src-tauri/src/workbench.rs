@@ -1341,8 +1341,7 @@ pub async fn cmd_inbox_decompose_task(
                     logs: None,
                     parent: Some(parent_id.clone()),
                 };
-                let sub_res =
-                    intake::add_task(store, &repo_path, sub_task, false, &sibling_ids)?;
+                let sub_res = intake::add_task(store, &repo_path, sub_task, false, &sibling_ids)?;
                 let sub_item_id = sub_res
                     .get("item_id")
                     .and_then(Value::as_str)

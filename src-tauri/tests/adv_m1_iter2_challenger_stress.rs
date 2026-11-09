@@ -278,7 +278,9 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 1. Direct Rust API: withdraw_ask with empty string
     let err_wd_empty = withdraw_ask(repo_path, "agent-1", "", "Valid reason").unwrap_err();
     assert!(
-        err_wd_empty.message().contains("thread_key must not be empty"),
+        err_wd_empty
+            .message()
+            .contains("thread_key must not be empty"),
         "withdraw_ask must reject empty thread_key, got: {}",
         err_wd_empty.message()
     );
@@ -294,7 +296,9 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 3. Direct Rust API: answer_ask with empty string
     let err_ans_empty = answer_ask(repo_path, "agent-1", "", "Valid answer").unwrap_err();
     assert!(
-        err_ans_empty.message().contains("thread_key must not be empty"),
+        err_ans_empty
+            .message()
+            .contains("thread_key must not be empty"),
         "answer_ask must reject empty thread_key, got: {}",
         err_ans_empty.message()
     );
@@ -302,7 +306,9 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 4. Direct Rust API: answer_ask with whitespace-only string
     let err_ans_ws = answer_ask(repo_path, "agent-1", "   \r\n  ", "Valid answer").unwrap_err();
     assert!(
-        err_ans_ws.message().contains("thread_key must not be empty"),
+        err_ans_ws
+            .message()
+            .contains("thread_key must not be empty"),
         "answer_ask must reject whitespace-only thread_key, got: {}",
         err_ans_ws.message()
     );

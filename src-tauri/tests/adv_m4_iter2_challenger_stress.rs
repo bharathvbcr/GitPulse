@@ -10,9 +10,7 @@
 
 mod common;
 
-use gitpulse_lib::engine::agent_bus::{
-    list_inbox_threads, post_thread_message,
-};
+use gitpulse_lib::engine::agent_bus::{list_inbox_threads, post_thread_message};
 use gitpulse_lib::mcp::{process_request, Era, JsonRpcRequest, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -207,7 +205,11 @@ fn test_multibyte_utf8_truncation_across_boundary_offsets_54_to_61() {
         .expect("list_inbox_threads must never panic on multi-byte UTF-8");
 
     // 8 offsets * 7 payloads = 56 threads
-    assert_eq!(threads.len(), 56, "All 56 UTF-8 test threads must be retrieved");
+    assert_eq!(
+        threads.len(),
+        56,
+        "All 56 UTF-8 test threads must be retrieved"
+    );
 
     for thread in &threads {
         assert!(
@@ -400,44 +402,74 @@ fn test_exact_length_boundaries_0_1_57_60_61_char_strings() {
         }
     }
 
-    let threads = list_inbox_threads(repo_path, None, None)
-        .expect("must list threads without panic");
+    let threads =
+        list_inbox_threads(repo_path, None, None).expect("must list threads without panic");
     assert_eq!(threads.len(), 10); // 9 posted + 1 injected
 
-    let t_injected = threads.iter().find(|t| t.thread_key == "thread-injected-empty").unwrap();
+    let t_injected = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-injected-empty")
+        .unwrap();
     assert_eq!(t_injected.title, "thread-injected-empty");
 
-    let t_1b = threads.iter().find(|t| t.thread_key == "thread-1byte").unwrap();
+    let t_1b = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-1byte")
+        .unwrap();
     assert_eq!(t_1b.title, "X");
 
-    let t_1e = threads.iter().find(|t| t.thread_key == "thread-1emoji").unwrap();
+    let t_1e = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-1emoji")
+        .unwrap();
     assert_eq!(t_1e.title, "🦀");
 
-    let t_57a = threads.iter().find(|t| t.thread_key == "thread-57-ascii").unwrap();
+    let t_57a = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-57-ascii")
+        .unwrap();
     assert_eq!(t_57a.title, "A".repeat(57));
     assert_eq!(t_57a.title.chars().count(), 57);
 
-    let t_57cjk = threads.iter().find(|t| t.thread_key == "thread-57-cjk").unwrap();
+    let t_57cjk = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-57-cjk")
+        .unwrap();
     assert_eq!(t_57cjk.title, "中".repeat(57));
     assert_eq!(t_57cjk.title.chars().count(), 57);
 
-    let t_60a = threads.iter().find(|t| t.thread_key == "thread-60-ascii").unwrap();
+    let t_60a = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-60-ascii")
+        .unwrap();
     assert_eq!(t_60a.title, "B".repeat(60));
     assert_eq!(t_60a.title.chars().count(), 60);
 
-    let t_60cjk = threads.iter().find(|t| t.thread_key == "thread-60-cjk").unwrap();
+    let t_60cjk = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-60-cjk")
+        .unwrap();
     assert_eq!(t_60cjk.title, "漢".repeat(60));
     assert_eq!(t_60cjk.title.chars().count(), 60);
 
-    let t_61a = threads.iter().find(|t| t.thread_key == "thread-61-ascii").unwrap();
+    let t_61a = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-61-ascii")
+        .unwrap();
     assert_eq!(t_61a.title, format!("{}…", "C".repeat(57)));
     assert_eq!(t_61a.title.chars().count(), 58);
 
-    let t_61cjk = threads.iter().find(|t| t.thread_key == "thread-61-cjk").unwrap();
+    let t_61cjk = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-61-cjk")
+        .unwrap();
     assert_eq!(t_61cjk.title, format!("{}…", "文".repeat(57)));
     assert_eq!(t_61cjk.title.chars().count(), 58);
 
-    let t_61emoji = threads.iter().find(|t| t.thread_key == "thread-61-emoji").unwrap();
+    let t_61emoji = threads
+        .iter()
+        .find(|t| t.thread_key == "thread-61-emoji")
+        .unwrap();
     assert_eq!(t_61emoji.title, format!("{}…", "🚀".repeat(57)));
     assert_eq!(t_61emoji.title.chars().count(), 58);
 }
@@ -499,7 +531,10 @@ fn test_mcp_inbox_tools_never_panic_under_utf8_stress() {
             "thread_key": "mcp-utf8-thread"
         }),
     );
-    assert!(!err_wt_inbox, "mcp gitpulse_worktree_inbox failed: {res_wt_inbox}");
+    assert!(
+        !err_wt_inbox,
+        "mcp gitpulse_worktree_inbox failed: {res_wt_inbox}"
+    );
     assert_eq!(res_wt_inbox["ok"], true);
     let msgs = res_wt_inbox["messages"].as_array().expect("messages array");
     assert_eq!(msgs.len(), 1);
@@ -515,7 +550,10 @@ fn test_mcp_inbox_tools_never_panic_under_utf8_stress() {
             "reason": "Stress test verified with multi-byte text 🚀"
         }),
     );
-    assert!(!err_withdraw, "mcp gitpulse_inbox_withdraw failed: {res_withdraw}");
+    assert!(
+        !err_withdraw,
+        "mcp gitpulse_inbox_withdraw failed: {res_withdraw}"
+    );
     assert_eq!(res_withdraw["ok"], true);
 
     // 5. Re-read to confirm status transition to withdrawn
@@ -538,7 +576,8 @@ fn test_adversarial_malformed_json_and_exotic_scripts() {
     let repo_path = repo.path().to_str().unwrap();
 
     // 1. Malformed JSON with multi-byte characters
-    let malformed_json = "{ \"title\": \"Incomplete json string 🚀🦀中文éΩЖ and tail exceeding sixty chars";
+    let malformed_json =
+        "{ \"title\": \"Incomplete json string 🚀🦀中文éΩЖ and tail exceeding sixty chars";
     post_thread_message(
         repo_path,
         "agent-malformed",
@@ -576,8 +615,8 @@ fn test_adversarial_malformed_json_and_exotic_scripts() {
     )
     .expect("post math");
 
-    let threads = list_inbox_threads(repo_path, None, None)
-        .expect("must list threads without panic");
+    let threads =
+        list_inbox_threads(repo_path, None, None).expect("must list threads without panic");
     assert_eq!(threads.len(), 3);
 
     for t in &threads {

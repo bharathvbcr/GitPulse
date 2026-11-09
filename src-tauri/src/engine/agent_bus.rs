@@ -869,7 +869,15 @@ pub fn withdraw_ask(
         "reason": clean_reason,
     })
     .to_string();
-    post_thread_message(repo_path, from_agent, None, Some(&clean_thread_key), "withdraw", &body, None)
+    post_thread_message(
+        repo_path,
+        from_agent,
+        None,
+        Some(&clean_thread_key),
+        "withdraw",
+        &body,
+        None,
+    )
 }
 
 /// Posts a developer or agent reply/answer to a thread or structured ask under `thread_key`.
@@ -880,7 +888,15 @@ pub fn answer_ask(
     answer_body: &str,
 ) -> Result<AgentBusMessage, CommandError> {
     let clean_thread_key = sanitize_token("thread_key", thread_key, 80)?;
-    post_thread_message(repo_path, from_agent, None, Some(&clean_thread_key), "reply", answer_body, None)
+    post_thread_message(
+        repo_path,
+        from_agent,
+        None,
+        Some(&clean_thread_key),
+        "reply",
+        answer_body,
+        None,
+    )
 }
 
 /// Lists aggregated inbox threads grouped by `thread_key` (or message sequence),
@@ -894,7 +910,9 @@ pub fn list_inbox_threads(
         Some(a) => Some(sanitize_token("agent_id", a, 128)?),
         None => None,
     };
-    let clean_status = status_filter.map(str::trim).filter(|s| !s.is_empty() && *s != "all");
+    let clean_status = status_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState =
@@ -1015,7 +1033,7 @@ pub fn list_inbox_threads(
             });
         }
 
-        threads.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at_ms));
         Ok(threads)
     })
 }
@@ -1846,7 +1864,8 @@ mod tests {
             "ask_type": "decide",
             "question": "Use SQLite or JSON?",
             "options": ["SQLite", "JSON"]
-        }).to_string();
+        })
+        .to_string();
 
         let m1 = post_thread_message(
             anchor,
@@ -1856,14 +1875,18 @@ mod tests {
             "ask",
             &ask_body,
             Some("feat/migration"),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(m1.seq, 1);
         assert_eq!(m1.thread_key.as_deref(), Some("db-migration"));
 
         // 2. Read thread messages
         let thread_page = read_thread_messages(anchor, Some("db-migration"), None, 0).unwrap();
         assert_eq!(thread_page.messages.len(), 1);
-        assert_eq!(thread_page.messages[0].thread_key.as_deref(), Some("db-migration"));
+        assert_eq!(
+            thread_page.messages[0].thread_key.as_deref(),
+            Some("db-migration")
+        );
 
         // 3. List inbox threads: verify status is open and ask_type is decide
         let threads_open = list_inbox_threads(anchor, None, Some("open")).unwrap();
@@ -1880,7 +1903,8 @@ mod tests {
             "human-dev",
             "db-migration",
             "Selected option: SQLite",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(m2.seq, 2);
         assert_eq!(m2.kind, "reply");
         assert_eq!(m2.thread_key.as_deref(), Some("db-migration"));
@@ -1900,7 +1924,8 @@ mod tests {
             "ask_type": "do",
             "question": "Run manual database seed",
             "steps": ["Create test tables", "Seed admin user"]
-        }).to_string();
+        })
+        .to_string();
 
         let m3 = post_thread_message(
             anchor,
@@ -1910,7 +1935,8 @@ mod tests {
             "ask",
             &ask2_body,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(m3.seq, 3);
 
         let m4 = withdraw_ask(
@@ -1918,7 +1944,8 @@ mod tests {
             "claude-worker-2",
             "db-seed",
             "Resolved automatically via migration script",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(m4.seq, 4);
         assert_eq!(m4.kind, "withdraw");
 
@@ -1940,25 +1967,83 @@ mod tests {
         crate::test_support::trust_repo(anchor_dir.path());
 
         // 1. Emoji 🚀 (4 bytes: 55..59)
-        let body_emoji = format!("{}🚀{}", "A".repeat(55), "tail_exceeding_sixty_characters_limit");
-        post_thread_message(anchor, "agent-1", None, Some("t-emoji"), "note", &body_emoji, None).unwrap();
+        let body_emoji = format!(
+            "{}🚀{}",
+            "A".repeat(55),
+            "tail_exceeding_sixty_characters_limit"
+        );
+        post_thread_message(
+            anchor,
+            "agent-1",
+            None,
+            Some("t-emoji"),
+            "note",
+            &body_emoji,
+            None,
+        )
+        .unwrap();
 
         // 2. CJK character 中 (3 bytes: 56..59)
-        let body_cjk = format!("{}中{}", "B".repeat(56), "tail_exceeding_sixty_characters_limit");
-        post_thread_message(anchor, "agent-2", None, Some("t-cjk"), "note", &body_cjk, None).unwrap();
+        let body_cjk = format!(
+            "{}中{}",
+            "B".repeat(56),
+            "tail_exceeding_sixty_characters_limit"
+        );
+        post_thread_message(
+            anchor,
+            "agent-2",
+            None,
+            Some("t-cjk"),
+            "note",
+            &body_cjk,
+            None,
+        )
+        .unwrap();
 
         // 3. Accented character é (2 bytes: 56..58)
-        let body_accent = format!("{}é{}", "C".repeat(56), "tail_exceeding_sixty_characters_limit");
-        post_thread_message(anchor, "agent-3", None, Some("t-accent"), "note", &body_accent, None).unwrap();
+        let body_accent = format!(
+            "{}é{}",
+            "C".repeat(56),
+            "tail_exceeding_sixty_characters_limit"
+        );
+        post_thread_message(
+            anchor,
+            "agent-3",
+            None,
+            Some("t-accent"),
+            "note",
+            &body_accent,
+            None,
+        )
+        .unwrap();
 
         // 4. Boundary cases: 60 chars and 61 chars
         let body_60 = "D".repeat(60);
-        post_thread_message(anchor, "agent-4", None, Some("t-60"), "note", &body_60, None).unwrap();
+        post_thread_message(
+            anchor,
+            "agent-4",
+            None,
+            Some("t-60"),
+            "note",
+            &body_60,
+            None,
+        )
+        .unwrap();
 
         let body_61 = "E".repeat(61);
-        post_thread_message(anchor, "agent-5", None, Some("t-61"), "note", &body_61, None).unwrap();
+        post_thread_message(
+            anchor,
+            "agent-5",
+            None,
+            Some("t-61"),
+            "note",
+            &body_61,
+            None,
+        )
+        .unwrap();
 
-        let threads = list_inbox_threads(anchor, None, None).expect("must not panic on multi-byte UTF-8");
+        let threads =
+            list_inbox_threads(anchor, None, None).expect("must not panic on multi-byte UTF-8");
         assert_eq!(threads.len(), 5);
 
         let t_emoji = threads.iter().find(|t| t.thread_key == "t-emoji").unwrap();

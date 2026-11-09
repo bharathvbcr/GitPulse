@@ -885,7 +885,13 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
 
     let confirmed = send_with_homes(
         &state,
-        &ask(SESSION, "Follow up on seat", "req-seat-1", true, Some("resume")),
+        &ask(
+            SESSION,
+            "Follow up on seat",
+            "req-seat-1",
+            true,
+            Some("resume"),
+        ),
         &mailbox,
         &claude_configs,
         &agy_homes,
@@ -897,7 +903,13 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
     // 2. Ended Claude managed attempt with `provider_thread_id` saved in `.claude-accounts` seat.
     let canonical_root = std::fs::canonicalize(&root).unwrap();
     let eff_cfg = json!({"cwd": canonical_root, "sandbox": {"type": "none"}}).to_string();
-    prepare(&state, &root, "runs.prepare_managed", "claude-mgd", "claude");
+    prepare(
+        &state,
+        &root,
+        "runs.prepare_managed",
+        "claude-mgd",
+        "claude",
+    );
     claim(&state, "claude-mgd", Some("managed"));
     state
         .with_store(|store| {
@@ -935,7 +947,13 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
     .unwrap();
     let mgd_preview = send_with_homes(
         &state,
-        &ask("claude-mgd", "Continue managed Claude", "req-seat-2", false, None),
+        &ask(
+            "claude-mgd",
+            "Continue managed Claude",
+            "req-seat-2",
+            false,
+            None,
+        ),
         &mailbox,
         &claude_configs,
         &agy_homes,
@@ -974,7 +992,13 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
     .unwrap();
     let agy_term_preview = send_with_homes(
         &state,
-        &ask(AGY_TERM_ID, "Resume Antigravity terminal", "req-agy-1", false, None),
+        &ask(
+            AGY_TERM_ID,
+            "Resume Antigravity terminal",
+            "req-agy-1",
+            false,
+            None,
+        ),
         &mailbox,
         &claude_configs,
         &agy_homes,
@@ -983,7 +1007,10 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
     .unwrap();
     assert_eq!(agy_term_preview["route"], "resume", "{agy_term_preview}");
     assert_eq!(agy_term_preview["session_id"], AGY_TERM_ID);
-    assert!(agy_term_preview["reason"].as_str().unwrap().contains("Antigravity"));
+    assert!(agy_term_preview["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Antigravity"));
 
     // 4. Ended Antigravity managed attempt with `.pb` conversation in `~/.gemini/antigravity-cli/conversations`.
     prepare(&state, &root, "runs.prepare_managed", "agy-mgd", "agy");
@@ -1029,7 +1056,13 @@ fn ended_pinned_seat_claude_and_antigravity_runs_route_to_resume_via_send_with()
     .unwrap();
     let agy_mgd_confirmed = send_with_homes(
         &state,
-        &ask("agy-mgd", "Resume Antigravity managed", "req-agy-2", true, Some("resume")),
+        &ask(
+            "agy-mgd",
+            "Resume Antigravity managed",
+            "req-agy-2",
+            true,
+            Some("resume"),
+        ),
         &mailbox,
         &claude_configs,
         &agy_homes,
@@ -1103,6 +1136,3 @@ fn warm_managed_run_transitions_from_managed_route_to_resume_after_idle_expiry()
         );
     }
 }
-
-
-

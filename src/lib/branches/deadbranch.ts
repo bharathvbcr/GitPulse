@@ -97,6 +97,21 @@ export function formatBackupTimestamp(timestampSec: number): string {
 /**
  * Filters branches based on user search term, age, and merge mode.
  */
+/**
+ * The branches a fresh scan pre-selects for deletion: merged, and neither
+ * protected nor in use. A gone upstream never selects a branch on its own — only
+ * `is_merged` does, and the backend sets that from ancestry or a tree comparison.
+ */
+export function preselectMerged(branches: StaleBranchInfo[]): Set<string> {
+  const selected = new Set<string>();
+  for (const b of branches) {
+    if (!b.is_protected && !b.is_current_or_worktree && b.is_merged) {
+      selected.add(b.name);
+    }
+  }
+  return selected;
+}
+
 export function filterStaleBranches(
   branches: StaleBranchInfo[],
   query: string,

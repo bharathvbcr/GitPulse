@@ -847,8 +847,7 @@ fn build_pty_command(
     let inherited_claude_vars: Vec<String> = cmd
         .iter_full_env_as_str()
         .filter(|(k, _)| {
-            k.eq_ignore_ascii_case("CLAUDECODE")
-                || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+            k.eq_ignore_ascii_case("CLAUDECODE") || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
         })
         .map(|(k, _)| k.to_owned())
         .collect();
@@ -3510,14 +3509,21 @@ fn run_terminal_inner(
     // Force pushes and other policy-violating git mutations are blocked.
     // Non-git commands bypass the harness gate (which only judges git commands)
     // and follow the deps/CI execution precedent.
-    let is_git = program == "git"
-        || program.ends_with("/git")
-        || program.ends_with("\\git")
-        || program.ends_with("\\git.exe")
-        || program.ends_with("/git.exe");
+    //
+    // That includes wrapper programs: `sh -c 'git push --force'`, `env git ...`,
+    // `xargs git ...` and the like are NOT gated, because only argv[0] is
+    // classified and the inner command of a wrapper is deliberately not parsed.
+    // The console is ungated for everything but git (and the Manvi actions,
+    // which are allowlist-authoritative).
+    //
+    // argv[0] is classified case-insensitively (see `is_git_program`), so a
+    // spelling like `GIT.EXE` is gated on a case-insensitive filesystem. On a
+    // case-sensitive one `GIT` names no git, and gating it anyway is accepted
+    // over-gating: this fails closed.
+    let is_git = is_git_program(program);
     let should_gate = is_git || manvi_action.is_some();
     let (policy_verdict, gated) = if should_gate {
-        match guard_command(repo_path, &arg_refs) {
+        match guard_command(repo_path, &judged_argv(&arg_refs, is_git)) {
             Ok(verdict) => (Some(verdict), true),
             Err(refusal) => {
                 // Return honest refusal/failure if blocked or gate failed.
@@ -3572,6 +3578,21 @@ fn run_terminal_inner(
     }
 }
 
+/// The argv the command gate and the ledger judge. A spelling of git the
+/// console accepts (`GIT.EXE`, `/usr/bin/GIT`, `git.cmd`) is judged as `git`:
+/// the review gate and the ledger's action names match the literal `git`, so
+/// the raw spelling would be gated but read as a non-git command by both. The
+/// program that is spawned stays the one the caller named.
+fn judged_argv<'a>(args: &[&'a str], is_git: bool) -> Vec<&'a str> {
+    let mut judged = args.to_vec();
+    if is_git {
+        if let Some(program) = judged.first_mut() {
+            *program = "git";
+        }
+    }
+    judged
+}
+
 fn validate_argv_bounds(args: &[String]) -> Result<(), String> {
     if args.len() > TERMINAL_ARG_COUNT_CAP {
         return Err(format!(
@@ -3608,6 +3629,18 @@ pub(crate) fn normalized_program(program: &str) -> String {
         .or_else(|| lower.strip_suffix(".bat"))
         .unwrap_or(&lower)
         .to_string()
+}
+
+/// Whether argv[0] names git: the program's file name, either path separator
+/// accepted, folded by [`normalized_program`] (lower-case, `.exe`/`.cmd`/`.bat`
+/// stripped), so `git`, `/usr/bin/GIT`, `C:\Git\bin\git.exe` and `git.cmd` all
+/// are.
+fn is_git_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    // Windows resolves `git.` and `git ` to `git.exe`, so trailing dots and
+    // spaces are not part of the name. Unix has no such rule; gating there is
+    // over-gating, which fails closed.
+    normalized_program(name.trim_end_matches(['.', ' '])) == "git"
 }
 
 fn has_parent_or_absolute_path(value: &str) -> bool {
@@ -7627,6 +7660,199 @@ mod tests {
         }
     }
 
+    /// Every spelling of git the console is asked to run is routed to the gate:
+    /// the classifier `run_terminal_inner` decides `should_gate` with. Bare
+    /// `git.exe`/`git.cmd`/`git.bat` and upper-case variants used to skip it.
+    #[test]
+    fn every_spelling_of_git_is_classified_as_git() {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            "C:\\Git\\bin\\git.exe",
+            "Git.exe",
+            "GIT.EXE",
+            "/usr/bin/GIT",
+            "git.exe",
+            "git.cmd",
+            "git.bat",
+            "C:\\Git\\cmd\\GIT.CMD",
+            "git.",
+            "git ",
+            "git.exe.",
+            "/usr/bin/git. ",
+            "GIT...",
+        ] {
+            assert!(is_git_program(program), "{program} must be gated as git");
+        }
+        for program in [
+            "gitk",
+            "digit",
+            "/usr/bin/legit",
+            "git-lfs",
+            "sh",
+            "env",
+            "xargs",
+            "/usr/bin/git/",
+            "git.exe.bak",
+        ] {
+            assert!(!is_git_program(program), "{program} is not git");
+        }
+    }
+
+    /// The console runs the argv a caller hands it, so the routing is checked
+    /// through the real entry. Each spelling names a real executable (a stub
+    /// that exits 0), so the spawn succeeds and the only open question is the
+    /// routing: the outcome must be a gated run carrying its verdict, or a
+    /// refusal naming why. Any other error, or an ungated run, fails the test.
+    #[cfg(unix)]
+    #[test]
+    fn a_case_variant_of_git_is_never_spawned_ungated() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TempDir::new().unwrap();
+        init_test_repo(repo.path());
+        let bin = TempDir::new().unwrap();
+        for name in [
+            "GIT", "Git", "GIT.EXE", "git.cmd", "git.bat", "git.", "Git.Exe",
+        ] {
+            let stub = bin.path().join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let program = stub.to_str().unwrap().to_string();
+            let repo_str = repo.path().to_str().unwrap();
+            let cursor = crate::ledger::latest_cursor(repo_str).unwrap_or(0);
+            let result = run_terminal(repo_str, &[program, "status".into()], Some(5));
+            // Whatever the gate decided, what it judged and the ledger recorded
+            // is `git status`, never the caller's spelling of the program.
+            for judged in judged_rows(repo_str, cursor) {
+                assert_eq!(judged[0], "git", "{name}: the gate judged {judged:?}");
+            }
+            match result {
+                Ok(run) => {
+                    assert!(run.gated, "{name} ran ungated");
+                    assert!(run.policy.is_some(), "{name} carries no verdict");
+                    assert_eq!(
+                        judged_rows(repo_str, cursor).len(),
+                        1,
+                        "{name}: one gate row for the run"
+                    );
+                }
+                Err(err) => {
+                    let message = err.message();
+                    assert!(
+                        message.contains("policy")
+                            || message.contains("blocked")
+                            || message.contains("refused")
+                            || message.contains("MANVI"),
+                        "{name}: an unexpected error, not a gate refusal: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The argv of every gate row the ledger holds past `cursor`, with its action.
+    #[cfg(unix)]
+    fn judged_rows(repo: &str, cursor: i64) -> Vec<Vec<String>> {
+        crate::ledger::tail(repo, cursor, 1_000)
+            .expect("ledger tail")
+            .into_iter()
+            .filter_map(|row| row.argv_json)
+            .map(|json| serde_json::from_str::<Vec<String>>(&json).expect("argv_json is an argv"))
+            .collect()
+    }
+
+    #[test]
+    fn the_gate_is_handed_git_for_every_spelling_of_git_and_nothing_else_is_rewritten() {
+        for program in [
+            "git",
+            "GIT.EXE",
+            "/usr/bin/GIT",
+            "C:\\Git\\cmd\\git.cmd",
+            "git.",
+        ] {
+            let args = [program, "merge", "topic"];
+            assert_eq!(
+                judged_argv(&args, is_git_program(program)),
+                ["git", "merge", "topic"],
+                "{program}"
+            );
+        }
+        let args = ["gh", "pr", "merge"];
+        assert_eq!(judged_argv(&args, is_git_program("gh")), args);
+    }
+
+    /// A console run of `GIT.EXE merge <attempt branch>` reaches the review
+    /// gate and the ledger as the git merge it is, not as an unknown command
+    /// that happens to be gated. The stub stands in for the executable, so a
+    /// run that was not refused would spawn it and succeed.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_lowercase_git_merge_of_an_attempt_reaches_the_review_gate_and_the_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let config_lock = crate::test_support::env::env_serial();
+        let config = TempDir::new().unwrap();
+        let _env = crate::test_support::env::bind_env(&config_lock)
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                config.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+        let profile = TempDir::new().unwrap();
+        let _profile =
+            crate::workbench::review::use_test_profile(&profile.path().join("profile.sqlite"));
+        let repo = crate::test_support::git_repo();
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "a.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "base"]);
+        crate::test_support::git_in(
+            repo.path(),
+            &["switch", "-q", "-c", "gitpulse/fix-1234abcd"],
+        );
+        std::fs::write(repo.path().join("b.txt"), "b").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "b.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "agent"]);
+        crate::test_support::git_in(repo.path(), &["switch", "-q", "main"]);
+        crate::test_support::trust_repo(repo.path());
+        let repo_str = repo.path().to_str().unwrap();
+        crate::tool_config::set_review_gate(
+            Some(&crate::harness::review::common_dir(repo.path()).unwrap()),
+            Some(true),
+        )
+        .unwrap();
+        let bin = TempDir::new().unwrap();
+        for name in ["GIT.EXE", "GIT"] {
+            let stub = bin.path().join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cursor = crate::ledger::latest_cursor(repo_str).unwrap_or(0);
+            let result = run_terminal(
+                repo_str,
+                &[
+                    stub.to_str().unwrap().to_string(),
+                    "merge".into(),
+                    "gitpulse/fix-1234abcd".into(),
+                ],
+                Some(5),
+            );
+            let message = result.expect_err(&format!(
+                "{name}: landing an attempt with no review must be refused by the review gate"
+            ));
+            assert!(
+                message.message().contains("gitpulse/fix-1234abcd"),
+                "{name}: {}",
+                message.message()
+            );
+            let rows = crate::ledger::tail(repo_str, cursor, 1_000).unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.action == "git.merge")
+                .unwrap_or_else(|| panic!("{name}: no git.merge row in {rows:?}"));
+            let argv: Vec<String> =
+                serde_json::from_str(row.argv_json.as_deref().unwrap()).unwrap();
+            assert_eq!(argv[..2], ["git", "merge"], "{name}");
+        }
+    }
+
     /// PTY-free tests for the post-EOF finalize logic: the exit payload must
     /// carry the real status when wait succeeds and degrade honestly to
     /// `exit_code: None` when reaping fails.
@@ -8572,7 +8798,8 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let proc_env = PtyEnv::from_process();
             for (program, is_shell) in [("/bin/zsh", true), ("claude", false)] {
-                let cmd = build_pty_command(program, is_shell, None, None, home.path(), &proc_env).cmd;
+                let cmd =
+                    build_pty_command(program, is_shell, None, None, home.path(), &proc_env).cmd;
                 let leaked: Vec<(String, String)> = cmd
                     .iter_full_env_as_str()
                     .filter(|(k, _)| {
@@ -8613,6 +8840,7 @@ mod tests {
             return;
         }
 
+        use crate::procguard::LockedSpawn;
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .env(CHILD_GUARD, "1")
             .env("CLAUDECODE", "1")
@@ -8622,7 +8850,7 @@ mod tests {
                 "terminal::tests::build_pty_command_strips_inherited_claude_code_recursion_vars_for_all_sessions",
                 "--nocapture",
             ])
-            .output()
+            .output_locked()
             .expect("spawn child test");
         assert!(
             output.status.success(),

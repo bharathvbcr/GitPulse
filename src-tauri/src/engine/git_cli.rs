@@ -120,8 +120,14 @@ fn has_bare_layout(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir()
 }
 
+/// What the spawn-gate report calls the `rev-parse` launches [`resolve_repo`]
+/// makes.
+pub(crate) const RESOLVE_REPO_SOURCE: &str = "git_cli.resolve_repo";
+
 fn rev_parse_is_bare(path: &Path) -> bool {
-    match git_text(path, &["rev-parse", "--is-bare-repository"]) {
+    match with_spawn_source(RESOLVE_REPO_SOURCE, || {
+        git_text(path, &["rev-parse", "--is-bare-repository"])
+    }) {
         Ok(text) => text.trim().eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -855,6 +861,37 @@ pub const STATUS_ARGV: &[&str] = &[
 /// no `-c` can blank) would run a program instead of git's own diff.
 const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
 
+/// The subcommands that run a `diff.<driver>.textconv` program on repository
+/// bytes: the patch printers plus `blame`. The converter's text would come back
+/// as the "patch" (which `git apply` refuses) or as blamed lines. `blame` takes
+/// `--no-textconv` but rejects `--no-ext-diff`, so it is guarded separately.
+/// The same rule as `dc_proc::guarded_args` (`vendored/dc-proc`), which this
+/// crate does not depend on; a parity test reads that source.
+const TEXTCONV_SUBCOMMANDS: &[&str] = &["diff", "show", "log", "blame"];
+
+/// The locale a git child runs under. Messages are pinned to English (the
+/// parsers match git's words) through `LC_MESSAGES` and `LANGUAGE`, which
+/// govern message catalogs and nothing else. `LC_ALL` is NOT set: it overrides
+/// every other locale variable, so a hook, gpg or pinentry that git execs would
+/// get the C locale (US-ASCII for Ruby) where the same command works from a
+/// terminal. The inherited `LANG` and `LC_CTYPE` pass through; an inherited
+/// `LC_ALL` is removed, and when it was the user's only encoding (neither `LANG`
+/// nor `LC_CTYPE` set) its value moves into `LC_CTYPE` so the encoding survives.
+/// Returns the `LC_CTYPE` to set, if any.
+fn lc_ctype_from_inherited(
+    lc_all: Option<&std::ffi::OsStr>,
+    lang: Option<&std::ffi::OsStr>,
+    lc_ctype: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    let present = |v: Option<&std::ffi::OsStr>| v.is_some_and(|v| !v.is_empty());
+    match lc_all {
+        Some(all) if present(lc_all) && !present(lang) && !present(lc_ctype) => {
+            Some(all.to_os_string())
+        }
+        _ => None,
+    }
+}
+
 /// The patch subcommands that print a signature header (and run the verifier
 /// to do it) when `log.showSignature` or `--show-signature` asks. `--no-show-signature`
 /// rides every one of them from here, so no read has to remember it; `diff` is
@@ -868,8 +905,11 @@ const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
 /// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
 /// call it, so they cannot drift apart: a setting added here reaches both.
 ///
-/// Prompts and pagers are off, the locale is `C` (the parsers match git's
-/// English words), optional locks are skipped so a read never contends with a
+/// Prompts and pagers are off, messages are English (the parsers match git's
+/// words; see [`lc_ctype_from_inherited`] for why `LC_ALL` is not the
+/// mechanism; one edge of that policy: a parent with `LC_ALL=C.UTF-8` and
+/// `LANG=C` keeps `LANG=C` and loses the UTF-8 `LC_ALL`, because `LANG` counts
+/// as the user's stated encoding), optional locks are skipped so a read never contends with a
 /// writer, every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
 /// is removed, and the editors are pinned to `true`.
 ///
@@ -886,7 +926,17 @@ fn pin_git_environment(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C");
+        .env("LC_MESSAGES", "C")
+        .env("LANGUAGE", "C");
+    let inherited = |name: &str| std::env::var_os(name);
+    if let Some(ctype) = lc_ctype_from_inherited(
+        inherited("LC_ALL").as_deref(),
+        inherited("LANG").as_deref(),
+        inherited("LC_CTYPE").as_deref(),
+    ) {
+        cmd.env("LC_CTYPE", ctype);
+    }
+    cmd.env_remove("LC_ALL");
     strip_injected_git_env(cmd);
     cmd.env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true");
@@ -959,8 +1009,12 @@ fn git_command_with_env(
         cmd.args(["-c", pin]);
     }
     match subcommand_index(args) {
-        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => {
-            cmd.args(&args[..=at]).arg("--no-ext-diff");
+        Some(at) if TEXTCONV_SUBCOMMANDS.contains(&args[at]) => {
+            cmd.args(&args[..=at]);
+            if PATCH_SUBCOMMANDS.contains(&args[at]) {
+                cmd.arg("--no-ext-diff");
+            }
+            cmd.arg("--no-textconv");
             if SIGNATURE_PRINTING_SUBCOMMANDS.contains(&args[at]) {
                 cmd.arg("--no-show-signature");
             }
@@ -3228,6 +3282,44 @@ pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T
     body()
 }
 
+/// The source of a spawn no caller named.
+pub(crate) const UNATTRIBUTED_SOURCE: &str = "unattributed";
+
+thread_local! {
+    /// The call site the current thread's spawns are attributed to in the gate
+    /// report. Same shape as [`ADMISSION`]: a forward-only context the runner
+    /// reads at admission, which is why it is not threaded through every
+    /// runner signature the way the error is (see `CommandError`).
+    static SPAWN_SOURCE: Cell<&'static str> = const { Cell::new(UNATTRIBUTED_SOURCE) };
+}
+
+/// `git rev-parse` children the process-wide gate has admitted under `source`.
+#[cfg(test)]
+pub(crate) fn rev_parse_launches_from(source: &str) -> u64 {
+    spawn_gate().rev_parse_launches_from(source)
+}
+
+/// The call site the current thread's spawns are attributed to. A body that
+/// hops threads (`thread::scope`, a pool) must carry it across with
+/// [`with_spawn_source`], exactly as it carries [`current_admission`].
+pub(crate) fn current_spawn_source() -> &'static str {
+    SPAWN_SOURCE.get()
+}
+
+/// Runs `body` with its spawns attributed to `source` (a fixed call-site name,
+/// never user data), restoring the previous source on return, error and
+/// unwinding. The innermost scope wins.
+pub(crate) fn with_spawn_source<T>(source: &'static str, body: impl FnOnce() -> T) -> T {
+    struct Restore(&'static str);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPAWN_SOURCE.set(self.0);
+        }
+    }
+    let _restore = Restore(SPAWN_SOURCE.replace(source));
+    body()
+}
+
 thread_local! {
     /// Depth of [`with_background_band`] scopes on this thread.
     static BAND_FORCED: Cell<u32> = const { Cell::new(0) };
@@ -3580,6 +3672,10 @@ struct GateState {
 #[derive(Default)]
 struct LabelCounts {
     counts: HashMap<String, u64>,
+    /// `git rev-parse` admissions by the call site that asked
+    /// ([`with_spawn_source`]), bounded like `counts`. Sources are `&'static
+    /// str` names chosen in code, never paths or ref names.
+    rev_parse_sources: HashMap<&'static str, u64>,
 }
 
 impl LabelCounts {
@@ -3587,6 +3683,54 @@ impl LabelCounts {
     const OTHER: &'static str = "other";
     /// Labels printed per report; the rest are summed into one figure.
     const REPORTED: usize = 8;
+    /// Distinct rev-parse sources kept; the rest count under [`Self::OTHER`].
+    const MAX_SOURCES: usize = 32;
+    /// Sources printed per report; the rest are summed into `rest=`.
+    const REPORTED_SOURCES: usize = 5;
+    /// The label (as [`report_label`] reduces it) whose launches are
+    /// attributed to a source.
+    const SOURCED_LABEL: &'static str = "git rev-parse";
+
+    /// [`Self::note`], and for a `git rev-parse` also the call site behind it.
+    fn note_sourced(&mut self, label: &str, source: &'static str) {
+        self.note(label);
+        if report_label(label) != Self::SOURCED_LABEL {
+            return;
+        }
+        let source = if !self.rev_parse_sources.contains_key(source)
+            && self.rev_parse_sources.len() >= Self::MAX_SOURCES
+        {
+            Self::OTHER
+        } else {
+            source
+        };
+        *self.rev_parse_sources.entry(source).or_insert(0) += 1;
+    }
+
+    /// `rev-parse by: a.b=9 c=4 unattributed=2 rest=1`, largest first, ties by
+    /// name; empty when no rev-parse was admitted.
+    fn sources_report(&self) -> String {
+        if self.rev_parse_sources.is_empty() {
+            return String::new();
+        }
+        let mut rows: Vec<(&&str, &u64)> = self.rev_parse_sources.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(Self::REPORTED_SOURCES)
+            .map(|(source, count)| format!("{source}={count}"))
+            .collect();
+        let rest: u64 = rows
+            .iter()
+            .skip(Self::REPORTED_SOURCES)
+            .map(|(_, count)| **count)
+            .sum();
+        if rest == 0 {
+            format!("rev-parse by: {}", shown.join(" "))
+        } else {
+            format!("rev-parse by: {} rest={rest}", shown.join(" "))
+        }
+    }
 
     fn note(&mut self, label: &str) {
         let key = report_label(label);
@@ -4133,20 +4277,28 @@ impl SpawnGate {
 
     /// The `top: ...` attribution line, rendered under a brief lock.
     fn label_report(&self) -> String {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_label
-            .report()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let top = state.by_label.report();
+        let sources = state.by_label.sources_report();
+        if sources.is_empty() {
+            top
+        } else {
+            format!("{top} | {sources}")
+        }
     }
 
-    /// Attributes one admitted child to its label for the gate report.
+    /// Attributes one admitted child to its label, and its rev-parse launches
+    /// to the call site on this thread ([`current_spawn_source`]), for the gate
+    /// report.
     fn note_admitted_label(&self, label: &str) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_label
-            .note(label);
+            .note_sourced(label, current_spawn_source());
     }
 
     fn note_coalesced(&self, class: Admission) {
@@ -4166,6 +4318,18 @@ impl SpawnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counters = &mut state.counters[class.index()];
         counters.coalesced = counters.coalesced.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    fn rev_parse_launches_from(&self, source: &str) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_label
+            .rev_parse_sources
+            .get(source)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -6731,6 +6895,153 @@ mod tests {
     }
 
     #[test]
+    fn rev_parse_report_names_the_top_five_sources_in_order() {
+        let mut counts = super::LabelCounts::default();
+        assert_eq!(counts.sources_report(), "", "no rev-parse, no line");
+        let launches: [(&'static str, u64); 7] = [
+            ("a.small", 1),
+            ("b.big", 9),
+            ("c.mid", 4),
+            ("d.tie", 4),
+            ("e.low", 2),
+            (super::UNATTRIBUTED_SOURCE, 6),
+            ("f.tiny", 1),
+        ];
+        for (source, n) in launches {
+            for _ in 0..n {
+                counts.note_sourced("git rev-parse --verify HEAD", source);
+            }
+        }
+        // Other commands are never attributed, whatever their source.
+        for _ in 0..50 {
+            counts.note_sourced("git status", "b.big");
+        }
+        assert_eq!(
+            counts.sources_report(),
+            "rev-parse by: b.big=9 unattributed=6 c.mid=4 d.tie=4 e.low=2 rest=2"
+        );
+        assert_eq!(counts.counts["git rev-parse"], 27, "label totals unchanged");
+        assert!(
+            counts.report().starts_with("top: git status=50 "),
+            "{}",
+            counts.report()
+        );
+    }
+
+    #[test]
+    fn rev_parse_sources_are_bounded_and_overflow_is_counted() {
+        const NAMES: [&str; 40] = [
+            "s00", "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11",
+            "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23",
+            "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31", "s32", "s33", "s34", "s35",
+            "s36", "s37", "s38", "s39",
+        ];
+        let mut counts = super::LabelCounts::default();
+        for name in NAMES {
+            counts.note_sourced("git rev-parse", name);
+        }
+        assert!(counts.rev_parse_sources.len() <= super::LabelCounts::MAX_SOURCES + 1);
+        assert_eq!(counts.rev_parse_sources.values().sum::<u64>(), 40);
+        assert_eq!(
+            counts.rev_parse_sources["other"], 8,
+            "32 kept, 8 overflowed"
+        );
+        // A source already kept still counts under its own name when full.
+        counts.note_sourced("git rev-parse", "s00");
+        assert_eq!(counts.rev_parse_sources["s00"], 2);
+    }
+
+    #[test]
+    fn spawn_source_is_unattributed_unset_nests_and_restores_after_a_panic() {
+        assert_eq!(super::current_spawn_source(), super::UNATTRIBUTED_SOURCE);
+        super::with_spawn_source("outer", || {
+            assert_eq!(super::current_spawn_source(), "outer");
+            super::with_spawn_source("inner", || {
+                assert_eq!(super::current_spawn_source(), "inner");
+            });
+            assert_eq!(super::current_spawn_source(), "outer");
+            let unwound = std::panic::catch_unwind(|| {
+                super::with_spawn_source("doomed", || panic!("body unwinds"));
+            });
+            assert!(unwound.is_err());
+            assert_eq!(super::current_spawn_source(), "outer", "restored on unwind");
+            // A new thread starts unattributed: a hop must re-enter the scope.
+            let hopped = std::thread::spawn(super::current_spawn_source)
+                .join()
+                .unwrap();
+            assert_eq!(hopped, super::UNATTRIBUTED_SOURCE);
+        });
+        assert_eq!(super::current_spawn_source(), super::UNATTRIBUTED_SOURCE);
+    }
+
+    /// Interleaved A/B, min of 9 rounds: a scope plus the report bookkeeping
+    /// against the bookkeeping alone. A spawn costs milliseconds; the bound is
+    /// 5 us per spawn, far above what a thread-local swap and a map bump cost.
+    #[test]
+    fn spawn_source_tagging_adds_negligible_per_spawn_overhead() {
+        // 20k x 9 rounds x 2 arms keeps this near 2 s in a debug build; the
+        // 5 us bound is ~100x what the swap and map bump cost.
+        const N: u32 = 20_000;
+        let time = |tagged: bool| {
+            let mut counts = super::LabelCounts::default();
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                if tagged {
+                    super::with_spawn_source("bench.site", || {
+                        counts.note_sourced("git rev-parse", super::current_spawn_source());
+                    });
+                } else {
+                    counts.note_sourced("git rev-parse", super::UNATTRIBUTED_SOURCE);
+                }
+            }
+            std::hint::black_box(&counts);
+            started.elapsed()
+        };
+        let (mut plain, mut tagged) = (Duration::MAX, Duration::MAX);
+        for _ in 0..9 {
+            plain = plain.min(time(false));
+            tagged = tagged.min(time(true));
+        }
+        let extra = tagged.saturating_sub(plain) / N;
+        println!("spawn-source A/B min-of-9 x {N}: plain {plain:?} tagged {tagged:?} extra {extra:?}/spawn");
+        assert!(extra < Duration::from_micros(5), "{extra:?} per spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_rev_parse_is_attributed_to_the_scope_it_ran_under() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(4)));
+        let run = |label: &str, source: Option<&'static str>| {
+            let mut cmd = Command::new("/usr/bin/true");
+            let go = |cmd: &mut Command| {
+                run_with_gate(
+                    cmd,
+                    label,
+                    Duration::from_secs(10),
+                    None,
+                    1024,
+                    &mut (),
+                    gate,
+                )
+                .expect("spawn");
+            };
+            match source {
+                Some(source) => super::with_spawn_source(source, || go(&mut cmd)),
+                None => go(&mut cmd),
+            }
+        };
+        run("git rev-parse", Some("one.site"));
+        run("git rev-parse", Some("one.site"));
+        run("git rev-parse", Some("two.site"));
+        run("git rev-parse", None);
+        run("git log", Some("one.site"));
+        assert_eq!(
+            gate.label_report(),
+            "top: git rev-parse=4 git log=1 | rev-parse by: one.site=2 two.site=1 unattributed=1"
+        );
+    }
+
+    #[test]
     fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
         let gate = super::SpawnGate::with_rate(8, 4, 4);
         let mut held = Vec::new();
@@ -7998,6 +8309,18 @@ mod tests {
             dir.path().canonicalize().unwrap().to_string_lossy()
         );
         assert!(!resolved.name.is_empty());
+    }
+
+    #[test]
+    fn resolve_repo_attributes_its_rev_parse_to_its_own_source() {
+        let dir = init_test_repo(false);
+        let before = super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE);
+        resolve_repo(&dir.path().to_string_lossy()).expect("resolve");
+        assert!(
+            super::rev_parse_launches_from(super::RESOLVE_REPO_SOURCE) > before,
+            "resolve_repo's rev-parse was not attributed to {}",
+            super::RESOLVE_REPO_SOURCE
+        );
     }
 
     #[test]
@@ -9494,7 +9817,8 @@ mod tests {
             PathSource::Inherited,
         ));
         for key in [
-            "LC_ALL",
+            "LC_MESSAGES",
+            "LANGUAGE",
             "GCM_INTERACTIVE",
             "GIT_OPTIONAL_LOCKS",
             "GIT_TERMINAL_PROMPT",
@@ -9511,7 +9835,13 @@ mod tests {
                 "the capture builder's {key}"
             );
         }
-        assert_eq!(git["LC_ALL"].as_deref(), Some("C"));
+        assert_eq!(git["LC_MESSAGES"].as_deref(), Some("C"));
+        assert_eq!(git["LANGUAGE"].as_deref(), Some("C"));
+        // `LC_ALL` is explicitly removed (Some(None)), never set: it would
+        // override the user's LC_CTYPE for every hook and tool git execs.
+        assert_eq!(git.get("LC_ALL"), Some(&None), "git_command removes LC_ALL");
+        assert_eq!(capture.get("LC_ALL"), git.get("LC_ALL"));
+        assert_eq!(capture.get("LC_CTYPE"), git.get("LC_CTYPE"));
         for key in [
             "GIT_DIR",
             "GIT_WORK_TREE",
@@ -9586,18 +9916,19 @@ mod tests {
             let args = argv(&[patch, "HEAD"]);
             let at = args.iter().position(|a| a == patch).expect("subcommand");
             assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
+            assert_eq!(args[at + 2], "--no-textconv", "{patch}: {args:?}");
             // `diff` rejects `--no-show-signature`; `show` and `log` carry it
             // so a signature header is never printed (and verified) for them.
             if patch == "diff" {
-                assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
-            } else {
-                assert_eq!(args[at + 2], "--no-show-signature", "{patch}: {args:?}");
                 assert_eq!(args[at + 3], "HEAD", "{patch}: {args:?}");
+            } else {
+                assert_eq!(args[at + 3], "--no-show-signature", "{patch}: {args:?}");
+                assert_eq!(args[at + 4], "HEAD", "{patch}: {args:?}");
             }
         }
         let notes_log = argv(&["-c", "x.y=z", "log", "-n1"]);
         let at = notes_log.iter().position(|a| a == "log").unwrap();
-        assert_eq!(notes_log[at + 2], "--no-show-signature", "{notes_log:?}");
+        assert_eq!(notes_log[at + 3], "--no-show-signature", "{notes_log:?}");
         assert!(
             !argv(&["diff", "--cached"])
                 .iter()
@@ -9611,6 +9942,64 @@ mod tests {
         let global = argv(&["-C", "/tmp", "diff", "--cached"]);
         let at = global.iter().position(|a| a == "diff").unwrap();
         assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+        // `blame` takes `--no-textconv` but rejects `--no-ext-diff`.
+        let blame = argv(&["blame", "--line-porcelain", "--", "f"]);
+        let at = blame.iter().position(|a| a == "blame").unwrap();
+        assert_eq!(blame[at + 1], "--no-textconv", "{blame:?}");
+        assert!(!blame.iter().any(|a| a == "--no-ext-diff"), "{blame:?}");
+    }
+
+    /// The textconv guard has one rule with `dc_proc::guarded_args`, which this
+    /// crate does not depend on: read its source and require that every
+    /// subcommand it adds `--no-textconv` after is one this builder does too,
+    /// and the reverse. Also pins the locale rule of [`lc_ctype_from_inherited`].
+    #[test]
+    fn textconv_guard_matches_the_vendored_guarded_args() {
+        let source = include_str!("../../vendored/dc-proc/src/lib.rs");
+        let body = source
+            .split("let guards: &[&str] = match sub.to_str() {")
+            .nth(1)
+            .and_then(|rest| rest.split("_ => &[],").next())
+            .expect("guarded_args guard table");
+        let mut vendored: Vec<&str> = ["diff", "log", "show", "blame"]
+            .into_iter()
+            .filter(|sub| {
+                body.split("=>")
+                    .zip(body.split("=>").skip(1))
+                    .any(|(head, arm)| {
+                        head.contains(&format!("\"{sub}\""))
+                            && arm
+                                .split("),")
+                                .next()
+                                .unwrap_or(arm)
+                                .contains("--no-textconv")
+                    })
+            })
+            .collect();
+        vendored.sort_unstable();
+        let mut ours: Vec<&str> = TEXTCONV_SUBCOMMANDS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(ours, vendored, "textconv subcommands drifted from dc-proc");
+    }
+
+    #[test]
+    fn lc_all_only_moves_into_lc_ctype_when_it_is_the_users_only_encoding() {
+        use std::ffi::OsStr;
+        let v = |s: &'static str| Some(OsStr::new(s));
+        assert_eq!(
+            lc_ctype_from_inherited(v("de_DE.UTF-8"), None, None).as_deref(),
+            v("de_DE.UTF-8")
+        );
+        assert_eq!(
+            lc_ctype_from_inherited(v("C"), v("en_US.UTF-8"), None),
+            None
+        );
+        assert_eq!(
+            lc_ctype_from_inherited(v("C"), None, v("en_US.UTF-8")),
+            None
+        );
+        assert_eq!(lc_ctype_from_inherited(None, v("en_US.UTF-8"), None), None);
+        assert_eq!(lc_ctype_from_inherited(v(""), None, None), None);
     }
 
     /// A batch stream that ends because its budget or deadline did keeps the

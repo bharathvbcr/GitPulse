@@ -68,6 +68,48 @@ pub(crate) struct FileIdentity {
     modified: Option<SystemTime>,
 }
 
+/// A [`FileIdentity`] strict enough to *prove* a file unchanged: it adds the
+/// device and the inode change time (ctime). No tool can set ctime back
+/// (`touch -r`, `cp -p`, a restored archive), so an edit that preserved the
+/// mtime and the size still moves it. [`FileIdentity`] itself does not carry
+/// it: its callers (ref listings, signing fingerprints) are bounded by a TTL
+/// and rely on an in-place rewrite with a restored mtime being a hit, which a
+/// ctime would turn into a miss.
+// Stamped only by the shortstat stamp (unix); elsewhere nothing builds one.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ChangeStamp {
+    identity: FileIdentity,
+    device: u64,
+    /// `None` where the platform has no change time.
+    changed: Option<SystemTime>,
+}
+
+impl ChangeStamp {
+    #[cfg(unix)]
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            identity: FileIdentity::of(meta),
+            device: file_device(meta),
+            changed: file_changed(meta),
+        }
+    }
+
+    /// Stamp of `path`, following symlinks; `None` when it cannot be read.
+    #[cfg(unix)]
+    pub(crate) fn at(path: &Path) -> Option<Self> {
+        std::fs::metadata(path).ok().map(|meta| Self::of(&meta))
+    }
+
+    /// The newest timestamp the stamp carries: what a racy-window check
+    /// compares against "now". `None` unless it carries both of them, because
+    /// a stamp without a change time cannot prove "unchanged".
+    #[cfg(unix)]
+    pub(crate) fn newest_timestamp(&self) -> Option<SystemTime> {
+        Some(self.identity.modified?.max(self.changed?))
+    }
+}
+
 impl FileIdentity {
     pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         Self {
@@ -94,6 +136,19 @@ fn file_inode(meta: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn file_inode(_meta: &std::fs::Metadata) -> u64 {
     0
+}
+
+#[cfg(unix)]
+fn file_device(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::dev(meta)
+}
+
+#[cfg(unix)]
+fn file_changed(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
 }
 
 /// Config files outside the repository that git reads for every command.
@@ -507,12 +562,12 @@ pub(crate) fn mono_now() -> Instant {
 /// reading beside [`mono_now`] because the two clocks are different types; a
 /// [`ManualClock`] moves both together.
 #[cfg(not(test))]
-fn wall_now() -> SystemTime {
+pub(crate) fn wall_now() -> SystemTime {
     SystemTime::now()
 }
 
 #[cfg(not(test))]
-fn racy_window() -> Duration {
+pub(crate) fn racy_window() -> Duration {
     RACY_WINDOW
 }
 
@@ -546,7 +601,7 @@ pub(crate) fn mono_now() -> Instant {
 }
 
 #[cfg(test)]
-fn wall_now() -> SystemTime {
+pub(crate) fn wall_now() -> SystemTime {
     CLOCK
         .with(std::cell::Cell::get)
         .map_or_else(SystemTime::now, |(_, wall)| wall)
@@ -596,7 +651,7 @@ impl Drop for ManualClock {
 }
 
 #[cfg(test)]
-fn racy_window() -> Duration {
+pub(crate) fn racy_window() -> Duration {
     RACY_OVERRIDE.with(|cell| cell.get()).unwrap_or(RACY_WINDOW)
 }
 

@@ -322,6 +322,12 @@ mod bare_and_worktrees {
             "HEAD",
         ]);
         repo.git(&["branch", "--set-upstream-to=origin/orphan/upstream-gone"]);
+        // The upstream then vanishes from the remote: only now is it "gone".
+        repo.git(&[
+            "update-ref",
+            "-d",
+            "refs/remotes/origin/orphan/upstream-gone",
+        ]);
         repo.git(&["checkout", "-q", "main"]);
         // Merge the orphan branch so ONLY done/deleted-later is merged-stale.
         repo.git(&["merge", "--quiet", "--ff-only", "orphan/upstream-gone"]);
@@ -333,12 +339,22 @@ mod bare_and_worktrees {
             names.iter().any(|n| n == "done/deleted-later"),
             "merged branch should be a cleanup candidate: {names:?}"
         );
-        // The orphan branch was ff-merged into main, so its tip is merged
-        // too — the cleanup plan must list it as a candidate even though
-        // its upstream separately shows as gone.
+        // The orphan branch was ff-merged, so it sits at main's own tip with
+        // nothing ahead: that is not "merged" (it reads the same as a fresh
+        // branch), and a gone upstream is not evidence of a merge either. It
+        // is counted as a gone upstream, not as a cleanup candidate.
         assert!(
-            names.iter().any(|n| n == "orphan/upstream-gone"),
-            "ff-merged branch is a cleanup candidate: {names:?}"
+            !names.iter().any(|n| n == "orphan/upstream-gone"),
+            "a same-tip branch with a gone upstream is not a cleanup candidate: {names:?}"
+        );
+        assert!(
+            report
+                .branches
+                .sample_gone_upstream
+                .iter()
+                .any(|n| n == "orphan/upstream-gone"),
+            "its upstream is still reported gone: {:?}",
+            report.branches.sample_gone_upstream
         );
         assert!(
             !report

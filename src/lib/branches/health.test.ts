@@ -91,16 +91,32 @@ describe("branch health verdicts", () => {
   });
 
   it("reports a fully merged branch as safe to delete", () => {
-    const health = branchHealth(branch({ commits_ahead_of_base: 0 }), NOW);
+    const health = branchHealth(branch({ commits_ahead_of_base: 0, commits_behind_base: 1 }), NOW);
     expect(health.code).toBe("merged");
     expect(health.detail).toContain("main");
     expect(health.detail).toContain("Safe to delete");
   });
 
+  it("does not call a branch at the base's own tip merged", () => {
+    const health = branchHealth(branch({ commits_ahead_of_base: 0, commits_behind_base: 0 }), NOW);
+    expect(health.code).not.toBe("merged");
+  });
+
+  it("does not take a gone upstream for evidence of a merge", () => {
+    const health = branchHealth(branch({ is_gone: true, commits_ahead_of_base: 3 }), NOW);
+    expect(health.code).toBe("gone");
+    expect(health.detail).not.toMatch(/probably deleted after merging/i);
+    expect(health.detail).toMatch(/does not show/i);
+  });
+
   it("prefers the actionable verdict when a branch is both merged and stale", () => {
     // Telling the reader they can delete it beats telling them it is old.
     const health = branchHealth(
-      branch({ commits_ahead_of_base: 0, last_commit_timestamp: daysAgo(200) }),
+      branch({
+        commits_ahead_of_base: 0,
+        commits_behind_base: 1,
+        last_commit_timestamp: daysAgo(200),
+      }),
       NOW,
     );
     expect(health.code).toBe("merged");
@@ -175,7 +191,7 @@ describe("branch health verdicts", () => {
       branch(),
       branch({ is_gone: true }),
       branch({ is_default: true }),
-      branch({ commits_ahead_of_base: 0 }),
+      branch({ commits_ahead_of_base: 0, commits_behind_base: 1 }),
       branch({ commits_ahead_of_base: 1, commits_behind_base: 1 }),
       branch({ last_commit_timestamp: daysAgo(90) }),
       branch({ upstream: null }),

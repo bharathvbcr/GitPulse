@@ -72,6 +72,8 @@ export interface BranchStorageSummary {
   local_count: number;
   remote_tracking_count: number;
   merged_stale_count: number;
+  /** Unmerged branches whose squash/rebase comparison did not run: merged_stale_count may undercount. */
+  merged_unchecked_count: number;
   gone_upstream_count: number;
   sample_merged_stale: string[];
   sample_gone_upstream: string[];

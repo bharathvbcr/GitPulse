@@ -760,14 +760,26 @@ mod tests {
         let watch = private_watch();
         assert!(wait_until(Duration::from_secs(2), || parked(watch)));
         let before = watch.wakes.load(Ordering::Relaxed);
+        let burst = Instant::now();
         for _ in 0..50 {
             let call = CommandTiming::queue_on(watch, "keystroke");
             std::thread::sleep(Duration::from_millis(2));
             drop(call);
         }
+        let took = burst.elapsed();
         let wakes = watch.wakes.load(Ordering::Relaxed) - before;
-        println!("50 calls woke the watchdog {wakes} times");
-        assert!(wakes <= 3, "{wakes} wakes for 50 calls");
+        // One wake for the burst, one more for the call in flight when it
+        // started, and one per sweep tick the burst legitimately spans. The
+        // pacing sleeps stretch on a loaded host, and a burst that runs past
+        // `WATCH_TICK` is swept again: that is the watchdog doing its job, not a
+        // wake per call. On an unloaded host the burst is ~100 ms, one tick, and
+        // the bound is the original `3`; per-call wakes would still be 50.
+        let ticks = usize::try_from(took.as_millis() / super::WATCH_TICK.as_millis()).unwrap() + 1;
+        println!("50 calls over {took:?} woke the watchdog {wakes} times");
+        assert!(
+            wakes <= 2 + ticks as u64,
+            "{wakes} wakes for 50 calls over {took:?} ({ticks} sweep tick(s) allowed)"
+        );
     }
 
     /// And the watchdog is not blinded by that: a call that arrives while it
