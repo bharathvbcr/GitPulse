@@ -1,0 +1,166 @@
+//! The graph's revision token: a reload that nothing has changed is answered
+//! without a history walk, lane solve or row on the wire, and the token never
+//! answers for a state or a view it was not issued for.
+//!
+//! Stamps are judged settled by `ref_cache::eager`, which runs a test with no
+//! racy window; the pages are read with `commit_graph_page`, on the test's own
+//! thread, because that override is thread-local.
+
+use super::*;
+use crate::ipc_error::CommandError;
+
+fn graph_token_repo() -> tempfile::TempDir {
+    let repo = crate::test_support::git_repo();
+    for n in 0..3 {
+        crate::test_support::git_in(
+            repo.path(),
+            &["commit", "--allow-empty", "-m", &format!("feat: {n}")],
+        );
+    }
+    repo
+}
+
+fn page(root: &str, max: usize, known: Option<&str>) -> Result<CommitGraphPayload, CommandError> {
+    commit_graph_page(
+        root.to_string(),
+        max,
+        None,
+        None,
+        None,
+        None,
+        known.map(str::to_string),
+    )
+}
+
+fn history_walks(root: &std::path::Path) -> usize {
+    crate::engine::git_cli::spawn_log::spawns_in(root)
+        .iter()
+        .filter(|argv| argv.iter().any(|a| a == "--topo-order"))
+        .count()
+}
+
+/// A token from one load answers the next reload of the same view with no
+/// rows, no refs and no history walk: the O(1)-on-the-wire contract.
+#[test]
+fn a_known_graph_token_is_answered_unchanged_without_a_walk_or_rows() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = graph_token_repo();
+        let root = repo.path().to_string_lossy().into_owned();
+        let full = page(&root, 100, None).expect("first load");
+        assert!(!full.unchanged);
+        assert_eq!(full.rows.len(), 3);
+        let token = full
+            .graph_token
+            .clone()
+            .expect("a settled load issues a token");
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+
+        let walks = history_walks(repo.path());
+        let again = page(&root, 100, Some(&token)).expect("reload");
+        assert!(again.unchanged, "the token still names the state");
+        assert!(again.rows.is_empty() && again.refs.is_empty());
+        assert_eq!(again.head_id, full.head_id, "HEAD is current on any answer");
+        assert_eq!(again.graph_token.as_deref(), Some(token.as_str()));
+        assert_eq!(history_walks(repo.path()), walks, "no history walk ran");
+        let unchanged_bytes = serde_json::to_vec(&again).unwrap().len();
+        assert!(
+            unchanged_bytes * 4 < full_bytes,
+            "unchanged {unchanged_bytes} B against full {full_bytes} B"
+        );
+    });
+}
+
+/// Every input of the page is part of the token: another window size, another
+/// query, a revision, a moved ref and a new branch each get a full answer.
+#[test]
+fn a_graph_token_does_not_answer_for_a_state_or_view_it_was_not_issued_for() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = graph_token_repo();
+        let root = repo.path().to_string_lossy().into_owned();
+        let token = page(&root, 100, None).unwrap().graph_token.unwrap();
+
+        assert!(
+            !page(&root, 50, Some(&token)).unwrap().unchanged,
+            "window size"
+        );
+        let other_query = commit_graph_page(
+            root.clone(),
+            100,
+            Some("feat".into()),
+            None,
+            None,
+            None,
+            Some(token.clone()),
+        )
+        .unwrap();
+        assert!(!other_query.unchanged, "query");
+        let revision = commit_graph_page(
+            root.clone(),
+            100,
+            None,
+            Some("main".into()),
+            None,
+            None,
+            Some(token.clone()),
+        )
+        .unwrap();
+        assert!(
+            !revision.unchanged && revision.graph_token.is_none(),
+            "revision"
+        );
+
+        crate::test_support::git_in(
+            repo.path(),
+            &["commit", "--allow-empty", "-m", "feat: 3"],
+        );
+        let moved = page(&root, 100, Some(&token)).unwrap();
+        assert!(!moved.unchanged, "a ref moved");
+        assert_eq!(moved.rows.len(), 4);
+        assert_ne!(moved.graph_token.as_deref(), Some(token.as_str()));
+
+        crate::test_support::git_in(repo.path(), &["branch", "side"]);
+        assert!(
+            !page(&root, 100, Some(&moved.graph_token.unwrap()))
+                .unwrap()
+                .unchanged,
+            "a new branch is a new decoration"
+        );
+    });
+}
+
+/// A write inside the stamp's tick cannot be told apart from the state
+/// stamped, so no token is issued and nothing is answered unchanged.
+#[test]
+fn an_unsettled_stamp_issues_no_token_and_answers_nothing_unchanged() {
+    let repo = graph_token_repo();
+    let root = repo.path().to_string_lossy().into_owned();
+    let full = page(&root, 100, None).expect("load");
+    assert!(
+        full.graph_token.is_none(),
+        "refs written moments ago are inside the racy window"
+    );
+    assert!(
+        !page(&root, 100, Some("0000000000000000"))
+            .unwrap()
+            .unchanged
+    );
+}
+
+/// A degraded facet is retried on the next reload, not vouched for.
+#[test]
+fn a_load_with_a_warning_issues_no_token() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = graph_token_repo();
+        let head = std::fs::read_to_string(repo.path().join(".git/HEAD")).unwrap();
+        let branch_ref = head.trim().trim_start_matches("ref: ").to_string();
+        std::fs::write(
+            repo.path().join(".git").join(branch_ref),
+            "not an object id\n",
+        )
+        .unwrap();
+        let root = repo.path().to_string_lossy().into_owned();
+        let degraded = page(&root, 100, None).expect("a degraded HEAD still loads");
+        assert!(!degraded.warnings.is_empty(), "{:?}", degraded.warnings);
+        assert!(degraded.graph_token.is_none());
+    });
+}

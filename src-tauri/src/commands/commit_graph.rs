@@ -38,6 +38,18 @@ pub struct CommitGraphPayload {
     /// newest commit's chain was pinned instead.
     #[serde(default)]
     pub mainline_name: Option<String>,
+    /// Names the state this page was drawn from, for the client to hand back
+    /// on its next reload of the same view (see [`graph_token`]). `None`
+    /// whenever the load cannot vouch for it: a revision or paged read, a
+    /// degraded facet, or refs written too recently to tell apart.
+    #[serde(default)]
+    pub graph_token: Option<String>,
+    /// True when the client's token still names the repository's state: the
+    /// client keeps the page it holds, and `rows` and `refs` are left empty
+    /// rather than resent. `head_id`, `warnings`, `notices` and `graph_token`
+    /// are current as on any other answer.
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 /// What a graph load has to say about itself, in the two kinds that must not
@@ -259,6 +271,8 @@ pub fn assemble_commit_graph(
         notices: notes.notices,
         mainline_id,
         mainline_name,
+        graph_token: None,
+        unchanged: false,
     }
 }
 
@@ -268,6 +282,12 @@ pub fn assemble_commit_graph(
 /// one answer for both, so the graph cannot draw a lane it has no name for
 /// (see [`crate::graph::ref_scope`]). `None` means the named set: branches,
 /// remote-tracking branches, tags and HEAD.
+///
+/// `known_token` is the [`CommitGraphPayload::graph_token`] of the page the
+/// client already holds for this same view. When it still names the
+/// repository's state the answer is `unchanged`: no history walk, no lane
+/// solve, no rows on the wire. It only ever short-circuits — a page is always
+/// one lane solve over its whole window, never stitched from two.
 #[tauri::command(async)]
 pub async fn cmd_get_commit_graph(
     repo_path: String,
@@ -276,8 +296,90 @@ pub async fn cmd_get_commit_graph(
     revision: Option<String>,
     skip: Option<usize>,
     ref_scope: Option<RefScope>,
+    known_token: Option<String>,
 ) -> Result<CommitGraphPayload, IpcError> {
     off_thread(move || {
+        commit_graph_page(
+            repo_path,
+            max_commits,
+            query,
+            revision,
+            skip,
+            ref_scope,
+            known_token,
+        )
+    })
+    .await
+}
+
+/// A state hash of everything a graph page is drawn from, or `None` when the
+/// page cannot be vouched for.
+///
+/// The page is a function of the ref tips it starts from (the decorations and
+/// HEAD, which are compared by content), of immutable objects, and of the
+/// files that rewrite history (`shallow`, grafts, replace refs) or change how
+/// refs resolve (config, packed and reftable stores), which `stamp` covers.
+/// The stamp must be settled: within the filesystem's timestamp tick a write
+/// is indistinguishable from the state stamped. A degraded facet (any
+/// warning) is never vouched for, so a probe that failed is retried on the
+/// next reload instead of being answered `unchanged` forever. The view's own
+/// arguments are part of the hash, so a token for one window cannot answer
+/// for another.
+#[allow(clippy::too_many_arguments)]
+fn graph_token(
+    stamp: Option<u64>,
+    repo_path: &str,
+    max_commits: usize,
+    query: Option<&str>,
+    ref_scope: RefScope,
+    head_id: Option<&str>,
+    refs: &[RefDecoration],
+    default_branch: Option<&str>,
+    notes: &GraphNotes,
+) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    if !notes.warnings.is_empty() {
+        return None;
+    }
+    let stamp = stamp?;
+    let refs = serde_json::to_vec(refs).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        stamp,
+        repo_path,
+        max_commits,
+        query,
+        ref_scope == RefScope::All,
+        head_id,
+        &refs,
+        default_branch,
+        &notes.notices,
+    )
+        .hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// The settled fingerprint of the files [`graph_token`] stands on, read now.
+fn graph_stamp(repo_path: &str, ref_scope: RefScope) -> Option<u64> {
+    crate::engine::ref_cache::stamp(
+        Path::new(repo_path),
+        crate::graph::decoration_patterns(ref_scope),
+    )?
+    .settled_fingerprint()
+}
+
+/// [`cmd_get_commit_graph`] on the calling thread, so a test can pin the
+/// clock the stamps are judged by.
+pub(super) fn commit_graph_page(
+    repo_path: String,
+    max_commits: usize,
+    query: Option<String>,
+    revision: Option<String>,
+    skip: Option<usize>,
+    ref_scope: Option<RefScope>,
+    known_token: Option<String>,
+) -> Result<CommitGraphPayload, CommandError> {
+    {
         // One row over the cap: the extra row is the has_more probe and is
         // dropped before lanes are solved. This arithmetic and the reader's
         // page_count_limit clamp must stay in lockstep — if the clamp swallows
@@ -294,8 +396,6 @@ pub async fn cmd_get_commit_graph(
         // Two lists, not one: see [`GraphNotes`]. `warnings` is what someone
         // has to fix; `notices` is what this graph is honestly not drawing.
         let mut notes = GraphNotes::default();
-        let repo = repo_path.clone();
-        let rev = revision.clone();
         // Parsing is pure string work, so it happens BEFORE the walk: a `path:`
         // token has to reach git itself. Narrowing a full walk afterwards left
         // every survivor naming parents that had been filtered out, and the
@@ -321,23 +421,39 @@ pub async fn cmd_get_commit_graph(
         // the first page already carries.
         let probe_hidden =
             revision.is_none() && ref_scope == RefScope::Named && skip.unwrap_or(0) == 0;
+        // A token is only vouched for on the plain first page of a view: a
+        // named revision may start anywhere in the ref store, and a paged read
+        // is a different window. The stamp is read BEFORE anything is walked,
+        // so a ref that moves during this load makes the token it issues stale
+        // on arrival instead of naming a state newer than the rows.
+        let tokenable = revision.is_none() && skip.unwrap_or(0) == 0;
+        let stamp_before = if tokenable {
+            graph_stamp(&repo_path, ref_scope)
+        } else {
+            None
+        };
+        // With a token to check, the cheap probes run first and the walk only
+        // if they say the page moved; without one the walk starts at once and
+        // overlaps them, as it always has.
+        let probe_first = known_token.is_some() && stamp_before.is_some();
         // A test's governor injection is thread-local, so the helper that walks
         // history takes the command's, as `off_thread` does for the pool thread.
         #[cfg(test)]
         let injected = crate::sysload::injected_governor_input();
+        let walk = || {
+            #[cfg(test)]
+            let _carried = injected.clone().map(crate::sysload::inject_governor);
+            GitReader::read_commit_history_paged(
+                &repo_path,
+                skip.unwrap_or(0),
+                fetch_limit,
+                revision.as_deref(),
+                path_filter.as_deref(),
+                ref_scope,
+            )
+        };
         let (history, head, refs, default_branch, hidden) = std::thread::scope(|scope| {
-            let history = scope.spawn(move || {
-                #[cfg(test)]
-                let _carried = injected.map(crate::sysload::inject_governor);
-                GitReader::read_commit_history_paged(
-                    &repo,
-                    skip.unwrap_or(0),
-                    fetch_limit,
-                    rev.as_deref(),
-                    path_filter.as_deref(),
-                    ref_scope,
-                )
-            });
+            let history = (!probe_first).then(|| scope.spawn(&walk));
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
@@ -351,7 +467,7 @@ pub async fn cmd_get_commit_graph(
                     .transpose()
             });
             (
-                history.join(),
+                history.map(|walk| walk.join()),
                 head.join(),
                 refs.join(),
                 default_branch.join(),
@@ -457,15 +573,54 @@ pub async fn cmd_get_commit_graph(
             ),
         }
 
-        // The walk ran on its own thread; a refusal there comes back in its
+        // What this page is a function of, as it stands now. Compared with the
+        // client's token before any history is read, and issued with the page
+        // otherwise.
+        let current = tokenable
+            .then(|| {
+                graph_token(
+                    stamp_before,
+                    &repo_path,
+                    max_commits,
+                    query.as_deref(),
+                    ref_scope,
+                    head_id.as_deref(),
+                    &refs,
+                    default_branch.as_deref(),
+                    &notes,
+                )
+            })
+            .flatten();
+        if let (Some(known), Some(current)) = (known_token.as_deref(), current.as_deref()) {
+            if known == current {
+                return Ok(CommitGraphPayload {
+                    rows: Vec::new(),
+                    head_id,
+                    refs: Vec::new(),
+                    has_more: false,
+                    warnings: notes.warnings,
+                    notices: notes.notices,
+                    mainline_id: None,
+                    mainline_name: None,
+                    graph_token: Some(current.to_string()),
+                    unchanged: true,
+                });
+            }
+        }
+
+        // The walk runs on its own thread; a refusal there comes back in its
         // error with its kind, so a deferred history read is typed (and
         // retried) as it is when the walk runs inline.
+        let history = match history {
+            Some(history) => history,
+            None => std::thread::scope(|scope| scope.spawn(&walk).join()),
+        };
         let history = match history {
             Ok(history) => history,
             Err(_) => Err("history walker panicked".into()),
         };
         let raw_commits = history?;
-        Ok(assemble_commit_graph(
+        let mut payload = assemble_commit_graph(
             raw_commits,
             max_commits,
             &filter,
@@ -473,9 +628,17 @@ pub async fn cmd_get_commit_graph(
             default_branch.as_deref(),
             head_id,
             notes,
-        ))
-    })
-    .await
+        );
+        // Vouched for only if no ref, config or history-rewriting file moved
+        // while the page was being drawn: the rows were read after the stamp
+        // and the decorations in the same window, so an unchanged stamp ties
+        // them to one state.
+        if tokenable && stamp_before.is_some() && graph_stamp(&repo_path, ref_scope) == stamp_before
+        {
+            payload.graph_token = current;
+        }
+        Ok(payload)
+    }
 }
 
 /// Rows to request from the history walker for one graph page: the user's cap

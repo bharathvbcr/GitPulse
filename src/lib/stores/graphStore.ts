@@ -205,6 +205,19 @@ export interface CommitGraphPayload {
    * no ref resolved.
    */
   mainline_name?: string | null;
+  /**
+   * Names the repository state this page was drawn from; handed back as
+   * `knownToken` on the next reload of the same view. Null or absent when the
+   * backend could not vouch for the state (a revision view, a degraded facet,
+   * refs written too recently to tell apart).
+   */
+  graph_token?: string | null;
+  /**
+   * True when `knownToken` still names the state: the page already held is
+   * current, and `rows` and `refs` are empty rather than resent. `head_id`,
+   * `warnings` and `notices` are current as on any answer.
+   */
+  unchanged?: boolean;
 }
 
 /**
@@ -303,6 +316,12 @@ interface CachedGraph {
    * watcher refresh, on top of the walk over the new payload.
    */
   signature: string;
+  /**
+   * The backend's `graph_token` for this page, sent back as `knownToken` so
+   * an unchanged repository costs no rows on the wire and no decode. Only a
+   * reload of the exact same view (query, scope, window) may send it.
+   */
+  graphToken: string | null;
 }
 function emptyVisible(
   path: string | null,
@@ -708,8 +727,8 @@ export function createGraphStore(
       repoPath: string,
       query = "",
       revision: string | null = null,
-      opts: { forceLimit?: number; refScope?: RefScope } = {}
-    ) => {
+      opts: { forceLimit?: number; refScope?: RefScope; withoutToken?: boolean } = {}
+    ): Promise<void> => {
       if (!repoPath) return;
       query = normalizeGraphQuery(query);
       const token = bump(repoPath);
@@ -735,6 +754,17 @@ export function createGraphStore(
           visiblePath: repoPath,
         }));
       }
+      // The token vouches for the page held, so it is offered only for a
+      // reload of that very page: same query, branch, scope and window. A
+      // "load more" raises the window and so never sends one.
+      const knownToken =
+        !opts.withoutToken &&
+        cached !== undefined &&
+        !refining &&
+        cached.maxCommits === max &&
+        !revision
+          ? cached.graphToken
+          : null;
       try {
         const payload = await invokeFn<CommitGraphPayload>("cmd_get_commit_graph", {
           repoPath,
@@ -742,6 +772,7 @@ export function createGraphStore(
           query: query || null,
           revision: revision || null,
           refScope,
+          knownToken,
         });
         if (!isCurrent(repoPath, token)) return;
 
@@ -787,6 +818,28 @@ export function createGraphStore(
         }
 
         const previous = cache.get(repoPath);
+        if (payload.unchanged === true) {
+          // The token named the page held: nothing to decode, hash or swap.
+          // Only trusted while the entry it was issued for is still the one
+          // cached; if that moved while the call was in flight, ask again for
+          // the whole page rather than keep rows that answer another view.
+          if (
+            knownToken !== null &&
+            payload.graph_token === knownToken &&
+            previous !== undefined &&
+            previous.graphToken === knownToken &&
+            previous.query === query &&
+            previous.revision === revision &&
+            previous.refScope === refScope &&
+            previous.maxCommits === max
+          ) {
+            if (visiblePath === repoPath && latestState?.isLoading) {
+              update((s) => ({ ...s, isLoading: false }));
+            }
+            return;
+          }
+          return api.loadGraph(repoPath, query, revision, { ...opts, withoutToken: true });
+        }
         // One walk over the payload per reload: the cached side was hashed
         // when it was stored, and the new entry keeps this one.
         const signature = graphPayloadSignature(payload);
@@ -799,7 +852,9 @@ export function createGraphStore(
           previous.signature === signature
         ) {
           // Identical reload: retire the flag, keep every array identity so
-          // downstream caches (canvas strips) survive untouched.
+          // downstream caches (canvas strips) survive untouched. The state
+          // moved without moving the page, so the token is the new one.
+          previous.graphToken = payload.graph_token ?? null;
           if (visiblePath === repoPath && latestState?.isLoading) {
             update((s) => ({ ...s, isLoading: false }));
           }
@@ -835,6 +890,7 @@ export function createGraphStore(
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
           signature,
+          graphToken: payload.graph_token ?? null,
         };
         shed.delete(repoPath);
         touch(repoPath, next);

@@ -170,6 +170,8 @@ where
 
 #[cfg(test)]
 mod assemble_tests;
+#[cfg(test)]
+mod graph_token_tests;
 #[cfg(all(test, unix))]
 mod parity_tests;
 #[cfg(test)]

@@ -290,6 +290,18 @@ pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
     RefStamp::read(repo, namespaces).map(Stamp)
 }
 
+impl Stamp {
+    /// A hash of the state this stamp describes, for a caller that carries it
+    /// to a later ask, or `None` while a write inside the same timestamp tick
+    /// could still be indistinguishable from it. A caller that only keeps this
+    /// value cannot tell two states apart that the stamp could not, so an
+    /// unsettled stamp yields nothing to keep, as it yields nothing to store.
+    /// A hash is not an identity: use it to short-circuit, never to prove.
+    pub(crate) fn settled_fingerprint(&self) -> Option<u64> {
+        self.0.settled(wall_now()).then(|| self.0.fingerprint())
+    }
+}
+
 #[derive(Default)]
 struct Walk {
     entries: Vec<(PathBuf, Option<FileIdentity>)>,
