@@ -3,7 +3,8 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { filesUnder } from "../stores/sourceScan";
-import { createRepoListing, MAX_CACHED_LISTINGS } from "./repoListing";
+import { writable } from "svelte/store";
+import { createRepoListing, MAX_CACHED_LISTINGS, releaseListingsOfClosedTabs } from "./repoListing";
 
 function rig(initialKey: string | null = "k1") {
   const calls: string[] = [];
@@ -87,6 +88,31 @@ describe("repository file listing owner", () => {
     for (const repo of repos) await listing.list(repo);
     expect(listing.peek(repos[0])).toBeNull();
     expect(listing.peek(repos[repos.length - 1])).not.toBeNull();
+  });
+});
+
+describe("listings of closed tabs", () => {
+  it("are dropped when the tab closes; open tabs keep theirs", async () => {
+    const { listing } = rig();
+    const tabs = writable({ openTabs: [{ path: "/r/a" }, { path: "/r/b" }] });
+    const stop = releaseListingsOfClosedTabs(listing, tabs);
+    await listing.list("/r/a");
+    await listing.list("/r/b");
+    tabs.set({ openTabs: [{ path: "/r/a" }] });
+    expect(listing.peek("/r/b")).toBeNull();
+    expect(listing.peek("/r/a")).not.toBeNull();
+    stop();
+  });
+
+  it("are left alone by a publish that did not change the tab list", async () => {
+    const { listing } = rig();
+    const openTabs = [{ path: "/r/a" }];
+    const tabs = writable({ openTabs });
+    const stop = releaseListingsOfClosedTabs(listing, tabs);
+    await listing.list("/r/gone");
+    tabs.set({ openTabs });
+    expect(listing.peek("/r/gone")).not.toBeNull();
+    stop();
   });
 });
 

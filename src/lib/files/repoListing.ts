@@ -1,4 +1,4 @@
-import { get } from "svelte/store";
+import { get, type Readable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { currentHeadTip } from "../stores/headTip";
 import { currentRepoPath, repoStore } from "../stores/repoStore";
@@ -85,7 +85,34 @@ export function createRepoListing(deps: RepoListingDeps) {
       if (repoPath === undefined) entries.clear();
       else entries.delete(repoPath);
     },
+
+    /** Forget every listing whose repository is not in `open`. */
+    retainOnly(open: ReadonlySet<string>): void {
+      for (const repoPath of [...entries.keys()]) if (!open.has(repoPath)) entries.delete(repoPath);
+    },
   };
+}
+
+type RepoListing = ReturnType<typeof createRepoListing>;
+
+/**
+ * Drops a repository's listing when its tab closes. The cap bounds the cache;
+ * this stops a closed repository's 100k strings outliving its tab. It follows
+ * the tab list rather than being called from the store's close routine because
+ * the store cannot import this module (it reads the store). `openTabs` keeps
+ * its identity until a tab opens, closes or moves, so most publishes return at
+ * the first line.
+ */
+export function releaseListingsOfClosedTabs(
+  listing: Pick<RepoListing, "retainOnly">,
+  source: Readable<{ openTabs: readonly { path: string }[] }>,
+): () => void {
+  let seen: readonly { path: string }[] | null = null;
+  return source.subscribe(({ openTabs }) => {
+    if (openTabs === seen) return;
+    seen = openTabs;
+    listing.retainOnly(new Set(openTabs.map((tab) => tab.path)));
+  });
 }
 
 const repoListing = createRepoListing({
@@ -99,6 +126,8 @@ const repoListing = createRepoListing({
     ].join("\u0000");
   },
 });
+
+releaseListingsOfClosedTabs(repoListing, repoStore);
 
 export const listRepoFiles = repoListing.list;
 export const peekRepoListing = repoListing.peek;
