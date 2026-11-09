@@ -7941,4 +7941,114 @@ done
             );
         }
     }
+
+    /// Adversarial checks of the owning-checkout fence (lane W3-L1) that hold.
+    #[cfg(unix)]
+    mod adv_held {
+        use super::*;
+        use crate::test_support::git_in;
+
+        fn rendered(output: &HookOutput) -> String {
+            output.render().unwrap_or_default()
+        }
+
+        /// A linked worktree nested inside a checkout, the layout of
+        /// `.claude/worktrees/<name>`.
+        pub(super) fn nested_worktree(parent: &str, name: &str) -> String {
+            let wt = Path::new(parent).join(".claude/worktrees").join(name);
+            git_in(
+                Path::new(parent),
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &format!("adv-{name}"),
+                    &wt.to_string_lossy(),
+                ],
+            );
+            wt.canonicalize().unwrap().to_string_lossy().into_owned()
+        }
+
+        /// A session in a nested worktree writing to its parent main checkout
+        /// is a write into another checkout of the same repository.
+        #[test]
+        fn a_bound_nested_worktree_is_denied_a_write_into_its_parent_checkout() {
+            let farm = farm_bound(false, true, 0);
+            let nested = nested_worktree(&farm.repo, "x");
+            crate::ledger::bindings::bind(&farm.repo, &nested, "TASK-HOOK").unwrap();
+            let output = guard_here(&edit_call(&nested, &format!("{}/src/planned.rs", farm.repo)));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny));
+            assert!(rendered(&output).contains(harness::SCOPE_OTHER_CHECKOUT));
+        }
+
+        /// A symlink inside a lane that points at the main checkout resolves to
+        /// the main checkout: the write is fenced, not read as the lane's own.
+        #[test]
+        fn a_symlink_in_a_bound_lane_to_the_main_checkout_is_fenced() {
+            let farm = farm_bound(false, true, 1);
+            let lane = bound_lane(&farm, 0);
+            std::os::unix::fs::symlink(&farm.repo, Path::new(&lane).join("viamain")).unwrap();
+            let output = guard_here(&edit_call(&lane, &format!("{lane}/viamain/src/planned.rs")));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny));
+            assert!(rendered(&output).contains(harness::SCOPE_OTHER_CHECKOUT));
+        }
+
+        /// A file whose parent directories do not exist yet, in another checkout.
+        #[test]
+        fn a_new_file_in_a_new_directory_of_the_main_checkout_is_fenced() {
+            let farm = farm_bound(false, true, 1);
+            let lane = bound_lane(&farm, 0);
+            let output = guard_here(&edit_call(&lane, &format!("{}/no/such/dir/f.rs", farm.repo)));
+            assert_eq!(decision_of(&output), Some(PermissionDecision::Deny));
+            assert!(rendered(&output).contains(harness::SCOPE_OTHER_CHECKOUT));
+        }
+
+        /// A `..` that climbs out of the lane through directories that do not
+        /// exist is never judged as the lane's own file.
+        #[test]
+        fn a_dotdot_escape_through_missing_directories_is_not_read_as_own_checkout() {
+            let farm = farm_bound(false, true, 1);
+            let lane = bound_lane(&farm, 0);
+            let sneaky = format!("{lane}/nope/../../../{}/src/planned.rs", farm.repo.trim_start_matches('/'));
+            let output = guard_here(&edit_call(&lane, &sneaky));
+            let text = rendered(&output);
+            assert!(
+                decision_of(&output) == Some(PermissionDecision::Deny)
+                    || text.contains("could not be determined")
+                    || text.contains("did NOT run"),
+                "{text}"
+            );
+        }
+
+        /// A `.git` file pointing nowhere is reported as undeterminable, not as
+        /// a judged-and-clean pass.
+        #[test]
+        fn a_bogus_gitdir_pointer_is_a_visible_notice() {
+            let farm = farm_bound(false, false, 0);
+            let outside = tempfile::tempdir().unwrap();
+            let dir = outside.path().canonicalize().unwrap().join("bogus");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".git"), "gitdir: /nonexistent/nowhere\n").unwrap();
+            let output = guard_here(&edit_call(&farm.repo, &format!("{}/x.rs", dir.display())));
+            let text = rendered(&output);
+            assert_eq!(decision_of(&output), None, "{text}");
+            assert!(text.contains("did NOT run"), "{text}");
+        }
+
+        /// Git spawns per guarded edit: in-root versus outside-root.
+        #[test]
+        fn spawn_cost_of_an_in_root_and_an_outside_root_edit() {
+            let farm = farm_bound(false, false, 1);
+            let lane = farm.sibling_dirs[0].to_string_lossy().into_owned();
+            let marks = spawn_marks(&farm.dirs);
+            let _ = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+            let inroot = spawn_cost(&farm.dirs, &marks);
+            let marks = spawn_marks(&farm.dirs);
+            let _ = guard_here(&edit_call(&lane, &format!("{}/seed.txt", farm.repo)));
+            let outroot = spawn_cost(&farm.dirs, &marks);
+            // Measured on this lane: 3 (1 worktree list, 2 status) each.
+            assert_eq!(inroot.total(), 3, "{inroot:?}");
+            assert!(outroot.total() <= inroot.total(), "{outroot:?} vs {inroot:?}");
+        }
+    }
 }
