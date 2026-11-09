@@ -301,12 +301,13 @@
   let showStackDetail = $state(false);
 </script>
 
-<!-- A scroller that is a column: every band below is `mx-auto w-full max-w-6xl`,
-     so the content centres in a wide pane instead of hugging the left edge and
-     leaving a third of the window blank, and the empty states take the leftover
+<!-- A scroller that is a column: every band below is `w-full`, so the content
+     spans the whole pane at any window width rather than stopping at a fixed
+     cap (it used to centre in max-w-6xl, which on a wide window left a quarter
+     of the pane blank on each side), and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
 <div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
-  <div class="flex items-start justify-between gap-3 mb-3 mx-auto w-full max-w-6xl">
+  <div class="flex items-start justify-between gap-3 mb-3 w-full">
     <div class="min-w-0">
       <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
       <p class="mt-1 text-textMuted text-[12px] leading-relaxed">
@@ -331,13 +332,13 @@
     </div>
   </div>
   {#if refreshError || navigationError || $repoStore.error}
-    <p role="alert" class="mx-auto mb-3 w-full max-w-6xl text-amber-700 dark:text-amber-300">{refreshError || navigationError || $repoStore.error}</p>
+    <p role="alert" class="mb-3 w-full text-amber-700 dark:text-amber-300">{refreshError || navigationError || $repoStore.error}</p>
   {/if}
 
   <!-- Where the reader is standing. First, because every other row on this
        screen is somewhere else. -->
   {#if $repoStore.currentPath}
-    <section aria-label="Current repository" class="overview-repository mb-3 mx-auto w-full max-w-6xl rounded-2xl border border-border/70 bg-surface p-4 shadow-card">
+    <section aria-label="Current repository" class="overview-repository mb-3 w-full rounded-2xl border border-border/70 bg-surface p-4 shadow-card">
       <div class="overview-repository-heading">
         <div class="flex items-center gap-3 min-w-0">
           <div class="rounded-xl bg-accent/10 p-2 text-accent shrink-0"><Layers size={22} /></div>
@@ -465,7 +466,7 @@
     <!-- Each tile selects the rows it counted. Tiles the projection can only
          ever count as zero would be four doors to an empty room, so a zero
          tile stays readable but is not offered as a filter. -->
-    <div aria-label="Workspace summary filters" class="overview-metrics mb-3 mx-auto w-full max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div aria-label="Workspace summary filters" class="overview-metrics mb-3 w-full grid grid-cols-2 md:grid-cols-4 gap-3">
       <button
         type="button"
         aria-pressed={facet === "all"}
@@ -528,14 +529,14 @@
       </button>
     </div>
 
-    <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center justify-between gap-2">
+    <div class="mb-3 w-full flex flex-wrap items-center justify-between gap-2">
       <h3 class="flex items-center gap-2 text-[13px] font-semibold">
         Work in flight
         <span class="rounded-full bg-surfaceHover px-2 py-0.5 text-[10px] font-mono font-normal text-textMuted">{visibleRows.length}{#if projection && visibleRows.length !== projection.rows.length} / {projection.rows.length}{/if}</span>
       </h3>
       <span class="text-[11px] text-textMuted">Blocked work appears first</span>
     </div>
-    <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center gap-2">
+    <div class="mb-3 w-full flex flex-wrap items-center gap-2">
       <label class="relative flex-1 min-w-52">
         <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
         <input
@@ -590,7 +591,7 @@
 
   {#if collisionError}
     <div
-      class="mb-3 mx-auto w-full max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
@@ -598,7 +599,7 @@
   {/if}
   {#if collisions && collisions.shared_worktrees.length > 0}
     <div
-      class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
@@ -623,7 +624,7 @@
   {/if}
   {#if collisions && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.failed_worktrees > 0 || collisions.truncated)}
     <div
-      class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
@@ -679,7 +680,7 @@
        before they start reading it. -->
   {#if degraded}
     <div
-      class="mb-3 mx-auto w-full max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>{degraded}</span>
@@ -691,7 +692,7 @@
       <EmptyState icon={LayoutGrid} title="No repository open" hint="Open a repository to see the work in it." />
     </div>
   {:else if loading && !projection}
-    <div class="mx-auto w-full max-w-6xl space-y-2">
+    <div class="w-full space-y-2">
       <Skeleton />
       <Skeleton />
       <Skeleton />
@@ -722,7 +723,7 @@
       />
     </div>
   {:else if projection}
-    <div class="mx-auto w-full max-w-6xl space-y-3">
+    <div class="w-full space-y-3">
       {#each renderedRows as row, i (row.key || `__unbound:${i}`)}
         {@const chips = noteworthyStatuses(row.verdicts)}
         {@const dirty = dirtySummary(row)}
@@ -984,7 +985,7 @@
   {/if}
 
   {#if $repoStore.currentPath}
-    <div class="mt-4 mx-auto w-full max-w-6xl">
+    <div class="mt-4 w-full">
       <button
         type="button"
         class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
@@ -1004,7 +1005,7 @@
       {/if}
     </div>
 
-    <div class="mt-4 mx-auto w-full max-w-6xl">
+    <div class="mt-4 w-full">
       <button
         type="button"
         class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
