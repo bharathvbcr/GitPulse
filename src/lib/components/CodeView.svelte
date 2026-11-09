@@ -1,7 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
-  import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewContextBar from "./ViewContextBar.svelte";
   import ViewSectionPanel from "./ViewSectionPanel.svelte";
 
   /** Named once: the tab and its panel must agree on the id. */
@@ -37,18 +37,19 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewSectionBar view="code">
-    <!-- The subject Blame shares with Explorer. Map has its own subject
-         (subsystems), so the path chip stays Blame-only. -->
-    {#if selected && section === "blame"}
+  <!-- The subject Blame shares with Explorer. Map has its own subject
+       (subsystems), so the path chip stays Blame-only, and with nothing to
+       show the row is not drawn. -->
+  {#if selected && section === "blame"}
+    <ViewContextBar label="Blamed file">
       <span
         class="ml-auto shrink-0 max-w-[40ch] truncate font-mono text-[11px] text-textMuted"
         title={selected}
       >
         {selected}
       </span>
-    {/if}
-  </ViewSectionBar>
+    </ViewContextBar>
+  {/if}
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane

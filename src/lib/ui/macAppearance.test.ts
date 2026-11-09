@@ -48,11 +48,17 @@ describe("Mac appearance boundary", () => {
     expect(cardScale().duration).toBe(260);
   });
 
-  it("renders one decorative liquid selection on Mac without duplicating tab semantics", () => {
+  it("renders one decorative liquid selection per selected control, without duplicating its semantics", () => {
     vi.stubGlobal("navigator", { platform: "MacIntel", maxTouchPoints: 0 });
     const body = render(ViewTabBar).body;
-    expect(body.match(/class="gp-liquid-selection gp-gpu"/g)).toHaveLength(1);
-    expect(body.match(/aria-selected="true"/g)).toHaveLength(1);
+    // The switcher has two selections: the current view (aria-current) and,
+    // beside it, its current section (a real tab, aria-selected). Each gets
+    // exactly one pill, and the pill itself is decoration only.
+    const current = body.match(/aria-current="page"/g) ?? [];
+    const selected = body.match(/aria-selected="true"/g) ?? [];
+    expect(current).toHaveLength(1);
+    expect(selected).toHaveLength(1);
+    expect(body.match(/class="gp-liquid-selection gp-gpu"/g)).toHaveLength(current.length + selected.length);
     expect(body).toContain('aria-hidden="true"');
   });
 

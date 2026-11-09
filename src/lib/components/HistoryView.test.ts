@@ -3,14 +3,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import ViewSectionBar from "./ViewSectionBar.svelte";
+import ViewSectionTabs from "./ViewSectionTabs.svelte";
 import { destinationGuide, tipGuideKey } from "../views/viewGuide";
 import { sectionsFor } from "../views/viewRegistry";
+import { panelId } from "../dom/tablist";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (name: string) => readFileSync(join(here, name), "utf8");
 const history = read("HistoryView.svelte");
-const sectionBar = read("ViewSectionBar.svelte");
+const sectionBar = read("ViewSectionTabs.svelte");
 const filterBar = read("FilterBar.svelte");
 const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
 
@@ -54,11 +55,11 @@ describe("HistoryView", () => {
 
   it("carries the commit filter in its own header", () => {
     expect(history).toContain("<FilterBar />");
-    expect(history).toContain("<ViewSectionBar");
+    expect(history).toContain("<ViewContextBar");
   });
 });
 
-describe("ViewSectionBar", () => {
+describe("ViewSectionTabs", () => {
   it("reads the catalog rather than taking a list of its own", () => {
     // One control for every sectioned view, so the lens switcher cannot drift
     // into looking different per view.
@@ -72,17 +73,28 @@ describe("ViewSectionBar", () => {
   });
 
   it("marks the active section for assistive tech, not just visually", () => {
-    expect(sectionBar).toContain('role="tab"');
-    // The attribute comes from the shared `tabProps` owner now rather than
-    // being hand-written per call site. What must hold is that the active
-    // section is announced AND that the tab points at a panel that exists —
-    // the bar used to declare role="tab" with no tabpanel anywhere in the app.
+    // The attribute comes from the shared `tabProps` owner rather than being
+    // hand-written per call site. What must hold is that the active section
+    // is announced AND that the tab points at a panel that exists — the bar
+    // used to declare role="tab" with no tabpanel anywhere in the app.
     expect(sectionBar).toContain('aria-selected={props["aria-selected"]}');
     expect(sectionBar).toContain('aria-controls={props["aria-controls"]}');
+    const body = render(ViewSectionTabs, {
+      props: { view: "history", attention: { conflictedCount: 0, verdictStatus: null } },
+    }).body;
+    expect(body.match(/role="tab"/g)).toHaveLength(sectionsFor("history").length);
+    expect(body.match(/aria-selected="true"/g)).toHaveLength(1);
+    expect(body).toContain(`aria-controls="${panelId("history", "graph")}"`);
   });
 
   it("uses liquid tabs so the section strip matches the header", () => {
-    expect(sectionBar).toContain("class:gp-liquid-tabs={macos}");
+    // The sections sit inside the header group's own liquid track, so they
+    // take its styling from there; a second track of their own drew a box
+    // inside the box.
+    const viewTabBar = read("ViewTabBar.svelte");
+    expect(viewTabBar).toContain("class:gp-liquid-tabs={macos}");
+    expect(viewTabBar).toContain("<ViewSectionTabs");
+    expect(sectionBar).not.toContain("class:gp-liquid-tabs");
     expect(sectionBar).toContain("gp-liquid-selection");
     expect(sectionBar).toContain("<span>{section.label}</span>");
   });
@@ -91,7 +103,7 @@ describe("ViewSectionBar", () => {
     expect(sectionBar).toContain("data-tip-guide={guideKey}");
     expect(sectionBar).not.toContain('title="{section.label}');
     for (const view of ["work", "code", "history", "insights"] as const) {
-      const body = render(ViewSectionBar, { props: { view } }).body;
+      const body = render(ViewSectionTabs, { props: { view, attention: { conflictedCount: 0, verdictStatus: null } } }).body;
       for (const section of sectionsFor(view)) {
         const key = tipGuideKey(view, section.id);
         const guide = destinationGuide(key);

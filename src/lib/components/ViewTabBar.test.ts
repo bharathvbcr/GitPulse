@@ -31,25 +31,44 @@ describe("ViewTabBar has no menu left to dismiss", () => {
     expect(source).not.toContain("data-view-nav-trigger");
     expect(source).not.toContain("shouldDismissOverlay");
     expect(source).not.toContain("addEventListener");
-    expect(source).not.toContain("use:portal");
   });
 
-  it("renders one tablist and nothing that opens on click but a view", () => {
-    expect(source).toContain('role="tablist"');
-    expect(source).toContain('role="tab"');
+  it("dismisses its hover flyout through the shared popover owner, not by hand", () => {
+    // The flyout is portaled for the reason the dropdown was: the title bar
+    // clips overflow. Its four dismissal paths (outside pointer, scroll,
+    // resize, Escape) are the popover owner's, which is where the dropdown's
+    // four regressions were fixed once for every popover in the app.
+    expect(source).toContain("use:portal");
+    expect(source).toContain("use:popover={flyoutPlacement}");
+    expect(source).toContain('inside: "[data-view-group], [data-view-flyout]"');
+  });
+
+  it("opens nothing on click but a view or a section", () => {
     expect(source).not.toContain('role="menu"');
     expect(source).not.toContain('role="menuitem"');
+    // A view pill's click navigates; only hover opens the flyout.
+    expect(source).toContain("onclick={() => selectTab(item.id)}");
+    expect(source).not.toMatch(/onclick=\{\(\) => \(?flyoutView =/);
+  });
+
+  it("puts the active view's sections beside it as real tabs", () => {
+    const body = header();
+    expect(body).toContain('role="tablist"');
+    expect(body).toContain('aria-label="Work sections"');
+    expect(body.match(/aria-current="page"/g)).toHaveLength(1);
+    // Only the active view expands inline; collapsed views carry no tabs.
+    expect(body).not.toContain('aria-label="Code sections"');
   });
 });
+
+const header = (conflictedCount = 0) =>
+  render(ViewTabBar, { props: { conflictedCount } }).body;
 
 describe("ViewTabBar view visibility", () => {
   afterEach(() => {
     interfaceStore.showAllViews();
     repoStore.setActiveTab("work");
   });
-
-  const header = (conflictedCount = 0) =>
-    render(ViewTabBar, { props: { conflictedCount } }).body;
 
   it("lists every view by default", () => {
     const body = header();
@@ -111,9 +130,16 @@ describe("ViewTabBar view visibility", () => {
       const key = tipGuideKey(item.id);
       const guide = destinationGuide(key);
       expect(guide, item.id).not.toBeNull();
-      expect(body, `guide attr: ${item.id}`).toContain(`data-tip-guide="${key}"`);
+      // Every view's summary is in the markup for assistive tech
+      // (aria-describedby), whatever the hover does.
       expect(body, `summary: ${item.id}`).toContain(guide!.summary);
     }
+    // Hover has one meaning per pill: the active view (which opens no flyout)
+    // shows its guide card; a collapsed view's flyout already says what the
+    // view is, so it carries no card to open over its own flyout.
+    expect(body).toContain(`data-tip-guide="${tipGuideKey("work")}"`);
+    expect(body).not.toContain(`data-tip-guide="${tipGuideKey("code")}"`);
+    expect(source).toContain("data-tip-guide={active ? guideKey : undefined}");
     expect(source).not.toContain("title={accelerator");
     expect(source).not.toContain("title={item.label");
   });

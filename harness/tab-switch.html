@@ -491,6 +491,65 @@
           check("in flight: alpha's late worktree list does not replace beta's", () =>
             text(worktreesPanel()).includes("beta-wt-two") && !text(worktreesPanel()).includes("alpha-wt-one"));
 
+          // ---- the header view switcher ------------------------------------------
+          // One group per view; the active one expanded into its sections as
+          // real tabs, the rest collapsed pills that preview their sections in
+          // a hover flyout. Only hover and keyboard here: navigating to a view
+          // this fixture does not answer would fail the IPC check below for a
+          // reason that has nothing to do with the switcher.
+          {
+            const group = (view) => $(`[data-view-group="${view}"]`);
+            const viewButton = (view) => group(view)?.querySelector("[data-view-button]");
+            const flyout = () => $("[data-view-flyout]");
+            const lefts = () => $$("[data-view-group]").map((g) => Math.round(g.getBoundingClientRect().left));
+            const sections = () => group("history")?.querySelector('[role="tablist"][aria-label="History sections"]');
+            const panel = $('[role="tabpanel"]');
+            check("switcher: the active view's sections sit beside it as real tabs", () =>
+              !!sections() && $$('[role="tablist"][aria-label$="sections"]').length === 1 &&
+              viewButton("history").getAttribute("aria-current") === "page");
+            check("switcher: the open panel names a section tab that exists", () =>
+              !!panel && !!document.getElementById(panel.getAttribute("aria-labelledby")));
+            check("switcher: a view with per-view content keeps its row, labelled", () =>
+              !!$('[role="group"][aria-label="Commit filter"]'));
+            const heights = $$("[data-view-group]").map((g) => g.getBoundingClientRect().height);
+            check("switcher: the expanded group is as tall as the collapsed ones", () =>
+              heights.length >= 4 && Math.max(...heights) - Math.min(...heights) < 1);
+
+            const before = lefts();
+            group("work").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
+            await wait(40);
+            check("switcher: a pointer crossing a pill does not open its flyout at once", () => !flyout());
+            await sleepUntil(() => !!flyout(), 1000);
+            const fly = flyout();
+            check("switcher: hovering a collapsed view opens its sections", () =>
+              fly?.dataset.viewFlyout === "work" && fly.querySelectorAll("[data-section]").length >= 4 &&
+              viewButton("work").getAttribute("aria-expanded") === "true");
+            check("switcher: the flyout opens below its pill without moving any group", () =>
+              !!fly && fly.getBoundingClientRect().top >= group("work").getBoundingClientRect().bottom &&
+              JSON.stringify(lefts()) === JSON.stringify(before));
+            check("switcher: the flyout marks the section the view would reopen on", () =>
+              fly?.querySelector('[data-remembered="true"]')?.dataset.section === "overview");
+            group("work").dispatchEvent(new PointerEvent("pointerleave", { pointerType: "mouse" }));
+            await sleepUntil(() => !flyout(), 1000);
+            check("switcher: leaving the pill closes the flyout after its grace", () => !flyout());
+            group("code").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "touch" }));
+            await wait(300);
+            check("switcher: a touch has no hover, so it opens no flyout", () => !flyout());
+            group("history").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
+            await wait(300);
+            check("switcher: the active view opens no flyout; its sections are already out", () => !flyout());
+
+            viewButton("history").focus();
+            viewButton("history").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+            await settle();
+            const landed = document.activeElement;
+            check("switcher: ArrowDown moves from the view into its selected section", () =>
+              landed?.getAttribute("role") === "tab" && landed.getAttribute("aria-selected") === "true" && sections()?.contains(landed));
+            landed?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+            await settle();
+            check("switcher: ArrowUp from a section returns to its view", () => document.activeElement === viewButton("history"));
+          }
+
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);
 

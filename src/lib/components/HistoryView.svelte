@@ -2,7 +2,7 @@
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { activeSectionFor } from "../views/viewRegistry";
-  import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewContextBar from "./ViewContextBar.svelte";
   import ViewSectionPanel from "./ViewSectionPanel.svelte";
 
   /** Named once: the tab and its panel must agree on the id. */
@@ -42,11 +42,11 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewSectionBar view="history">
+  <ViewContextBar label="Commit filter">
     <!-- The filter applies to every section here: the graph walk, the diff's
          commit list, and the reflog table are all drawn from it. -->
     <FilterBar />
-  </ViewSectionBar>
+  </ViewContextBar>
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane

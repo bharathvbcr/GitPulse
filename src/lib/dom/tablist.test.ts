@@ -47,8 +47,7 @@ describe("handleTablistKeydown", () => {
 
 describe("every tablist in the app implements the pattern it announces", () => {
   const TABLISTS: Array<[string, string]> = [
-    ["ViewSectionBar.svelte", "section switcher"],
-    ["ViewTabBar.svelte", "view switcher"],
+    ["ViewSectionTabs.svelte", "section switcher"],
     ["FileViewer.svelte", "open-file strip"],
     ["TaskBoard.svelte", "open-task strip"],
   ];
@@ -79,8 +78,22 @@ describe("every tablist in the app implements the pattern it announces", () => {
 
   it("names the section tablist by its display label, not its raw id", () => {
     // The old accessible name announced "work sections".
-    const source = read("ViewSectionBar.svelte");
+    const source = read("ViewSectionTabs.svelte");
     expect(source).toContain('aria-label="{groupLabel} sections"');
     expect(source).toContain("VIEW_REGISTRY[view].label");
+  });
+
+  it("announces the view switcher as navigation, and implements its keys", () => {
+    // The views are destinations, each with sections of its own, so the
+    // switcher is a nav whose current view carries aria-current. Only the
+    // active view's sections are tabs: theirs are the only panels that exist.
+    // A nested tablist inside a tablist would announce neither correctly.
+    const source = read("ViewTabBar.svelte");
+    expect(source).toContain('<nav class="relative shrink-0" aria-label="Views"');
+    expect(source).toContain('aria-current={active ? "page" : undefined}');
+    expect(source).not.toContain('role="tablist"');
+    expect(source).toContain("handleTablistKeydown");
+    expect(source).toContain("onkeydown={onKeydown}");
+    expect(source).toContain('event.key === "ArrowDown"');
   });
 });
