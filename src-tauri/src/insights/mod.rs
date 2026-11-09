@@ -2734,10 +2734,15 @@ fn session_brief_powershell(binary: &str, args: &str) -> Result<String, String> 
 /// 0. A host older than 2.1.295 that ignores `onFailure` would treat a missing
 /// executable as a non-blocking failure and allow the call.
 ///
+/// The launch-time `--settings` hooks GitPulse injects into the claude sessions
+/// it starts use this same function on Windows
+/// ([`crate::workbench::claude_hook::settings_hooks_for`]); there is no second
+/// Windows renderer. Notify-only hooks carry no `onFailure`, in both copies.
+///
 /// `args` come from the plugin's own manifest and must be plain words; a
 /// `binary` with a control character is refused. Pure and not `cfg(windows)`,
 /// so every test runs it; none runs it on Windows.
-fn windows_hook_handler(
+pub(crate) fn windows_hook_handler(
     handler: &mut serde_json::Value,
     binary: &str,
     args: &str,
@@ -5461,6 +5466,50 @@ mod tests {
         for (_, handler) in notify {
             assert_eq!(handler["args"].as_array().unwrap().len(), 2, "{handler}");
         }
+    }
+
+    /// One generator: every handler GitPulse injects into a launched claude
+    /// session on Windows is the very object the Settings copy has for the same
+    /// event, matcher and subcommand (command, args, onFailure, timeout and
+    /// all), so the two cannot drift and no second Windows renderer exists.
+    #[test]
+    fn the_injected_windows_hooks_equal_the_settings_copy_handler_for_handler() {
+        let binary = r"C:\Program Files\GitPulse\gitpulse-hook.exe";
+        let copy: serde_json::Value = serde_json::from_str(
+            &hooks_config_for(&plugin_hooks_template(), binary, "C:/plugin", true).unwrap(),
+        )
+        .unwrap();
+        let injected =
+            crate::workbench::claude_hook::settings_hooks_for(Path::new(binary), true).unwrap();
+        let mut compared = 0;
+        for (event, groups) in injected.as_object().unwrap() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let twin = copy["hooks"][event]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|g| g["matcher"] == group["matcher"])
+                        .flat_map(|g| g["hooks"].as_array().unwrap())
+                        .find(|h| h["args"] == handler["args"])
+                        .unwrap_or_else(|| panic!("{event}: no Settings twin for {handler}"));
+                    assert_eq!(twin, handler, "{event}");
+                    compared += 1;
+                }
+            }
+        }
+        // Every hook of every injected event, none skipped.
+        let expected: usize =
+            crate::workbench::claude_hook::settings_hooks_for(Path::new(binary), false)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|groups| groups.as_array().unwrap())
+                .map(|group| group["hooks"].as_array().unwrap().len())
+                .sum();
+        assert_eq!(compared, expected);
+        assert!(compared >= 9, "only {compared} handlers compared");
     }
 
     /// `session-brief` is the one hook that stays in shell form: a hook that
