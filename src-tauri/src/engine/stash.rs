@@ -272,7 +272,77 @@ where
     let argv = action_argv(action, &entry.selector, &entry.oid);
     let verdict = judge(&argv)?;
     let output = git_text(repo.as_path(), &argv[1..])?;
+    if matches!(action, StashAction::Pop | StashAction::Drop) {
+        verify_dropped_entry(repo.as_path(), action, &entry.oid, &output)?;
+    }
     Ok((verdict, output))
+}
+
+/// The object id git printed for the entry it just removed, from
+/// `Dropped refs/stash@{0} (<oid>)` (printed by both `drop` and `pop`).
+///
+/// `None` when no line has that shape or the id is not a full object name.
+/// Callers must treat that as "unverified", never as a match.
+fn parse_dropped_oid(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("Dropped ")?;
+        let inner = rest.strip_suffix(')')?.rsplit_once('(')?.1;
+        (inner.len() >= 40 && validate_oid(inner).is_ok()).then_some(inner)
+    })
+}
+
+/// Proves the entry git removed is the one the caller confirmed.
+///
+/// `repo_mutation_lock` fences only GitPulse writers, and `judge` is a sidecar
+/// round trip, so an outside `git stash push` between the re-listing and the
+/// index-addressed `drop`/`pop` shifts every index and removes a different
+/// entry. Git names what it removed, so that is compared with `expected_oid`;
+/// on a mismatch the removed entry is stored back and the call fails, naming
+/// both ids. Output that cannot be parsed is a failure too: success is only
+/// reported for an entry that was seen to be the confirmed one.
+fn verify_dropped_entry(
+    repo: &Path,
+    action: StashAction,
+    expected_oid: &str,
+    output: &str,
+) -> Result<(), CommandError> {
+    let label = action.label();
+    let Some(actual) = parse_dropped_oid(output) else {
+        return Err(format!(
+            "git stash {label} ran but its output did not name the entry it removed, so it \
+             could not be checked against the confirmed entry {expected_oid}. Check `git stash \
+             list`; if that entry is gone, `git stash store -m <message> {expected_oid}` \
+             restores it. {STALE_STACK_HINT}"
+        )
+        .into());
+    };
+    if actual.eq_ignore_ascii_case(expected_oid) {
+        return Ok(());
+    }
+    let message = git_text(repo, &["show", "-s", "--format=%s", actual])
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
+    let restore = if message.is_empty() {
+        git_text(repo, &["stash", "store", actual])
+    } else {
+        git_text(repo, &["stash", "store", "-m", &message, actual])
+    };
+    let outcome = match restore {
+        Ok(_) => "that entry was restored to the stash stack".to_string(),
+        Err(e) => format!(
+            "restoring it failed ({}); `git stash store {actual}` brings it back",
+            e.message()
+        ),
+    };
+    let applied = if action == StashAction::Pop {
+        " The pop also applied that entry's changes to the working tree."
+    } else {
+        ""
+    };
+    Err(stale(format!(
+        "git stash {label} removed {actual} instead of the confirmed entry {expected_oid}: \
+         the stack changed after it was listed. {outcome}.{applied} {STALE_STACK_HINT}"
+    )))
 }
 
 #[cfg(test)]
@@ -372,6 +442,152 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\0");
         assert_eq!(parse_stash_list(&raw).entries.len(), MAX_STASH_ENTRIES);
+    }
+
+    const OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn the_oid_git_printed_is_parsed_from_drop_and_pop_output() {
+        assert_eq!(
+            parse_dropped_oid(&format!("Dropped refs/stash@{{0}} ({OID_A})\n")),
+            Some(OID_A)
+        );
+        // `pop` prints the status of the restored tree before the drop line.
+        let pop = format!("On branch main\nChanges not staged:\n\tmodified: a\nDropped refs/stash@{{2}} ({OID_A})\n");
+        assert_eq!(parse_dropped_oid(&pop), Some(OID_A));
+    }
+
+    #[test]
+    fn malformed_drop_output_is_not_a_match() {
+        for raw in [
+            "",
+            "Dropped refs/stash@{0}\n",
+            "Dropped refs/stash@{0} ()\n",
+            "Dropped refs/stash@{0} (abc123)\n",
+            "Dropped refs/stash@{0} (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz)\n",
+            "Dropped refs/stash@{0} (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "dropped refs/stash@{0} (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
+        ] {
+            assert_eq!(parse_dropped_oid(raw), None, "{raw:?}");
+        }
+        let error = verify_dropped_entry(
+            Path::new("."),
+            StashAction::Drop,
+            OID_A,
+            "Gelöscht refs/stash@{0}\n",
+        )
+        .expect_err("unparseable output must fail closed");
+        assert!(error.message().contains(OID_A), "{}", error.message());
+    }
+
+    mod real_git {
+        use super::*;
+        use crate::procguard::LockedSpawn;
+        use std::process::Command;
+
+        fn git(path: &Path, args: &[&str]) -> String {
+            let mut command = Command::new("git");
+            crate::test_support::pin_git(&mut command);
+            let output = command
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "GitPulse Test")
+                .env("GIT_AUTHOR_EMAIL", "gitpulse@example.test")
+                .env("GIT_COMMITTER_NAME", "GitPulse Test")
+                .env("GIT_COMMITTER_EMAIL", "gitpulse@example.test")
+                .output_locked()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn stash_of(path: &Path, content: &str, message: &str) {
+            std::fs::write(path.join("a.txt"), content).unwrap();
+            git(path, &["stash", "push", "-m", message]);
+        }
+
+        /// Stack `[confirmed]`; an outside `git stash push` lands while the
+        /// gate is judging, so `stash@{0}` is now someone else's work.
+        fn raced_action(action: StashAction) -> (tempfile::TempDir, String, String, CommandError) {
+            let dir = tempfile::tempdir().expect("temp repo");
+            let path = dir.path();
+            git(path, &["init", "-b", "main"]);
+            crate::test_support::trust_repo(path);
+            std::fs::write(path.join("a.txt"), "base").unwrap();
+            git(path, &["add", "a.txt"]);
+            git(path, &["commit", "-m", "base"]);
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+
+            let repo = path.to_str().unwrap();
+            let intruder = std::cell::RefCell::new(String::new());
+            let error = run_action_with(repo, action, 0, &confirmed, |_: &[&str]| {
+                stash_of(path, "intruder", "outside work");
+                *intruder.borrow_mut() = git(path, &["rev-parse", "refs/stash"]);
+                Ok(())
+            })
+            .expect_err("the dropped entry was not the confirmed one");
+            (dir, confirmed, intruder.into_inner(), error)
+        }
+
+        #[test]
+        fn a_stash_pushed_during_the_gate_does_not_cost_the_user_either_entry() {
+            let (dir, confirmed, intruder, error) = raced_action(StashAction::Drop);
+            let message = error.message();
+            assert!(
+                message.contains(&intruder),
+                "actual oid reported: {message}"
+            );
+            assert!(
+                message.contains(&confirmed),
+                "expected oid reported: {message}"
+            );
+            assert!(message.contains("restored"), "{message}");
+
+            let listed = list(dir.path().to_str().unwrap()).unwrap().entries;
+            let oids: Vec<&str> = listed.iter().map(|e| e.oid.as_str()).collect();
+            assert_eq!(oids, vec![intruder.as_str(), confirmed.as_str()]);
+            assert_eq!(
+                listed[0].message, "outside work",
+                "restored with its message"
+            );
+        }
+
+        #[test]
+        fn a_raced_pop_is_reported_and_the_popped_entry_restored() {
+            let (dir, confirmed, intruder, error) = raced_action(StashAction::Pop);
+            assert!(error.message().contains("applied"), "{}", error.message());
+            let listed = list(dir.path().to_str().unwrap()).unwrap().entries;
+            let oids: Vec<&str> = listed.iter().map(|e| e.oid.as_str()).collect();
+            assert_eq!(oids, vec![intruder.as_str(), confirmed.as_str()]);
+        }
+
+        #[test]
+        fn an_unraced_drop_still_succeeds() {
+            let dir = tempfile::tempdir().expect("temp repo");
+            let path = dir.path();
+            git(path, &["init", "-b", "main"]);
+            crate::test_support::trust_repo(path);
+            std::fs::write(path.join("a.txt"), "base").unwrap();
+            git(path, &["add", "a.txt"]);
+            git(path, &["commit", "-m", "base"]);
+            stash_of(path, "mine", "mine");
+            let oid = git(path, &["rev-parse", "refs/stash"]);
+            let (_, output) = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Drop,
+                0,
+                &oid,
+                |_: &[&str]| Ok(()),
+            )
+            .expect("drop");
+            assert!(output.contains(&oid), "{output}");
+            assert!(list(path.to_str().unwrap()).unwrap().entries.is_empty());
+        }
     }
 
     #[test]

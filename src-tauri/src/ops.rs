@@ -12,7 +12,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_captured, git_text, validate_repo, BoundedRun};
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::{BranchInfo, GitReader};
 
@@ -441,6 +441,40 @@ pub struct ReleasePlan {
     pub create_tag: bool,
 }
 
+/// The commit the local tag `tag` peels to; `None` when no such tag exists.
+///
+/// Qualified as `refs/tags/<tag>` so a branch spelled like the tag is not taken
+/// for it. `--verify --quiet` makes exit 1 with empty stdout git's answer
+/// "missing"; every other outcome (exit 128, a spawn refusal, a deadline, a cut
+/// stream) is a read that did not happen and is an `Err`, never "no tag".
+fn local_release_tag(repo: &std::path::Path, tag: &str) -> Result<Option<String>, CommandError> {
+    local_release_tag_with(tag, |args| git_captured(repo, args))
+}
+
+fn local_release_tag_with<F>(tag: &str, run: F) -> Result<Option<String>, CommandError>
+where
+    F: FnOnce(&[&str]) -> Result<BoundedRun, CommandError>,
+{
+    let spec = format!("refs/tags/{tag}^{{commit}}");
+    let run = run(&["rev-parse", "--verify", "--quiet", &spec])?;
+    let stdout = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if run.incomplete.is_some() || run.cancelled {
+        return Err(format!(
+            "Could not read the local release tag {tag}: git's answer was cut off"
+        )
+        .into());
+    }
+    match run.status_code {
+        0 if !stdout.is_empty() => Ok(Some(stdout)),
+        1 if stdout.is_empty() => Ok(None),
+        code => Err(format!(
+            "Could not read the local release tag {tag} (git exited {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into()),
+    }
+}
+
 pub fn prepare_release(
     repo_path: &str,
     tag: &str,
@@ -483,8 +517,7 @@ pub fn prepare_release(
     validate_ref_name(remote)?;
 
     let head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-    let local_tag = git_text(&repo, &["rev-list", "-n", "1", tag]).ok();
-    let create_tag = match local_tag.map(|value| value.trim().to_string()) {
+    let create_tag = match local_release_tag(&repo, tag)? {
         Some(target) if target == head => false,
         Some(_) => return Err("Release tag already exists locally at a different commit".into()),
         None => true,
@@ -751,6 +784,137 @@ mod tests {
         std::fs::write(repo.path().join("dirty.txt"), "dirty").expect("fixture write");
         let error = prepare_release(path, "v1.0.0", "Release v1.0.0").unwrap_err();
         assert!(error.contains("clean working tree"));
+    }
+
+    /// A pushed, synchronized default branch with one commit: the shape
+    /// `prepare_release` accepts. The remote is returned to keep it alive.
+    fn release_ready_repo() -> (tempfile::TempDir, tempfile::TempDir) {
+        let remote = tempfile::tempdir().expect("bare remote");
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+        let repo = tempfile::tempdir().expect("local repo");
+        git(repo.path(), &["init", "-b", "main"]);
+        commit_file(repo.path(), "app.txt", "ready", "feat: ready release #1");
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().expect("utf8 remote"),
+            ],
+        );
+        git(repo.path(), &["push", "-u", "origin", "main"]);
+        (remote, repo)
+    }
+
+    /// A branch spelled like the release tag is not the tag. `rev-list v1.5.0`
+    /// resolves the branch, so the tag was taken for existing and never made.
+    #[test]
+    fn a_branch_named_like_the_release_tag_is_not_an_existing_tag() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["branch", "v1.5.0"]);
+        let path = repo.path().to_str().expect("utf8 repo");
+
+        let plan = prepare_release(path, "v1.5.0", "Release v1.5.0").expect("ready release");
+        assert!(
+            plan.create_tag,
+            "a same-named branch at HEAD must not stand in for the tag"
+        );
+    }
+
+    #[test]
+    fn a_branch_named_like_the_tag_at_another_commit_does_not_block_the_release() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["branch", "v1.5.0", "HEAD"]);
+        git(repo.path(), &["switch", "-q", "v1.5.0"]);
+        commit_file(repo.path(), "other.txt", "x", "feat: elsewhere");
+        git(repo.path(), &["switch", "-q", "main"]);
+        let path = repo.path().to_str().expect("utf8 repo");
+
+        let plan = prepare_release(path, "v1.5.0", "Release v1.5.0").expect("ready release");
+        assert!(plan.create_tag);
+    }
+
+    #[test]
+    fn a_tag_at_another_commit_is_refused() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "v1.5.0"]);
+        // HEAD moves on, stays pushed and clean: only the tag is stale.
+        commit_file(repo.path(), "next.txt", "next", "feat: next");
+        git(repo.path(), &["push", "origin", "main"]);
+        let path = repo.path().to_str().expect("utf8 repo");
+
+        let error = prepare_release(path, "v1.5.0", "Release v1.5.0").unwrap_err();
+        assert!(
+            error.contains("already exists locally at a different commit"),
+            "{}",
+            error.message()
+        );
+    }
+
+    fn probe(status_code: i32, stdout: &str, stderr: &str) -> BoundedRun {
+        BoundedRun {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            success: status_code == 0,
+            status_code,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled: false,
+        }
+    }
+
+    /// Only git's "missing" answer (exit 1, nothing on stdout) is "no local
+    /// tag". Any other failure used to collapse into it, so `create_tag=true`
+    /// was reported for a repository git could not read.
+    #[test]
+    fn only_a_missing_ref_means_no_local_tag() {
+        let missing = local_release_tag_with("v1.5.0", |args| {
+            assert_eq!(
+                args,
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/tags/v1.5.0^{commit}"
+                ]
+            );
+            Ok(probe(1, "", ""))
+        });
+        assert_eq!(missing.expect("missing is an answer"), None);
+
+        let found = local_release_tag_with("v1.5.0", |_| Ok(probe(0, "abc123\n", "")));
+        assert_eq!(found.expect("found"), Some("abc123".to_string()));
+
+        let broken = local_release_tag_with("v1.5.0", |_| {
+            Ok(probe(128, "", "fatal: unable to read refs"))
+        })
+        .expect_err("exit 128 is not 'missing'");
+        assert!(broken.message().contains("128"), "{}", broken.message());
+
+        let unspawnable =
+            local_release_tag_with("v1.5.0", |_| Err("spawn refused".to_string().into()));
+        assert!(unspawnable.is_err());
+
+        let empty_success = local_release_tag_with("v1.5.0", |_| Ok(probe(0, "", "")));
+        assert!(
+            empty_success.is_err(),
+            "exit 0 with no oid is not an answer"
+        );
+
+        let mut cut = probe(1, "", "");
+        cut.cancelled = true;
+        assert!(local_release_tag_with("v1.5.0", |_| Ok(cut)).is_err());
+    }
+
+    #[test]
+    fn a_local_tag_at_head_is_reused_not_recreated() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "v1.5.0"]);
+        let path = repo.path().to_str().expect("utf8 repo");
+
+        let plan = prepare_release(path, "v1.5.0", "Release v1.5.0").expect("ready release");
+        assert!(!plan.create_tag);
     }
 
     /// A commit landing between the checks and the tag must not be published:
