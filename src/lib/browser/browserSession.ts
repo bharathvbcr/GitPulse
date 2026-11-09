@@ -157,16 +157,41 @@ export function sameBounds(a: PaneBounds | null, b: PaneBounds | null): boolean 
   );
 }
 
+/** Hit-test points along one axis: both ends (pulled in by `inset`) and evenly between. */
+function axisPoints(start: number, length: number, inset: number, spacing: number, max: number): number[] {
+  const from = start + inset;
+  const to = start + length - inset;
+  if (to <= from) return [];
+  const steps = Math.min(max - 1, Math.max(1, Math.ceil((to - from) / spacing)));
+  return Array.from({ length: steps + 1 }, (_, i) => from + ((to - from) * i) / steps);
+}
+
 /**
- * Points (CSS pixels) to hit-test for something drawn over `rect`: the
- * centre, the four corners and the four edge midpoints, each pulled in by
- * `inset` so a neighbour's border is not mistaken for an overlay.
+ * Points (CSS pixels) to hit-test for something drawn over `rect`: a grid at
+ * most `spacing` apart, or a ninth of the span once that would take more than
+ * `maxPerAxis` points a side, edges pulled in by `inset` so a neighbour's border
+ * is not mistaken for an overlay. An overlay at least one grid step wide and
+ * tall is always hit; smaller ones are found by `overlapsRect` when they are
+ * portaled to the body, which every menu, dialog and toast is.
  */
-export function samplePoints(rect: CssRect, inset = 3): { x: number; y: number }[] {
-  if (rect.width <= inset * 2 || rect.height <= inset * 2) return [];
-  const xs = [rect.left + inset, rect.left + rect.width / 2, rect.left + rect.width - inset];
-  const ys = [rect.top + inset, rect.top + rect.height / 2, rect.top + rect.height - inset];
+export function samplePoints(rect: CssRect, inset = 3, spacing = 64, maxPerAxis = 10): { x: number; y: number }[] {
+  const xs = axisPoints(rect.left, rect.width, inset, spacing, maxPerAxis);
+  const ys = axisPoints(rect.top, rect.height, inset, spacing, maxPerAxis);
   return xs.flatMap((x) => ys.map((y) => ({ x, y })));
+}
+
+/**
+ * Whether `other` overlaps `rect` by any area. A box under `minSide` on
+ * either side (a screen-reader live region, an empty wrapper) does not count.
+ */
+export function overlapsRect(rect: CssRect, other: CssRect, minSide = 4): boolean {
+  if (other.width < minSide || other.height < minSide) return false;
+  return (
+    rect.left < other.left + other.width &&
+    other.left < rect.left + rect.width &&
+    rect.top < other.top + other.height &&
+    other.top < rect.top + rect.height
+  );
 }
 
 /**
@@ -175,8 +200,8 @@ export function samplePoints(rect: CssRect, inset = 3): { x: number; y: number }
  * sits above every element of this page, so a menu, dialog or toast that
  * opens over the session would otherwise be hidden behind it.
  *
- * Hit-testing skips elements with `pointer-events: none`, so a purely
- * decorative overlay (a tooltip) is not seen; see `BrowserSession.svelte`.
+ * Hit-testing skips elements with `pointer-events: none`; portaled ones are
+ * caught by their box instead (`overlapsRect`, `BrowserSession.svelte`).
  */
 export function isOccluded(
   host: Element,

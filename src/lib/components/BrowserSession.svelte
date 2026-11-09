@@ -11,9 +11,12 @@
    * - hidden whenever the tab is off screen (another tab, Console mode, a
    *   hidden dock or repository) and whenever something of GitPulse's own is
    *   drawn over the area, because a native view sits above the whole page
-   *   and would cover a menu or dialog. Overlays are found by hit-testing the
-   *   area, so one marked `pointer-events: none` (a tooltip) is not seen, and
-   *   the view hides a frame or two after the overlay paints;
+   *   and would cover a menu or dialog. Anything portaled to the body (every
+   *   menu, dialog and toast) is found by its box, at any size; anything else
+   *   by hit-testing a grid at most 64px apart (a ninth of the area on a
+   *   larger one), so an unportaled overlay smaller than that, or one that
+   *   ignores the pointer, can be missed. The view hides a frame or two after
+   *   the overlay paints;
    * - closed when the tab closes; a main-page reload closes it from the
    *   backend (`desktop::handle_page_load`), and sessions are not restored.
    *
@@ -33,6 +36,7 @@
     lastAddress,
     normalizeAddress,
     onPageEvents,
+    overlapsRect,
     paneShown,
     rememberAddress,
     sameBounds,
@@ -95,8 +99,24 @@
     const next = toWindowPoints(rect, get(pageZoom));
     if (!sameBounds(bounds, next)) bounds = next;
     occluded = onscreen && opened
-      ? isOccluded(host, samplePoints(rect), (x, y) => document.elementFromPoint(x, y))
+      ? coveredByPortal(host, rect) || isOccluded(host, samplePoints(rect), (x, y) => document.elementFromPoint(x, y))
       : false;
+  }
+
+  /**
+   * Menus, dialogs and toasts are portaled to the body (`dom/portal.ts`), so
+   * any visible body child that is not the app and overlaps the area covers
+   * it, however small — including one that ignores the pointer, which the
+   * hit-test cannot see.
+   */
+  function coveredByPortal(el: HTMLElement, rect: DOMRect): boolean {
+    for (const child of document.body.children) {
+      if (child.contains(el)) continue;
+      const style = getComputedStyle(child);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") continue;
+      if (overlapsRect(rect, child.getBoundingClientRect())) return true;
+    }
+    return false;
   }
 
   let frame = 0;

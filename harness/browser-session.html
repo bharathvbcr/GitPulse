@@ -1,6 +1,6 @@
 <!doctype html>
 <html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Browser session verification</title></head>
-<body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
+<body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;top:600px;left:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
 <script type="module">
   import { mockIPCWithEvents, adoptOutput } from "./tauriMocks";
   import "../src/app.css";
@@ -157,6 +157,28 @@
       check("An overlay over just a corner hides it too", () => lastVisible() === false);
       corner.remove();
       await wait(() => lastVisible() === true, "the page to come back after the corner");
+
+      // The real session-type menu, portaled to the body over the dock.
+      byLabel("New session type").click();
+      await wait(() => lastVisible() === false, "the page to hide under the session-type menu");
+      check("The session-type menu opened over the page hides it", () => lastVisible() === false);
+      document.querySelector("#terminal-launcher-menu input").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await wait(() => lastVisible() === true, "the page to return after the menu closes");
+
+      // Overlays the nine-point sampling used to miss.
+      const at = placeholder().getBoundingClientRect();
+      const probe = (css, parent = document.body) => { const el = document.createElement("div"); el.style.cssText = `position:fixed;z-index:50;${css}`; parent.append(el); return el; };
+      for (const [what, el] of [
+        ["a 200px menu 8px inside the top-right corner", () => probe(`left:${at.right - 208}px;top:${at.top + 8}px;width:200px;height:120px`)],
+        ["a 20px tooltip that ignores the pointer, between sample points", () => probe(`left:${at.left + at.width * 0.3}px;top:${at.top + at.height * 0.3}px;width:20px;height:20px;pointer-events:none`)],
+        ["a 70px overlay inside the app, not portaled", () => probe(`left:${at.left + at.width * 0.3}px;top:${at.top + at.height * 0.65}px;width:70px;height:70px`, document.getElementById("app"))],
+      ]) {
+        const node = el();
+        await wait(() => lastVisible() === false, `the page to hide under ${what}`);
+        check(`The page hides under ${what}`, () => lastVisible() === false);
+        node.remove();
+        await wait(() => lastVisible() === true, `the page to return after ${what}`);
+      }
 
       byText("button", "Console").click();
       await wait(() => lastVisible() === false, "the page to hide in Console");

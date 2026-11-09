@@ -18,6 +18,7 @@ const {
   lastAddress,
   normalizeAddress,
   onPageEvents,
+  overlapsRect,
   paneShown,
   parsePageEvent,
   rememberAddress,
@@ -168,13 +169,35 @@ describe("placement", () => {
     expect(sameBounds(a, null)).toBe(false);
   });
 
-  it("samples the middle, the corners and the edges, inset from the border", () => {
-    const points = samplePoints({ left: 0, top: 0, width: 100, height: 60 });
-    expect(points).toHaveLength(9);
-    expect(points).toContainEqual({ x: 50, y: 30 });
-    expect(points).toContainEqual({ x: 3, y: 3 });
-    expect(points).toContainEqual({ x: 97, y: 57 });
+  it("samples a grid at most 64px apart, inset from the border, at most 10 a side", () => {
+    const small = samplePoints({ left: 0, top: 0, width: 100, height: 60 });
+    expect(small).toContainEqual({ x: 3, y: 3 });
+    expect(small).toContainEqual({ x: 97, y: 57 });
+    expect(small).toContainEqual({ x: 50, y: 3 });
+    const page = { left: 10, top: 20, width: 600, height: 400 };
+    const grid = samplePoints(page);
+    const xs = [...new Set(grid.map((p) => p.x))].sort((a, b) => a - b);
+    const ys = [...new Set(grid.map((p) => p.y))].sort((a, b) => a - b);
+    // At most 64px apart, or a ninth of the sampled span on a larger page.
+    expect(xs.every((x, i) => i === 0 || x - xs[i - 1] <= Math.max(64, 594 / 9) + 1e-9)).toBe(true);
+    expect(ys.every((y, i) => i === 0 || y - ys[i - 1] <= 64)).toBe(true);
+    expect(xs[0]).toBe(13);
+    expect(xs.at(-1)).toBe(607);
+    // A 200px menu tucked 8px inside the top-right corner falls on the grid.
+    const menu = { left: 10 + 600 - 208, top: 20 + 8, width: 200, height: 220 };
+    expect(grid.some((p) => p.x >= menu.left && p.x <= menu.left + menu.width && p.y >= menu.top && p.y <= menu.top + menu.height)).toBe(true);
+    // A huge page is sampled more coarsely, never with more than 100 points.
+    expect(samplePoints({ left: 0, top: 0, width: 5000, height: 3000 })).toHaveLength(100);
     expect(samplePoints({ left: 0, top: 0, width: 4, height: 100 })).toEqual([]);
+  });
+
+  it("counts any overlap by a real box, and ignores a sliver", () => {
+    const pane = { left: 0, top: 0, width: 100, height: 100 };
+    expect(overlapsRect(pane, { left: 90, top: 90, width: 20, height: 20 })).toBe(true);
+    expect(overlapsRect(pane, { left: 100, top: 0, width: 20, height: 20 })).toBe(false);
+    expect(overlapsRect(pane, { left: -30, top: 10, width: 20, height: 20 })).toBe(false);
+    expect(overlapsRect(pane, { left: 50, top: 50, width: 1, height: 1 })).toBe(false);
+    expect(overlapsRect(pane, { left: 50, top: 50, width: 0, height: 40 })).toBe(false);
   });
 
   describe("occlusion", () => {

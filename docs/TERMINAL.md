@@ -239,9 +239,10 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
   dock moves or resizes and with the interface size, and it is hidden while the
   tab is not on screen (another tab, Console, a hidden dock or repository) and
   while a menu, dialog or toast of GitPulse's is drawn over it — a native view
-  would otherwise cover them. An overlay marked to ignore the pointer (a
-  tooltip) is not detected, and the page hides a frame or two after an overlay
-  appears.
+  would otherwise cover them. Overlays portaled to the page body (every menu,
+  dialog and toast) are detected at any size; any other overlay is found by
+  hit-testing a grid at most 64px apart (a ninth of the page on a larger
+  one), so one smaller than that can be missed. The page hides a frame or two after an overlay appears.
 - **Keys go to the page while it has focus,** so the dock's shortcuts work again
   once you click the address bar or the tab strip.
 - A browser tab runs no process: it does not count against the terminal session
