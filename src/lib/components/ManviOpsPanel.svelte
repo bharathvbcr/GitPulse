@@ -35,6 +35,7 @@
     formatReleaseDate,
     releaseTagSuggestion,
     summarizeCommitReview,
+    splitBranchCleanup,
     type BranchCleanupPlan,
     type CommitReviewReport,
     type TagCleanupPlan,
@@ -324,7 +325,9 @@
     // sidebar toast uses. The durable ledger before_ref survives toast death.
     const restoredTips: { name: string; tip: string }[] = [];
     try {
-      for (const candidate of selected) {
+      const { ancestry, byTree } = splitBranchCleanup(selected, selectedBranches);
+      let repositoryRefused = false;
+      for (const candidate of ancestry) {
         const tip = candidate.tip_commit_id;
         const outcome = await repoStore.deleteBranch(candidate.name, false, target);
         if (outcome.ok) {
@@ -334,7 +337,42 @@
           failures.push(`${candidate.name}: ${outcome.error ?? "failed"}`);
         }
         // The repository changed: every remaining branch would be refused too.
-        if (outcome.refused) break;
+        if (outcome.refused) {
+          repositoryRefused = true;
+          break;
+        }
+      }
+      // Squash- and rebase-merged branches: `git branch -d` refuses them, so
+      // the gated dead-branch clean deletes them. It re-scans, backs up, and
+      // forces only a branch it re-proves merged by tree.
+      if (byTree.length > 0 && !repositoryRefused) {
+        const outcome = await repoStore.deadbranchClean(
+          byTree.map((c) => c.name),
+          false,
+          true,
+          target,
+        );
+        if (outcome.ok && outcome.output) {
+          const gone = new Set(outcome.output.deleted);
+          for (const candidate of byTree) {
+            if (gone.has(candidate.name)) {
+              deleted += 1;
+              if (candidate.tip_commit_id) {
+                restoredTips.push({ name: candidate.name, tip: candidate.tip_commit_id });
+              }
+            }
+          }
+          for (const [name, reason] of outcome.output.failed) failures.push(`${name}: ${reason}`);
+          // A branch the clean neither deleted nor reported was not re-proven merged.
+          const failedNames = new Set(outcome.output.failed.map(([name]) => name));
+          for (const candidate of byTree) {
+            if (!gone.has(candidate.name) && !failedNames.has(candidate.name)) {
+              failures.push(`${candidate.name}: not deleted (no longer provably merged)`);
+            }
+          }
+        } else {
+          failures.push(`${byTree.map((c) => c.name).join(", ")}: ${outcome.error ?? "failed"}`);
+        }
       }
       // The Undo is bound to the repository the delete ran in, so it is offered
       // even when another tab is active now. The panel's own notice and rescan

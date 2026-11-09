@@ -8,6 +8,11 @@ export interface BranchCleanupCandidate {
   last_author: string;
   last_commit_timestamp: number;
   upstream_gone: boolean;
+  /**
+   * Merged only by tree comparison (a squash or rebase merge): `git branch -d`
+   * refuses it, so it is deleted through the gated dead-branch clean.
+   */
+  merged_by_tree: boolean;
 }
 
 export interface BranchCleanupPlan {
@@ -153,4 +158,22 @@ export function summarizeCommitReview(report: CommitReviewReport): string {
     return `Reviewed ${report.reviewed_commits} of ${report.total_commits} outgoing commits (capped).`;
   }
   return `Reviewed all ${report.reviewed_commits} outgoing commits.`;
+}
+
+/**
+ * Which delete a selection of cleanup candidates takes. An ancestry-merged
+ * branch is removed with the ordinary `git branch -d`. A branch merged only by
+ * tree comparison is refused by `-d`, so it goes through the gated dead-branch
+ * clean, which re-proves the merge before it forces anything.
+ */
+export function splitBranchCleanup(
+  candidates: BranchCleanupCandidate[],
+  selected: readonly string[],
+): { ancestry: BranchCleanupCandidate[]; byTree: BranchCleanupCandidate[] } {
+  const chosen = new Set(selected);
+  const picked = candidates.filter((candidate) => chosen.has(candidate.name));
+  return {
+    ancestry: picked.filter((candidate) => !candidate.merged_by_tree),
+    byTree: picked.filter((candidate) => candidate.merged_by_tree),
+  };
 }
