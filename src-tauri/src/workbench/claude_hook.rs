@@ -202,25 +202,41 @@ pub(crate) fn for_launch(provider: &str) -> HookInjection {
 }
 
 /// POSIX single-quoting, so a path with spaces or quotes stays one word of
-/// the shell command a hook runs as.
+/// the shell command a hook runs as. Windows hooks are never shell form (see
+/// [`settings_hooks_for`]), so this is the only quoting there is.
 fn shell_quote(path: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{path}\"")
-    } else {
-        format!("'{}'", path.replace('\'', r"'\''"))
-    }
+    format!("'{}'", path.replace('\'', r"'\''"))
 }
 
 /// The `hooks` value for a `--settings` object: the plugin manifest's
 /// injected events with the hook invoked by absolute path.
 pub(crate) fn settings_hooks(binary: &Path) -> Result<Value, String> {
+    settings_hooks_for(binary, cfg!(windows))
+}
+
+/// [`settings_hooks`] for the platform `windows` names, so a test on one
+/// platform can check the other's.
+///
+/// On Windows each handler is made by the same generator as the hooks.json the
+/// Settings page copies, [`crate::insights::windows_hook_handler`]: Claude
+/// Code's documented exec form (`command` is the absolute path, `args` the
+/// subcommand words, no shell), with `"onFailure": "block"` on the deciding
+/// hooks (`collision-guard`, `command-gate`) and none on the notify-only ones
+/// (`notify`, `deliver`), whose loss costs a report, never a verdict. A quoted
+/// path followed by bare words is not a command PowerShell can run, and a host
+/// without Git Bash runs shell-form hooks under PowerShell, which blocked every
+/// tool call. The Claude Code versions involved (`onFailure` needs 2.1.295, and
+/// what an older host does) are recorded on that function. Unix keeps the
+/// POSIX-quoted shell form.
+pub(crate) fn settings_hooks_for(binary: &Path, windows: bool) -> Result<Value, String> {
     let manifest: Value = serde_json::from_str(PLUGIN_HOOKS)
         .map_err(|e| format!("the plugin hook manifest is not JSON: {e}"))?;
     let events = manifest
         .get("hooks")
         .and_then(Value::as_object)
         .ok_or("the plugin hook manifest has no hooks object")?;
-    let quoted = shell_quote(&binary.to_string_lossy());
+    let binary = binary.to_string_lossy();
+    let quoted = shell_quote(&binary);
     let prefix = format!("{HOOK_NAME} ");
     let mut out = Map::new();
     for event in INJECTED_EVENTS {
@@ -236,9 +252,17 @@ pub(crate) fn settings_hooks(binary: &Path) -> Result<Value, String> {
                 .into_iter()
                 .flatten()
             {
-                let command = hook.get("command").and_then(Value::as_str).unwrap_or("");
+                let command = hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 if let Some(rest) = command.strip_prefix(&prefix) {
-                    hook["command"] = json!(format!("{quoted} {rest}"));
+                    if windows {
+                        crate::insights::windows_hook_handler(hook, &binary, rest)?;
+                    } else {
+                        hook["command"] = json!(format!("{quoted} {rest}"));
+                    }
                     if event == "SessionEnd" {
                         hook["timeout"] = json!(SESSION_END_TIMEOUT_SECS);
                     }
@@ -441,6 +465,60 @@ mod tests {
         assert_eq!(subcommands, ["collision-guard", "command-gate"]);
     }
 
+    /// The injected Windows hooks are the documented exec form: `command` the
+    /// bare executable path, `args` the words, no shell, nothing quoted. A
+    /// quoted path plus bare words is a PowerShell parse error, which blocked
+    /// every tool call on a host without Git Bash. The deciding hooks carry
+    /// `onFailure: block` (Claude Code >= 2.1.295; an older host ignores it and
+    /// lets a hook that cannot start through, the stated F2 policy, recorded on
+    /// `windows_hook_handler`); the notify-only ones carry none. Built by the
+    /// OS-parameterised function; not executed on Windows.
+    #[test]
+    fn the_injected_windows_hooks_are_exec_form_with_on_failure_on_the_deciding_ones() {
+        let binary = r"C:\Program Files\GitPulse\gitpulse-hook.exe";
+        let hooks = settings_hooks_for(Path::new(binary), true).unwrap();
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        for (group, sub) in pre.iter().zip(["collision-guard", "command-gate"]) {
+            assert_eq!(
+                group["hooks"][0],
+                json!({
+                    "type": "command",
+                    "command": binary,
+                    "args": [sub],
+                    "onFailure": "block",
+                    "timeout": group["hooks"][0]["timeout"],
+                }),
+                "{sub}"
+            );
+        }
+        for (event, groups) in hooks.as_object().unwrap() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let sub = handler["args"][0].as_str().unwrap();
+                    assert_eq!(handler["command"], binary, "{event}");
+                    assert!(handler.get("shell").is_none(), "{event}");
+                    assert_eq!(
+                        handler.get("onFailure").is_some(),
+                        matches!(sub, "collision-guard" | "command-gate"),
+                        "{event} {sub}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            hooks["SessionEnd"][0]["hooks"][0]["timeout"],
+            json!(SESSION_END_TIMEOUT_SECS)
+        );
+    }
+
+    /// A path PowerShell-or-not cannot be carried as one `command` string is
+    /// refused, not emitted: an injected hook is never half-formed.
+    #[test]
+    fn a_windows_path_with_a_control_character_is_refused() {
+        assert!(settings_hooks_for(Path::new("C:\\a\nb\\gitpulse-hook.exe"), true).is_err());
+    }
+
     #[test]
     fn a_quote_in_the_path_cannot_end_the_quoting() {
         let hooks = settings_hooks(Path::new("/tmp/it's/gitpulse-hook")).unwrap();
@@ -533,5 +611,116 @@ mod tests {
     #[test]
     fn other_providers_are_never_injected() {
         assert_eq!(for_launch("codex"), HookInjection::NotApplicable);
+    }
+
+    /// Adversary: base 0ea2cc37's Unix renderer, reproduced literally, equals
+    /// the new one for awkward paths.
+    #[test]
+    fn adv_unix_output_is_byte_identical_to_the_base_renderer() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        for binary in [
+            "/opt/gitpulse/gitpulse-hook",
+            "/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook",
+            "/tmp/it's/a\"b$c`d/gitpulse-hook",
+            "/tmp/\u{e9}\u{4e16}/gitpulse-hook",
+        ] {
+            let quoted = format!("'{}'", binary.replace('\'', r"'\''"));
+            let mut out = Map::new();
+            for event in INJECTED_EVENTS {
+                let mut groups = manifest["hooks"][event].clone();
+                for group in groups.as_array_mut().unwrap() {
+                    for hook in group["hooks"].as_array_mut().unwrap() {
+                        let command = hook["command"].as_str().unwrap().to_owned();
+                        if let Some(rest) = command.strip_prefix("gitpulse-hook ") {
+                            hook["command"] = json!(format!("{quoted} {rest}"));
+                            if event == "SessionEnd" {
+                                hook["timeout"] = json!(SESSION_END_TIMEOUT_SECS);
+                            }
+                        }
+                    }
+                }
+                out.insert(event.to_owned(), groups);
+            }
+            let expected = serde_json::to_string(&Value::Object(out)).unwrap();
+            let got = settings_hooks_for(Path::new(binary), false).unwrap();
+            assert_eq!(serde_json::to_string(&got).unwrap(), expected, "{binary}");
+            assert_eq!(
+                serde_json::to_string(&settings_hooks(Path::new(binary)).unwrap()).unwrap(),
+                if cfg!(windows) {
+                    serde_json::to_string(&settings_hooks_for(Path::new(binary), true).unwrap())
+                        .unwrap()
+                } else {
+                    expected
+                },
+            );
+        }
+    }
+
+    /// Adversary: awkward Windows paths ride in `command` verbatim, survive a
+    /// JSON round trip, and the deciding set / timeout / async fields match the
+    /// shipped hooks.json exactly.
+    #[test]
+    fn adv_windows_paths_are_verbatim_and_fields_survive() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        let long = format!(r"C:\{}\gitpulse-hook.exe", "d".repeat(4000));
+        for binary in [
+            r"C:\Program Files (x86)\Git Pulse & Co\100%\^caret\it's\gitpulse-hook.exe",
+            r"\\server\share\Git Pulse\gitpulse-hook.exe",
+            "C:\\caf\u{e9}\\\u{4e16}\u{754c}\\gitpulse-hook.exe",
+            r#"C:\a"b\gitpulse-hook.exe"#,
+            r"C:\trailing\",
+            long.as_str(),
+        ] {
+            let hooks = settings_hooks_for(Path::new(binary), true).unwrap();
+            let round: Value =
+                serde_json::from_str(&serde_json::to_string(&hooks).unwrap()).unwrap();
+            assert_eq!(round, hooks);
+            for event in INJECTED_EVENTS {
+                let src = manifest["hooks"][event].as_array().unwrap();
+                let got = hooks[event].as_array().unwrap();
+                assert_eq!(src.len(), got.len(), "{event}");
+                for (sg, gg) in src.iter().zip(got) {
+                    assert_eq!(sg["matcher"], gg["matcher"], "{event}");
+                    for (sh, gh) in sg["hooks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .zip(gg["hooks"].as_array().unwrap())
+                    {
+                        let cmd = sh["command"].as_str().unwrap();
+                        let rest = cmd.strip_prefix("gitpulse-hook ").unwrap();
+                        assert_eq!(gh["command"], binary);
+                        let words: Vec<&str> = rest.split_whitespace().collect();
+                        assert_eq!(gh["args"], json!(words));
+                        let deciding = matches!(words[0], "collision-guard" | "command-gate");
+                        assert_eq!(
+                            gh["onFailure"] == json!("block"),
+                            deciding,
+                            "{event} {rest}"
+                        );
+                        for key in ["async", "asyncRewake", "matcher", "statusMessage", "if"] {
+                            assert_eq!(sh.get(key), gh.get(key), "{event} {rest} {key}");
+                        }
+                        if event != "SessionEnd" {
+                            assert_eq!(sh["timeout"], gh["timeout"], "{event} {rest}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adversary: every control character refuses (no omitted hook), for every
+    /// event, and the refusal is an Err, not a smaller object.
+    #[test]
+    fn adv_windows_control_characters_refuse_the_whole_injection() {
+        for bad in ["\n", "\r", "\0", "\u{7f}", "\t", "\u{1b}", "\u{85}"] {
+            let path = format!("C:\\a{bad}b\\gitpulse-hook.exe");
+            assert!(
+                settings_hooks_for(Path::new(&path), true).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(settings_hooks_for(Path::new(""), true).is_err());
     }
 }
