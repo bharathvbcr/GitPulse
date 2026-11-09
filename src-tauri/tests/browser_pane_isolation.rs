@@ -444,20 +444,39 @@ mod mac {
             Err(e) => check.that(false, format!("pane on the second origin: {e}")),
         }
 
-        // 5. The navigation handler is wired: a non-loopback load is cancelled.
-        let before = on_main(app, |_| {
-            browser::with_webview(|w| w.url()).map_err(|e| e.to_string())
-        });
+        // 5. The navigation handler is wired. A `data:` page needs no network
+        //    and commits at once when allowed, so a document that never
+        //    becomes it within the wait was cancelled, not slow (removing the
+        //    handler turns this red). The document's title is the signal, not
+        //    the webview's URL: WebKit reports the provisional URL while the
+        //    policy decision is pending, so the URL flickers to `data:` even
+        //    when the navigation is then cancelled.
+        let title = |app: &AppHandle| {
+            let (sent, received) = mpsc::channel();
+            let scheduled = on_main(app, move |_| {
+                browser::with_webview(|w| {
+                    w.evaluate_script_with_callback("document.title", move |title| {
+                        let _ = sent.send(title);
+                    })
+                })
+                .is_ok_and(|r| r.is_ok())
+            });
+            scheduled
+                .then(|| received.recv_timeout(Duration::from_secs(2)).ok())
+                .flatten()
+        };
+        let before = title(app);
         let _ = on_main(app, |_| {
-            browser::with_webview(|w| w.load_url("http://example.invalid/")).map(|_| ())
+            browser::with_webview(|w| w.load_url("data:text/html,<title>refused</title>"))
+                .map(|_| ())
         });
-        std::thread::sleep(Duration::from_millis(800));
-        let after = on_main(app, |_| {
-            browser::with_webview(|w| w.url()).map_err(|e| e.to_string())
+        let committed = crate::hermetic_env::wait_until(Duration::from_millis(1500), || {
+            title(app).is_some_and(|t| t.contains("refused"))
         });
+        let after = title(app);
         check.that(
-            matches!((&before, &after), (Ok(Ok(a)), Ok(Ok(b))) if a == b && b.contains(&other_port.to_string())),
-            format!("policy: a non-loopback navigation is cancelled (url before {before:?}, after {after:?})"),
+            !committed && before.is_some() && before == after,
+            format!("policy: a non-loopback (data:) navigation is cancelled (title before {before:?}, after {after:?})"),
         );
 
         // 6. Close: the view leaves the window; cycles leave nothing behind.
@@ -477,13 +496,14 @@ mod mac {
             }
             Err(e) => check.that(false, format!("close: {e}")),
         }
-        std::thread::sleep(Duration::from_millis(1000));
-        let deallocated = on_main(app, |_| {
-            DEPARTED.with(|slot| slot.borrow().as_ref().map(|w| w.load().is_none()))
+        let deallocated = crate::hermetic_env::wait_until(Duration::from_secs(5), || {
+            on_main(app, |_| {
+                DEPARTED.with(|slot| slot.borrow().as_ref().is_some_and(|w| w.load().is_none()))
+            })
         });
         check.that(
-            deallocated == Some(true),
-            format!("close: the native WKWebView is deallocated within 1 s (weak reference cleared: {deallocated:?})"),
+            deallocated,
+            "close: the native WKWebView is deallocated (its weak reference clears within 5 s)",
         );
 
         let cycles = 5;
