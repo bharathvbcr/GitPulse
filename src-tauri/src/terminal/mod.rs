@@ -3509,11 +3509,18 @@ fn run_terminal_inner(
     // Force pushes and other policy-violating git mutations are blocked.
     // Non-git commands bypass the harness gate (which only judges git commands)
     // and follow the deps/CI execution precedent.
-    let is_git = program == "git"
-        || program.ends_with("/git")
-        || program.ends_with("\\git")
-        || program.ends_with("\\git.exe")
-        || program.ends_with("/git.exe");
+    //
+    // That includes wrapper programs: `sh -c 'git push --force'`, `env git ...`,
+    // `xargs git ...` and the like are NOT gated, because only argv[0] is
+    // classified and the inner command of a wrapper is deliberately not parsed.
+    // The console is ungated for everything but git (and the Manvi actions,
+    // which are allowlist-authoritative).
+    //
+    // argv[0] is classified case-insensitively (see `is_git_program`), so a
+    // spelling like `GIT.EXE` is gated on a case-insensitive filesystem. On a
+    // case-sensitive one `GIT` names no git, and gating it anyway is accepted
+    // over-gating: this fails closed.
+    let is_git = is_git_program(program);
     let should_gate = is_git || manvi_action.is_some();
     let (policy_verdict, gated) = if should_gate {
         match guard_command(repo_path, &arg_refs) {
@@ -3607,6 +3614,18 @@ pub(crate) fn normalized_program(program: &str) -> String {
         .or_else(|| lower.strip_suffix(".bat"))
         .unwrap_or(&lower)
         .to_string()
+}
+
+/// Whether argv[0] names git: the program's file name, either path separator
+/// accepted, folded by [`normalized_program`] (lower-case, `.exe`/`.cmd`/`.bat`
+/// stripped), so `git`, `/usr/bin/GIT`, `C:\Git\bin\git.exe` and `git.cmd` all
+/// are.
+fn is_git_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    // Windows resolves `git.` and `git ` to `git.exe`, so trailing dots and
+    // spaces are not part of the name. Unix has no such rule; gating there is
+    // over-gating, which fails closed.
+    normalized_program(name.trim_end_matches(['.', ' '])) == "git"
 }
 
 fn has_parent_or_absolute_path(value: &str) -> bool {
@@ -7622,6 +7641,87 @@ mod tests {
                     run.policy.is_some(),
                     "a gated command must carry the verdict it was judged by"
                 );
+            }
+        }
+    }
+
+    /// Every spelling of git the console is asked to run is routed to the gate:
+    /// the classifier `run_terminal_inner` decides `should_gate` with. Bare
+    /// `git.exe`/`git.cmd`/`git.bat` and upper-case variants used to skip it.
+    #[test]
+    fn every_spelling_of_git_is_classified_as_git() {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            "C:\\Git\\bin\\git.exe",
+            "Git.exe",
+            "GIT.EXE",
+            "/usr/bin/GIT",
+            "git.exe",
+            "git.cmd",
+            "git.bat",
+            "C:\\Git\\cmd\\GIT.CMD",
+            "git.",
+            "git ",
+            "git.exe.",
+            "/usr/bin/git. ",
+            "GIT...",
+        ] {
+            assert!(is_git_program(program), "{program} must be gated as git");
+        }
+        for program in [
+            "gitk",
+            "digit",
+            "/usr/bin/legit",
+            "git-lfs",
+            "sh",
+            "env",
+            "xargs",
+            "/usr/bin/git/",
+            "git.exe.bak",
+        ] {
+            assert!(!is_git_program(program), "{program} is not git");
+        }
+    }
+
+    /// The console runs the argv a caller hands it, so the routing is checked
+    /// through the real entry. Each spelling names a real executable (a stub
+    /// that exits 0), so the spawn succeeds and the only open question is the
+    /// routing: the outcome must be a gated run carrying its verdict, or a
+    /// refusal naming why. Any other error, or an ungated run, fails the test.
+    #[cfg(unix)]
+    #[test]
+    fn a_case_variant_of_git_is_never_spawned_ungated() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TempDir::new().unwrap();
+        init_test_repo(repo.path());
+        let bin = TempDir::new().unwrap();
+        for name in [
+            "GIT", "Git", "GIT.EXE", "git.cmd", "git.bat", "git.", "Git.Exe",
+        ] {
+            let stub = bin.path().join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let program = stub.to_str().unwrap().to_string();
+            match run_terminal(
+                repo.path().to_str().unwrap(),
+                &[program, "status".into()],
+                Some(5),
+            ) {
+                Ok(run) => {
+                    assert!(run.gated, "{name} ran ungated");
+                    assert!(run.policy.is_some(), "{name} carries no verdict");
+                }
+                Err(err) => {
+                    let message = err.message();
+                    assert!(
+                        message.contains("policy")
+                            || message.contains("blocked")
+                            || message.contains("refused")
+                            || message.contains("MANVI"),
+                        "{name}: an unexpected error, not a gate refusal: {message}"
+                    );
+                }
             }
         }
     }
