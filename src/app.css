@@ -263,19 +263,15 @@
 }
 
 @utility gp-section-edge {
-  /* Panel header and footer edges. `border-t` / `border-b` still draw the
-     1px geometry; `border-image` fades the colour at the sides so the edge
-     does not read as a hard box. Pair this class with those utilities — it
-     is not a substitute for them. `border-image` ignores `border-radius`;
-     call sites inside overflow-clipped cards are rectangular already. */
-  border-image: linear-gradient(
-      to right,
-      transparent,
-      rgb(var(--c-border) / 0.5) 20%,
-      rgb(var(--c-border) / 0.5) 80%,
-      transparent
-    )
-    1;
+  /* Panel header, toolbar and footer edges. The app draws no rule between a
+     toolbar and the content under it: rows are told apart by their own
+     controls and tint, and a line under every row read as a page of boxes.
+     `border-t` / `border-b` at the call sites still reserve the 1px, so
+     nothing shifts; this makes that pixel transparent. `border-image` wins
+     over the call sites' border colour whatever order the utilities land in.
+     Forced-colors mode (below) puts a solid edge back, because there the
+     tints that separate rows are gone. */
+  border-image: linear-gradient(transparent, transparent) 1;
 }
 
 @utility gp-segmented {
@@ -285,9 +281,9 @@
 
 @utility gp-surface-header {
   /* The top bar of a full-pane surface (Tasks, Agents): title on the left,
-     the surface's switches and actions on the right, one height and edge for
+     the surface's switches and actions on the right, one height and no rule for
      every surface so moving between them does not shift the chrome. */
-  @apply flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border/65 px-3.5 py-2.5;
+  @apply flex shrink-0 flex-wrap items-center justify-between gap-3 px-3.5 py-2.5;
 }
 
 @utility gp-surface-title {

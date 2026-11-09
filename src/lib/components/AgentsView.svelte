@@ -389,7 +389,7 @@
        Inbox has neither, and showing them there offered controls that did
        nothing. Each group is labelled rather than told apart by a divider. -->
   {#if activeView === "plane"}
-    <div class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border/65 px-3.5 py-2" data-testid="agents-toolbar">
+    <div class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2" data-testid="agents-toolbar">
       {#if scopeLabel}
         <span
           class="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 pl-2 pr-0.5 py-0.5 text-[11px] text-textPrimary"

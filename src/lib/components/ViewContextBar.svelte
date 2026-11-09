@@ -22,10 +22,13 @@
   } = $props();
 </script>
 
+<!-- No rule and no band of its own: its controls (a pill search, a chip)
+     float on the pane, so the row reads as part of the view below it rather
+     than a second strip under the header. -->
 <div
   role="group"
   aria-label={label}
-  class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 gp-section-edge bg-surface/40 select-none min-w-0"
+  class="h-10 shrink-0 px-3 pt-1 flex items-center gap-3 select-none min-w-0"
 >
   {@render children()}
 </div>

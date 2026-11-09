@@ -1611,7 +1611,7 @@
 
   .agent-inbox.embedded .inbox-toolbar {
     background: transparent;
-    border-bottom-color: rgb(var(--c-border) / 0.65);
+    border-bottom-color: transparent;
     padding: 8px 14px;
   }
 
