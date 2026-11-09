@@ -579,6 +579,41 @@ to prevent exponential event duplication attacks from malformed wikilinks (`[[a|
 under `ENABLE_WIKILINKS`. Pictures beside a note are read only from inside its
 repository, through the same containment check as `cmd_get_file_blob`.
 
+### Browser Sessions: Pages With No Route to GitPulse
+
+A Browser session in the terminal dock (macOS) shows a local dev server's page
+in a native webview laid over the tab (`src-tauri/src/browser`). That brings
+web content into the process that holds git and the terminals, so the webview
+is built to have no way back in:
+
+- **No IPC bridge.** It is built with wry directly, not as a Tauri webview.
+  Tauri gives every webview it manages the invoke script, the `ipc` message
+  handler and the `ipc://` scheme, and its capability check matches the
+  *window* as well as the webview, so a Tauri child of the main window would
+  inherit every command grant; in a dev build `devUrl` (`localhost:5173`) is
+  also treated as the app's own origin. The browser webview gets no IPC
+  handler, no custom scheme and no injected script.
+  `src-tauri/tests/browser_pane_isolation.rs` checks, against Tauri's own
+  webview in the same window as a control, that a page on the `devUrl` origin
+  and on another origin finds no `__TAURI_INTERNALS__`, no `window.ipc`, no
+  `ipc` handler, and cannot `fetch("ipc://…")`; giving the pane an IPC handler
+  turns it red.
+- **Loopback only.** Only `http`/`https` to `localhost`, `127.0.0.0/8` or `::1`
+  (and `about:blank`) load. The rule is applied to every frame's navigations,
+  so a remote iframe is refused too, and a refusal is shown in the session.
+  Subresource requests (`fetch`, images) are not navigations and are not
+  filtered.
+- **Its own storage.** Each session uses a non-persistent data store, so a page
+  on the app's own dev origin cannot read GitPulse's localStorage or cookies,
+  and nothing is written to disk.
+- **No popups, no downloads, at most 8 sessions**, and every session is closed
+  when the main page reloads.
+- **Page text is data.** The URL and title a page reports are capped in the
+  backend, and the title goes through the tab-title sanitizer.
+
+Once the page has keyboard focus it receives keystrokes, as any browser does;
+nothing typed there reaches GitPulse.
+
 ---
 
 ## 2. Reporting a Vulnerability

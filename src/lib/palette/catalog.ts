@@ -90,7 +90,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       category: "Workspace",
       icon: Terminal,
       disabledReason: launcher.kind === "browser" && !get(hostPlatform).browser_sessions
-        ? "Browser sessions are available on macOS only for now."
+        ? "Browser sessions are not available on this computer yet."
         : unavailable,
       action: async () => {
         // The palette captured `state` when it was built; refuse rather than

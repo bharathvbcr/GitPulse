@@ -248,7 +248,7 @@
   }
   function capacityTitleFor(kind: SessionKind): string {
     if (kind !== "browser") return capacityTitle;
-    if (!$hostPlatform.browser_sessions) return "Browser sessions are available on macOS only for now";
+    if (!$hostPlatform.browser_sessions) return "Browser sessions are not available on this computer yet";
     return stripFull
       ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
       : "New browser session — a local dev server's page";

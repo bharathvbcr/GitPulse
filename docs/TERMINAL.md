@@ -219,6 +219,37 @@ prompt.
 Holding the new/close shortcut does not repeatedly create or terminate shells.
 IME composition and the shell's ordinary Ctrl+F binding are preserved.
 
+## Browser sessions
+
+On macOS, **Browser** is also a session type: a tab that shows a local dev
+server's page, for looking at the UI you (or an agent) are building next to its
+terminal. Choose it in **New session type** and press **+**, use **New browser**
+in an empty dock, or run *New Browser Session* from the command palette. Type an
+address — `localhost:5173`, a bare port such as `3000`, or a full
+`http://127.0.0.1:8080/` URL — and press **Open**; **Back**, **Forward** and
+**Reload** sit beside it, and the page's title names the tab.
+
+- **Local addresses only.** Anything that is not `localhost`, `127.0.0.0/8` or
+  `::1` is refused, including a remote frame inside a local page, and the
+  session says which address it blocked.
+- **No access to GitPulse.** The page runs in its own webview with no route to
+  GitPulse's commands and its own non-persistent storage
+  ([Security](SECURITY.md#browser-sessions-pages-with-no-route-to-gitpulse)).
+- **The page is a native view over the tab.** It follows the tab's area as the
+  dock moves or resizes and with the interface size, and it is hidden while the
+  tab is not on screen (another tab, Console, a hidden dock or repository) and
+  while a menu, dialog or toast of GitPulse's is drawn over it — a native view
+  would otherwise cover them. An overlay marked to ignore the pointer (a
+  tooltip) is not detected, and the page hides a frame or two after an overlay
+  appears.
+- **Keys go to the page while it has focus,** so the dock's shortcuts work again
+  once you click the address bar or the tab strip.
+- A browser tab runs no process: it does not count against the terminal session
+  limit (at most 8 browser sessions are open at once), closing it asks nothing,
+  and Find, Clear scrollback and the output actions do not apply. Browser
+  sessions are not restored after a restart or a window reload; the reload
+  closes them.
+
 ## Input, output, and recovery
 
 Typing and paste are delivered in order in chunks of at most 16 KiB. The pending

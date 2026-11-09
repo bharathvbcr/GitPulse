@@ -30,6 +30,8 @@
 //! 8. **Coordinates.** One CSS pixel of the main page times its zoom is one
 //!    point of the content area the panes are placed in, at zoom 1 and 1.25,
 //!    which is what the frontend's placement assumes.
+//! 9. **Reload.** A main-page reload closes every pane, through GitPulse's own
+//!    `desktop::handle_page_load`.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
@@ -702,6 +704,24 @@ mod mac {
                 (_, Err(e)) => check.that(false, format!("zoom {zoom}: {e}")),
             }
         }
+
+        // 9. A main-page reload closes every pane, through GitPulse's own
+        //    page-load handler (installed on this app, as `lib.rs` does).
+        let reloaded = on_main(app, |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            browser::open(&main, "before-reload", "about:blank", SMALL, None)
+                .map_err(|e| e.to_string())?;
+            let open = browser::open_count();
+            main.eval("location.reload()").map_err(|e| e.to_string())?;
+            Ok::<_, String>(open)
+        });
+        let closed = crate::hermetic_env::wait_until(Duration::from_secs(10), || {
+            on_main(app, |_| browser::open_count()) == 0
+        });
+        check.that(
+            reloaded == Ok(1) && closed,
+            format!("reload: the pane open before a main-page reload is closed by it (open before: {reloaded:?}, all closed: {closed})"),
+        );
         check
     }
 
@@ -737,6 +757,10 @@ mod mac {
         context.config_mut().app.windows.clear();
 
         let app = tauri::Builder::default()
+            // What GitPulse's page-load handler reads (step 9).
+            .manage(gitpulse_lib::desktop::DesktopState::default())
+            .manage(gitpulse_lib::terminal::TerminalSessions::default())
+            .on_page_load(gitpulse_lib::desktop::handle_page_load)
             .setup(move |app| {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;
                 Ok(())

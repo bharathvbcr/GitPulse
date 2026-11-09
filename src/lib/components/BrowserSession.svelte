@@ -24,6 +24,7 @@
   import { get } from "svelte/store";
   import { AlertCircle, ArrowLeft, ArrowRight, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
   import { pageZoom } from "../ui/uiScale";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { formatError } from "../ui/formatError";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
   import {
@@ -140,10 +141,11 @@
       attributes: true,
       attributeFilter: ["class", "style", "open", "hidden", "aria-hidden"],
     });
-    const settle = setInterval(schedule, 500);
+    // Stops while the window is hidden, like every recurring UI timer.
+    const stopSettle = createAdaptiveTimer(schedule, 500);
     return () => {
       mutations.disconnect();
-      clearInterval(settle);
+      stopSettle();
     };
   });
 
