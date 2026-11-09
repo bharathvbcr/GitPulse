@@ -253,7 +253,9 @@
   }
 </script>
 
-<div class="p-3 border-t border-border/60 gp-section-edge bg-surface flex flex-col gap-2 shrink-0">
+<!-- A card inset in the sidebar, like the branch card at its top, rather
+     than a full-width band ruled off the list above. -->
+<div class="mx-2 mb-2 mt-1 rounded-xl border border-border/70 p-3 bg-surface flex flex-col gap-2 shrink-0">
   <div class="flex items-center justify-between">
     <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Commit</span>
     <button

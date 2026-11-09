@@ -643,14 +643,20 @@ describe("macOS material", () => {
     expect(tokens).not.toContain("gp-gpu");
   });
 
-  it("runs the workspace pane flush to the status bar", () => {
-    // An 8px bottom margin was a band of the shell's hue between every view
-    // and the status bar. The right-hand margin stays; the vertical moat does
-    // not, and neither does a block border that would redraw that edge.
-    const rule = css.match(/html\.macos \.gp-workspace \{([^}]+)\}/);
-    expect(rule?.[1]).toMatch(/margin:\s*0 8px 0 0;/);
-    expect(rule?.[1]).not.toMatch(/margin:\s*8px/);
-    expect(rule?.[1]).toMatch(/border-block-width:\s*0;/);
+  it("draws the sidebar and workspace as rounded cards on one shared gutter", () => {
+    // Both panes take their margin and radius from the same two tokens, so
+    // the gap between them matches the gap around them and the corners
+    // agree. The old 8px moat was wider than the gutter is now.
+    const tokens = css.match(/html\.macos \{\s*--gp-pane-gutter:\s*(\d+)px;\s*--gp-pane-radius:\s*(\d+)px;/);
+    expect(Number(tokens?.[1])).toBeLessThan(8);
+    expect(Number(tokens?.[2])).toBeGreaterThan(0);
+    const workspace = css.match(/html\.macos \.gp-workspace \{([^}]+)\}/)?.[1];
+    expect(workspace).toMatch(/margin:\s*var\(--gp-pane-gutter\);/);
+    expect(workspace).toMatch(/border-radius:\s*var\(--gp-pane-radius\);/);
+    const sidebar = css.match(/html\.macos \.gp-sidebar \{([^}]+)\}/)?.[1];
+    expect(sidebar).toMatch(/margin:\s*var\(--gp-pane-gutter\) 0 var\(--gp-pane-gutter\) var\(--gp-pane-gutter\);/);
+    expect(sidebar).toMatch(/border-radius:\s*var\(--gp-pane-radius\);/);
+    expect(sidebar).toMatch(/height:\s*auto;/);
   });
 
   it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
