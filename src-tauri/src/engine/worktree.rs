@@ -3106,11 +3106,220 @@ fn try_apfs_clone_regular_file(src: &Path, dst: &Path) -> bool {
     }
 }
 
+/// The attributes that decide whether checkout writes the blob's bytes.
+#[cfg(target_os = "macos")]
+const CONVERSION_ATTRS: [&str; 6] = [
+    "text",
+    "eol",
+    "crlf",
+    "filter",
+    "working-tree-encoding",
+    "ident",
+];
+
+/// One path's value for each of [`CONVERSION_ATTRS`], as `git check-attr`
+/// prints them: `set`, `unset`, `unspecified` or a string.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConversionAttrs {
+    text: String,
+    eol: String,
+    crlf: String,
+    filter: String,
+    encoding: String,
+    ident: String,
+}
+
+#[cfg(target_os = "macos")]
+impl ConversionAttrs {
+    /// Whether `git checkout` may write bytes other than the blob's for this
+    /// path (`git help attributes`: `text`/`eol` with `core.autocrlf` and
+    /// `core.eol`, `filter` smudge, `ident`, `working-tree-encoding`, and the
+    /// legacy `crlf`). Answers "yes" for any value it cannot place, so a new
+    /// attribute value costs a checkout and never a wrong clone.
+    ///
+    /// `default_crlf` is true when `core.autocrlf` or `core.eol` could make
+    /// the default line ending CRLF, or are set to something unrecognised.
+    /// Only macOS runs this, where the native line ending is LF; output that
+    /// is LF (or no conversion) writes the blob's bytes unchanged.
+    fn converted_on_checkout(&self, default_crlf: bool) -> bool {
+        let inert = |value: &str| matches!(value, "unspecified" | "unset");
+        if self.crlf != "unspecified"
+            || !inert(&self.filter)
+            || !inert(&self.encoding)
+            || !inert(&self.ident)
+        {
+            return true;
+        }
+        // `-text` turns every end-of-line conversion off, `eol` included.
+        if self.text == "unset" {
+            return false;
+        }
+        match self.eol.as_str() {
+            "lf" => false,
+            "unspecified" | "unset" => default_crlf,
+            _ => true,
+        }
+    }
+}
+
+/// `core.autocrlf` / `core.eol` that could make checkout write CRLF. Only an
+/// unset key, `false`/`input` and `lf`/`native` rule it out.
+#[cfg(target_os = "macos")]
+fn default_eol_may_be_crlf(repo: &Path) -> Result<bool, CommandError> {
+    let read = |key: &str| -> Result<Option<String>, CommandError> {
+        let out = crate::engine::git_cli::git_captured(repo, &["config", "--get", key])?;
+        match out.status_code {
+            0 => Ok(Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .to_ascii_lowercase(),
+            )),
+            1 => Ok(None),
+            code => Err(format!("git config --get {key} exited {code}").into()),
+        }
+    };
+    let autocrlf_crlf = read("core.autocrlf")?
+        .is_some_and(|v| !matches!(v.as_str(), "false" | "no" | "off" | "0" | "input"));
+    let eol_crlf = read("core.eol")?.is_some_and(|v| !matches!(v.as_str(), "lf" | "native"));
+    Ok(autocrlf_crlf || eol_crlf)
+}
+
+/// Parses `git check-attr -z` output (`path NUL attr NUL value NUL`, repeated)
+/// into one [`ConversionAttrs`] per path. A path that does not come back with
+/// every attribute is an error, never a path with nothing to convert.
+#[cfg(target_os = "macos")]
+fn parse_conversion_attrs(raw: &[u8]) -> Result<HashMap<String, ConversionAttrs>, CommandError> {
+    let mut fields = raw.split(|&b| b == 0).collect::<Vec<_>>();
+    if fields.last().is_some_and(|last| last.is_empty()) {
+        fields.pop();
+    }
+    if fields.len() % 3 != 0 {
+        return Err("git check-attr output is not path/attribute/value triples"
+            .to_string()
+            .into());
+    }
+    let mut seen: HashMap<String, [Option<String>; 6]> = HashMap::new();
+    for triple in fields.chunks_exact(3) {
+        let (Ok(path), Ok(attr), Ok(value)) = (
+            std::str::from_utf8(triple[0]),
+            std::str::from_utf8(triple[1]),
+            std::str::from_utf8(triple[2]),
+        ) else {
+            return Err("git check-attr output is not UTF-8".to_string().into());
+        };
+        let Some(index) = CONVERSION_ATTRS.iter().position(|name| *name == attr) else {
+            return Err(format!("git check-attr returned unrequested attribute '{attr}'").into());
+        };
+        seen.entry(path.to_string()).or_default()[index] = Some(value.to_string());
+    }
+    seen.into_iter()
+        .map(|(path, values)| {
+            let [text, eol, crlf, filter, encoding, ident] = values;
+            match (text, eol, crlf, filter, encoding, ident) {
+                (Some(text), Some(eol), Some(crlf), Some(filter), Some(encoding), Some(ident)) => {
+                    Ok((
+                        path,
+                        ConversionAttrs {
+                            text,
+                            eol,
+                            crlf,
+                            filter,
+                            encoding,
+                            ident,
+                        },
+                    ))
+                }
+                _ => Err(format!("git check-attr omitted an attribute for '{path}'").into()),
+            }
+        })
+        .collect()
+}
+
+/// The paths among `paths` that `git checkout` would not write as their blob's
+/// bytes, judged against the attributes of the new worktree's own index (what
+/// checkout reads) and the repository's end-of-line configuration. These are
+/// left to `git checkout-index`; everything else may be cloned.
+#[cfg(target_os = "macos")]
+fn paths_converted_on_checkout(
+    target: &Path,
+    paths: &[&str],
+) -> Result<std::collections::HashSet<String>, CommandError> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let default_crlf = default_eol_may_be_crlf(target)?;
+    let mut args: Vec<&str> = vec!["check-attr", "--cached", "-z", "--stdin"];
+    args.extend(CONVERSION_ATTRS);
+    let mut stdin = Vec::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
+    for path in paths {
+        stdin.extend_from_slice(path.as_bytes());
+        stdin.push(0);
+    }
+    let attrs = parse_conversion_attrs(&crate::engine::git_cli::git_with_stdin(
+        target, &args, &stdin,
+    )?)?;
+    Ok(paths
+        .iter()
+        .filter(|path| {
+            attrs
+                .get(**path)
+                .is_none_or(|a| a.converted_on_checkout(default_crlf))
+        })
+        .map(|path| (*path).to_string())
+        .collect())
+}
+
+/// The clones whose bytes, hashed as stored with no filter, are not their
+/// index blob. `cloned` is `(path, blob oid)` pairs, paths free of newlines.
+#[cfg(target_os = "macos")]
+fn clones_that_are_not_their_blob(
+    target: &Path,
+    cloned: &[(String, String)],
+) -> Result<Vec<String>, CommandError> {
+    if cloned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stdin = Vec::new();
+    for (rel, _) in cloned {
+        stdin.extend_from_slice(rel.as_bytes());
+        stdin.push(b'\n');
+    }
+    let out = crate::engine::git_cli::git_with_stdin(
+        target,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        &stdin,
+    )?;
+    let hashed = String::from_utf8_lossy(&out);
+    let oids: Vec<&str> = hashed.lines().collect();
+    if oids.len() != cloned.len() {
+        return Err(format!(
+            "git hash-object returned {} oids for {} clones",
+            oids.len(),
+            cloned.len()
+        )
+        .into());
+    }
+    Ok(cloned
+        .iter()
+        .zip(oids)
+        .filter(|((_, expected), actual)| expected != actual)
+        .map(|((rel, _), _)| rel.clone())
+        .collect())
+}
+
 /// Zero-copy APFS tracked source materialization (`F15` / `P3.2`):
 /// creates the linked worktree with `--no-checkout`, `clonefile(2)`s clean tracked
 /// regular files whose `(mode, blob_oid)` matches `HEAD`, materializes only dirty,
 /// diverged, or symlink entries via `git checkout-index`, refreshes the index stat
 /// cache, and verifies zero working-tree drift via `git diff-files`.
+///
+/// A clone must be the bytes `git checkout` would write here, which is not what
+/// `git status` calling the donor clean proves. So a path is cloned only when
+/// `git check-attr --cached` and the end-of-line config say checkout writes its
+/// blob unchanged ([`ConversionAttrs::converted_on_checkout`]), and every clone
+/// is then hashed against its blob ([`clones_that_are_not_their_blob`]). The
+/// rest, and any clone that fails the hash, go through `git checkout-index`.
 #[cfg(target_os = "macos")]
 fn try_add_worktree_cow_macos(
     repo: &Path,
@@ -3159,17 +3368,6 @@ fn try_add_worktree_cow_macos(
     for (_, _, rel) in &donor_entries {
         if rel == ".gitmodules" || rel.ends_with("/.gitmodules") {
             return Ok(None);
-        }
-        if rel == ".gitattributes" || rel.ends_with("/.gitattributes") {
-            if let Ok(attr_text) = std::fs::read_to_string(repo.join(rel)) {
-                if attr_text.contains("filter=")
-                    || attr_text.contains("working-tree-encoding")
-                    || attr_text.contains("eol=")
-                    || attr_text.contains("ident")
-                {
-                    return Ok(None);
-                }
-            }
         }
     }
 
@@ -3239,8 +3437,26 @@ fn try_add_worktree_cow_macos(
         created_dirs.insert(target.to_path_buf());
         let mut need_checkout: Vec<String> = Vec::new();
 
+        // Paths whose donor copy is clean and matches HEAD, minus the ones git
+        // must write because checkout would not write the blob's bytes.
+        let candidates: Vec<&str> = target_entries
+            .iter()
+            .filter(|(mode, oid, rel)| {
+                matches!(mode.as_str(), "100644" | "100755")
+                    && !rel.contains('\n')
+                    && donor_clean
+                        .get(rel)
+                        .is_some_and(|(d_mode, d_oid)| d_mode == mode && d_oid == oid)
+            })
+            .map(|(_, _, rel)| rel.as_str())
+            .collect();
+        let converted = paths_converted_on_checkout(target, &candidates)?;
+        let mut cloned: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+
         for (mode, oid, rel) in target_entries {
             let can_clone = matches!(mode.as_str(), "100644" | "100755")
+                && !rel.contains('\n')
+                && !converted.contains(&rel)
                 && donor_clean
                     .get(&rel)
                     .is_some_and(|(d_mode, d_oid)| d_mode == &mode && d_oid == &oid);
@@ -3258,9 +3474,20 @@ fn try_add_worktree_cow_macos(
                 }
             }
             let src = repo.join(&rel);
-            if !try_apfs_clone_regular_file(&src, &dst) {
+            if try_apfs_clone_regular_file(&src, &dst) {
+                cloned.push((rel, oid));
+            } else {
                 need_checkout.push(rel);
             }
+        }
+
+        // `git status` calling the donor clean says its content converts back
+        // to the blob, not that it is the bytes checkout writes here (a stat
+        // cache can hide a copy written under older attributes). Hash each
+        // clone as stored; any that is not the blob goes to git.
+        for rel in clones_that_are_not_their_blob(target, &cloned)? {
+            let _ = std::fs::remove_file(target.join(&rel));
+            need_checkout.push(rel);
         }
 
         if need_checkout.len() > 512 {
@@ -3313,6 +3540,10 @@ fn try_add_worktree_cow_macos(
 
     Ok(Some(target_path.to_string()))
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "worktree_cow_tests.rs"]
+mod cow_attribute_tests;
 
 /// A worktree that exists, and what of its optional setup did not happen.
 ///
