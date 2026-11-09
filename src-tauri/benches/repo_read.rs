@@ -111,6 +111,68 @@ fn main() {
         })
         .collect();
 
+    // The numstat limit (F-3): at 50k tracked files `get_status` used to run
+    // `git diff --numstat -z` over every index entry to find churn for the few
+    // paths `status` had just named. The two arms are the shipped read and the
+    // whole-tree oracle on one repository, interleaved by `interleave`, so the
+    // pair shares the host load of the moment. `rows` and `churn` must agree
+    // between the arms or the row is not a comparison.
+    let wide_spec = Spec {
+        files: 50_000,
+        dirs: 500,
+        extra_commits: 1,
+        touch: 5,
+        linked_worktrees: 0,
+    };
+    for dirty in [1usize, 50] {
+        let repo = build_repo(&temp.path().join(format!("wide-{dirty}")), &wide_spec);
+        dirty_files(&repo, &wide_spec, dirty);
+        let (limited, whole) = (
+            GitReader::get_status(repo.path()).expect("limited status"),
+            GitReader::get_status_whole_tree_numstat(repo.path()).expect("whole-tree status"),
+        );
+        let churn = |rows: &[gitpulse_lib::engine::git_reader::FileStatus]| {
+            rows.iter()
+                .map(|row| (row.additions + row.deletions) as u64)
+                .sum::<u64>()
+        };
+        assert_eq!(
+            format!("{limited:?}"),
+            format!("{whole:?}"),
+            "the arms disagree on {dirty} dirty files"
+        );
+        let total = churn(&limited);
+        let repo = std::sync::Arc::new(repo);
+        let shipped = std::sync::Arc::clone(&repo);
+        cases.push(Case::new(
+            format!("get_status 50k files {dirty} dirty, numstat limited to changed paths"),
+            move || {
+                let rows = status(&shipped);
+                std::hint::black_box(&rows);
+                Sample::default()
+                    .counter("rows", rows.len() as u64)
+                    .counter("churn", total)
+            },
+        ));
+        cases.push(Case::new(
+            format!("get_status 50k files {dirty} dirty, numstat over the whole tree"),
+            move || {
+                let rows = GitReader::get_status_whole_tree_numstat(repo.path())
+                    .expect("whole-tree status");
+                std::hint::black_box(&rows);
+                Sample::default()
+                    .counter("rows", rows.len() as u64)
+                    .counter("churn", total)
+            },
+        ));
+    }
+    report.note(
+        "50k-file repository (500 dirs, 2 commits), 1 and 50 tracked files modified: the same \
+         get_status with the numstat limited to the reported paths against the whole-tree numstat \
+         it replaced; the pair is interleaved and asserted row-for-row equal before timing"
+            .to_string(),
+    );
+
     // Opening a file and saving it are the two reads of a file's bytes the
     // editor pays for, and both now also hash those bytes (the base token a
     // save is judged against). `get_file_blob` reads the working-tree file and
