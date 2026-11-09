@@ -1172,13 +1172,14 @@ html.macos .gp-welcome-card {
   border-radius: 28px;
 }
 
-/* The sidebar and the workspace are two rounded cards on the shell's hue
-   field, separated and edged by one shared gutter. The gutter is what lets a
-   corner read as a corner: rounded and flush against a straight bar leaves a
-   sliver instead. Keep it tight — a wide band of hue around the panes reads
-   as wasted space. */
+/* The sidebar and the workspace are two rounded cards that fill the space
+   between the tab strip and the status bar, with no gutter around or
+   between them; any band of the shell's hue there read as wasted space. The
+   gutter stays a token so both panes keep moving together. The rounded
+   corners leave a tiny wedge of shell hue where they meet the straight bars,
+   which is accepted. */
 html.macos {
-  --gp-pane-gutter: 6px;
+  --gp-pane-gutter: 0px;
   --gp-pane-radius: 14px;
 }
 
@@ -1197,8 +1198,8 @@ html.macos .gp-workspace {
 
 /* Its right-hand gutter is the workspace's left margin. `height: auto` lets
    the row's stretch fit it between the vertical gutters (`h-full` plus a
-   margin would overflow). `gp-pane`'s paint containment clips the children
-   to the rounded edge. */
+   non-zero margin would overflow). `gp-pane`'s paint containment clips the
+   children, the commit card's bottom included, to the rounded edge. */
 html.macos .gp-sidebar {
   margin: var(--gp-pane-gutter) 0 var(--gp-pane-gutter) var(--gp-pane-gutter);
   height: auto;
