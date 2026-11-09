@@ -376,8 +376,18 @@ never reaches the final assignment — that is how the StoragePanel defect
 presented).
 
 - `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `FleetView` |
-  `TerminalPanel` | `ManviOpsPanel` | `StatusBar` | `LoopCanary`
-- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs`
+  `TerminalPanel` | `ManviOpsPanel` | `StatusBar` | `LoopCanary` | `FileTreePanel` | `RepoTabBar`
+- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs` | `flushcost`
+- `flushcost` is the per-publish flush-cost probe: it times one `repoStore` publish
+  (a file click, `selectFilePath`) plus `flushSync()` with the pane mounted and again
+  with nothing mounted, interleaved per iteration, and records both under
+  `__gpResult.flushcost` (`producer`, `mounted`, and `consumerMedianMs` /
+  `consumerMinMs` = the difference). `paths=N` sets the repository file listing and
+  `dirty=N` the changed files; `tabs` may exceed the eight named repositories here
+  (generated `/r/gen-N`). Record before a change and after it:
+  `?c=FileTreePanel&scenario=flushcost&paths=100000&dirty=20&tabs=1&cycles=30` and
+  `?c=RepoTabBar&scenario=flushcost&tabs=500&cycles=30` (also `tabs=1000`).
+  A pane that rendered nothing sets `armed: false`.
 - `termtabs` drives the terminal strip through the real DOM (open / switch / close),
   because that state is internal to the component. Pair it with `TerminalPanel`:
   every open mounts an xterm into a visible box and hides the previous one, which
