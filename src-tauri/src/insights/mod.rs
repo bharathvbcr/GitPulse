@@ -1077,7 +1077,9 @@ fn snapshot_observed(
         Err(error) => live_sessions::unattributed(error.message()),
     };
 
-    let changes = match GitReader::get_status(repo_path) {
+    // The main checkout is read here, for the changes facet, and its row below
+    // takes this same read: a pass reads each worktree once.
+    let changes = match GitReader::get_status_since(repo_path, clock.started()) {
         // The facet carries counts, not rows, and the whole status is already
         // in memory: count every file. Counting only the first
         // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
