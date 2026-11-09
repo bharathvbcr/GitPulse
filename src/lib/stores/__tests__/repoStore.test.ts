@@ -3051,10 +3051,47 @@ describe("repoStore index and worktree mutations refresh the status facet only",
     const { store, graph } = makeStore(invoke);
     await store.openRepo("/r/status-only");
     const loadedBefore = graph.loaded.length;
+    const revisionBefore = get(store.contentRevisions)["/r/status-only"];
     recording = true;
     await mutate(store);
-    return { calls, graphLoads: graph.loaded.length - loadedBefore };
+    return {
+      calls,
+      graphLoads: graph.loaded.length - loadedBefore,
+      revisionMoved: get(store.contentRevisions)["/r/status-only"] !== revisionBefore,
+    };
   }
+
+  const merge = {
+    kind: "Merge", current_step: null, total_steps: null, head_ref: "main", incoming_ref: "feature",
+    conflicted_paths: ["a.ts"], conflicted_total: 1, available: ["abort"],
+  };
+
+  it("with no operation in progress, staging re-reads neither the operation, the branches nor the revision", async () => {
+    const { calls, revisionMoved } = await afterMutation((s) => s.stageFile("a.ts"));
+    expect(calls).not.toContain("cmd_repo_operation");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(revisionMoved).toBe(false);
+  });
+
+  it.each([
+    ["stageFile", (s: Store) => s.stageFile("a.ts")],
+    ["unstageFile", (s: Store) => s.unstageFile("b.ts")],
+    ["stage patch", (s: Store) => s.stageSelectivePatch(patch, true)],
+    ["stageAll", (s: Store) => s.stageAll()],
+    ["discard", (s: Store) => s.discardChanges("a.ts")],
+  ])("mid-merge, %s re-reads the operation and moves the review revision", async (_name, mutate) => {
+    const { calls, revisionMoved } = await afterMutation(mutate, { cmd_repo_operation: async () => merge as never });
+    expect(calls).toContain("cmd_repo_operation");
+    expect(revisionMoved).toBe(true);
+  });
+
+  it("an operation probe that failed is not taken for an idle repository", async () => {
+    const { calls } = await afterMutation((s) => s.stageFile("a.ts"), {
+      cmd_repo_operation: async () => { throw new Error("probe failed"); },
+    });
+    // The failed probe at open leaves `probeFailed`; the mutation re-asks.
+    expect(calls).toContain("cmd_repo_operation");
+  });
 
   it.each([
     ["stageFile", (s: Store) => s.stageFile("a.ts")],

@@ -269,7 +269,8 @@ const REPOSITORY_CHANGED = "The repository changed while this was waiting; nothi
  * refresh is the status facet, the same one the watcher schedules for a
  * `worktree` or `index` change, so branches and the graph window are not
  * reloaded. A mutation that can move a ref (commit, checkout, merge, reset,
- * stash, ...) must not use this.
+ * stash, ...) must not use this. `runMutating` widens it back to `all` while an
+ * operation is parked or its probe failed.
  */
 const WORKTREE_ONLY = { facet: "status" } as const satisfies { facet: HydrationFacet };
 
@@ -4025,8 +4026,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       });
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
+        // The narrow facet reads statuses only. The operation banner, its
+        // conflicted count and Continue, and the review-diff revision come from
+        // the full hydrate, so while a merge or rebase is parked (or the probe
+        // for one could not run) staging the last conflicted file must run it.
+        const operationLive = still.operation.operation !== null || still.operation.probeFailed;
         const refreshFacet: HydrationFacet =
-          opts.facet && still.hasHydrated ? opts.facet : "all";
+          opts.facet && still.hasHydrated && !operationLive ? opts.facet : "all";
         await store.refresh(path, refreshFacet);
         refreshed = true;
         // The refresh updates statuses/branches but nothing refetches the
