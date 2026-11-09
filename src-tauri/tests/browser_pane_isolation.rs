@@ -523,16 +523,20 @@ mod mac {
 
         // 7. The startup flag: a remote URL opens nothing; a loopback one
         //    opens the pane over the right 40% of the main window.
-        std::env::set_var("GITPULSE_BROWSER_PANE_URL", "https://example.com/");
+        // Through the env owner, so the change is serialized and restored.
+        let serial = crate::hermetic_env::env_serial();
+        let remote_flag = crate::hermetic_env::bind_env(&serial)
+            .set("GITPULSE_BROWSER_PANE_URL", "https://example.com/");
         let remote = on_main(app, |app| {
             browser::open_from_env(app);
             browser::is_open()
         });
+        drop(remote_flag);
         check.that(
             !remote,
             "flag: a non-loopback GITPULSE_BROWSER_PANE_URL opens no pane",
         );
-        std::env::set_var(
+        let loopback_flag = crate::hermetic_env::bind_env(&serial).set(
             "GITPULSE_BROWSER_PANE_URL",
             format!("http://127.0.0.1:{other_port}/child"),
         );
@@ -554,7 +558,8 @@ mod mac {
                 (size.width, size.height),
             ))
         });
-        std::env::remove_var("GITPULSE_BROWSER_PANE_URL");
+        drop(loopback_flag);
+        drop(serial);
         match flagged {
             Ok(((x, y, w, h), (width, height))) => check.that(
                 (x - width * 0.6).abs() < 1.0 && y == 0.0 && (w - width * 0.4).abs() < 1.0 && (h - height).abs() < 1.0,
