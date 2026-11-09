@@ -612,4 +612,115 @@ mod tests {
     fn other_providers_are_never_injected() {
         assert_eq!(for_launch("codex"), HookInjection::NotApplicable);
     }
+
+    /// Adversary: base 0ea2cc37's Unix renderer, reproduced literally, equals
+    /// the new one for awkward paths.
+    #[test]
+    fn adv_unix_output_is_byte_identical_to_the_base_renderer() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        for binary in [
+            "/opt/gitpulse/gitpulse-hook",
+            "/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook",
+            "/tmp/it's/a\"b$c`d/gitpulse-hook",
+            "/tmp/\u{e9}\u{4e16}/gitpulse-hook",
+        ] {
+            let quoted = format!("'{}'", binary.replace('\'', r"'\''"));
+            let mut out = Map::new();
+            for event in INJECTED_EVENTS {
+                let mut groups = manifest["hooks"][event].clone();
+                for group in groups.as_array_mut().unwrap() {
+                    for hook in group["hooks"].as_array_mut().unwrap() {
+                        let command = hook["command"].as_str().unwrap().to_owned();
+                        if let Some(rest) = command.strip_prefix("gitpulse-hook ") {
+                            hook["command"] = json!(format!("{quoted} {rest}"));
+                            if event == "SessionEnd" {
+                                hook["timeout"] = json!(SESSION_END_TIMEOUT_SECS);
+                            }
+                        }
+                    }
+                }
+                out.insert(event.to_owned(), groups);
+            }
+            let expected = serde_json::to_string(&Value::Object(out)).unwrap();
+            let got = settings_hooks_for(Path::new(binary), false).unwrap();
+            assert_eq!(serde_json::to_string(&got).unwrap(), expected, "{binary}");
+            assert_eq!(
+                serde_json::to_string(&settings_hooks(Path::new(binary)).unwrap()).unwrap(),
+                if cfg!(windows) {
+                    serde_json::to_string(&settings_hooks_for(Path::new(binary), true).unwrap())
+                        .unwrap()
+                } else {
+                    expected
+                },
+            );
+        }
+    }
+
+    /// Adversary: awkward Windows paths ride in `command` verbatim, survive a
+    /// JSON round trip, and the deciding set / timeout / async fields match the
+    /// shipped hooks.json exactly.
+    #[test]
+    fn adv_windows_paths_are_verbatim_and_fields_survive() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        let long = format!(r"C:\{}\gitpulse-hook.exe", "d".repeat(4000));
+        for binary in [
+            r"C:\Program Files (x86)\Git Pulse & Co\100%\^caret\it's\gitpulse-hook.exe",
+            r"\\server\share\Git Pulse\gitpulse-hook.exe",
+            "C:\\caf\u{e9}\\\u{4e16}\u{754c}\\gitpulse-hook.exe",
+            r#"C:\a"b\gitpulse-hook.exe"#,
+            r"C:\trailing\",
+            long.as_str(),
+        ] {
+            let hooks = settings_hooks_for(Path::new(binary), true).unwrap();
+            let round: Value =
+                serde_json::from_str(&serde_json::to_string(&hooks).unwrap()).unwrap();
+            assert_eq!(round, hooks);
+            for event in INJECTED_EVENTS {
+                let src = manifest["hooks"][event].as_array().unwrap();
+                let got = hooks[event].as_array().unwrap();
+                assert_eq!(src.len(), got.len(), "{event}");
+                for (sg, gg) in src.iter().zip(got) {
+                    assert_eq!(sg["matcher"], gg["matcher"], "{event}");
+                    for (sh, gh) in sg["hooks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .zip(gg["hooks"].as_array().unwrap())
+                    {
+                        let cmd = sh["command"].as_str().unwrap();
+                        let rest = cmd.strip_prefix("gitpulse-hook ").unwrap();
+                        assert_eq!(gh["command"], binary);
+                        let words: Vec<&str> = rest.split_whitespace().collect();
+                        assert_eq!(gh["args"], json!(words));
+                        let deciding = matches!(words[0], "collision-guard" | "command-gate");
+                        assert_eq!(
+                            gh["onFailure"] == json!("block"),
+                            deciding,
+                            "{event} {rest}"
+                        );
+                        for key in ["async", "asyncRewake", "matcher", "statusMessage", "if"] {
+                            assert_eq!(sh.get(key), gh.get(key), "{event} {rest} {key}");
+                        }
+                        if event != "SessionEnd" {
+                            assert_eq!(sh["timeout"], gh["timeout"], "{event} {rest}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adversary: every control character refuses (no omitted hook), for every
+    /// event, and the refusal is an Err, not a smaller object.
+    #[test]
+    fn adv_windows_control_characters_refuse_the_whole_injection() {
+        for bad in ["\n", "\r", "\0", "\u{7f}", "\t", "\u{1b}", "\u{85}"] {
+            let path = format!("C:\\a{bad}b\\gitpulse-hook.exe");
+            assert!(
+                settings_hooks_for(Path::new(&path), true).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(settings_hooks_for(Path::new(""), true).is_err());
+    }
 }
