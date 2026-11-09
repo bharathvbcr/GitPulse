@@ -903,7 +903,13 @@ fn spawn_porcelain(
     only: Option<OnlyPaths<'_>>,
 ) -> Result<String, CommandError> {
     #[cfg(test)]
-    status_probes::fire(dir);
+    {
+        status_probes::fire(dir);
+        // Stands in for a hung git ending at its own time limit.
+        if only.is_none() && status_probes::forced_timeout(dir) {
+            return Err("git status timed out after 0.3s".to_string().into());
+        }
+    }
     let magic = match only {
         Some(only) if only.ignore_case => ":(literal,icase)",
         _ => ":(literal)",
@@ -1008,6 +1014,10 @@ mod status_cell {
 
     struct Fill {
         started: Instant,
+        /// The leader ran under a caller's deadline, so a timeout it reports
+        /// is that caller's clock; without one it is git's own limit, which
+        /// every waiter would hit too.
+        deadline_bound: bool,
         result: OnceLock<Result<PorcelainRead, CommandError>>,
     }
 
@@ -1105,6 +1115,12 @@ mod status_cell {
         error.message() == DEADLINE_PASSED || is_timed_out(error.message())
     }
 
+    /// A read that ran out of git's own time limit, as opposed to a deadline
+    /// that was never given the chance to start it.
+    fn is_a_hang(error: &CommandError) -> bool {
+        error.message() != DEADLINE_PASSED && is_timed_out(error.message())
+    }
+
     pub(super) fn read(
         dir: &Path,
         deadline: Option<&ScanDeadline>,
@@ -1188,6 +1204,7 @@ mod status_cell {
             let Some(running) = state.filling.clone() else {
                 let fill = Arc::new(Fill {
                     started: Instant::now(),
+                    deadline_bound: deadline.is_some(),
                     result: OnceLock::new(),
                 });
                 state.filling = Some(Arc::clone(&fill));
@@ -1216,6 +1233,12 @@ mod status_cell {
                 match running.result.get() {
                     Some(Ok(read)) => return Ok(read.clone()),
                     Some(Err(error)) if !is_a_cut(error) => return Err(error.clone()),
+                    // A hung git ends every waiter at the same moment it ends
+                    // the leader, not one 90 s after another. Only a cut that
+                    // was a caller's deadline is retried.
+                    Some(Err(error)) if !running.deadline_bound && is_a_hang(error) => {
+                        return Err(error.clone());
+                    }
                     _ => {}
                 }
             }
@@ -1307,6 +1330,40 @@ pub(crate) mod status_probes {
     type Probe = Arc<dyn Fn(&Path) + Send + Sync>;
     static PROBES: Mutex<Vec<(u64, Vec<PathBuf>, Probe)>> = Mutex::new(Vec::new());
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    static FORCED_TIMEOUTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Whether the unfiltered status read of `dir` is to end as a git timeout.
+    pub(super) fn forced_timeout(dir: &Path) -> bool {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        FORCED_TIMEOUTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&canonical)
+    }
+
+    /// Runs `body` with every unfiltered status read of `dir` ending as a git
+    /// timeout (after any probe has run).
+    pub(crate) fn with_forced_timeout<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let mut forced = FORCED_TIMEOUTS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(at) = forced.iter().position(|dir| *dir == self.0) {
+                    forced.remove(at);
+                }
+            }
+        }
+        FORCED_TIMEOUTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(canonical.clone());
+        let _remove = Remove(canonical);
+        body()
+    }
 
     pub(super) fn fire(dir: &Path) {
         let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -2544,6 +2601,22 @@ mod diff_stamp {
                 common.join("info").join("attributes"),
             ];
             config_paths.extend(user_config_paths());
+            // Attributes files git reads for every diff besides the worktree's
+            // own: the user's, wherever `XDG_CONFIG_HOME` puts it (or its
+            // `~/.config` default), and the one `core.attributesFile` names.
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+                config_paths.push(PathBuf::from(xdg).join("git").join("attributes"));
+            }
+            if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+                config_paths.push(
+                    PathBuf::from(home)
+                        .join(".config")
+                        .join("git")
+                        .join("attributes"),
+                );
+            }
+            let named = named_attributes_files(&config_paths)?;
+            config_paths.extend(named);
             let config: Vec<(PathBuf, Option<ChangeStamp>)> = config_paths
                 .into_iter()
                 .map(|path| {
@@ -2573,6 +2646,47 @@ mod diff_stamp {
                 config,
             })
         }
+    }
+
+    /// The files `core.attributesFile` names in any of `configs`, to be stamped
+    /// beside them. `None` (unprovable) when a config sets the key in a form
+    /// read here with doubt: no `=`, a relative path, or a value carrying a
+    /// quote, escape or comment character. A config that cannot be read is
+    /// also unprovable; one that is absent has no key.
+    #[cfg(unix)]
+    fn named_attributes_files(configs: &[PathBuf]) -> Option<Vec<PathBuf>> {
+        let mut named = Vec::new();
+        for config in configs {
+            let text = match std::fs::read_to_string(config) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                let lower = line.to_ascii_lowercase();
+                let Some(rest) = lower.strip_prefix("attributesfile") else {
+                    continue;
+                };
+                if !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
+                    continue;
+                }
+                let value = line["attributesfile".len()..].trim_start();
+                let value = value.strip_prefix('=')?.trim();
+                if value.is_empty() || value.contains(['"', '\\', '#', ';']) {
+                    return None;
+                }
+                let path = match value.strip_prefix("~/") {
+                    Some(tail) => PathBuf::from(std::env::var_os("HOME")?).join(tail),
+                    None => PathBuf::from(value),
+                };
+                if !path.is_absolute() {
+                    return None;
+                }
+                named.push(path);
+            }
+        }
+        Some(named)
     }
 
     /// The paths a shortstat of HEAD depends on, from `status --porcelain -z`,
@@ -15152,10 +15266,10 @@ mod scan_once_tests {
         let started = Instant::now();
         while !gathering(&root) {
             assert!(
-                started.elapsed() < Duration::from_secs(10),
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                 "never gathered"
             );
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::yield_now();
         }
         let snapshot = crate::insights::snapshot(root.to_str().unwrap());
         let listed = listing.join().unwrap().expect("listing");
@@ -15176,6 +15290,9 @@ mod scan_once_tests {
     /// one `ref_cache` injects, so no test sleeps three seconds.
     #[test]
     fn an_unchanged_worktree_is_not_diffed_again_once_it_is_older_than_the_racy_window() {
+        // The stamp reads HOME and XDG_CONFIG_HOME: no test may rebind them
+        // under this one.
+        let _serial = crate::test_support::env::env_serial();
         let clock = ManualClock::install();
         let (main, _parent, linked) = repo_with_worktrees(3);
         let root = plain(main.path());
@@ -15200,6 +15317,7 @@ mod scan_once_tests {
     /// changed nothing.
     #[test]
     fn the_listing_always_agrees_with_a_fresh_measurement_across_every_kind_of_change() {
+        let _serial = crate::test_support::env::env_serial();
         let clock = ManualClock::install();
         let (main, _parent, linked) = repo_with_worktrees(1);
         let root = plain(main.path());
@@ -15287,6 +15405,7 @@ mod scan_once_tests {
     /// A stamp that cannot be proven never skips and is never kept.
     #[test]
     fn an_unprovable_stamp_measures_every_time() {
+        let _serial = crate::test_support::env::env_serial();
         let (main, _parent, linked) = repo_with_worktrees(1);
         let dir = linked[0].clone();
         std::fs::write(dir.join("seed.txt"), "seed\nchanged\n").unwrap();
@@ -15370,6 +15489,7 @@ mod scan_once_tests {
     /// changed file, have different stamps.
     #[test]
     fn a_stamp_sees_a_moved_head_and_an_edit_that_kept_size_and_mtime() {
+        let _serial = crate::test_support::env::env_serial();
         let _clock = ManualClock::install();
         let (_main, _parent, linked) = repo_with_worktrees(1);
         let dir = linked[0].clone();
@@ -15451,6 +15571,44 @@ mod scan_once_tests {
         assert!(
             read_status_since(&root, None, Instant::now()).is_ok(),
             "the cut left no failure behind"
+        );
+    }
+
+    /// A deadline-less read that ends at git's own time limit ends every caller
+    /// waiting on it, together: six waiters on a hung worktree used to retry one
+    /// after another and finish at six times the limit.
+    #[test]
+    fn callers_waiting_on_a_hung_read_fail_with_it_together() {
+        let (_main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        let early = Instant::now();
+        let started = Instant::now();
+        let hang = Duration::from_millis(300);
+        let results = status_probes::with_probe(
+            std::slice::from_ref(&dir),
+            move |_| std::thread::sleep(hang),
+            || {
+                status_probes::with_forced_timeout(&dir, || {
+                    std::thread::scope(|scope| {
+                        let waiters: Vec<_> = (0..6)
+                            .map(|_| scope.spawn(|| read_status_since(&dir, None, early)))
+                            .collect();
+                        waiters
+                            .into_iter()
+                            .map(|waiter| waiter.join().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+            },
+        );
+        let took = started.elapsed();
+        for result in &results {
+            let error = result.as_ref().expect_err("the read hung");
+            assert!(error.message().contains("timed out"), "{error:?}");
+        }
+        assert!(
+            took < crate::test_support::coverage_relaxed(hang * 3),
+            "six waiters took {took:?} for a {hang:?} hang: they retried one at a time"
         );
     }
 }

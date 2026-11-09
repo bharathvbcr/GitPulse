@@ -75,7 +75,7 @@
           "min_ns": 164950792,
           "counters": {
             "facets_ok": 7,
-            "git_processes": 26,
+            "git_processes": 21,
             "worktrees": 18
           }
         },
