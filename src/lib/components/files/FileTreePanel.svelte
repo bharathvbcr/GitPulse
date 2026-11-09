@@ -4,7 +4,7 @@
   import { rowHeight } from "../../ui/density";
   import { currentRepoPath, repoStore, type FileStatus } from "../../stores/repoStore";
   import { currentHeadTip } from "../../stores/headTip";
-  import { invoke } from "../../ipc/invoke";
+  import { listRepoFiles, peekRepoListing } from "../../files/repoListing";
   import {
     ChevronDown,
     ChevronRight,
@@ -102,7 +102,7 @@
 
   // Replaced wholesale by each listing, never edited in place — a deep proxy
   // over tens of thousands of paths would buy nothing.
-  let files = $state.raw<string[]>([]);
+  let files = $state.raw<readonly string[]>([]);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -187,10 +187,25 @@
       .map(([ext]) => ext);
   });
 
-  async function loadFiles(repo: string) {
+  /**
+   * `force` is for a caller that knows the tree changed behind the store's
+   * back (this panel's own create, move and delete) or is retrying a failure.
+   * Everything else lets the shared listing decide whether it is still current.
+   */
+  async function loadFiles(repo: string, force = false) {
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
+    const held = force ? null : peekRepoListing(repo);
+    if (held) {
+      // Re-entering the view with nothing changed: no call, and no blank frame.
+      files = held;
+      listedRepo = repo;
+      hasLoaded = true;
+      errorMsg = null;
+      isLoading = false;
+      return;
+    }
     if (repo !== listedRepo) {
       files = [];
       hasLoaded = false;
@@ -198,7 +213,7 @@
     isLoading = true;
     errorMsg = null;
     try {
-      const list = await invoke<string[]>("cmd_list_repo_files", { repoPath: repo });
+      const list = await listRepoFiles(repo, { force });
       if (!guard.isLive()) return;
       files = list;
       listedRepo = repo;
@@ -588,7 +603,7 @@
       (name) => (parentDir ? `${parentDir}/${name}` : name),
     );
     if (!created) return;
-    await loadFiles(repo);
+    await loadFiles(repo, true);
     chooseFile(created);
   }
 
@@ -611,7 +626,7 @@
       (name) => (parentDir ? `${parentDir}/${name}/.gitkeep` : `${name}/.gitkeep`),
     );
     if (!created) return;
-    await loadFiles(repo);
+    await loadFiles(repo, true);
   }
 
   /**
@@ -638,7 +653,7 @@
     // one in front.
     if (repo !== $repoStore.currentPath) return;
     const selected = $repoStore.selectedFilePath;
-    await loadFiles(repo);
+    await loadFiles(repo, true);
     if (row.kind === "file") chooseFile(to);
     else if (selected && isAtOrUnder(selected, row.path)) chooseFile(remapPath(selected, row.path, to));
   }
@@ -671,7 +686,7 @@
     if (selected && isAtOrUnder(selected, row.path) && typeof onSelectFile !== "function") {
       repoStore.selectFilePath(null);
     }
-    await loadFiles(repo);
+    await loadFiles(repo, true);
     if (outcome?.left_behind) {
       repoStore.setError(`${row.path} still holds ignored files, which GitPulse does not delete.`);
     }
@@ -1084,7 +1099,7 @@
     >
       <div class="flex items-center justify-between gap-2">
         <span>Could not refresh the file list. Showing the last successful listing.</span>
-        <button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
+        <button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath, true); }}>Retry</button>
       </div>
       <div class="text-textMuted truncate" title={errorMsg}>{errorMsg}</div>
     </div>
@@ -1111,7 +1126,7 @@
     {:else if errorMsg && !hasLoaded}
       <div class="h-full flex flex-col items-center justify-center gap-2 text-rose-400 text-xs p-4 text-center">
         <span>{errorMsg}</span>
-        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
+        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath, true); }}>Retry</button>
       </div>
     {:else if rows.length === 0}
       <EmptyState
