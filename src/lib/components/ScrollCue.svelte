@@ -13,10 +13,13 @@
   import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from "@lucide/svelte";
   import {
     EMPTY_OVERFLOW_HINT,
+    NO_CUE_YIELD,
+    observeCueYield,
     observeOverflow,
     overflowFadeToken,
     scrollOverflowBy,
     setOverflowFade,
+    type CueYield,
     type OverflowAxis,
     type OverflowHint,
   } from "../dom/overflowHint";
@@ -48,6 +51,27 @@
     });
   });
 
+  // A chevron that would land on an enclosing scroller's chevron for the same
+  // edge gives way to it (see cueYield); the fade below is unaffected.
+  let yielded: CueYield = $state(NO_CUE_YIELD);
+  $effect(() => {
+    const el = target;
+    if (!el) {
+      yielded = NO_CUE_YIELD;
+      return;
+    }
+    // Compared against a plain local, not `yielded`: the first answer is
+    // delivered synchronously, and reading the state here would make this
+    // effect depend on its own output.
+    let last = NO_CUE_YIELD;
+    yielded = NO_CUE_YIELD;
+    return observeCueYield(el, axis, (next) => {
+      if (next.start === last.start && next.end === last.end) return;
+      last = next;
+      yielded = next;
+    });
+  });
+
   // The token follows the hint; clearing is tied to the element alone, so a
   // retarget or unmount never leaves a mask behind and a hint change is one
   // attribute write, not a delete-then-set.
@@ -71,10 +95,10 @@
 </script>
 
 {#if target && resolved.canScroll}
-  {#if resolved.showStart}
+  {#if resolved.showStart && !yielded.start}
     {@render cue("start")}
   {/if}
-  {#if resolved.showEnd}
+  {#if resolved.showEnd && !yielded.end}
     {@render cue("end")}
   {/if}
 {/if}
