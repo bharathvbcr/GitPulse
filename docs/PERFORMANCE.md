@@ -940,6 +940,7 @@ measurement.
 | --- | --- | --- |
 | `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
+| `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
@@ -1132,6 +1133,27 @@ N is the sample count per row (full mode, not `--smoke`).
 | lane_solver merge-heavy 10k | 1.88 ms | 2.33 ms | 2.81 ms | 9,997 rows, 8,330 connections, 1,666 merges, width 4 |
 | lane_solver linear 100k | 41.07 ms | 43.12 ms | 45.32 ms | 100,000 rows, 99,999 connections |
 | lane_solver merge-heavy 100k | 24.83 ms | 25.82 ms | 29.00 ms | 99,601 rows, 83,000 connections, 16,600 merges, width 4 |
+
+`graph_window` (perf1109-graph-blame-reads; N = 7, load average 16.2 on 18
+cores, generated 12-commit merge cycle with ~55-character subjects, no
+repository; `assemble` includes cloning the input commits, as the command
+moves them, so it slightly overstates the solve):
+
+| row | min | p50 | p95 | counters |
+| --- | --- | --- | --- | --- |
+| assemble 5k | 2.15 ms | 2.69 ms | 2.90 ms | 5,000 rows, 5,415 connections |
+| assemble 30k | 15.23 ms | 16.56 ms | 17.77 ms | 30,000 rows |
+| assemble 100k | 57.94 ms | 65.20 ms | 71.10 ms | 100,000 rows, 108,332 connections |
+| serialize 100k | 28.20 ms | 31.08 ms | 32.86 ms | 52,395,741 payload bytes (about 524 B per row) |
+| decode 100k (`serde_json::Value`, a stand-in for `JSON.parse`) | 137.45 ms | 147.57 ms | 157.86 ms | same bytes |
+| serialize 5k / 30k | 1.34 / 8.51 ms | | | 2.6 MB / 15.7 MB |
+| unchanged answer | 4.21 us | 5.08 us | 8.83 us | 208 payload bytes |
+
+So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
+fixture), the lane solve is tens of milliseconds, and the cost of a reload that
+changed nothing is dominated by bytes and decode rather than by the solve; the
+token answer replaces all of it with 208 bytes. A real repository's subjects
+and lane width move the byte counts.
 
 `watcher` (N = 60): `record_event_signal` over 10,000 events: min 15.14 ms, p50
 18.21 ms, p95 20.17 ms; 549k events/s at p50-ish (metric); 7,000 admitted, 3,000
