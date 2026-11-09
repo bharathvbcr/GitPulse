@@ -473,37 +473,122 @@ pub(crate) fn classify_merge(ancestry_merged: bool, tree: Option<&TreeMerge>) ->
     }
 }
 
-/// Compares each `(name, tip)` branch's content with the default branch's tree,
-/// in parallel, one verdict per input in order. A partial clone is refused once
-/// for the whole batch (a merge there would make git fetch blobs).
-pub(crate) fn tree_merge_verdicts(
-    repo: &Path,
-    base_oid: &str,
-    default_tree: &str,
-    branches: &[(&str, &str)],
-) -> Vec<TreeMerge> {
-    let refused = crate::engine::object_quarantine::refuse_partial_clone(repo).err();
-    branches
-        .par_iter()
-        .map(|(name, tip)| match &refused {
-            Some(reason) => TreeMerge::Unknown(reason.message().to_string()),
-            // The tip is already a full object name, so the merge runs
-            // without a resolve per branch; a short one goes by name.
-            None if is_full_oid(tip) => TreeMerge::of(
-                merge_tree_resolved(repo, base_oid, tip, Instant::now() + TREE_MERGE_BUDGET),
-                default_tree,
-            ),
-            None => is_branch_merged_by_tree(repo, default_tree, base_oid, name),
-        })
-        .collect()
+/// Tree comparisons one call may run. Each is a quarantined `git merge-tree`
+/// process, so an unbounded batch is a process per branch: a repository with
+/// hundreds of unmerged branches would spend its whole cleanup scan, and the
+/// storage panel's refresh, on them. Branches past the cap are left unmerged
+/// and counted (see [`TreeChecks::unchecked`]).
+pub(crate) const MAX_TREE_CHECKS: usize = 64;
+
+/// One deadline for every comparison in a call, whatever their number. Fifteen
+/// seconds: a merge-tree over a normal branch takes milliseconds, so this is
+/// reached only by a stuck git or a huge history, and it is the longest an
+/// interactive panel should wait on a background question. It is below the
+/// per-comparison [`TREE_MERGE_BUDGET`], which still bounds the name-resolving
+/// path used on its own.
+const TREE_CHECKS_DEADLINE: Duration = Duration::from_secs(15);
+
+/// What a batch of tree comparisons established.
+pub(crate) struct TreeChecks {
+    /// One verdict per input branch, in input order. A branch that was not
+    /// compared holds [`TreeMerge::Unknown`] with the reason: never merged.
+    pub verdicts: Vec<TreeMerge>,
+    /// How many branches were not compared or whose comparison failed.
+    pub unchecked: usize,
+    /// The first reason (in input order) one of them was not checked.
+    pub reason: Option<String>,
 }
 
-/// The default branch's tree, for [`tree_merge_verdicts`]; `None` when it
-/// cannot be read (the tree comparison is then skipped, never assumed).
-pub(crate) fn default_tree_of(repo: &Path, base_oid: &str) -> Option<String> {
-    git_text(repo, &["rev-parse", &format!("{base_oid}^{{tree}}")])
+impl TreeChecks {
+    fn all_unknown(count: usize, reason: &str) -> Self {
+        Self {
+            verdicts: vec![TreeMerge::Unknown(reason.to_string()); count],
+            unchecked: count,
+            reason: (count > 0).then(|| reason.to_string()),
+        }
+    }
+}
+
+/// Compares each `(name, tip)` branch's content with the default branch's tree
+/// (`base_oid^{tree}`), in parallel, under one shared budget; one verdict per
+/// input in order. The one place both the cleanup plan and the dead-branch scan
+/// spend tree comparisons.
+///
+/// * At most [`MAX_TREE_CHECKS`] branches are compared, chosen by branch name
+///   in ascending byte order so the same repository always gets the same
+///   answer; the rest are `Unknown("... budget ...")`.
+/// * Every comparison shares one [`TREE_CHECKS_DEADLINE`]; one that starts
+///   after it, or is cut off by it, is `Unknown`.
+/// * A partial clone is refused once for the whole batch (a merge there would
+///   make git fetch blobs), and an unreadable default tree makes every branch
+///   `Unknown`: the phase is never silently skipped.
+pub(crate) fn tree_merge_checks(
+    repo: &Path,
+    base_oid: &str,
+    branches: &[(&str, &str)],
+) -> TreeChecks {
+    if branches.is_empty() {
+        return TreeChecks::all_unknown(0, "");
+    }
+    let Some(default_tree) = git_text(repo, &["rev-parse", &format!("{base_oid}^{{tree}}")])
         .ok()
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return TreeChecks::all_unknown(
+            branches.len(),
+            "the default branch's tree could not be read",
+        );
+    };
+    if let Err(reason) = crate::engine::object_quarantine::refuse_partial_clone(repo) {
+        return TreeChecks::all_unknown(branches.len(), reason.message());
+    }
+
+    let mut by_name: Vec<usize> = (0..branches.len()).collect();
+    by_name.sort_by(|&a, &b| branches[a].0.cmp(branches[b].0).then(a.cmp(&b)));
+    let mut selected = vec![false; branches.len()];
+    for &at in by_name.iter().take(MAX_TREE_CHECKS) {
+        selected[at] = true;
+    }
+
+    let deadline = Instant::now() + TREE_CHECKS_DEADLINE;
+    let over_budget = format!("the limit of {MAX_TREE_CHECKS} tree checks per scan was reached");
+    let verdicts: Vec<TreeMerge> = branches
+        .par_iter()
+        .enumerate()
+        .map(|(at, (name, tip))| {
+            if !selected[at] {
+                return TreeMerge::Unknown(over_budget.clone());
+            }
+            if Instant::now() >= deadline {
+                return TreeMerge::Unknown(format!(
+                    "the {}s tree-check deadline was reached",
+                    TREE_CHECKS_DEADLINE.as_secs()
+                ));
+            }
+            // The tip is already a full object name, so the merge runs
+            // without a resolve per branch; a short one goes by name.
+            let candidate = if is_full_oid(tip) {
+                merge_tree_resolved(repo, base_oid, tip, deadline)
+            } else {
+                merge_tree_candidate(repo, base_oid, name, deadline)
+            };
+            TreeMerge::of(candidate, &default_tree)
+        })
+        .collect();
+    let mut unchecked = 0usize;
+    let mut reason = None::<String>;
+    for verdict in &verdicts {
+        if let TreeMerge::Unknown(why) = verdict {
+            unchecked += 1;
+            reason.get_or_insert_with(|| why.clone());
+        }
+    }
+    TreeChecks {
+        verdicts,
+        unchecked,
+        reason,
+    }
 }
 
 /// Check if a branch was squash-merged or rebase-merged into the default branch
@@ -598,12 +683,6 @@ fn scan_branches(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Resolve default branch tree OID for squash-merge detection
-    let default_tree = match (&base, config.check_squash) {
-        (Some((_, base_oid)), true) => default_tree_of(repo, base_oid),
-        _ => None,
-    };
-
     // First pass: collect metadata and evaluate fast ancestry merge status
     let mut candidates: Vec<StaleBranchInfo> = Vec::new();
     // Per candidate: whether a tree comparison could find anything.
@@ -681,7 +760,7 @@ fn scan_branches(
     }
 
     // Second pass: deep tree-based squash/rebase merge detection for unmerged non-protected branches
-    if let (Some(d_tree), Some((_, base_oid))) = (&default_tree, &base) {
+    if let (Some((_, base_oid)), true) = (&base, config.check_squash) {
         let pending: Vec<usize> = candidates
             .iter()
             .enumerate()
@@ -702,26 +781,17 @@ fn scan_branches(
                 )
             })
             .collect();
-        let verdicts = tree_merge_verdicts(repo, base_oid, d_tree, &tips);
-        let mut tree_check_errors = 0usize;
-        let mut first_reason = None::<String>;
-        for (at, verdict) in pending.into_iter().zip(verdicts) {
-            let class = classify_merge(false, Some(&verdict));
-            if let TreeMerge::Unknown(reason) = verdict {
-                tree_check_errors += 1;
-                first_reason.get_or_insert(reason);
-            }
+        let checks = tree_merge_checks(repo, base_oid, &tips);
+        for (at, verdict) in pending.into_iter().zip(&checks.verdicts) {
+            let class = classify_merge(false, Some(verdict));
             candidates[at].is_merged = class.merged;
             candidates[at].merged_by_tree = class.by_tree;
         }
-
-        let err_count = tree_check_errors;
-        if err_count > 0 {
-            let why = first_reason
-                .map(|reason| format!(": {reason}"))
-                .unwrap_or_default();
+        if checks.unchecked > 0 {
             warnings.push(format!(
-                "Squash-merge tree comparison could not resolve for {err_count} branch(es); left as unmerged{why}"
+                "Squash-merge tree comparison did not run for {} branch(es); left as unmerged: {}",
+                checks.unchecked,
+                checks.reason.as_deref().unwrap_or("no reason given")
             ));
         }
     } else if config.check_squash {

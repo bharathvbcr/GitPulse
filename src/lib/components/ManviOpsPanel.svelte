@@ -824,6 +824,11 @@
           <div class="gp-separator" aria-hidden="true"></div>
           <div class="mt-3 flex items-center justify-between pt-3 text-textMuted">
             <span>{cleanup.protected_branches} protected · {cleanup.unmerged_branches} unmerged</span>
+            {#if cleanup.unchecked_branches > 0}
+              <span class="text-amber-300" title={cleanup.unchecked_reason ?? ""}>
+                {cleanup.unchecked_branches} not checked for squash merges{cleanup.unchecked_reason ? `: ${cleanup.unchecked_reason}` : ""}
+              </span>
+            {/if}
             <button class="gp-btn" onclick={cleanBranches} disabled={!cleanupInvariant || selectedBranches.length === 0 || busy !== null}>
               <Trash2 size={13} /> Delete {selectedBranches.length} selected
             </button>

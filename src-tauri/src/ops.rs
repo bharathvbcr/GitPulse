@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
 use crate::engine::deadbranch::{
-    classify_merge, default_tree_of, is_ancestry_merged, needs_tree_check, tree_merge_verdicts,
-    TreeMerge,
+    classify_merge, is_ancestry_merged, needs_tree_check, tree_merge_checks, TreeMerge,
 };
 use crate::engine::git_cli::{git_captured, git_text, validate_repo, BoundedRun};
 use crate::engine::git_writer::validate_ref_name;
@@ -48,6 +47,13 @@ pub struct BranchCleanupPlan {
     pub total_local_branches: usize,
     pub protected_branches: usize,
     pub unmerged_branches: usize,
+    /// Branches counted in `unmerged_branches` whose squash/rebase tree
+    /// comparison did not run or failed (budget, deadline, partial clone,
+    /// unreadable default tree). They may in fact be merged; they are left out
+    /// of `candidates` on the safe side.
+    pub unchecked_branches: usize,
+    /// Why, when `unchecked_branches > 0`.
+    pub unchecked_reason: Option<String>,
     pub candidates: Vec<BranchCleanupCandidate>,
 }
 
@@ -183,26 +189,16 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
         .copied()
         .filter(|b| !is_protected(b) && !is_ancestry_merged(b) && needs_tree_check(b))
         .collect();
-    let tree_verdicts: HashMap<&str, TreeMerge> =
-        match default_tree_of(&repo, &default.tip_commit_id) {
-            Some(default_tree) if !pending.is_empty() => {
-                let tips: Vec<(&str, &str)> = pending
-                    .iter()
-                    .map(|b| (b.name.as_str(), b.tip_commit_id.as_str()))
-                    .collect();
-                pending
-                    .iter()
-                    .map(|b| b.name.as_str())
-                    .zip(tree_merge_verdicts(
-                        &repo,
-                        &default.tip_commit_id,
-                        &default_tree,
-                        &tips,
-                    ))
-                    .collect()
-            }
-            _ => HashMap::new(),
-        };
+    let tips: Vec<(&str, &str)> = pending
+        .iter()
+        .map(|b| (b.name.as_str(), b.tip_commit_id.as_str()))
+        .collect();
+    let checks = tree_merge_checks(&repo, &default.tip_commit_id, &tips);
+    let tree_verdicts: HashMap<&str, &TreeMerge> = pending
+        .iter()
+        .map(|b| b.name.as_str())
+        .zip(checks.verdicts.iter())
+        .collect();
 
     let mut candidates = Vec::new();
     let mut protected_branches = 0usize;
@@ -212,7 +208,7 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
             protected_branches += 1;
         } else if classify_merge(
             is_ancestry_merged(branch),
-            tree_verdicts.get(branch.name.as_str()),
+            tree_verdicts.get(branch.name.as_str()).copied(),
         )
         .merged
         {
@@ -236,6 +232,8 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, Command
         total_local_branches: local.len(),
         protected_branches,
         unmerged_branches,
+        unchecked_branches: checks.unchecked,
+        unchecked_reason: checks.reason,
         candidates,
     })
 }
@@ -471,33 +469,67 @@ pub struct ReleasePlan {
 
 /// The commit the local tag `tag` peels to; `None` when no such tag exists.
 ///
-/// Qualified as `refs/tags/<tag>` so a branch spelled like the tag is not taken
-/// for it. `--verify --quiet` makes exit 1 with empty stdout git's answer
-/// "missing"; every other outcome (exit 128, a spawn refusal, a deadline, a cut
-/// stream) is a read that did not happen and is an `Err`, never "no tag".
+/// Two questions, asked in order, each answered by git's exit status alone:
+///
+/// 1. Does `refs/tags/<tag>` exist? (`show-ref --verify --quiet`: exit 1 is
+///    "missing".) Qualified, so a branch spelled like the tag is not taken for it.
+/// 2. Does it peel to a commit? (`rev-parse --verify --quiet <ref>^{commit}`.)
+///    A tag that exists but peels to a tree or blob is an error naming the
+///    object type, never "missing": reporting it missing would offer to create a
+///    tag that is already there.
+///
+/// Every other outcome (exit 128, a spawn refusal, a deadline, a cut stream) is a
+/// read that did not happen and is an `Err`, never "no tag".
 fn local_release_tag(repo: &std::path::Path, tag: &str) -> Result<Option<String>, CommandError> {
     local_release_tag_with(tag, |args| git_captured(repo, args))
 }
 
-fn local_release_tag_with<F>(tag: &str, run: F) -> Result<Option<String>, CommandError>
+fn local_release_tag_with<F>(tag: &str, mut run: F) -> Result<Option<String>, CommandError>
 where
-    F: FnOnce(&[&str]) -> Result<BoundedRun, CommandError>,
+    F: FnMut(&[&str]) -> Result<BoundedRun, CommandError>,
 {
-    let spec = format!("refs/tags/{tag}^{{commit}}");
-    let run = run(&["rev-parse", "--verify", "--quiet", &spec])?;
-    let stdout = String::from_utf8_lossy(&run.stdout).trim().to_string();
-    if run.incomplete.is_some() || run.cancelled {
-        return Err(format!(
-            "Could not read the local release tag {tag}: git's answer was cut off"
-        )
-        .into());
+    let mut ask = |args: &[&str]| -> Result<(i32, String, String), CommandError> {
+        let run = run(args)?;
+        if run.incomplete.is_some() || run.cancelled {
+            return Err(format!(
+                "Could not read the local release tag {tag}: git's answer was cut off"
+            )
+            .into());
+        }
+        Ok((
+            run.status_code,
+            String::from_utf8_lossy(&run.stdout).trim().to_string(),
+            String::from_utf8_lossy(&run.stderr).trim().to_string(),
+        ))
+    };
+    let tag_ref = format!("refs/tags/{tag}");
+    match ask(&["show-ref", "--verify", "--quiet", &tag_ref])? {
+        (0, _, _) => {}
+        (1, _, _) => return Ok(None),
+        (code, _, stderr) => {
+            return Err(format!(
+                "Could not read the local release tag {tag} (git exited {code}): {stderr}"
+            )
+            .into())
+        }
     }
-    match run.status_code {
-        0 if !stdout.is_empty() => Ok(Some(stdout)),
-        1 if stdout.is_empty() => Ok(None),
-        code => Err(format!(
-            "Could not read the local release tag {tag} (git exited {code}): {}",
-            String::from_utf8_lossy(&run.stderr).trim()
+    let commit = format!("{tag_ref}^{{commit}}");
+    match ask(&["rev-parse", "--verify", "--quiet", &commit])? {
+        (0, oid, _) if !oid.is_empty() => Ok(Some(oid)),
+        (1, _, _) => {
+            // Exists, does not peel to a commit. The type is only for the message.
+            let peeled = format!("{tag_ref}^{{}}");
+            let kind = match ask(&["cat-file", "-t", &peeled]) {
+                Ok((0, kind, _)) if !kind.is_empty() => format!("a {kind}"),
+                _ => "not a commit".to_string(),
+            };
+            Err(format!(
+                "Release tag {tag} already exists locally but points at {kind}, not a commit"
+            )
+            .into())
+        }
+        (code, _, stderr) => Err(format!(
+            "Could not read the local release tag {tag} (git exited {code}): {stderr}"
         )
         .into()),
     }
@@ -577,7 +609,7 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
-    fn git(path: &Path, args: &[&str]) {
+    fn git(path: &Path, args: &[&str]) -> String {
         let mut command = Command::new("git");
         crate::test_support::pin_git(&mut command);
         let output = command
@@ -598,6 +630,7 @@ mod tests {
         if args.first() == Some(&"init") {
             crate::test_support::trust_repo(path);
         }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn commit_file(path: &Path, name: &str, content: &str, message: &str) {
@@ -1013,47 +1046,79 @@ mod tests {
         }
     }
 
-    /// Only git's "missing" answer (exit 1, nothing on stdout) is "no local
-    /// tag". Any other failure used to collapse into it, so `create_tag=true`
-    /// was reported for a repository git could not read.
+    /// A git whose answers are scripted per subcommand: `(exit, stdout)`.
+    fn scripted(
+        show_ref: (i32, &'static str),
+        rev_parse: (i32, &'static str),
+        cat_file: (i32, &'static str),
+    ) -> impl FnMut(&[&str]) -> Result<BoundedRun, CommandError> {
+        move |args| {
+            let (code, out) = match args[0] {
+                "show-ref" => show_ref,
+                "rev-parse" => rev_parse,
+                "cat-file" => cat_file,
+                other => panic!("unexpected git {other}"),
+            };
+            Ok(probe(code, out, "fatal: scripted"))
+        }
+    }
+
+    /// Only git's "missing" answer (`show-ref --verify --quiet` exit 1) is "no
+    /// local tag". Any other failure used to collapse into it, so
+    /// `create_tag=true` was reported for a repository git could not read.
     #[test]
     fn only_a_missing_ref_means_no_local_tag() {
         let missing = local_release_tag_with("v1.5.0", |args| {
             assert_eq!(
                 args,
-                [
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    "refs/tags/v1.5.0^{commit}"
-                ]
+                ["show-ref", "--verify", "--quiet", "refs/tags/v1.5.0"]
             );
             Ok(probe(1, "", ""))
         });
         assert_eq!(missing.expect("missing is an answer"), None);
 
-        let found = local_release_tag_with("v1.5.0", |_| Ok(probe(0, "abc123\n", "")));
+        let found = local_release_tag_with("v1.5.0", scripted((0, ""), (0, "abc123\n"), (0, "")));
         assert_eq!(found.expect("found"), Some("abc123".to_string()));
 
-        let broken = local_release_tag_with("v1.5.0", |_| {
-            Ok(probe(128, "", "fatal: unable to read refs"))
-        })
-        .expect_err("exit 128 is not 'missing'");
+        for (name, run) in [
+            ("show-ref 128", scripted((128, ""), (0, ""), (0, ""))),
+            ("rev-parse 128", scripted((0, ""), (128, ""), (0, ""))),
+            ("empty success", scripted((0, ""), (0, ""), (0, ""))),
+        ] {
+            let error = local_release_tag_with("v1.5.0", run).expect_err(name);
+            assert!(
+                !error.message().contains("points at"),
+                "{name}: {}",
+                error.message()
+            );
+        }
+        let broken = local_release_tag_with("v1.5.0", scripted((128, ""), (0, ""), (0, "")))
+            .expect_err("exit 128 is not 'missing'");
         assert!(broken.message().contains("128"), "{}", broken.message());
 
         let unspawnable =
             local_release_tag_with("v1.5.0", |_| Err("spawn refused".to_string().into()));
         assert!(unspawnable.is_err());
 
-        let empty_success = local_release_tag_with("v1.5.0", |_| Ok(probe(0, "", "")));
-        assert!(
-            empty_success.is_err(),
-            "exit 0 with no oid is not an answer"
-        );
-
         let mut cut = probe(1, "", "");
         cut.cancelled = true;
-        assert!(local_release_tag_with("v1.5.0", |_| Ok(cut)).is_err());
+        assert!(local_release_tag_with("v1.5.0", |_| Ok(cut.clone())).is_err());
+    }
+
+    /// A tag that exists but peels to a tree or blob is not a missing tag.
+    #[test]
+    fn a_tag_that_exists_but_is_no_commit_is_an_error_naming_its_type() {
+        let error = local_release_tag_with("v1.5.0", scripted((0, ""), (1, ""), (0, "tree\n")))
+            .expect_err("exists, not a commit");
+        assert!(error.message().contains("a tree"), "{}", error.message());
+
+        let unknown_type = local_release_tag_with("v1.5.0", scripted((0, ""), (1, ""), (128, "")))
+            .expect_err("type unknown still an error");
+        assert!(
+            unknown_type.message().contains("not a commit"),
+            "{}",
+            unknown_type.message()
+        );
     }
 
     #[test]
@@ -1100,6 +1165,302 @@ mod tests {
             tagged.trim(),
             plan.head,
             "the release tag was created on an unchecked commit"
+        );
+    }
+
+    // ---- moved from the adversary review: release tag ----
+
+    #[test]
+    fn an_annotated_tag_at_head_is_reused() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "-a", "v1.5.0", "-m", "release"]);
+        let plan = prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release").unwrap();
+        assert!(!plan.create_tag, "annotated tag peels to the commit");
+    }
+
+    #[test]
+    fn a_packed_tag_at_head_is_reused() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "v1.5.0"]);
+        git(repo.path(), &["pack-refs", "--all"]);
+        let plan = prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release").unwrap();
+        assert!(!plan.create_tag);
+    }
+
+    #[test]
+    fn a_tag_at_head_wins_over_a_same_named_branch_elsewhere() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "v1.5.0"]);
+        git(repo.path(), &["switch", "-q", "-c", "v1.5.0"]);
+        commit_file(repo.path(), "o.txt", "o", "feat: o");
+        git(repo.path(), &["switch", "-q", "main"]);
+        let plan = prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release").unwrap();
+        assert!(!plan.create_tag, "refs/tags/ qualification, not the branch");
+    }
+
+    #[test]
+    fn an_annotated_tag_at_another_commit_is_refused() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "-a", "v1.5.0", "-m", "old"]);
+        commit_file(repo.path(), "n.txt", "n", "feat: next");
+        git(repo.path(), &["push", "origin", "main"]);
+        let error =
+            prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release").unwrap_err();
+        assert!(error.contains("different commit"), "{}", error.message());
+    }
+
+    #[test]
+    fn option_and_revision_shaped_tag_names_never_reach_git() {
+        let (_remote, repo) = release_ready_repo();
+        let path = repo.path().to_str().unwrap();
+        for tag in [
+            "--all",
+            "-v1.0.0",
+            "v1.0.0^{}",
+            "v1.0.0..v2.0.0",
+            "v1.0.0@{0}",
+            "v1.0.0^{commit}",
+            "v1.0.0\n",
+        ] {
+            assert!(prepare_release(path, tag, "Release").is_err(), "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn a_shallow_clone_reads_the_tag_like_any_other() {
+        let (remote, _repo) = release_ready_repo();
+        let shallow = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", remote.path().display());
+        git(shallow.path(), &["clone", "-q", "--depth=1", &url, "clone"]);
+        let clone = shallow.path().join("clone");
+        crate::test_support::trust_repo(&clone);
+        git(&clone, &["tag", "v1.5.0"]);
+        let plan = prepare_release(clone.to_str().unwrap(), "v1.5.0", "Release").unwrap();
+        assert!(!plan.create_tag);
+    }
+
+    /// A tag at a tree (or blob) cannot be peeled to a commit. `rev-parse --verify
+    /// --quiet <tag>^{commit}` exits 1 with empty stdout for that too, so the
+    /// classification reads "missing" and `create_tag=true` is reported for a tag
+    /// that exists (the later `git tag` then fails). The doc comment promises every
+    /// outcome other than "missing" is an Err.
+    #[test]
+    fn a_tag_that_exists_but_is_no_commit_is_an_error_not_missing() {
+        let (_remote, repo) = release_ready_repo();
+        git(repo.path(), &["tag", "v1.5.0", "HEAD^{tree}"]);
+        let result = prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release");
+        match result {
+            Err(_) => {}
+            Ok(plan) => panic!(
+                "tag v1.5.0 exists (a tree); plan says create_tag={} instead of refusing",
+                plan.create_tag
+            ),
+        }
+    }
+
+    #[test]
+    fn a_tag_at_a_blob_is_an_error_not_missing() {
+        let (_remote, repo) = release_ready_repo();
+        let blob = git(repo.path(), &["rev-parse", "HEAD:app.txt"]);
+        git(repo.path(), &["tag", "v1.5.0", &blob]);
+        let result = prepare_release(repo.path().to_str().unwrap(), "v1.5.0", "Release");
+        assert!(result.is_err(), "blob tag treated as missing: {result:?}");
+    }
+
+    // ---- moved from the adversary review: one merged rule ----
+
+    fn names(plan: &BranchCleanupPlan) -> Vec<String> {
+        let mut v: Vec<String> = plan.candidates.iter().map(|c| c.name.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_squash_merge_is_found_even_after_main_advanced_past_the_squash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["switch", "-c", "sq"]);
+        commit_file(p, "s.txt", "s", "feat: s");
+        git(p, &["switch", "main"]);
+        git(p, &["merge", "--squash", "sq"]);
+        git(p, &["commit", "-m", "feat: s (#1)"]);
+        commit_file(p, "later.txt", "later", "feat: later");
+        // Main also rewrites the squashed file afterwards: still "in main" as
+        // history, but the tip tree no longer equals the merge result.
+        commit_file(p, "s.txt", "s changed later", "fix: s tweaked");
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        assert_eq!(
+            names(&plan),
+            Vec::<String>::new(),
+            "documented limit: a later rewrite of the squashed file hides the squash (unmerged, safe side)"
+        );
+    }
+
+    #[test]
+    fn a_gone_upstream_with_nothing_ahead_and_main_past_it_is_merged_by_ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        git(p, &["remote", "add", "origin", "./nowhere.git"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["branch", "old"]);
+        commit_file(p, "n.txt", "n", "feat: main moves on");
+        git(p, &["update-ref", "refs/remotes/origin/old", "old"]);
+        git(p, &["branch", "--set-upstream-to=origin/old", "old"]);
+        git(p, &["update-ref", "-d", "refs/remotes/origin/old"]);
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        assert_eq!(names(&plan), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn a_branch_checked_out_in_another_worktree_is_protected_even_when_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["branch", "busy"]);
+        commit_file(p, "n.txt", "n", "feat: next");
+        let wt = tempfile::tempdir().unwrap();
+        git(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.path().join("w").to_str().unwrap(),
+                "busy",
+            ],
+        );
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        assert!(names(&plan).is_empty(), "{:?}", names(&plan));
+        assert_eq!(plan.protected_branches, 2);
+    }
+
+    #[test]
+    fn a_detached_head_is_refused_not_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["branch", "old"]);
+        commit_file(p, "n.txt", "n", "feat: next");
+        git(p, &["switch", "-q", "--detach", "HEAD"]);
+        assert!(branch_cleanup_plan(p.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn no_resolvable_default_branch_plans_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "weird-trunk"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["branch", "old"]);
+        commit_file(p, "n.txt", "n", "feat: next");
+        match branch_cleanup_plan(p.to_str().unwrap()) {
+            Err(_) => {}
+            Ok(plan) => assert!(
+                names(&plan).is_empty(),
+                "an unresolved default must not mark anything merged: {:?}",
+                names(&plan)
+            ),
+        }
+    }
+
+    // Spawn measurement: the numbers are printed with --nocapture.
+
+    fn many_branches(count: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        for i in 0..count {
+            let name = format!("feature/b{i:03}");
+            git(p, &["switch", "-q", "-c", &name]);
+            commit_file(p, &format!("f{i}.txt"), "x", "feat: work");
+            git(p, &["switch", "-q", "main"]);
+        }
+        commit_file(p, "next.txt", "n", "feat: main moves on");
+        dir
+    }
+
+    fn plan_spawns(count: usize) -> (usize, usize, usize) {
+        let dir = many_branches(count);
+        let p = dir.path();
+        let canonical = std::fs::canonicalize(p).unwrap();
+        let log = || crate::engine::git_cli::spawn_log::spawns_in(&canonical);
+        let before = log().len();
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        let used: Vec<Vec<String>> = log()[before..].to_vec();
+        assert_eq!(plan.unmerged_branches, count);
+        // Past the shared budget the rest are left unmerged and counted.
+        assert_eq!(
+            plan.unchecked_branches,
+            count.saturating_sub(crate::engine::deadbranch::MAX_TREE_CHECKS)
+        );
+        let merge_trees = used
+            .iter()
+            .filter(|a| a.iter().any(|x| x == "merge-tree"))
+            .count();
+        let all = used.len();
+        eprintln!(
+            "SPAWNS branch_cleanup_plan branches={count} total={all} merge-tree={merge_trees}"
+        );
+        (all, merge_trees, count)
+    }
+
+    #[test]
+    fn measure_plan_spawns_at_50_branches() {
+        let (_, merge_trees, n) = plan_spawns(50);
+        assert!(merge_trees <= n);
+    }
+
+    /// 200 unmerged branches: the cleanup plan (and so `storage::branch_summary`,
+    /// which calls it) used to cost one `git branch --merged`. It now runs one
+    /// quarantined `merge-tree` per unmerged branch with no cap.
+    #[test]
+    fn the_cleanup_plan_does_not_fan_out_one_merge_tree_per_branch() {
+        let (total, merge_trees, n) = plan_spawns(200);
+        assert!(
+            merge_trees <= crate::engine::deadbranch::MAX_TREE_CHECKS,
+            "{merge_trees} merge-tree spawns ({total} spawns total) for {n} branches: unbounded fan-out"
+        );
+    }
+
+    /// A tree comparison that cannot run leaves the branch unmerged with no trace:
+    /// the plan type has no field that says "N branches were not checked".
+    #[test]
+    fn a_skipped_tree_check_is_visible_in_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        commit_file(p, "base.txt", "base", "feat: initial");
+        git(p, &["switch", "-q", "-c", "sq"]);
+        commit_file(p, "s.txt", "s", "feat: s");
+        git(p, &["switch", "-q", "main"]);
+        git(p, &["merge", "--squash", "sq"]);
+        git(p, &["commit", "-m", "feat: s (#1)"]);
+        // Make this a partial clone so every tree comparison is refused.
+        git(p, &["config", "extensions.partialClone", "origin"]);
+        git(p, &["config", "remote.origin.promisor", "true"]);
+        git(p, &["config", "remote.origin.url", "./nowhere.git"]);
+        let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
+        let json = serde_json::to_string(&plan).unwrap().to_lowercase();
+        assert!(
+            plan.candidates.is_empty()
+                && (json.contains("unknown")
+                    || json.contains("warn")
+                    || json.contains("unchecked")),
+            "squash-merged `sq` is silently reported as plain unmerged: {json}"
+        );
+        assert_eq!(plan.unchecked_branches, 1);
+        assert!(
+            plan.unchecked_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{:?}",
+            plan.unchecked_reason
         );
     }
 }

@@ -271,11 +271,58 @@ where
 
     let argv = action_argv(action, &entry.selector, &entry.oid);
     let verdict = judge(&argv)?;
-    let output = git_text(repo.as_path(), &argv[1..])?;
-    if matches!(action, StashAction::Pop | StashAction::Drop) {
-        verify_dropped_entry(repo.as_path(), action, &entry.oid, &output)?;
-    }
+    let output = match action {
+        StashAction::Apply => git_text(repo.as_path(), &argv[1..])?,
+        StashAction::Drop => {
+            let output = git_text(repo.as_path(), &argv[1..])?;
+            verify_dropped_entry(repo.as_path(), action, &entry.oid, &output)?;
+            output
+        }
+        StashAction::Pop => pop_entry(repo.as_path(), index, entry)?,
+    };
     Ok((verdict, output))
+}
+
+/// `git stash pop`, done as the two steps it is, each bound to the confirmed
+/// entry.
+///
+/// `pop stash@{n}` applies whatever sits at `n` and only then names it, so an
+/// outside `git stash push` after the listing would put someone else's changes
+/// in the working tree before anything could notice. Instead:
+///
+/// 1. The index is re-resolved right before touching anything; a different
+///    oid there refuses with nothing applied and nothing dropped.
+/// 2. `git stash apply <oid>` applies the confirmed entry itself, by object id,
+///    so it cannot hit the wrong one. A failure (a conflict) drops nothing, as
+///    `pop` itself does not.
+/// 3. Only then the verified drop: the entry git removes must be the confirmed
+///    one, or it is stored back and the error says the confirmed changes were
+///    applied.
+///
+/// The gate judges the line the user confirmed (`git stash pop <selector>`);
+/// together the two steps are exactly its effect.
+fn pop_entry(repo: &Path, index: usize, entry: &StashEntry) -> Result<String, CommandError> {
+    let held = git_text(repo, &["rev-parse", "--verify", "--quiet", &entry.selector])
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
+    if !held.eq_ignore_ascii_case(&entry.oid) {
+        return Err(stale(format!(
+            "Stash entry {index} changed after it was listed. Nothing was applied or dropped. \
+             {STALE_STACK_HINT}"
+        )));
+    }
+    let applied = git_text(repo, &["stash", "apply", &entry.oid])?;
+    let dropped = git_text(repo, &["stash", "drop", &entry.selector]).map_err(|e| {
+        e.wrap(|e| {
+            format!(
+                "The stash entry {} was applied but could not be dropped, so it is still on the \
+                 stack: {e}",
+                entry.oid
+            )
+        })
+    })?;
+    verify_dropped_entry(repo, StashAction::Pop, &entry.oid, &dropped)?;
+    Ok(format!("{applied}{dropped}"))
 }
 
 /// The object id git printed for the entry it just removed, from
@@ -335,9 +382,12 @@ fn verify_dropped_entry(
         ),
     };
     let applied = if action == StashAction::Pop {
-        " The pop also applied that entry's changes to the working tree."
+        format!(
+            " The confirmed entry's changes WERE applied to the working tree, and {expected_oid} \
+             is still on the stack."
+        )
     } else {
-        ""
+        String::new()
     };
     Err(stale(format!(
         "git stash {label} removed {actual} instead of the confirmed entry {expected_oid}: \
@@ -564,6 +614,204 @@ mod tests {
             let listed = list(dir.path().to_str().unwrap()).unwrap().entries;
             let oids: Vec<&str> = listed.iter().map(|e| e.oid.as_str()).collect();
             assert_eq!(oids, vec![intruder.as_str(), confirmed.as_str()]);
+        }
+
+        /// A repository with one committed file `a.txt` ("base") and no stash.
+        fn repo_with_base() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("temp repo");
+            let path = dir.path();
+            git(path, &["init", "-b", "main"]);
+            crate::test_support::trust_repo(path);
+            std::fs::write(path.join("a.txt"), "base").unwrap();
+            git(path, &["add", "a.txt"]);
+            git(path, &["commit", "-m", "base"]);
+            dir
+        }
+
+        fn oids(path: &Path) -> Vec<String> {
+            list(path.to_str().unwrap())
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|e| e.oid)
+                .collect()
+        }
+
+        // ---- moved from the adversary review ----
+
+        #[test]
+        fn two_intruder_pushes_cost_the_user_nothing() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            let seen = std::cell::RefCell::new(Vec::new());
+            let error = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Drop,
+                0,
+                &confirmed,
+                |_| {
+                    stash_of(path, "one", "intruder one");
+                    seen.borrow_mut()
+                        .push(git(path, &["rev-parse", "refs/stash"]));
+                    stash_of(path, "two", "intruder two");
+                    seen.borrow_mut()
+                        .push(git(path, &["rev-parse", "refs/stash"]));
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.message().contains("restored"), "{}", error.message());
+            let seen = seen.into_inner();
+            assert_eq!(
+                oids(path),
+                vec![seen[1].clone(), seen[0].clone(), confirmed]
+            );
+        }
+
+        #[test]
+        fn an_outsider_dropping_the_confirmed_entry_does_not_drop_the_next_one() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "older", "older work");
+            let older = git(path, &["rev-parse", "refs/stash"]);
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            let result = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Drop,
+                0,
+                &confirmed,
+                |_| {
+                    git(path, &["stash", "drop"]);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "the confirmed entry was already gone");
+            assert_eq!(oids(path), vec![older], "the next entry must survive");
+        }
+
+        #[test]
+        fn an_outsider_dropping_the_only_entry_is_an_error_not_a_success() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            let result = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Drop,
+                0,
+                &confirmed,
+                |_| {
+                    git(path, &["stash", "drop"]);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(oids(path).is_empty());
+        }
+
+        #[test]
+        fn a_dash_and_newline_message_survives_the_restore() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            let seen = std::cell::RefCell::new(String::new());
+            let _ = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Drop,
+                0,
+                &confirmed,
+                |_| {
+                    stash_of(path, "x", "-rf weird\nsecond line");
+                    *seen.borrow_mut() = git(path, &["rev-parse", "refs/stash"]);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            let listed = list(path.to_str().unwrap()).unwrap().entries;
+            assert_eq!(listed[0].oid, seen.into_inner());
+            assert!(
+                listed[0].message.starts_with("-rf weird"),
+                "{:?}",
+                listed[0].message
+            );
+        }
+
+        /// `git stash pop stash@{0}` applies whatever sits at index 0 before the
+        /// oid is compared. A raced pop must leave the working tree as it was.
+        #[test]
+        fn a_raced_pop_leaves_the_working_tree_untouched() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            std::fs::write(path.join("a.txt"), "confirmed").unwrap();
+            git(path, &["stash", "push", "-m", "confirmed work"]);
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            let error = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Pop,
+                0,
+                &confirmed,
+                |_| {
+                    std::fs::write(path.join("a.txt"), "intruder").unwrap();
+                    git(path, &["stash", "push", "-m", "outside work"]);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.message().contains("applied"), "{}", error.message());
+            let on_disk = std::fs::read_to_string(path.join("a.txt")).unwrap();
+            let status = git(path, &["status", "--porcelain"]);
+            assert_eq!(
+                (on_disk.as_str(), status.as_str()),
+                ("base", ""),
+                "the failed pop left the foreign entry's changes in the working tree"
+            );
+        }
+
+        /// A pop applies the confirmed entry by object id, so it cannot apply
+        /// another one, and a conflict drops nothing (as `git stash pop` does).
+        #[test]
+        fn a_pop_that_conflicts_applies_nothing_wrong_and_drops_nothing() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            std::fs::write(path.join("a.txt"), "uncommitted local edit").unwrap();
+            let result = run_action_with(
+                path.to_str().unwrap(),
+                StashAction::Pop,
+                0,
+                &confirmed,
+                |_| Ok(()),
+            );
+            assert!(result.is_err(), "apply over a dirty file must fail");
+            assert_eq!(oids(path), vec![confirmed], "nothing was dropped");
+        }
+
+        /// The mismatch after `apply` succeeded (the stack moved between the
+        /// re-check and the drop): the dropped entry is stored back and the error
+        /// says the confirmed changes WERE applied.
+        #[test]
+        fn a_pop_whose_drop_hits_another_entry_restores_it_and_says_what_was_applied() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            stash_of(path, "confirmed", "confirmed work");
+            let confirmed = git(path, &["rev-parse", "refs/stash"]);
+            stash_of(path, "intruder", "outside work");
+            let intruder = git(path, &["rev-parse", "refs/stash"]);
+            let dropped = git(path, &["stash", "drop"]);
+            let error = verify_dropped_entry(path, StashAction::Pop, &confirmed, &dropped)
+                .expect_err("the intruder was dropped, not the confirmed entry");
+            let message = error.message();
+            assert!(message.contains("WERE applied"), "{message}");
+            assert!(
+                message.contains(&intruder) && message.contains(&confirmed),
+                "{message}"
+            );
+            assert_eq!(oids(path), vec![intruder, confirmed]);
         }
 
         #[test]

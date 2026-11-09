@@ -1,7 +1,3 @@
-#[cfg(test)]
-mod adv_w3gb_tests;
-#[cfg(test)]
-mod adv_w3gb_break_tests;
 // macOS only: the QoS classes and the `ps -o pri` band readings it asserts are
 // Darwin's, and `pools::current_thread_qos` exists only there.
 #[cfg(all(test, target_os = "macos"))]

@@ -16,6 +16,9 @@ export interface BranchCleanupPlan {
   total_local_branches: number;
   protected_branches: number;
   unmerged_branches: number;
+  /** Unmerged branches whose squash/rebase comparison did not run or failed; they may be merged. */
+  unchecked_branches: number;
+  unchecked_reason: string | null;
   candidates: BranchCleanupCandidate[];
 }
 
