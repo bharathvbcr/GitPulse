@@ -75,6 +75,8 @@ pub(crate) struct FileIdentity {
 /// it: its callers (ref listings, signing fingerprints) are bounded by a TTL
 /// and rely on an in-place rewrite with a restored mtime being a hit, which a
 /// ctime would turn into a miss.
+// Stamped only by the shortstat stamp (unix); elsewhere nothing builds one.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChangeStamp {
     identity: FileIdentity,
@@ -84,6 +86,7 @@ pub(crate) struct ChangeStamp {
 }
 
 impl ChangeStamp {
+    #[cfg(unix)]
     pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         Self {
             identity: FileIdentity::of(meta),
@@ -93,6 +96,7 @@ impl ChangeStamp {
     }
 
     /// Stamp of `path`, following symlinks; `None` when it cannot be read.
+    #[cfg(unix)]
     pub(crate) fn at(path: &Path) -> Option<Self> {
         std::fs::metadata(path).ok().map(|meta| Self::of(&meta))
     }
@@ -100,6 +104,7 @@ impl ChangeStamp {
     /// The newest timestamp the stamp carries: what a racy-window check
     /// compares against "now". `None` unless it carries both of them, because
     /// a stamp without a change time cannot prove "unchanged".
+    #[cfg(unix)]
     pub(crate) fn newest_timestamp(&self) -> Option<SystemTime> {
         Some(self.identity.modified?.max(self.changed?))
     }
@@ -138,22 +143,12 @@ fn file_device(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::dev(meta)
 }
 
-#[cfg(not(unix))]
-fn file_device(_meta: &std::fs::Metadata) -> u64 {
-    0
-}
-
 #[cfg(unix)]
 fn file_changed(meta: &std::fs::Metadata) -> Option<SystemTime> {
     use std::os::unix::fs::MetadataExt;
     let secs = u64::try_from(meta.ctime()).ok()?;
     let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
     SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
-}
-
-#[cfg(not(unix))]
-fn file_changed(_meta: &std::fs::Metadata) -> Option<SystemTime> {
-    None
 }
 
 /// Config files outside the repository that git reads for every command.
