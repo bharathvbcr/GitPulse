@@ -93,6 +93,62 @@ describe("graphStore revision token", () => {
     expect(get(store).rows).toHaveLength(1);
   });
 
+  it("treats the full answer to an expired token like any reload and adopts its fresh token", async () => {
+    // The backend refuses a token older than the ref cache's TTL and answers
+    // with a whole page: the store swaps it in and offers the new token next.
+    const { invoke, calls } = backend((n) => (n === 2 ? full("b", "t2") : full("a", `t${n}`)));
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).rows.map((r) => r.id)).toEqual(["b"]);
+    await store.loadGraph("/r/a");
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", "t2"]);
+  });
+
+  it("clears an error banner when an unchanged answer confirms the rows on screen", async () => {
+    let failNext = false;
+    const { invoke } = backend((n) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("boom");
+      }
+      return n === 1 ? full("a", "t1") : unchanged("t1");
+    });
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    failNext = true;
+    await store.loadGraph("/r/a");
+    expect(get(store).error).not.toBeNull();
+    await store.loadGraph("/r/a");
+    expect(get(store).error).toBeNull();
+    expect(get(store).errorRequest).toBeNull();
+    expect(get(store).isLoading).toBe(false);
+  });
+
+  it("clears an error banner when an identical full reload confirms the rows on screen", async () => {
+    let failNext = false;
+    let served = 0;
+    const { invoke } = backend(() => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("boom");
+      }
+      served += 1;
+      return full("a", `t${served}`);
+    });
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    failNext = true;
+    await store.loadGraph("/r/a");
+    expect(get(store).error).not.toBeNull();
+    await store.loadGraph("/r/a");
+    expect(get(store).error).toBeNull();
+    expect(get(store).errorRequest).toBeNull();
+  });
+
   it("does not run the unchanged answer through the identical-payload path", async () => {
     let held: unknown[] | null = null;
     const { invoke } = backend((n) => (n === 1 ? full("a", "t1") : unchanged("t1")));

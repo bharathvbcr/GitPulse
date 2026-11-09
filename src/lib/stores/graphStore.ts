@@ -529,6 +529,21 @@ export function createGraphStore(
     return cache.get(repoPath)?.maxCommits ?? shed.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
   }
 
+  /**
+   * A reload that confirmed what is on screen ends the load: the progress flag
+   * and any error banner from an earlier failed load are retired, because the
+   * rows shown have just been shown to be current. Without this a banner
+   * outlived the success that answered it, since neither confirming path
+   * replaces the visible state.
+   */
+  function settleVisible(path: string): void {
+    if (visiblePath !== path || latestState === null) return;
+    if (!latestState.isLoading && latestState.error === null && latestState.errorRequest === null) {
+      return;
+    }
+    update((s) => ({ ...s, isLoading: false, error: null, errorRequest: null }));
+  }
+
   /** Marks `path` most recently used. */
   function touch(path: string, entry: CachedGraph): void {
     cache.delete(path);
@@ -833,9 +848,7 @@ export function createGraphStore(
             previous.refScope === refScope &&
             previous.maxCommits === max
           ) {
-            if (visiblePath === repoPath && latestState?.isLoading) {
-              update((s) => ({ ...s, isLoading: false }));
-            }
+            settleVisible(repoPath);
             return;
           }
           return api.loadGraph(repoPath, query, revision, { ...opts, withoutToken: true });
@@ -855,9 +868,7 @@ export function createGraphStore(
           // downstream caches (canvas strips) survive untouched. The state
           // moved without moving the page, so the token is the new one.
           previous.graphToken = payload.graph_token ?? null;
-          if (visiblePath === repoPath && latestState?.isLoading) {
-            update((s) => ({ ...s, isLoading: false }));
-          }
+          settleVisible(repoPath);
           return;
         }
 
