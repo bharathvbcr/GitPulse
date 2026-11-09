@@ -41,7 +41,11 @@
 //! a `hooks.json` for that profile). `wiki/MCP and Agents.md` states both.
 //!
 //! CI does not run this file: it needs that Manvi build, and none exists at a
-//! ref CI can fetch. Run it by hand when the harness changes.
+//! ref CI can fetch. Run it by hand when the harness changes. The fence
+//! decisions that do not depend on the real harness's parsing (out-of-plan
+//! Deny, in-plan allow, and a write outside the cwd's checkout) are covered in
+//! CI by `the_scope_fence_decides_for_in_plan_out_of_plan_and_outside_cwd_root_files`
+//! and its neighbours in `src/hooks/mod.rs`, against a plan-aware stand-in.
 //!
 //! Its `HOME` is scoped to the test through `bind_env`: trust records live under
 //! it, and a fixture must not write the developer's own.

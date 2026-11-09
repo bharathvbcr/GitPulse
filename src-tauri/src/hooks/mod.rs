@@ -1220,22 +1220,55 @@ fn collision_guard_decided(
         );
     };
 
-    let file = canonical_enough(Path::new(&input.file_path));
-    let Some(target) = repo_relative(&root, &file) else {
-        return (
-            unchecked(
-                &input.file_path,
-                &format!("the path is not inside the worktree at {}", root.display()),
-            ),
-            None,
-        );
+    let file = canonical_through_existing(Path::new(&input.file_path));
+    // `here` is the checkout the session works in; `root` is the checkout that
+    // owns the file, the one the scope, the collision scan and the claim are
+    // about. They are the same unless the file lies in another checkout.
+    let here = root;
+    let (root, target, other) = match owning_checkout(&here, &file) {
+        Owner::Here(target) => (here.clone(), target, None),
+        Owner::Elsewhere {
+            root,
+            target,
+            same_family,
+        } => (root, target, Some(same_family)),
+        // Outside every Git repository: nothing to judge it against, said as
+        // it always was.
+        Owner::NoRepo => {
+            return (
+                unchecked(
+                    &input.file_path,
+                    &format!("the path is not inside the worktree at {}", here.display()),
+                ),
+                None,
+            );
+        }
+        // The file's own checkout could not be established, so it was not
+        // judged, and the notice says so rather than reading as a clean pass.
+        Owner::Unresolved(why) => {
+            return (
+                unchecked(
+                    &input.file_path,
+                    &format!("the checkout that owns the path could not be determined: {why}"),
+                ),
+                None,
+            );
+        }
     };
 
     let root_arg = root.to_string_lossy().into_owned();
+    let here_arg = here.to_string_lossy().into_owned();
     let op = write_op(&input.tool_name, &file);
     let (scope_root, scope_target) = (root_arg.clone(), target.clone());
-    let Some(scope) = run(Box::new(move || {
-        harness::check_file_in_scope(&scope_root, &scope_target, op)
+    let Some(scope) = run(Box::new(move || match other {
+        None => harness::check_file_in_scope(&scope_root, &scope_target, op),
+        Some(same_family) => harness::check_file_in_other_checkout(
+            &here_arg,
+            &scope_root,
+            &scope_target,
+            same_family,
+            op,
+        ),
     })) else {
         // The scope could not be read in time, so neither check ran: refusing
         // would be a guess, and silence would read as a clean pass. The write
@@ -1291,7 +1324,9 @@ fn collision_guard_decided(
         );
     };
 
-    let mut facts = collision_facts(&risk, &root, &target, &|path| {
+    // Holders are everyone but the session's own checkout, so a sibling that
+    // owns the file and holds it dirty is named.
+    let mut facts = collision_facts(&risk, &here, &target, &|path| {
         agent_session_slug(path).unwrap_or_default()
     });
     if let (Some(incoming), false) = (input.incoming.clone(), facts.others.is_empty()) {
@@ -1311,7 +1346,11 @@ fn collision_guard_decided(
         facts.partial,
         risk.scanned_worktrees,
     );
-    let notices = claim_notices(&root, &risk, &target, &input.session_id);
+    // Claims live per repository family: the session's own checkout reads its
+    // family's store (and skips its own claims); an unrelated repository's
+    // claims are in that repository's store.
+    let claims_root = if other == Some(false) { &root } else { &here };
+    let notices = claim_notices(claims_root, &risk, &target, &input.session_id);
     let output = merge_outputs(scoped, collision_decision_with_claims(&facts, &notices));
     let pending = PendingClaim {
         repair: notices.unreadable_lines,
@@ -1365,6 +1404,80 @@ fn classify_incoming_edit(
         contended_lines: Vec::new(),
         stale: false,
     })
+}
+
+/// Which checkout a file belongs to, relative to the session's own.
+enum Owner {
+    /// Inside the session's checkout, at this repo-relative path.
+    Here(String),
+    /// Inside a different checkout, at this repo-relative path.
+    Elsewhere {
+        root: PathBuf,
+        target: String,
+        /// The two checkouts are the main checkout and linked worktrees of one
+        /// repository (they share a common Git directory).
+        same_family: bool,
+    },
+    /// Not inside any Git repository.
+    NoRepo,
+    /// The owner or the family could not be established.
+    Unresolved(String),
+}
+
+/// Resolves the checkout that owns `file` (already canonical through its
+/// existing ancestors; the file itself may not exist yet).
+///
+/// A file under the session's checkout is judged as it always was, so nothing
+/// that was judged there is judged less. Only a file outside it is looked up:
+/// the nearest enclosing checkout, then whether it shares a repository with the
+/// session's by their canonical common Git directories.
+fn owning_checkout(here: &Path, file: &Path) -> Owner {
+    if let Some(target) = repo_relative(here, file) {
+        return Owner::Here(target);
+    }
+    let Some(dir) = file.ancestors().skip(1).find(|dir| dir.is_dir()) else {
+        return Owner::NoRepo;
+    };
+    let Some(root) = find_git_root(dir) else {
+        return Owner::NoRepo;
+    };
+    let Some(target) = repo_relative(&root, file) else {
+        return Owner::Unresolved(format!(
+            "{} is not a file inside {}",
+            file.display(),
+            root.display()
+        ));
+    };
+    let common = |repo: &Path| -> Result<PathBuf, String> {
+        crate::engine::git_cli::resolve_git_common_dir(repo)
+            .map(|dir| dir.canonicalize().unwrap_or(dir))
+            .map_err(|error| format!("{}: {}", repo.display(), error.message()))
+    };
+    match (common(here), common(&root)) {
+        (Ok(mine), Ok(theirs)) => Owner::Elsewhere {
+            root,
+            target,
+            same_family: mine == theirs,
+        },
+        (Err(why), _) | (_, Err(why)) => Owner::Unresolved(why),
+    }
+}
+
+/// [`canonical_enough`] for a path whose parent may not exist either: the
+/// nearest existing ancestor is canonicalised and the rest re-joined, so a new
+/// file in a new directory of a checkout compares against that checkout's
+/// canonical root (macOS `/var` against `/private/var`).
+fn canonical_through_existing(path: &Path) -> PathBuf {
+    let exact = canonical_enough(path);
+    if exact != path || path.exists() {
+        return exact;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if let (Ok(real), Ok(rest)) = (ancestor.canonicalize(), path.strip_prefix(ancestor)) {
+            return real.join(rest);
+        }
+    }
+    exact
 }
 
 /// The write-gate operation a file tool performs, in the harness's words.
@@ -5793,6 +5906,209 @@ done
                 .is_empty(),
             "an unbound edit was sent to the harness"
         );
+    }
+
+    /// A `manvi serve` stand-in that reads the plan like the real one: the
+    /// planned file is allowed, any other is `scope.unplanned`.
+    #[cfg(unix)]
+    const FAKE_PLAN_AWARE_MANVI: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"path":"src/planned.rs"'*) reply "$line" '{"action":"allow","rule":"scope.planned","severity":"soft","reason":"inside the plan","target":"src/planned.rs","task_id":"TASK-HOOK","demoted":"","degraded":[]}' ;;
+    *) reply "$line" '{"action":"deny","rule":"scope.unplanned","severity":"soft","reason":"Task TASK-HOOK does not authorize changes to this file","target":"docs/other.md","task_id":"TASK-HOOK","demoted":"","degraded":[]}' ;;
+  esac
+done
+"#;
+
+    /// A lane's session (a linked worktree bound to the farm's task).
+    #[cfg(unix)]
+    fn bound_lane(farm: &Farm, n: usize) -> String {
+        let lane = farm.sibling_dirs[n].to_string_lossy().into_owned();
+        crate::ledger::bindings::bind(&farm.repo, &lane, "TASK-HOOK").expect("bind the lane");
+        lane
+    }
+
+    #[cfg(unix)]
+    fn decision_of(output: &HookOutput) -> Option<PermissionDecision> {
+        output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|specific| specific.permission_decision)
+    }
+
+    /// [B-agents-01] cwd = worktree A, file in sibling worktree B that holds it
+    /// dirty: the collision scan runs against B's checkout and names B. It used
+    /// to be the "did NOT run" notice.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_in_a_sibling_worktree_that_holds_the_file_dirty_is_asked_about_naming_it() {
+        let farm = farm_bound(false, false, 2);
+        let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
+        std::fs::write(b.join("seed.txt"), "theirs").unwrap();
+        let output = guard_here(&edit_call(
+            a.to_str().unwrap(),
+            &format!("{}/seed.txt", b.display()),
+        ));
+        let rendered = output.render().unwrap_or_default();
+        assert!(asks(&output), "{rendered}");
+        assert!(reason_of(&output).contains("sibling-1"), "{rendered}");
+        assert!(!rendered.contains("did NOT run"), "{rendered}");
+        // The same file in a checkout nobody holds dirty stays silent.
+        let quiet = guard_here(&edit_call(
+            a.to_str().unwrap(),
+            &format!("{}/README.md", b.display()),
+        ));
+        assert!(quiet.is_silent(), "{:?}", quiet.render());
+    }
+
+    /// [B-agents-01] A task-bound lane writing into the main checkout is
+    /// outside its scope, even to a path its own plan lists: the plan names
+    /// files of the lane's checkout, not of another one.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_bound_lane_is_denied_a_write_into_the_main_checkout() {
+        let farm = farm_bound(false, true, 1);
+        let lane = bound_lane(&farm, 0);
+        std::fs::create_dir_all(Path::new(&farm.repo).join("docs")).unwrap();
+        for file in ["docs/other.md", "src/planned.rs"] {
+            let output = guard_here(&edit_call(&lane, &format!("{}/{file}", farm.repo)));
+            let rendered = output.render().unwrap_or_default();
+            assert_eq!(
+                decision_of(&output),
+                Some(PermissionDecision::Deny),
+                "{file}: {rendered}"
+            );
+            assert!(
+                rendered.contains(harness::SCOPE_OTHER_CHECKOUT),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&farm.repo),
+                "names the owning checkout: {rendered}"
+            );
+        }
+    }
+
+    /// [B-agents-01] An unbound session writing into a checkout that is bound
+    /// is judged by that checkout's own binding.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_into_a_bound_checkout_is_judged_by_its_own_binding() {
+        let farm = farm_bound(false, true, 1);
+        let lane = farm.sibling_dirs[0].to_string_lossy().into_owned();
+        let serial = crate::harness::sidecar::test_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
+        let denied = guard_here(&edit_call(&lane, &format!("{}/docs/other.md", farm.repo)));
+        assert_eq!(
+            decision_of(&denied),
+            Some(PermissionDecision::Deny),
+            "{:?}",
+            denied.render()
+        );
+        assert!(denied
+            .render()
+            .unwrap_or_default()
+            .contains("scope.unplanned"));
+        let planned = guard_here(&edit_call(&lane, &format!("{}/src/planned.rs", farm.repo)));
+        assert_eq!(decision_of(&planned), None, "{:?}", planned.render());
+    }
+
+    /// [B-agents-01] A file in an unrelated repository is judged against that
+    /// repository's own binding, never waved through as if judged.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_into_an_unrelated_repository_is_judged_by_that_repository() {
+        let (_dir_a, repo_a, _) = scoped_hook_fixture(false);
+        let (dir_b, repo_b, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir_b.path(), &requests, &serial);
+        let output = guard_here(&edit_call(&repo_a, &format!("{repo_b}/docs/elsewhere.md")));
+        let rendered = output.render().unwrap_or_default();
+        assert_eq!(
+            decision_of(&output),
+            Some(PermissionDecision::Deny),
+            "{rendered}"
+        );
+        assert!(rendered.contains("scope.unplanned"), "{rendered}");
+        assert!(!rendered.contains("did NOT run"), "{rendered}");
+    }
+
+    /// [B-agents-01] A path outside every Git repository keeps the notice it
+    /// always had, word for word.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_outside_any_repository_keeps_the_did_not_run_notice() {
+        let (_dir, repo, _) = scoped_hook_fixture(false);
+        let outside = tempfile::tempdir().unwrap();
+        let outside_dir = outside.path().canonicalize().unwrap();
+        for file in [
+            outside_dir.join("x.txt"),
+            outside_dir.join("not/yet/there.txt"),
+        ] {
+            let output = guard_here(&edit_call(&repo, &file.to_string_lossy()));
+            assert_eq!(
+                output.system_message.as_deref(),
+                unchecked(
+                    &file.to_string_lossy(),
+                    &format!("the path is not inside the worktree at {repo}")
+                )
+                .system_message
+                .as_deref(),
+            );
+            assert!(output
+                .system_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did NOT run"));
+            assert_eq!(decision_of(&output), None);
+        }
+    }
+
+    /// The non-ignored equivalent of `tests/hook_scope_fence.rs` for the file
+    /// tools: a plan-aware stand-in harness denies the out-of-plan file and
+    /// allows the planned one, in the cwd's checkout and (new) in another one.
+    #[cfg(unix)]
+    #[test]
+    fn the_scope_fence_decides_for_in_plan_out_of_plan_and_outside_cwd_root_files() {
+        let farm = farm_bound(false, true, 2);
+        let serial = crate::harness::sidecar::test_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let _binary = install_manvi(dir.path(), "plan-manvi", FAKE_PLAN_AWARE_MANVI, &serial);
+        std::fs::create_dir_all(Path::new(&farm.repo).join("docs")).unwrap();
+
+        // In the checkout the session works in (the bound main checkout).
+        let denied = guard_here(&edit_call(
+            &farm.repo,
+            &format!("{}/docs/other.md", farm.repo),
+        ));
+        assert_eq!(decision_of(&denied), Some(PermissionDecision::Deny));
+        assert!(denied
+            .render()
+            .unwrap_or_default()
+            .contains("scope.unplanned"));
+        let planned = guard_here(&edit_call(
+            &farm.repo,
+            &format!("{}/src/planned.rs", farm.repo),
+        ));
+        assert_eq!(decision_of(&planned), None, "{:?}", planned.render());
+
+        // Outside the cwd's root: a bound lane is fenced out of main; an
+        // unbound lane is held to main's plan.
+        let lane = bound_lane(&farm, 0);
+        let fenced = guard_here(&edit_call(&lane, &format!("{}/src/planned.rs", farm.repo)));
+        assert_eq!(decision_of(&fenced), Some(PermissionDecision::Deny));
+        let free = farm.sibling_dirs[1].to_string_lossy().into_owned();
+        let other = guard_here(&edit_call(&free, &format!("{}/docs/other.md", farm.repo)));
+        assert_eq!(decision_of(&other), Some(PermissionDecision::Deny));
+        let allowed = guard_here(&edit_call(&free, &format!("{}/src/planned.rs", farm.repo)));
+        assert_eq!(decision_of(&allowed), None, "{:?}", allowed.render());
     }
 
     /// The file-tool hook in an untrusted repository says it judged unscoped.

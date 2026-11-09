@@ -261,6 +261,74 @@ pub(crate) fn check_file_in_scope(repo_path: &str, file_path: &str, op: &str) ->
     }
 }
 
+/// The rule a task-bound session's write into another checkout is refused under.
+pub(crate) const SCOPE_OTHER_CHECKOUT: &str = "scope.other_checkout";
+
+/// Judges one write by a session rooted at `session_root` into a file that
+/// belongs to a different checkout, `owner_root`, where `owner_target` is the
+/// file's path inside it.
+///
+/// A task scope is a list of paths inside the checkout the task is bound to, so
+/// it never authorises a file in another checkout, and the same repo-relative
+/// spelling in the plan must not be read as if it did. With `same_family` (the
+/// two checkouts share one repository: the main checkout and its linked
+/// worktrees) a session bound to a declared scope is therefore refused outright,
+/// and one whose binding could not be resolved is refused as
+/// [`TASK_SCOPE_UNAVAILABLE`] (it fails closed, as the in-checkout path does).
+/// Otherwise, and for a file in an unrelated repository, the write is judged
+/// against the owning checkout's own binding by [`check_file_in_scope`]; a
+/// session binding says nothing about another repository's files.
+pub(crate) fn check_file_in_other_checkout(
+    session_root: &str,
+    owner_root: &str,
+    owner_target: &str,
+    same_family: bool,
+    op: &str,
+) -> FileScopeCheck {
+    if same_family {
+        match hook_scope(session_root) {
+            HookScope::Declared(scope) => {
+                let verdict = PolicyVerdict {
+                    status: PolicyStatus::Blocked,
+                    checked: false,
+                    target: owner_target.to_string(),
+                    rule: SCOPE_OTHER_CHECKOUT.to_string(),
+                    severity: "hard".to_string(),
+                    reason: format!(
+                        "Task {} authorizes changes inside {session_root} only; {owner_target} \
+                         belongs to the checkout at {owner_root}, which is outside its scope",
+                        scope.task_id
+                    ),
+                    demoted: String::new(),
+                    grant_id: String::new(),
+                    granted_by: String::new(),
+                    widened: String::new(),
+                    degraded: Vec::new(),
+                    task_id: scope.task_id,
+                    detail: "GitPulse refused before asking the harness: the write targets \
+                             another checkout of this repository."
+                        .to_string(),
+                    detail_code: "other_checkout".to_string(),
+                };
+                return FileScopeCheck::Judged(Box::new(ScopedVerdict {
+                    bound: true,
+                    unscoped: None,
+                    verdict,
+                }));
+            }
+            HookScope::Unresolved(failure) => {
+                return FileScopeCheck::Judged(Box::new(ScopedVerdict {
+                    bound: true,
+                    unscoped: None,
+                    verdict: failure.verdict(owner_target),
+                }));
+            }
+            HookScope::Unbound | HookScope::Untrusted => {}
+        }
+    }
+    check_file_in_scope(owner_root, owner_target, op)
+}
+
 /// What [`check_file_in_scope`] established.
 #[derive(Debug, Clone)]
 pub(crate) enum FileScopeCheck {
