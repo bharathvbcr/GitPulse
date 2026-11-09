@@ -354,18 +354,12 @@ describe("App overlay wiring", () => {
 
 
 describe("App chrome preferences", () => {
-  it("merges Open and Clone into one header menu without dropping their actions", () => {
-    // The two title-bar pills became one menu so Clone stops occupying a
-    // second hit target. The trigger's accessible name, and the two item
-    // labels, live on HeaderRepoMenu — App only has to keep both actions wired.
-    expect(source).toContain("<HeaderRepoMenu");
-    expect(source).toContain("onOpen={() => void repoStore.pickAndOpenRepo()}");
-    expect(source).toContain("onClone={openCloneDialog}");
-    expect(source).not.toContain(
-      "{#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}",
-    );
-    expect(source).not.toContain(
-      "{#if $interfaceStore.showHeaderActionLabels}<span>Clone...</span>{/if}",
+  it("has one Open entry point, on the tab strip, with Clone wired beside it", () => {
+    // The title bar used to carry its own Open/Clone menu next to the tab
+    // strip's + Open: two controls for one action. The tab strip owns both now.
+    expect(source).not.toContain("HeaderRepoMenu");
+    expect(source).toContain(
+      "<RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />",
     );
   });
 
@@ -406,7 +400,7 @@ describe("App chrome preferences", () => {
     // Tasks, Open, Recents and the app-wide keydown listener.
     const idx = source.indexOf("<RepoTabBar");
     expect(idx).toBeGreaterThan(-1);
-    expect(source).toContain("<RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />");
+    expect(source).toContain("<RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />");
     expect(source.slice(Math.max(0, idx - 160), idx)).not.toContain("autoHideRepoTabs");
   });
 

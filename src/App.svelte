@@ -130,7 +130,6 @@
   // Opened from the first-run card, the tools panels and the palette, never
   // at startup; it renders nothing until `onboardingStore.wizard.open`.
   const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
-  import HeaderRepoMenu from "./lib/components/HeaderRepoMenu.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -1097,13 +1096,7 @@
            the drag region instead -- a bare attribute drags only on direct
            hits, so the controls inside it still take their own clicks. -->
       <div class="flex items-center gap-2 min-w-full w-max pl-2 h-full" data-tauri-drag-region>
-        <HeaderRepoMenu
-          onOpen={() => void repoStore.pickAndOpenRepo()}
-          onClone={openCloneDialog}
-        />
-
         {#if $repoStore.currentPath}
-          <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
           <ViewTabBar {conflictedCount} />
         {/if}
       </div>
@@ -1149,7 +1142,7 @@
   </header>
   </svelte:boundary>
 
-  <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />
+  <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />

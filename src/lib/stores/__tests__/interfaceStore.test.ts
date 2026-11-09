@@ -496,19 +496,16 @@ describe("interfaceStore chrome preferences", () => {
     const prefs = get(interfaceStore);
     expect(prefs.hiddenViews).toEqual([]);
     expect(prefs.statusBarMode).toBe("full");
-    expect(prefs.showHeaderActionLabels).toBe(true);
     expect(prefs.autoHideRepoTabs).toBe(false);
     expect(prefs.diagnosticsButton).toBe("always");
   });
 
   it("sets each chrome preference without disturbing the others", () => {
     interfaceStore.setStatusBarMode("hidden");
-    interfaceStore.setShowHeaderActionLabels(false);
     interfaceStore.setAutoHideRepoTabs(true);
     interfaceStore.setDiagnosticsButton("issues");
     const prefs = get(interfaceStore);
     expect(prefs.statusBarMode).toBe("hidden");
-    expect(prefs.showHeaderActionLabels).toBe(false);
     expect(prefs.autoHideRepoTabs).toBe(true);
     expect(prefs.diagnosticsButton).toBe("issues");
     // Untouched neighbours from other sections stay put.
@@ -576,12 +573,14 @@ describe("interfaceStore chrome preferences", () => {
       // must be dropped like any other non-view, or the preference would name
       // something the header can never list.
       expect(bad.hiddenViews).toEqual(["code"]);
-      expect(bad.showHeaderActionLabels).toBe(true);
       expect(bad.autoHideRepoTabs).toBe(false);
       // showWalkthroughButton is retired along with the header's Walkthrough
       // pill. Every upgraded profile still carries it, so the reader must drop
       // it rather than carry a preference no control can change back.
       expect(bad).not.toHaveProperty("showWalkthroughButton");
+      // showHeaderActionLabels is retired with the title bar's Open menu, the
+      // only control it labelled; upgraded profiles carry it, so drop it too.
+      expect(bad).not.toHaveProperty("showHeaderActionLabels");
 
       // The control: valid values do survive, so the cases above are not
       // passing because the reader ignores these fields.
@@ -589,13 +588,11 @@ describe("interfaceStore chrome preferences", () => {
         statusBarMode: "minimal",
         diagnosticsButton: "issues",
         hiddenViews: ["insights"],
-        showHeaderActionLabels: false,
         autoHideRepoTabs: true,
       });
       expect(good.statusBarMode).toBe("minimal");
       expect(good.diagnosticsButton).toBe("issues");
       expect(good.hiddenViews).toEqual(["insights"]);
-      expect(good.showHeaderActionLabels).toBe(false);
       expect(good.autoHideRepoTabs).toBe(true);
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);

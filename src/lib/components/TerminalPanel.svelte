@@ -239,7 +239,7 @@
    * Compact overlay, not an in-flow chrome row. A full-width `terminal-popover`
    * shoved the PTY down by the height of the type list. The other chrome
    * bars stay in the column because they are short toolbars; this one is a
-   * picker, so it uses the same portaled menu as HeaderRepoMenu.
+   * picker, so it uses the shared portaled popover (`ui/popover.ts`).
    */
   const launcherMenuDismissal = $derived({
     anchor: { kind: "element" as const, element: launcherTriggerEl, gap: 6 },

@@ -173,12 +173,6 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "errors warnings header toolbar log troubleshoot",
   },
   {
-    id: "header-labels",
-    section: "layout",
-    label: "Header button labels",
-    keywords: "open clone title bar words icons text",
-  },
-  {
     id: "repo-tabs",
     section: "layout",
     label: "Hide repository tabs when alone",

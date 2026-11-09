@@ -18,7 +18,7 @@ export function tourPosition(target: TourRect | null, card: { width: number; hei
  * minimised window, a background tab and a headless runner all leave
  * `requestAnimationFrame` callbacks queued indefinitely, and a measurement that
  * only ever arrives on a frame then never arrives at all: the tour draws no
- * spotlight and tells the reader "The Open menu is not currently visible" about
+ * spotlight and tells the reader "The Open button is not currently visible" about
  * a control that is on screen — a claim it has not measured. Bound the wait, so
  * a host that has stopped painting still reaches the measurement. */
 export const FRAME_FALLBACK_MS = 50;

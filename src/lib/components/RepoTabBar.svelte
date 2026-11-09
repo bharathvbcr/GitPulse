@@ -16,6 +16,7 @@
   import {
     ChevronDown,
     ChevronRight,
+    Download,
     Pin,
     Plus,
     X,
@@ -62,8 +63,10 @@
 
   let {
     onOpen,
+    onClone,
   }: {
     onOpen?: () => void;
+    onClone?: () => void;
   } = $props();
 
   /**
@@ -1397,6 +1400,7 @@
       title="Open repository"
       aria-label="Open repository"
       data-testid="open-repo-tab"
+      data-tour="repository"
       onclick={() => onOpen?.()}
       class="gp-btn py-1! px-2.5! shrink-0"
     >
@@ -1408,7 +1412,8 @@
       <button
         bind:this={recentsTriggerEl}
         type="button"
-        title="Recent repositories"
+        title="Clone or open a recent repository"
+        aria-label="Clone or open a recent repository"
         aria-haspopup="menu"
         aria-expanded={recentsOpen}
         aria-controls="recent-repositories-menu"
@@ -1426,12 +1431,28 @@
           use:popover={recentsDismissal}
           id="recent-repositories-menu"
           role="menu"
-          aria-label="Recent repositories"
+          aria-label="Clone or open a recent repository"
           tabindex="-1"
           onkeydown={handlePopupKeydown}
           class="absolute right-0 top-full mt-1.5 w-80 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(28rem,calc(100vh-7.5rem))] shadow-float"
           style="z-index: {LAYERS.MENU}"
         >
+          {#if onClone}
+            <button
+              type="button"
+              role="menuitem"
+              data-testid="clone-repo-item"
+              class="gp-menu-item shrink-0"
+              onclick={() => {
+                recentsOpen = false;
+                onClone?.();
+              }}
+            >
+              <Download size={13} class="text-accent" />
+              Clone Repository…
+            </button>
+            <div class="gp-separator shrink-0" aria-hidden="true"></div>
+          {/if}
           <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0">
             Recent repositories
           </div>

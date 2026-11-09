@@ -19,6 +19,7 @@
       const params = new URLSearchParams(location.search);
       const errors = [];
       const unexpected = [];
+      let cloneCalls = 0;
       addEventListener("error", (event) => errors.push(event.message));
       addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
 
@@ -130,7 +131,7 @@
           resetStackState();
           interfaceStore.setStackWorktreeTabs(true);
           interfaceStore.setAutoHideRepoTabs(false);
-          mount(RepoTabBar, { target: $("#stage") });
+          mount(RepoTabBar, { target: $("#stage"), props: { onClone: () => { cloneCalls += 1; } } });
           // A workspace pane drawn beneath the bar, later in source order and
           // lower in z-order, to prove the bar's dropdowns are not clipped by it.
           const pane = document.createElement("div");
@@ -759,7 +760,7 @@
           // ---- the recent-repositories dropdown ---------------------------------
           // By now two hundred repositories have been opened, so the recents
           // list is far longer than the window can show.
-          const recentsTrigger = $('[title="Recent repositories"]');
+          const recentsTrigger = $('[title="Clone or open a recent repository"]');
           const recentsMenu = () => $("#recent-repositories-menu");
           check("the recents trigger announces a menu and starts closed", () =>
             recentsTrigger.getAttribute("aria-haspopup") === "menu" && recentsTrigger.getAttribute("aria-expanded") === "false" && !recentsMenu());
@@ -768,8 +769,10 @@
           const rm = recentsMenu();
           check("opening it reports expanded and shows a labelled menu", () =>
             recentsTrigger.getAttribute("aria-expanded") === "true" && rm?.getAttribute("role") === "menu" &&
-            rm.getAttribute("aria-label") === "Recent repositories" && recentsTrigger.getAttribute("aria-controls") === "recent-repositories-menu");
+            rm.getAttribute("aria-label") === "Clone or open a recent repository" && recentsTrigger.getAttribute("aria-controls") === "recent-repositories-menu");
           check("focus moves onto its first item", () => items(rm)[0] === document.activeElement);
+          check("Clone is the menu's first item, above the recents", () =>
+            items(rm)[0]?.dataset.testid === "clone-repo-item" && /Clone Repository/.test(items(rm)[0].textContent));
           const recentItems = items(rm);
           key(rm, { key: "ArrowDown" });
           const recentsDown = document.activeElement === recentItems[1];
@@ -794,6 +797,11 @@
           await press(rm, { key: "Escape" });
           check("Escape closes it and returns focus to the trigger", () =>
             !recentsMenu() && document.activeElement === recentsTrigger && recentsTrigger.getAttribute("aria-expanded") === "false");
+          recentsTrigger.click();
+          await settle(); await wait(20);
+          $('[data-testid="clone-repo-item"]').click();
+          await settle();
+          check("choosing Clone runs the clone action once and closes the menu", () => cloneCalls === 1 && !recentsMenu());
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);

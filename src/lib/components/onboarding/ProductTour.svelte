@@ -114,7 +114,7 @@
           <p>Take a hands-on tour of GitPulse. Open a repository, try the workspace views, and find Tasks and Settings.</p>
           <p>The guide will move beside the controls as you explore. Every step is optional; resume later from Settings → Appearance → Guided walkthrough.</p>
         {:else if step === "repository"}
-          <p>{target ? "Try the highlighted Open menu to choose or clone a repository. You can also use the button below." : "Use the button below to choose a repository. The Open menu is not currently visible."} Review repository trust when asked.</p>
+          <p>{target ? "Try the highlighted Open button to choose a repository, or clone one from the menu beside it. You can also use the button below." : "Use the button below to choose a repository. The Open button is not currently visible."} Review repository trust when asked.</p>
           <button class="gp-btn" disabled={busy} onclick={() => openRepository()}><FolderOpen size={15} /> {busy ? "Opening…" : "Choose a repository"}</button>
           {#if repositoryPath}<p role="status" class="tour-success"><Check size={15} /> Repository open. Continue when you’re ready.</p>
           {:else}<p class="text-xs">No repository open yet. Canceling the picker keeps you here; you can try again or skip.</p>{/if}

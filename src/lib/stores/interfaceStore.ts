@@ -124,8 +124,6 @@ export interface InterfacePrefs {
   hiddenViews: ViewTab[];
   /** How much of the bottom status bar is drawn. */
   statusBarMode: StatusBarMode;
-  /** Word label beside the header's Open menu. */
-  showHeaderActionLabels: boolean;
   /** Drop the repository tab strip while a single repository is open. */
   autoHideRepoTabs: boolean;
   /** Draw the worktrees of one repository as one tab with a switcher. */
@@ -372,7 +370,6 @@ const DEFAULTS: InterfacePrefs = {
   uiFontScale: 1.0,
   hiddenViews: [],
   statusBarMode: "full",
-  showHeaderActionLabels: true,
   autoHideRepoTabs: false,
   stackWorktreeTabs: true,
   collapseInactiveGroupTabs: false,
@@ -519,10 +516,6 @@ function readPrefs(): InterfacePrefs {
       statusBarMode: isStatusBarMode(parsed.statusBarMode)
         ? parsed.statusBarMode
         : DEFAULTS.statusBarMode,
-      showHeaderActionLabels: bool(
-        parsed.showHeaderActionLabels,
-        DEFAULTS.showHeaderActionLabels,
-      ),
       autoHideRepoTabs: bool(parsed.autoHideRepoTabs, DEFAULTS.autoHideRepoTabs),
       stackWorktreeTabs: bool(parsed.stackWorktreeTabs, DEFAULTS.stackWorktreeTabs),
       collapseInactiveGroupTabs: bool(parsed.collapseInactiveGroupTabs, DEFAULTS.collapseInactiveGroupTabs),
@@ -695,7 +688,6 @@ function createInterfaceStore() {
     toggleGraphAvatars: () =>
       patch((prefs) => ({ showGraphAvatars: !prefs.showGraphAvatars })),
     setStatusBarMode: (mode: StatusBarMode) => patch({ statusBarMode: mode }),
-    setShowHeaderActionLabels: (show: boolean) => patch({ showHeaderActionLabels: show }),
     setShowStatusIcon: (show: boolean) => patch({ showStatusIcon: show }),
     setHideDockWhenClosed: (hide: boolean) => patch({ hideDockWhenClosed: hide }),
     setStatusIconCounts: (show: boolean) => patch({ statusIconCounts: show }),

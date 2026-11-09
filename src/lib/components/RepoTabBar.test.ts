@@ -41,7 +41,7 @@ describe("RepoTabBar", () => {
     const { body } = render(RepoTabBar);
     expect(body).toContain("my-project");
     expect(body).toContain('title="Open repository"');
-    expect(body).toContain('title="Recent repositories"');
+    expect(body).toContain('title="Clone or open a recent repository"');
 
     await repoStore.closeActiveTab();
   });
@@ -54,7 +54,7 @@ describe("RepoTabBar", () => {
     expect(body).toContain('data-testid="tasks-tab-chip"');
     expect(body).toContain('data-testid="fleet-tab-chip"');
     expect(body).toContain('data-testid="open-repo-tab"');
-    expect(body).toContain('title="Recent repositories"');
+    expect(body).toContain('title="Clone or open a recent repository"');
     expect(body).not.toContain('role="tablist"');
     expect(body).not.toContain("alone-project");
 
