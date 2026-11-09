@@ -44,7 +44,10 @@ fn adv_pop_restores_untracked_files_stashed_with_u() {
     git_in(p, &["stash", "push", "-u", "-m", "u"]);
     let oid = g(p, &["rev-parse", "refs/stash"]);
     pop(p, &oid).expect("pop");
-    assert_eq!(std::fs::read_to_string(p.join("new.txt")).unwrap(), "untracked");
+    assert_eq!(
+        std::fs::read_to_string(p.join("new.txt")).unwrap(),
+        "untracked"
+    );
     assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "edit");
     assert!(oids(p).is_empty());
 }
@@ -99,11 +102,12 @@ fn adv_pop_mismatch_error_is_typed_stale_stash() {
 
 /// A `git` that hangs on `merge-tree` and is otherwise the real one.
 fn hanging_merge_tree_path(dir: &Path) -> std::ffi::OsString {
+    use crate::procguard::LockedSpawn;
     use std::os::unix::fs::PermissionsExt;
     let orig = std::env::var_os("PATH").unwrap_or_default();
     let real = std::process::Command::new("sh")
         .args(["-c", "command -v git"])
-        .output()
+        .output_locked()
         .unwrap();
     let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
     let script = format!(
@@ -112,10 +116,8 @@ fn hanging_merge_tree_path(dir: &Path) -> std::ffi::OsString {
     let tool = dir.join("git");
     std::fs::write(&tool, script).unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::join_paths(
-        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&orig)),
-    )
-    .unwrap()
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&orig)))
+        .unwrap()
 }
 
 fn feature_branches(p: &Path, names: &[String]) -> Vec<(String, String)> {
@@ -147,10 +149,16 @@ fn adv_hung_merge_tree_returns_within_deadline_and_counts_unchecked() {
     let started = Instant::now();
     let checks = tree_merge_checks(p, &base, &refs);
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(25), "deadline not enforced: {took:?}");
+    assert!(
+        took < Duration::from_secs(25),
+        "deadline not enforced: {took:?}"
+    );
     assert_eq!(checks.unchecked, 12, "{:?}", checks.reason);
     assert!(checks.reason.is_some());
-    assert!(checks.verdicts.iter().all(|v| matches!(v, TreeMerge::Unknown(_))));
+    assert!(checks
+        .verdicts
+        .iter()
+        .all(|v| matches!(v, TreeMerge::Unknown(_))));
 }
 
 #[test]
@@ -174,9 +182,15 @@ fn adv_clean_refuses_to_treat_a_hung_check_as_merged() {
         |_| Ok(()),
     );
     let deleted = result.map(|r| r.deleted).unwrap_or_default();
-    assert!(deleted.is_empty(), "deleted on an unchecked verdict: {deleted:?}");
+    assert!(
+        deleted.is_empty(),
+        "deleted on an unchecked verdict: {deleted:?}"
+    );
     drop(_env);
-    assert!(!g(p, &["branch", "--list", "feat"]).is_empty(), "branch is gone");
+    assert!(
+        !g(p, &["branch", "--list", "feat"]).is_empty(),
+        "branch is gone"
+    );
 }
 
 #[test]
