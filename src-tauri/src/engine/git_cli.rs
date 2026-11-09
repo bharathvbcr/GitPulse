@@ -907,7 +907,9 @@ const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
 ///
 /// Prompts and pagers are off, messages are English (the parsers match git's
 /// words; see [`lc_ctype_from_inherited`] for why `LC_ALL` is not the
-/// mechanism), optional locks are skipped so a read never contends with a
+/// mechanism; one edge of that policy: a parent with `LC_ALL=C.UTF-8` and
+/// `LANG=C` keeps `LANG=C` and loses the UTF-8 `LC_ALL`, because `LANG` counts
+/// as the user's stated encoding), optional locks are skipped so a read never contends with a
 /// writer, every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
 /// is removed, and the editors are pinned to `true`.
 ///

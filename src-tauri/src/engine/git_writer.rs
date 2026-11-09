@@ -1190,12 +1190,19 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
+        Ok(Self::config_value_raw(repo, name)?.filter(|value| !value.is_empty()))
+    }
+
+    /// [`Self::config_value`] without folding a blank value into "unset":
+    /// `Some("")` is a key that is set to nothing, which git treats differently
+    /// from a key that is absent (`user.email = ""` stops the search for an
+    /// address; it does not fall through to `EMAIL`).
+    fn config_value_raw(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
         let run = git_captured(repo, &["config", "--get", name])?;
         match run.status_code {
-            0 => {
-                let value = String::from_utf8_lossy(&run.stdout).trim().to_string();
-                Ok((!value.is_empty()).then_some(value))
-            }
+            0 => Ok(Some(
+                String::from_utf8_lossy(&run.stdout).trim().to_string(),
+            )),
             1 => Ok(None),
             code => Err(format!(
                 "Could not read {name} from git config (exit {code}): {}",
@@ -1206,9 +1213,20 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// The identity a commit in `repo` would be recorded under, resolved as
-    /// `git var GIT_AUTHOR_IDENT` resolves it: `GIT_AUTHOR_NAME` /
-    /// `GIT_AUTHOR_EMAIL` each over `user.*` config, then `EMAIL` for the
-    /// address. Each field is honoured on its own.
+    /// `git var GIT_AUTHOR_IDENT` resolves it (git 2.54, probed case by case):
+    /// the name is `GIT_AUTHOR_NAME`, then `author.name`, then `user.name`; the
+    /// address is `GIT_AUTHOR_EMAIL`, then `author.email`, then `user.email`,
+    /// then `EMAIL`. Each field is honoured on its own. An empty `author.*`
+    /// falls through to `user.*`; an empty `user.email` is final (`<>`), and
+    /// `EMAIL` is read only when `user.email` is absent.
+    ///
+    /// A `GIT_AUTHOR_*` variable that is set outranks everything even when it
+    /// is blank, and git does not fall back from it: a blank name is refused
+    /// ("empty ident name not allowed"), reported here as no name; a blank
+    /// address is accepted as `<>`, reported here as no address, which is what
+    /// the commit box asks the user to fill in. A host-derived name or address
+    /// (git's last resort, from the login and hostname) is deliberately not
+    /// consulted: an identity the user never set is "not configured".
     pub fn identity(repo_path: &str) -> Result<GitIdentity, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::identity_in(&repo)
@@ -1219,24 +1237,44 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// [`Self::identity_in`] with the environment passed in: git's child
-    /// inherits this process's `GIT_AUTHOR_*` / `EMAIL`.
-    ///
-    /// Same precedence as `git var GIT_AUTHOR_IDENT`: the author variable
-    /// outranks config, per field, and the `GIT_COMMITTER_*` pair plays no part
-    /// (git resolves the committer ident separately, from its own variables
-    /// and the same config). A blank value counts as unset.
+    /// inherits this process's `GIT_AUTHOR_*` / `EMAIL`. The `GIT_COMMITTER_*`
+    /// pair plays no part: git resolves the committer ident separately.
     fn identity_with(
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<GitIdentity, CommandError> {
-        let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
-        let name = match env("GIT_AUTHOR_NAME") {
-            Some(name) => Some(name),
-            None => Self::config_value(repo, "user.name")?,
+        // `Some(None)`: set but blank, which stops the search without an answer.
+        let author_env = |name: &str| {
+            lookup(name).map(|value| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_string())
+            })
         };
-        let email = match env("GIT_AUTHOR_EMAIL") {
-            Some(email) => Some(email),
-            None => Self::config_value(repo, "user.email")?.or_else(|| env("EMAIL")),
+        let first_config = |keys: &[&str]| -> Result<Option<String>, CommandError> {
+            for key in keys {
+                if let Some(value) = Self::config_value(repo, key)? {
+                    return Ok(Some(value));
+                }
+            }
+            Ok(None)
+        };
+        let name = match author_env("GIT_AUTHOR_NAME") {
+            Some(blank_or_value) => blank_or_value,
+            None => first_config(&["author.name", "user.name"])?,
+        };
+        let email = match author_env("GIT_AUTHOR_EMAIL") {
+            Some(blank_or_value) => blank_or_value,
+            None => match Self::config_value(repo, "author.email")? {
+                Some(email) => Some(email),
+                // A set-but-blank `user.email` ends the search (`<>`); only an
+                // absent one reaches `EMAIL`.
+                None => match Self::config_value_raw(repo, "user.email")? {
+                    Some(email) => (!email.is_empty()).then_some(email),
+                    None => lookup("EMAIL")
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty()),
+                },
+            },
         };
         Ok(GitIdentity { name, email })
     }
@@ -6900,59 +6938,189 @@ mod tests {
         );
     }
 
-    /// Every combination of (author name env, author email env, config) agrees
-    /// with what the real `git var GIT_AUTHOR_IDENT` prints, with the committer
-    /// variables and `EMAIL` unset (the committer-only case is the test above).
+    /// Each case sets author/user config and the environment, then compares
+    /// `identity()` with what the real `git var GIT_AUTHOR_IDENT` does with the
+    /// same inputs: the same name and address when git answers (an empty
+    /// address, which git prints as `<>`, is "no email" here), and an incomplete
+    /// identity when git refuses. The committer variables are unset throughout.
+    /// Cases that would reach git's host-derived fallback are left out.
     #[test]
     fn identity_matches_git_var_author_ident_across_env_and_config_combinations() {
-        let _serial = crate::test_support::env::env_serial();
-        for config_set in [false, true] {
-            for env_name in [false, true] {
-                for env_email in [false, true] {
-                    let dir = init_repo_with_commit();
-                    blank_identity(dir.path());
-                    if config_set {
-                        git_ok(dir.path(), &["config", "user.name", "Cfg Name"]);
-                        git_ok(dir.path(), &["config", "user.email", "cfg@gitpulse.dev"]);
-                    }
-                    let lookup = |key: &str| match key {
-                        "GIT_AUTHOR_NAME" => env_name.then(|| "Env Name".to_string()),
-                        "GIT_AUTHOR_EMAIL" => env_email.then(|| "env@gitpulse.dev".to_string()),
-                        _ => None,
-                    };
-                    let mut git = std::process::Command::new("git");
-                    git.args(["var", "GIT_AUTHOR_IDENT"])
-                        .current_dir(dir.path())
-                        .env_remove("EMAIL")
-                        .env_remove("GIT_COMMITTER_NAME")
-                        .env_remove("GIT_COMMITTER_EMAIL")
-                        .env_remove("GIT_AUTHOR_NAME")
-                        .env_remove("GIT_AUTHOR_EMAIL");
-                    if env_name {
-                        git.env("GIT_AUTHOR_NAME", "Env Name");
-                    }
-                    if env_email {
-                        git.env("GIT_AUTHOR_EMAIL", "env@gitpulse.dev");
-                    }
-                    let out = git.output_locked().expect("git var");
-                    let ours = GitWriter::identity_with(dir.path(), &lookup).unwrap();
-                    let label = format!("config={config_set} name={env_name} email={env_email}");
-                    if out.status.success() {
-                        let line = String::from_utf8_lossy(&out.stdout);
-                        let (name, rest) = line.split_once(" <").expect("ident shape");
-                        let email = rest.split_once('>').expect("ident shape").0;
-                        assert_eq!(ours.name.as_deref(), Some(name), "{label}: {line}");
-                        // Git prints an empty address as `<>`; the app calls
-                        // that "no email" (the commit box asks for one).
-                        assert_eq!(
-                            ours.email.as_deref(),
-                            (!email.is_empty()).then_some(email),
-                            "{label}: {line}"
-                        );
-                    } else {
-                        assert!(!ours.is_complete(), "{label}: git var refused, {ours:?}");
-                    }
-                }
+        type Pairs = &'static [(&'static str, &'static str)];
+        // (label, config, environment)
+        let cases: &[(&str, Pairs, Pairs)] = &[
+            (
+                "user only",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[],
+            ),
+            (
+                "author.name over user.*",
+                &[
+                    ("author.name", "A"),
+                    ("user.name", "U"),
+                    ("user.email", "u@x"),
+                ],
+                &[],
+            ),
+            (
+                "author.* over user.*",
+                &[
+                    ("author.name", "A"),
+                    ("author.email", "a@x"),
+                    ("user.name", "U"),
+                    ("user.email", "u@x"),
+                ],
+                &[],
+            ),
+            (
+                "author.* alone",
+                &[("author.name", "A"), ("author.email", "a@x")],
+                &[],
+            ),
+            (
+                "env over author.* and user.*",
+                &[
+                    ("author.name", "A"),
+                    ("author.email", "a@x"),
+                    ("user.name", "U"),
+                    ("user.email", "u@x"),
+                ],
+                &[("GIT_AUTHOR_NAME", "E"), ("GIT_AUTHOR_EMAIL", "e@x")],
+            ),
+            (
+                "env name alone",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_NAME", "E")],
+            ),
+            (
+                "env email alone",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_EMAIL", "e@x")],
+            ),
+            (
+                "env name set empty is refused, config is not consulted",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_NAME", "")],
+            ),
+            (
+                "env name whitespace is refused",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_NAME", "  ")],
+            ),
+            (
+                "env email set empty is `<>`, config is not consulted",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_EMAIL", "")],
+            ),
+            (
+                "env email whitespace is `<>`",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("GIT_AUTHOR_EMAIL", "  ")],
+            ),
+            (
+                "env email empty beats EMAIL",
+                &[("user.name", "U")],
+                &[("GIT_AUTHOR_EMAIL", ""), ("EMAIL", "m@x")],
+            ),
+            (
+                "EMAIL alone supplies the address",
+                &[("user.name", "U")],
+                &[("EMAIL", "m@x")],
+            ),
+            (
+                "user.email beats EMAIL",
+                &[("user.name", "U"), ("user.email", "u@x")],
+                &[("EMAIL", "m@x")],
+            ),
+            (
+                "author.email beats EMAIL",
+                &[("user.name", "U"), ("author.email", "a@x")],
+                &[("EMAIL", "m@x")],
+            ),
+            (
+                "empty author.name falls through to user.name",
+                &[
+                    ("author.name", ""),
+                    ("user.name", "U"),
+                    ("user.email", "u@x"),
+                ],
+                &[],
+            ),
+            (
+                "empty author.email falls through to user.email",
+                &[
+                    ("author.email", ""),
+                    ("user.name", "U"),
+                    ("user.email", "u@x"),
+                ],
+                &[],
+            ),
+            (
+                "empty user.name is refused",
+                &[("user.name", ""), ("user.email", "u@x")],
+                &[],
+            ),
+            (
+                "whitespace user.name is refused",
+                &[("user.name", "  "), ("user.email", "u@x")],
+                &[],
+            ),
+            (
+                "empty user.email is `<>`",
+                &[("user.name", "U"), ("user.email", "")],
+                &[],
+            ),
+        ];
+        let serial = crate::test_support::env::env_serial();
+        for (label, config, env) in cases {
+            let dir = init_repo_with_commit();
+            for (key, value) in *config {
+                git_ok(dir.path(), &["config", key, value]);
+            }
+            // An empty home and no system config: a key a case leaves out is
+            // genuinely absent, for both `git var` and the engine's git (which
+            // reads `$HOME/.gitconfig`), not filled in by the test machine.
+            let empty_home = tempfile::tempdir().unwrap();
+            let _isolated = crate::test_support::env::bind_env(&serial)
+                .set("HOME", empty_home.path())
+                .set("GIT_CONFIG_NOSYSTEM", "1")
+                .remove("GIT_CONFIG_GLOBAL")
+                .remove("XDG_CONFIG_HOME");
+            let lookup = |key: &str| {
+                env.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            };
+            let mut git = std::process::Command::new("git");
+            git.args(["var", "GIT_AUTHOR_IDENT"])
+                .current_dir(dir.path())
+                .env_remove("EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL")
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL");
+            for (key, value) in *env {
+                git.env(key, value);
+            }
+            let out = git.output_locked().expect("git var");
+            let ours = GitWriter::identity_with(dir.path(), &lookup).unwrap();
+            if out.status.success() {
+                let line = String::from_utf8_lossy(&out.stdout);
+                let (name, rest) = line.split_once(" <").expect("ident shape");
+                let email = rest.split_once('>').expect("ident shape").0;
+                assert_eq!(ours.name.as_deref(), Some(name), "{label}: {line}");
+                assert_eq!(
+                    ours.email.as_deref(),
+                    (!email.is_empty()).then_some(email),
+                    "{label}: {line}"
+                );
+            } else {
+                assert!(
+                    ours.name.is_none(),
+                    "{label}: git var refused ({}), identity() has a name: {ours:?}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
             }
         }
     }
