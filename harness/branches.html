@@ -112,9 +112,10 @@ if(params.has("check")) {
   try {
     // --- two-line branch rows -------------------------------------------
     // Geometry, so it can only be checked where real layout exists. The
-    // sidebar here is 320px: narrow enough that line two overflows on a
-    // branch with churn AND divergence, which is the case that used to
-    // paint numbers straight through the row's edge.
+    // sidebar here is 320px. Line two of a branch with churn AND divergence
+    // used to overflow at that width and paint numbers straight through the
+    // row's edge; since the action rail moved to line one it fits there, and
+    // the overflow case is measured at 280px below.
     const branchRows = () => [...document.querySelectorAll(".gp-cv-row")]
       .filter(r => r.querySelector('[aria-label^="Copy branch name"]'));
     const lines = row => [...row.querySelector(".flex-col").children];
@@ -135,8 +136,17 @@ if(params.has("check")) {
       [...document.querySelectorAll(".gp-cv-row")]
         .filter(r => !r.querySelector('[aria-label^="Copy branch name"]'))
         .every(r => Math.round(r.getBoundingClientRect().height)===sidebarRowHeight("section-header","spacious","two-line")));
-    check("neither line paints under the hover actions",branchRows().every(row =>
-      paintRight(row) <= row.querySelector('[aria-label^="Copy branch name"]').parentElement.getBoundingClientRect().left + 0.5));
+    // The action rail sits level with line one, so line one must end before
+    // it and line two must start below it; line two then has the full row.
+    const rail = row => row.querySelector('[aria-label^="Copy branch name"]').parentElement.getBoundingClientRect();
+    const linePaintRight = line => {
+      const edge = line.getBoundingClientRect().right;
+      return Math.max(...[...line.children].map(c => Math.min(c.getBoundingClientRect().right, edge)));
+    };
+    check("line one never paints under the hover actions",branchRows().every(row =>
+      linePaintRight(lines(row)[0]) <= rail(row).left + 0.5));
+    check("line two runs below the hover actions, never under them",branchRows().every(row =>
+      lines(row)[1].getBoundingClientRect().top >= rail(row).bottom - 0.5));
     check("no row paints past its own edge",branchRows().every(row =>
       paintRight(row) <= row.getBoundingClientRect().right));
     // The name gets line one to itself. Measured against the widest thing
@@ -153,19 +163,30 @@ if(params.has("check")) {
       !/[+↑↓]\d/.test(lines(navRow)[0].textContent));
     check("line two carries the measured numbers",
       /\+2768/.test(lines(navRow)[1].textContent) && /↑14/.test(lines(navRow)[1].textContent));
-    // Clipping is the last resort and it must cost the attribution first,
-    // never a count — a half-drawn "+27" reads as a smaller number.
+    // At 320px this busy row fits: the author gives up width through its own
+    // ellipsis, which is the ordinary way line two degrades.
     const busy = lines(navRow)[1];
-    check("line two clips rather than overflowing",busy.scrollWidth > busy.clientWidth);
+    const authorEl = [...busy.querySelectorAll("span")].find(el => el.title.startsWith("Last commit by"));
+    check("at 320px line two fits by shortening the author, not by clipping",
+      busy.scrollWidth <= busy.clientWidth && authorEl.scrollWidth > authorEl.clientWidth);
+    // Clipping is the last resort and it must cost the attribution first,
+    // never a count — a half-drawn "+27" reads as a smaller number. Line two
+    // has the full row now, so this fixture only overflows on a narrower
+    // sidebar: measure there, then put the 320px stage back.
+    const sidebarEl = document.getElementById("sidebar");
+    sidebarEl.style.width = "280px";
     const paintedWidth = (el,line) => {
       const b = el.getBoundingClientRect(), edge = line.getBoundingClientRect().right;
       return Math.max(0, Math.min(b.right, edge) - b.left);
     };
-    const authorEl = [...busy.querySelectorAll("span")].find(el => el.title.startsWith("Last commit by"));
+    check("at 280px line two clips rather than overflowing",busy.scrollWidth > busy.clientWidth);
     check("clipping takes the author first — it paints nothing",paintedWidth(authorEl,busy)===0);
     check("clipping never touches a count",
       busy.querySelector('[aria-label*="additions"]').getBoundingClientRect().right
         <= busy.getBoundingClientRect().right + 0.5);
+    check("a clipped line two still paints nothing past its row",branchRows().every(row =>
+      paintRight(row) <= row.getBoundingClientRect().right));
+    sidebarEl.style.width = "";
     // Stale is the age's own tint now, not a second chip beside it.
     const staleRow = branchRows().find(r => r.textContent.includes("0.0.9"));
     const staleAge = [...lines(staleRow)[1].querySelectorAll("span")]

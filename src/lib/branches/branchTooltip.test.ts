@@ -49,6 +49,14 @@ describe("branchTooltip", () => {
     expect(text).toContain("upstream gone");
   });
 
+  it("carries the health verdict the row's dot stands for, and only then", () => {
+    // The dot fades for the hover actions, so its reason must be in the hover text.
+    const gone = branchTooltip(branch({ is_gone: true }), 1_700_086_400);
+    expect(gone.split("\n").at(-1)).toMatch(/^Upstream gone — /);
+    const fresh = branchTooltip(branch({ upstream: null, commits_ahead_of_base: 0 }), 1_700_000_100);
+    expect(fresh).not.toMatch(/ — /);
+  });
+
   it("reports ahead/behind counts when present", () => {
     const text = branchTooltip(branch({ ahead_count: 2, behind_count: 5 }), undefined);
     expect(text).toContain("ahead 2, behind 5");

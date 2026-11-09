@@ -1,6 +1,7 @@
 import type { BranchInfo, TagInfo } from "./types";
 import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
 import { plural } from "../format";
+import { branchHealth, needsAttention } from "./health";
 
 /**
  * Rich hover text for the branch tree.
@@ -56,6 +57,12 @@ export function branchTooltip(
 
   const meta = [...counts, ...flags].join(" · ");
   if (meta) lines.push(meta);
+
+  // The verdict behind the row's health dot. The dot gives way to the row's
+  // actions on hover, so the hover text is where its reason has to live.
+  // Same filter as BranchHealthDot: only a branch the dot is drawn for.
+  const health = branchHealth(branch, nowSec === undefined ? Date.now() : nowSec * 1000);
+  if (needsAttention(health)) lines.push(`${health.title} — ${health.detail}`);
 
   return lines.join("\n");
 }

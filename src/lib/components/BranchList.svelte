@@ -892,9 +892,9 @@
 {#snippet branchActions(branch: BranchInfo, reveal: boolean)}
   <button
     type="button"
-    class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0 {reveal
-      ? 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity'
-      : ''}"
+    class="rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0 {reveal
+      ? 'p-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity'
+      : 'p-1'}"
     onclick={() => void copyText(branch.name)}
     title="Copy branch name"
     aria-label="Copy branch name {branch.name}"
@@ -961,7 +961,7 @@
       oncontextmenu={(e) => openBranchMenu(e, branch)}
       title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
       class={twoLine
-        ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-11"
+        ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"
         : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
     >
       {#if twoLine}
@@ -969,31 +969,31 @@
         <span class="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
           <!-- Line one is the name's alone. Nothing after it can outgrow a
                chip, so the name truncates at the width of the sidebar rather
-               than at whatever a row of buttons and counters left over. -->
-          <span class="w-full flex items-center gap-1.5 min-w-0 leading-none">
+               than at whatever a row of buttons and counters left over.
+               Only this line reserves the action rail (`pr-11`): the rail sits
+               level with the name, so the reservation is constant and the name
+               never re-truncates when the actions appear on hover. -->
+          <span class="w-full flex items-center gap-1.5 min-w-0 leading-none pr-11">
             {@render branchIdentity(branch, leaf, false, false)}
-            <span class="ml-auto flex items-center gap-1 shrink-0">
-              <BranchHealthDot {branch} />
-              {#if branch.is_current}
-                <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs"></span>
-              {/if}
-            </span>
           </span>
           <!-- Line two, flush left under the name, in descending order of
                what a reader would miss: churn, divergence, files, then the
                attribution. An `ml-auto` here would right-align the tail,
                which on the common branch — no churn, no divergence — leaves
-               it floating alone across an empty row.
+               it floating alone across an empty row. It runs the full width
+               of the row: the action rail is on line one, so nothing here
+               needs to make room for it.
                `overflow-hidden` is load-bearing, not tidiness: the numbers
                are all shrink-0, so on a sidebar dragged near its 264px
                minimum they would otherwise paint straight through the row's
-               edge and under the hover actions. The mask fades the last 14px
-               only if content actually reaches them, so a clipped row looks
-               clipped instead of looking like a smaller number — and the
-               order above means what goes first is the author, not a count. -->
+               edge. The mask fades only the 10px of right padding, so it
+               touches nothing but content that has already overflowed: a
+               clipped number looks clipped instead of looking smaller, while
+               the author's ellipsis — the normal way this line gives up
+               width — ends before the fade and stays crisp. -->
           <span
-            class="w-full flex items-center gap-1 min-w-0 leading-none overflow-hidden"
-            style="mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent);"
+            class="w-full flex items-center gap-1 min-w-0 leading-none overflow-hidden pr-2.5"
+            style="mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent);"
           >
             {@render branchNumbers(branch, statsMissing)}
             <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
@@ -1005,8 +1005,23 @@
       {/if}
     </button>
     {#if twoLine}
-      <div class="absolute right-1 top-0 h-full flex items-center gap-0.5">
-        {@render branchActions(branch, true)}
+      <!-- Level with line one and clear of line two: 16px buttons (the copy
+           button drops to the menu button's p-0.5 here) centred on the name,
+           y 5–21, above line two's top at ~21.5. At rest the status dots sit
+           at the row's right edge; on hover or focus they fade and the actions
+           take their place, so neither ever pushes the name. -->
+      <div class="absolute right-1 top-[5px] h-4 flex items-center">
+        <span
+          class="absolute right-1.5 flex items-center gap-1 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0"
+        >
+          <BranchHealthDot {branch} />
+          {#if branch.is_current}
+            <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs"></span>
+          {/if}
+        </span>
+        <span class="relative flex items-center gap-0.5">
+          {@render branchActions(branch, true)}
+        </span>
       </div>
     {:else}
       <div class="flex items-center gap-1 shrink-0 opacity-90">
