@@ -940,7 +940,7 @@ measurement.
 | --- | --- | --- |
 | `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
-| `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
+| `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the size of the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
@@ -1147,13 +1147,24 @@ moves them, so it slightly overstates the solve):
 | serialize 100k | 28.20 ms | 31.08 ms | 32.86 ms | 52,395,741 payload bytes (about 524 B per row) |
 | decode 100k (`serde_json::Value`, a stand-in for `JSON.parse`) | 137.45 ms | 147.57 ms | 157.86 ms | same bytes |
 | serialize 5k / 30k | 1.34 / 8.51 ms | | | 2.6 MB / 15.7 MB |
-| unchanged answer | 4.21 us | 5.08 us | 8.83 us | 208 payload bytes |
+| unchanged payload serialize | 4.21 us | 5.08 us | 8.83 us | 208 payload bytes |
+
+The last row serializes a hand-built `unchanged` struct and nothing else: its
+208 bytes are the size of the answer on the wire, but its 4 us is not the cost
+of an unchanged reload. A real hit still stats every ref file and runs the
+HEAD, ref-decoration, default-branch and hidden-ref probes before it can
+answer, and **that cost is not measured**. Likewise, a reload whose token is
+stale now runs those probes before the history walk instead of overlapping it
+with them, and **that added latency is not measured either**. The token is also
+refused once it is older than the ref cache's 60 s TTL (the stamp cannot see
+files pulled in by `include.path`), so a reload after a minute is a full one.
 
 So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
-fixture), the lane solve is tens of milliseconds, and the cost of a reload that
-changed nothing is dominated by bytes and decode rather than by the solve; the
-token answer replaces all of it with 208 bytes. A real repository's subjects
-and lane width move the byte counts.
+fixture) and the lane solve is tens of milliseconds, so on the payload side the
+cost of a reload that changed nothing is bytes and decode rather than the
+solve; what the token answer saves in practice, against what its probes cost,
+is not established by these rows. A real repository's subjects and lane width
+move the byte counts.
 
 `watcher` (N = 60): `record_event_signal` over 10,000 events: min 15.14 ms, p50
 18.21 ms, p95 20.17 ms; 549k events/s at p50-ish (metric); 7,000 admitted, 3,000

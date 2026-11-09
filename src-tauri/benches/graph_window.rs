@@ -1,6 +1,7 @@
 //! What one graph window costs once git has answered: assembling and
-//! lane-solving it, serializing it, decoding it, and the `unchanged` answer
-//! that replaces all of that when a revision token still names the state.
+//! lane-solving it, serializing it, decoding it, and the size of the
+//! `unchanged` answer that replaces the payload when a revision token still
+//! names the state.
 //!
 //! Run with `cargo bench --manifest-path src-tauri/Cargo.toml --bench graph_window`
 //! (`-- --smoke` for 3 samples, `-- --json <path>` for the report).
@@ -20,8 +21,11 @@
 //! * `decode`: `serde_json::from_slice` into a `Value`, a stand-in for the
 //!   WebView's `JSON.parse` (same bytes, same allocation shape; the real parse
 //!   is not measured here).
-//! * `unchanged`: serializing the answer a matching token gets. Counter:
-//!   `payload_bytes`, the O(1) the token buys.
+//! * `unchanged payload serialize`: serializing a hand-built `unchanged`
+//!   struct, nothing else. Its counter, `payload_bytes`, is the O(1) the token
+//!   buys on the wire. Its time is NOT the cost of an unchanged reload, which
+//!   also stats every ref file and runs the HEAD, refs, default-branch and
+//!   hidden-ref probes; that path is not measured here.
 //!
 //! # Fixture
 //!
@@ -149,7 +153,7 @@ fn main() {
             Sample::default().counter("payload_bytes", bytes.len() as u64)
         }));
     }
-    cases.push(Case::new("unchanged answer", || {
+    cases.push(Case::new("unchanged payload serialize", || {
         let out = serde_json::to_vec(&unchanged).expect("serialize");
         std::hint::black_box(&out);
         Sample::default().counter("payload_bytes", out.len() as u64)
