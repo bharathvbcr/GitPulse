@@ -109,10 +109,7 @@ fn a_graph_token_does_not_answer_for_a_state_or_view_it_was_not_issued_for() {
             "revision"
         );
 
-        crate::test_support::git_in(
-            repo.path(),
-            &["commit", "--allow-empty", "-m", "feat: 3"],
-        );
+        crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "feat: 3"]);
         let moved = page(&root, 100, Some(&token)).unwrap();
         assert!(!moved.unchanged, "a ref moved");
         assert_eq!(moved.rows.len(), 4);
@@ -124,6 +121,84 @@ fn a_graph_token_does_not_answer_for_a_state_or_view_it_was_not_issued_for() {
                 .unwrap()
                 .unchanged,
             "a new branch is a new decoration"
+        );
+    });
+}
+
+/// The ref cache never serves an answer older than its TTL, because the stamp
+/// cannot see every input; a token is held to the same bound.
+#[test]
+fn a_graph_token_older_than_the_ref_cache_ttl_is_answered_with_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let clock = crate::engine::ref_cache::ManualClock::install();
+        let repo = graph_token_repo();
+        let root = repo.path().to_string_lossy().into_owned();
+        let ttl = crate::engine::ref_cache::TTL;
+        let first = page(&root, 100, None).unwrap().graph_token.unwrap();
+
+        clock.advance(ttl - std::time::Duration::from_secs(2));
+        let inside = page(&root, 100, Some(&first)).unwrap();
+        assert!(
+            inside.unchanged,
+            "a token inside the TTL still names the state"
+        );
+        assert_eq!(
+            inside.graph_token.as_deref(),
+            Some(first.as_str()),
+            "an unchanged answer does not renew the token: its age counts from the real read"
+        );
+
+        clock.advance(std::time::Duration::from_secs(4));
+        let past = page(&root, 100, Some(&first)).unwrap();
+        assert!(!past.unchanged, "a token past the TTL is refused");
+        assert_eq!(past.rows.len(), 3, "and the refusal is a whole page");
+        let fresh = past.graph_token.expect("a fresh token comes with it");
+        assert_ne!(fresh, first);
+        assert!(page(&root, 100, Some(&fresh)).unwrap().unchanged);
+    });
+}
+
+/// Nothing the stamp covers moves when an `include.path` file switches replace
+/// refs off, yet the history git prints changes. The TTL is what bounds how
+/// long a held graph can stay wrong.
+#[test]
+fn a_change_the_stamp_cannot_see_is_picked_up_once_the_token_expires() {
+    crate::engine::ref_cache::eager(|| {
+        let clock = crate::engine::ref_cache::ManualClock::install();
+        let repo = graph_token_repo();
+        let outside = tempfile::tempdir().expect("a directory outside .git");
+        let included = outside.path().join("extra.gitconfig");
+        std::fs::write(&included, "").unwrap();
+        crate::test_support::git_in(
+            repo.path(),
+            &["config", "include.path", included.to_str().unwrap()],
+        );
+        // The middle commit is replaced by a parentless copy of itself.
+        crate::test_support::git_in(repo.path(), &["replace", "--graft", "HEAD~1"]);
+        let root = repo.path().to_string_lossy().into_owned();
+        let first = page(&root, 100, None).unwrap();
+        assert_eq!(
+            first.rows.len(),
+            2,
+            "the replace ref hides the oldest commit"
+        );
+        let token = first.graph_token.unwrap();
+
+        std::fs::write(&included, "[core]\n\tuseReplaceRefs = false\n").unwrap();
+        clock.advance(std::time::Duration::from_secs(1));
+        let inside = page(&root, 100, Some(&token)).unwrap();
+        assert!(
+            inside.unchanged,
+            "no stamped file moved, so inside the TTL the held graph is kept"
+        );
+
+        clock.advance(crate::engine::ref_cache::TTL);
+        let past = page(&root, 100, Some(&token)).unwrap();
+        assert!(!past.unchanged);
+        assert_eq!(
+            past.rows.len(),
+            3,
+            "the full history is back once the token expires"
         );
     });
 }

@@ -359,6 +359,38 @@ fn graph_token(
     Some(format!("{:016x}", hasher.finish()))
 }
 
+/// Seconds since the Unix epoch on the clock the ref cache judges stamps by.
+fn issue_seconds() -> u64 {
+    crate::engine::ref_cache::wall_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The token a client holds: the state hash and the second the load that
+/// issued it began. The stamp cannot see everything a graph is a function of
+/// (a file pulled in by `include.path` can switch off replace refs without
+/// touching any stamped file), which is why the ref cache bounds every answer
+/// by [`crate::engine::ref_cache::TTL`]. A token carries the same bound.
+fn issued_token(hash: &str, issued: u64) -> String {
+    format!("{hash}-{issued}")
+}
+
+/// True when `known` was issued for state `hash` and is younger than the ref
+/// cache's TTL. An issue time in the future (the clock stepped back) is not
+/// trusted. It is judged on the same clock a test can pin.
+fn token_names(known: &str, hash: &str) -> bool {
+    let Some((known_hash, issued)) = known.split_once('-') else {
+        return false;
+    };
+    let Ok(issued) = issued.parse::<u64>() else {
+        return false;
+    };
+    known_hash == hash
+        && issue_seconds()
+            .checked_sub(issued)
+            .is_some_and(|age| age < crate::engine::ref_cache::TTL.as_secs())
+}
+
 /// The settled fingerprint of the files [`graph_token`] stands on, read now.
 fn graph_stamp(repo_path: &str, ref_scope: RefScope) -> Option<u64> {
     crate::engine::ref_cache::stamp(
@@ -427,6 +459,7 @@ pub(super) fn commit_graph_page(
         // so a ref that moves during this load makes the token it issues stale
         // on arrival instead of naming a state newer than the rows.
         let tokenable = revision.is_none() && skip.unwrap_or(0) == 0;
+        let issued = issue_seconds();
         let stamp_before = if tokenable {
             graph_stamp(&repo_path, ref_scope)
         } else {
@@ -592,7 +625,7 @@ pub(super) fn commit_graph_page(
             })
             .flatten();
         if let (Some(known), Some(current)) = (known_token.as_deref(), current.as_deref()) {
-            if known == current {
+            if token_names(known, current) {
                 return Ok(CommitGraphPayload {
                     rows: Vec::new(),
                     head_id,
@@ -602,7 +635,9 @@ pub(super) fn commit_graph_page(
                     notices: notes.notices,
                     mainline_id: None,
                     mainline_name: None,
-                    graph_token: Some(current.to_string()),
+                    // The token it came with, so its age keeps counting from
+                    // the load that really read the page.
+                    graph_token: Some(known.to_string()),
                     unchanged: true,
                 });
             }
@@ -635,7 +670,7 @@ pub(super) fn commit_graph_page(
         // them to one state.
         if tokenable && stamp_before.is_some() && graph_stamp(&repo_path, ref_scope) == stamp_before
         {
-            payload.graph_token = current;
+            payload.graph_token = current.map(|hash| issued_token(&hash, issued));
         }
         Ok(payload)
     }

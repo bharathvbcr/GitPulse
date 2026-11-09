@@ -38,7 +38,7 @@ use crate::engine::git_cli::{self, Incomplete};
 const RACY_WINDOW: Duration = Duration::from_secs(3);
 
 /// Upper bound on how long any answer is served, whatever its stamp says.
-const TTL: Duration = Duration::from_secs(60);
+pub(crate) const TTL: Duration = Duration::from_secs(60);
 
 /// Files and directories one stamp may cover. A repository with more loose
 /// refs than this is answered by git every time, as it was before.
