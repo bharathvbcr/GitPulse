@@ -8050,5 +8050,16 @@ done
             assert_eq!(inroot.total(), 3, "{inroot:?}");
             assert!(outroot.total() <= inroot.total(), "{outroot:?} vs {inroot:?}");
         }
+
+        /// A case-variant spelling of a file in a sibling that holds it dirty
+        /// (APFS is case-insensitive).
+        #[test]
+        fn case_variant_spelling_of_a_sibling_file_is_still_judged() {
+            let farm = farm_bound(true, false, 2);
+            let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
+            let upper = format!("{}/SEED.TXT", b.display());
+            let output = guard_here(&edit_call(a.to_str().unwrap(), &upper));
+            assert!(asks(&output), "{}", rendered(&output));
+        }
     }
 }
