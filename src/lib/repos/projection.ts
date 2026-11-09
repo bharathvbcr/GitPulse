@@ -143,10 +143,18 @@ export interface ProjectionCache {
   tabs: readonly TabRecord[] | null;
   labels: Map<string, string>;
   rows: Map<string, { tab: TabRecord; session: RepoSession | undefined; active: boolean; label: string; row: OpenRepoTab }>;
+  /** The array `project` returned last, handed back while no row changed or moved. */
+  openTabs: OpenRepoTab[] | null;
 }
 
 export function createProjectionCache(): ProjectionCache {
-  return { tabs: null, labels: new Map(), rows: new Map() };
+  return { tabs: null, labels: new Map(), rows: new Map(), openTabs: null };
+}
+
+/** Every `OpenRepoTab` field is a primitive, so equal keys and values is equal. */
+function sameRow(a: OpenRepoTab, b: OpenRepoTab): boolean {
+  const keys = Object.keys(a) as (keyof OpenRepoTab)[];
+  return keys.length === Object.keys(b).length && keys.every((key) => Object.is(a[key], b[key]));
 }
 
 export function project(
@@ -162,7 +170,7 @@ export function project(
     for (const id of cache.rows.keys()) if (!live.has(id)) cache.rows.delete(id);
   }
   const labels = cache.labels;
-  const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
+  const mapped: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
     const session = internal.sessions[tab.id];
     const active = tab.id === internal.workspace.activeId;
     const label = labels.get(tab.path) ?? displayName(tab.path);
@@ -170,10 +178,22 @@ export function project(
     if (kept && kept.tab === tab && kept.session === session && kept.active === active && kept.label === label) {
       return kept.row;
     }
-    const row = projectTab(tab, session, active, label, options);
+    const built = projectTab(tab, session, active, label, options);
+    // The store replaces a session on every change, selection and status
+    // included, so a rebuilt row is usually equal to the one it replaces.
+    // Keeping the old object is what lets the array below keep its identity.
+    const row = kept && sameRow(kept.row, built) ? kept.row : built;
     cache.rows.set(tab.id, { tab, session, active, label, row });
     return row;
   });
+  // Positionally identical, not merely "every row came from the cache": a
+  // drag reorder reuses every row and moves them, and must publish a new array.
+  const previous = cache.openTabs;
+  const openTabs =
+    previous && previous.length === mapped.length && mapped.every((row, i) => row === previous[i])
+      ? (previous as OpenRepoTab[])
+      : mapped;
+  cache.openTabs = openTabs;
 
   const active = internal.workspace.activeId
     ? internal.sessions[internal.workspace.activeId]

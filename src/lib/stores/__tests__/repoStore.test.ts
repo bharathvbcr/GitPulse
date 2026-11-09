@@ -2980,6 +2980,47 @@ describe("repoStore ignore-whitespace preference", () => {
   });
 });
 
+describe("repoStore openTabs identity", () => {
+  async function twoTabs() {
+    const { store } = makeStore();
+    await store.openRepo("/r/tabs-a");
+    await store.openRepo("/r/tabs-b");
+    return store;
+  }
+
+  it("keeps the array when a publish changed no tab entry", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    expect(before).toHaveLength(2);
+    // Replaces the active session without touching anything a tab row reads.
+    store.selectFilePath("README.md");
+    const after = get(store).openTabs;
+    expect(get(store).selectedFilePath).toBe("README.md");
+    expect(after).toBe(before);
+    expect(after[0]).toBe(before[0]);
+  });
+
+  it("returns a new array when a tab entry changes", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    await store.activateTab(before[0].id);
+    const after = get(store).openTabs;
+    expect(after).not.toBe(before);
+    expect(after.map((tab) => tab.isActive)).toEqual([true, false]);
+  });
+
+  it("returns a new array when tabs are reordered although every row is reused", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    expect(store.moveTabBy(before[1].id, -1)).toBe(true);
+    const after = get(store).openTabs;
+    expect(after).not.toBe(before);
+    expect(after.map((tab) => tab.path)).toEqual(["/r/tabs-b", "/r/tabs-a"]);
+    expect(after[0]).toBe(before[1]);
+    expect(after[1]).toBe(before[0]);
+  });
+});
+
 describe("repoStore index and worktree mutations refresh the status facet only", () => {
   const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
   const unit = async () => undefined as never;
