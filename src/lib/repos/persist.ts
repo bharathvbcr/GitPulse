@@ -2,6 +2,7 @@ import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "./path
 // Runtime import, and safe: viewRegistry takes only `import type` from this
 // module, which the compiler erases, so the two do not form a runtime cycle.
 import { resolveSection } from "../views/viewRegistry";
+import { restoredHistoryList, type HistoryList } from "../views/historyList";
 import {
   MAX_LAST_CLOSED,
   MAX_OPEN_TABS,
@@ -37,8 +38,8 @@ export interface PersistedTab {
    * The section last open in each sectioned view, keyed by view id.
    *
    * Per view, not one value, because a section is a lens on that view's
-   * subject: leaving History on Reflog and coming back through Files should
-   * return to Reflog, not reset. Additive on the schema — an older build
+   * subject: leaving History on Diff and coming back through Files should
+   * return to Diff, not reset. Additive on the schema — an older build
    * ignores the field and simply opens each view on its default section.
    */
   viewSections?: Record<string, string>;
@@ -57,6 +58,13 @@ export interface PersistedTab {
    * recovery.
    */
   terminalOpen?: boolean;
+  /**
+   * Which list History › Graph was drawing (see `views/historyList.ts`).
+   * Written only as `"moves"`: absent is the commit graph, so a blob from a
+   * session that never opened the reflog is unchanged, and an older build
+   * ignores the field and opens on the graph.
+   */
+  historyList?: "moves";
   searchQuery: string;
   selectedBranch: string | null;
 }
@@ -154,8 +162,10 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // Graph, Diff and Reflog all answer "what happened to this repository".
   // As separate tabs the split forced round trips the Diff view had to grow
   // its own commit picker to avoid; as sections they share the selection.
+  // Reflog later folded into Graph as its "HEAD moves" list, which
+  // `restoredHistoryList` restores from this same retired id.
   diff: { tab: "history", section: "diff" },
-  reflog: { tab: "history", section: "reflog" },
+  reflog: { tab: "history", section: "graph" },
   // Pulse, Health, Storage and Coverage are the same shape: an on-demand scan
   // of the repository that must report honestly on its own truncation. Four
   // header entries that are empty until someone runs them became one view
@@ -207,7 +217,7 @@ export function migrateViewTab(value: unknown): ViewTab {
  * Two sources, in order: whatever the blob recorded, then the section a
  * retired `viewTab` implies. The retirement wins, because it describes the
  * pane the user was actually looking at when the session was written —
- * restoring "History" without "on the Reflog" is the retirement reading as a
+ * restoring "History" without "on the Diff" is the retirement reading as a
  * deletion.
  *
  * Every id is narrowed by the registry: a section renamed or dropped since
@@ -517,6 +527,7 @@ export function workspaceToPersisted(
       searchQuery?: string;
       selectedBranch?: string | null;
       terminalOpen?: boolean;
+      historyList?: HistoryList;
     }
   >,
   epoch = 0,
@@ -536,6 +547,7 @@ export function workspaceToPersisted(
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
+        ...(session?.historyList === "moves" ? { historyList: "moves" as const } : {}),
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -574,6 +586,9 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
       // or older blob might carry, both mean "closed". Opening a dock is what
       // spawns a shell, so the permissive reading is the costly one.
       terminalOpen: record.terminalOpen === true,
+      // Read from the raw record, before `sanitizeViewSections` narrows a
+      // retired `history: "reflog"` to Graph and the mode with it.
+      ...(restoredHistoryList(record) === "moves" ? { historyList: "moves" as const } : {}),
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

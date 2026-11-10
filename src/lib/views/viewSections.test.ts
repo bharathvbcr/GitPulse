@@ -13,17 +13,24 @@ import { RETIRED_VIEWS, isViewTab } from "../repos/persist";
 import { WIP_DESTINATIONS, WIP_REASON_KINDS } from "../repos/wipSummary";
 
 describe("view sections", () => {
-  it("keeps the three lenses that were three tabs, and the one that never was", () => {
-    // Graph, Diff and Reflog were top-level tabs, and their order is what the
-    // consolidation promised. Suspects is a fourth reading of the same subject
-    // — the history read backwards, from a symptom to its causes — so it lands
-    // after them rather than displacing one.
+  it("keeps Graph and Diff in order, with Suspects after them and no Reflog section", () => {
+    // Graph, Diff and Reflog were top-level tabs, then sections. Reflog then
+    // folded into Graph as its "HEAD moves" list (views/historyList.ts), so
+    // it is not a section any more. Suspects is another reading of the same
+    // subject — the history read backwards, from a symptom to its causes —
+    // so it lands after them rather than displacing one.
     expect(sectionsFor("history").map((s) => s.id)).toEqual([
       "graph",
       "diff",
-      "reflog",
       "suspects",
     ]);
+  });
+
+  it("lands a remembered Reflog section on Graph, the view's default", () => {
+    // The list mode a remembered Reflog implies is restored separately, by
+    // `restoredHistoryList` in persist; the section itself must still open.
+    expect(activeSectionFor("history", { history: "reflog" })).toBe("graph");
+    expect(resolveSection("history", "reflog")).toBe("graph");
   });
 
   it("opens a sectioned view on its first section", () => {
@@ -58,7 +65,7 @@ describe("view sections", () => {
   });
 
   it("keeps a remembered section", () => {
-    expect(activeSectionFor("history", { history: "reflog" })).toBe("reflog");
+    expect(activeSectionFor("history", { history: "suspects" })).toBe("suspects");
   });
 
   it("answers what is actually on screen, not merely which view is open", () => {

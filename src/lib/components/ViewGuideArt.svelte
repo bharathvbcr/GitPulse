@@ -144,15 +144,6 @@
     <rect x="20" y="40" width="88" height="4" rx="2" fill="rgb(var(--c-status-rose))" fill-opacity="0.7" />
     <rect x="20" y="52" width="104" height="4" rx="2" fill="rgb(var(--c-status-emerald))" fill-opacity="0.7" />
     <rect x="20" y="64" width="80" height="4" rx="2" fill="rgb(var(--c-status-emerald))" fill-opacity="0.55" />
-  {:else if view === "history" && section === "reflog"}
-    {#each [0, 1, 2, 3] as row (row)}
-      <rect x="16" y={26 + row * 16} width="224" height="13" rx="4" fill="rgb(var(--c-surface))" />
-      <rect x="24" y={30 + row * 16} width="28" height="5" rx="2.5" fill="rgb(var(--c-text-muted))" fill-opacity="0.4" />
-      <rect x="58" y={30 + row * 16} width={90 - row * 8} height="5" rx="2.5" fill="rgb(var(--c-text))" fill-opacity="0.3" />
-      {#if row === 0}
-        <rect x="200" y={28 + row * 16} width="32" height="9" rx="4.5" fill="rgb(var(--c-accent))" fill-opacity="0.3" />
-      {/if}
-    {/each}
   {:else if view === "history"}
     <rect x="10" y="24" width="236" height="62" rx="6" fill="rgb(var(--c-surface))" />
     <path

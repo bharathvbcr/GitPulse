@@ -80,6 +80,7 @@ import {
 } from "../repos/stripNav";
 import { expandedStacks, lastUsedCheckouts, noteActiveCheckout } from "../repos/stackState";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
+import { sanitizeHistoryList, type HistoryList } from "../views/historyList";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
 import type { MergeMode } from "../branches/mergeSelection";
 import { parseGitPreflight, type GitIdentity, type GitPreflight, type IdentityScope } from "../repos/gitPreflight";
@@ -2086,6 +2087,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         restore?: {
           viewTab?: ViewTab;
           viewSections?: Record<string, string>;
+          historyList?: HistoryList;
           searchQuery?: string;
           selectedBranch?: string | null;
           terminalOpen?: boolean;
@@ -2252,6 +2254,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
               viewSections:
                 extras.restore?.viewSections ?? carriedSession?.viewSections,
+              historyList:
+                extras.restore?.historyList ?? carriedSession?.historyList,
               searchQuery:
                 extras.restore?.searchQuery ?? carriedSession?.searchQuery,
               selectedBranch:
@@ -2841,6 +2845,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               restore: {
                 viewTab: tab.viewTab,
                 viewSections: tab.viewSections,
+                historyList: sanitizeHistoryList(tab.historyList),
                 searchQuery: tab.searchQuery,
                 selectedBranch: tab.selectedBranch,
                 terminalOpen: tab.terminalOpen,
@@ -3767,9 +3772,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         ...(resolved
           ? { viewSections: { ...session.viewSections, [tab]: resolved } }
           : {}),
+        // Naming Graph explicitly ("View history", the Graph menu item) asks
+        // for the commit graph, not whichever list Graph was last left on.
+        // Without a section, the view comes back as it was left.
+        ...(tab === "history" && resolved === "graph" ? { historyList: "commits" as const } : {}),
       });
       // The view tab is persisted state: flush so quitting right after a
       // switch does not restore the previous one.
+      flushPersist();
+    },
+    /**
+     * Switches the list History › Graph draws, on the ACTIVE tab. Does not
+     * change the view or section: the toggle lives inside Graph, and callers
+     * that must land there say so with `setActiveTab("history", "graph")`
+     * first.
+     */
+    setHistoryList: (list: HistoryList) => {
+      const session = activeSession();
+      if (!session) return;
+      const next = sanitizeHistoryList(list);
+      if (session.historyList === next) return;
+      applyToSession(session.id, session.generation, { historyList: next });
       flushPersist();
     },
     /** Change the lens within a view without leaving it. */
@@ -3825,6 +3848,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedIsStaged: false,
         selectionKind: "commit",
         activeTab: "history",
+        // The commit is being shown as part of history, so the graph that
+        // draws it, not the reflog list, is what should be beside it.
+        historyList: "commits",
       });
       flushPersist();
     },

@@ -304,6 +304,30 @@ interface CachedGraph {
    */
   signature: string;
 }
+/**
+ * Stand-in row for a selected commit the graph walk does not draw. It has no
+ * lane, parents, author or time: the details read fills those in, and nothing
+ * here may pretend to know them (a reflog's time is when the ref moved, not
+ * when the commit was made).
+ */
+function offGraphRow(id: string, summary: string): VisualCommitRow {
+  return {
+    id,
+    parent_ids: [],
+    summary,
+    author_name: "",
+    author_email: "",
+    timestamp: 0,
+    lane: 0,
+    color_index: 0,
+    active_lanes: [],
+    active_lane_colors: [],
+    connections: [],
+    is_merge: false,
+    is_root: false,
+  };
+}
+
 function emptyVisible(
   path: string | null,
   maxCommits: number,
@@ -808,8 +832,16 @@ export function createGraphStore(
 
         const keepId = previous?.selectedCommit?.id ?? shed.get(repoPath)?.selectedCommitId ?? undefined;
         const kept = keepId ? payload.rows.find((row) => row.id === keepId) : undefined;
+        // A selection the previous rows did not draw either was chosen by id
+        // (a reflog entry a reset orphaned): the walk was never going to hold
+        // it, so a reload keeps it rather than swapping in the newest row. A
+        // drawn selection a filter dropped still falls back, as before.
+        const offGraph =
+          previous?.selectedCommit && !previous.rows.some((row) => row.id === previous.selectedCommit?.id)
+            ? previous.selectedCommit
+            : undefined;
         const selectedCommit =
-          kept ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
+          kept ?? offGraph ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
         const keepDetails =
           previous &&
           selectedCommit &&
@@ -934,6 +966,25 @@ export function createGraphStore(
         const seq = selectionSeq(path);
         await fetchDetails(path, token, commit.id, seq);
       }
+    },
+    /**
+     * Selects a commit by id, whether or not the loaded rows draw it.
+     *
+     * A drawn commit is selected exactly as a click would. One the walk does
+     * not reach (a reflog entry a reset or amend orphaned) gets a stand-in row
+     * carrying only its id and `hint.summary`; its details are read like any
+     * other, and a pruned object lands in the pane's error-and-Retry state.
+     */
+    selectCommitById: async (
+      commitId: string,
+      hint: { summary?: string } = {},
+      repoPath?: string
+    ) => {
+      if (!commitId) return;
+      const path = repoPath ?? visiblePath;
+      const rows = (path ? cache.get(path)?.rows : undefined) ?? latestState?.rows ?? [];
+      const drawn = rows.find((r) => r.id === commitId);
+      await api.selectCommit(drawn ?? offGraphRow(commitId, hint.summary ?? ""), repoPath);
     },
   };
 

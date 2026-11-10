@@ -49,12 +49,12 @@ describe("commit-search chord", () => {
   });
 
   it("leaves History's diff to its own find bar, and keeps the rest", () => {
-    // Graph and Reflog are lists of commits, which the filter narrows. Diff
+    // Graph (commits or HEAD moves) is a list, which the filter narrows. Diff
     // is a file — or a commit's worth of files — and the chord belongs to the
     // find bar inside it, for the same reason Code owns it.
     expect(ownsCommitSearchChord("history", "diff")).toBe(false);
     expect(ownsCommitSearchChord("history", "graph")).toBe(true);
-    expect(ownsCommitSearchChord("history", "reflog")).toBe(true);
+    expect(ownsCommitSearchChord("history", "suspects")).toBe(true);
     expect(ownsCommitSearchChord("history")).toBe(true);
   });
 

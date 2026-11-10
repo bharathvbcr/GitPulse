@@ -85,8 +85,8 @@
   // 334 KB xterm runtime. WorkView is deliberately NOT here: it is the
   // default tab, so deferring it would only add a round trip to startup.
   // Code and History followed when the entry chunk reached 778 KB against
-  // its 780 KB ceiling: together they took 214 KB out of it (Graph, Diff,
-  // Reflog and the file tree live inside them). A session restored into
+  // its 780 KB ceiling: together they took 214 KB out of it (Graph with its
+  // reflog list, Diff and the file tree live inside them). A session restored into
   // either tab pays one local chunk fetch, as every view here does.
   //
   // Declared at module scope on purpose. LazyView keys its cache on the

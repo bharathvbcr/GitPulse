@@ -3,8 +3,8 @@
    * Regression suspects: which commit since a known-good ref could have caused
    * a symptom.
    *
-   * The fourth lens on "what happened to this repository". Graph, Diff and
-   * Reflog all answer it forwards — here is the history, now read it. This one
+   * Another lens on "what happened to this repository". Graph (with its
+   * reflog list) and Diff answer it forwards — here is the history, now read it. This one
    * answers it backwards: name the symbol that is misbehaving and the last ref
    * it was well at, and the ranking walks the call graph out from the symptom
    * and blames the lines it reaches.

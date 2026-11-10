@@ -118,5 +118,8 @@ export function planCommitReconcile(input: ReconcileInput): ReconcilePlan {
   if (repoId === null && input.foreignSelection) return NOTHING;
   if (diff.pending) return NOTHING;
   if (diff.error !== null && repoId === graphId) return NOTHING;
+  // Both stores already agree on a commit the rows do not draw (a reflog
+  // entry selected by id) and its diff is read: there is nothing to follow.
+  if (diff.loaded && repoId === graphId) return NOTHING;
   return { selectGraphId: null, loadDiffId: graphId };
 }

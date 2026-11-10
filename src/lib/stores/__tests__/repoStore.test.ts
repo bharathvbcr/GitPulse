@@ -2557,6 +2557,37 @@ describe("repoStore diff selection", () => {
     expect(state.selectedDiff).toBeNull();
   });
 
+  it("lands on History's commit graph or keeps the list Graph was left on, by how it was asked", async () => {
+    // Reflog folded into Graph as the "HEAD moves" list. Naming Graph, or
+    // inspecting a commit from elsewhere, asks for the commit graph; arriving
+    // at History or switching its section does not change the list.
+    const { store } = makeStore(makeInvoke());
+    await store.openRepo("/r/lists");
+    expect(get(store).historyList).toBe("commits");
+
+    store.setActiveTab("history", "graph");
+    store.setHistoryList("moves");
+    expect(get(store).historyList).toBe("moves");
+
+    store.setViewSection("history", "diff");
+    store.setViewSection("history", "graph");
+    expect(get(store).historyList).toBe("moves");
+    store.setActiveTab("work");
+    store.setActiveTab("history");
+    expect(get(store).historyList).toBe("moves");
+
+    store.setActiveTab("history", "graph");
+    expect(get(store).historyList).toBe("commits");
+
+    store.setHistoryList("moves");
+    store.inspectCommitInHistory("deadbeef");
+    expect(get(store).historyList).toBe("commits");
+
+    store.setHistoryList("moves");
+    store.setActiveTab("history", "diff");
+    expect(get(store).historyList).toBe("moves");
+  });
+
   it("stageSelectivePatch routes staging and unstaging to the matching commands", async () => {
     const calls: string[] = [];
     const patch = {

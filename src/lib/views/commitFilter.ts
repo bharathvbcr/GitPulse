@@ -4,8 +4,9 @@ import type { ViewTab } from "../repos/persist";
  * Where the commit filter lives, and who owns ⌘F.
  *
  * The bar used to be a full-width strip App stacked above the sidebar for
- * five different views. Those five are one view now — History, whose Graph,
- * Diff and Reflog sections are all drawn from the same filtered walk — so the
+ * five different views. Those five are one view now — History, whose Graph
+ * and Diff sections are drawn from the same filtered walk (Graph's reflog
+ * list narrows its loaded entries by the same text) — so the
  * bar moved into that view's own section bar, and this module shrank to the
  * one question the rest of the app still asks: who handles the chord.
  */
@@ -29,8 +30,8 @@ export function showsCommitFilter(tab: ViewTab): boolean {
  * Code says no for both its sections, because Blame's lines are the Explorer's
  * lines and ⌘F must not mean one thing on a file and something else on the
  * same file one click later. History's Diff section shows lines too, which is
- * why the section matters here: Graph and Reflog are lists of commits and
- * ⌘F belongs to the filter that narrows them, while Diff is a file — or a
+ * why the section matters here: Graph (commits or HEAD moves) is a list and
+ * ⌘F belongs to the filter that narrows it, while Diff is a file — or a
  * commit's worth of files — and ⌘F belongs to the find bar inside it.
  *
  * The section argument is optional so callers that only know the view keep

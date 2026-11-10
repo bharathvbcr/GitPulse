@@ -98,7 +98,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         entries: &[
             ("section:history:graph", "Graph"),
             ("section:history:diff", "Diff"),
-            ("section:history:reflog", "Reflog"),
             ("section:history:suspects", "Suspects"),
         ],
     },
@@ -331,14 +330,15 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        // 18 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // 17 is owned by `scripts/view-menu-contract.test.ts`, which compares
         // this catalog against the frontend view registry entry by entry and
         // label by label. This assertion is the cheap smoke check beside it —
         // it went stale at 16 once when the section count dropped, again at 15
         // when History gained Suspects, and again at 16 when Insights gained
-        // Secrets, and at 17 when Code gained Search; the parity contract is what proves the number is the
-        // right one rather than just the current one.
-        assert_eq!(entries.len(), 18);
+        // Secrets, at 17 when Code gained Search, and at 18 when Reflog folded
+        // into History › Graph; the parity contract is what proves the number
+        // is the right one rather than just the current one.
+        assert_eq!(entries.len(), 17);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -415,6 +415,11 @@ mod tests {
         assert_eq!(NativeAction::parse("tab-terminal"), None);
         assert_eq!(NativeAction::parse("tab-diff"), None);
         assert_eq!(NativeAction::parse("tab-reflog"), None);
+        // Reflog then folded into History › Graph as its "HEAD moves" list,
+        // so its section id must not resolve either: an old menu build
+        // naming it would store a section this app has no pane for.
+        assert_eq!(NativeAction::parse("section:history:reflog"), None);
+        assert!(NativeAction::parse("section:history:graph").is_some());
         // Pulse, Coverage, Health and Storage became sections of Insights.
         assert_eq!(NativeAction::parse("tab-pulse"), None);
         assert_eq!(NativeAction::parse("tab-coverage"), None);

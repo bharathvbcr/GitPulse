@@ -116,6 +116,23 @@ describe("planCommitReconcile", () => {
     expect(plan).toEqual({ selectGraphId: null, loadDiffId: null });
   });
 
+  it("does not re-read the diff of a commit both stores already show outside the rows", () => {
+    // A reflog entry the graph does not draw: the click selects it in the
+    // graph store and reads its diff into the repo store. The two ids then
+    // agree on a commit outside the rows, which must not plan the same read
+    // again (it did, once per toggle back to the commit graph).
+    const plan = planCommitReconcile(
+      input({
+        repoId: "orphan",
+        graphId: "orphan",
+        repoInRows: false,
+        prev: null,
+        diff: { loaded: true, pending: false, error: null },
+      }),
+    );
+    expect(plan).toEqual({ selectGraphId: null, loadDiffId: null });
+  });
+
   it("plans nothing when no id changed (a watcher refresh republishing the same ids)", () => {
     const seen = { repoId: "x", graphId: "a", repoInRows: false };
     expect(planCommitReconcile(input({ ...seen, prev: seen }))).toEqual({

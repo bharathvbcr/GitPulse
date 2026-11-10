@@ -8,6 +8,7 @@ import { type GroupColor, type TabColor } from "./tabColors";
 import { type StashEntry } from "./stash";
 import { type WatchState, type WatchStatus } from "./watchState";
 import { type OperationState } from "./operation";
+import { type HistoryList } from "../views/historyList";
 
 /** What a mutating action reports back: whether it ran, and under what verdict. */
 export interface MutationOutcome<T = unknown> {
@@ -254,10 +255,16 @@ export interface RepoSession {
    * The section last open in each sectioned view, keyed by view id.
    *
    * Per view rather than one value: a section is a lens on that view's
-   * subject, so leaving History on Reflog and returning through Files should
-   * come back to Reflog. Unset views open on their registered default.
+   * subject, so leaving History on Diff and returning through Files should
+   * come back to Diff. Unset views open on their registered default.
    */
   viewSections: Record<string, string>;
+  /**
+   * Which list History › Graph draws: the commit graph, or HEAD's moves (the
+   * reflog). Per tab and persisted, like the section it replaced: leaving
+   * Graph on the reflog and coming back finds the reflog.
+   */
+  historyList: HistoryList;
   /**
    * Whether the terminal dock is showing on THIS repository tab.
    *
@@ -396,6 +403,8 @@ export interface RepoState {
   activeTab: ViewTab;
   /** Section last open in each sectioned view; see the session field. */
   viewSections: Record<string, string>;
+  /** Which list History › Graph draws on the ACTIVE tab; see the session field. */
+  historyList: HistoryList;
   /** Whether the ACTIVE tab is showing the terminal dock; see the session field. */
   terminalOpen: boolean;
   isLoading: boolean;

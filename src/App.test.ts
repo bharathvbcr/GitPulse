@@ -76,7 +76,7 @@ describe("App view code splitting", () => {
     );
     // Used in the template, not necessarily as `load={…}` on a LazyView:
     // a loader may be handed to a view that owns the section it belongs to
-    // (History takes the reflog's). What must never happen is a loader that
+    // (History takes the reflog's, for Graph's HEAD-moves list). What must never happen is a loader that
     // is declared and then reaches nothing, which is a chunk nobody loads.
     // A lazy view's own loaders travel in its LazyView `props={{ … }}`.
     expect(template, `load${view} is declared but never rendered`).toMatch(
@@ -224,8 +224,8 @@ describe("App overlay wiring", () => {
 
   it("asks the chord owner about the section, not only about the view", () => {
     // History's Diff section reads a file's lines and owns ⌘F for finding
-    // inside them; its Graph and Reflog sections are commit lists and hand
-    // the chord to the filter that narrows them. Passing only the view made
+    // inside them; its Graph section (commits or HEAD moves) is a list and
+    // hands the chord to the filter that narrows it. Passing only the view made
     // ⌘F focus the commit filter over an open diff.
     expect(source).toContain(
       "ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))",

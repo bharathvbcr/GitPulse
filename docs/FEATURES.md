@@ -16,13 +16,13 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 18 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 17 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
-| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
+| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves) · Diff · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 18 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 17 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -52,7 +52,7 @@ flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Search · Map — file selection, text search and code/docs map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
+        History["<b>History</b> (<code>history</code>)<br/>Graph (commits or HEAD moves) · Diff · Suspects — three lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
     end
 
@@ -341,10 +341,11 @@ flowchart TD
 
 ## 3. History (`history`)
 
-Four lenses on one subject — what happened to this repository — switched by
-the segmented control in the view's own header (Graph, Diff, Reflog, Suspects), which also carries the commit
-filter. Graph, Diff and Reflog were three top-level tabs; with Suspects they share
-selected commit context, so switching lens keeps the commit or regression window you were looking at.
+Three lenses on one subject — what happened to this repository — switched by
+the segmented control in the view's own header (Graph, Diff, Suspects), which also carries the commit
+filter. Graph, Diff and Reflog were three top-level tabs, then sections; Reflog then folded into
+Graph as its *HEAD moves* list. With Suspects they share selected commit context, so switching
+lens keeps the commit or regression window you were looking at.
 The split was expensive in a way the code admitted: the Diff tab had to grow
 its own commit picker purely so you would not have to walk back to Graph for
 the commit you had just selected.
@@ -381,10 +382,12 @@ the commit you had just selected.
 - **Symbol-Level Collision Notes**: Overlapping file paths in collision scans leverage DevMap symbol spans to identify whether active worktrees touch the exact same symbol or merely share a file. Missing or stale indexes degrade safely to file-level notices.
 - **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets, inside the same frame.
 
-### 3.3 Reflog
+### 3.3 Reflog (Graph › HEAD moves)
 
-- **Reference Log Browser**: Full history of HEAD movements, checkouts, commits, rebases, and resets.
-- **Recovery Points**: Instant checkout or branch creation from detached reflog entries to recover discarded commits.
+- **Reference Log Browser**: The *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's reflog: every movement of HEAD, checkouts, commits, rebases and resets, newest first (the 200 most recent, with the cap named). The commit filter narrows the loaded entries by selector, sha, action or message.
+- **Selected In Place**: Clicking an entry shows its commit in the details pane below the list, including a commit a reset or amend left reachable only from the reflog (marked *Not in the graph*). A pruned object shows the details error and Retry, not an empty commit.
+- **Recovery Points**: Create a branch at an entry, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop.
+- **Restored Sessions**: A session saved on the old Reflog section or view reopens on Graph's HEAD-moves list.
 
 ### 3.4 Suspects
 
@@ -717,7 +720,7 @@ stop per checkout.
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
-Reflog / Suspects, Insights' Pulse / Coverage / Health / Secrets / Storage — are switched by that
+Suspects, Insights' Pulse / Coverage / Health / Secrets / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
 section directly, including all five Work sections.

@@ -34,6 +34,7 @@ interface Entry {
 
 /** Matches that do not classify a backend error. */
 const NOT_A_CLASSIFIER: readonly Entry[] = [
+  { file: "lib/branches/reflogFilter.ts", line: "return terms.every((term) => haystack.includes(term));", why: "matches the commit filter's text against a reflog entry's message, which is git data being shown, not an error" },
   { file: "lib/components/CommitRow.svelte", line: "const match = msg.match(/^([a-zA-Z]+)(\\([^\\)]+\\))?(!)?:\\s/);", why: "parses a commit subject's conventional-commit prefix, which is data the user wrote" },
   { file: "lib/diagnostics/diagnostics.ts", line: "return /effect_update_depth_exceeded/i.test(message)", why: "recognises the webview's own console noise, not a backend error" },
   { file: "lib/diagnostics/diagnostics.ts", line: "|| /svelte\\.dev\\/e\\/effect_update_depth_exceeded/i.test(message);", why: "recognises the webview's own console noise, not a backend error" },

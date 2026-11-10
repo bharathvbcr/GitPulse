@@ -87,6 +87,25 @@ before that tag is pushed.
   hook then builds the index as before. Measurements and remaining work are in
   `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.
 
+### Changed
+
+- **The reflog is part of History › Graph, not its own section.** A
+  *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
+  reflog, with the commit details below either list. History has three
+  sections now (Graph, Diff, Suspects), so Suspects moves from ⌥4 to ⌥3 and
+  the Go → History menu loses its Reflog item. *Open Reflog — HEAD movements
+  and recovery points* in the command palette still opens it, and a session
+  saved on the old Reflog section reopens on the HEAD-moves list.
+  - **Clicking an entry selects it in place.** It used to select the commit on
+    Graph while the Reflog pane stayed on screen, so the click changed nothing
+    you could see. Commits a reset or amend left reachable only from the reflog
+    now open too, marked *Not in the graph*; a pruned one shows the details
+    error and Retry. Choosing one survives graph reloads.
+  - **The commit filter narrows the reflog.** Its text matches an entry's
+    selector, sha, action or message, and the header says how many of the
+    loaded entries match. The branch chip does not apply, since this is HEAD's
+    log.
+
 ## [1.5.0] - 2026-11-03
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

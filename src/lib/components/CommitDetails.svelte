@@ -56,6 +56,21 @@
 
   let details = $state<CommitDetailsPayload | null>(null);
 
+  // A commit selected from the reflog that the graph walk does not draw (a
+  // reset or amend orphaned it). Its row is a stand-in carrying only the id
+  // and the reflog's message, so author, date and subject come from the
+  // details read, never from the stand-in's empty fields.
+  let offGraph = $derived(
+    selectedCommit !== null && !$graphStore.rows.some((r) => r.id === selectedCommit.id),
+  );
+  let readDetails = $derived(details !== null && details.id === selectedCommit?.id ? details : null);
+  let headerSummary = $derived(
+    offGraph && readDetails ? readDetails.summary : (selectedCommit?.summary ?? ""),
+  );
+  let headerAuthor = $derived(
+    offGraph ? (readDetails?.author_name ?? "") : (selectedCommit?.author_name ?? ""),
+  );
+
   // The store's read status describes ITS selected commit; it only speaks for
   // the commit on screen when they are the same one. Anything else is "not
   // read yet", which renders as loading, never as an empty commit.
@@ -279,10 +294,16 @@
         </button>
 
         <div class="flex items-center gap-1.5 min-w-0 group/msg">
-          <span class="text-xs font-medium text-textPrimary truncate select-text">{selectedCommit.summary}</span>
+          <span class="text-xs font-medium text-textPrimary truncate select-text">{headerSummary}</span>
+          {#if offGraph}
+            <span
+              class="shrink-0 rounded px-1.5 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-300"
+              title="The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there."
+            >Not in the graph</span>
+          {/if}
           <button
             type="button"
-            onclick={() => copyMessage(selectedCommit.summary)}
+            onclick={() => copyMessage(headerSummary)}
             class="opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 focus-visible:opacity-100 text-textMuted hover:text-textPrimary transition-opacity p-0.5"
             title="Copy commit message"
             aria-label="Copy commit message"
@@ -296,8 +317,8 @@
         </div>
       </div>
       <div class="flex items-center gap-4 text-[11px] text-textMuted shrink-0">
-        <span class="flex items-center gap-1.5 select-text"><User size={13} /> {selectedCommit.author_name}</span>
-        <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || formatDate(selectedCommit.timestamp)}</span>
+        <span class="flex items-center gap-1.5 select-text"><User size={13} /> {headerAuthor || "—"}</span>
+        <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || (offGraph ? "—" : formatDate(selectedCommit.timestamp))}</span>
         <span class="flex items-center gap-1 {sig.ok ? 'text-green-400' : 'text-textMuted'}">
           {#if sig.ok}
             <ShieldCheck size={13} />

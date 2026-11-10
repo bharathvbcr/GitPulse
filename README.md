@@ -40,13 +40,13 @@ walks through a review, task creation, and optional setup.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 18 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 17 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **Code** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
-| **History** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
+| **History** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected
@@ -127,7 +127,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 18 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end

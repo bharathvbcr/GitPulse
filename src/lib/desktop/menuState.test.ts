@@ -14,12 +14,12 @@ const model = (repo = empty(), activity: Record<string, string[]> = {}) =>
 
 describe("native menu projection", () => {
   it.each(["fleet", "tasks", "agents", "repository"] as const)("projects selection for the %s surface", (globalSurface) => {
-    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "reflog" } };
+    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "suspects" } };
     const state = buildMenuState(repo, { ...prefs(), globalSurface }, "system", {}, false);
     expect(state.checked.includes("fleet")).toBe(globalSurface === "fleet");
     expect(state.checked.includes("agents")).toBe(globalSurface === "agents");
     expect(state.checked.includes("tab-history")).toBe(globalSurface === "repository");
-    expect(state.checked.includes("section:history:reflog")).toBe(globalSurface === "repository");
+    expect(state.checked.includes("section:history:suspects")).toBe(globalSurface === "repository");
     expect(menuActionEnabled(state, "tab-history")).toBe(true);
   });
   it("keeps the first status menu compact even for long repository names and branches", () => {
@@ -83,9 +83,9 @@ describe("native menu projection", () => {
   it("shows selection and terminal state, including an explicit theme equal to the system", () => {
     // The dock is per repository tab, so its menu state comes from the repo,
     // not from a workspace preference.
-    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "reflog" }, terminalOpen: true };
+    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "suspects" }, terminalOpen: true };
     const state = buildMenuState(repo, prefs(), "light", {}, false);
-    expect(state.checked).toEqual(expect.arrayContaining(["theme-light", "tab-history", "section:history:reflog", "terminal-dock"]));
+    expect(state.checked).toEqual(expect.arrayContaining(["theme-light", "tab-history", "section:history:suspects", "terminal-dock"]));
     expect(state.checked).not.toContain("theme-system");
     expect(state.labels).toContainEqual({ id: "terminal-dock", text: "Hide Terminal" });
   });

@@ -213,9 +213,18 @@ describe("CommitTable single current commit", () => {
   });
 
   it("reconciles the two stores on id changes only, reading everything else untracked", () => {
-    const start = source.indexOf("let reconcileSeen");
+    // The reconciler moved out of the table into its own component, which
+    // History › Graph mounts under both lists: with Graph on HEAD's moves the
+    // table is not mounted, and the diff must still follow the selection.
+    const reconciler = readFileSync(new URL("./CommitReconciler.svelte", import.meta.url), "utf8");
+    const history = readFileSync(new URL("./HistoryView.svelte", import.meta.url), "utf8");
+    expect(source).not.toContain("planCommitReconcile(");
+    expect(history).toContain("<CommitReconciler />");
+    expect(history.indexOf("<CommitReconciler />")).toBeGreaterThan(history.indexOf('{#if list === "moves"}'));
+    expect(history.indexOf("<CommitReconciler />")).toBeGreaterThan(history.indexOf("{/if}", history.indexOf('{#if list === "moves"}')));
+    const start = reconciler.indexOf("let reconcileSeen");
     expect(start).toBeGreaterThan(-1);
-    const effect = source.slice(start, source.indexOf("// A new query or branch lands"));
+    const effect = reconciler.slice(start, reconciler.indexOf("</script>"));
     expect(effect).toContain("planCommitReconcile(");
     expect(effect).toContain("untrack(() => {");
     expect(effect).toContain("get(repoStore)");

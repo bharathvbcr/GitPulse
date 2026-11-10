@@ -40,6 +40,22 @@ describe("command catalog and context", () => {
       }
     }
   });
+  it("keeps a door to the reflog after it folded into Graph, landing on Graph's HEAD-moves list", async () => {
+    // The registry's section loop no longer covers it (Reflog is not a
+    // section), so this is the test that the retirement kept its door.
+    const calls: string[] = [];
+    vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    vi.spyOn(repoStore, "setActiveTab").mockImplementation((tab, section) => { calls.push(`tab:${tab}:${section}`); });
+    vi.spyOn(repoStore, "setHistoryList").mockImplementation(list => { calls.push(`list:${list}`); });
+    const command = buildCommands(ready(), () => {}).find(item => item.id === "history:head-moves");
+    expect(command?.label).toContain("Reflog");
+    expect(command?.disabledReason).toBeUndefined();
+    await command?.action();
+    // Order matters: naming Graph resets the list to commits, so the list
+    // must be switched after it.
+    expect(calls).toEqual(["tab:history:graph", "list:moves"]);
+    expect(buildCommands(ready(), () => {}).some(item => item.id === "history:reflog")).toBe(false);
+  });
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
     const commands = buildCommands(ready(), () => {});

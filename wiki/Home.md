@@ -34,7 +34,7 @@ flowchart LR
     subgraph Views["The four views"]
         Work["Work — Overview · Resolve · Remote · Policy · Tasks"]
         Code["Code — Explorer · Blame · Search · Map"]
-        History["History — Graph · Diff · Reflog · Suspects"]
+        History["History — Graph (commits / HEAD moves) · Diff · Suspects"]
         Insights["Insights — Pulse · Coverage · Health · Secrets · Storage"]
     end
     subgraph Beside["Not views"]

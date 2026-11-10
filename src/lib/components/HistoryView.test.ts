@@ -21,6 +21,20 @@ describe("HistoryView", () => {
     expect(history).toContain("loadReflog");
   });
 
+  it("draws the reflog inside Graph, as its HEAD-moves list, not as a section", () => {
+    // Reflog folded into Graph: no section branch may remain for it, the
+    // toggle shows only on Graph, and the details pane sits under either list.
+    expect(history).not.toContain('section === "reflog"');
+    expect(history).toContain('{#if section === "graph"}');
+    expect(history).toContain("onselect={(next) => repoStore.setHistoryList(next)}");
+    const graphPane = history.slice(history.indexOf('{#if list === "moves"}'));
+    expect(graphPane.indexOf("<LazyView load={loadReflog}")).toBeGreaterThan(-1);
+    expect(graphPane.indexOf("<CommitTable />")).toBeGreaterThan(graphPane.indexOf("{:else}"));
+    expect(graphPane.indexOf("<CommitDetails />")).toBeGreaterThan(graphPane.indexOf("{/if}"));
+    // The word "reflog" stays findable on the control that replaced the tab.
+    expect(history).toMatch(/title: "Reflog: every movement of HEAD/);
+  });
+
   it("keeps the reflog lazy so its chunk is not in the entry bundle", () => {
     // The loader is declared at App's module scope and passed in: an inline
     // `() => import(...)` would be a fresh function each render, and LazyView

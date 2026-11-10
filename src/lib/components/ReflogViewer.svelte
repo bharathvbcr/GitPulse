@@ -11,6 +11,9 @@
   import type { ReflogEntry, ResetPreview } from "../branches/types";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { graphStore } from "../stores/graphStore";
+  import { filterStore } from "../stores/filterStore";
+  import { filterReflogEntries } from "../branches/reflogFilter";
   import { invoke } from "../ipc/invoke";
   import { GitBranchPlus, History, RotateCcw } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -29,6 +32,14 @@
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
   let inflight: AsyncGuard | null = null;
+  /** The entry last selected here; several entries can name one commit. */
+  let selectedSelector = $state<string | null>(null);
+
+  // History's commit filter sits above this list, as it does above the graph.
+  // It narrows the entries already loaded (up to REFLOG_ENTRY_LIMIT); the
+  // branch chip cannot apply, because this is HEAD's log, not a branch's.
+  let shown = $derived(filterReflogEntries(entries, $filterStore.searchQuery));
+  let selectedCommitId = $derived($graphStore.selectedCommit?.id ?? null);
 
   async function load() {
     const repo = $repoStore.currentPath;
@@ -55,8 +66,18 @@
     }
   }
 
+  /**
+   * Shows the entry's commit in the details pane below this list, in place.
+   *
+   * It used to hand off to `inspectCommitInHistory`, which selected the
+   * commit on Graph while this pane, then its own section, stayed on screen:
+   * the click changed nothing anyone could see. Selection by id also reaches
+   * commits the graph walk does not draw, which is what a reflog is for.
+   */
   function inspectEntry(entry: ReflogEntry) {
-    repoStore.inspectCommitInHistory(entry.commit_id);
+    selectedSelector = entry.selector;
+    void graphStore.selectCommitById(entry.commit_id, { summary: `${entry.action}: ${entry.message}` });
+    void repoStore.selectCommitDiff(entry.commit_id);
   }
 
   /** The non-destructive way back: a new branch at the entry's commit. */
@@ -150,12 +171,15 @@
   });
 </script>
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
-    <div class="flex items-center gap-2">
-      <History size={16} class="text-accent" />
-      <span class="font-semibold text-textPrimary">Reflog</span>
-    </div>
+<div class="flex-1 flex flex-col bg-background min-h-0 text-xs font-sans overflow-hidden">
+  <div class="px-4 py-1.5 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
+    <span class="text-textMuted" role="status">
+      {#if $filterStore.searchQuery.trim() && entries.length > 0}
+        {shown.length} of {plural(entries.length, "loaded entry", "loaded entries")} match
+      {:else}
+        HEAD's reflog · {plural(entries.length, "entry", "entries")}
+      {/if}
+    </span>
     <button onclick={load} class="gp-btn">Refresh</button>
   </div>
 
@@ -169,6 +193,12 @@
         icon={History}
         title="No reflog entries"
         hint="Reference updates (commits, checkouts, resets, merges) will appear here."
+      />
+    {:else if shown.length === 0}
+      <EmptyState
+        icon={History}
+        title="No reflog entries match"
+        hint="The commit filter narrows the entries already loaded. Clear it to see them all."
       />
     {:else}
       {#if entries.length >= REFLOG_ENTRY_LIMIT}
@@ -189,15 +219,17 @@
             </tr>
           </thead>
           <tbody>
-            {#each entries as entry}
+            {#each shown as entry (entry.selector)}
+              {@const current = entry.selector === selectedSelector && entry.commit_id === selectedCommitId}
               <tr
-                class="group border-t border-border/30 hover:bg-surfaceHover/60 transition-colors focus-within:bg-surfaceHover"
+                aria-current={current ? "true" : undefined}
+                class="group border-t border-border/30 hover:bg-surfaceHover/60 transition-colors focus-within:bg-surfaceHover {current ? 'bg-accent/10' : ''}"
               >
                 <td class="px-3 py-1.5 font-mono rounded-l-lg">
                   <button
                     type="button"
                     aria-label={`Inspect ${entry.selector}, commit ${shortHash(entry.commit_id, 8)}, ${entry.action}: ${entry.message}, ${formatDate(entry.timestamp)}`}
-                    title="Inspect this commit in History"
+                    title="Show this commit below"
                     onclick={() => inspectEntry(entry)}
                     class="rounded px-1 -mx-1 text-accent hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
                   >

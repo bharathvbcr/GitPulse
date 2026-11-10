@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reflog in Graph checks</title>
+<style>body{margin:0}#preview{display:flex;flex-direction:column;height:720px;width:1100px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
+<body><div id="preview"></div><pre id="result"></pre>
+<script type="module">
+/**
+ * History › Graph's "HEAD moves" list: the reflog, after it folded into Graph.
+ *
+ * Settles in a real page, against fixture IPC, that History has no Reflog
+ * section, that Graph's Commits | HEAD moves toggle swaps the list and keeps
+ * the details pane under it, that clicking an entry selects its commit in
+ * place — including one the graph does not draw, which used to be the click
+ * that changed nothing on screen — that the commit filter narrows the loaded
+ * entries and says how many match, and that the list survives a section
+ * switch but not an explicit "open Graph". Nothing here executes git.
+ */
+import "../src/app.css";
+import { createChecks } from "./checks.ts";
+const crashes=[], unexpected=[], calls=[];
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const root="/workspace/alpha";
+const hex=(n)=>n.toString(16).padStart(4,"0").repeat(10);
+const TOTAL=200, FIRST_PAGE=120;
+/** A main line with one side branch near the top, then a long straight history. */
+function graphRows(count){
+ const rows=[];
+ for(let i=0;i<count;i++){
+  const side=i===1;
+  rows.push({
+   id:hex(i),parent_ids:i+1<TOTAL?[hex(i===0?2:i+1)]:[],
+   summary:i===3?"":`commit number ${i}`,author_name:i%2?"Bob":"Ada",author_email:i%2?"bob@example.com":"ada@example.com",
+   timestamp:1_700_000_000-i*3600,lane:side?1:0,color_index:side?1:0,
+   active_lanes:i<=1?[0,1]:[0],active_lane_colors:i<=1?[0,1]:[0],
+   connections:i+1<count?[{from_lane:side?1:0,to_lane:0,to_row_offset:i===0?2:1,is_merge:false,color_index:side?1:0,is_dangling:false}]:(i+1<TOTAL?[{from_lane:0,to_lane:0,to_row_offset:1,is_merge:false,color_index:0,is_dangling:true}]:[]),
+   is_merge:i===5,is_root:i===TOTAL-1,is_mainline:!side,
+  });
+ }
+ return rows;
+}
+const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_code,is_conflicted:false,additions:1,deletions:1});
+const files=[status("worktree-only.ts")];
+const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
+let graphFail=false;
+/** The working-tree file whose diff reads empty, for the empty-state checks. */
+let emptyDiffPath=null;
+const fixtures={
+ cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ cmd_get_head_id:()=>hex(0),
+ cmd_codeintel_symbols_for_file:a=>({available:false,head_matches:false,file_path:a.filePath,requested_head_sha:a.headSha,items:[],reason:"no code index in this fixture"}),
+ cmd_apple_intelligence_status:()=>({compiled:false,state:"unsupported_os",reason:"not_compiled",detail:"Not built into this fixture."}),
+ cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
+ cmd_repo_operation:()=>null,cmd_stash_list:()=>({entries:[],truncated:false}),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
+ cmd_pull_rebase_config:()=>null,cmd_set_recent_menu:()=>null,
+ cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
+ cmd_devcouncil_init:()=>({repo:root,state_dir:root+"/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
+ cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
+ cmd_get_commit_graph:a=>{
+  calls.push({cmd:"cmd_get_commit_graph",args:a});
+  if(graphFail)throw new Error("walk exploded");
+  const count=a.maxCommits>5000?TOTAL:FIRST_PAGE;
+  return {rows:graphRows(count),head_id:hex(0),refs:[{name:"main",kind:"local",commit_id:hex(0),is_head:true},{name:"feature",kind:"local",commit_id:hex(1),is_head:false}],has_more:count<TOTAL,mainline_id:hex(0),mainline_name:"main"};
+ },
+ cmd_get_file_diff:a=>{calls.push({cmd:"cmd_get_file_diff",args:a});return {text:a.filePath===emptyDiffPath?"":patch(a.filePath,"worktree change"),truncated:false};},
+ cmd_get_commit_diff:a=>{calls.push({cmd:"cmd_get_commit_diff",args:a});return {text:patch("one.ts",`commit ${a.commitId.slice(0,4)}`),truncated:false};},
+ cmd_get_commit_file_diff:a=>{calls.push({cmd:"cmd_get_commit_file_diff",args:a});return {text:patch(a.filePath,`commit file ${a.commitId.slice(0,4)}`),truncated:false};},
+ cmd_get_commit_files:a=>{calls.push({cmd:"cmd_get_commit_files",args:a});return [{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}];},
+ cmd_get_range_diff:a=>{calls.push({cmd:"cmd_get_range_diff",args:a});return {text:patch("range.ts","range change"),truncated:false};},
+ cmd_get_compare_diff:a=>{calls.push({cmd:"cmd_get_compare_diff",args:a});return {text:patch(a.filePath??"both.ts",`compare ${a.from.slice(0,4)}..${a.to.slice(0,4)}`),truncated:false};},
+ cmd_get_compare_files:a=>{calls.push({cmd:"cmd_get_compare_files",args:a});return {files:[{path:"compared-a.ts",status_code:"M",additions:3,deletions:1},{path:"compared-b.ts",status_code:"R",additions:0,deletions:0}]};},
+ cmd_get_commit_details:a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:"Ada",author_email:"ada@example.com",author_date:"",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:"s",body:`Body of ${a.commitId.slice(0,4)}: why this change was made.`,co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};},
+ cmd_get_commit_bodies:a=>{calls.push({cmd:"cmd_get_commit_bodies",args:a});return a.commitIds.map(id=>({commit_id:id,body:`Body of ${id.slice(0,4)}: why this change was made.`}));},
+ cmd_get_commit_notes:a=>{calls.push({cmd:"cmd_get_commit_notes",args:a});return a.commitIds.map(id=>({commit_id:id,note:id===hex(2)?"Reviewed by Ana — ship it":null}));},
+ // The card renders the body as Markdown, through the same Rust renderer the
+ // details pane uses; the fixture answers as it would for one plain paragraph.
+ cmd_markdown_render:a=>({html:`<p>${a.text.replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</p>`,headings:[],frontmatter:[],omittedBytes:0}),
+ cmd_verify_commit_signature:()=>({state:"unsigned",signer:null,key:null,detail:null}),
+ cmd_provenance_freshness_batch:a=>{calls.push({cmd:"cmd_provenance_freshness_batch",args:a});return a.revisions.map(rev=>({commit_sha:rev,distance:rev===hex(2)?0:null,confidence:rev===hex(2)?1:null,is_fresh:rev===hex(2),unmeasured_reason:"",notes_readable:true,verified:rev===hex(2),verification:rev===hex(2)?{verdict:"pass",verified_at:1_700_000_000,checked_by:"ci",task_id:null,details:null}:null,session:null,landed_on_base:null}));},
+ cmd_get_language_stats:()=>({stats:[],truncated:false}),
+ cmd_last_fetch_at:()=>null,cmd_note_tab_activated:()=>null,
+ cmd_get_file_content:()=>"fixture content",
+ cmd_codeintel_impact_at_rung:()=>({source_freshness:{fresh:null,reason:"this query did not verify whole-tree freshness; ask status for a live check"},available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
+ cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
+ cmd_devmap_preview_many:()=>[],
+ cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>[],
+ cmd_repository_trust:()=>({path:root,git_dir:root+"/.git",common_dir:root+"/.git",identity:"fixture-identity",scope:"repository",worktrees:1}),
+ cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
+ cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:1,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,shared_worktrees:[],sessions_ok:true,sessions_error:""}),
+ cmd_fleet_snapshot:()=>({repos:[],requested:1,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
+};
+const ORPHAN="dead".repeat(10);
+const reflog=[
+ {index:0,commit_id:hex(0),selector:"HEAD@{0}",action:"reset",message:"moving to HEAD~1",timestamp:1_700_000_500},
+ {index:1,commit_id:ORPHAN,selector:"HEAD@{1}",action:"commit",message:"lost work on the parser",timestamp:1_700_000_400},
+ {index:2,commit_id:hex(2),selector:"HEAD@{2}",action:"checkout",message:"moving from feature to main",timestamp:1_700_000_300},
+];
+// The details pane's freshness badge asks about the one selected commit.
+fixtures.cmd_provenance_freshness=a=>({commit_sha:a.commitSha,distance:null,confidence:null,is_fresh:false,unmeasured_reason:"not measured in this fixture",notes_readable:true,verified:false,verification:null,session:null,landed_on_base:null});
+fixtures.cmd_get_reflog=a=>{calls.push({cmd:"cmd_get_reflog",args:a});return reflog;};
+fixtures.cmd_get_commit_details=a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:a.commitId===ORPHAN?"Orphan Author":"Ada",author_email:"ada@example.com",author_date:"Tue Nov 14 2023",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:`details of ${a.commitId.slice(0,4)}`,body:"",co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};};
+window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
+const {mount,tick}=await import("svelte");
+const {get}=await import("svelte/store");
+const {repoStore}=await import("../src/lib/stores/repoStore.ts");
+const {graphStore}=await import("../src/lib/stores/graphStore.ts");
+const {filterStore}=await import("../src/lib/stores/filterStore.ts");
+const HistoryView=(await import("../src/lib/components/HistoryView.svelte")).default;
+const loadReflog=()=>import("../src/lib/components/ReflogViewer.svelte");
+const loadSuspects=()=>import("../src/lib/components/RegressionSuspectsPanel.svelte");
+const {results,check,stopped}=createChecks();
+const preview=document.getElementById("preview");
+const wait=(ms=60)=>new Promise(r=>setTimeout(r,ms));
+const until=async(test,label)=>{const end=Date.now()+8000;while(!test()&&Date.now()<end)await wait();if(!test())throw new Error("Timed out: "+label);};
+const text=()=>preview.textContent;
+const toggle=()=>preview.querySelector('[role="group"][aria-label="Graph list"]');
+const option=(label)=>[...(toggle()?.querySelectorAll("button")??[])].find(b=>b.textContent.trim()===label);
+const table=()=>preview.querySelector("table");
+const entry=(selector)=>[...preview.querySelectorAll("tbody tr")].find(r=>r.textContent.includes(selector));
+const inspect=(selector)=>entry(selector)?.querySelector('button[aria-label^="Inspect"]');
+const details=()=>preview.querySelector(".h-64");
+const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
+(async()=>{try{
+ await repoStore.openRepo(root);
+ graphStore.showRepo(root);
+ await graphStore.loadGraph(root,"",null);
+ // Opened straight onto HEAD moves, as a restored session or "Open Reflog"
+ // from another view does: the commit graph never mounts first, so nothing
+ // it does on mount may be what the details pane depends on.
+ repoStore.setActiveTab("history","graph");
+ repoStore.setHistoryList("moves");
+ mount(HistoryView,{target:preview,props:{loadReflog,loadSuspects}});
+ await until(()=>toggle()&&entry("HEAD@{0}")&&details(),"opened on moves");
+ check("opening on HEAD moves draws the reflog without the graph first",()=>option("HEAD moves").getAttribute("aria-pressed")==="true"&&!preview.querySelector("canvas"));
+ await until(()=>!details().textContent.includes("Reading the diff…"),"preview settles when opened on moves");
+ check("the details preview settles when History opens on HEAD moves",()=>!details().textContent.includes("Reading the diff…")&&get(repoStore).selectedCommitId===get(graphStore).selectedCommit?.id);
+ option("Commits").click();
+ await until(()=>!table()&&preview.querySelector("canvas"),"commits after opening on moves");
+
+ // --- the toggle -----------------------------------------------------------
+ check("History has no Reflog section tab any more",()=>![...preview.querySelectorAll('[role="tab"]')].some(t=>t.textContent.trim()==="Reflog"));
+ check("Graph offers Commits | HEAD moves, and Commits is pressed",()=>option("Commits")?.getAttribute("aria-pressed")==="true"&&option("HEAD moves")?.getAttribute("aria-pressed")==="false");
+ check("the HEAD moves option still says it is the reflog",()=>option("HEAD moves").title.startsWith("Reflog"));
+ check("Commits draws the graph, not the reflog",()=>preview.querySelector("canvas")&&!table());
+
+ option("HEAD moves").click();
+ await until(()=>entry("HEAD@{1}"),"reflog rows");
+ check("HEAD moves swaps in the reflog list",()=>table()&&get(repoStore).historyList==="moves"&&option("HEAD moves").getAttribute("aria-pressed")==="true");
+ check("the details pane stays under the reflog list",()=>details()&&details().getBoundingClientRect().top>=table().getBoundingClientRect().top);
+ check("the reflog was read on each open, and served from cache in between",()=>callsOf("cmd_get_reflog").length===2);
+
+ // --- selecting an orphaned entry, in place --------------------------------
+ const detailsBefore=callsOf("cmd_get_commit_details").length;
+ inspect("HEAD@{1}").click();
+ await until(()=>details()?.textContent.includes(ORPHAN.slice(0,8))&&details().textContent.includes("details of dead"),"orphan details");
+ check("an orphaned entry's commit opens in the pane below, not on another pane",()=>table()&&details().textContent.includes(ORPHAN.slice(0,8)));
+ check("it is marked as not drawn by the graph",()=>details().textContent.includes("Not in the graph"));
+ check("its author comes from the details read, not the stand-in row",()=>details().textContent.includes("Orphan Author"));
+ check("its details were read by id",()=>callsOf("cmd_get_commit_details").slice(detailsBefore).some(c=>c.args.commitId===ORPHAN));
+ await until(()=>callsOf("cmd_get_commit_diff").some(c=>c.args.commitId===ORPHAN),"orphan diff");
+ check("its diff was read for the preview",()=>get(repoStore).selectedCommitId===ORPHAN);
+ check("the selected entry is marked current",()=>entry("HEAD@{1}").getAttribute("aria-current")==="true"&&!entry("HEAD@{2}").hasAttribute("aria-current"));
+
+ // --- a drawn entry ---------------------------------------------------------
+ inspect("HEAD@{2}").click();
+ await until(()=>details()?.textContent.includes("commit number 2"),"drawn details");
+ check("a drawn entry's commit opens with its graph row, unmarked",()=>!details().textContent.includes("Not in the graph"));
+ check("the current mark follows the click",()=>entry("HEAD@{2}").getAttribute("aria-current")==="true"&&!entry("HEAD@{1}").hasAttribute("aria-current"));
+
+ // --- the commit filter -----------------------------------------------------
+ filterStore.setSearch("parser");
+ await until(()=>!entry("HEAD@{0}"),"filtered");
+ check("the commit filter narrows the loaded entries",()=>entry("HEAD@{1}")&&!entry("HEAD@{2}"));
+ check("and says how many of the loaded entries match",()=>text().includes("1 of 3 loaded entries match"));
+ filterStore.setSearch("nothing-matches-this");
+ await until(()=>text().includes("No reflog entries match"),"no match");
+ check("a filter that matches nothing says so instead of an empty table",()=>!table());
+ filterStore.setSearch("");
+ await until(()=>entry("HEAD@{0}"),"unfiltered");
+
+ // --- leaving and coming back -------------------------------------------------
+ repoStore.setViewSection("history","diff");
+ await until(()=>!toggle(),"toggle hidden on Diff");
+ check("the toggle belongs to Graph and is not shown on Diff",()=>!toggle());
+ repoStore.setViewSection("history","graph");
+ await until(()=>toggle(),"back on graph");
+ check("switching sections keeps the list Graph was left on",()=>option("HEAD moves").getAttribute("aria-pressed")==="true");
+ option("Commits").click();
+ await until(()=>!table(),"commits again");
+ check("Commits brings the graph back",()=>preview.querySelector("canvas")&&get(repoStore).historyList==="commits");
+ // --- an orphan selected, then back to the commit graph -----------------------
+ option("HEAD moves").click();await until(()=>entry("HEAD@{1}"),"moves for orphan");
+ inspect("HEAD@{1}").click();
+ await until(()=>details()?.textContent.includes("Not in the graph"),"orphan again");
+ option("Commits").click();
+ await until(()=>!table()&&preview.querySelector("canvas"),"commits with orphan selected");
+ await wait(200);
+ check("the commit graph mounts with an orphan selected and the pane still names it",()=>details().textContent.includes(ORPHAN.slice(0,8))&&details().textContent.includes("Not in the graph"));
+ const graphFocus=preview.querySelector('[role="grid"],[role="listbox"],[tabindex="0"]');
+ graphFocus?.focus();
+ for(const k of ["ArrowDown","ArrowDown"])(document.activeElement??window).dispatchEvent(new KeyboardEvent("keydown",{key:k,bubbles:true,cancelable:true}));
+ await wait(300);
+ check("arrow keys over the graph from an orphan selection keep a real selection",()=>{const id=get(graphStore).selectedCommit?.id;return typeof id==="string"&&id.length>0&&crashes.length===0;});
+ check("the preview is not stuck reading after leaving the orphan",()=>!details().textContent.includes("Reading the diff…")||get(repoStore).selectedDiffPending);
+
+ option("HEAD moves").click();await until(()=>table(),"moves again");
+ repoStore.setActiveTab("history","graph");
+ await until(()=>!table(),"named graph");
+ check("asking for Graph by name opens the commit graph",()=>option("Commits").getAttribute("aria-pressed")==="true");
+
+ check("No unexpected commands",()=>unexpected.length===0);
+ check("No runtime errors",()=>crashes.length===0);
+}catch(error){stopped(error);}
+ const result={results,crashes,unexpected};window.__gpResult=result;
+ document.documentElement.dataset.gpResult=encodeURIComponent(JSON.stringify(result));
+ document.getElementById("result").textContent=results.map(r=>(r.pass?"ok   ":"FAIL ")+r.name).join("\n");
+ const report=new URLSearchParams(location.search).get("report");if(report)await fetch(report,{method:"POST",body:document.documentElement.outerHTML});
+})();
+</script></body></html>

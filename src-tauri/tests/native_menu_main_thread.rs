@@ -258,7 +258,7 @@ fn main() {
             "fetch",
             "stage-all",
             "tab-history",
-            "section:history:reflog",
+            "section:history:diff",
             "terminal-dock",
         ]
         .into_iter()
@@ -267,7 +267,7 @@ fn main() {
     selected.checked = vec![
         "theme-light".into(),
         "tab-history".into(),
-        "section:history:reflog".into(),
+        "section:history:diff".into(),
         "terminal-dock".into(),
     ];
     selected.labels = vec![gitpulse_lib::desktop::state::MenuLabel {
@@ -307,7 +307,7 @@ fn main() {
         }
     }
     assert_eq!(seen["terminal-dock"], ("Hide Terminal".into(), true, true));
-    assert!(seen["tab-history"].2 && seen["section:history:reflog"].2 && seen["theme-light"].2);
+    assert!(seen["tab-history"].2 && seen["section:history:diff"].2 && seen["theme-light"].2);
     assert!(!seen["theme-system"].2 && !seen["stash-pop"].1);
     assert!(seen["activate-repo:/r/one/repo"].2 && !seen["activate-repo:/r/two/repo"].2);
     assert_eq!(seen["open-recent:/r/one/repo"].0, "/r/one/repo");

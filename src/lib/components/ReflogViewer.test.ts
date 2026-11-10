@@ -17,8 +17,8 @@ describe("ReflogViewer interaction contract", () => {
 
   it("provides a real action control without assigning interactive behavior to a table row", () => {
     const row = source.slice(
-      source.indexOf("{#each entries as entry}"),
-      source.indexOf("{/each}", source.indexOf("{#each entries as entry}")),
+      source.indexOf("{#each shown as entry (entry.selector)}"),
+      source.indexOf("{/each}", source.indexOf("{#each shown as entry (entry.selector)}")),
     );
 
     expect(row).toContain('<button\n                    type="button"');

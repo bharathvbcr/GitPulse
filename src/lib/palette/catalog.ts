@@ -64,6 +64,20 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         repoStore.setActiveTab(view.id, section.id);
       },
     })),
+    // Reflog was a History section, and the palette was one of its doors.
+    // It folded into Graph as a list (views/historyList.ts), so this door
+    // lands on Graph and switches the list; the registry derives no command
+    // for it because it is no longer a section.
+    ...(view.id === "history" ? [{
+      id: "history:head-moves", label: "Open Reflog — HEAD movements and recovery points",
+      description: "History → Graph → HEAD moves · Every movement of HEAD, including commits a reset or amend left behind.",
+      keywords: "History Graph reflog HEAD moves recovery undo reset", category: "Views", icon: icons.history, disabledReason: unavailable,
+      action: () => {
+        interfaceStore.setGlobalSurface("repository");
+        repoStore.setActiveTab("history", "graph");
+        repoStore.setHistoryList("moves");
+      },
+    }] : []),
   ]);
   return [
     { id: "open_repo", label: "Open Repository…", description: "Choose a local Git repository", category: "Repositories", icon: FolderOpen, shortcut: "⌘T", closeBefore: true, action: () => repoStore.pickAndOpenRepo() },

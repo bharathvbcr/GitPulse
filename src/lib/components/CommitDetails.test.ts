@@ -67,7 +67,7 @@ describe("CommitDetails", () => {
 
 describe("CommitDetails copy controls keyboard access", () => {
   it("shows the copy-message button on focus and gives both copy buttons accessible names", () => {
-    const start = source.indexOf("onclick={() => copyMessage(selectedCommit.summary)}");
+    const start = source.indexOf("onclick={() => copyMessage(headerSummary)}");
     expect(start).toBeGreaterThan(-1);
     const button = source.slice(start, source.indexOf("</button>", start));
     expect(button).toContain("group-focus-within/msg:opacity-100");

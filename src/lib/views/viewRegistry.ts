@@ -156,18 +156,25 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "history",
     label: "History",
     summary:
-      "What happened in this repository. The graph, the selected commit's diff and the reflog share one selection.",
-    paletteCommand: "Open History — the commit graph, diffs and the reflog",
-    // Three renderings of one subject: what happened to this repository.
-    // They were three tabs, and the split cost more than it saved — the Diff
-    // view had to grow its own commit picker and file rail purely so the
-    // user would not have to go back to Graph for the commit they had just
-    // been looking at. Sharing `selectedCommitId`, the sections keep it.
+      "What happened in this repository. The graph, HEAD's moves (the reflog) and the selected commit's diff share one selection.",
+    paletteCommand: "Open History — the commit graph, the reflog and diffs",
+    // Renderings of one subject: what happened to this repository. They were
+    // separate tabs, and the split cost more than it saved — the Diff view
+    // had to grow its own commit picker and file rail purely so the user
+    // would not have to go back to Graph for the commit they had just been
+    // looking at. Sharing `selectedCommitId`, the sections keep it.
+    //
+    // Reflog was a section too, until it folded into Graph as the "HEAD
+    // moves" list (views/historyList.ts): both are lists of commits feeding
+    // the same details pane, and as a separate pane a click on an entry
+    // selected a commit on a Graph nobody was looking at. Its palette door
+    // is `history:head-moves` in palette/catalog.ts.
     sections: [
       {
         id: "graph",
         label: "Graph",
-        summary: "The commit graph: branches, merges, and the commit you have selected.",
+        summary:
+          "The commit graph, or every movement of HEAD (the reflog) with its recovery points. The commit you select is described below either list.",
       },
       {
         id: "diff",
@@ -175,13 +182,6 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         summary:
           "The changes in the selected commit — or the working tree, if none is selected.",
         paletteCommand: "Open Diff — changes in the selected commit",
-      },
-      {
-        id: "reflog",
-        label: "Reflog",
-        summary:
-          "Every movement of HEAD. Recovery points after a reset, checkout or amend.",
-        paletteCommand: "Open Reflog — HEAD movements and recovery points",
       },
       {
         id: "suspects",
