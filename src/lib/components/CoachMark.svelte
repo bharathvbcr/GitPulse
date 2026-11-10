@@ -4,6 +4,9 @@
   import { fade, scale } from "svelte/transition";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
+  // Floats over the shell: it is mounted after the status bar in the shell
+  // column, so in flow it would push that bar up while it shows.
+  import { LAYERS } from "../ui/layers";
 
   let {
     id,
@@ -35,7 +38,8 @@
 
 {#if !isSeen}
   <div
-    class="gp-pop gp-card rounded-2xl p-3 border border-accent/40 bg-surface shadow-float max-w-xs z-30 select-none {extraClass}"
+    class="gp-pop gp-card fixed rounded-2xl p-3 border border-accent/40 bg-surface shadow-float max-w-xs select-none {extraClass}"
+    style="z-index: {LAYERS.TOUR}"
     in:scale={{ start: 0.95, duration: 180 }}
     out:fade={{ duration: 120 }}
     role="tooltip"

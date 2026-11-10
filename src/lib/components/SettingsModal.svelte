@@ -1123,9 +1123,9 @@
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle
-                        label="Manvi status badges"
-                        description="Policy and local-model chips in the toolbar."
-                        ariaLabel="Show Manvi status badges"
+                        label="Manvi status in the title bar"
+                        description="Policy and local-model status in the title bar."
+                        ariaLabel="Show Manvi status in the title bar"
                         checked={$interfaceStore.showHarnessBadges}
                         onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
                       />

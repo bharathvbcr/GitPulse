@@ -436,7 +436,7 @@
      cap (it used to centre in max-w-6xl, which on a wide window left a quarter
      of the pane blank on each side), and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
-<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
+<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto font-sans text-[12px] text-textPrimary">
   <div class="flex items-start justify-between gap-3 mb-3 w-full">
     <div class="min-w-0">
       <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
@@ -1165,7 +1165,10 @@
 <style>
   .work-overview {
     container-type: inline-size;
-    padding: clamp(16px, 1.6vw, 24px);
+    /* Block padding is a band of pane background under the section tabs and
+       again under the last block. Inline padding stays. */
+    padding-inline: clamp(16px, 1.6vw, 24px);
+    padding-block: 0;
   }
 
   .overview-repository {
