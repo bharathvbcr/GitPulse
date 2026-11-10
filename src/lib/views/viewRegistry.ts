@@ -139,8 +139,8 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "history",
     label: "History",
     summary:
-      "What happened in this repository. The graph, HEAD's moves (the reflog) and the selected commit's diff share one selection.",
-    paletteCommand: "Open History — the commit graph, the reflog and diffs",
+      "What happened in this repository. The graph, HEAD's moves (the reflog), regression suspects and the selected commit's diff share one selection.",
+    paletteCommand: "Open History — the commit graph, the reflog, suspects and diffs",
     // Renderings of one subject: what happened to this repository. They were
     // separate tabs, and the split cost more than it saved — the Diff view
     // had to grow its own commit picker and file rail purely so the user
@@ -152,12 +152,19 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // the same details pane, and as a separate pane a click on an entry
     // selected a commit on a Graph nobody was looking at. Its palette door
     // is `history:head-moves` in palette/catalog.ts.
+    //
+    // Suspects followed as Graph's third list: its ranking is a list of
+    // commits too, and as a section a click left it for Diff, so the ranking
+    // and the commit it named were never on screen together. Its question
+    // sits in the context bar, its verdict in the details pane, and the other
+    // lists chip the commits it ranked. Its palette door keeps the id
+    // `history:suspects`.
     sections: [
       {
         id: "graph",
         label: "Graph",
         summary:
-          "The commit graph, or every movement of HEAD (the reflog) with its recovery points. The commit you select is described below either list.",
+          "The commit graph, every movement of HEAD (the reflog) with its recovery points, or the commits ranked as suspects for a symptom. The commit you select is described below whichever list is showing.",
       },
       {
         id: "diff",
@@ -165,13 +172,6 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         summary:
           "The changes in the selected commit — or the working tree, if none is selected.",
         paletteCommand: "Open Diff — changes in the selected commit",
-      },
-      {
-        id: "suspects",
-        label: "Suspects",
-        summary:
-          "Which commit since a known-good ref could have caused a symptom. Ranked by what the call graph reaches, not by how recent they are; the window ends at the indexed commit, not at HEAD.",
-        paletteCommand: "Find regression suspects — which commit broke this symbol",
       },
     ],
   },
@@ -329,9 +329,10 @@ export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<
   // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
   // the file a saved session was searching or blaming is still the selection.
   code: { search: "explorer", blame: "explorer" },
-  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
-  // itself is restored from the same retired id by `restoredHistoryList`.
-  history: { reflog: "graph" },
+  // Reflog and Suspects became Graph's "HEAD moves" and "Suspects" lists
+  // (`views/historyList.ts`); each list is restored from the same retired id
+  // by `restoredHistoryList`.
+  history: { reflog: "graph", suspects: "graph" },
 };
 
 /** Where a retired section's content now lives, or null when it is not retired. */

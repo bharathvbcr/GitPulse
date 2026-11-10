@@ -60,11 +60,11 @@ export interface PersistedTab {
   terminalOpen?: boolean;
   /**
    * Which list History › Graph was drawing (see `views/historyList.ts`).
-   * Written only as `"moves"`: absent is the commit graph, so a blob from a
-   * session that never opened the reflog is unchanged, and an older build
+   * Written only as `"moves"` or `"suspects"`: absent is the commit graph, so
+   * a blob from a session that never left it is unchanged, and an older build
    * ignores the field and opens on the graph.
    */
-  historyList?: "moves";
+  historyList?: "moves" | "suspects";
   searchQuery: string;
   selectedBranch: string | null;
 }
@@ -552,7 +552,9 @@ export function workspaceToPersisted(
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
-        ...(session?.historyList === "moves" ? { historyList: "moves" as const } : {}),
+        ...(session?.historyList && session.historyList !== "commits"
+          ? { historyList: session.historyList }
+          : {}),
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -592,8 +594,11 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
       // spawns a shell, so the permissive reading is the costly one.
       terminalOpen: record.terminalOpen === true,
       // Read from the raw record, before `sanitizeViewSections` narrows a
-      // retired `history: "reflog"` to Graph and the mode with it.
-      ...(restoredHistoryList(record) === "moves" ? { historyList: "moves" as const } : {}),
+      // retired `history: "reflog"` or `"suspects"` to Graph and the list with it.
+      ...(() => {
+        const list = restoredHistoryList(record);
+        return list === "commits" ? {} : { historyList: list };
+      })(),
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

@@ -14,6 +14,8 @@ const history = read("HistoryView.svelte");
 const sectionBar = read("ViewSectionTabs.svelte");
 const filterBar = read("FilterBar.svelte");
 const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
+const historyList = readFileSync(join(here, "..", "views", "historyList.ts"), "utf8");
+const query = readFileSync(join(here, "..", "codeintel", "suspectsQuery.ts"), "utf8");
 
 describe("HistoryView", () => {
   it("hosts all three lenses that used to be top-level tabs", () => {
@@ -33,7 +35,38 @@ describe("HistoryView", () => {
     expect(graphPane.indexOf("<CommitTable />")).toBeGreaterThan(graphPane.indexOf("{:else}"));
     expect(graphPane.indexOf("<CommitDetails />")).toBeGreaterThan(graphPane.indexOf("{/if}"));
     // The word "reflog" stays findable on the control that replaced the tab.
-    expect(history).toMatch(/title: "Reflog: every movement of HEAD/);
+    expect(historyList).toMatch(/title: "Reflog: every movement of HEAD/);
+    expect(history).toContain("import { HISTORY_LISTS }");
+  });
+
+  it("draws Suspects inside Graph, as its third list, not as a section", () => {
+    // Suspects folded into Graph the way the reflog did: its ranking is a
+    // list of commits feeding the same details pane, and as a section a click
+    // left it for Diff.
+    expect(history).not.toContain('section === "suspects"');
+    const graphPane = history.slice(history.indexOf('{#if list === "moves"}'));
+    const suspectsBranch = graphPane.indexOf('{:else if list === "suspects"}');
+    expect(suspectsBranch).toBeGreaterThan(-1);
+    expect(graphPane.indexOf("<LazyView load={loadSuspects}")).toBeGreaterThan(suspectsBranch);
+    // The details pane sits under all three lists.
+    expect(graphPane.indexOf("<CommitDetails />")).toBeGreaterThan(graphPane.indexOf("<CommitTable />"));
+    expect(historyList).toMatch(/value: "suspects", *\n? *label: "Suspects"/);
+  });
+
+  it("asks the suspects question where the filter sits, and only on that list", () => {
+    // A ranking is one answer; narrowing it by text would reorder nothing and
+    // hide rows whose rank still counts. So the context bar swaps the filter
+    // for the question rather than showing both.
+    expect(history).toContain('const asksSuspects = $derived(section === "graph" && list === "suspects")');
+    const bar = history.slice(history.indexOf("<ViewContextBar"), history.indexOf("</ViewContextBar>"));
+    expect(bar.indexOf("{#if asksSuspects}")).toBeGreaterThan(-1);
+    expect(bar.indexOf("<SuspectsQueryBar />")).toBeGreaterThan(bar.indexOf("{#if asksSuspects}"));
+    expect(bar.indexOf("<SuspectsQueryBar />")).toBeLessThan(bar.indexOf("{:else}"));
+    expect(bar.indexOf("<FilterBar />")).toBeGreaterThan(bar.indexOf("{:else}"));
+  });
+
+  it("drops the suspects answer when the repository changes", () => {
+    expect(history).toContain("suspectsQuery.bindRepo($currentRepoPath)");
   });
 
   it("keeps the reflog lazy so its chunk is not in the entry bundle", () => {
@@ -44,17 +77,20 @@ describe("HistoryView", () => {
     expect(history).not.toContain('import ReflogViewer');
   });
 
-  it("hosts the suspects lens on the same lazy contract", () => {
-    // It pulls the code-graph client, which no other History section needs, so
-    // eager-importing it would put that chunk in every session that opens a
-    // repository. Same stable-loader rule as the reflog.
+  it("hosts the suspects list on the same lazy contract", () => {
+    // It belongs with the code-graph client, which no other History list
+    // needs, so eager-importing it would put that chunk in every session that
+    // opens a repository. Same stable-loader rule as the reflog. The eager
+    // parts (the question, the chips, the verdict in the details) read the
+    // client-free `suspectsQuery`, which loads the client on first run.
     expect(history).toContain("loadSuspects: ViewLoader");
-    expect(history).toContain('{:else if section === "suspects"}');
-    expect(history).not.toContain("import RegressionSuspectsPanel");
-    expect(app).toContain("const loadRegressionSuspectsPanel = () =>");
+    expect(history).not.toContain("import SuspectsList");
+    expect(app).toContain("const loadSuspectsList = () =>");
+    expect(query).not.toMatch(/^import .*from "\.\/client"/m);
+    expect(query).toContain('await import("./client")');
     // History is itself lazy, so App hands its loaders through LazyView's
     // `props={{ … }}` rather than as attributes.
-    expect(app).toContain("loadSuspects: loadRegressionSuspectsPanel");
+    expect(app).toContain("loadSuspects: loadSuspectsList");
     // Inline arrows are the failure this contract exists for: a new function
     // each render misses LazyView's cache and remounts the pane.
     expect(app).not.toMatch(/loadSuspects(=\{|:\s*)\(\)\s*=>/);

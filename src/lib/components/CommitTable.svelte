@@ -3,6 +3,7 @@
   import { get } from "svelte/store";
   import { graphStore } from "../stores/graphStore";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { suspectsQuery, suspectMarks } from "../codeintel/suspectsQuery";
   import { filterStore } from "../stores/filterStore";
   import { themeStore } from "../stores/themeStore";
   import { densityStore } from "../stores/densityStore";
@@ -166,6 +167,8 @@
   // identical reloads (signature check), which is what keeps the strip cache
   // alive between watcher refreshes.
   let filteredRows = $derived($graphStore.rows);
+  // Commits Graph's Suspects list ranked, chipped on their rows here.
+  let suspectByCommit = $derived(suspectMarks($suspectsQuery, $currentRepoPath));
 
   /** Parents a row's stubs point at, so the spoken context can name them. */
   function missingParentsOf(row: VisualCommitRow): string[] {
@@ -582,10 +585,7 @@
     // Connector hits attribute to the commit that owns the descent, so
     // clicking anywhere along a branch's closing line selects that commit.
     const hit = hitAt(e.clientX, e.clientY);
-    if (hit) {
-      graphStore.selectCommit(hit.row);
-      repoStore.selectCommitDiff(hit.row.id);
-    }
+    if (hit) repoStore.selectHistoryCommit(hit.row.id);
   }
 
   /**
@@ -984,10 +984,8 @@
             onFocusRow={(element, keyboardVisible) =>
               handleRowFocus(row, element, keyboardVisible)}
             onBlurRow={handleRowBlur}
-            onSelect={() => {
-              graphStore.selectCommit(row);
-              repoStore.selectCommitDiff(row.id);
-            }}
+            onSelect={() => repoStore.selectHistoryCommit(row.id)}
+            suspect={suspectByCommit.get(row.id) ?? null}
           />
         {/each}
       </div>

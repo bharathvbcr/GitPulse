@@ -22,9 +22,10 @@ describe("view icons", () => {
         checked += 1;
       }
     }
-    // The control: the loop above ran over the real catalog (12 sections since
-    // Work's Policy folded into Overview, Remote and Settings).
-    expect(checked).toBeGreaterThanOrEqual(12);
+    // The control: the loop above ran over the real catalog (11 sections since
+    // Work's Policy folded into Overview, Remote and Settings and History's
+    // Suspects into Graph).
+    expect(checked).toBeGreaterThanOrEqual(11);
   });
 
   it("maps no section the catalog does not have", () => {

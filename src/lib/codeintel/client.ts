@@ -119,10 +119,12 @@ export async function getDeadSymbols(
  * A mirror of `MAX_CONE_DEPTH` in `src-tauri/src/codeintel/suspects.rs`, which
  * is itself held against the `maximum` the MCP schema advertises. Mirrored
  * rather than fetched because the input has to be bounded before the first
- * call, and held by a test (`suspects.test.ts`) so the two cannot drift: a UI
- * that offers a depth the backend refuses is a control that fails on use.
+ * call, and held by a test so the two cannot drift: a UI that offers a depth
+ * the backend refuses is a control that fails on use. Declared in the
+ * client-free `suspectsQuery` so History's context bar can bound its input
+ * without pulling this module into the entry chunk.
  */
-export const MAX_SUSPECT_CONE_DEPTH = 10;
+export { MAX_SUSPECT_CONE_DEPTH } from "./suspectsQuery";
 
 /**
  * Which commits since `since` could have caused `symptom`.

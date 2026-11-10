@@ -494,6 +494,14 @@ export function createGraphStore(
    */
   const shed = new Map<string, ShedView>();
   /**
+   * The commit each repository's selection was pinned to by a list that is
+   * not the graph (HEAD moves, Suspects). A reload keeps a pinned selection
+   * even when its rows stop drawing it: the reader clicked it in a list that
+   * still shows it, and swapping in the newest row would change the details
+   * pane under a highlight that did not move. A graph click clears the pin.
+   */
+  const pinned = new Map<string, string>();
+  /**
    * Ordering epochs come from store-wide monotonic counters, so a value is
    * never handed out twice. That is what makes pruning safe: evict() deletes
    * both maps' entries for the path (absent entry ⇒ every outstanding token
@@ -755,6 +763,7 @@ export function createGraphStore(
     evict: (path: string) => {
       cache.delete(path);
       shed.delete(path);
+      pinned.delete(path);
       // Prune the ordering maps too: entries for closed repos would otherwise
       // grow without bound. A missing entry orphans every outstanding token
       // for this path (undefined === token is false), which is exactly what
@@ -931,12 +940,17 @@ export function createGraphStore(
         // (a reflog entry a reset orphaned): the walk was never going to hold
         // it, so a reload keeps it rather than swapping in the newest row. A
         // drawn selection a filter dropped still falls back, as before.
+        // A selection pinned by HEAD moves or Suspects is kept the same way,
+        // drawn or not: that list still highlights it.
         const offGraph =
-          previous?.selectedCommit && !previous.rows.some((row) => row.id === previous.selectedCommit?.id)
+          previous?.selectedCommit &&
+          (pinned.get(repoPath) === previous.selectedCommit.id ||
+            !previous.rows.some((row) => row.id === previous.selectedCommit?.id))
             ? previous.selectedCommit
             : undefined;
         const selectedCommit =
           kept ?? offGraph ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
+        if (selectedCommit?.id !== pinned.get(repoPath)) pinned.delete(repoPath);
         const keepDetails =
           previous &&
           selectedCommit &&
@@ -1041,27 +1055,17 @@ export function createGraphStore(
       await api.loadGraph(repoPath, query, revision, { forceLimit: next });
       return true;
     },
-    selectCommit: async (commit: VisualCommitRow, repoPath?: string) => {
+    /** Selects a drawn row, as a click on the graph does. Clears any pin. */
+    selectCommit: (commit: VisualCommitRow, repoPath?: string) => select(commit, repoPath, false),
+    /**
+     * Reads the selected commit's details again (the details pane's Retry),
+     * keeping the selection's pin: retrying is not choosing a commit.
+     */
+    retryDetails: (repoPath?: string) => {
       const path = repoPath ?? visiblePath;
-      // The status describes the selected commit, so it cannot outlive a
-      // change of selection: only details already held for this commit keep
-      // their verdict, anything else starts over (the fetch below says "loading").
-      update((s) => ({
-        ...s,
-        selectedCommit: commit,
-        ...(commit && s.selectedCommitDetails?.id === commit.id
-          ? {}
-          : { selectedCommitDetailsStatus: "idle" as const, selectedCommitDetailsError: null }),
-      }));
-      if (path && visiblePath === path) {
-        const cached = cache.get(path);
-        if (cached) cached.selectedCommit = commit;
-      }
-      if (path && commit) {
-        const token = generations.get(path) ?? 0;
-        const seq = selectionSeq(path);
-        await fetchDetails(path, token, commit.id, seq);
-      }
+      const commit = (path ? cache.get(path)?.selectedCommit : undefined) ?? latestState?.selectedCommit ?? null;
+      if (!commit) return Promise.resolve();
+      return select(commit, repoPath, path !== null && pinned.get(path) === commit.id);
     },
     /**
      * Selects a commit by id, whether or not the loaded rows draw it.
@@ -1070,19 +1074,48 @@ export function createGraphStore(
      * not reach (a reflog entry a reset or amend orphaned) gets a stand-in row
      * carrying only its id and `hint.summary`; its details are read like any
      * other, and a pruned object lands in the pane's error-and-Retry state.
+     * `hint.pin` is for lists other than the graph: it keeps the selection
+     * across a reload that stops drawing it (see `pinned`).
      */
     selectCommitById: async (
       commitId: string,
-      hint: { summary?: string } = {},
+      hint: { summary?: string; pin?: boolean } = {},
       repoPath?: string
     ) => {
       if (!commitId) return;
       const path = repoPath ?? visiblePath;
       const rows = (path ? cache.get(path)?.rows : undefined) ?? latestState?.rows ?? [];
       const drawn = rows.find((r) => r.id === commitId);
-      await api.selectCommit(drawn ?? offGraphRow(commitId, hint.summary ?? ""), repoPath);
+      await select(drawn ?? offGraphRow(commitId, hint.summary ?? ""), repoPath, hint.pin === true);
     },
   };
+
+  async function select(commit: VisualCommitRow, repoPath: string | undefined, pin: boolean) {
+    const path = repoPath ?? visiblePath;
+    if (path) {
+      if (pin) pinned.set(path, commit.id);
+      else pinned.delete(path);
+    }
+    // The status describes the selected commit, so it cannot outlive a
+    // change of selection: only details already held for this commit keep
+    // their verdict, anything else starts over (the fetch below says "loading").
+    update((s) => ({
+      ...s,
+      selectedCommit: commit,
+      ...(commit && s.selectedCommitDetails?.id === commit.id
+        ? {}
+        : { selectedCommitDetailsStatus: "idle" as const, selectedCommitDetailsError: null }),
+    }));
+    if (path && visiblePath === path) {
+      const cached = cache.get(path);
+      if (cached) cached.selectedCommit = commit;
+    }
+    if (path && commit) {
+      const token = generations.get(path) ?? 0;
+      const seq = selectionSeq(path);
+      await fetchDetails(path, token, commit.id, seq);
+    }
+  }
 
   return api;
 }

@@ -80,7 +80,7 @@ import {
 } from "../repos/stripNav";
 import { expandedStacks, lastUsedCheckouts, noteActiveCheckout } from "../repos/stackState";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
-import { sanitizeHistoryList, type HistoryList } from "../views/historyList";
+import { historySelectionLabel, sanitizeHistoryList, type HistoryList } from "../views/historyList";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
 import type { MergeMode } from "../branches/mergeSelection";
 import { parseGitPreflight, type GitIdentity, type GitPreflight, type IdentityScope } from "../repos/gitPreflight";
@@ -3063,6 +3063,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // selections just record the preference for the next file click.
       if (selectionKind !== "file" || !filePath) return;
       void store.selectFileDiff(filePath, isStaged);
+    },
+    /**
+     * Selects a commit in History from any of Graph's lists: the commit graph,
+     * HEAD moves or Suspects. One path for all three, so the graph's
+     * selection (header, files, ring on the canvas) and the diff below can
+     * never name different commits, whichever list the click came from.
+     *
+     * `pin` is for the lists that are not the graph: their row stays selected
+     * across a graph reload that stops drawing it (`graphStore.selectCommitById`).
+     * `summary` labels a commit the graph does not draw until its details land;
+     * `label` is what that list calls it (a reflog selector), for the details
+     * pane's prompts.
+     */
+    selectHistoryCommit: (
+      commitId: string,
+      opts: { summary?: string; pin?: boolean; label?: string } = {},
+    ) => {
+      if (!commitId) return;
+      historySelectionLabel.set(opts.label ? { commitId, label: opts.label } : null);
+      void graphStore.selectCommitById(commitId, { summary: opts.summary, pin: opts.pin });
+      void store.selectCommitDiff(commitId);
     },
     selectCommitDiff: (commitId: string) =>
       diffSelection.select({

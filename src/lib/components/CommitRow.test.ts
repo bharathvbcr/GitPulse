@@ -206,12 +206,16 @@ describe("tag chips carry the tag's standing against the base", () => {
 
 describe("CommitRow branch creation contract", () => {
   it("names its repository before the prompt, and toasts success only after an ok outcome", () => {
-    const body = functionBody(source, "createBranchHere");
-    expect(body.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
-    expect(body.indexOf("repoStore.captureTarget()")).toBeLessThan(body.indexOf("await askText("));
-    expect(body).toContain("const outcome = await repoStore.createBranch(name.trim(), row.id, target);");
-    expect(body).toContain("reportFailure(outcome,");
-    expect(body.indexOf("toastStore.success(")).toBeGreaterThan(body.indexOf("reportFailure(outcome,"));
+    // The row menu and the details pane share one owner for this, whose
+    // ordering (target before prompt, toast after an ok outcome) is driven
+    // behaviourally in branches/commitActions.test.ts.
+    expect(functionBody(source, "createBranchHere")).toContain("await createBranchAt(row.id)");
+    expect(functionBody(source, "resetHere")).toContain("await resetKeepTo(row.id)");
+    const actions = readFileSync(new URL("../branches/commitActions.ts", import.meta.url), "utf8");
+    const create = functionBody(actions, "createBranchAt");
+    expect(create.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
+    expect(create.indexOf("repoStore.captureTarget()")).toBeLessThan(create.indexOf("await askText("));
+    expect(create.indexOf("toastStore.success(")).toBeGreaterThan(create.indexOf("reportFailure(outcome,"));
   });
 });
 

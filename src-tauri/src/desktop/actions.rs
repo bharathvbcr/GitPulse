@@ -94,7 +94,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         entries: &[
             ("section:history:graph", "Graph"),
             ("section:history:diff", "Diff"),
-            ("section:history:suspects", "Suspects"),
         ],
     },
     SectionMenu {
@@ -333,11 +332,12 @@ mod tests {
         // Secrets, at 17 when Code gained Search, at 18 before Secrets folded
         // into Health (17) and Code's Search and Blame became toggles inside
         // Explorer (15), at 15 when Reflog folded into History › Graph (14),
-        // at 14 when Work's Resolve folded into Policy (13), and at 13 when
-        // Policy's cards moved to Overview, Remote and Settings (12); the
+        // at 14 when Work's Resolve folded into Policy (13), at 13 when
+        // Policy's cards moved to Overview, Remote and Settings (12), and at
+        // 12 when History's Suspects folded into Graph as a list (11); the
         // parity contract is what proves the number is the right one rather
         // than just the current one.
-        assert_eq!(entries.len(), 12);
+        assert_eq!(entries.len(), 11);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {

@@ -1,7 +1,7 @@
 # GitPulse documentation
 
 GitPulse brings Git, code exploration, tasks, and repository insights into one
-local-first desktop workspace with 12 specialized sections across 4 views. This is the index for maintained documentation.
+local-first desktop workspace with 11 specialized sections across 4 views. This is the index for maintained documentation.
 
 [Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
 [Website](https://gitpulse.vbcr.dev/) · [Project overview](../README.md) ·

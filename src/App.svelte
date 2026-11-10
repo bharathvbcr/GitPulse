@@ -100,8 +100,7 @@
   const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
   const loadGitHubPanel = () => import("./lib/components/GitHubPanel.svelte");
   const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
-  const loadRegressionSuspectsPanel = () =>
-    import("./lib/components/RegressionSuspectsPanel.svelte");
+  const loadSuspectsList = () => import("./lib/components/SuspectsList.svelte");
   const loadRepoMapPanel = () => import("./lib/components/RepoMapPanel.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
@@ -1241,7 +1240,7 @@
                 <LazyView
                   load={loadHistoryView}
                   name="History"
-                  props={{ loadReflog: loadReflogViewer, loadSuspects: loadRegressionSuspectsPanel }}
+                  props={{ loadReflog: loadReflogViewer, loadSuspects: loadSuspectsList }}
                 />
               {:else if $repoStore.activeTab === "insights"}
                 <InsightsView

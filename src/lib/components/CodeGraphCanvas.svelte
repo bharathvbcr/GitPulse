@@ -17,6 +17,7 @@
   } from "../codeintel/graphPayload";
   import { buildGraphIndex, filterGraphNodes, fitGraphView, graphNodeOpenPath, traceGraph, type TraceDirection } from "../codeintel/graphNavigation";
   import type { GraphVizLoad } from "../codeintel/types";
+  import { openSuspectsFor } from "../codeintel/openSuspects";
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
@@ -486,6 +487,12 @@
     {:else if selectedNode}
       <aside class="map-neighbors" aria-label="Node connections">
         <div class="neighbor-heading"><strong>Connections</strong><button type="button" aria-label="Close connections" onclick={() => selectedId = null}>×</button></div>
+        {#if load?.kind === "code_graph"}
+          <!-- A code-graph node id is a DevMap node id (a file, or file::symbol),
+               which is exactly what the suspects walk resolves a symptom by.
+               Subsystem and doc nodes are not, so they do not offer it. -->
+          <button type="button" class="node-suspects" onclick={() => openSuspectsFor(selectedNode.id)} title="Which commit since the last known good could have broken {selectedNode.name}, ranked by what the call graph reaches from it">Find suspects for {selectedNode.name}</button>
+        {/if}
         <div class="trace-controls">
           <select aria-label="Trace direction" bind:value={direction} onchange={() => connectionPage = 0}>
             <option value="both">Both directions</option><option value="outgoing">Depends on</option><option value="incoming">Used by</option>
@@ -588,6 +595,8 @@
   .neighbor-heading, .trace-controls, .map-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .neighbor-heading { font-size: 11px; margin-bottom: 9px; }
   .neighbor-heading button { width: 24px; height: 24px; }
+  .node-suspects { width: 100%; margin-bottom: 9px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--map-border); font-size: 11px; text-align: left; }
+  .node-suspects:hover { background: var(--map-panel); }
   .trace-controls select { min-width: 0; padding: 5px; border-radius: 5px; background: var(--map-panel); color: inherit; border: 1px solid var(--map-border); font-size: 11px; }
   .trace-summary, .neighbor-list p { margin: 8px 0; font-size: 10px; line-height: 1.5; color: var(--map-muted); }
   .neighbor-list button { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 8px 4px; border-radius: 6px; }

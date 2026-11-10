@@ -41,11 +41,12 @@ describe("native section menus match the frontend registry", () => {
     );
     // Written out so the registry side cannot collapse to nothing and let the
     // comparison below pass against an equally empty Rust side. Bump it when a
-    // section is added or removed — the edit is the review. 12 = 3 Work
+    // section is added or removed — the edit is the review. 11 = 3 Work
     // (Resolve and Policy folded into Overview, Remote and Settings) + 2 Code
-    // (Search and Blame are toggles inside Explorer now) + 3 History (Reflog
-    // folded into Graph) + 4 Insights (Secrets folded into Health).
-    expect(expected).toHaveLength(12);
+    // (Search and Blame are toggles inside Explorer now) + 2 History (Reflog
+    // and Suspects folded into Graph as lists) + 4 Insights (Secrets folded
+    // into Health).
+    expect(expected).toHaveLength(11);
     expect(entries.sort()).toEqual(expected.sort());
     expect(menu).toContain("actions::SECTION_MENUS");
   });

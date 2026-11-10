@@ -16,16 +16,16 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 12 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 11 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Tasks |
 | **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
-| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
+| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
-Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
+Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
 
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 12 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 11 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -52,7 +52,7 @@ flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph (commits or HEAD moves) · Diff · Suspects — three lenses on commit history"]
+        History["<b>History</b> (<code>history</code>)<br/>Graph (commits, HEAD moves or suspects) · Diff — lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
     end
 
@@ -372,11 +372,11 @@ flowchart TD
 
 ## 3. History (`history`)
 
-Three lenses on one subject — what happened to this repository — switched by
-the segmented control in the view's own header (Graph, Diff, Suspects), which also carries the commit
-filter. Graph, Diff and Reflog were three top-level tabs, then sections; Reflog then folded into
-Graph as its *HEAD moves* list. With Suspects they share selected commit context, so switching
-lens keeps the commit or regression window you were looking at.
+Lenses on one subject — what happened to this repository — switched by
+the segmented control in the view's own header (Graph, Diff); the context bar below carries the commit
+filter, or the suspects question while Graph shows Suspects. Graph, Diff and Reflog were three top-level
+tabs, then sections; Reflog then folded into Graph as its *HEAD moves* list and Suspects as its third
+list. They share selected commit context, so switching list or lens keeps the commit you were looking at.
 The split was expensive in a way the code admitted: the Diff tab had to grow
 its own commit picker purely so you would not have to walk back to Graph for
 the commit you had just selected.
@@ -417,10 +417,10 @@ the commit you had just selected.
 
 - **Reference Log Browser**: The *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's reflog: every movement of HEAD, checkouts, commits, rebases and resets, newest first (the 200 most recent, with the cap named). The commit filter narrows the loaded entries by selector, sha, action or message.
 - **Selected In Place**: Clicking an entry shows its commit in the details pane below the list, including a commit a reset or amend left reachable only from the reflog (marked *Not in the graph*). A pruned object shows the details error and Retry, not an empty commit.
-- **Recovery Points**: Create a branch at an entry, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop.
+- **Recovery Points**: Select an entry and use *Branch* or *Reset* in the details pane below to create a branch at its commit, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop. The same two actions act on any commit the pane describes, whichever list selected it, and sit in the graph's row menu (`branches/commitActions.ts` owns both). The list reloads when HEAD moves.
 - **Restored Sessions**: A session saved on the old Reflog section or view reopens on Graph's HEAD-moves list.
 
-### 3.4 Suspects
+### 3.4 Suspects (Graph's third list)
 
 ```mermaid
 flowchart LR
@@ -436,10 +436,12 @@ flowchart LR
         GraphSearch --> Ranker
     end
 
-    subgraph Output["History → Suspects"]
+    subgraph Output["History → Graph → Suspects"]
         Results["Ranked Suspects List<br/>(Commit OID, Author, Evidence Chip)"]
-        DiffJump["Click Suspect → Jump to Unified/Split Diff"]
-        Ranker --> Results --> DiffJump
+        Details["Click Suspect → Commit Details Below<br/>(verdict, files, diff preview)"]
+        Chips["Commits / HEAD moves<br/>chip ranked commits"]
+        Ranker --> Results --> Details
+        Results --> Chips
     end
 
     Input --> Analysis
@@ -448,6 +450,9 @@ flowchart LR
 - **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
 - **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.
 - **Indexed Search Window**: Analyzes the historical commit window up to the currently indexed commit, reporting exact commit reachability and blame attribution.
+- **Ways In**: Blame's toolbar (*Suspects* — the blamed file is the symptom), a diff hunk's symbol (*suspects*), a code-graph node's connections panel (*Find suspects for …*, by its DevMap id), the palette (*Find regression suspects*, and *Find suspects for the open file*), and *Suspects since* on any commit's details. All go through `openSuspectsFor`, which lands on Graph's Suspects list and asks at once when a symptom was named.
+- **One of Graph's Lists**: The question (symptom, last known good, cone depth) sits in History's context bar in place of the commit filter. A click selects the suspect in place, above the same details pane as the commit graph and HEAD moves, and stays selected when a graph reload stops drawing it. The details pane shows the suspect's verdict whichever list selected the commit, the other lists chip ranked commits (the tooltip names the symptom and window), and *Suspects since* on any commit's details asks again from that commit.
+- **Restored Sessions**: A session saved on the old Suspects section reopens on Graph's Suspects list; the palette's *Find regression suspects* keeps its id and opens it with the symptom focused.
 
 ---
 
@@ -755,8 +760,8 @@ stop per checkout.
 | **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
-Sections within a view — Work's Overview / Remote / Tasks, Code's Explorer / Map, History's Graph / Diff /
-Suspects, Insights' Pulse / Coverage / Health / Storage — are switched by that
+Sections within a view — Work's Overview / Remote / Tasks, Code's Explorer / Map, History's Graph /
+Diff, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
 section directly, including all three Work sections.
