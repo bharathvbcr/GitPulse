@@ -170,22 +170,53 @@ fn autocrlf_true_leaves_every_text_path_to_git_and_matches_a_plain_checkout() {
     );
 }
 
-/// Measurement, not a check. Creates `GITPULSE_COW_MEASURE_N` (default 5)
-/// lanes of each arm from the scratch repository named by
-/// `GITPULSE_COW_MEASURE_REPO`, interleaved, and prints one line per lane:
-/// wall time and the bytes the lane owns (clone-private; a clone of the
-/// donor owns nothing). The `plain` arm is `git worktree add`, the path
-/// `add_worktree` falls through to when the clone path declines.
-#[test]
-#[ignore = "measurement: set GITPULSE_COW_MEASURE_REPO to a scratch clone"]
-fn cow_lane_creation_cost() {
+fn load1() -> f64 {
+    let mut load = [0f64; 3];
+    // SAFETY: `getloadavg` writes at most the 3 doubles it is given.
+    unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+    load[0]
+}
+
+/// (min, median, max) of `values`, which must not be empty.
+fn spread(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    (
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+    )
+}
+
+/// A round whose 1-minute load average, before or after, is above this is
+/// reported as contaminated, never dropped.
+const QUIET_LOAD: f64 = 30.0;
+
+fn measure_env() -> (PathBuf, usize) {
     let repo = PathBuf::from(std::env::var("GITPULSE_COW_MEASURE_REPO").expect("repo path"));
-    let runs: usize = std::env::var("GITPULSE_COW_MEASURE_N")
+    let runs = std::env::var("GITPULSE_COW_MEASURE_N")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(5);
     trust_repo(&repo);
+    (repo, runs)
+}
+
+/// Measurement, not a check. Creates `GITPULSE_COW_MEASURE_N` (default 5)
+/// lanes of each arm from the scratch repository named by
+/// `GITPULSE_COW_MEASURE_REPO`, interleaved, both through `add_worktree` (the
+/// lock, validation and account marker are in both). `plain` passes neither a
+/// branch nor `--detach`, which `try_add_worktree_cow_macos` declines, so
+/// `add_worktree` runs the plain `git worktree add`; `cow` passes a branch.
+/// Wall time is reported without and with a `sync(2)` flush of the lane's
+/// freshly written pages, with the load average either side of each lane, and
+/// the bytes the lane owns (clone-private; a clone of the donor owns nothing).
+#[test]
+#[ignore = "measurement: set GITPULSE_COW_MEASURE_REPO to a scratch clone"]
+fn cow_lane_creation_cost() {
+    let (repo, runs) = measure_env();
     let parent = repo.parent().unwrap().to_path_buf();
+    let mut rows: Vec<(&str, f64, f64, f64, bool)> = Vec::new();
     for run in 0..runs {
         let arms = if run % 2 == 0 {
             ["plain", "cow"]
@@ -193,41 +224,240 @@ fn cow_lane_creation_cost() {
             ["cow", "plain"]
         };
         for arm in arms {
-            let lane = parent.join(format!("lane-{arm}-{run}"));
-            let branch = format!("measure/{arm}-{run}");
+            let name = format!("lane-{arm}-{run}");
+            let lane = parent.join(&name);
+            let before = load1();
             let started = std::time::Instant::now();
-            if arm == "plain" {
-                git_in(
-                    &repo,
-                    &["worktree", "add", "-b", &branch, lane.to_str().unwrap()],
-                );
-            } else {
-                add_worktree(
-                    repo.to_str().unwrap(),
-                    lane.to_str().unwrap(),
-                    Some(&branch),
-                    None,
-                    false,
-                )
-                .expect("add_worktree");
-            }
-            let wall = started.elapsed();
-            // SAFETY: `sync(2)` takes no arguments; it makes freshly written
-            // blocks allocated so their private size is not read as zero.
+            let branch = (arm == "cow").then_some(name.as_str());
+            add_worktree(
+                repo.to_str().unwrap(),
+                lane.to_str().unwrap(),
+                branch,
+                None,
+                false,
+            )
+            .expect("add_worktree");
+            let wall = started.elapsed().as_secs_f64() * 1000.0;
+            // SAFETY: `sync(2)` takes no arguments.
             unsafe { libc::sync() };
+            let flushed = started.elapsed().as_secs_f64() * 1000.0;
+            let after = load1();
             let (private, logical, files, unread) =
                 crate::storage::clone_size::private_tree_bytes(&lane);
+            let contaminated = before > QUIET_LOAD || after > QUIET_LOAD;
             println!(
-                "MEASURE arm={arm} run={run} wall_ms={} private_bytes={private} logical_bytes={logical} files={files} unread={unread}",
-                wall.as_millis()
+                "MEASURE arm={arm} run={run} wall_ms={wall:.0} flushed_ms={flushed:.0} private_bytes={private} logical_bytes={logical} files={files} unread={unread} load_before={before:.1} load_after={after:.1} contaminated={contaminated}"
             );
+            rows.push((arm, wall, flushed, load1(), contaminated));
             git_in(
                 &repo,
                 &["worktree", "remove", "--force", lane.to_str().unwrap()],
             );
-            git_in(&repo, &["branch", "-D", &branch]);
+            git_in(&repo, &["branch", "-D", &name]);
         }
     }
+    for arm in ["plain", "cow"] {
+        for (label, only_quiet) in [("all", false), ("quiet", true)] {
+            let of: Vec<_> = rows
+                .iter()
+                .filter(|row| row.0 == arm && (!only_quiet || !row.4))
+                .collect();
+            if of.is_empty() {
+                println!("SUMMARY arm={arm} rounds={label} n=0");
+                continue;
+            }
+            let wall: Vec<f64> = of.iter().map(|row| row.1).collect();
+            let flushed: Vec<f64> = of.iter().map(|row| row.2).collect();
+            let (w0, w1, w2) = spread(&wall);
+            let (f0, f1, f2) = spread(&flushed);
+            println!(
+                "SUMMARY arm={arm} rounds={label} n={} wall_ms min/median/max={w0:.0}/{w1:.0}/{w2:.0} flushed_ms min/median/max={f0:.0}/{f1:.0}/{f2:.0}",
+                of.len()
+            );
+        }
+    }
+}
+
+/// Measurement, not a check. Runs each phase of the clone path by itself, in
+/// the order `try_add_worktree_cow_macos` runs them and through the same
+/// helpers and the same git wrapper, and prints each phase's min / median /
+/// max over `GITPULSE_COW_MEASURE_N` rounds. The phases are re-run here, not
+/// instrumented in production code, so their sum is the clone path without
+/// `add_worktree`'s own overhead. One raw plain `git worktree add` is traced
+/// with `GIT_TRACE_PERFORMANCE` for the plain arm's breakdown.
+#[test]
+#[ignore = "measurement: set GITPULSE_COW_MEASURE_REPO to a scratch clone"]
+fn cow_phase_timings() {
+    use crate::procguard::LockedSpawn;
+    use std::collections::HashMap;
+
+    let (repo, runs) = measure_env();
+    let parent = repo.parent().unwrap().to_path_buf();
+    let mut phases: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut totals: Vec<f64> = Vec::new();
+    let mut contaminated = 0usize;
+
+    fn timed<T>(phases: &mut Vec<(String, Vec<f64>)>, name: &str, f: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = f();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        match phases.iter_mut().find(|(n, _)| n == name) {
+            Some((_, samples)) => samples.push(ms),
+            None => phases.push((name.to_string(), vec![ms])),
+        }
+        out
+    }
+
+    for run in 0..runs {
+        let before = load1();
+        let round_started = std::time::Instant::now();
+        let name = format!("phase-lane-{run}");
+        let target = parent.join(&name);
+        let target_text = target.to_str().unwrap().to_string();
+
+        let ls_donor = timed(&mut phases, "donor: ls-files -s -z", || {
+            crate::engine::git_cli::git_captured(&repo, &["ls-files", "-s", "-z"]).unwrap()
+        });
+        let donor_entries = parse_ls_files_stage0(&ls_donor.stdout);
+        let status = timed(&mut phases, "donor: status --porcelain -z", || {
+            crate::engine::git_cli::git_captured(
+                &repo,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+            )
+            .unwrap()
+        });
+        let dirty = parse_porcelain_dirty_paths_z(&status.stdout);
+        let mut donor_clean: HashMap<String, (String, String)> = HashMap::new();
+        for (mode, oid, rel) in donor_entries {
+            if !dirty.contains(&rel) && matches!(mode.as_str(), "100644" | "100755") {
+                donor_clean.insert(rel, (mode, oid));
+            }
+        }
+        timed(&mut phases, "hook probe: git hook list", || {
+            post_checkout_hook_runs(&repo)
+        });
+        timed(&mut phases, "worktree add --no-checkout", || {
+            git_text(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    "-b",
+                    &name,
+                    &target_text,
+                ],
+            )
+            .unwrap()
+        });
+        timed(&mut phases, "target: read-tree HEAD", || {
+            git_text(&target, &["read-tree", "HEAD"]).unwrap()
+        });
+        let ls_target = timed(&mut phases, "target: ls-files -s -z", || {
+            crate::engine::git_cli::git_captured(&target, &["ls-files", "-s", "-z"]).unwrap()
+        });
+        let target_entries = parse_ls_files_stage0(&ls_target.stdout);
+        let candidates: Vec<&str> = target_entries
+            .iter()
+            .filter(|(mode, oid, rel)| {
+                matches!(mode.as_str(), "100644" | "100755")
+                    && named_exactly_by_stdin_paths(rel)
+                    && donor_clean
+                        .get(rel)
+                        .is_some_and(|(d_mode, d_oid)| d_mode == mode && d_oid == oid)
+            })
+            .map(|(_, _, rel)| rel.as_str())
+            .collect();
+        let converted = timed(
+            &mut phases,
+            "target: config x2 + check-attr --cached",
+            || paths_converted_on_checkout(&target, &candidates).unwrap(),
+        );
+        let mut cloned: Vec<(String, String)> = Vec::new();
+        let candidate_set: std::collections::HashSet<&str> = candidates.iter().copied().collect();
+        timed(
+            &mut phases,
+            "clonefile loop (create_dir_all + clone)",
+            || {
+                let mut created: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                for (_, oid, rel) in &target_entries {
+                    if !candidate_set.contains(rel.as_str()) || converted.contains(rel) {
+                        continue;
+                    }
+                    let dst = target.join(rel);
+                    if let Some(parent) = dst.parent() {
+                        if created.insert(parent.to_path_buf()) {
+                            std::fs::create_dir_all(parent).unwrap();
+                        }
+                    }
+                    if try_apfs_clone_regular_file(&repo.join(rel), &dst) {
+                        cloned.push((rel.clone(), oid.clone()));
+                    }
+                }
+            },
+        );
+        let wrong = timed(&mut phases, "hash-object --stdin-paths (verify)", || {
+            clones_that_are_not_their_blob(&target, &cloned).unwrap()
+        });
+        assert!(wrong.is_empty(), "scratch clone is clean: {wrong:?}");
+        timed(&mut phases, "update-index --refresh", || {
+            crate::engine::git_cli::git_captured(&target, &["update-index", "-q", "--refresh"])
+                .unwrap()
+        });
+        timed(&mut phases, "diff-files --name-only", || {
+            crate::engine::git_cli::git_captured(&target, &["diff-files", "--name-only", "-z"])
+                .unwrap()
+        });
+        totals.push(round_started.elapsed().as_secs_f64() * 1000.0);
+        let after = load1();
+        if before > QUIET_LOAD || after > QUIET_LOAD {
+            contaminated += 1;
+        }
+        println!(
+            "ROUND run={run} cloned={} spawned_phases_total_ms={:.0} load_before={before:.1} load_after={after:.1}",
+            cloned.len(),
+            totals[run]
+        );
+        git_in(&repo, &["worktree", "remove", "--force", &target_text]);
+        git_in(&repo, &["branch", "-D", &name]);
+    }
+    for (name, samples) in &phases {
+        let (lo, mid, hi) = spread(samples);
+        println!(
+            "PHASE {name}: min/median/max_ms={lo:.1}/{mid:.1}/{hi:.1} n={}",
+            samples.len()
+        );
+    }
+    let (lo, mid, hi) = spread(&totals);
+    println!(
+        "PHASE_TOTAL min/median/max_ms={lo:.0}/{mid:.0}/{hi:.0} n={} contaminated_rounds={contaminated}",
+        totals.len()
+    );
+
+    // The plain path's own breakdown: one raw `git worktree add` traced.
+    let trace = parent.join("plain-trace.txt");
+    let name = "plain-traced";
+    let lane = parent.join(name);
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["worktree", "add", "-b", name, lane.to_str().unwrap()])
+        .current_dir(&repo)
+        .env("GIT_TRACE_PERFORMANCE", &trace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::test_support::pin_git(&mut command);
+    let output = command.spawn_locked().unwrap().wait_with_output().unwrap();
+    assert!(output.status.success());
+    for line in std::fs::read_to_string(&trace).unwrap_or_default().lines() {
+        println!("PLAIN_TRACE {line}");
+    }
+    git_in(
+        &repo,
+        &["worktree", "remove", "--force", lane.to_str().unwrap()],
+    );
+    git_in(&repo, &["branch", "-D", name]);
 }
 
 fn attrs(
