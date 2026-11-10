@@ -369,13 +369,21 @@ const IGNORE_RETRY: Duration = Duration::from_secs(30);
 pub(crate) struct IgnoreRules {
     /// Folded, `/`-separated directory prefixes (`scratch`, `pkg/generated`).
     prefixes: HashSet<String>,
-    /// The same prefixes in the spelling git printed them, which is the
-    /// on-disk spelling an event path carries. The refresh classifier folds
-    /// case (a refresh that is merely too eager is harmless); the question
-    /// "may this change be assumed away" does not: only an exact match is
-    /// proof that git ignores the directory, so a directory that differs from
-    /// an ignored one only by case never counts as ignored, whatever the
-    /// volume does with case.
+    /// The directories a RULE excludes, in the spelling git printed them,
+    /// which is the on-disk spelling an event path carries. This is a
+    /// different set from `prefixes`: `git ls-files -o -i --directory` also
+    /// prints a directory that no rule excludes whenever every file currently
+    /// in it is ignored (`build/` holding only `*.o`, `src/x/` holding only a
+    /// `*.swp`), so that listing describes contents, not rules. A directory is
+    /// in `exact` only when `git check-ignore` said the directory ITSELF is
+    /// excluded (then nothing beneath it can be re-included) and no tracked
+    /// file lives under it. See the invariant in `facts.rs`.
+    ///
+    /// The refresh classifier folds case and uses `prefixes` (a refresh that
+    /// is merely too eager is harmless); the question "may this change be
+    /// assumed away" uses only this set and only an exact match, so a
+    /// directory that differs from an excluded one only by case never counts,
+    /// whatever the volume does with case.
     exact: HashSet<String>,
     /// `None` only when the query finished and the prefix list was complete.
     load_error: Option<String>,
@@ -399,10 +407,24 @@ impl IgnoreRules {
         }
     }
 
-    /// One bounded `git ls-files` for directories the ignore rules already cover.
-    /// A failed or truncated query keeps the built-in build-dir names and
-    /// records why: it does not pretend the tree was scanned and found clean.
+    /// What the recursive watch loads. Tests only: production goes through
+    /// [`IgnoreRules::load_confirming`] with the watch's own mode.
+    #[cfg(test)]
     fn load(repo: &Path) -> Self {
+        Self::load_confirming(repo, true)
+    }
+
+    /// One bounded `git ls-files` for directories the ignore rules already
+    /// cover. A failed or truncated query keeps the built-in build-dir names
+    /// and records why: it does not pretend the tree was scanned and found
+    /// clean. `confirm` asks git which listed directories a rule excludes
+    /// (`check-ignore` over at most [`MAX_IGNORE_PREFIXES`] directories in
+    /// argument-sized chunks, then one tracked-but-ignored list: a bounded
+    /// number of spawns per reload, none per event). Only a watch that vouches for
+    /// "nothing changed" needs it; a watch that does not passes `false` and
+    /// keeps the single listing.
+    fn load_confirming(repo: &Path, confirm: bool) -> Self {
+        let started = Instant::now();
         match git_text_with_timeout(
             repo,
             &[
@@ -416,7 +438,18 @@ impl IgnoreRules {
             IGNORE_QUERY_TIMEOUT,
         ) {
             Ok(stdout) => {
-                let (prefixes, exact, truncated) = parse_ignored_directories_exact(&stdout);
+                let (prefixes, candidates, truncated) = parse_ignored_directories_exact(&stdout);
+                // A failed confirmation leaves `exact` empty: every listed
+                // directory then costs an epoch instead of being assumed
+                // away, and the error schedules a retry.
+                let (exact, confirm_error) = if confirm && !candidates.is_empty() {
+                    match confirm_excluded_directories(repo, &candidates, started) {
+                        Ok(excluded) => (excluded, None),
+                        Err(error) => (HashSet::new(), Some(error)),
+                    }
+                } else {
+                    (HashSet::new(), None)
+                };
                 if truncated {
                     let error = format!(
                         "ignore directory list truncated at {MAX_IGNORE_PREFIXES}; further ignored directories were not recorded"
@@ -429,10 +462,13 @@ impl IgnoreRules {
                         truncated: true,
                     }
                 } else {
+                    if let Some(error) = &confirm_error {
+                        log::warn!(target: "watcher", "{}: {error}", repo.display());
+                    }
                     Self {
                         prefixes,
                         exact,
-                        load_error: None,
+                        load_error: confirm_error,
                         truncated: false,
                     }
                 }
@@ -460,10 +496,13 @@ fn parse_ignored_directories(stdout: &str) -> (HashSet<String>, bool) {
     (folded, truncated)
 }
 
-/// [`parse_ignored_directories`] that also returns the prefixes as printed.
-fn parse_ignored_directories_exact(stdout: &str) -> (HashSet<String>, HashSet<String>, bool) {
+/// The folded prefixes of the directories the listing printed, those same
+/// directories as printed (CANDIDATES for [`confirm_excluded_directories`]:
+/// the listing also prints directories no rule excludes), and whether the list
+/// was cut at [`MAX_IGNORE_PREFIXES`].
+fn parse_ignored_directories_exact(stdout: &str) -> (HashSet<String>, Vec<String>, bool) {
     let mut prefixes = HashSet::new();
-    let mut exact = HashSet::new();
+    let mut exact = Vec::new();
     let mut truncated = false;
     for field in stdout.split('\0') {
         if field.is_empty() || !(field.ends_with('/') || field.ends_with('\\')) {
@@ -477,10 +516,108 @@ fn parse_ignored_directories_exact(stdout: &str) -> (HashSet<String>, HashSet<St
             truncated = true;
             break;
         }
-        prefixes.insert(printed.to_ascii_lowercase());
-        exact.insert(printed.to_string());
+        if prefixes.insert(printed.to_ascii_lowercase()) {
+            exact.push(printed.to_string());
+        }
     }
     (prefixes, exact, truncated)
+}
+
+/// Total time `load` may spend asking git, across every spawn it makes.
+const IGNORE_CONFIRM_BUDGET: Duration = Duration::from_secs(6);
+/// Bytes of directory names handed to one `git check-ignore`; below every
+/// platform's argument limit (Windows' is 32 KiB).
+const CHECK_IGNORE_ARG_BYTES: usize = 16 * 1024;
+
+/// Which of `candidates` (directories, no trailing slash) a RULE excludes and
+/// no tracked file lives under.
+///
+/// `git ls-files -o -i --directory` is not that: it collapses a directory into
+/// one `dir/` entry whenever every file currently in it is ignored, rule or no
+/// rule. `git check-ignore <dir>` (no trailing slash, which would add
+/// "directory-only" matching that a `logs/*` style rule does not satisfy) asks
+/// about the directory itself. Git does not descend into a directory a rule
+/// excludes, so nothing beneath it can be re-included; the one exception is a
+/// file that is already tracked, which `git ls-files -c -i` lists, and every
+/// ancestor of such a file is removed.
+///
+/// At most `1 + ceil(bytes / CHECK_IGNORE_ARG_BYTES)` spawns, all inside
+/// [`IGNORE_CONFIRM_BUDGET`] counted from `started`. A name git would print
+/// quoted (control or non-ASCII bytes) is simply not confirmed: unconfirmed is
+/// the safe side. Any failure is an `Err`, never a smaller set that looks
+/// complete.
+fn confirm_excluded_directories(
+    repo: &Path,
+    candidates: &[String],
+    started: Instant,
+) -> Result<HashSet<String>, String> {
+    let remaining = |what: &str| {
+        IGNORE_CONFIRM_BUDGET
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| format!("ignore confirmation ran out of time before {what}"))
+    };
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut chunk: Vec<&str> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    for candidate in candidates {
+        if chunk_bytes + candidate.len() > CHECK_IGNORE_ARG_BYTES && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_bytes = 0;
+        }
+        chunk_bytes += candidate.len() + 1;
+        chunk.push(candidate);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    for names in chunks {
+        let mut args: Vec<&str> = vec!["check-ignore", "--"];
+        args.extend(names.iter().copied());
+        let run = crate::engine::git_cli::git_observed(
+            repo,
+            &args,
+            remaining("check-ignore")?,
+            crate::engine::git_cli::MAX_OUTPUT_BYTES,
+            &mut (),
+        )
+        .map_err(|error| format!("git check-ignore failed: {}", error.message()))?;
+        if run.incomplete.is_some() {
+            return Err("git check-ignore output was cut short".into());
+        }
+        // Exit 0: some are ignored. Exit 1: none is. Anything else is a failure.
+        match run.status_code {
+            0 => {}
+            1 => continue,
+            code => return Err(format!("git check-ignore exited with status {code}")),
+        }
+        let text = String::from_utf8_lossy(&run.stdout);
+        let named: HashSet<&str> = names.iter().copied().collect();
+        for line in text.lines() {
+            if let Some(name) = named.get(line) {
+                excluded.insert((*name).to_string());
+            }
+        }
+    }
+    if excluded.is_empty() {
+        return Ok(excluded);
+    }
+    // A tracked file keeps its directory under git's eye whatever the rules say.
+    let tracked = git_text_with_timeout(
+        repo,
+        &["ls-files", "-c", "-i", "--exclude-standard", "-z"],
+        remaining("the tracked-but-ignored list")?,
+    )
+    .map_err(|error| format!("git ls-files -c -i failed: {}", error.message()))?;
+    for path in tracked.split('\0').filter(|path| !path.is_empty()) {
+        let mut at = path.len();
+        while let Some(slash) = path[..at].rfind('/') {
+            excluded.remove(&path[..slash]);
+            at = slash;
+        }
+    }
+    Ok(excluded)
 }
 
 /// Directories that are build output by construction. Ordinary source names
@@ -522,7 +659,9 @@ fn ignore_verdict(relative: &Path, rules: Option<&IgnoreRules>) -> IgnoreVerdict
     let mut named = false;
     let mut folded = String::new();
     let mut printed = String::new();
-    for component in relative.components() {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let last = components.peek().is_none();
         let name = component.as_os_str().to_string_lossy();
         if !folded.is_empty() {
             folded.push('/');
@@ -532,7 +671,14 @@ fn ignore_verdict(relative: &Path, rules: Option<&IgnoreRules>) -> IgnoreVerdict
         printed.push_str(&name);
         if let Some(rules) = rules {
             if rules.exact.contains(&printed) {
-                return IgnoreVerdict::Confirmed;
+                // Only what is BENEATH an excluded directory is covered. The
+                // directory itself being created, removed or replaced by a
+                // file (`out/` excludes a directory, not a file named `out`)
+                // can change what status shows.
+                if !last {
+                    return IgnoreVerdict::Confirmed;
+                }
+                named = true;
             }
             // Equal after folding but not as printed: ignored enough to skip
             // a refresh, not enough to assume nothing changed.
@@ -1123,7 +1269,10 @@ where
     // change that arrives while it runs leaves the published set stale.
     let load_rules = || {
         let wanted = facts.rules_wanted();
-        let loaded = Arc::new(IgnoreRules::load(Path::new(&path)));
+        let loaded = Arc::new(IgnoreRules::load_confirming(
+            Path::new(&path),
+            facts.recursive(),
+        ));
         facts.publish_rules(Arc::clone(&loaded), wanted);
         loaded
     };
@@ -1643,7 +1792,6 @@ where
     };
     let started = Instant::now();
     let covered = facts.cover_at(started);
-    let epoch_before = facts.epoch_now();
     // Taken before the read, like the epoch: whatever git rewrites during the
     // read leaves the kept answer with an identity that no longer matches.
     let identity = facts.identity();
@@ -1656,7 +1804,6 @@ where
     if let Some(epoch) = covered {
         facts.settle(epoch, &rows, identity, started);
     }
-    facts.observe(epoch_before, &rows);
     Ok(rows)
 }
 
@@ -3529,6 +3676,8 @@ mod tests {
     fn gitignored_directory_does_not_schedule_a_scan() {
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
+        // Confirming which listed directories a rule excludes is a trusted read.
+        crate::test_support::trust_repo(dir.path());
         std::fs::write(dir.path().join(".gitignore"), "scratch/\n").unwrap();
         std::fs::create_dir_all(dir.path().join("scratch")).unwrap();
         std::fs::write(dir.path().join("scratch").join("a.txt"), "x").unwrap();
@@ -5741,22 +5890,29 @@ mod tests {
         });
     }
 
+    /// A stream that delivers ONE unrelated event and then goes quiet again is
+    /// still dead. The previous rule ("a later read differs and the epoch
+    /// moved") lifted the conviction here and served the next change stale.
     #[test]
-    fn a_conviction_lifts_when_delivery_is_proven_again() {
+    fn a_dead_stream_that_delivers_one_unrelated_event_stays_convicted() {
         silent_watch(|state, path, root, facts, reads| {
             convict_by_a_silent_plain_edit(state, path, root, facts, reads);
-            // The stream comes back: a file changes and its event arrives.
-            std::fs::write(root.join("later.txt"), "x").unwrap();
+            // One event for a file whose status does not change, then a real
+            // change the stream never announces.
             assert!(facts.admit(&Ok(
-                Event::new(EventKind::Any).add_path(root.join("later.txt"))
+                Event::new(EventKind::Any).add_path(root.join("unrelated.log"))
             )));
+            std::fs::write(root.join("later.txt"), "x").unwrap();
             let rows = poll(state, path);
-            assert_eq!(reads.load(Ordering::SeqCst), 4);
-            assert!(rows.iter().any(|r| r.path == "later.txt"));
-            assert!(!facts.is_convicted(), "an event and a confirming read");
+            assert!(rows.iter().any(|r| r.path == "later.txt"), "{rows:?}");
+            assert!(facts.is_convicted(), "one event is not delivery proven");
             poll(state, path);
             poll(state, path);
-            assert_eq!(reads.load(Ordering::SeqCst), 5, "kept and served again");
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                6,
+                "every poll still reads: nothing is served from a dead stream"
+            );
         });
     }
 
@@ -6050,5 +6206,390 @@ mod tests {
             "{payload:?}"
         );
         stop.stop();
+    }
+
+    // ---- N1: what may be dropped is decided by rules, not by contents ------
+
+    /// Polls twice (the second may be served) and returns the read count: the
+    /// state every N1 test asserts a later change against.
+    #[cfg(target_os = "macos")]
+    fn settle_polls(state: &WatcherState, path: &str, reads: &AtomicUsize) -> usize {
+        poll(state, path);
+        poll(state, path);
+        reads.load(Ordering::SeqCst)
+    }
+
+    /// Asserts that a source file written under `dir` is seen: the poll after
+    /// it reads, and the answer lists it.
+    #[cfg(target_os = "macos")]
+    fn assert_new_file_is_seen(
+        state: &WatcherState,
+        path: &str,
+        reads: &AtomicUsize,
+        settled: usize,
+        wanted: &str,
+    ) {
+        thread::sleep(Duration::from_millis(1500));
+        let rows = poll(state, path);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            settled + 1,
+            "a new source file must make the poll read (stale clean otherwise); rows={rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.path.starts_with(wanted)),
+            "{rows:?}"
+        );
+    }
+
+    /// The reviewer's reproduction, through the real loop: `src/x/` is created
+    /// holding only a swap file, so the first reload lists it as ignored
+    /// although no rule excludes it; the source file written next is untracked
+    /// and `git status` shows it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_that_holds_only_swap_files_still_shows_the_source_file_written_next() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "*.swp\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "ignore swap files"]);
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let wanted = facts.rules_wanted();
+            std::fs::create_dir_all(root.join("src/x")).unwrap();
+            std::fs::write(root.join("src/x/.a.rs.swp"), "x").unwrap();
+            wait_for("the new directory to reach the watch", || {
+                facts.rules_wanted() > wanted
+            });
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            std::fs::write(root.join("src/x/a.rs"), "fn main() {}\n").unwrap();
+            assert_new_file_is_seen(state, path, reads, settled, "src/x");
+        });
+    }
+
+    /// The same shape with the directory already there when the watch starts
+    /// (the reviewer's second probe): `build/` holds only `*.o` files.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_holding_only_pattern_ignored_files_shows_the_source_file_added_to_it() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "*.o\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "ignore objects"]);
+            std::fs::create_dir_all(root.join("build/sub")).unwrap();
+            std::fs::write(root.join("build/a.o"), "x").unwrap();
+            std::fs::write(root.join("build/sub/b.o"), "x").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            std::fs::write(root.join("build/main.c"), "int main;\n").unwrap();
+            assert_new_file_is_seen(state, path, reads, settled, "build");
+            // And one level down, in a directory of its own.
+            let settled = settle_polls(state, path, reads);
+            std::fs::write(root.join("build/sub/more.c"), "int more;\n").unwrap();
+            assert_new_file_is_seen(state, path, reads, settled, "build");
+        });
+    }
+
+    /// A directory a rule excludes stays filtered whatever is written under it
+    /// later, and nothing about it costs an epoch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_a_rule_excludes_keeps_dropping_whatever_is_written_under_it() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "ignore out"]);
+            std::fs::create_dir_all(root.join("out/deep")).unwrap();
+            std::fs::write(root.join("out/deep/seed.txt"), "x").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            let epoch = facts.epoch_now();
+            std::fs::write(root.join("out/deep/main.rs"), "x").unwrap();
+            std::fs::write(root.join("out/new.rs"), "x").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), settled, "served, not read");
+            assert_eq!(facts.epoch_now(), epoch, "no epoch for an excluded tree");
+        });
+    }
+
+    /// An excluded directory with a force-added tracked file is not filtered:
+    /// the file's edit is a change `git status` reports.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_excluded_directory_holding_a_tracked_file_is_not_filtered() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            std::fs::create_dir_all(root.join("out/tracked")).unwrap();
+            std::fs::write(root.join("out/tracked/t.txt"), "one\n").unwrap();
+            std::fs::create_dir_all(root.join("out/deep")).unwrap();
+            std::fs::write(root.join("out/deep/f.txt"), "x").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["add", "-f", "out/tracked/t.txt"]);
+            git_in(root, &["commit", "-m", "tracks one file under out"]);
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            std::fs::write(root.join("out/tracked/t.txt"), "two\n").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), settled + 1, "rows={rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "out/tracked/t.txt" && r.status_code.contains('M')),
+                "{rows:?}"
+            );
+            // The sibling that nothing tracks is still filtered.
+            let settled = settle_polls(state, path, reads);
+            let epoch = facts.epoch_now();
+            std::fs::write(root.join("out/deep/g.txt"), "x").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), settled);
+            assert_eq!(facts.epoch_now(), epoch);
+        });
+    }
+
+    /// `logs/*` excludes the children but `!logs/keep/` re-includes one: that
+    /// directory, holding only `*.o` files, is not excluded by a rule, while
+    /// its sibling is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_negated_pattern_under_an_excluded_parent_is_not_filtered() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "logs/*\n!logs/keep/\n*.o\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "rules"]);
+            std::fs::create_dir_all(root.join("logs/keep")).unwrap();
+            std::fs::create_dir_all(root.join("logs/other")).unwrap();
+            std::fs::write(root.join("logs/keep/seed.o"), "x").unwrap();
+            std::fs::write(root.join("logs/other/seed.txt"), "x").unwrap();
+            // A tracked file keeps `logs/` from being listed as one collapsed
+            // entry, so its children are listed (and judged) one by one.
+            std::fs::write(root.join("logs/.keep"), "x").unwrap();
+            git_in(root, &["add", "-f", "logs/.keep"]);
+            git_in(root, &["commit", "-m", "track logs"]);
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            let epoch = facts.epoch_now();
+            std::fs::write(root.join("logs/other/more.txt"), "x").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), settled, "excluded sibling");
+            assert_eq!(facts.epoch_now(), epoch);
+            std::fs::write(root.join("logs/keep/note.md"), "x").unwrap();
+            assert_new_file_is_seen(state, path, reads, settled, "logs/keep");
+        });
+    }
+
+    /// Confirmation by a real git: what is a rule's, what is only collapsed,
+    /// with and without a tracked file, and the shapes that must stay
+    /// unconfirmed rather than guess.
+    #[test]
+    fn confirmation_separates_excluded_directories_from_collapsed_ones() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path();
+        crate::test_support::trust_repo(root);
+        std::fs::write(
+            root.join(".gitignore"),
+            "*.o\nout/\nvendor/\n!vendor/keep/\nlogs/*\n!logs/keep/\n",
+        )
+        .unwrap();
+        for sub in [
+            "build/sub",
+            "out/deep",
+            "out/tracked",
+            "vendor/keep",
+            "logs/keep",
+            "logs/other",
+            "plain",
+        ] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        std::fs::write(root.join("build/a.o"), "x").unwrap();
+        std::fs::write(root.join("build/sub/b.o"), "x").unwrap();
+        std::fs::write(root.join("out/deep/f.txt"), "x").unwrap();
+        std::fs::write(root.join("out/tracked/t.txt"), "x").unwrap();
+        std::fs::write(root.join("vendor/keep/k.txt"), "x").unwrap();
+        std::fs::write(root.join("logs/keep/k.o"), "x").unwrap();
+        std::fs::write(root.join("logs/other/o.txt"), "x").unwrap();
+        std::fs::write(root.join("plain/p.o"), "x").unwrap();
+        std::fs::write(root.join("logs/.keep"), "x").unwrap();
+        git_in(root, &["add", ".gitignore"]);
+        git_in(root, &["add", "-f", "out/tracked/t.txt", "logs/.keep"]);
+        git_in(root, &["commit", "-m", "base"]);
+
+        let rules = IgnoreRules::load(root);
+        assert!(rules.load_error.is_none(), "{:?}", rules.load_error);
+        let mut excluded: Vec<&str> = rules.exact.iter().map(String::as_str).collect();
+        excluded.sort_unstable();
+        assert_eq!(
+            excluded,
+            ["logs/other", "out/deep", "vendor"],
+            "only directories a rule excludes (and no tracked file under)"
+        );
+        // The collapsed ones are listed for the refresh classifier, but are
+        // not assumed away.
+        for collapsed in ["build", "logs/keep", "plain"] {
+            assert!(rules.prefixes.contains(collapsed), "{collapsed} is listed");
+            assert!(!rules.exact.contains(collapsed), "{collapsed} is collapsed");
+        }
+        let at = |relative: &str| ignore_verdict(Path::new(relative), Some(&rules));
+        assert_eq!(at("out/deep/x.rs"), IgnoreVerdict::Confirmed);
+        assert_eq!(at("vendor/keep/k.txt"), IgnoreVerdict::Confirmed);
+        assert_eq!(at("out/deep"), IgnoreVerdict::Named, "the directory itself");
+        // Listed but not rule-excluded: costs an epoch, is never Confirmed.
+        assert_eq!(at("build/main.c"), IgnoreVerdict::Named);
+        assert_eq!(at("logs/keep/note.md"), IgnoreVerdict::Named);
+        assert_eq!(at("out/tracked/t.txt"), IgnoreVerdict::Not);
+    }
+
+    /// An ancestor of a tracked-but-ignored file is removed from the confirmed
+    /// set even when `check-ignore` says it is excluded, and the failure paths
+    /// are errors, not smaller sets.
+    #[test]
+    fn confirmation_removes_ancestors_of_tracked_files_and_fails_loudly() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path();
+        crate::test_support::trust_repo(root);
+        std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+        std::fs::create_dir_all(root.join("out/x/y")).unwrap();
+        std::fs::write(root.join("out/x/y/f.txt"), "x").unwrap();
+        git_in(root, &["add", ".gitignore"]);
+        git_in(root, &["add", "-f", "out/x/y/f.txt"]);
+        git_in(root, &["commit", "-m", "base"]);
+        // Handed over as if the listing had named them (it would not, as a
+        // tracked file keeps its directory out of `-o`; this is the guard for
+        // the window between a `git add -f` and the reload it triggers).
+        let candidates: Vec<String> = ["out", "out/x", "out/x/y"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let confirmed = confirm_excluded_directories(root, &candidates, Instant::now()).unwrap();
+        assert!(confirmed.is_empty(), "{confirmed:?}");
+
+        let spent = Instant::now() - IGNORE_CONFIRM_BUDGET - Duration::from_secs(1);
+        let error = confirm_excluded_directories(root, &candidates, spent).unwrap_err();
+        assert!(error.contains("ran out of time"), "{error}");
+        let missing = TempDir::new().unwrap();
+        assert!(
+            confirm_excluded_directories(missing.path(), &candidates, Instant::now()).is_err(),
+            "an unreadable repository is an error, not an empty answer"
+        );
+    }
+
+    // ---- N2 and N3: what makes the rules stale --------------------------------
+
+    /// A rescan flag, a backend error and an eventless wake say events may
+    /// have been lost, and the lost events may have been a rule edit or a new
+    /// directory: the epoch moves and the rules are no longer known current.
+    #[test]
+    fn events_that_may_have_been_lost_also_make_the_rules_stale() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for (label, lost) in [
+            (
+                "rescan",
+                Ok(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+            ),
+            ("backend error", Err(notify::Error::generic("events lost"))),
+            ("eventless wake", Ok(Event::new(EventKind::Other))),
+        ] {
+            let facts = WatchFacts::new(
+                Some(&root),
+                vec![root.join(".git")],
+                notify::RecursiveMode::Recursive,
+            );
+            let wanted = facts.rules_wanted();
+            facts.publish_rules(Arc::new(IgnoreRules::builtin()), wanted);
+            assert!(facts.rules_fresh(), "{label}: loaded and current");
+            let epoch = facts.epoch_now();
+            assert!(facts.admit(&lost), "{label}: delivered");
+            assert!(facts.epoch_now() > epoch, "{label}: epoch moved");
+            assert!(!facts.rules_fresh(), "{label}: rules must be stale");
+            assert_eq!(facts.cover(), None, "{label}: nothing is vouched for");
+        }
+    }
+
+    /// A write to this checkout's `config` can change `core.excludesFile` or
+    /// `core.ignorecase`, so the rules are stale; the loop reloads them and the
+    /// directory the new global file names is filtered from then on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_config_write_makes_the_rules_stale_and_the_reload_applies_it() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            let global = root.parent().unwrap().join(format!(
+                "excludes-{}",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&global, "gen/\n").unwrap();
+            std::fs::create_dir_all(root.join("gen")).unwrap();
+            std::fs::write(root.join("gen/seed.txt"), "x").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let wanted = facts.rules_wanted();
+            git_in(
+                root,
+                &["config", "core.excludesFile", &global.to_string_lossy()],
+            );
+            wait_for("the config write to reach the watch", || {
+                facts.rules_wanted() > wanted
+            });
+            wait_for_a_still_epoch(&facts);
+            let settled = settle_polls(state, path, reads);
+            let epoch = facts.epoch_now();
+            std::fs::write(root.join("gen/more.txt"), "x").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            poll(state, path);
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                settled,
+                "gen/ is excluded by the new global file: served, not read"
+            );
+            assert_eq!(facts.epoch_now(), epoch);
+            let _ = std::fs::remove_file(&global);
+        });
+    }
+
+    /// Facts-level: the config files of this checkout, and no others, count.
+    #[test]
+    fn a_write_to_the_repository_config_marks_the_rules_stale() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let git = root.join(".git");
+        let facts = WatchFacts::new(
+            Some(&root),
+            vec![git.clone()],
+            notify::RecursiveMode::Recursive,
+        );
+        for (file, stale) in [
+            (git.join("config"), true),
+            (git.join("config.worktree"), true),
+            (git.join("description"), false),
+            (root.join("config"), false),
+        ] {
+            let wanted = facts.rules_wanted();
+            facts.publish_rules(Arc::new(IgnoreRules::builtin()), wanted);
+            facts.admit(&Ok(Event::new(EventKind::Any).add_path(file.clone())));
+            assert_eq!(
+                !facts.rules_fresh(),
+                stale,
+                "{} must {}mark the rules stale",
+                file.display(),
+                if stale { "" } else { "not " }
+            );
+        }
     }
 }

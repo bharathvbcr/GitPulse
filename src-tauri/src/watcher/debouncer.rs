@@ -185,7 +185,7 @@ impl RepoFileWatcher {
                 }
                 // A full queue loses the event; the epoch says so.
                 if forward_event(&tx, &callback_overflow, res) {
-                    callback_facts.bump();
+                    callback_facts.lost_something();
                 }
             },
             Config::default().with_poll_interval(Duration::from_millis(150)),

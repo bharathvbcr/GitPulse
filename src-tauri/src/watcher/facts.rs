@@ -15,6 +15,31 @@
 //! ignored directory fills the queue and the loop answers the overflow with a
 //! full refresh, which is the cost this watch exists to remove.
 //!
+//! # What entitles a path to be dropped without an epoch move
+//!
+//! Only a path BENEATH a directory D that was, when the rules were loaded,
+//! all of:
+//! 1. excluded by a RULE, as `git check-ignore D` (no trailing slash) says of
+//!    D itself. `git ls-files -o -i --directory` is not that answer: it prints
+//!    `build/` whenever every file currently inside is ignored (`*.o`,
+//!    `*.swp`), though no rule excludes `build/` and the next source file
+//!    created there is untracked and shown by `git status`;
+//! 2. free of tracked files (`git ls-files -c -i` lists tracked files that
+//!    match an ignore pattern; every ancestor directory of one is removed);
+//! 3. spelled exactly as git printed it (case-folded spellings only move the
+//!    epoch), and the path is strictly beneath D (D itself appearing,
+//!    disappearing or becoming a file moves the epoch).
+//!
+//! Why nothing created later beneath D can be visible to `git status`: git does
+//! not descend into a directory a rule excludes, and a pattern cannot
+//! re-include a file whose parent directory is excluded, so an untracked file
+//! beneath D is never listed; and with no tracked file under D there is no
+//! tracked content whose modification or deletion status could show. What
+//! could break this is a change to the premises: a rule edit, a file becoming
+//! tracked, a config change. Each is an event this watch sees and answers by
+//! marking the rules stale (below), so the premise is re-asked before any path
+//! is dropped again.
+//!
 //! # Unknown is never clean
 //!
 //! [`WatchFacts::cover_at`] says nothing (`None`) unless every one of these
@@ -23,11 +48,17 @@
 //!   is per directory and bounded by descriptors);
 //! - the watch has not ended;
 //! - the ignore rules are loaded and nothing that can change them has been
-//!   seen since: a `.gitignore` or `info/exclude` edit, a new directory, or a
-//!   write to this checkout's own index or `HEAD`. The rule set is the answer
-//!   of `git ls-files -o -i --directory`, which depends on what is tracked, so
-//!   a file that becomes tracked inside an ignored directory (`git add -f`,
-//!   `checkout`, `stash pop`, `read-tree`) makes it wrong;
+//!   seen since: a `.gitignore` or `info/exclude` edit, a new directory, a
+//!   write to this checkout's own index or `HEAD`, a write to the repository
+//!   `config` (`core.excludesFile`, `core.ignorecase`), or anything that means
+//!   events may have been lost (a must-rescan flag, a backend error, an
+//!   eventless wake, a full queue). Not seen, by design: the global excludes
+//!   file and `~/.gitconfig`, which no worktree watch observes; an edit there
+//!   can leave a kept read stale for at most [`KEPT_STATUS_MAX_AGE`], after
+//!   which the read at the cap disagrees with it and the watch is convicted
+//!   (every poll reads). The rules also depend on what is tracked (`git add -f`,
+//!   `checkout`, `stash pop`, `read-tree` change it), hence the index and
+//!   `HEAD`;
 //! - the root directory is the one that was registered (FSEvents is created
 //!   without `WatchRoot`, so a moved or replaced root sends no event; its
 //!   inode is the only witness);
@@ -55,10 +86,10 @@
 //! moved by then the suspicion is dropped; if it has not, the watch is
 //! *convicted*: it is logged once, the kept read is discarded, and `cover_at`
 //! says nothing, so the poll reads every time as it did before this watch
-//! existed. A conviction lifts when delivery is proven again: a later read
-//! differs from the one before it AND the epoch moved between them (an event
-//! arrived for a change a read then confirmed), or the watch is re-registered
-//! (a new `WatchFacts`).
+//! existed. A conviction lifts only when the watch is re-registered (a new
+//! `WatchFacts`: the pool parks and wakes watches). "A later read differs and
+//! the epoch moved" is not evidence of delivery, because one unrelated event
+//! on an otherwise dead stream satisfies it.
 
 use super::{
     event_updates_ignore_rules, ignore_verdict, is_generated_state_noise_cached,
@@ -192,8 +223,6 @@ struct Trust {
     kept: Option<Kept>,
     suspect: Option<Suspicion>,
     convicted: bool,
-    /// While convicted: the previous read, to tell when delivery is proven.
-    last_read: Option<(u64, Arc<Vec<FileStatus>>)>,
 }
 
 /// Whether two answers say the same thing. `FileStatus` has no `PartialEq`
@@ -424,34 +453,6 @@ impl WatchFacts {
         });
     }
 
-    /// Every real read, vouched for or not. While convicted, a read that
-    /// differs from the one before it with the epoch moved in between proves
-    /// the stream delivered for a change a read then confirmed, and lifts the
-    /// conviction.
-    pub(crate) fn observe(&self, epoch_before: u64, rows: &[FileStatus]) {
-        let mut trust = self.lock_trust();
-        if !trust.convicted {
-            return;
-        }
-        let proven = trust.last_read.as_ref().is_some_and(|(prev_epoch, prev)| {
-            self.epoch_now() > *prev_epoch && !same_rows(prev, rows)
-        });
-        if proven {
-            trust.convicted = false;
-            trust.suspect = None;
-            trust.last_read = None;
-            trust.kept = None;
-            log::info!(
-                target: "watcher",
-                "{}: a change was delivered and confirmed by a read; the watch is trusted again",
-                self.root.display()
-            );
-            return;
-        }
-        trust.last_read =
-            (rows.len() <= MAX_KEPT_ROWS).then(|| (epoch_before, Arc::new(rows.to_vec())));
-    }
-
     /// The backend callback's gate: whether `res` is delivered to the loop.
     /// Runs on the backend's thread, so it spawns nothing and takes only the
     /// rule set's read lock.
@@ -463,12 +464,12 @@ impl WatchFacts {
             Ok(event) => event,
             // A backend error says events may have been lost.
             Err(_) => {
-                self.bump();
+                self.lost_something();
                 return true;
             }
         };
         if event.need_rescan() || event.paths.is_empty() {
-            self.bump();
+            self.lost_something();
             return true;
         }
         // Reads move nothing; the loop discards them too.
@@ -518,16 +519,44 @@ impl WatchFacts {
         deliver
     }
 
-    /// This checkout's own `index` or `HEAD`: the files whose change can
-    /// change which paths are tracked. (A linked checkout's own git directory
-    /// is `internal_roots[0]`, so its private copies are these.)
+    /// "You may have missed something" (a must-rescan flag, a backend error, an
+    /// eventless wake, a full queue). The lost events may have been anything,
+    /// including an edit to a rule file or a directory creation, so the epoch
+    /// moves AND the rules are no longer known to be current: the loop reloads
+    /// them, and nothing is assumed away until it has.
+    pub(crate) fn lost_something(&self) {
+        self.rules_wanted.fetch_add(1, Ordering::AcqRel);
+        self.bump();
+    }
+
+    /// The files whose change can change what is tracked or which rules apply:
+    /// this checkout's own `index` and `HEAD`, and the repository `config`
+    /// (and a linked checkout's `config.worktree`), where `core.excludesFile`,
+    /// `core.ignorecase` and friends live. (A linked checkout's own git
+    /// directory is `internal_roots[0]`; the common directory is the other
+    /// root.) Not covered, by design: the global excludes file and
+    /// `~/.gitconfig`, which no worktree watch sees; the bound for those is
+    /// the cap on a kept read.
     fn is_own_tracking_state(&self, path: &Path) -> bool {
-        self.internal_roots.first().is_some_and(|own| {
-            path.parent() == Some(own.as_path())
-                && path
-                    .file_name()
-                    .is_some_and(|name| name == "index" || name == "HEAD")
-        })
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let own = self.internal_roots.first().map(PathBuf::as_path);
+        match name {
+            "index" | "HEAD" => Some(parent) == own,
+            "config" | "config.worktree" => self
+                .internal_roots
+                .iter()
+                .any(|root| parent == root.as_path()),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn recursive(&self) -> bool {
+        self.recursive
     }
 
     fn classify(&self, path: &Path, rules: Option<&IgnoreRules>) -> PathClass {
@@ -845,6 +874,11 @@ mod tests {
         assert!(facts.admit(&Ok(rescan)));
         assert!(facts.admit(&Err(notify::Error::generic("lost"))));
         assert!(facts.admit(&Ok(Event::new(EventKind::Any))));
+        assert_eq!(facts.epoch_now(), start + 3);
+        // Lost events may have been a rule edit: nothing is vouched for until
+        // the rules are loaded again.
+        assert_eq!(facts.cover(), None);
+        ready(&facts, &[]);
         assert_eq!(facts.cover(), Some(start + 3));
     }
 
@@ -956,8 +990,12 @@ mod tests {
         assert!(!facts.is_convicted());
     }
 
+    /// A conviction is final for this registration. Any weaker rule (a later
+    /// read that differs after the epoch moved) is satisfied by one unrelated
+    /// event on an otherwise dead stream, which would hand back a watch that
+    /// still misses the changes that matter.
     #[test]
-    fn a_conviction_lifts_when_a_delivered_change_is_confirmed_by_a_read() {
+    fn a_conviction_does_not_lift_on_an_unrelated_event_or_a_changed_answer() {
         let (_temp, root, facts) = repo_like();
         let t0 = Instant::now();
         let epoch = facts.cover_at(t0).unwrap();
@@ -966,37 +1004,10 @@ mod tests {
         facts.settle(epoch, &[row("b.txt")], identity, t0);
         assert_eq!(facts.cover_at(t0 + SUSPECT_GRACE), None);
         assert!(facts.is_convicted());
-
-        // Convicted: polls read. A read with nothing new proves nothing.
-        facts.observe(facts.epoch_now(), &[row("b.txt")]);
-        facts.observe(facts.epoch_now(), &[row("b.txt")]);
-        assert!(facts.is_convicted());
-        // An event arrives and the next read differs from the one before it.
-        assert!(facts.admit(&write(&root.join("c.txt"))));
-        facts.observe(facts.epoch_now(), &[row("b.txt"), row("c.txt")]);
-        assert!(!facts.is_convicted());
-        let now = facts
-            .cover_at(t0 + SUSPECT_GRACE * 3)
-            .expect("trusted again");
-        assert_eq!(now, facts.epoch_now());
-    }
-
-    /// An event alone, or a changed answer alone, is not delivery proven.
-    #[test]
-    fn a_conviction_does_not_lift_on_an_event_without_a_confirmed_change() {
-        let (_temp, root, facts) = repo_like();
-        let t0 = Instant::now();
-        let epoch = facts.cover_at(t0).unwrap();
-        let identity = facts.identity();
-        facts.settle(epoch, &[row("a.txt")], identity, t0);
-        facts.settle(epoch, &[row("b.txt")], identity, t0);
-        assert_eq!(facts.cover_at(t0 + SUSPECT_GRACE), None);
-        facts.observe(facts.epoch_now(), &[row("b.txt")]);
+        // One unrelated event arrives, and the answer then differs.
         assert!(facts.admit(&write(&root.join("noise.txt"))));
-        facts.observe(facts.epoch_now(), &[row("b.txt")]);
-        assert!(facts.is_convicted(), "the answer did not change");
-        // The answer changes but no event moved the epoch in between.
-        facts.observe(facts.epoch_now(), &[row("z.txt")]);
+        facts.settle(facts.epoch_now(), &[row("b.txt"), row("c.txt")], identity, t0);
+        assert_eq!(facts.cover_at(t0 + SUSPECT_GRACE * 3), None);
         assert!(facts.is_convicted());
     }
 

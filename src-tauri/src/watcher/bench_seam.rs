@@ -64,7 +64,9 @@ impl StormClassifier {
         let kept = prefixes.len();
         let rules = IgnoreRules {
             prefixes,
-            exact,
+            // The benchmark has no repository to ask: it treats every listed
+            // directory as rule-excluded, which is the volume it measures.
+            exact: exact.into_iter().collect(),
             load_error: None,
             truncated,
         };
