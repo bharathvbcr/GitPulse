@@ -99,6 +99,7 @@ fn graph_page(path: &str) -> (u64, bool) {
         None,
         None,
         None,
+        None,
     ))
     .unwrap_or_else(|error| panic!("cmd_get_commit_graph failed: {error}"));
     assert_eq!(

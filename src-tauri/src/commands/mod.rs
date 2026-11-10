@@ -9,6 +9,7 @@ use crate::diff::conflict_session::{
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
+use crate::engine::git_cli::read_cancel::ReadScope;
 use crate::engine::git_cli::{
     git_text, resolve_repo, sandbox_create, sandbox_overwrite_edited_text,
     sandbox_save_edited_text, validate_repo, FileWriteError, ResolvedRepo, SavedFile,

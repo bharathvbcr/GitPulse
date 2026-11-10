@@ -54,12 +54,31 @@ pub async fn cmd_get_file_diff(
     .await
 }
 
+/// Stops the read that was started under `request_id` (the `request_id` the
+/// reads that take one were called with), because the caller that asked for it
+/// has gone and no other waits. Always answers `Ok`: an id that is unknown,
+/// finished or malformed changes nothing, and a cancel that loses the race
+/// with the read's own end is not a failure. The answer says whether a live
+/// read was signalled, which no caller needs to act on.
+///
+/// Reads nothing and writes nothing in the repository, so it is not guarded.
+#[tauri::command(async)]
+pub fn cmd_cancel_read(request_id: String) -> bool {
+    crate::engine::git_cli::read_cancel::cancel(&request_id)
+}
+
 #[tauri::command(async)]
 pub async fn cmd_get_commit_diff(
     repo_path: String,
     commit_id: String,
+    request_id: Option<String>,
 ) -> Result<DiffPayload, IpcError> {
-    off_thread(move || GitReader::get_commit_diff(&repo_path, &commit_id)).await
+    let read = ReadScope::open(request_id.as_deref());
+    off_thread(move || {
+        let _cancellable = read.enter();
+        GitReader::get_commit_diff(&repo_path, &commit_id)
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -67,8 +86,14 @@ pub async fn cmd_get_commit_file_diff(
     repo_path: String,
     commit_id: String,
     file_path: String,
+    request_id: Option<String>,
 ) -> Result<DiffPayload, IpcError> {
-    off_thread(move || GitReader::get_commit_file_diff(&repo_path, &commit_id, &file_path)).await
+    let read = ReadScope::open(request_id.as_deref());
+    off_thread(move || {
+        let _cancellable = read.enter();
+        GitReader::get_commit_file_diff(&repo_path, &commit_id, &file_path)
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -76,8 +101,14 @@ pub async fn cmd_get_range_diff(
     repo_path: String,
     from: String,
     to: String,
+    request_id: Option<String>,
 ) -> Result<DiffPayload, IpcError> {
-    off_thread(move || GitReader::get_range_diff(&repo_path, &from, &to)).await
+    let read = ReadScope::open(request_id.as_deref());
+    off_thread(move || {
+        let _cancellable = read.enter();
+        GitReader::get_range_diff(&repo_path, &from, &to)
+    })
+    .await
 }
 
 /// The direct change between two commits, `from..to` (see
@@ -88,10 +119,15 @@ pub async fn cmd_get_compare_diff(
     from: String,
     to: String,
     file_path: Option<String>,
+    request_id: Option<String>,
 ) -> Result<DiffPayload, IpcError> {
-    off_thread(move || match file_path {
-        Some(path) => GitReader::get_compare_file_diff(&repo_path, &from, &to, &path),
-        None => GitReader::get_compare_diff(&repo_path, &from, &to),
+    let read = ReadScope::open(request_id.as_deref());
+    off_thread(move || {
+        let _cancellable = read.enter();
+        match file_path {
+            Some(path) => GitReader::get_compare_file_diff(&repo_path, &from, &to, &path),
+            None => GitReader::get_compare_diff(&repo_path, &from, &to),
+        }
     })
     .await
 }

@@ -43,6 +43,7 @@
     "allow-cmd-branch-stats",
     "allow-cmd-cache-inventory",
     "allow-cmd-cancel-git-hooks",
+    "allow-cmd-cancel-read",
     "allow-cmd-catch-up",
     "allow-cmd-change-index",
     "allow-cmd-check-app-update",

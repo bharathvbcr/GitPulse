@@ -276,8 +276,15 @@ pub async fn cmd_get_commit_graph(
     revision: Option<String>,
     skip: Option<usize>,
     ref_scope: Option<RefScope>,
+    request_id: Option<String>,
 ) -> Result<CommitGraphPayload, IpcError> {
+    // Registered before the body is queued, so a cancel that arrives while
+    // the walk waits for a pool thread still finds it. Only the history walk
+    // (the long pole) is cancellable; the short probes beside it run on.
+    let read = ReadScope::open(request_id.as_deref());
     off_thread(move || {
+        let _cancellable = read.enter();
+        let walk_cancel = read.handle();
         // One row over the cap: the extra row is the has_more probe and is
         // dropped before lanes are solved. This arithmetic and the reader's
         // page_count_limit clamp must stay in lockstep — if the clamp swallows
@@ -329,6 +336,7 @@ pub async fn cmd_get_commit_graph(
             let history = scope.spawn(move || {
                 #[cfg(test)]
                 let _carried = injected.map(crate::sysload::inject_governor);
+                let _cancellable = crate::engine::git_cli::read_cancel::enter(walk_cancel.as_ref());
                 GitReader::read_commit_history_paged(
                     &repo,
                     skip.unwrap_or(0),
