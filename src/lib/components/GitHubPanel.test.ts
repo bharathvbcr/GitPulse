@@ -70,6 +70,51 @@ describe("GitHubPanel confirmation and refresh contracts", () => {
   });
 });
 
+describe("GitHubPanel silent background refresh", () => {
+  // Ported from ManviOpsPanel's issue monitor, which refreshed once a minute
+  // while visible. Remote now owns that single read; no second poller exists.
+  it("refreshes once a minute through the adaptive timer, keyed on the repository", () => {
+    expect(source).toContain("const BACKGROUND_REFRESH_MS = 60_000;");
+    expect(source).toContain("createAdaptiveTimer(() => void refreshQuietly(repo), BACKGROUND_REFRESH_MS)");
+  });
+
+  it("claims neither loading nor the action banner, and yields to a read a person asked for", () => {
+    const body = source.slice(source.indexOf("async function refreshQuietly"), source.indexOf("/** A failed refresh over data already on screen"));
+    expect(body).toContain("if (quietRefreshing || loading || $repoStore.currentPath !== repo) return;");
+    expect(body).not.toContain("loading = true");
+    expect(body).not.toContain("actionNotice");
+    expect(body).not.toContain("actionError");
+    expect(body).toContain("readGitHubContext<GitHubContext>(repo, { force: false })");
+  });
+
+  it("keeps what is on screen when the background read fails, and says so beside the stamp", () => {
+    const body = source.slice(source.indexOf("async function refreshQuietly"), source.indexOf("/** A failed refresh over data already on screen"));
+    expect(body).toContain("if (next.error) {");
+    expect(body).toContain("Couldn't refresh GitHub in the background.");
+    expect(source).toContain("{#if backgroundError}");
+    // Only an explicit Refresh may revive a run poll that gave up.
+    expect(body).not.toContain("livePoll");
+  });
+
+  it("drops a background answer for a repository that is no longer open", () => {
+    const body = source.slice(source.indexOf("async function refreshQuietly"), source.indexOf("/** A failed refresh over data already on screen"));
+    expect(body).toContain("if ($repoStore.currentPath !== repo || loading) return;");
+  });
+});
+
+describe("GitHubPanel's issue, outgoing and release additions", () => {
+  it("adds no whole-store array read of its own", () => {
+    // repoStoreEffects.contract budgets GitHubPanel at two; these were already there.
+    expect(source.match(/\$repoStore\.branches\.find/g)).toHaveLength(2);
+  });
+
+  it("mounts the three cards where the design puts them", () => {
+    expect(source).toContain("<OutgoingCommitReview />");
+    expect(source).toContain("<IssueTaskActions issues={ctx.issues} onReported={() => void loadAll()}>");
+    expect(source).toContain("runs={runs}");
+  });
+});
+
 describe("GitHubPanel live-poll lifecycle contracts", () => {
   it("drops a poll whose repository is no longer the open one", () => {
     // A resolve can land after the path moved; applying it would show one

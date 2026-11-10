@@ -103,11 +103,12 @@ describe("shared GitHub context read", () => {
   });
 });
 
-describe("Work, GitHubPanel and ManviOpsPanel share one read", () => {
+describe("Work and GitHubPanel share one read", () => {
   // The panels cannot be mounted here (no DOM in vitest), so each consumer is
   // exercised the way it calls the owner: Work through `loadWork`, GitHubPanel
-  // and ManviOpsPanel through `readGitHubContext` with the `force` their read
-  // sites pass (mount: false; Refresh and post-action reloads: true).
+  // through `readGitHubContext` with the `force` its read sites pass (mount and
+  // the once-a-minute background read: false; Refresh and post-action reloads:
+  // true). GitHubPanel also carries the issue monitor ManviOpsPanel used to be.
   const githubCalls = () => calls.filter((c) => c === "cmd_github_context").length;
 
   it("all three asking inside the window invoke the command once", async () => {
@@ -130,11 +131,11 @@ describe("Work, GitHubPanel and ManviOpsPanel share one read", () => {
     expect(githubCalls()).toBe(2);
   });
 
-  it("a failed read fails for each of the three, and none of them gets an empty success", async () => {
+  it("a failed read fails for each of the three (Work, the mount read, the background read), and none of them gets an empty success", async () => {
     answer = () => {
       throw new Error("gh not authenticated");
     };
-    const [work, panel, ops] = await Promise.allSettled([
+    const [work, panel, background] = await Promise.allSettled([
       loadWork("/repo"),
       readGitHubContext("/repo", { force: false }),
       readGitHubContext("/repo", { force: false }),
@@ -145,21 +146,21 @@ describe("Work, GitHubPanel and ManviOpsPanel share one read", () => {
       expect(work.value.sources.github.detail).toContain("gh not authenticated");
     }
     expect(panel.status).toBe("rejected");
-    expect(ops.status).toBe("rejected");
+    expect(background.status).toBe("rejected");
     expect(githubCalls()).toBe(1);
   });
 
   it("a partial read reaches each consumer with its degradation intact, and the next ask reads again", async () => {
     const partial = { ...clean, releases_error: "rate limited", warnings: ["PR listing failed to parse"] };
     answer = () => partial;
-    const [work, panel, ops] = await Promise.all([
+    const [work, panel, background] = await Promise.all([
       loadWork("/repo"),
       readGitHubContext<typeof partial>("/repo", { force: false }),
       readGitHubContext<typeof partial>("/repo", { force: false }),
     ]);
     expect(panel).toBe(partial);
-    expect(ops.releases_error).toBe("rate limited");
-    expect(ops.warnings).toEqual(["PR listing failed to parse"]);
+    expect(background.releases_error).toBe("rate limited");
+    expect(background.warnings).toEqual(["PR listing failed to parse"]);
     expect(work.sources.github.detail).not.toBe("");
     expect(githubCalls()).toBe(1);
     await readGitHubContext("/repo", { force: false });
@@ -211,20 +212,21 @@ describe("Work's Refresh button", () => {
 
 describe("the panels read through the owner", () => {
   const panel = readFileSync(new URL("../components/GitHubPanel.svelte", import.meta.url), "utf8");
-  const ops = readFileSync(new URL("../components/ManviOpsPanel.svelte", import.meta.url), "utf8");
+  const issues = readFileSync(new URL("../components/IssueTaskActions.svelte", import.meta.url), "utf8");
 
   it("neither asks the backend for the context itself", () => {
     expect(panel).not.toContain('"cmd_github_context"');
-    expect(ops).not.toContain('"cmd_github_context"');
+    // The issue block's task wiring takes the pane's list; it never reads GitHub.
+    expect(issues).not.toContain('"cmd_github_context"');
+    expect(issues).not.toContain("readGitHubContext");
     expect(panel).toMatch(/readGitHubContext<GitHubContext>\(\s*repo\s*,\s*\{\s*force\s*\}\s*\)/);
-    expect(ops).toMatch(/readGitHubContext<GitHubContext>\(\s*repo\s*,\s*\{\s*force:\s*!opts\.background\s*&&\s*!opts\.reuse\s*\}\s*\)/);
   });
 
-  it("only the mount read may reuse; every refresh forces", () => {
+  it("only the mount read and the once-a-minute background read may reuse; every refresh forces", () => {
     expect(panel).toMatch(/async function loadFor\(\s*repo: string,\s*force = true\s*\)/);
     expect(panel.match(/loadFor\(\s*repo\s*,\s*false\s*\)/g)).toHaveLength(1);
-    expect(ops).toMatch(/loadIssues\(\s*repo\s*,\s*\{\s*reuse: true\s*\}\s*\)/);
-    expect(ops.match(/reuse: true/g)).toHaveLength(1);
+    // The background read is the issue monitor ManviOpsPanel used to run, folded into this one path.
+    expect(panel.match(/readGitHubContext<GitHubContext>\(\s*repo\s*,\s*\{\s*force:\s*false\s*\}\s*\)/g)).toHaveLength(1);
   });
 });
 

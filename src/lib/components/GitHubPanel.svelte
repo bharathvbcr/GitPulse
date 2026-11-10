@@ -50,6 +50,9 @@
   import PullRequestCreate from "./github/PullRequestCreate.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import FirebasePanel from "./FirebasePanel.svelte";
+  import OutgoingCommitReview from "./OutgoingCommitReview.svelte";
+  import IssueTaskActions from "./IssueTaskActions.svelte";
+  import ReleasePublish from "./ReleasePublish.svelte";
   import { freshnessStore } from "../provenance/store";
   import { prHeadFreshness, prRevisions } from "../provenance/pullRequests";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -106,6 +109,7 @@
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import type { GitHubRunsReport } from "../github/types";
 
+  const BACKGROUND_REFRESH_MS = 60_000;
   const macos = isMacOS();
   const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
@@ -139,6 +143,10 @@
     ),
   );
   let loading = $state(false);
+  /** A background refresh is out; kept apart from `loading` so it never spins or disables anything. */
+  let quietRefreshing = false;
+  /** Why the last background refresh left the screen as it was; cleared by the next that lands. */
+  let backgroundError = $state<string | null>(null);
   /** PR numbers with a checkout in flight; any in-flight checkout disables all. */
   const checkingOut = new SvelteSet<number>();
   /** PR numbers being opened in a new worktree. Either set disables both actions. */
@@ -277,6 +285,13 @@
   // Visibility-aware: a ticker whose only job is to re-render a relative
   // stamp must not wake the renderer behind other windows.
   $effect(() => createAdaptiveTimer(() => (clockTick = Date.now()), 30_000));
+  // One read a minute while the pane is on screen and the window is in front;
+  // the timer itself pauses behind other windows.
+  $effect(() => {
+    const repo = $currentRepoPath;
+    if (!repo) return;
+    return createAdaptiveTimer(() => void refreshQuietly(repo), BACKGROUND_REFRESH_MS);
+  });
   const fetchedAgo = $derived(
     fetchedAt === null ? "" : relativeAge(new Date(fetchedAt).toISOString(), clockTick),
   );
@@ -450,6 +465,41 @@
     }
   }
 
+  /**
+   * The once-a-minute read that keeps issues, pull requests and releases from
+   * going stale while the pane stays open.
+   *
+   * Silent by design: it spins nothing, disables nothing and never touches the
+   * action banner. It reuses a read the Work view or a neighbour just made
+   * (`force: false`), yields to any read a person asked for, and a failure
+   * keeps what is on screen and says so beside the fetched stamp. It does not
+   * revive the run poll; only an explicit Refresh does that.
+   */
+  async function refreshQuietly(repo: string) {
+    if (quietRefreshing || loading || $repoStore.currentPath !== repo) return;
+    quietRefreshing = true;
+    try {
+      const next = await readGitHubContext<GitHubContext>(repo, { force: false });
+      if ($repoStore.currentPath !== repo || loading) return;
+      if (next.error) {
+        backgroundError = `Couldn't refresh GitHub in the background. ${next.error}`;
+        return;
+      }
+      backgroundError = null;
+      ctx = next;
+      liveRuns = null;
+      fetchedAt = Date.now();
+      velocityNow = Date.now();
+      ctxCache.set(repo, next);
+    } catch (err) {
+      if ($repoStore.currentPath === repo) {
+        backgroundError = `Couldn't refresh GitHub in the background. ${formatError(err)}`;
+      }
+    } finally {
+      quietRefreshing = false;
+    }
+  }
+
   /** A failed refresh over data already on screen: keep the data, say what failed and how old it is. */
   function reportRefreshFailure(message: string) {
     actionError = `Refresh failed: ${message} — showing ${fetchedAgo ? `data fetched ${fetchedAgo}` : "the last data read"}`;
@@ -585,6 +635,7 @@
       ciRunning = false;
       actionNotice = null;
       actionError = null;
+      backgroundError = null;
       // Dispatch ref is repo-scoped: default to the checked-out branch.
       dispatchRef = branch ?? "";
       if (!repo) {
@@ -859,6 +910,9 @@
       {#if fetchedAgo}
         <p class="mt-1 text-[10px] text-textMuted font-mono">fetched {fetchedAgo}</p>
       {/if}
+      {#if backgroundError}
+        <p class="mt-1 text-meta text-warn" role="status">{backgroundError}</p>
+      {/if}
     </div>
     <div class="flex flex-wrap items-center justify-end gap-1.5 shrink-0">
       {#if prCreateUrl}
@@ -1001,6 +1055,10 @@
     </div>
   {/if}
 
+  <!-- A local check, so it sits outside the GitHub branch below: it answers
+       with gh missing, signed out or rate limited. -->
+  <OutgoingCommitReview />
+
   {#if (loading && !ctx) || (workflowsLoading && !workflows)}
     <div class="space-y-4 max-w-4xl">
       <Skeleton variant="card" count={2} />
@@ -1018,6 +1076,9 @@
       {/if}
     </div>
   {:else if ctx}
+    <!-- The snippet below runs after the branch is left behind in the type
+         checker's eyes, so it reads the context through this binding. -->
+    {@const c = ctx}
     {#if actionNotice || actionError}
       <div
         class="mb-4 p-3 rounded-xl border text-xs max-w-3xl {actionError
@@ -1259,19 +1320,21 @@
               </label>
             {/if}
           </div>
-          {#if ctx.issues_error}
+          <IssueTaskActions issues={ctx.issues} onReported={() => void loadAll()}>
+            {#snippet children(rowAction)}
+          {#if c.issues_error}
             <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
-              Issue listing unavailable: {ctx.issues_error}
+              Issue listing unavailable: {c.issues_error}
             </div>
-          {:else if ctx.issues.length === 0 && !ctx.issues_truncated}
+          {:else if c.issues.length === 0 && !c.issues_truncated}
             <EmptyState icon={CircleDot} title="No open issues" compact />
-          {:else if ctx.issues.length === 0}
+          {:else if c.issues.length === 0}
             <EmptyState icon={CircleDot} title="No open issues shown" compact />
           {:else if issuesNarrowedToNothing}
             <EmptyState
               icon={Search}
               title="No issue matches this filter"
-              hint="{ctx.issues.length} open issues are loaded."
+              hint="{c.issues.length} open issues are loaded."
               compact
               action={{ label: "Clear filter", onClick: () => (issueQuery = "") }}
             />
@@ -1294,22 +1357,27 @@
                       {/if}
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onclick={() => openExternal(issue.url)}
-                    class="gp-icon-btn shrink-0"
-                    title="Open on GitHub"
-                    aria-label={`Open issue #${issue.number} on GitHub`}
-                  >
-                    <ExternalLink size={14} />
-                  </button>
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    {@render rowAction(issue)}
+                    <button
+                      type="button"
+                      onclick={() => openExternal(issue.url)}
+                      class="gp-icon-btn shrink-0"
+                      title="Open on GitHub"
+                      aria-label={`Open issue #${issue.number} on GitHub`}
+                    >
+                      <ExternalLink size={14} />
+                    </button>
+                  </div>
                 </div>
               {/each}
             </div>
           {/if}
-          {#if ctx.issues_truncated}
-            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {ctx.issues.length} issues; more open issues exist. This is not complete coverage.</div>
+          {#if c.issues_truncated}
+            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {c.issues.length} issues; more open issues exist. This is not complete coverage.</div>
           {/if}
+            {/snippet}
+          </IssueTaskActions>
         </section>
       </div>
 
@@ -1643,6 +1711,11 @@
               <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {ctx.releases.length} releases; more releases exist.</div>
             {/if}
           {/if}
+          <ReleasePublish
+            releases={ctx.releases ?? []}
+            runs={runs}
+            onPublished={(message) => void reloadThenNotice(message)}
+          />
         </section>
       </div>
     </div>

@@ -2,7 +2,8 @@
  * Issue to Task transformation and agent handoff preparation.
  *
  * Provides a robust, boundary-hardened bridge between the GitHub issue monitor
- * (e.g. in the Policy page / ManviOpsPanel) and Workbench tasks.
+ * (the Open issues block of Work's Remote pane, through IssueTaskActions) and
+ * Workbench tasks.
  *
  * Every issue converted through this module produces a well-formed TaskDraft
  * that satisfies all repository and SQLite workbench store invariants:
