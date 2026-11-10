@@ -4,6 +4,7 @@ use crate::engine::git_cli::{
     resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
     OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
+use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
 use crate::ipc_error::CommandError;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
@@ -1190,19 +1191,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
-        Ok(Self::config_value_raw(repo, name)?.filter(|value| !value.is_empty()))
-    }
-
-    /// [`Self::config_value`] without folding a blank value into "unset":
-    /// `Some("")` is a key that is set to nothing, which git treats differently
-    /// from a key that is absent (`user.email = ""` stops the search for an
-    /// address; it does not fall through to `EMAIL`).
-    fn config_value_raw(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
         let run = git_captured(repo, &["config", "--get", name])?;
         match run.status_code {
-            0 => Ok(Some(
-                String::from_utf8_lossy(&run.stdout).trim().to_string(),
-            )),
+            0 => Ok(
+                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            ),
             1 => Ok(None),
             code => Err(format!(
                 "Could not read {name} from git config (exit {code}): {}",
@@ -1243,6 +1237,29 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<GitIdentity, CommandError> {
+        // For display only (the commit box). The cache's stamp does not see a
+        // file pulled in by `include.path`, so what it answers can be a
+        // minute old: nothing that gates a write reads this, see
+        // [`Self::identity_fresh`].
+        Ok(Self::identity_from_config(&config_snapshot(repo)?, lookup))
+    }
+
+    /// The identity as git resolves it right now, from one `config --list`
+    /// that bypasses the cache. A refusal to commit is decided on this: a
+    /// cached "set" for a key the user just removed from an included file
+    /// would let git record a host-derived address.
+    fn identity_fresh(repo: &Path) -> Result<GitIdentity, CommandError> {
+        Ok(Self::identity_from_config(
+            &config_snapshot_fresh(repo)?,
+            &|name| std::env::var(name).ok(),
+        ))
+    }
+
+    /// [`Self::identity_with`] over a config listing already in hand.
+    fn identity_from_config(
+        config: &HashMap<String, String>,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> GitIdentity {
         // `Some(None)`: set but blank, which stops the search without an answer.
         let author_env = |name: &str| {
             lookup(name).map(|value| {
@@ -1250,40 +1267,32 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 (!value.is_empty()).then(|| value.to_string())
             })
         };
-        let first_config = |keys: &[&str]| -> Result<Option<String>, CommandError> {
-            for key in keys {
-                if let Some(value) = Self::config_value(repo, key)? {
-                    return Ok(Some(value));
-                }
-            }
-            Ok(None)
-        };
+        // `--get` prints the trimmed last value; the listing keeps the last.
+        let set = |key: &str| config.get(key).map(|value| value.trim().to_string());
+        let non_blank = |key: &str| set(key).filter(|value| !value.is_empty());
         let name = match author_env("GIT_AUTHOR_NAME") {
             Some(blank_or_value) => blank_or_value,
-            None => first_config(&["author.name", "user.name"])?,
+            None => non_blank("author.name").or_else(|| non_blank("user.name")),
         };
         let email = match author_env("GIT_AUTHOR_EMAIL") {
             Some(blank_or_value) => blank_or_value,
-            None => match Self::config_value(repo, "author.email")? {
-                Some(email) => Some(email),
+            None => non_blank("author.email").or_else(|| match set("user.email") {
                 // A set-but-blank `user.email` ends the search (`<>`); only an
                 // absent one reaches `EMAIL`.
-                None => match Self::config_value_raw(repo, "user.email")? {
-                    Some(email) => (!email.is_empty()).then_some(email),
-                    None => lookup("EMAIL")
-                        .map(|v| v.trim().to_string())
-                        .filter(|v| !v.is_empty()),
-                },
-            },
+                Some(email) => (!email.is_empty()).then_some(email),
+                None => lookup("EMAIL")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+            }),
         };
-        Ok(GitIdentity { name, email })
+        GitIdentity { name, email }
     }
 
     /// Refuses before git runs when no identity is configured. Git would
     /// otherwise either fail with its own multi-line advice or, on a machine
     /// with a resolvable hostname, quietly record `user@host.local`.
     fn require_identity(repo: &Path) -> Result<(), CommandError> {
-        let identity = Self::identity_in(repo)?;
+        let identity = Self::identity_fresh(repo)?;
         let missing: Vec<&str> = [
             ("user.name", identity.name.is_none()),
             ("user.email", identity.email.is_none()),
@@ -6887,6 +6896,153 @@ mod tests {
     fn blank_identity(dir: &std::path::Path) {
         git_ok(dir, &["config", "user.name", ""]);
         git_ok(dir, &["config", "user.email", ""]);
+    }
+
+    /// Every `git config --get` child recorded for `repo` so far.
+    fn config_get_spawns(repo: &std::path::Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--get")
+            })
+            .count()
+    }
+
+    /// F-8: a commit used to ask git for each identity key one process at a
+    /// time (up to four `config --get`), with the whole listing already cached.
+    /// The identity now comes from that listing, so no `--get` child starts,
+    /// and the answer is the one `--get` gave for every shape of key: the
+    /// `author.*` pair outranking `user.*`, a blank `author.name` falling
+    /// through, a blank `user.email` ending the search, and `EMAIL` read only
+    /// when `user.email` is absent.
+    #[test]
+    fn identity_is_read_from_the_config_listing_without_config_get_children() {
+        let dir = init_repo_with_commit();
+        let repo = dir.path().canonicalize().unwrap();
+        git_ok(&repo, &["config", "user.name", "Grace"]);
+        git_ok(&repo, &["config", "user.email", "grace@example.org"]);
+        git_ok(&repo, &["config", "author.name", ""]);
+        let none = |_: &str| None;
+        let before = config_get_spawns(&repo);
+        for _ in 0..3 {
+            let identity = GitWriter::identity_with(&repo, &none).unwrap();
+            assert_eq!(identity.name.as_deref(), Some("Grace"), "blank author.name");
+            assert_eq!(identity.email.as_deref(), Some("grace@example.org"));
+        }
+        assert_eq!(
+            config_get_spawns(&repo) - before,
+            0,
+            "identity must not spawn `git config --get`"
+        );
+
+        git_ok(&repo, &["config", "author.email", "ada@example.org"]);
+        git_ok(&repo, &["config", "author.name", "Ada"]);
+        let identity = GitWriter::identity_with(&repo, &none).unwrap();
+        assert_eq!(identity.name.as_deref(), Some("Ada"));
+        assert_eq!(identity.email.as_deref(), Some("ada@example.org"));
+
+        assert_eq!(config_get_spawns(&repo) - before, 0);
+    }
+
+    /// Every `git config --list` child recorded for `repo` so far.
+    fn config_list_spawns(repo: &std::path::Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--list")
+            })
+            .count()
+    }
+
+    /// A repository whose identity comes from a file pulled in by
+    /// `include.path` (the shape of a work `includeIf`), blank everywhere
+    /// else. The cache stamps `.git/config` and the user's config files, not
+    /// the included one, and does not trust a stamp younger than its racy
+    /// window, so the config sits for longer than that before the cache is
+    /// warmed.
+    fn repo_with_included_identity() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = init_repo_with_commit();
+        let repo = dir.path().canonicalize().unwrap();
+        blank_identity(&repo);
+        let included = repo.join(".git").join("identity.inc");
+        std::fs::write(
+            &included,
+            "[user]\n\tname = Included\n\temail = included@example.org\n",
+        )
+        .unwrap();
+        // Appended after the blank `user.*`, so the included values win.
+        git_ok(&repo, &["config", "include.path", "identity.inc"]);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        (dir, repo, included)
+    }
+
+    /// F-8, the gate: the refusal decision reads the effective config
+    /// straight from git, in one `config --list` and no `config --get`. A
+    /// cached listing cannot be trusted with it (see the next test).
+    #[test]
+    fn the_commit_gate_reads_identity_in_one_config_list_and_no_config_get() {
+        let (_dir, repo, _included) = repo_with_included_identity();
+        GitWriter::require_identity(&repo).expect("the included identity is set");
+        let (gets, lists) = (config_get_spawns(&repo), config_list_spawns(&repo));
+        for _ in 0..3 {
+            GitWriter::require_identity(&repo).unwrap();
+        }
+        assert_eq!(config_get_spawns(&repo) - gets, 0, "no `config --get`");
+        assert_eq!(
+            config_list_spawns(&repo) - lists,
+            3,
+            "one `config --list` per check, even with a warm cache"
+        );
+    }
+
+    /// The defect: the cached snapshot does not see an included file change,
+    /// so a commit within the cache's life of the user removing their identity
+    /// from it was let through, and git recorded a host-derived address.
+    #[test]
+    fn a_commit_is_refused_when_the_included_identity_is_removed_while_the_cache_is_warm() {
+        let (_dir, repo, included) = repo_with_included_identity();
+        GitWriter::require_identity(&repo).expect("the included identity is set");
+        // Warm the cached listing the display path reads.
+        let none = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(&repo, &none)
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("included@example.org")
+        );
+        std::fs::write(&included, "[user]\n").unwrap();
+        let refused =
+            GitWriter::require_identity(&repo).expect_err("no identity is configured any more");
+        assert!(
+            refused.message().starts_with(IDENTITY_MISSING),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// The `user.email` rules over a listing, without the machine's own
+    /// configuration in the way: blank ends the search, absent reaches EMAIL.
+    #[test]
+    fn identity_from_a_listing_keeps_blank_and_absent_apart() {
+        let email_env = |key: &str| (key == "EMAIL").then(|| "env@example.org".to_string());
+        let listing = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let blank = GitWriter::identity_from_config(&listing(&[("user.email", "")]), &email_env);
+        assert_eq!(blank.email, None, "a blank user.email ends the search");
+        let absent = GitWriter::identity_from_config(&listing(&[]), &email_env);
+        assert_eq!(absent.email.as_deref(), Some("env@example.org"));
+        let author = GitWriter::identity_from_config(
+            &listing(&[("author.email", "a@x.org"), ("user.email", "u@x.org")]),
+            &email_env,
+        );
+        assert_eq!(author.email.as_deref(), Some("a@x.org"));
+        let valueless = GitWriter::identity_from_config(&listing(&[("user.name", "")]), &email_env);
+        assert_eq!(valueless.name, None, "a name set to nothing is no name");
     }
 
     #[test]

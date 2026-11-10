@@ -18,11 +18,14 @@
 //! work and not the production gate's 8-spawns-per-second refill.
 
 mod common;
+#[path = "repo_read/numstat_paired.rs"]
+mod numstat_paired;
 
 use common::fixture::{build_repo, count_git_processes, dirty_files, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
 use gitpulse_lib::engine::git_reader::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 
 struct Shape {
     label: &'static str,
@@ -110,6 +113,21 @@ fn main() {
             })
         })
         .collect();
+
+    // `GITPULSE_BENCH_ONLY=<substring>` runs only the rows whose name contains
+    // it (and the numstat pairs when it names "50k files"), so one measurement
+    // does not pay for every other row; `GITPULSE_BENCH_ROUNDS` sets n.
+    let only = std::env::var("GITPULSE_BENCH_ONLY").ok();
+    let rounds = std::env::var("GITPULSE_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| report.opts.samples(15));
+    if only
+        .as_deref()
+        .is_none_or(|only| only.contains("50k files"))
+    {
+        numstat_paired::run(&mut report, &temp.path().join("numstat"), rounds);
+    }
 
     // Opening a file and saving it are the two reads of a file's bytes the
     // editor pays for, and both now also hash those bytes (the base token a
@@ -257,9 +275,49 @@ fn main() {
          detail_json, and a transcript edit (object path plus 4-field detail_json)"
     ));
 
-    let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
+    if let Some(only) = &only {
+        cases.retain(|case| case.name.contains(only.as_str()));
+    }
+    let rows = interleave(cases, rounds, report.opts.warmup(2));
     report.extend(rows);
     report.finish();
+}
+
+/// CPU time (user + system) of the child processes this process has reaped,
+/// as a delta from [`ChildCpu::start`]. `RUSAGE_CHILDREN` accumulates every
+/// waited-for child, so the delta around a call is what the git children that
+/// call started and waited for used; the cases run one at a time.
+struct ChildCpu(f64);
+
+impl ChildCpu {
+    fn now_ms() -> f64 {
+        // SAFETY: `usage` is a valid, writable `rusage` for the call to fill.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let status = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+        assert_eq!(status, 0, "getrusage(RUSAGE_CHILDREN) failed");
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1_000.0 + t.tv_usec as f64 / 1_000.0;
+        ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    fn start() -> Self {
+        Self(Self::now_ms())
+    }
+
+    fn spent_ms(&self) -> f64 {
+        Self::now_ms() - self.0
+    }
+}
+
+/// Stdout of `git <args>` in `dir`; a failed git aborts the bench.
+fn git_bytes(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output_locked()
+        .expect("spawn git");
+    assert!(output.status.success(), "git {args:?} failed");
+    output.stdout
 }
 
 const REDACT_ROUNDS: usize = 2_000;

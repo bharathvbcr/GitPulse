@@ -2416,6 +2416,30 @@ This change takes the snapshot from N+1 to N status reads (27 to 26 processes in
 - A read with no caller deadline that ends at git's own 90 s limit ends every waiter on it with the same error at the same moment; only a cut that was a caller's deadline is retried by the next waiter.
 - `changed_paths_only` (a pathspec-limited status) is a different question and is not routed through the cell.
 
+## 2026-11-10: `get_status` numstat limited to the reported paths, up to 100 (perf1109-refresh-scope, F-3)
+
+`get_status` read `git diff --numstat -z` (and `--cached`) over every index entry to find churn for the few paths `status` had just named. It now passes those paths as literal pathspecs behind `--` (both sides of a rename or copy), and reads the whole tree when there are more than `MAX_NUMSTAT_PATHSPECS` = 100 paths, more than 16 KiB of them, a path that is not valid UTF-8, or a path `listing_must_match_path_exactly` names (`*?[:`, which Git for Windows mishandles after `:(literal)`). A numstat that fails still fails the report.
+
+Bench: `repo_read`, `numstat_paired` (`GITPULSE_BENCH_ONLY="50k files" GITPULSE_BENCH_ROUNDS=21 cargo bench --bench repo_read`). Synthetic repository: 50,000 files in 500 directories, 24-line files, 2 commits; one repository per dirty count shared by both arms. n=21 pairs per count after 2 discarded rounds. Each round does one untimed status read, then runs both arms in an order that alternates by round. Host load 11.9 at the start of the run and 9.3 at the end on 18 cores. The "whole" arm is `get_status_whole_tree_numstat`, the read this replaced. Median ms [min..max]; "paired" is limited minus whole per round, "smaller" is the rounds in which limited was faster:
+
+| dirty | wall limited | wall whole | paired median, smaller | child CPU limited | child CPU whole |
+|---:|---|---|---|---|---|
+| 1 | 128 [114..172] | 159 [146..206] | -32, 20/21 | 482 [443..829] | 897 [859..988] |
+| 50 | 139 [123..172] | 158 [140..508] | -21, 20/21 | 523 [403..832] | 935 [846..1065] |
+| 100 | 144 [135..168] | 155 [150..165] | -11, 19/21 | 585 [531..881] | 1032 [959..1075] |
+| 200 | 180 [168..199] | 186 [161..234] | -4, 13/21 | 964 [909..1291] | 965 [856..1260] |
+| 300 | 196 [177..245] | 198 [177..226] | +3, 8/21 | 971 [894..1279] | 982 [883..1340] |
+| 500 | 219 [205..247] | 218 [202..270] | -2, 14/21 | 946 [889..1337] | 963 [900..1308] |
+| 2000 | 405 [343..563] | 409 [364..440] | -3, 11/21 | 1179 [1125..1449] | 1183 [1127..1474] |
+
+Above 100 both arms are the same code (the shipped read falls back), so the rows at 200 to 2000 are four null checks: the arms agree within their spread (paired medians -4, +3, -2, -3 ms). The run also aborts if the 2000 pair disagrees beyond the smaller arm's inter-quartile range; it passed.
+
+What this saves: child CPU, about 46% at 1 dirty file, 44% at 50, 43% at 100. Wall time improves by 10 to 30 ms (7 to 20%) at 1 to 100, with the limited arm faster in 19 or 20 of 21 rounds; at 50 the medians differ by 19 ms but the whole arm's max is an outlier (508), so read the paired column. What it does not save: anything above 100, which is the whole-tree read again.
+
+Why the cap is 100. The same bench before the cap was lowered (cap 512, same repository shape, load 9 to 15), limited minus whole in median wall: 1 dirty -29 ms, 50 -23, 100 -10 (17/21, min 139 vs 154), 200 +16 (5/21, min 194 vs 172), 300 +31 (2/21), 500 +57 (1/21); the same-code pair at 2000 read +16 (7/21), the noise floor. Raw `git diff --numstat -z` with one literal pathspec per dirty file at 2000: 746 ms against 322 ms whole tree, limited smaller in 0 of 21. So pathspec matching cost grows with the list; beyond about 100 paths it costs more wall time than the whole-tree stat pass it avoids, though child CPU stayed lower up to 500 (about -24%). The rule took the largest measured count whose median and min are not worse, erring low. Not measured: path depth and length (the 16 KiB byte bound caps argument size regardless), and counts between 100 and 200.
+
+Earlier numbers in this work that should not be used: the first two tables (4 counts, then 7 counts) queued each pair's arms in a fixed order, so the first arm paid the cold file-system cache and looked slower even at 2000 where both arms ran the same code. Their child-CPU columns were probably less affected but showed the same bias.
+
 ## 2026-11-06: repository tuning thresholds (ft-6b68be32)
 
 The Storage panel may offer, and on a click apply, three changes: `core.untrackedCache`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.

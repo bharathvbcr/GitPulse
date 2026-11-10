@@ -1225,7 +1225,12 @@ impl GitReader {
         repo_path: &str,
         not_before: Instant,
     ) -> Result<Vec<FileStatus>, CommandError> {
-        Self::get_status_in(repo_path, UntrackedBudget::SHIPPED, not_before)
+        Self::get_status_in(
+            repo_path,
+            UntrackedBudget::SHIPPED,
+            not_before,
+            NumstatReach::ChangedPaths,
+        )
     }
 
     /// [`Self::get_status`] with `untracked` as the most it may read to count
@@ -1235,13 +1240,33 @@ impl GitReader {
         repo_path: &str,
         untracked: UntrackedBudget,
     ) -> Result<Vec<FileStatus>, CommandError> {
-        Self::get_status_in(repo_path, untracked, Instant::now())
+        Self::get_status_in(
+            repo_path,
+            untracked,
+            Instant::now(),
+            NumstatReach::ChangedPaths,
+        )
+    }
+
+    /// [`Self::get_status`] with both numstats read over the whole tree, as
+    /// every status did before they were limited to the reported paths. The
+    /// baseline arm of the `repo_read` benchmark, and the oracle the parity
+    /// test compares against.
+    #[doc(hidden)]
+    pub fn get_status_whole_tree_numstat(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
+        Self::get_status_in(
+            repo_path,
+            UntrackedBudget::SHIPPED,
+            Instant::now(),
+            NumstatReach::WholeTree,
+        )
     }
 
     fn get_status_in(
         repo_path: &str,
         untracked: UntrackedBudget,
         not_before: Instant,
+        reach: NumstatReach,
     ) -> Result<Vec<FileStatus>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
@@ -1264,16 +1289,28 @@ impl GitReader {
         // broken diff must fail the report rather than fabricate numbers, and
         // records that decode but carry unparseable counts ride their row as
         // an explicit warning instead of reading as fact.
+        //
+        // Each numstat is limited to the paths its rows look up (see
+        // [`numstat_pathspecs`]); past the bound it reads the whole tree.
         let numstat_work = if reads_work {
-            parse_numstat_with_issues(&git_text_shared(&repo, &["diff", "--numstat", "-z"])?)
+            let paths = numstat_pathspecs(
+                records
+                    .iter()
+                    .filter(|r| status_kind(r.index_status, r.work_status).work_changed),
+                reach,
+            );
+            read_numstat(&repo, &["diff", "--numstat", "-z"], paths)?
         } else {
             NumstatParse::default()
         };
         let numstat_index = if reads_index {
-            parse_numstat_with_issues(&git_text_shared(
-                &repo,
-                &["diff", "--cached", "--numstat", "-z"],
-            )?)
+            let paths = numstat_pathspecs(
+                records
+                    .iter()
+                    .filter(|r| status_kind(r.index_status, r.work_status).staged),
+                reach,
+            );
+            read_numstat(&repo, &["diff", "--cached", "--numstat", "-z"], paths)?
         } else {
             NumstatParse::default()
         };
@@ -3860,6 +3897,13 @@ pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, Co
     config_snapshot_with(repo, Reads::Cached)
 }
 
+/// [`config_snapshot`] straight from git, never from the cache. For a caller
+/// that decides on what the config says (the commit identity gate), since the
+/// cache's stamp does not see a file pulled in by `include.path`.
+pub(crate) fn config_snapshot_fresh(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
+    config_snapshot_with(repo, Reads::Fresh)
+}
+
 /// How the default-base lookup reads the two inputs that live outside the
 /// ref store: the effective config and HEAD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6289,6 +6333,90 @@ fn status_kind(index_status: char, work_status: char) -> StatusKind {
         untracked: index_status == '?' && work_status == '?',
         work_changed: work_status != ' ' && work_status != '?',
     }
+}
+
+/// How far a status's numstat reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumstatReach {
+    /// Only the paths the status reported, whenever they fit the bound.
+    ChangedPaths,
+    /// Every index entry, as before the limit existed.
+    WholeTree,
+}
+
+/// Most paths, and bytes of them, one numstat's pathspec list may carry. They
+/// ride on the command line (`git diff` takes no `--pathspec-from-file`), whose
+/// limit is smallest on Windows (about 32 KiB for the whole line). Past either
+/// bound the whole tree is read, which is slower but cannot be wrong.
+///
+/// The count is where limiting stops paying in wall time, measured on
+/// 2026-11-10 by the `repo_read` bench (`numstat_paired`, rows
+/// `get_status <N> dirty`): 50k tracked files in 500 directories, 24-line files,
+/// n=21 counterbalanced pairs per count, host load 9-15 on 18 cores, null check
+/// passed (the 2000-dirty arms run the same code and agreed). Limited minus
+/// whole, median wall: 1 dirty -29 ms, 50 -23, 100 -10 (smaller in 17/21
+/// rounds, min 139 vs 154), 200 +16 (5/21, min 194 vs 172), 300 +31 (2/21), 500
+/// +57 (1/21). The same-code null pair at 2000 reads +16 (7/21), so +16 is the
+/// noise floor and 200 is not distinguishable from it; the rule took the largest
+/// count whose median AND min are not worse than whole-tree, erring low: 100.
+/// Child CPU is lower at every count up to 500 (about -47% at 1, -41% at 100,
+/// -24% at 500), so the cap is set by wall time. Unmeasured: path depth and
+/// length (the byte bound below caps total argument size regardless).
+const MAX_NUMSTAT_PATHSPECS: usize = 100;
+const MAX_NUMSTAT_PATHSPEC_BYTES: usize = 16 * 1024;
+
+/// The literal pathspecs for the paths of `rows` (both sides of a rename or
+/// copy: the status row looks its churn up under either), or `None` to read the
+/// whole tree. `None` is also the answer when
+/// - `reach` asks for it;
+/// - there are more paths than [`MAX_NUMSTAT_PATHSPECS`] or more bytes of them
+///   than [`MAX_NUMSTAT_PATHSPEC_BYTES`]. Rename detection is bounded by
+///   `diff.renameLimit` on the candidates a pathspec leaves, so a long list
+///   could pair what the status did not; the count bound keeps the two apart;
+/// - a path is not valid UTF-8: it was decoded with replacement characters, and
+///   a pathspec built from those names a file that does not exist, which would
+///   read as zero churn;
+/// - a path is one [`listing_must_match_path_exactly`] names (`*?[` or `:`):
+///   Git for Windows glob-expands `*?[` after `:(literal)` and reads `X:rest`
+///   as a drive ("is outside repository"), which would fail the whole report.
+///   The predicate is the same on every platform so the decision is testable.
+fn numstat_pathspecs<'a>(
+    rows: impl Iterator<Item = &'a RawStatusRecord>,
+    reach: NumstatReach,
+) -> Option<Vec<String>> {
+    if reach == NumstatReach::WholeTree {
+        return None;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for row in rows {
+        for path in std::iter::once(&row.path).chain(row.old_path.as_ref()) {
+            if undecodable_path_warning(path).is_some() || listing_must_match_path_exactly(path) {
+                return None;
+            }
+            paths.insert(path.as_str());
+        }
+    }
+    let bytes: usize = paths.iter().map(|path| path.len()).sum();
+    if paths.len() > MAX_NUMSTAT_PATHSPECS || bytes > MAX_NUMSTAT_PATHSPEC_BYTES {
+        return None;
+    }
+    Some(paths.into_iter().map(literal_pathspec).collect())
+}
+
+/// `git diff --numstat -z`, over `pathspecs` when given and the whole tree
+/// otherwise. A failed read is an error either way: it never reads as zero
+/// churn.
+fn read_numstat(
+    repo: &Path,
+    base: &[&str],
+    pathspecs: Option<Vec<String>>,
+) -> Result<NumstatParse, CommandError> {
+    let mut args = base.to_vec();
+    if let Some(pathspecs) = &pathspecs {
+        args.push("--");
+        args.extend(pathspecs.iter().map(String::as_str));
+    }
+    Ok(parse_numstat_with_issues(&git_text_shared(repo, &args)?))
 }
 
 fn parse_numstat_with_issues(stdout: &str) -> NumstatParse {
@@ -13407,6 +13535,460 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(churn("empty.txt"), (0, 0));
         assert_eq!(churn("binary.dat"), (0, 0));
         assert_eq!(churn("sub/one.txt"), (1, 0));
+    }
+
+    /// Every `diff --numstat` child recorded for `root` so far.
+    fn numstat_spawns(root: &Path) -> Vec<Vec<String>> {
+        crate::engine::git_cli::spawn_log::spawns_in(root)
+            .into_iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "--numstat"))
+            .collect()
+    }
+
+    /// Both reads of the same worktree: the shipped one (numstat limited to
+    /// the reported paths) and the whole-tree oracle, as Debug text, which is
+    /// every field of every row, plus the numstat children the first one ran.
+    fn status_both_ways(root: &Path) -> (String, String, Vec<Vec<String>>) {
+        let path = root.to_str().unwrap();
+        let seen = numstat_spawns(root).len();
+        let limited = GitReader::get_status(path).unwrap();
+        let spawned: Vec<Vec<String>> = numstat_spawns(root).into_iter().skip(seen).collect();
+        let whole = GitReader::get_status_whole_tree_numstat(path).unwrap();
+        (format!("{limited:#?}"), format!("{whole:#?}"), spawned)
+    }
+
+    /// F-3: `get_status` ran `git diff --numstat` (and `--cached`) over every
+    /// index entry to find churn for the few paths `status` had just named.
+    /// Now each is limited to those paths as literal pathspecs. The fixture is
+    /// every shape the limit could get wrong: both sides of a staged rename
+    /// that is also edited, spaces, a newline, a leading dash, glob and magic
+    /// characters (with a decoy a glob would widen to), non-ASCII, a binary
+    /// edit, a deletion staged and not, intent-to-add, an unmerged path, a
+    /// moved submodule, and untracked files. The rows must equal the
+    /// whole-tree read's, field for field.
+    #[cfg(unix)]
+    #[test]
+    fn status_numstat_is_limited_to_reported_paths_and_matches_the_whole_tree_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git = |args: &[&str]| crate::test_support::git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        let body = |tag: &str| {
+            (1..=12)
+                .map(|n| format!("{tag} line {n}\n"))
+                .collect::<String>()
+        };
+        let tracked = [
+            "plain.txt",
+            "sp ace.txt",
+            "new\nline.txt",
+            "-dash.txt",
+            "glob_decoy.txt",
+            "ünï.txt",
+            "ren_src.txt",
+            "gone.txt",
+            "removed.txt",
+            "staged_only.txt",
+            "both.txt",
+            "conflict.txt",
+            "dir/nested.txt",
+        ];
+        for name in tracked {
+            std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+            std::fs::write(root.join(name), body(name)).unwrap();
+        }
+        std::fs::write(root.join("bin.dat"), b"a\0b\n").unwrap();
+        for n in 0..40 {
+            std::fs::write(root.join(format!("bystander{n:02}.txt")), body("by")).unwrap();
+        }
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        crate::test_support::git_in(&sub, &["init", "-q", "-b", "main"]);
+        std::fs::write(sub.join("f.txt"), "one\n").unwrap();
+        crate::test_support::git_in(&sub, &["add", "f.txt"]);
+        crate::test_support::git_in(&sub, &["commit", "-q", "-m", "sub one"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // An unmerged path first: a merge will not start on a dirty index.
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("conflict.txt"), body("side")).unwrap();
+        git(&["commit", "-q", "-am", "side"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("conflict.txt"), body("main")).unwrap();
+        git(&["commit", "-q", "-am", "main"]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .env("GIT_AUTHOR_NAME", "GitPulse")
+            .env("GIT_AUTHOR_EMAIL", "gitpulse@test.local")
+            .env("GIT_COMMITTER_NAME", "GitPulse")
+            .env("GIT_COMMITTER_EMAIL", "gitpulse@test.local")
+            .current_dir(&root)
+            .output_locked()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge must conflict");
+
+        let edit = |name: &str| {
+            let mut text = std::fs::read_to_string(root.join(name)).unwrap();
+            text = text.replacen("line 3\n", "line 3 edited\nextra\n", 1);
+            std::fs::write(root.join(name), text).unwrap();
+        };
+        for name in [
+            "plain.txt",
+            "sp ace.txt",
+            "new\nline.txt",
+            "-dash.txt",
+            "glob_decoy.txt",
+            "ünï.txt",
+            "dir/nested.txt",
+        ] {
+            edit(name);
+        }
+        git(&["mv", "ren_src.txt", "ren_dst.txt"]);
+        edit("ren_dst.txt");
+        git(&["add", "ren_dst.txt"]);
+        std::fs::write(root.join("ren_dst.txt"), body("ren_src.txt") + "tail\n").unwrap();
+        edit("staged_only.txt");
+        git(&["add", "staged_only.txt"]);
+        edit("both.txt");
+        git(&["add", "both.txt"]);
+        std::fs::write(root.join("both.txt"), "all new\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        git(&["rm", "-q", "removed.txt"]);
+        std::fs::write(root.join("bin.dat"), b"a\0b\0c\n").unwrap();
+        std::fs::write(root.join("itm.txt"), body("itm")).unwrap();
+        git(&["add", "-N", "itm.txt"]);
+        std::fs::write(root.join("untracked.txt"), body("u")).unwrap();
+        std::fs::write(sub.join("f.txt"), "two\n").unwrap();
+        crate::test_support::git_in(&sub, &["commit", "-q", "-am", "sub two"]);
+
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole, "limited numstat must read the same churn");
+        for token in [
+            "ren_dst.txt",
+            "ren_src.txt",
+            "itm.txt",
+            "conflict.txt",
+            "sub",
+        ] {
+            assert!(
+                limited.contains(token),
+                "{token} is in the report: {limited}"
+            );
+        }
+
+        assert_eq!(spawned.len(), 2, "one numstat each way: {spawned:?}");
+        for argv in &spawned {
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("pathspec fence");
+            assert!(
+                argv[at + 1..]
+                    .iter()
+                    .all(|spec| spec.starts_with(":(literal)")),
+                "every pathspec is literal: {argv:?}"
+            );
+        }
+        let worktree = spawned
+            .iter()
+            .find(|a| !a.iter().any(|x| x == "--cached"))
+            .unwrap();
+        for wanted in [":(literal)-dash.txt", ":(literal)new\nline.txt"] {
+            assert!(
+                worktree.iter().any(|spec| spec == wanted),
+                "{wanted}: {worktree:?}"
+            );
+        }
+        assert!(
+            !worktree.iter().any(|spec| spec.contains("bystander")),
+            "paths status did not report stay out: {worktree:?}"
+        );
+        let staged = spawned
+            .iter()
+            .find(|a| a.iter().any(|x| x == "--cached"))
+            .unwrap();
+        for wanted in [":(literal)ren_src.txt", ":(literal)ren_dst.txt"] {
+            assert!(
+                staged.iter().any(|spec| spec == wanted),
+                "both sides: {staged:?}"
+            );
+        }
+    }
+
+    /// Git for Windows reads `:(literal)X:rest` as a drive path ("is outside
+    /// repository") and glob-expands `*?[` after `:(literal)`, so a status
+    /// that names such a path cannot take the limited read there. The decision
+    /// is the same everywhere (it reuses [`listing_must_match_path_exactly`]),
+    /// so it is checked here on every platform; the Windows behaviour itself is
+    /// not exercised by this test.
+    #[test]
+    fn numstat_pathspecs_are_withheld_for_paths_a_pathspec_cannot_name_exactly() {
+        let row = |path: &str| RawStatusRecord {
+            index_status: ' ',
+            work_status: 'M',
+            path: path.to_string(),
+            old_path: None,
+        };
+        for hostile in [
+            "glob*.txt",
+            "q?.txt",
+            "br[ac].txt",
+            ":colon.txt",
+            "C:rest.txt",
+            "d/a:b",
+        ] {
+            let rows = [row("fine.txt"), row(hostile)];
+            assert_eq!(
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
+                None,
+                "{hostile}"
+            );
+            let renamed = [RawStatusRecord {
+                old_path: Some(hostile.to_string()),
+                ..row("fine.txt")
+            }];
+            assert_eq!(
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths),
+                None,
+                "old side {hostile}"
+            );
+        }
+        assert!(numstat_pathspecs([row("fine.txt")].iter(), NumstatReach::ChangedPaths).is_some());
+    }
+
+    /// The same names through a real status: the report still carries their
+    /// churn, read over the whole tree.
+    #[test]
+    fn status_numstat_with_glob_and_drive_like_names_reads_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+            std::fs::write(root.join(name), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+            std::fs::write(root.join(name), "a\nb\n").unwrap();
+        }
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(limited.contains("additions: 1"), "churn counted: {limited}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "whole-tree read: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// Exactly [`MAX_NUMSTAT_PATHSPECS`] paths are limited; one more is not.
+    /// The same line for their bytes: [`MAX_NUMSTAT_PATHSPEC_BYTES`] fit, one
+    /// byte more does not.
+    #[test]
+    fn numstat_pathspecs_fall_back_exactly_past_the_count_and_byte_bounds() {
+        let rows = |paths: Vec<String>| -> Vec<RawStatusRecord> {
+            paths
+                .into_iter()
+                .map(|path| RawStatusRecord {
+                    index_status: ' ',
+                    work_status: 'M',
+                    path,
+                    old_path: None,
+                })
+                .collect()
+        };
+        let limited = |rows: &[RawStatusRecord]| {
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths).map(|specs| specs.len())
+        };
+        let short = |count: usize| rows((0..count).map(|n| format!("f{n:04}")).collect());
+        assert_eq!(
+            limited(&short(MAX_NUMSTAT_PATHSPECS)),
+            Some(MAX_NUMSTAT_PATHSPECS)
+        );
+        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS + 1)), None);
+        // 16 paths of 1024 bytes each are exactly the byte bound.
+        let long = |count: usize, tail: usize| {
+            rows(
+                (0..count)
+                    .map(|n| format!("{n:04}{}", "x".repeat(1020 + usize::from(n == 0) * tail)))
+                    .collect(),
+            )
+        };
+        let per_path = MAX_NUMSTAT_PATHSPEC_BYTES / 16;
+        assert_eq!(per_path, 1024);
+        assert_eq!(limited(&long(16, 0)), Some(16));
+        assert_eq!(limited(&long(16, 1)), None);
+        // Both sides of a rename count, once each, and a path is not counted twice.
+        let rename = || RawStatusRecord {
+            index_status: 'R',
+            work_status: ' ',
+            path: "b".into(),
+            old_path: Some("a".into()),
+        };
+        assert_eq!(limited(&[rename()]), Some(2));
+        assert_eq!(limited(&[rename(), rename()]), Some(2));
+    }
+
+    /// Past the bound the list would not fit a command line, so the whole tree
+    /// is read, and the rows are still the whole-tree read's.
+    #[test]
+    fn status_numstat_reads_the_whole_tree_past_the_pathspec_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        let count = MAX_NUMSTAT_PATHSPECS + 8;
+        for n in 0..count {
+            std::fs::write(root.join(format!("f{n:04}.txt")), "a\nb\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for n in 0..count {
+            std::fs::write(root.join(format!("f{n:04}.txt")), "a\nc\nd\n").unwrap();
+        }
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "over the bound the read is whole-tree: {:?}",
+            spawned[0]
+        );
+        assert!(limited.contains("additions: 2"), "churn was counted");
+    }
+
+    /// The form switches exactly at the cap, counted on the numstat child's
+    /// argv: `MAX_NUMSTAT_PATHSPECS` changed files are read through a pathspec
+    /// list, one more reads the whole tree, and the rows are the whole-tree
+    /// read's either way. No timing: which form ran is read off the command.
+    #[test]
+    fn status_numstat_switches_form_exactly_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        for n in 0..=MAX_NUMSTAT_PATHSPECS {
+            std::fs::write(root.join(format!("f{n:03}.txt")), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let change = |count: usize| {
+            for n in 0..count {
+                std::fs::write(root.join(format!("f{n:03}.txt")), "a\nb\n").unwrap();
+            }
+        };
+        change(MAX_NUMSTAT_PATHSPECS);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        let argv = &spawned[0];
+        let at = argv.iter().position(|arg| arg == "--").expect("at the cap");
+        assert_eq!(
+            argv.len() - at - 1,
+            MAX_NUMSTAT_PATHSPECS,
+            "one spec per file"
+        );
+        change(MAX_NUMSTAT_PATHSPECS + 1);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "one past the cap reads the whole tree: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// A path that is not valid UTF-8 reaches the report with replacement
+    /// characters, which no pathspec can name. Limiting the read to it would
+    /// report zero churn for a file that changed, so that status reads the
+    /// whole tree and counts the churn. Linux only: APFS refuses such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_numstat_with_a_non_utf8_path_reads_the_whole_tree() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        let odd = root.join(std::ffi::OsStr::from_bytes(b"odd\xff.txt"));
+        std::fs::write(&odd, "a\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(&odd, "a\nb\nc\n").unwrap();
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(limited.contains("additions: 2"), "churn counted: {limited}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "whole-tree read: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// The same decision without a file system that may refuse the name: a
+    /// replacement character in either side of a row means no pathspec list.
+    #[test]
+    fn numstat_pathspecs_are_withheld_for_an_undecodable_path_and_for_whole_tree_reach() {
+        let row = |path: &str, old_path: Option<&str>| RawStatusRecord {
+            index_status: 'R',
+            work_status: ' ',
+            path: path.to_string(),
+            old_path: old_path.map(str::to_string),
+        };
+        let rows = [row("new.txt", Some("old.txt")), row("b.txt", None)];
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
+            Some(vec![
+                ":(literal)b.txt".to_string(),
+                ":(literal)new.txt".to_string(),
+                ":(literal)old.txt".to_string(),
+            ]),
+            "both sides of the rename, sorted and literal"
+        );
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::WholeTree),
+            None
+        );
+        for odd in [
+            [row("odd\u{FFFD}.txt", None)],
+            [row("new.txt", Some("odd\u{FFFD}.txt"))],
+        ] {
+            assert_eq!(
+                numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths),
+                None
+            );
+        }
+    }
+
+    /// A numstat git cannot complete fails the report; it is never zero churn.
+    /// The staged blob is removed, so `status` (which compares object ids) still
+    /// answers while `diff --cached --numstat` cannot read the content.
+    #[cfg(unix)]
+    #[test]
+    fn status_fails_when_its_numstat_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree-unique-blob\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "a.txt"]);
+        let oid = git_text(&root, &["rev-parse", ":a.txt"]).unwrap();
+        let oid = oid.trim();
+        let object = root.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(&object).unwrap();
+        // While the file still matches the index entry git reads the staged
+        // side from the working tree instead of the object, so change it.
+        std::fs::write(root.join("a.txt"), "edited after staging\n").unwrap();
+        let alternates = root.join(".git/objects/info/alternates");
+        assert!(
+            git_text(&root, &["cat-file", "-t", oid]).is_err(),
+            "the staged blob must be gone from every object store (alternates: {:?})",
+            std::fs::read_to_string(alternates)
+        );
+        let error = GitReader::get_status(root.to_str().unwrap())
+            .expect_err("an unreadable numstat must fail the report");
+        assert!(!error.message().is_empty());
     }
 
     /// A repository holding one tracked file and `count` untracked ones,
