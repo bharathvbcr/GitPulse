@@ -3,6 +3,9 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { conflictSessions } from "../diff/conflictSession";
   import { WORK_CONFLICTS_ID, conflictsFocusRequest, takeConflictsFocus } from "../ui/workConflicts";
+  import { harnessStore } from "../stores/harnessStore";
+  import { manviFocusHint } from "../ui/manviFocus";
+  import { openManviFocus } from "../ui/openManviFocus";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import WorkView from "./WorkView.svelte";
 
@@ -52,6 +55,9 @@
   });
   let reviewingDrafts = $state(false);
   const showEditor = $derived(live || (reviewingDrafts && retainedDrafts > 0));
+  // Conflicts outrank a blocked verdict (viewAttention.ts): while the editor
+  // leads the page, the notice would only push it down.
+  const blockedVerdict = $derived(!showEditor && $harnessStore.lastVerdict?.status === "blocked");
 
   // A door to the conflicts (status bar, tray, merge dialog, palette, a row)
   // asks for the editor; it is taken here, on mount or while mounted, and
@@ -89,7 +95,22 @@
       {/if}
       <LazyView load={loadConflict} name="the conflict editor" />
     </section>
-  {:else if retainedDrafts > 0}
+  {:else if blockedVerdict}
+    <!-- The attention dot on Overview says "Manvi blocked the last action";
+         the why is in Policy activity, a collapsed disclosure below the rows.
+         One line and one door, only while that verdict is the latest. -->
+    <div
+      class="shrink-0 flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted"
+      data-testid="work-blocked-verdict"
+      role="status"
+    >
+      <span>Manvi blocked the last action.</span>
+      <button type="button" class="gp-btn ml-auto" title={manviFocusHint("activity")} onclick={() => openManviFocus("activity")}>
+        Show activity
+      </button>
+    </div>
+  {/if}
+  {#if !showEditor && retainedDrafts > 0}
     <div
       class="shrink-0 flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted"
       data-testid="work-retained-drafts"

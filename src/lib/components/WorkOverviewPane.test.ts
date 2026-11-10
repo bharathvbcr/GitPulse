@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
   parked: false,
   probeFailed: false,
   retained: 0,
+  verdict: null as null | "blocked" | "allowed",
 }));
 
 vi.mock("../stores/repoStore", async (importOriginal) => {
@@ -71,6 +72,20 @@ vi.mock("../stores/repoStore", async (importOriginal) => {
   };
 });
 
+vi.mock("../stores/harnessStore", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../stores/harnessStore")>();
+  return {
+    ...real,
+    harnessStore: {
+      ...real.harnessStore,
+      subscribe: (run: (value: unknown) => void) =>
+        real.harnessStore.subscribe((value) =>
+          run({ ...value, lastVerdict: state.verdict ? { ...(value.lastVerdict ?? {}), status: state.verdict } : null }),
+        ),
+    },
+  };
+});
+
 vi.mock("../diff/conflictSession", async (importOriginal) => {
   const real = await importOriginal<typeof import("../diff/conflictSession")>();
   return {
@@ -92,10 +107,28 @@ const OVERVIEW = 'aria-label="Overview"';
 const DRAFTS = 'data-testid="work-retained-drafts"';
 
 afterEach(() => {
-  Object.assign(state, { conflicted: false, parked: false, probeFailed: false, retained: 0 });
+  Object.assign(state, { conflicted: false, parked: false, probeFailed: false, retained: 0, verdict: null });
 });
 
 describe("WorkOverviewPane", () => {
+  it("offers one door to the blocked verdict's explanation, above the rows", () => {
+    state.verdict = "blocked";
+    const body = pane();
+    expect(body).toContain('data-testid="work-blocked-verdict"');
+    expect(body).toContain("Manvi blocked the last action.");
+    expect(body).toContain("Show activity");
+    expect(body.indexOf("work-blocked-verdict")).toBeLessThan(body.indexOf(OVERVIEW));
+  });
+
+  it("drops the verdict notice once the verdict changes, and while the editor leads", () => {
+    state.verdict = "allowed";
+    expect(pane()).not.toContain("work-blocked-verdict");
+    Object.assign(state, { verdict: "blocked", conflicted: true });
+    const body = pane();
+    expect(body).toContain(EDITOR);
+    expect(body).not.toContain("work-blocked-verdict");
+  });
+
   it("is Overview alone when there is nothing to resolve", () => {
     const body = pane();
     expect(body).toContain(OVERVIEW);

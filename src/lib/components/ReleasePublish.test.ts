@@ -46,6 +46,24 @@ describe("ReleasePublish", () => {
   });
 });
 
+describe("ReleasePublish after a repository switch", () => {
+  it("still says what happened to a push that ran in the repository it was asked for", () => {
+    // The old panel always reported the outcome; dropping it when the reader
+    // switched tabs mid-push would leave a pushed tag with no word about it.
+    const body = source.slice(source.indexOf("async function publishRelease"));
+    const switched = body.slice(body.indexOf("if ($repoStore.currentPath !== repo) {"), body.indexOf("if (!outcome.ok)"));
+    expect(switched).toContain("toastStore.success(");
+    expect(switched).toContain("toastStore.error(");
+    expect(switched).toContain("return;");
+  });
+
+  it("lets the next release's message follow its tag again", () => {
+    const body = source.slice(source.indexOf("async function publishRelease"));
+    const success = body.slice(body.indexOf("releaseConfirmed = false;"), body.indexOf("onPublished("));
+    expect(success).toContain("messageEdited = false;");
+  });
+});
+
 describe("ReleasePublish contracts", () => {
   it("cannot push without the confirmation and a tag", () => {
     expect(source).toContain('const canPush = $derived(releaseConfirmed && releaseTag.trim() !== "" && !publishing);');

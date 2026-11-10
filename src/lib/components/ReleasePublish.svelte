@@ -3,6 +3,7 @@
   import { describeFailure } from "../ui/copy/describeFailure";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { verdictLabel } from "../stores/harnessStore";
+  import { toastStore } from "../stores/toastStore";
   import { formatReleaseDate, releaseTagSuggestion, type ReleaseInfo } from "../ops/model";
   import type { WorkflowRunInfo } from "../github/types";
   import { untrack } from "svelte";
@@ -89,7 +90,14 @@
     error = null;
     try {
       const outcome = await repoStore.publishRelease(tag, releaseMessage.trim() || `Release ${tag}`);
-      if ($repoStore.currentPath !== repo) return;
+      if ($repoStore.currentPath !== repo) {
+        // The push ran in the repository it was asked for; the reader moved on.
+        // A pushed tag is not undone by switching tabs, so say what happened
+        // rather than dropping it with this pane's state.
+        if (outcome.ok) toastStore.success(`Pushed ${outcome.output?.tag ?? tag} in ${repo}.`);
+        else toastStore.error(`Couldn't push ${tag} in ${repo}. ${outcome.error ?? ""}`.trim());
+        return;
+      }
       if (!outcome.ok) {
         error = outcome.error ?? "Couldn't publish the release.";
         return;
@@ -97,6 +105,7 @@
       releaseConfirmed = false;
       open = false;
       tagEdited = false;
+      messageEdited = false;
       onPublished(
         `Pushed ${outcome.output?.tag ?? tag} to ${outcome.output?.remote ?? "the remote"}${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}; the release workflow can now build the app.`,
       );
