@@ -38,9 +38,6 @@ pub(crate) mod read_cancel;
 mod read_cancel_tests;
 
 #[cfg(test)]
-mod alloc_probe;
-
-#[cfg(test)]
 mod awaiting_adversarial_tests;
 
 #[cfg(test)]
@@ -2737,6 +2734,28 @@ pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> CommandError {
     refusal_message_at(label, refusal, None)
 }
 
+/// What a spawn refused because its caller cancelled while it queued says
+/// after its label.
+const CANCELLED_BEFORE_SPAWN: &str = " cancelled before spawn";
+
+/// Whether `error` is a cancellation (a read whose callers have gone, or any
+/// spawn cancelled while it queued) and so no fault of the process: it is not
+/// counted as a process failure, which feeds health reporting.
+fn is_cancellation(error: &CommandError) -> bool {
+    error.message() == read_cancel::CANCELLED_MESSAGE
+        || error.message().ends_with(CANCELLED_BEFORE_SPAWN)
+}
+
+/// A cancelled spawn of a read whose request can be cancelled, as that read's
+/// cancellation: the same words as one cancelled while it ran.
+fn as_read_cancellation(error: CommandError, cancellable: bool) -> CommandError {
+    if cancellable && error.message().ends_with(CANCELLED_BEFORE_SPAWN) {
+        read_cancel::CANCELLED_MESSAGE.into()
+    } else {
+        error
+    }
+}
+
 /// [`refusal_message`], naming the bucket that refused and its level when the
 /// gate knows them. The text before the level is unchanged, so every reader
 /// that matches on the deferral (see [`is_deferred_under_load`]) reads it as
@@ -2753,7 +2772,7 @@ pub(crate) fn refusal_message_at(
     let deferred =
         |text: String| CommandError::typed(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text);
     match refusal {
-        Refusal::Cancelled => format!("{label} cancelled before spawn").into(),
+        Refusal::Cancelled => format!("{label}{CANCELLED_BEFORE_SPAWN}").into(),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
@@ -5065,7 +5084,7 @@ fn run_read_shared_once(
         }
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
-        if let Err(error) = &shared {
+        if let Some(error) = shared.as_ref().err().filter(|error| !is_cancellation(error)) {
             note_process_failure(error);
         }
         return SharedAttempt::Done(shared);
@@ -5606,7 +5625,7 @@ fn run_admitted(
         }
         other => other,
     };
-    if let Err(error) = &result {
+    if let Some(error) = result.as_ref().err().filter(|error| !is_cancellation(error)) {
         note_process_failure(error);
     }
     result
@@ -6247,8 +6266,8 @@ fn git_run_inner(
         // never shared whatever the caller asked. A shared read observes its
         // flight (see [`FlightObserver`]); one that is not shared observes
         // its own request.
-        let mut out = if shared && stdin_bytes.is_none() && hooked.is_none() {
-            run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
+        let ran = if shared && stdin_bytes.is_none() && hooked.is_none() {
+            run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())
         } else if let Some(cancel) = &cancel {
             let mut cmd = cmd;
             let mut observer = read_cancel::OwnCancel(cancel);
@@ -6259,7 +6278,7 @@ fn git_run_inner(
                 stdin_bytes,
                 stdout_cap,
                 &mut observer,
-            )?
+            )
         } else if let Some((_, run)) = &hooked {
             let mut cmd = cmd;
             let mut observer = HookObserver(run);
@@ -6270,10 +6289,13 @@ fn git_run_inner(
                 stdin_bytes,
                 stdout_cap,
                 &mut observer,
-            )?
+            )
         } else {
-            run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?
+            run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)
         };
+        // A read cancelled while it queued for a slot is the same cancellation
+        // as one cancelled while it ran, not a refusal with a label of its own.
+        let mut out = ran.map_err(|error| as_read_cancellation(error, cancel.is_some()))?;
         if let Some((repo, _)) = &hooked {
             if out.cancelled {
                 return Err(hooks::cancelled_message(repo, sub).into());

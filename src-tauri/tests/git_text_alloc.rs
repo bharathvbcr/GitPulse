@@ -1,9 +1,25 @@
+//! F-10: captured git output that is valid UTF-8 is decoded in place.
+//!
 //! Counts the bytes the calling thread allocates, so a test can say whether a
-//! decode copied a buffer it had no need to. Counts only on the thread that
-//! asked, so tests running beside it in this binary add nothing.
+//! decode copied a buffer it had no need to. The counting allocator belongs to
+//! this test binary alone; the library's own tests run on the default one.
+//!
+//! Covers the public text entries. `git_text_shared` and
+//! `git_text_capped_shared` are crate-private (they are reached through
+//! `ref_cache`) and are not measured here; they decode through the same
+//! `text_from_bytes` as the entries below, which is checked by reading, and the
+//! helper itself by `decoding_valid_captured_output_does_not_copy_the_buffer`
+//! in the library's tests.
 
-use super::*;
+use gitpulse_lib::engine::git_cli::{
+    git_bytes_capped, git_text, git_text_capped, git_text_partial, git_text_with_timeout,
+    MAX_OUTPUT_BYTES,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::time::Duration;
+
+mod common;
 
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
@@ -55,66 +71,61 @@ fn allocated_by<T>(body: impl FnOnce() -> T) -> (T, usize) {
     (out, BYTES.with(Cell::get))
 }
 
-/// F-10. Captured output that is valid UTF-8 is decoded in place: through every
-/// entry that returns text, the call allocates no more than the call that
-/// returns the bytes, give or take a fraction of the payload. A decode that
-/// copies the buffer (`from_utf8_lossy(..).into_owned()`) costs one whole
-/// payload more, which is what this measures.
+/// Through every public entry that returns text, the call allocates no more than
+/// the call that returns the bytes, give or take a fraction of the payload. A
+/// decode that copies the buffer (`from_utf8_lossy(..).into_owned()`) costs one
+/// whole payload more, which is what this measures.
 #[cfg(unix)]
 #[test]
 fn text_entries_allocate_no_second_copy_of_the_output() {
     const PAYLOAD: usize = 6 * 1024 * 1024;
-    let repo = crate::test_support::git_repo();
-    let blob = repo.path().join("big.txt");
-    std::fs::write(&blob, "a line of ordinary text\n".repeat(PAYLOAD / 24)).unwrap();
-    let oid = git_text(repo.path(), &["hash-object", "-w", "big.txt"])
+    common::unmetered_spawns();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path();
+    common::run_git(path, &["init", "-b", "main"]);
+    common::trust_repo(path);
+    std::fs::write(
+        path.join("big.txt"),
+        "a line of ordinary text\n".repeat(PAYLOAD / 24),
+    )
+    .unwrap();
+    let oid = git_text(path, &["hash-object", "-w", "big.txt"])
         .unwrap()
         .trim()
         .to_string();
     let args = ["cat-file", "blob", oid.as_str()];
-    let path = repo.path();
     let slack = PAYLOAD / 3;
 
-    // The runner's own cost for this output, with no decode, per route.
-    let (bytes, plain_cost) = allocated_by(|| git_bytes_capped(path, &args, MAX_OUTPUT_BYTES).unwrap());
-    assert!(bytes.0.len() >= PAYLOAD - 24, "the fixture printed {} bytes", bytes.0.len());
-    let (shared_bytes, shared_cost) = allocated_by(|| {
-        git_run_inner(Some(path), &args, DEFAULT_TIMEOUT, None, MAX_OUTPUT_BYTES, true).unwrap()
-    });
-    assert_eq!(shared_bytes.0.len(), bytes.0.len());
-    drop((bytes, shared_bytes));
+    // The runner's own cost for this output, with no decode.
+    let (bytes, baseline) = allocated_by(|| git_bytes_capped(path, &args, MAX_OUTPUT_BYTES).unwrap());
+    assert!(
+        bytes.0.len() >= PAYLOAD - 24,
+        "the fixture printed {} bytes",
+        bytes.0.len()
+    );
+    drop(bytes);
 
-    let routes: [(&str, usize, usize); 5] = [
-        (
-            "git_text",
-            allocated_by(|| git_text(path, &args).unwrap().len()).1,
-            plain_cost,
-        ),
+    let routes: [(&str, usize); 4] = [
+        ("git_text", allocated_by(|| git_text(path, &args).unwrap().len()).1),
         (
             "git_text_capped",
             allocated_by(|| git_text_capped(path, &args, MAX_OUTPUT_BYTES).unwrap().0.len()).1,
-            plain_cost,
         ),
         (
             "git_text_partial",
             allocated_by(|| git_text_partial(path, &args).unwrap().0.len()).1,
-            plain_cost,
         ),
         (
-            "git_text_shared",
-            allocated_by(|| git_text_shared(path, &args).unwrap().len()).1,
-            shared_cost,
-        ),
-        (
-            "git_text_capped_shared",
+            "git_text_with_timeout",
             allocated_by(|| {
-                git_text_capped_shared(path, &args, MAX_OUTPUT_BYTES).unwrap().0.len()
+                git_text_with_timeout(path, &args, Duration::from_secs(60))
+                    .unwrap()
+                    .len()
             })
             .1,
-            shared_cost,
         ),
     ];
-    for (route, cost, baseline) in routes {
+    for (route, cost) in routes {
         eprintln!("{route}: {cost} bytes allocated against {baseline} for the bytes alone");
         assert!(
             cost <= baseline + slack,
