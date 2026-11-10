@@ -3270,13 +3270,46 @@ fn paths_converted_on_checkout(
         .collect())
 }
 
-/// Whether `repo` has a `post-checkout` hook git would run: the file
-/// `git rev-parse --git-path hooks/post-checkout` names (which honours
-/// `core.hooksPath` and a linked worktree's shared hooks directory), if it is
-/// a regular file with an execute bit. `None` when git could not say, which
+/// Whether git would run a `post-checkout` hook in `repo`: `Some(true)` or
+/// `Some(false)` when it could be told, `None` when it could not, which
 /// callers treat as "has one".
+///
+/// Git itself is asked first: `git hook list post-checkout` exits 0 when any
+/// hook would run (a file, or one defined in config with `hook.<name>.command`
+/// and `.event`, which no file check can see) and 1 when none would, a hook
+/// file without the execute bit included. Git older than the subcommand exits
+/// 129 (usage), and it predates config-defined hooks too, so there the hook
+/// file is the whole answer ([`post_checkout_hook_file_is_executable`]).
 #[cfg(target_os = "macos")]
-fn post_checkout_hook_is_executable(repo: &Path) -> Option<bool> {
+fn post_checkout_hook_runs(repo: &Path) -> Option<bool> {
+    let listed = crate::engine::git_cli::git_captured(repo, &["hook", "list", "post-checkout"])
+        .ok()
+        .map(|out| out.status_code);
+    post_checkout_hook_decision(listed, || post_checkout_hook_file_is_executable(repo))
+}
+
+/// The decision [`post_checkout_hook_runs`] makes from `git hook list`'s exit
+/// status (`None` when git could not be run) and, for a git without the
+/// subcommand, the hook-file check. Any other status is git failing, which is
+/// not an answer.
+#[cfg(target_os = "macos")]
+fn post_checkout_hook_decision(
+    list_status: Option<i32>,
+    hook_file: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    match list_status {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        Some(129) => hook_file(),
+        _ => None,
+    }
+}
+
+/// The file `git rev-parse --git-path hooks/post-checkout` names (which
+/// honours `core.hooksPath` and a linked worktree's shared hooks directory), if
+/// it is a regular file with an execute bit.
+#[cfg(target_os = "macos")]
+fn post_checkout_hook_file_is_executable(repo: &Path) -> Option<bool> {
     use std::os::unix::fs::PermissionsExt;
 
     let out = crate::engine::git_cli::git_captured(
@@ -3386,7 +3419,7 @@ fn try_add_worktree_cow_macos(
     // `git worktree add` does. A repository that has the hook (Git LFS installs
     // one) must keep getting it run, and running it from here would be
     // GitPulse executing repository code on its own, so it takes the plain path.
-    if post_checkout_hook_is_executable(repo) != Some(false) {
+    if post_checkout_hook_runs(repo) != Some(false) {
         return Ok(None);
     }
     let target = Path::new(target_path);

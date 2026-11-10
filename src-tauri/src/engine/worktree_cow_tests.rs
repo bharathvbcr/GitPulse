@@ -370,6 +370,91 @@ fn a_repository_with_a_post_checkout_hook_gets_it_run_by_plain_git() {
     assert_eq!(std::fs::read(lane.join("a.txt")).unwrap(), b"a\n");
 }
 
+/// Git 2.56 can define a hook in config (`hook.<name>.command` and
+/// `hook.<name>.event`). `git rev-parse --git-path hooks/post-checkout` still
+/// prints a path where no file exists, so only asking `git hook list` finds it.
+#[cfg(unix)]
+#[test]
+fn a_post_checkout_hook_defined_in_git_config_is_run_by_plain_git() {
+    let sandbox = tempfile::TempDir::new().unwrap();
+    let main = sandbox.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git_in(&main, &["init", "-b", "main"]);
+    trust_repo(&main);
+    std::fs::write(main.join("a.txt"), "a\n").unwrap();
+    git_in(&main, &["add", "."]);
+    git_in(&main, &["commit", "-m", "initial"]);
+    set_mtime(&main.join("a.txt"));
+    let marker = sandbox.path().join("hook-ran");
+    git_in(
+        &main,
+        &[
+            "config",
+            "hook.mark.command",
+            &format!("echo ran > '{}'", marker.display()),
+        ],
+    );
+    git_in(&main, &["config", "hook.mark.event", "post-checkout"]);
+    let listed =
+        crate::engine::git_cli::git_captured(&main, &["hook", "list", "post-checkout"]).unwrap();
+    if listed.status_code != 0 {
+        // This git has no config-defined hooks: nothing to run, nothing to test.
+        return;
+    }
+    let _ = crate::engine::git_cli::git_captured(&main, &["update-index", "--refresh"]).unwrap();
+
+    let lane = sandbox.path().join("lane");
+    add_worktree(
+        main.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("lane"),
+        None,
+        false,
+    )
+    .expect("add_worktree");
+
+    assert!(
+        marker.exists(),
+        "a hook defined in config runs on plain `git worktree add` and not on `--no-checkout`, so the clone path must not be taken"
+    );
+}
+
+#[test]
+fn when_git_cannot_say_whether_a_hook_runs_the_clone_path_is_not_taken() {
+    let file_says = |answer| move || answer;
+    // `git hook list` answers: 0 hooks run, 1 none do.
+    assert_eq!(
+        post_checkout_hook_decision(Some(0), file_says(Some(false))),
+        Some(true)
+    );
+    assert_eq!(
+        post_checkout_hook_decision(Some(1), file_says(Some(true))),
+        Some(false)
+    );
+    // A git without the subcommand (usage error): the hook file is the answer.
+    assert_eq!(
+        post_checkout_hook_decision(Some(129), file_says(Some(false))),
+        Some(false)
+    );
+    assert_eq!(
+        post_checkout_hook_decision(Some(129), file_says(Some(true))),
+        Some(true)
+    );
+    // Neither can answer: unknown, which the caller reads as "has a hook".
+    assert_eq!(
+        post_checkout_hook_decision(Some(129), file_says(None)),
+        None
+    );
+    assert_eq!(
+        post_checkout_hook_decision(Some(128), file_says(Some(false))),
+        None
+    );
+    assert_eq!(
+        post_checkout_hook_decision(None, file_says(Some(false))),
+        None
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_hook_that_is_not_executable_does_not_stop_the_clone() {
