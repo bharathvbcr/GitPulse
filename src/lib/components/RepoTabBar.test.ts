@@ -35,6 +35,48 @@ describe("RepoTabBar", () => {
     expect(body).toContain('title="Open repository"');
   });
 
+  it("pins Open, Fetch and Work to the right of the repository tabs", () => {
+    // The tab list stays shrink-wrapped. Free space belongs in front of Open,
+    // so the Open control, its menu and the workspace actions sit on the
+    // strip's right edge instead of immediately after the last tab.
+    const tabs = source.indexOf('aria-label="Open repositories"');
+    const open = source.indexOf('data-testid="open-repo-tab"');
+    const actions = source.indexOf("<WorkspaceActions");
+    expect(tabs).toBeGreaterThan(-1);
+    expect(open).toBeGreaterThan(tabs);
+    expect(actions).toBeGreaterThan(open);
+    const { body } = render(RepoTabBar);
+    expect(body).toMatch(/data-testid="open-repo-tab"[^>]*\bml-auto\b/);
+    const openTag = source.slice(source.lastIndexOf("<button", open), source.indexOf("\n    >", open));
+    expect(openTag).toContain("ml-auto");
+    expect(openTag).toContain("shrink-0");
+  });
+
+  it("dismisses Fleet with the same close control Agents and Tasks use", () => {
+    interfaceStore.setFleetOpen(false);
+    expect(render(RepoTabBar).body).not.toContain('data-testid="fleet-tab-close"');
+
+    interfaceStore.setFleetOpen(true);
+    try {
+      const { body } = render(RepoTabBar);
+      expect(body).toContain('data-testid="fleet-tab-close"');
+      expect(body).toContain('aria-label="Close Fleet"');
+      expect(body).toContain('class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"');
+    } finally {
+      interfaceStore.setFleetOpen(false);
+    }
+
+    const fleet = source.slice(
+      source.indexOf('data-testid="fleet-tab-chip"'),
+      source.indexOf('data-testid="agents-tab-chip"'),
+    );
+    expect(fleet).toContain("interfaceStore.toggleFleet()");
+    expect(fleet.indexOf("interfaceStore.toggleFleet()")).toBeLessThan(fleet.indexOf('data-testid="fleet-tab-close"'));
+    expect(fleet).toContain("{#if fleetOpen}");
+    expect(fleet).toContain("event.stopPropagation()");
+    expect(fleet).toContain("interfaceStore.setFleetOpen(false)");
+  });
+
   it("renders tab bar when tabs are open", async () => {
     await repoStore.openRepo("/repo/my-project", { allowBroken: true, activate: true });
 

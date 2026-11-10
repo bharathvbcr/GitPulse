@@ -63,6 +63,14 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("F3");
   });
 
+  it("includes the terminal chords that used to live on the dock", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Terminal");
+    expect(body).toContain("New shell in the directory of the shell beside it");
+    expect(body).toContain("Find in the terminal");
+    expect(body).toContain("Close session");
+  });
+
   it("documents how to reorder repository tabs from the keyboard", () => {
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Move the focused repository tab left or right");

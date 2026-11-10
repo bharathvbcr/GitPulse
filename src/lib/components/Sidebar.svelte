@@ -1,3 +1,52 @@
+<script lang="ts" module>
+  import type { StatusDashboard } from "../files/fileStatus";
+
+  export type WorkingTreeSegmentKind = "staged" | "unstaged" | "untracked" | "conflict";
+
+  export interface WorkingTreeSegment {
+    kind: WorkingTreeSegmentKind;
+    count: number;
+    /** Share of the filled track. Zero-length when the tree is clean. */
+    percent: number;
+  }
+
+  /** Staged, unstaged, untracked, then conflicts — the counts summarizeStatuses already publishes. */
+  export function workingTreeSegments(
+    summary: Pick<StatusDashboard, "staged" | "unstaged" | "untracked" | "conflicted">,
+  ): WorkingTreeSegment[] {
+    const parts: { kind: WorkingTreeSegmentKind; count: number }[] = [
+      { kind: "staged", count: summary.staged },
+      { kind: "unstaged", count: summary.unstaged },
+      { kind: "untracked", count: summary.untracked },
+      { kind: "conflict", count: summary.conflicted },
+    ];
+    const total = parts.reduce((sum, part) => sum + part.count, 0);
+    if (total <= 0) return [];
+    return parts
+      .filter((part) => part.count > 0)
+      .map((part) => ({ ...part, percent: (part.count / total) * 100 }));
+  }
+
+  /** Same hues as statusBadgeClass, solid so a 6px track stays readable. */
+  export function workingTreeSegmentClass(kind: WorkingTreeSegmentKind): string {
+    switch (kind) {
+      case "staged":
+        return "bg-ok";
+      case "unstaged":
+        return "bg-warn";
+      case "untracked":
+        return "bg-info";
+      case "conflict":
+        return "bg-danger";
+    }
+  }
+
+  export function workingTreeSegmentLabel(kind: WorkingTreeSegmentKind, count: number): string {
+    const name = kind === "conflict" ? (count === 1 ? "conflict" : "conflicts") : kind;
+    return `${count} ${name}`;
+  }
+</script>
+
 <script lang="ts">
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { LAYERS } from "../ui/layers";
@@ -10,7 +59,7 @@
   import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { formatPathParts } from "../files/formatPath";
-  import { hasUnstagedChanges, statusForSide } from "../files/fileStatus";
+  import { hasUnstagedChanges, statusForSide, summarizeStatuses } from "../files/fileStatus";
   import {
     layoutStore,
     loadSections,
@@ -92,10 +141,17 @@
   /* --- Derived repo pulse --------------------------------------------------- */
 
   let statuses = $derived($repoStore.statuses);
-  let dirtyCount = $derived(statuses.length);
-  let totalAdditions = $derived(statuses.reduce((n, s) => n + (s.additions || 0), 0));
-  let totalDeletions = $derived(statuses.reduce((n, s) => n + (s.deletions || 0), 0));
-  let conflictedCount = $derived(statuses.filter((s) => s.is_conflicted).length);
+  let statusSummary = $derived(summarizeStatuses(statuses));
+  let dirtyCount = $derived(statusSummary.dirty);
+  let totalAdditions = $derived(statusSummary.additions);
+  let totalDeletions = $derived(statusSummary.deletions);
+  let conflictedCount = $derived(statusSummary.conflicted);
+  let changeSegments = $derived(workingTreeSegments(statusSummary));
+  let changeBarLabel = $derived(
+    changeSegments.length === 0
+      ? "No uncommitted changes"
+      : changeSegments.map((segment) => workingTreeSegmentLabel(segment.kind, segment.count)).join(", "),
+  );
 
   // The pulse strip speaks only for the checked-out branch; a remote ref or a
   // missing match must never surface someone else's counts.
@@ -283,79 +339,102 @@
           </div>
         </div>
 
-        {#if dirtyCount === 0}
-          <div class="flex items-center gap-1.5 text-textMuted/70" title="No uncommitted changes">
-            <CheckCircle2 size={12} class="text-ok/80 shrink-0" />
-            <span>Working tree clean</span>
-          </div>
-        {:else}
-          <div class="flex items-center justify-between gap-1.5 min-w-0 w-full">
-            <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-accent" title="Preview uncommitted files and modifications">
-              <span
-                class="font-mono text-meta shrink-0"
-                title="Total added / deleted lines across all changed files"
-              >
-                <span class="text-ok">+{totalAdditions}</span>
-                <span class="text-danger">−{totalDeletions}</span>
-              </span>
-              <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
-                {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
-              </span>
-              {#if conflictedCount > 0}
+        <div class="space-y-1">
+          {#if dirtyCount === 0}
+            <div class="flex items-center gap-1.5 text-textMuted/70" title="No uncommitted changes">
+              <CheckCircle2 size={12} class="text-ok/80 shrink-0" />
+              <span>Working tree clean</span>
+            </div>
+          {:else}
+            <div class="flex items-center justify-between gap-1.5 min-w-0 w-full">
+              <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-accent" title="Preview uncommitted files and modifications">
                 <span
-                  class="ml-auto flex items-center gap-1 shrink-0 text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
-                  title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
+                  class="font-mono text-meta shrink-0"
+                  title="Total added / deleted lines across all changed files"
                 >
-                  <AlertTriangle size={10} class="shrink-0" />
-                  {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
+                  <span class="text-ok">+{totalAdditions}</span>
+                  <span class="text-danger">−{totalDeletions}</span>
                 </span>
-              {/if}
-            </button>
-            <AgentCommitMenu compact={true} align="right" />
+                <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
+                  {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
+                </span>
+                {#if conflictedCount > 0}
+                  <span
+                    class="ml-auto flex items-center gap-1 shrink-0 text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
+                    title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
+                  >
+                    <AlertTriangle size={10} class="shrink-0" />
+                    {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
+                  </span>
+                {/if}
+              </button>
+              <AgentCommitMenu compact={true} align="right" />
+            </div>
+          {/if}
+          <div
+            class="flex h-1.5 w-full overflow-hidden rounded-full bg-textMuted/20"
+            data-working-tree-bar
+            role="img"
+            aria-label={changeBarLabel}
+            title={changeBarLabel}
+          >
+            {#each changeSegments as segment (segment.kind)}
+              <span
+                class="h-full {workingTreeSegmentClass(segment.kind)}"
+                style:flex="{segment.count} 0 0px"
+                data-segment={segment.kind}
+                data-count={segment.count}
+                title={workingTreeSegmentLabel(segment.kind, segment.count)}
+              ></span>
+            {/each}
           </div>
-        {/if}
+        </div>
 
         <!-- Quick actions -->
-        <div class="flex gap-1 pt-1.5 mt-2">
+        <div class="@container/actions flex w-full min-w-0 gap-1 overflow-x-hidden pt-1.5 mt-2">
           <button
             type="button"
-            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.fetch()}
             disabled={$repoStore.isLoading}
             title="Fetch from remote"
             aria-label="Fetch from remote"
           >
-            <DownloadCloud size={13} />
+            <DownloadCloud size={13} class="shrink-0" />
+            <span class="@max-[279px]/actions:hidden">Fetch</span>
           </button>
           <button
             type="button"
-            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.pull()}
             disabled={$repoStore.isLoading}
             title="Pull from upstream"
             aria-label="Pull from upstream"
           >
-            <ArrowDownToLine size={13} />
+            <ArrowDownToLine size={13} class="shrink-0" />
+            <span class="@max-[279px]/actions:hidden">Pull</span>
           </button>
           <button
             type="button"
-            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.push()}
             disabled={$repoStore.isLoading}
             title="Push to upstream"
             aria-label="Push to upstream"
           >
-            <ArrowUpFromLine size={13} />
+            <ArrowUpFromLine size={13} class="shrink-0" />
+            <span class="@max-[279px]/actions:hidden">Push</span>
           </button>
           <button
             type="button"
-            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.stashSave()}
             disabled={$repoStore.isLoading}
             title="Stash changes"
             aria-label="Stash changes"
           >
-            <Archive size={13} />
+            <Archive size={13} class="shrink-0" />
+            <span class="@max-[279px]/actions:hidden">Stash</span>
           </button>
         </div>
       </div>

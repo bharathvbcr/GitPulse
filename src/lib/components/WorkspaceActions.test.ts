@@ -19,6 +19,12 @@ describe("showsWorkspaceControls", () => {
     expect(showsWorkspaceControls(2)).toBe(true);
     expect(showsWorkspaceControls(24)).toBe(true);
   });
+
+  it("does not let the action cluster shrink off the right edge", () => {
+    // The tab strip shrinks. These controls are pinned after it, so a narrow
+    // window must scroll the tabs rather than crush Fetch and Work.
+    expect(source).toContain('class="flex shrink-0 items-center gap-1"');
+  });
 });
 
 describe("the work-in-progress roll-up panel", () => {

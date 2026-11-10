@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore, verdictDetail, verdictLabel } from "../stores/harnessStore";
   import {
     harnessPermissionMode,
@@ -64,11 +65,32 @@
   let refreshLabel = $derived($harnessStore.isProbing
     ? "Refreshing local models"
     : $harnessStore.error ? "Try local model discovery again" : "Refresh local models");
-  let automaticDetail = $derived(preferred ? "" : $harnessStore.isProbing
-    ? " · checking…"
-    : $harnessStore.error ? " · retry needed"
-    : modelReady && ai?.selected ? ` · ${ai.selected.model}`
-    : ai ? " · no models" : " · not checked");
+  /**
+   * Closed title-bar label. A failed model check reads "Failed"; the icon
+   * button beside it is the retry. The failure sentence stays on the tooltip.
+   */
+  let closedFace = $derived(
+    $harnessStore.isProbing
+      ? "Checking…"
+      : $harnessStore.error
+        ? "Failed"
+        : preferred
+          ? preferred.model
+          : modelReady && ai?.selected
+            ? `Automatic · ${ai.selected.model}`
+            : ai
+              ? "No models"
+              : "Not checked",
+  );
+  /** The Automatic choice. When it is selected, its label is the closed face. */
+  let automaticOption = $derived(preferred ? "Automatic" : closedFace);
+  let discoveryNote = $derived(
+    endpoints.some((endpoint) => endpoint.models.length > 0)
+      ? ""
+      : $harnessStore.isProbing
+        ? "Looking for local models…"
+        : "No local models available",
+  );
   let verdict = $derived($harnessStore.lastVerdict);
   let permissionMode = $derived(harnessPermissionMode(harness));
   /** Not probed yet is unknown, never a neutral that reads as "fine". */
@@ -87,7 +109,9 @@
   );
 
   let modelTitle = $derived(
-    `${modelStatus}${preferred ? `\n${preferred.model} at ${preferred.base_url}`
+    `${modelStatus}${
+      discoveryNote && !modelStatus.includes(discoveryNote) ? `\n${discoveryNote}` : ""
+    }${preferred ? `\n${preferred.model} at ${preferred.base_url}`
       : modelReady && ai?.selected ? `\n${ai.selected.base_url}` : ""}${
       modelReady ? `\n${ai?.model_info?.describe ?? "context window not probed"}` : ""
     }\nChoose a local model.`,
@@ -114,7 +138,8 @@
   }
 </script>
 
-<div class="flex items-center gap-1.5">
+{#if $interfaceStore.showHarnessBadges}
+<div class="flex items-center gap-1.5" data-testid="manvi-titlebar-status">
   <!-- The harness and the local model are separate facts with separate states,
        so each keeps its own tone. The harness chip's states stay distinct on
        purpose: connected, unavailable, "a rule fired on the last action" and
@@ -137,8 +162,12 @@
       <span class="font-medium">Manvi</span>
     </button>
 
-    <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
-    <div class="relative min-w-0 max-w-[180px] flex-1">
+    <!-- Native selection supplies keyboard navigation, typeahead and dismissal.
+         The select stays for the model list, but it is drawn invisibly over a
+         short face: its closed width follows the face, not the longest
+         option, and a long model name ellipsizes at 160px. The failure
+         sentence is the tooltip. -->
+    <div class="relative min-w-0 max-w-[160px] flex-1 focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-accent">
       <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 {modelTone}" aria-hidden="true">
         {#if modelAttention}
           <CircleAlert size={12} />
@@ -146,6 +175,7 @@
           <Sparkles size={12} />
         {/if}
       </span>
+      <span aria-hidden="true" data-manvi-face={closedFace} class="gp-select block truncate pl-7 pr-5">{closedFace}</span>
       <select
         aria-label="Local model"
         aria-describedby="{instanceId}-model-status"
@@ -153,22 +183,19 @@
         title={modelTitle}
         value={preferredKey}
         onchange={(event) => pickModel(event.currentTarget.value)}
-        class="gp-select w-full pl-7"
+        class="absolute inset-0 h-full w-full cursor-pointer opacity-0"
       >
-        <option value="">Automatic{automaticDetail}</option>
+        <option value="">{automaticOption}</option>
         {#if preferred && !preferredListed}
           <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
         {/if}
-        {#each endpoints as endpoint}
+        {#each endpoints as endpoint (endpoint.base_url)}
           <optgroup label={endpoint.base_url}>
-            {#each endpoint.models as model}
+            {#each endpoint.models as model (model)}
               <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
             {/each}
           </optgroup>
         {/each}
-        {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
-          <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
-        {/if}
       </select>
     </div>
     <button
@@ -198,3 +225,4 @@
     </button>
   {/if}
 </div>
+{/if}

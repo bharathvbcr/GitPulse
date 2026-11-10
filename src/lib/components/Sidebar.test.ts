@@ -3,7 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import Sidebar from "./Sidebar.svelte";
+import Sidebar, { workingTreeSegments } from "./Sidebar.svelte";
+import { summarizeStatuses, type StatusLike } from "../files/fileStatus";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "Sidebar.svelte"),
@@ -122,6 +123,56 @@ describe("Sidebar repo pulse strip", () => {
     expect(source).toContain("<CheckCircle2");
   });
 
+  it("lays a clean working tree out as a title row plus an empty change bar", () => {
+    const card = source.slice(
+      source.indexOf("At-a-glance repo pulse"),
+      source.indexOf("Main Scrollable Section"),
+    );
+    const title = card.indexOf(">Working tree clean<");
+    const bar = card.indexOf("data-working-tree-bar");
+    // The old status was one 16px line. The title has to sit above a track.
+    expect(title).toBeGreaterThan(-1);
+    expect(bar).toBeGreaterThan(title);
+    expect(card).toContain('class="flex h-1.5 w-full overflow-hidden rounded-full');
+    expect(card).toContain("{#each changeSegments as segment (segment.kind)}");
+    expect(card).toContain('style:flex="{segment.count} 0 0px"');
+    expect(card).toContain('$repoStore.currentBranch ?? "detached"');
+  });
+
+  it("sizes the change bar from staged, unstaged, untracked, and conflict counts", () => {
+    const row = (partial: Partial<StatusLike> & Pick<StatusLike, "path" | "status_code">): StatusLike => ({
+      is_staged: false,
+      is_conflicted: false,
+      additions: 0,
+      deletions: 0,
+      ...partial,
+    });
+    const summary = summarizeStatuses([
+      row({ path: "a.ts", status_code: "M ", is_staged: true }),
+      row({ path: "b.ts", status_code: "M ", is_staged: true }),
+      row({ path: "c.ts", status_code: " M" }),
+      row({ path: "d.ts", status_code: "??" }),
+      row({ path: "e.ts", status_code: "UU", is_conflicted: true }),
+    ]);
+    expect(summary).toMatchObject({ staged: 2, unstaged: 1, untracked: 1, conflicted: 1, dirty: 5 });
+    expect(workingTreeSegments(summary)).toEqual([
+      { kind: "staged", count: 2, percent: 40 },
+      { kind: "unstaged", count: 1, percent: 20 },
+      { kind: "untracked", count: 1, percent: 20 },
+      { kind: "conflict", count: 1, percent: 20 },
+    ]);
+    // A file staged and unstaged at once counts in both segments, once as a dirty file.
+    const mixed = summarizeStatuses([
+      row({ path: "mixed.ts", status_code: "MM", is_staged: true, additions: 3, deletions: 2 }),
+    ]);
+    expect(mixed.dirty).toBe(1);
+    expect(workingTreeSegments(mixed)).toEqual([
+      { kind: "staged", count: 1, percent: 50 },
+      { kind: "unstaged", count: 1, percent: 50 },
+    ]);
+    expect(workingTreeSegments({ staged: 0, unstaged: 0, untracked: 0, conflicted: 0 })).toEqual([]);
+  });
+
   it("stays hidden when no repository is open", () => {
     expect(source).toContain('{#if $repoStore.currentPath}');
   });
@@ -138,6 +189,30 @@ describe("Sidebar quick actions", () => {
     expect(source).toContain('aria-label="Pull from upstream"');
     expect(source).toContain('aria-label="Push to upstream"');
     expect(source).toContain('aria-label="Stash changes"');
+  });
+
+  it("shows fetch, pull, push, and stash as pills that become icons before they overflow", () => {
+    const start = source.indexOf("<!-- Quick actions -->");
+    const row = source.slice(start, source.indexOf("</div>", start));
+    expect(row).toContain("gp-btn");
+    expect(row).toContain("flex-1");
+    expect(row).toContain("min-w-0");
+    expect(row).toContain("@container/actions");
+    expect(row).not.toContain("gp-icon-btn");
+    // Visible words. Stash is the short label; the tooltip stays the full one.
+    expect(row).toContain(">Fetch</span>");
+    expect(row).toContain(">Pull</span>");
+    expect(row).toContain(">Push</span>");
+    expect(row).toContain(">Stash</span>");
+    expect(row).not.toContain(">Stash changes</span>");
+    expect(row).toContain('title="Stash changes"');
+    expect(row).toContain('aria-label="Fetch from remote"');
+    expect(row).toContain('aria-label="Pull from upstream"');
+    expect(row).toContain('aria-label="Push to upstream"');
+    expect(row).toContain('aria-label="Stash changes"');
+    // The row's own width, not the collapsed rail, hides the words together.
+    expect(row).toContain("@max-[279px]/actions:hidden");
+    expect(row.match(/@max-\[279px\]\/actions:hidden/g)?.length).toBe(4);
   });
 });
 

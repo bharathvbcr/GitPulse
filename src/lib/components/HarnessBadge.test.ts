@@ -7,6 +7,7 @@ import { get, writable } from "svelte/store";
 import HarnessBadge from "./HarnessBadge.svelte";
 import { MANVI_FOCUS_IDS } from "../ui/manviFocus";
 import { harnessStore, type AiStatus, type HarnessState } from "../stores/harnessStore";
+import { interfaceStore } from "../stores/interfaceStore";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "HarnessBadge.svelte"),
@@ -18,7 +19,10 @@ const chipTargets = [...source.matchAll(/openManvi\("([a-z]+)"\)/g)].map(
   (match) => match[1],
 );
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  interfaceStore.reset();
+});
 
 function renderState(overrides: Partial<HarnessState>) {
   const state = writable({ ...get(harnessStore), ...overrides });
@@ -83,11 +87,14 @@ describe("HarnessBadge reachability", () => {
 
 describe("HarnessBadge rendering", () => {
   it("offers model selection directly in the header without an open repository", () => {
-    const { body } = render(HarnessBadge);
+    const body = renderState({ ai: null, preferred: null, error: null, isProbing: false });
     const picker = body.match(/<select\b[^>]*>[\s\S]*?<\/select>/)?.[0];
     expect(picker).toBeDefined();
     expect(picker).toContain('aria-label="Local model"');
-    expect(picker).toContain("Automatic");
+    // Idle, before a probe: the closed face is the short "not checked" status,
+    // not a sentence. The empty-value option is still the Automatic choice.
+    expect(picker).toContain("Not checked");
+    expect(picker).toContain('value=""');
     expect(picker).not.toMatch(/<select[^>]*\sdisabled/);
   });
 
@@ -149,8 +156,10 @@ describe("HarnessBadge model options", () => {
 
   it("makes an empty discovery result visible in the selected Automatic option", () => {
     const body = renderState({ ai: { ...ready, endpoints: [], ready: false, selected: null } });
-    expect(body).toMatch(/<option value="" selected="">Automatic · no models<\/option>/);
+    expect(body).toMatch(/<option value="" selected="">No models<\/option>/);
+    expect(body).toMatch(/data-manvi-face="No models"/);
     expect(body).toContain("Start a local model server, then refresh.");
+    expect(body).toContain("No local models available");
   });
 
   it("groups models by server and distinguishes identical model names", () => {
@@ -180,6 +189,64 @@ describe("HarnessBadge model options", () => {
     expect(body).toMatch(/<option[^>]*selected[^>]*>missing \(unavailable\)<\/option>/);
     expect(body).toContain("No local models available");
     expect(body).toContain('<option value="">Automatic</option>');
+  });
+
+  it("keeps the title-bar face short and the failure on the tooltip", () => {
+    const error = "Cannot read properties of undefined (reading 'invoke')";
+    const body = renderState({ error, isProbing: false });
+    expect(body).toMatch(/data-manvi-face="Failed"/);
+    expect(body).not.toMatch(
+      /data-manvi-face="[^"]*(Retry|Cannot read properties|No local models available|retry needed|Automatic · retry)/,
+    );
+    const option = body.match(/<option value=""[^>]*>[^<]*<\/option>/)?.[0] ?? "";
+    expect(option).toContain(">Failed<");
+    expect(option).not.toContain("Retry");
+    expect(option).not.toContain("Cannot read properties");
+    expect(option).not.toContain("No local models available");
+    expect(body).toContain('aria-label="Try local model discovery again"');
+    expect(body).not.toMatch(/<option[^>]*>[^<]*No local models available/);
+    expect(body).not.toMatch(/<option[^>]*>[^<]*Looking for local models/);
+    // The longer reason is still in the tooltip and the live status.
+    expect(body).toContain(`Couldn't check local models. ${error} Refresh to try again.`);
+    expect(body).toContain("No local models available");
+    expect(body).toContain("Choose a local model.");
+  });
+
+  it("shortens the other closed faces without inventing a status", () => {
+    expect(renderState({ isProbing: true })).toMatch(/data-manvi-face="Checking…"/);
+    vi.restoreAllMocks();
+    expect(renderState({ ai: null, error: null, isProbing: false, preferred: null })).toMatch(
+      /data-manvi-face="Not checked"/,
+    );
+    vi.restoreAllMocks();
+    const model = "very-long-local-model-name-that-would-crowd-the-title-bar";
+    const crowded = renderState({
+      ai: { ...ready, selected: { base_url: ready.endpoints[0].base_url, model } },
+      preferred: null,
+    });
+    expect(crowded).toMatch(new RegExp(`data-manvi-face="Automatic · ${model}"`));
+    expect(crowded).toContain("max-w-[160px]");
+    expect(crowded).toContain("truncate");
+  });
+
+  it("renders no title-bar badge when the setting is off", () => {
+    const app = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../App.svelte"),
+      "utf8",
+    );
+    expect(app).toMatch(/\{#if \$interfaceStore\.showHarnessBadges\}\s*<HarnessBadge \/>/);
+    const ungated = app.replace(
+      /\{#if \$interfaceStore\.showHarnessBadges\}[\s\S]*?\{\/if\}/,
+      "",
+    );
+    expect(ungated).not.toMatch(/<HarnessBadge(?:\s|\/>)/);
+
+    interfaceStore.setShowHarnessBadges(false);
+    const body = render(HarnessBadge).body;
+    expect(body).not.toContain("MANVI");
+    expect(body).not.toContain("data-manvi-face");
+    expect(body).not.toContain('aria-label="Local model"');
+    expect(body).not.toContain('data-testid="manvi-titlebar-status"');
   });
 
   it("distinguishes discovery in progress from an empty or failed result", () => {

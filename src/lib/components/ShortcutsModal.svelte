@@ -5,7 +5,8 @@
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "@lucide/svelte";
+  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff, SquareTerminal } from "@lucide/svelte";
+  import { terminalGuideShortcuts } from "../terminal/shortcutGuide";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { isDialogEscape } from "../keyboard/dialogEscape";
   import { isModalOccupied } from "../keyboard/modalOccupied";
@@ -108,8 +109,8 @@
   // Control off macOS; only this printed reference was wrong. Mapping happens
   // before filtering so that searching "ctrl" on Windows finds the rows whose
   // keys are authored as macOS glyphs.
-  let platformCategories = $derived(
-    SHORTCUT_CATEGORIES.map((cat) => ({
+  let platformCategories = $derived([
+    ...SHORTCUT_CATEGORIES.map((cat) => ({
       ...cat,
       shortcuts: cat.shortcuts.map((item) => ({
         ...item,
@@ -119,7 +120,14 @@
         description: shortcutTextLabel(item.description, $hostPlatform.os),
       })),
     })),
-  );
+    // Already written for this host. A ⌘ on Find would become Ctrl off macOS,
+    // and the terminal's find chord there is Ctrl+Shift, not Ctrl.
+    {
+      title: "Terminal",
+      icon: SquareTerminal,
+      shortcuts: terminalGuideShortcuts($hostPlatform.os),
+    },
+  ]);
 
   let filteredCategories = $derived.by(() => {
     const q = filterQuery.trim().toLowerCase();
