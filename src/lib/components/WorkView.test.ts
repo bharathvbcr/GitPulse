@@ -6,6 +6,7 @@ import { render } from "svelte/server";
 import WorkView from "./WorkView.svelte";
 import { stripMarkupComments } from "../dom/markupText";
 import { ALL_STATUSES } from "../work/projection";
+import { functionBody } from "../stores/sourceScan";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "WorkView.svelte"),
@@ -158,12 +159,23 @@ describe("WorkView", () => {
 
   it("opens the stuck worktree, not the first one on the row", () => {
     expect(source).toContain("openPathFor(row)");
-    // A parked operation goes to Policy, which leads with the conflict editor
-    // while one is parked — a section of Work, so it switches section without
-    // leaving the view the row was clicked in.
-    // Anything else lands on the working-tree diff, a section of History.
-    expect(source).toContain('repoStore.setActiveTab("work", "policy")');
+    // A parked operation goes to Overview, which leads with the conflict editor
+    // while one is parked — the same section, so it never leaves the view the
+    // row was clicked in. Anything else lands on the working-tree diff, a
+    // section of History.
+    expect(source).toContain("showConflicts();\n          else reviewChanges();");
     expect(source).toContain('repoStore.setActiveTab("history", "graph")');
+  });
+
+  it("sends every Resolve control to Overview, and scrolls the editor into view when already there", () => {
+    // Policy retired; a button that switched to a section that no longer
+    // exists would do nothing, and one that only switched would do nothing
+    // from Overview itself, where the reader may be scrolled among the rows.
+    expect(source).not.toContain('"policy"');
+    const body = functionBody(source, "showConflicts");
+    expect(body).toContain('repoStore.setActiveTab("work", "overview")');
+    expect(body).toContain("document.getElementById(WORK_CONFLICTS_ID)?.scrollIntoView({ block: \"start\" })");
+    expect(source.match(/onclick=\{showConflicts\}/g)).toHaveLength(3);
   });
 
   it("refreshes when repository status generation changes", () => {
@@ -197,5 +209,77 @@ describe("WorkView", () => {
   it("marks the current worktree and shows each worktree's path", () => {
     expect(source).toContain("Current worktree");
     expect(source).toContain("{row.worktrees[0].worktree.path}");
+  });
+
+  it("keeps the disclosures in order, collapsed, and nothing new above the rows", () => {
+    const order = [
+      "Remotes, submodules and stash",
+      "Branch chains and stacked diffs",
+      "<BranchTagCleanup bind:open={showCleanup} />",
+      "<PolicyActivity bind:open={showActivity} />",
+    ].map((marker) => source.indexOf(marker));
+    expect(order.every((index) => index > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // All four sit after the rows.
+    expect(order[0]).toBeGreaterThan(source.indexOf("{#each renderedRows as row"));
+    // None starts open: only the reader or a deep link expands one.
+    for (const name of ["showRepoDetail", "showStackDetail", "showCleanup", "showActivity"]) {
+      expect(source).toContain(`let ${name} = $state(false);`);
+    }
+  });
+
+  it("draws no cleanup disclosure with no repository open", () => {
+    const { body } = render(WorkView);
+    // No repository: the disclosures are about a repository, so none is drawn.
+    expect(body).not.toContain("Branch and tag cleanup");
+  });
+});
+
+describe("WorkView deep links", () => {
+  it("takes only the requests whose card lives on a view, on mount and on every change", () => {
+    expect(source).toContain('takeManviFocusFor("view")');
+    expect(source).toContain("$manviFocusRequest");
+    expect(source).not.toContain("takeManviFocus()");
+  });
+
+  it("expands the disclosure before looking for the anchor", () => {
+    const reveal = source.slice(source.indexOf("async function revealFocus"));
+    expect(reveal.indexOf("showCleanup = true")).toBeLessThan(
+      reveal.indexOf("document.getElementById(manviSectionId(id))"),
+    );
+    expect(reveal.indexOf("showActivity = true")).toBeLessThan(
+      reveal.indexOf("document.getElementById(manviSectionId(id))"),
+    );
+    expect(reveal).toContain("await tick();");
+  });
+
+  it("lands instantly and moves focus with the scroll", () => {
+    // Smooth scrolling never advances in a webview that is not compositing,
+    // which turns the whole deep link into a no-op; every other
+    // scroll-into-view in the app is instant too.
+    expect(source).not.toContain('behavior: "smooth"');
+    expect(source).toContain('section.scrollIntoView({ block: "start" });');
+    expect(source).toContain("section.focus({ preventScroll: true });");
+  });
+
+  it("re-aligns over the page's settle, and yields to a scroll gesture", () => {
+    // Cards above the target grow as their data arrives; without the second
+    // pass the reader lands just under the heading they asked for.
+    expect(source).toContain("const REALIGN_DELAYS_MS = [0, 250];");
+    expect(source).toContain("window.addEventListener(event, clearRealign, { once: true, passive: true });");
+  });
+
+  it("flashes the landing cue for 1.6 s, then drops it with its timers and listeners on teardown", () => {
+    expect(source).toContain('section.classList.add("gp-focus-flash");');
+    expect(source).toContain("window.setTimeout(() => clearFlash(), 1600)");
+    expect(source).toContain('flashed?.classList.remove("gp-focus-flash");');
+    const teardown = source.slice(source.indexOf("return () => {\n      clearFlash();"));
+    expect(teardown).toContain("clearRealign();");
+    expect(teardown).toContain("window.removeEventListener(event, clearRealign);");
+  });
+
+  it("offers the policy journal unless Manvi is known to be absent", () => {
+    expect(source).toContain("policyActivityVisible(");
+    expect(source).toContain("{#if showPolicyActivity}");
   });
 });

@@ -6,9 +6,8 @@
 
   /** Named once: the tab and its panel must agree on the id. */
   const view = "work" as const;
-  import WorkView from "./WorkView.svelte";
+  import WorkOverviewPane from "./WorkOverviewPane.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
-  import PolicyPane from "./PolicyPane.svelte";
   const loadTasks = () => import("./RepositoryTasks.svelte");
 
   /**
@@ -18,7 +17,9 @@
    * the app's strictest honesty contracts (an unreadable verdict is never
    * counted as allowed; a source that could not be read is named rather than
    * rendered as empty), and those must not move in the same change that moves
-   * the layout. This component only decides which pane is on screen.
+   * the layout. `WorkOverviewPane` wraps it with the conflict editor, which
+   * leads only while a merge needs a person. This component only decides which
+   * pane is on screen.
    *
    * What the merge actually removes is duplication: the GitHub and MANVI
    * views each issued `cmd_github_context` — four `gh` round trips, up to 45s
@@ -30,12 +31,10 @@
     loadConflict,
     loadGitHub,
     loadStack,
-    loadManvi,
   }: {
     loadConflict: ViewLoader;
     loadGitHub: ViewLoader;
     loadStack: ViewLoader;
-    loadManvi: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("work", $repoStore.viewSections));
@@ -52,7 +51,7 @@
     <ViewContextBar label="Conflicts">
       <button
         type="button"
-        onclick={() => repoStore.setViewSection("work", "policy")}
+        onclick={() => repoStore.setViewSection("work", "overview")}
         class="ml-auto shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors"
         title="{conflictedCount} file{conflictedCount === 1 ? '' : 's'} still carry conflict markers"
       >
@@ -68,10 +67,8 @@
       <LazyView load={loadGitHub} name="GitHub" />
     {:else if section === "stack"}
       <LazyView load={loadStack} name="the code stack" />
-    {:else if section === "policy"}
-      <PolicyPane {loadConflict} {loadManvi} />
     {:else}
-      <WorkView />
+      <WorkOverviewPane {loadConflict} />
     {/if}
   </ViewSectionPanel>
 </div>

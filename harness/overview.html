@@ -181,8 +181,17 @@
           check("browse navigates to explorer", get(repoStore).activeTab === "code" && get(repoStore).viewSections.code === "explorer");
           await click("View history");
           check("history navigates to graph", get(repoStore).activeTab === "history" && get(repoStore).viewSections.history === "graph");
+          const disclosure = name => [...target.querySelectorAll("button[aria-expanded]")].find(b => b.textContent.trim().startsWith(name));
+          check("cleanup disclosure is present and collapsed before any scan, with no count", disclosure("Branch and tag cleanup")?.getAttribute("aria-expanded") === "false" && !disclosure("Branch and tag cleanup").querySelector(".gp-chip"));
+          check("policy activity disclosure is present and collapsed", disclosure("Policy activity")?.getAttribute("aria-expanded") === "false");
+          const { requestManviFocus } = await import("../src/lib/ui/manviFocus.ts");
+          requestManviFocus("cleanup"); await settle();
+          check("a cleanup deep link expands the disclosure, focuses its card and marks it", disclosure("Branch and tag cleanup").getAttribute("aria-expanded") === "true" && document.activeElement?.id === "manvi-section-cleanup" && document.activeElement.classList.contains("gp-focus-flash"));
+          await new Promise(r => setTimeout(r, 1800));
+          check("the landing cue clears itself", !document.querySelector(".gp-focus-flash"));
+          await click("Branch and tag cleanup");
           await click("Rebase in progress");
-          check("parked operation opens the correct worktree in Policy", get(repoStore).currentPath.includes("review-flow") && get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "policy");
+          check("parked operation opens the correct worktree in Overview", get(repoStore).currentPath.includes("review-flow") && get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "overview");
           await repoStore.openRepo(root); await settle();
           repoStore.setActiveTab("code", "explorer");
           const resolve = fixtures.cmd_resolve_repo;

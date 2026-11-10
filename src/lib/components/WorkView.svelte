@@ -18,7 +18,7 @@
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { openExternal } from "../desktop/openExternal";
   import {
@@ -69,7 +69,16 @@
     type WorkFacet,
   } from "../work/focus";
   import { timestampFormat } from "../ui/timestampFormat";
-  import type { PolicyStatus } from "../stores/harnessStore";
+  import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
+  import BranchTagCleanup from "./BranchTagCleanup.svelte";
+  import PolicyActivity, { policyActivityVisible } from "./PolicyActivity.svelte";
+  import { WORK_CONFLICTS_ID } from "../ui/workConflicts";
+  import {
+    manviFocusRequest,
+    manviSectionId,
+    takeManviFocusFor,
+    type ManviFocusId,
+  } from "../ui/manviFocus";
 
   let projection = $state<WorkProjection | null>(null);
   let collisions = $state<CollisionRisk | null>(null);
@@ -167,6 +176,23 @@
 
   const hasTasks = $derived(projection?.sources.tasks.present === true);
 
+  /**
+   * Brings the conflict editor on screen.
+   *
+   * The editor leads this same section (`WorkOverviewPane`) while a merge needs
+   * a person, so "Resolve" is two steps: make sure Overview is the section
+   * showing, then scroll the editor to the top of the pane. From another
+   * section the switch mounts the pane, which starts at the editor; from
+   * Overview itself the reader may be scrolled down among the rows, and doing
+   * nothing would read as a dead button.
+   */
+  function showConflicts(): void {
+    repoStore.setActiveTab("work", "overview");
+    void tick().then(() => {
+      document.getElementById(WORK_CONFLICTS_ID)?.scrollIntoView({ block: "start" });
+    });
+  }
+
   function reviewChanges(): void {
     void repoStore.previewUncommitted();
   }
@@ -176,7 +202,7 @@
    *
    * This is what makes the screen a workspace rather than a report: the whole
    * point of showing that a worktree is stuck mid-rebase is being one click
-   * from the conflict editor in Policy that unsticks it. Rows with several worktrees open
+   * from the conflict editor that unsticks it. Rows with several worktrees open
    * the first — the one the row is keyed on in worktree mode.
    */
   async function openWorktree(row: WorkRow): Promise<void> {
@@ -190,7 +216,7 @@
     try {
       const opened = await repoStore.openRepo(path, {
         onReady: () => {
-          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) repoStore.setActiveTab("work", "policy");
+          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) showConflicts();
           else reviewChanges();
         },
       });
@@ -299,6 +325,104 @@
    */
   let showRepoDetail = $state(false);
   let showStackDetail = $state(false);
+  // Opened by the reader or by a deep link, never on their own: these cards
+  // answer questions about the repository rather than work in flight, so they
+  // must not push the rows down.
+  let showCleanup = $state(false);
+  let showActivity = $state(false);
+
+  const showPolicyActivity = $derived(
+    policyActivityVisible($harnessStore.harness, $harnessStore.actions.length, $harnessStore.error),
+  );
+
+  /* --- deep links ---------------------------------------------------------- */
+
+  /**
+   * A deep link from elsewhere in the app (the header chips, the storage
+   * panel) names a card, not just this view. Expanding the disclosure is only
+   * half the answer: the card still has to be brought on screen and marked, or
+   * the reader lands mid-page with no idea which card answered their click.
+   */
+  let flashTimer: number | null = null;
+  let flashed: HTMLElement | null = null;
+  let realignTimers: number[] = [];
+
+  function clearFlash() {
+    if (flashTimer !== null) {
+      window.clearTimeout(flashTimer);
+      flashTimer = null;
+    }
+    // The marked section belongs to a child component, so the class is
+    // applied to the node rather than bound in one component's markup.
+    flashed?.classList.remove("gp-focus-flash");
+    flashed = null;
+  }
+
+  function clearRealign() {
+    for (const timer of realignTimers) window.clearTimeout(timer);
+    realignTimers = [];
+  }
+
+  /**
+   * Cards above the target keep settling for a moment after the view mounts —
+   * the rows resolve, a grant list arrives — and every height change slides
+   * the section the reader was sent to, typically far enough to push its
+   * heading off the top. Two bounded re-alignments cover the settle; a scroll
+   * gesture cancels them, because yanking a reader back is worse than drift.
+   */
+  const REALIGN_DELAYS_MS = [0, 250];
+
+  function keepAligned(section: HTMLElement) {
+    clearRealign();
+    for (const delay of REALIGN_DELAYS_MS) {
+      realignTimers.push(
+        window.setTimeout(() => section.scrollIntoView({ block: "start" }), delay),
+      );
+    }
+    for (const event of ["wheel", "touchstart", "keydown"] as const) {
+      window.addEventListener(event, clearRealign, { once: true, passive: true });
+    }
+  }
+
+  async function revealFocus(id: ManviFocusId) {
+    // The disclosure that holds the card is opened here, before looking for it.
+    if (id === "cleanup") showCleanup = true;
+    else if (id === "activity") showActivity = true;
+    await tick();
+    const section = document.getElementById(manviSectionId(id));
+    if (!section) return;
+    // Instant, like every other scroll-into-view in the app: a deep link should
+    // land deterministically, and a smooth 2000px glide is both a lot of motion
+    // and, in a webview that is not compositing, no scroll at all.
+    section.scrollIntoView({ block: "start" });
+    keepAligned(section);
+    // Sections carry tabindex="-1": keyboard and screen-reader users land on
+    // the same card the scroll brought into view, not back at the page top.
+    section.focus({ preventScroll: true });
+    clearFlash();
+    section.classList.add("gp-focus-flash");
+    flashed = section;
+    flashTimer = window.setTimeout(() => clearFlash(), 1600);
+  }
+
+  // Runs on mount (the view mounts lazily, after the click) and again whenever
+  // a request arrives while the view is already open. Only requests whose card
+  // lives here are taken; Settings' are left for Settings.
+  $effect(() => {
+    if (!$manviFocusRequest) return;
+    const requested = takeManviFocusFor("view");
+    if (requested) void revealFocus(requested);
+  });
+
+  $effect(() => {
+    return () => {
+      clearFlash();
+      clearRealign();
+      for (const event of ["wheel", "touchstart", "keydown"] as const) {
+        window.removeEventListener(event, clearRealign);
+      }
+    };
+  });
 </script>
 
 <!-- A scroller that is a column: every band below is `w-full`, so the content
@@ -352,7 +476,7 @@
         </div>
         <div class="flex flex-wrap items-center gap-2">
           {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
-            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "policy")}>
+            <button type="button" class="gp-btn-primary" onclick={showConflicts}>
               <GitMerge size={13} /> Resolve conflicts
             </button>
           {:else if here && here.staged + here.unstaged > 0}
@@ -421,8 +545,8 @@
             <button
               type="button"
               class="text-rose-600 dark:text-rose-400 hover:underline"
-              onclick={() => repoStore.setActiveTab("work", "policy")}
-              title="Open the conflicts in Policy"
+              onclick={showConflicts}
+              title="Open the conflict editor"
             >
               {here.conflicted} conflicted
             </button>
@@ -448,8 +572,8 @@
         <button
           type="button"
           class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
-          onclick={() => repoStore.setActiveTab("work", "policy")}
-          title="Open Policy to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
+          onclick={showConflicts}
+          title="Open the conflict editor to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
           <GitMerge size={12} class="mt-px shrink-0" />
           <span class="min-w-0">{headline($repoStore.operation.operation)}</span>
@@ -1024,6 +1148,11 @@
         </div>
       {/if}
     </div>
+
+    <BranchTagCleanup bind:open={showCleanup} />
+    {#if showPolicyActivity}
+      <PolicyActivity bind:open={showActivity} />
+    {/if}
   {/if}
 </div>
 

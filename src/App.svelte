@@ -98,7 +98,6 @@
   const loadTerminalPanel = () => import("./lib/components/TerminalPanel.svelte");
   const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
   const loadGitHubPanel = () => import("./lib/components/GitHubPanel.svelte");
-  const loadManviOpsPanel = () => import("./lib/components/ManviOpsPanel.svelte");
   const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
   const loadRegressionSuspectsPanel = () =>
     import("./lib/components/RegressionSuspectsPanel.svelte");
@@ -1222,7 +1221,6 @@
                   loadConflict={loadConflictEditor}
                   loadGitHub={loadGitHubPanel}
                   loadStack={loadCodeStackViewer}
-                  loadManvi={loadManviOpsPanel}
                 />
               {:else if $repoStore.activeTab === "code"}
                 <LazyView
