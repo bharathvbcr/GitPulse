@@ -41,10 +41,10 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::fixture::{build_chain, git_process_profile, trust_repo};
+use common::fixture::{build_chain, git, git_process_profile, trust_repo};
 use common::{percentile, Report, Row};
 use gitpulse_lib::procguard::LockedSpawn;
 
@@ -60,7 +60,10 @@ const SIZES: [(&str, usize, usize); 2] = [("6k/5k", 6_000, 5_000), ("100k/30k", 
 enum Arm {
     Old,
     NewHit,
+    /// A well-formed token that names nothing real (another view and stamp).
     NewStale,
+    /// The genuine token the same repository issued before one ref moved.
+    NewMoved,
 }
 
 struct Obs {
@@ -93,7 +96,8 @@ fn call(
     strict: bool,
 ) -> (Option<String>, usize) {
     let stale = format!(
-        "0000000000000000-{}",
+        "{:0>48}-{}",
+        0,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -107,6 +111,11 @@ fn call(
                 .to_string(),
         ),
         Arm::NewStale => Some(stale),
+        Arm::NewMoved => Some(
+            token
+                .expect("a moved-ref arm needs the token from before the move")
+                .to_string(),
+        ),
     };
     let payload = tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_get_commit_graph(
         path.to_string(),
@@ -127,7 +136,7 @@ fn call(
             assert!(payload.unchanged, "the token should have named the state");
             assert!(payload.rows.is_empty());
         }
-        Arm::Old | Arm::NewStale => {
+        Arm::Old | Arm::NewStale | Arm::NewMoved => {
             assert!(!payload.unchanged);
             assert_eq!(
                 payload.rows.len(),
@@ -224,6 +233,7 @@ impl Pair {
             Arm::Old => "old",
             Arm::NewHit => "new-hit",
             Arm::NewStale => "new-stale",
+            Arm::NewMoved => "new-moved",
         }
     }
 }
@@ -247,10 +257,89 @@ fn arm_stats(label: &str, obs: &[Obs]) -> String {
     )
 }
 
+/// The four probes the command runs beside the walk (HEAD, ref decorations,
+/// default branch, hidden-ref census), joined, on a path nothing has read.
+fn run_probes(path: &str) {
+    std::thread::scope(|scope| {
+        let head = scope.spawn(|| gitpulse_lib::engine::git_reader::GitReader::head_id(path));
+        let refs = scope.spawn(|| {
+            gitpulse_lib::graph::list_ref_decorations(path, gitpulse_lib::graph::RefScope::Named)
+        });
+        let default =
+            scope.spawn(|| gitpulse_lib::engine::git_reader::GitReader::default_branch_name(path));
+        let hidden = scope.spawn(|| gitpulse_lib::graph::probe_hidden_history(path));
+        head.join().expect("head").expect("head ok");
+        refs.join().expect("refs").expect("refs ok");
+        default.join().expect("default").expect("default ok");
+        hidden.join().expect("hidden").expect("hidden ok");
+    });
+}
+
+/// The history walk alone for a window, on a path nothing has read.
+fn run_walk(path: &str, window: usize) {
+    let rows = gitpulse_lib::engine::git_reader::GitReader::read_commit_history_paged(
+        path,
+        0,
+        window + 1,
+        None,
+        None,
+        gitpulse_lib::graph::RefScope::Named,
+    )
+    .expect("walk");
+    assert_eq!(rows.len(), window + 1);
+}
+
+/// Where a cold reload's time goes: the probes alone and the walk alone, each
+/// on its own fresh clone, in alternating order. The old path overlaps them
+/// (about the larger of the two plus the assembly); the probes-first path puts
+/// them in series (about their sum), so the difference between the two arms is
+/// about the smaller one.
+fn stage_breakdown(source: &Path, scratch: &Path, window: usize, rounds: usize, label: &str) {
+    let mut probes = Vec::new();
+    let mut walks = Vec::new();
+    for round in 0..rounds {
+        let pa = scratch.join(format!("bp{round}"));
+        let wa = scratch.join(format!("bw{round}"));
+        let (probe_path, walk_path) = (clone_repo(source, &pa), clone_repo(source, &wa));
+        let time = |f: &dyn Fn()| {
+            let started = Instant::now();
+            f();
+            ms(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        };
+        let (p, w);
+        if round.is_multiple_of(2) {
+            p = time(&|| run_probes(&probe_path));
+            w = time(&|| run_walk(&walk_path, window));
+        } else {
+            w = time(&|| run_walk(&walk_path, window));
+            p = time(&|| run_probes(&probe_path));
+        }
+        if round >= DISCARD {
+            probes.push(p);
+            walks.push(w);
+        }
+        let _ = std::fs::remove_dir_all(&pa);
+        let _ = std::fs::remove_dir_all(&wa);
+    }
+    println!(
+        "\n-- stage breakdown {label}, cold, n={}: probes alone median {:.2} ms (min {:.2}, max {:.2}); walk alone median {:.2} ms (min {:.2}, max {:.2})",
+        probes.len(),
+        median(&probes),
+        probes.iter().cloned().fold(f64::INFINITY, f64::min),
+        probes.iter().cloned().fold(0.0, f64::max),
+        median(&walks),
+        walks.iter().cloned().fold(f64::INFINITY, f64::min),
+        walks.iter().cloned().fold(0.0, f64::max),
+    );
+}
+
 fn main() {
     gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("graph_hit_path");
     let smoke = report.opts.smoke;
+    // `--breakdown-only` skips the paired arms and prints only where a cold
+    // reload's time goes.
+    let breakdown_only = std::env::args().any(|arg| arg == "--breakdown-only");
     let rounds = if smoke { DISCARD + 3 } else { ROUNDS };
     let temp = tempfile::tempdir().expect("temp dir");
     report.note(format!(
@@ -267,6 +356,10 @@ fn main() {
         // window for a token to be issued at all.
         std::thread::sleep(Duration::from_secs(4));
         let warm_path = source_path.clone();
+        if breakdown_only {
+            stage_breakdown(&source, temp.path(), window, rounds, label);
+            continue;
+        }
 
         // Work counters, in their own untimed pass (trace2 adds time).
         let spawns = |arm: Arm, cold: bool| -> u64 {
@@ -304,6 +397,8 @@ fn main() {
         let mut cold_null = Pair::new("cold-null", Arm::Old, Arm::Old);
         let mut warm = Pair::new("warm", Arm::Old, Arm::NewHit);
         let mut warm_null = Pair::new("warm-null", Arm::Old, Arm::Old);
+        let mut moved = Pair::new("moved", Arm::Old, Arm::NewMoved);
+        let mut moved_null = Pair::new("moved-null", Arm::Old, Arm::Old);
 
         for round in 0..rounds {
             // Cold pairs: both arms on repository paths no one has read.
@@ -333,13 +428,40 @@ fn main() {
                     || timed(&path, window, second, token.as_deref()),
                 );
             }
+            // One ref moved by one commit after the client's last read, and
+            // the stamp settled: the reload after an ordinary commit. Each arm
+            // has its own clone, read once (warm, and the token the client
+            // would hold) and then moved; one 4 s wait settles all of them.
+            let mut prepared: Vec<(PathBuf, String, Option<String>)> = Vec::new();
+            for tag in ["m1a", "m1b", "m2a", "m2b"] {
+                let dir = temp.path().join(format!("{tag}-{round}"));
+                let path = clone_repo(&source, &dir);
+                let token = call(&path, window, Arm::Old, None, true).0;
+                git(&dir, &["commit", "--allow-empty", "-q", "-m", "one more"]);
+                prepared.push((dir, path, token));
+            }
+            std::thread::sleep(Duration::from_secs(4));
+            for (pair, at) in [(&mut moved, 0), (&mut moved_null, 2)] {
+                let (first, second) = (pair.first, pair.second);
+                let (_, pa, ta) = &prepared[at];
+                let (_, pb, tb) = &prepared[at + 1];
+                pair.round(
+                    round,
+                    || timed(pa, window, first, ta.as_deref()),
+                    || timed(pb, window, second, tb.as_deref()),
+                );
+            }
+            for (dir, _, _) in prepared {
+                let _ = std::fs::remove_dir_all(dir);
+            }
         }
 
         println!("\n=== {label}: {commits} commits, {BRANCHES} branches, window {window}");
         for (name, n) in counters {
             println!("git processes, one untimed sample, {name}: {n}");
         }
-        for pair in [&cold_null, &cold, &warm_null, &warm] {
+        stage_breakdown(&source, temp.path(), window, rounds, label);
+        for pair in [&cold_null, &cold, &moved_null, &moved, &warm_null, &warm] {
             println!(
                 "\n-- pair {} ({} vs {})",
                 pair.name,
