@@ -260,6 +260,22 @@ class Waiters extends Set<Interest> {
   }
 }
 
+/**
+ * Whether a caller may attach to the call `interests` belongs to. A call that
+ * has been told to stop will answer with the cancellation, and a caller that
+ * has not aborted must never be handed that: it starts a read of its own.
+ *
+ * Every place a second caller attaches to a running or waiting call asks this,
+ * so the rule holds in one place for all of them: the shared-read join and the
+ * two joins onto a call waiting to retry. The alternative, a fresh id for each
+ * retry attempt, was not taken: a cancel names one call, and a call whose id
+ * changes under it would leave a cancel racing the attempt it was meant for.
+ * Refusing the join keeps one call, one id, and a cancel that is final.
+ */
+function joinable(interests: Set<Interest>): boolean {
+  return !(interests instanceof Waiters && interests.cancelled);
+}
+
 const waitersOf = new WeakMap<Interest, Set<Waiters>>();
 /** The callers that carry an abort signal, i.e. can leave. */
 const signalled = new WeakSet<Interest>();
@@ -433,7 +449,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
           //
           // Not one that has been told to stop: its answer will be the
           // cancellation, which a caller still waiting must not receive.
-          if (live && live.generation === readGeneration && !(live.interests instanceof Waiters && live.interests.cancelled)) {
+          if (live && live.generation === readGeneration && joinable(live.interests)) {
             live.interests.add(interest);
             return live.promise as Promise<T>;
           }
@@ -492,7 +508,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       key = lazyRetryKey(cmd, rest[0]);
       if (key === null) return call<T>(cmd, rest);
       const pending = retrying.get(key);
-      if (pending) {
+      if (pending && joinable(pending.interests)) {
         for (const interest of interests) pending.interests.add(interest);
         return pending.chain as Promise<T>;
       }
@@ -509,7 +525,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       if (key === null) throw error;
       const settledKey = key;
       const joined = retrying.get(settledKey);
-      if (joined) {
+      if (joined && joinable(joined.interests)) {
         for (const interest of interests) joined.interests.add(interest);
         return joined.chain as Promise<T>;
       }

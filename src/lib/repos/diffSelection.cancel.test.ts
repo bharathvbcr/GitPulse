@@ -3,7 +3,7 @@ import { createDiffSelection, type DiffSelectionSpec } from "./diffSelection";
 import type { RepoSession } from "./storeTypes";
 
 /** A selection whose reads wait on the test, and which records each call's abort signal. */
-function harness() {
+function harness(options_: { onAbort?: "abort" | "cancellation" } = {}) {
   let session = {
     id: "t1",
     generation: 1,
@@ -22,7 +22,10 @@ function harness() {
       new Promise((resolve, reject) => {
         const read = { commitId: args.commitId, signal: options?.signal, answer: (text: string) => resolve({ text, truncated: false, truncation_reason: null }) };
         reads.push(read);
-        options?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        // What the backend's answer to a cancelled read looks like, when it
+        // reaches a caller before that caller's own abort does.
+        const refusal = options_.onAbort === "cancellation" ? { kind: "unclassified", message: "git read cancelled: its caller is gone" } : new DOMException("aborted", "AbortError");
+        options?.signal?.addEventListener("abort", () => reject(refusal), { once: true });
       })) as never,
     activeSession: () => session,
     applyToSession: (_id, _gen, patch) => {
@@ -63,6 +66,17 @@ describe("a newer diff selection gives up the older read", () => {
     await pending;
     expect(h.session().selectedDiff).toBeNull();
     expect(h.session().selectedDiffError ?? null).toBeNull();
+  });
+
+  it("a cancellation reaching the given-up read is dropped, never shown as the diff's error", async () => {
+    const h = harness({ onAbort: "cancellation" });
+    const older = h.sel.select(commit("a"));
+    const newer = h.sel.select(commit("b"));
+    h.reads[1].answer("diff b");
+    await Promise.all([older, newer]);
+    expect(h.session().selectedDiffError ?? null).toBeNull();
+    expect(h.session().selectedDiff).toBe("diff b");
+    expect(h.session().selectedCommitId).toBe("b");
   });
 
   it("a read that finished is not given up when the next selection starts", async () => {
