@@ -2,16 +2,19 @@
 #[doc(hidden)]
 pub mod bench_seam;
 pub mod debouncer;
+pub(crate) mod facts;
 #[cfg(test)]
 mod registration_timing;
 #[cfg(all(test, unix))]
 mod storm;
 
 pub use debouncer::RepoFileWatcher;
+pub(crate) use facts::WatchFacts;
 
 use crate::engine::git_cli::{
     git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
+use crate::engine::git_reader::FileStatus;
 use crate::ipc_error::CommandError;
 use notify::{Event, EventKind};
 use serde::Serialize;
@@ -91,6 +94,9 @@ pub struct WatchSession {
     /// directory disappears and canonicalization starts failing (which
     /// would otherwise leak one of MAX_WATCHES slots forever).
     aliases: Vec<String>,
+    /// What this watch can vouch for; see [`facts`]. `None` only for a slot
+    /// reserved without a backend.
+    facts: Option<Arc<WatchFacts>>,
 }
 
 impl Drop for WatchSession {
@@ -119,10 +125,12 @@ pub struct RepoChangedPayload {
 /// admitted — never a second admission rule, which is how a self-echo loop
 /// would come back.
 ///
-/// The worktree watch is non-recursive, so `paths` names the top-level
-/// entries that fired, not every file below them; deeper edits surface as
-/// [`ChangeKind::Index`] or [`ChangeKind::Refs`] writes. A consumer must read
-/// `paths` as "at least these", never as "only these".
+/// On Linux and Windows the worktree watch is non-recursive, so `paths` names
+/// the top-level entries that fired, not every file below them; deeper edits
+/// surface as [`ChangeKind::Index`] or [`ChangeKind::Refs`] writes. On macOS
+/// the watch is recursive and `paths` names the files themselves. A consumer
+/// must read `paths` as "at least these", never as "only these": it is bounded
+/// by [`MAX_CHANGED_PATHS`] everywhere.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RepoChange {
     /// Sorted and deduplicated.
@@ -256,6 +264,15 @@ impl WatcherState {
         Ok(crate::supervisor::lock_or_recover(&self.sessions))
     }
 
+    /// What the watch on `key` (a canonical repository path) can vouch for. A
+    /// path with no session (never watched, failed to register, parked,
+    /// evicted, unwatched, or reaped by its own loop) has no facts, which is the
+    /// same answer as a watch that cannot vouch: the caller reads.
+    fn facts_for(&self, key: &str) -> Option<Arc<WatchFacts>> {
+        let guard = self.lock_sessions().ok()?;
+        guard.get(key)?.facts.clone()
+    }
+
     /// Drops a reserved slot only if it is still the session we inserted.
     /// Used when thread spawn fails after the sessions lock has been released.
     fn abandon_watch_slot(&self, key: &str, stop: &Arc<StopSignal>) -> Result<(), String> {
@@ -295,6 +312,7 @@ fn insert_watch_session(
             stop: stop.clone(),
             retired,
             aliases,
+            facts: None,
         },
     );
     Ok(Some(stop))
@@ -348,7 +366,7 @@ const IGNORE_RETRY: Duration = Duration::from_secs(30);
 /// names applied in [`is_build_dir_name`]. An empty prefix list is the
 /// built-in names only — a failed or truncated query must not look like
 /// "nothing is ignored" and must not look like "everything is ignored".
-struct IgnoreRules {
+pub(crate) struct IgnoreRules {
     /// Folded, `/`-separated directory prefixes (`scratch`, `pkg/generated`).
     prefixes: HashSet<String>,
     /// `None` only when the query finished and the prefix list was complete.
@@ -470,22 +488,41 @@ fn is_build_dir_name(name: &str) -> bool {
         || (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn is_build_or_ignored_path(relative: &Path, rules: &IgnoreRules) -> bool {
+/// Why a worktree-relative path is, or is not, under an ignored directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IgnoreVerdict {
+    /// A directory prefix git itself listed as ignored.
+    Confirmed,
+    /// Only a build-output name (`target*`, `node_modules`, ...) matched. Fine
+    /// for deciding what is worth a refresh; not proof that status cannot
+    /// change, since nothing says git ignores it.
+    Named,
+    Not,
+}
+
+fn ignore_verdict(relative: &Path, rules: Option<&IgnoreRules>) -> IgnoreVerdict {
+    let mut named = false;
     let mut accumulated = String::new();
     for component in relative.components() {
         let name = component.as_os_str().to_string_lossy();
-        if is_build_dir_name(&name) {
-            return true;
-        }
         if !accumulated.is_empty() {
             accumulated.push('/');
         }
         accumulated.push_str(&name.to_ascii_lowercase());
-        if rules.prefixes.contains(&accumulated) {
-            return true;
+        if rules.is_some_and(|rules| rules.prefixes.contains(&accumulated)) {
+            return IgnoreVerdict::Confirmed;
         }
+        named |= is_build_dir_name(&name);
     }
-    false
+    if named {
+        IgnoreVerdict::Named
+    } else {
+        IgnoreVerdict::Not
+    }
+}
+
+fn is_build_or_ignored_path(relative: &Path, rules: &IgnoreRules) -> bool {
+    ignore_verdict(relative, Some(rules)) != IgnoreVerdict::Not
 }
 
 /// Reload ignore rules after a real `.gitignore` edit, but not on every
@@ -627,8 +664,9 @@ fn record_event_signal(
 ///
 /// Live index vacuums, DevCouncil ledgers, and GitNexus indexes live under
 /// `.devcouncil`, `.devmap`, and `.gitnexus`. A worktree watch is
-/// non-recursive, but those top-level directories still fire, and nested
-/// writes can leak through FSEvents. Ledger appends already have their own
+/// non-recursive on Linux and Windows, but those top-level directories still
+/// fire there, and on macOS the watch is recursive so their nested writes
+/// arrive too. Ledger appends already have their own
 /// `ledger-appended` event; ignoring `.devcouncil` here does not drop that
 /// channel.
 ///
@@ -773,8 +811,8 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     }
     // An event naming the git directory ITSELF, rather than something inside
     // it, carries no information about what changed — and that same directory
-    // is watched recursively, so whatever changed delivers its own event. The
-    // worktree-root watch is non-recursive, and on Windows
+    // is watched recursively, so whatever changed delivers its own event. On
+    // Windows the worktree-root watch is non-recursive and
     // ReadDirectoryChangesW reports a direct child directory for any write
     // beneath it: every `.git/index.lock` touch arrived a second time as a
     // bare `<repo>/.git` event, which passed this filter and made pure
@@ -1053,7 +1091,17 @@ where
         path: path.clone(),
         change: change.take(),
     };
-    let mut rules = IgnoreRules::load(Path::new(&path));
+    let facts = watcher.facts();
+    // The rule set the callback filters with is the one this loop classifies
+    // with: one load, published to both. `wanted` is read BEFORE the query so a
+    // change that arrives while it runs leaves the published set stale.
+    let load_rules = || {
+        let wanted = facts.rules_wanted();
+        let loaded = Arc::new(IgnoreRules::load(Path::new(&path)));
+        facts.publish_rules(Arc::clone(&loaded), wanted);
+        loaded
+    };
+    let mut rules = load_rules();
     let mut last_rules_load = Instant::now();
     // When the watched git directory is deleted (repo moved/removed), notify
     // keeps delivering remove/error events forever, and the settle timer would
@@ -1084,6 +1132,15 @@ where
             pending = true;
             last_event = Instant::now();
         }
+        // A rule file or a new directory was seen after the last load: the
+        // callback's filter may be hiding what now matters, and the watch
+        // vouches for nothing until it is reloaded. The coalesce window still
+        // bounds how often git is asked.
+        let stale_at = facts.rules_stale().then(|| last_rules_load + SCAN_COALESCE);
+        if stale_at.is_some_and(|at| at <= Instant::now()) {
+            rules = load_rules();
+            last_rules_load = Instant::now();
+        }
         let wait = next_wait(&WaitPlan {
             now: Instant::now(),
             pending,
@@ -1091,7 +1148,10 @@ where
             first_pending,
             last_scan,
             dead_misses,
-            rules_retry_at: rules_retry_at(&rules, last_rules_load),
+            rules_retry_at: [rules_retry_at(&rules, last_rules_load), stale_at]
+                .into_iter()
+                .flatten()
+                .min(),
         });
         match watcher.receiver.recv_timeout(wait) {
             // A stop wakes the loop with a path-less event; it is not a change.
@@ -1136,7 +1196,7 @@ where
                     };
                 }
                 if rules_due(&rules, last_rules_load, Instant::now(), reload_rules) {
-                    rules = IgnoreRules::load(worktree);
+                    rules = load_rules();
                     last_rules_load = Instant::now();
                 }
                 // Noise never opens or extends the pending window, but it
@@ -1190,7 +1250,7 @@ where
                     break;
                 }
                 if rules_due(&rules, last_rules_load, Instant::now(), false) {
-                    rules = IgnoreRules::load(Path::new(&path));
+                    rules = load_rules();
                     last_rules_load = Instant::now();
                 }
                 if scan_is_due(
@@ -1320,8 +1380,9 @@ where
     eprintln!("watch setup {repo_path}: resolve git directory");
     let git_dir = resolve_git_dir(&canonical)?;
     // Bare repos have no separate worktree root (git dir == repo); a normal
-    // checkout and a linked worktree both do. The non-recursive worktree
-    // watch is what makes unstaged edits fire `repo-changed`.
+    // checkout and a linked worktree both do. The worktree watch is what makes
+    // unstaged edits fire `repo-changed` (recursive on macOS, top-level
+    // entries elsewhere; see `RepoFileWatcher::watch_repo`).
     let worktree_root = if git_dir == canonical {
         None
     } else {
@@ -1369,7 +1430,12 @@ where
             Some(retired_rx),
         )? {
             None => return Ok(key),
-            Some(stop) => stop,
+            Some(stop) => {
+                if let Some(session) = guard.get_mut(&key) {
+                    session.facts = Some(watcher.facts());
+                }
+                stop
+            }
         }
     };
     // Before the loop exists: a stop that lands in between is replayed here.
@@ -1516,6 +1582,46 @@ pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
     }
     drop(guard);
     retire_sessions(retired)
+}
+
+/// The status of `repo_path`: `read`'s answer, or, when `may_reuse` and the
+/// watch can show that nothing under the worktree has changed since the read
+/// that produced it, that earlier answer with no git spawned.
+///
+/// The epoch is taken before `read` starts and the answer is kept under it, so
+/// an event that lands while `read` runs leaves the kept answer at an older
+/// epoch than the watch reports next, and the next call reads again. Every
+/// state in which the watch cannot vouch (see [`facts`]) makes `cover` say
+/// nothing, and the call reads. A read is always kept when the watch can vouch,
+/// whoever asked, so a refresh that followed an event also serves the poll that
+/// comes after it; only a caller that says `may_reuse` is ever served one.
+pub(crate) fn status_through_watch<F>(
+    state: &WatcherState,
+    repo_path: &str,
+    may_reuse: bool,
+    read: F,
+) -> Result<Vec<FileStatus>, CommandError>
+where
+    F: FnOnce() -> Result<Vec<FileStatus>, CommandError>,
+{
+    let facts = validate_repo(repo_path)
+        .ok()
+        .and_then(|repo| state.facts_for(&repo.to_string_lossy()));
+    let Some(facts) = facts else {
+        return read();
+    };
+    let started = Instant::now();
+    let covered = facts.cover();
+    if may_reuse {
+        if let Some(rows) = covered.and_then(|epoch| facts.kept(epoch, started)) {
+            return Ok(rows.as_ref().clone());
+        }
+    }
+    let rows = read()?;
+    if let Some(epoch) = covered {
+        facts.keep(epoch, &rows, started);
+    }
+    Ok(rows)
 }
 
 pub fn unwatch_all(state: &WatcherState) -> Result<(), String> {
@@ -2493,6 +2599,21 @@ mod tests {
         Arc<StopSignal>,
         PathBuf,
     ) {
+        let (rx, stop, root, _, _) = spawn_loop_observed(dir);
+        (rx, stop, root)
+    }
+
+    /// [`spawn_loop`] that also hands back what the watch can vouch for and a
+    /// sender that wakes the loop, for a test that drives either.
+    fn spawn_loop_observed(
+        dir: &Path,
+    ) -> (
+        std::sync::mpsc::Receiver<RepoChangedPayload>,
+        Arc<StopSignal>,
+        PathBuf,
+        Arc<WatchFacts>,
+        WakeSender,
+    ) {
         use std::process::Command;
 
         let output = Command::new("git")
@@ -2509,6 +2630,7 @@ mod tests {
 
         let stop = StopSignal::new();
         stop.arm(watcher.waker());
+        let (facts, waker) = (watcher.facts(), watcher.waker());
         let thread_stop = stop.clone();
         let session_stop = stop.clone();
         let emit_path = canonical.to_string_lossy().into_owned();
@@ -2537,7 +2659,7 @@ mod tests {
             .expect("spawn loop");
         // Give the OS backend time to install its watches before the storm.
         thread::sleep(Duration::from_millis(300));
-        (rx, stop, canonical)
+        (rx, stop, canonical, facts, waker)
     }
 
     /// Overall ceiling for priming the watcher pipeline in tests: generous
@@ -2600,8 +2722,8 @@ mod tests {
     /// (`framework/notify/src/fsevent.rs` `callback_impl`), `forward_event`
     /// feeds a FIFO channel, and one loop thread debounces it. ASSUMED, not
     /// established here: that fseventsd delivers batches in event-id order
-    /// across batches and across the recursive `.git` and non-recursive root
-    /// watches of the one stream. Excluded: a full queue drops events and the
+    /// across batches and across the `.git` and worktree-root paths of the one
+    /// stream. Excluded: a full queue drops events and the
     /// loop answers with a later full refresh, so under overflow an earlier
     /// write can surface after the probe. Under those assumptions a callback
     /// naming a probe means every earlier write was already delivered; even
@@ -3024,12 +3146,14 @@ mod tests {
 
     /// Build-directory paths must not schedule a scan.
     ///
-    /// A non-recursive worktree watch does not deliver nested `target/` writes
-    /// (see [`measure_target_directory_event_rate`]). Paths still have to be
-    /// classified: FSEvents can report the `target` directory itself, a
-    /// `target-*` sibling, or a nested path that leaked through. Before this
-    /// filter every one of those was signal, and each signal opens a refresh
-    /// that fans out into many `git` children.
+    /// The event queue does not receive nested `target/` writes on any
+    /// platform (see [`measure_target_directory_event_rate`]): the root watch
+    /// is non-recursive on Linux and Windows, and on macOS the callback drops
+    /// them. Paths still have to be classified here: FSEvents can report the
+    /// `target` directory itself, a `target-*` sibling, or a nested path that
+    /// leaked through before the rules were loaded. Before this filter every
+    /// one of those was signal, and each signal opens a refresh that fans out
+    /// into many `git` children.
     #[test]
     fn build_output_storm_does_not_schedule_a_scan() {
         let root = Path::new("/repo");
@@ -3338,9 +3462,14 @@ mod tests {
         eprintln!(
             "target-storm writes={writes} raw_events={events} target_events={target_events} ({per_sec:.1}/s) sentinel_events={sentinel_events} window={window:?}\n{sample}"
         );
+        // The rule differs by platform and the number does not. Linux and
+        // Windows: the root watch is non-recursive, so nested paths are never
+        // delivered. macOS: it is recursive, and `WatchFacts::admit` drops a
+        // build-looking directory's writes on the callback thread, before they
+        // take a slot in the bounded queue this reads.
         assert_eq!(
             target_events, 0,
-            "nested target/ writes must not reach the non-recursive worktree watch"
+            "nested target/ writes must not reach the event queue on any platform"
         );
         assert!(
             sentinel_events >= 1,
@@ -3611,7 +3740,7 @@ mod tests {
         std::fs::create_dir_all(&common_refs).unwrap();
 
         // Warm the pipeline with bounded retries before asserting: the probe
-        // files land in the watched (non-recursive) worktree root. A single
+        // files land at the watched worktree root. A single
         // assertion write races FSEvents stream installation (see
         // prime_watcher).
         prime_watcher(&rx, &work_path, PRIME_DEADLINE);
@@ -5117,5 +5246,535 @@ mod tests {
             .emitted
             .recv_timeout(Duration::from_millis(1200))
             .is_err());
+    }
+
+    // ---- the worktree root watch, per platform, and the facts built on it ----
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// The rule, stated once: only macOS watches the worktree root
+    /// recursively. Linux and Windows keep the non-recursive root watch and
+    /// the status poll they had (inotify spends a descriptor per directory;
+    /// ReadDirectoryChangesW reports a whole tree).
+    #[test]
+    fn the_worktree_root_is_watched_recursively_only_on_macos() {
+        assert_eq!(
+            facts::ROOT_WATCH_MODE == notify::RecursiveMode::Recursive,
+            cfg!(target_os = "macos")
+        );
+    }
+
+    fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + PRIME_DEADLINE;
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Waits until the epoch has not moved for `still`: the setup's own events
+    /// (git init, the first rule load, directory creations) have been
+    /// delivered, so a later change is the test's.
+    #[cfg(target_os = "macos")]
+    fn wait_for_a_still_epoch(facts: &WatchFacts) {
+        let still = DEBOUNCE_MAX_WAIT + Duration::from_millis(500);
+        wait_for("the ignore rules", || facts.cover().is_some());
+        let mut seen = facts.cover();
+        let mut since = Instant::now();
+        wait_for("a still epoch", || {
+            let now = facts.cover();
+            if now != seen {
+                seen = now;
+                since = Instant::now();
+            }
+            now.is_some() && since.elapsed() >= still
+        });
+    }
+
+    /// A trusted repository under a live session, and a counter of the `git
+    /// status` spawns made for it while `body` runs.
+    fn watched_repo_counting_status_reads<T>(
+        body: impl FnOnce(&WatcherState, &str, &Path, &Arc<AtomicUsize>) -> T,
+    ) -> T {
+        let temp = TempDir::new().unwrap();
+        git_init(temp.path(), false);
+        crate::test_support::trust_repo(temp.path());
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        let state = WatcherState::default();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let out = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&root),
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            },
+            || body(&state, &path, &root, &reads),
+        );
+        let _ = unwatch_all(&state);
+        out
+    }
+
+    fn poll(state: &WatcherState, path: &str) -> Vec<FileStatus> {
+        status_through_watch(state, path, true, || {
+            crate::engine::git_reader::GitReader::get_status(path)
+        })
+        .expect("status")
+    }
+
+    /// Before this change the root watch dropped every path below the top
+    /// level, so the 6 s poll was the only thing that saw `src/deep/er/x.rs`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_nested_edit_is_announced_where_the_root_watch_is_recursive() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root, _, _) = spawn_loop_observed(temp.path());
+        let nested = root.join("src").join("deep").join("er");
+        std::fs::create_dir_all(&nested).unwrap();
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+        let payload = write_until_announced(
+            &rx,
+            PRIME_DEADLINE,
+            "nested-edit",
+            |name| std::fs::write(nested.join(name), "x").unwrap(),
+            |payload, probe| {
+                let wanted = format!("src/deep/er/{probe}");
+                payload.change.paths.contains(&wanted)
+            },
+        );
+        assert!(
+            payload.change.kinds.contains(&ChangeKind::Worktree),
+            "{payload:?}"
+        );
+        stop.stop();
+    }
+
+    /// The Linux and Windows rule, run where it can be: the same call with the
+    /// non-recursive mode delivers the top level and not what is below it, and
+    /// the watch then vouches for nothing, so the poll reads as it always did.
+    #[test]
+    fn a_non_recursive_root_watch_delivers_the_top_level_and_not_what_is_below() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let git_dir = dir.path().join(".git");
+        let nested = dir.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        let watcher = RepoFileWatcher::watch_repo_with(
+            &git_dir,
+            Some(dir.path()),
+            None,
+            notify::RecursiveMode::NonRecursive,
+        )
+        .expect("watch");
+        watcher
+            .facts()
+            .publish_rules(Arc::new(IgnoreRules::builtin()), 0);
+        thread::sleep(Duration::from_millis(400));
+        while watcher.receiver.try_recv().is_ok() {}
+
+        std::fs::write(nested.join("below.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("top-sentinel.rs"), "x").unwrap();
+        let (mut below, mut sentinel) = (0u32, 0u32);
+        let deadline = Instant::now() + PRIME_DEADLINE;
+        while sentinel == 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Ok(event)) = watcher.receiver.recv_timeout(left) else {
+                break;
+            };
+            for path in &event.paths {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("below.rs") => below += 1,
+                    Some("top-sentinel.rs") => sentinel += 1,
+                    _ => {}
+                }
+            }
+        }
+        while let Ok(Ok(event)) = watcher.receiver.try_recv() {
+            below += event
+                .paths
+                .iter()
+                .filter(|path| path.file_name().is_some_and(|name| name == "below.rs"))
+                .count() as u32;
+        }
+        assert!(sentinel >= 1, "the top-level file must still arrive");
+        assert_eq!(below, 0, "a non-recursive root watch must not see below");
+        assert_eq!(watcher.facts().cover(), None, "and it vouches for nothing");
+    }
+
+    /// Where the root watch is not recursive nothing can show a worktree
+    /// unchanged, so every poll reads.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn without_a_recursive_root_watch_every_poll_reads() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// A poll with nothing moved spawns no git; a nested edit makes the next
+    /// one read, and what it reads includes the edit.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_poll_with_nothing_moved_spawns_no_git_and_a_nested_edit_makes_the_next_one_read() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "the first poll reads");
+            for _ in 0..5 {
+                poll(state, path);
+            }
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "nothing moved: no git");
+
+            let epoch = facts.cover();
+            std::fs::create_dir_all(root.join("src").join("deep")).unwrap();
+            std::fs::write(root.join("src").join("deep").join("new.rs"), "x").unwrap();
+            wait_for("the nested edit to reach the watch", || {
+                facts.cover() != epoch
+            });
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "an event makes it read");
+            assert!(
+                rows.iter().any(|row| row.path == "src/deep/new.rs"),
+                "{rows:?}"
+            );
+        });
+    }
+
+    /// The race the epoch exists for. The read starts, the file changes while
+    /// it runs, and what it returns is from before the change: it must not be
+    /// kept as covering an event that arrived after it began.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_in_flight_when_an_edit_lands_does_not_cover_it() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let epoch = facts.cover();
+            let early = status_through_watch(state, path, true, || {
+                let before = crate::engine::git_reader::GitReader::get_status(path)?;
+                std::fs::write(root.join("during.txt"), "x").unwrap();
+                wait_for("the edit to reach the watch", || facts.cover() != epoch);
+                Ok(before)
+            })
+            .unwrap();
+            assert!(early.iter().all(|row| row.path != "during.txt"));
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "the next poll must read");
+            assert!(rows.iter().any(|row| row.path == "during.txt"), "{rows:?}");
+        });
+    }
+
+    /// Unknown is never clean: each of these leaves the poll reading as it did.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dropped_or_must_rescan_event_makes_the_next_poll_read() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+            assert!(facts.admit(&Ok(rescan)));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_backend_error_makes_the_next_poll_read() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert!(facts.admit(&Err(notify::Error::generic("events lost"))));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// A worktree whose watch was parked or evicted has no session, hence no
+    /// facts: every poll reads, even though a read was kept while it was live.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_parked_or_evicted_watch_makes_every_poll_read() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            unwatch(state, path.to_string()).unwrap();
+            assert!(
+                facts.cover().is_none(),
+                "an ended watch vouches for nothing"
+            );
+            assert!(state.facts_for(path).is_none());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    /// A watch that failed to register never became a session.
+    #[test]
+    fn a_watch_that_failed_to_register_leaves_no_facts_and_every_poll_reads() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            assert!(start_watch_inner(state, "/nonexistent/for/sure".into(), |_| {}).is_err());
+            assert!(state.facts_for("/nonexistent/for/sure").is_none());
+            assert!(state.facts_for(path).is_none(), "never watched");
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// 10,000 files written under a directory git ignores through the whole
+    /// pipeline: nothing is announced, the epoch does not move for them, and
+    /// the poll that follows reads nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ten_thousand_writes_under_an_ignored_directory_cost_no_refresh_and_no_status_read() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            let out = root.join("out");
+            for shard in 0..50 {
+                std::fs::create_dir_all(out.join(format!("d{shard}"))).unwrap();
+            }
+            std::fs::write(out.join("seed.o"), "x").unwrap();
+            let announced = Arc::new(Mutex::new(Vec::<RepoChangedPayload>::new()));
+            let sink = Arc::clone(&announced);
+            start_watch_inner(state, path.to_string(), move |payload| {
+                sink.lock().unwrap().push(payload);
+            })
+            .unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            let settled = announced.lock().unwrap().len();
+            let epoch = facts.cover().unwrap();
+
+            for i in 0..10_000u32 {
+                std::fs::write(
+                    out.join(format!("d{}", i % 50)).join(format!("f{i}.o")),
+                    "x",
+                )
+                .unwrap();
+            }
+            poll(state, path);
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                1,
+                "the churn must not cost a status read"
+            );
+
+            // Everything above was delivered before this file, in order.
+            std::fs::write(root.join("sentinel.txt"), "x").unwrap();
+            wait_for("the sentinel to reach the watch", || {
+                facts.cover() != Some(epoch)
+            });
+            let moved = facts.cover().unwrap() - epoch;
+            // The sentinel's own events (a create, a modify, the root's
+            // metadata: 3 to 5 observed) are all of it; the churn is 10,000
+            // writes and about three times as many raw events.
+            assert!(
+                moved <= 16,
+                "10,000 ignored writes moved the epoch {moved} times"
+            );
+            wait_for("the sentinel to be announced", || {
+                announced.lock().unwrap().len() > settled
+            });
+            let seen = announced.lock().unwrap();
+            assert!(
+                seen.iter().skip(settled).all(|payload| payload
+                    .change
+                    .paths
+                    .iter()
+                    .all(|p| !p.starts_with("out/"))),
+                "{seen:?}"
+            );
+            drop(seen);
+            assert!(
+                facts.examined() < 40_000,
+                "classifier work is bounded by the events delivered, got {}",
+                facts.examined()
+            );
+            assert!(!facts.rules_stale(), "nothing in `out/` reloads the rules");
+        });
+    }
+
+    fn load_average_1m() -> f64 {
+        let mut load = [0f64; 3];
+        // SAFETY: `getloadavg` writes at most `3` doubles into the array.
+        let got = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+        if got >= 1 {
+            load[0]
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Counter-based measurement for the card's last criterion. Run on a quiet
+    /// host: `cargo test --lib watcher::tests::measure_idle -- --ignored --nocapture`.
+    ///
+    /// Idle arm: `git status` spawns for one idle open worktree over the 10
+    /// polls a minute holds at `STATUS_POLL_INTERVAL_MS` (6 s), counted at the
+    /// spawn site. "Before" is the poll that always reads (what the code did,
+    /// and still does where the root watch is not recursive); "after" is the
+    /// poll that may be served from the kept read. The polls are issued
+    /// back to back, not 6 s apart, so this counts spawns per 10 polls, not
+    /// wall-clock time; the kept read's 300 s age cap does not enter. Arms are
+    /// interleaved over fresh repositories, 5 repetitions.
+    ///
+    /// Churn arm: 10,000 file writes under a directory git ignores, then one
+    /// sentinel; reports how many paths the callback classified, how many
+    /// times the epoch moved, and how many refreshes were announced.
+    ///
+    /// A run that starts or ends above load 30 is printed as CONTAMINATED and
+    /// is not a result.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "measurement; needs a quiet host"]
+    fn measure_idle_status_spawns_and_ignored_churn_event_volume() {
+        const POLLS_PER_MINUTE: usize = 10;
+        const REPS: usize = 5;
+        let load_start = load_average_1m();
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for _ in 0..REPS {
+            for may_reuse in [false, true] {
+                let spawns = watched_repo_counting_status_reads(|state, path, _, reads| {
+                    start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+                    let facts = state.facts_for(path).expect("a live session has facts");
+                    wait_for_a_still_epoch(&facts);
+                    for _ in 0..POLLS_PER_MINUTE {
+                        status_through_watch(state, path, may_reuse, || {
+                            crate::engine::git_reader::GitReader::get_status(path)
+                        })
+                        .unwrap();
+                    }
+                    reads.load(Ordering::SeqCst)
+                });
+                if may_reuse { &mut after } else { &mut before }.push(spawns);
+            }
+        }
+        let churn = watched_repo_counting_status_reads(|state, path, root, _| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            let out = root.join("out");
+            for shard in 0..50 {
+                std::fs::create_dir_all(out.join(format!("d{shard}"))).unwrap();
+            }
+            std::fs::write(out.join("seed.o"), "x").unwrap();
+            let announced = Arc::new(AtomicUsize::new(0));
+            let sink = Arc::clone(&announced);
+            start_watch_inner(state, path.to_string(), move |_| {
+                sink.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            let (epoch, examined, settled) = (
+                facts.cover().unwrap(),
+                facts.examined(),
+                announced.load(Ordering::SeqCst),
+            );
+            for i in 0..10_000u32 {
+                std::fs::write(
+                    out.join(format!("d{}", i % 50)).join(format!("f{i}.o")),
+                    "x",
+                )
+                .unwrap();
+            }
+            std::fs::write(root.join("sentinel.txt"), "x").unwrap();
+            wait_for("the sentinel", || facts.cover() != Some(epoch));
+            wait_for("the sentinel's refresh", || {
+                announced.load(Ordering::SeqCst) > settled
+            });
+            (
+                facts.examined() - examined,
+                facts.cover().unwrap() - epoch,
+                announced.load(Ordering::SeqCst) - settled,
+            )
+        });
+        let load_end = load_average_1m();
+        let contaminated = load_start > 30.0 || load_end > 30.0 || load_start.is_nan();
+        eprintln!(
+            "MEASURE status spawns per {POLLS_PER_MINUTE} polls (one minute at 6 s), n={REPS}: \
+             before={before:?} after={after:?}; ignored churn of 10,000 writes + 1 sentinel: \
+             paths classified={}, epoch moves={}, refreshes announced={}; \
+             load 1m start={load_start:.1} end={load_end:.1} {}",
+            churn.0,
+            churn.1,
+            churn.2,
+            if contaminated {
+                "CONTAMINATED (above 30): not a result"
+            } else {
+                "clean"
+            }
+        );
+        assert!(after.iter().all(|spawns| *spawns == 1), "{after:?}");
+        assert!(
+            before.iter().all(|spawns| *spawns == POLLS_PER_MINUTE),
+            "{before:?}"
+        );
+    }
+
+    /// A rule file edited after the rules loaded: the watch stops vouching
+    /// until the loop reloads them, and then the directory the new rule names
+    /// is filtered.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ignore_edit_withdraws_the_watch_until_the_rules_reload() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root, facts, waker) = spawn_loop_observed(temp.path());
+        wait_for("the first rules", || facts.cover().is_some());
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("seed.o"), "x").unwrap();
+        std::fs::write(root.join(".gitignore"), "fresh/\n").unwrap();
+        // The loop is asleep until something wakes it; the real watch's own
+        // event does that, and so does this.
+        let _ = waker.try_send(Ok(Event::new(EventKind::Other)));
+        wait_for("the rules to be stale or already reloaded", || {
+            facts.rules_stale() || facts.cover().is_some()
+        });
+        wait_for("the reload", || {
+            facts.cover().is_some() && !facts.rules_stale()
+        });
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        for i in 0..200 {
+            std::fs::write(fresh.join(format!("g{i}.o")), "x").unwrap();
+        }
+        let payload = write_until_announced(
+            &rx,
+            PRIME_DEADLINE,
+            "after-reload",
+            |name| std::fs::write(root.join(name), "x").unwrap(),
+            names_probe,
+        );
+        assert!(
+            payload
+                .change
+                .paths
+                .iter()
+                .all(|p| !p.starts_with("fresh/")),
+            "{payload:?}"
+        );
+        stop.stop();
     }
 }

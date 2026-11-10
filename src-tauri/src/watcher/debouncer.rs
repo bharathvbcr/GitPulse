@@ -1,3 +1,4 @@
+use super::facts::{WatchFacts, ROOT_WATCH_MODE};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +22,16 @@ pub struct RepoFileWatcher {
     /// [`Self::waker`]). It also means the receiver no longer disconnects when
     /// the backend dies; [`Self::backend_alive`] is how that is noticed.
     wake: SyncSender<Result<Event, notify::Error>>,
+    /// Shared with the native callback, which filters with it and counts the
+    /// epoch it reports; see [`super::facts`].
+    facts: Arc<WatchFacts>,
 }
 
 impl RepoFileWatcher {
+    pub(crate) fn facts(&self) -> Arc<WatchFacts> {
+        Arc::clone(&self.facts)
+    }
+
     /// A sender onto this watcher's event channel, for waking its reader.
     pub(crate) fn waker(&self) -> SyncSender<Result<Event, notify::Error>> {
         self.wake.clone()
@@ -55,6 +63,8 @@ impl RepoFileWatcher {
     /// reads. notify's Windows Drop only queues Stop; dropping its Rust handle
     /// alone does not mean ReadDirectoryChangesW has relinquished the tree.
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+        // Whatever this watch said before it ended is not to be relied on after.
+        self.facts.end();
         if let Some(watcher) = self.watcher.take() {
             drop(watcher);
             match self.retired.recv_timeout(Duration::from_secs(2)) {
@@ -82,14 +92,25 @@ impl RepoFileWatcher {
     /// anywhere must fire), and — when the repository has a separate
     /// worktree root — that root too.
     ///
-    /// The worktree watch is deliberately NON-recursive (top-level entries
-    /// only). Recursive watching of a whole checkout is far too hot for the
-    /// debounce loop, but without *some* worktree coverage an unstaged edit
-    /// never fires `repo-changed` and status goes stale. Top-level entries are
-    /// where edits surface first (new/removed files, mtime churn on roots);
-    /// deeper edits still reach us through the index/HEAD writes they cause
-    /// inside `.git`. Both `notify` backends in use here support the mode:
-    /// inotify natively, FSEvents via its own filtering.
+    /// How the worktree root is watched depends on the platform
+    /// ([`ROOT_WATCH_MODE`]).
+    ///
+    /// On macOS it is RECURSIVE. FSEvents is recursive in the kernel, and the
+    /// stream already covers the root because `.git` lives under it; the
+    /// backend's `NonRecursive` mode was only a user-space filter that threw
+    /// nested paths away (`framework/notify/src/fsevent.rs`, `callback_impl`).
+    /// Choosing `Recursive` removes that filter, adds no stream and no
+    /// registration, and lets a nested edit be seen. What would then flood the
+    /// bounded event queue (a build writing thousands of files under `target/`)
+    /// is dropped by [`WatchFacts::admit`] on the callback thread, before it
+    /// takes a slot.
+    ///
+    /// On Linux and Windows it stays NON-recursive (top-level entries only):
+    /// inotify watches one descriptor per directory and ReadDirectoryChangesW
+    /// reports a whole tree, so recursion there is bounded by descriptors or
+    /// pays for the whole tree. Deeper edits still reach us through the
+    /// index/HEAD writes they cause inside `.git`, and the status poll covers
+    /// the rest.
     ///
     /// # Registration is atomic (was: lossy on macOS)
     ///
@@ -117,6 +138,17 @@ impl RepoFileWatcher {
         worktree_root: Option<&Path>,
         common_dir: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::watch_repo_with(git_dir, worktree_root, common_dir, ROOT_WATCH_MODE)
+    }
+
+    /// [`Self::watch_repo`] with the worktree root's mode named, so a test can
+    /// exercise the mode the other platforms use on this one.
+    pub(crate) fn watch_repo_with(
+        git_dir: &Path,
+        worktree_root: Option<&Path>,
+        common_dir: Option<&Path>,
+        root_mode: RecursiveMode,
+    ) -> Result<Self, String> {
         if !git_dir.exists() {
             return Err(format!(
                 "Git directory does not exist: {}",
@@ -130,12 +162,31 @@ impl RepoFileWatcher {
         let callback_overflow = overflow.clone();
         let (lifetime, retired) = channel::<()>();
 
+        let mut internal_roots = vec![git_dir.to_path_buf()];
+        if let Some(common) = common_dir {
+            if !internal_roots.iter().any(|root| root == common) {
+                internal_roots.push(common.to_path_buf());
+            }
+        }
+        let facts = WatchFacts::new(
+            worktree_root.filter(|root| *root != git_dir),
+            internal_roots,
+            root_mode,
+        );
+        let callback_facts = Arc::clone(&facts);
+
         let mut watcher = RecommendedWatcher::new(
             move |res| {
                 // The sender's lifetime follows every native callback owner.
                 // It is never sent to: disconnect is the shutdown receipt.
                 std::hint::black_box(&lifetime);
-                forward_event(&tx, &callback_overflow, res);
+                if !callback_facts.admit(&res) {
+                    return;
+                }
+                // A full queue loses the event; the epoch says so.
+                if forward_event(&tx, &callback_overflow, res) {
+                    callback_facts.bump();
+                }
             },
             Config::default().with_poll_interval(Duration::from_millis(150)),
         )
@@ -169,10 +220,8 @@ impl RepoFileWatcher {
 
             if let Some(root) = worktree_root {
                 if root != git_dir {
-                    // Non-recursive on purpose: a recursive watch of a whole
-                    // checkout is far too hot for the debounce loop.
                     paths
-                        .add(root, RecursiveMode::NonRecursive)
+                        .add(root, root_mode)
                         .map_err(|e| format!("Failed to watch work tree root: {}", e))?;
                 }
             }
@@ -192,21 +241,26 @@ impl RepoFileWatcher {
             receiver: rx,
             overflow,
             wake,
+            facts,
         })
     }
 }
 
 /// Hands one native event to the debounce loop without ever blocking the
-/// backend's callback thread: a full queue records an overflow instead.
+/// backend's callback thread: a full queue records an overflow instead and
+/// returns true, so the caller can account for the event it lost.
 fn forward_event(
     tx: &SyncSender<Result<Event, notify::Error>>,
     overflow: &AtomicBool,
     res: Result<Event, notify::Error>,
-) {
+) -> bool {
     match tx.try_send(res) {
-        Err(TrySendError::Full(_)) => overflow.store(true, Ordering::Release),
+        Err(TrySendError::Full(_)) => {
+            overflow.store(true, Ordering::Release);
+            true
+        }
         // The consumer is gone; the loop's own disconnect handling reports it.
-        Err(TrySendError::Disconnected(_)) | Ok(()) => {}
+        Err(TrySendError::Disconnected(_)) | Ok(()) => false,
     }
 }
 
@@ -221,6 +275,25 @@ impl Drop for RepoFileWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The callback moves the watch's epoch for an event the queue could not
+    /// take, so a read that began before it is not mistaken for covering it.
+    #[test]
+    fn a_dropped_event_is_reported_to_the_caller_that_owns_the_epoch() {
+        let (tx, _rx) = sync_channel(1);
+        let overflow = AtomicBool::new(false);
+        assert!(!forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(notify::EventKind::Any))
+        ));
+        assert!(forward_event(
+            &tx,
+            &overflow,
+            Ok(Event::new(notify::EventKind::Any))
+        ));
+        assert!(overflow.load(Ordering::Acquire));
+    }
 
     #[test]
     fn a_full_queue_records_one_overflow_instead_of_growing() {

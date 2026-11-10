@@ -21,7 +21,8 @@ struct Scale {
     /// Files per repository written under ignored build directories.
     ignored: usize,
     /// Tracked rewrites per repository: top-level files, plus the same count
-    /// under `src/`, which a non-recursive worktree watch never sees.
+    /// under `src/`, which the non-recursive worktree watch of Linux and
+    /// Windows never sees and the recursive one of macOS does.
     tracked: usize,
     /// Loose-object-sized writes under `.git/objects` per repository.
     objects: usize,
