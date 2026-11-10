@@ -3,8 +3,10 @@ import {
   CUE_BAND_PX,
   cueYield,
   EMPTY_OVERFLOW_HINT,
+  NO_CUE_YIELD,
   applyHorizontalScrollDelta,
   bindHorizontalWheel,
+  observeCueYield,
   observeOverflow,
   OVERFLOW_ROUNDING_SLACK,
   overflowFadeToken,
@@ -625,5 +627,141 @@ describe("cueYield", () => {
   it("never reads another axis's token as its own", () => {
     expect(cueYield(list, body, "x-both", "y")).toEqual({ start: false, end: false });
     expect(cueYield({ start: 0, end: 300 }, { start: 0, end: 310 }, "y-end", "x").end).toBe(false);
+  });
+});
+
+describe("observeCueYield", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  type Rect = { left: number; right: number; top: number; bottom: number };
+  type Node = {
+    parentElement: Node | null;
+    dataset: Record<string, string | undefined>;
+    rect: Rect;
+    overflow: { x: string; y: string };
+    listeners: Map<string, () => void>;
+    getBoundingClientRect: () => Rect;
+    addEventListener: (type: string, fn: () => void) => void;
+    removeEventListener: (type: string, fn: () => void) => void;
+  };
+
+  function node(parent: Node | null, rect: Rect, overflow = { x: "visible", y: "visible" }): Node {
+    const n: Node = {
+      parentElement: parent,
+      dataset: {},
+      rect,
+      overflow,
+      listeners: new Map(),
+      getBoundingClientRect: () => n.rect,
+      addEventListener: (type, fn) => n.listeners.set(type, fn),
+      removeEventListener: (type, fn) => {
+        if (n.listeners.get(type) === fn) n.listeners.delete(type);
+      },
+    };
+    return n;
+  }
+
+  function harness(axis: "x" | "y", outerOverflow: { x: string; y: string }) {
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      nextFrame += 1;
+      frames.set(nextFrame, cb);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+    vi.stubGlobal("getComputedStyle", (n: Node) => ({ overflowX: n.overflow.x, overflowY: n.overflow.y }));
+    let mutate: (() => void) | null = null;
+    let fadeFilter: unknown = null;
+    let moConnected = false;
+    vi.stubGlobal("MutationObserver", class {
+      constructor(cb: () => void) { mutate = cb; }
+      observe(_target: unknown, options: { attributeFilter?: string[] }) { moConnected = true; fadeFilter = options.attributeFilter; }
+      disconnect() { moConnected = false; }
+    });
+    const held = new Set<unknown>();
+    let resized: ResizeObserverCallback | null = null;
+    class FakeRO {
+      constructor(cb: ResizeObserverCallback) { resized = cb; }
+      observe(target: unknown) { held.add(target); }
+      unobserve(target: unknown) { held.delete(target); }
+      disconnect() { held.clear(); }
+    }
+    // The sidebar shape: a scrolling body, a plain wrapper, then the list.
+    const outer = node(null, { left: 0, right: 300, top: 0, bottom: 500 }, outerOverflow);
+    const wrapper = node(outer, { left: 0, right: 300, top: 0, bottom: 500 });
+    const inner = node(wrapper, { left: 0, right: 300, top: 0, bottom: 500 }, { x: "auto", y: "auto" });
+    const answers: unknown[] = [];
+    const stop = observeCueYield(inner as unknown as HTMLElement, axis, (next) => answers.push(next), {
+      ResizeObserver: FakeRO as unknown as new (cb: ResizeObserverCallback) => ResizeObserver,
+      raf: (cb) => { cb(0); return 1; },
+      caf: () => undefined,
+    });
+    return {
+      outer, inner, answers, stop, held,
+      mutate: () => mutate?.(),
+      resize: () => resized?.([{ target: inner } as unknown as ResizeObserverEntry], {} as ResizeObserver),
+      flushFrames: () => {
+        const due = [...frames.values()];
+        frames.clear();
+        due.forEach((cb) => cb(0));
+      },
+      pendingFrames: () => frames.size,
+      fadeFilter: () => fadeFilter,
+      moConnected: () => moConnected,
+    };
+  }
+
+  it("answers NO_CUE_YIELD at once when no ancestor scrolls on the axis, and its dispose is harmless", () => {
+    const h = harness("y", { x: "auto", y: "visible" });
+    expect(h.answers).toEqual([NO_CUE_YIELD]);
+    expect(h.held.size).toBe(0);
+    expect(h.inner.listeners.size).toBe(0);
+    h.stop();
+    expect(h.answers).toEqual([NO_CUE_YIELD]);
+  });
+
+  it("skips non-scrolling ancestors, answers synchronously, and yields the end chevron the enclosing scroller draws", () => {
+    const h = harness("y", { x: "visible", y: "auto" });
+    expect(h.answers).toEqual([{ start: false, end: false }]);
+    expect([...h.held]).toEqual([h.inner, h.outer]);
+    expect(h.fadeFilter()).toEqual(["data-gp-fade"]);
+    h.outer.dataset.gpFade = "y-end";
+    h.mutate();
+    h.mutate();
+    expect(h.pendingFrames()).toBe(1);
+    h.flushFrames();
+    expect(h.answers.at(-1)).toEqual({ start: false, end: true });
+  });
+
+  it("re-reads on scroll of either scroller and on resize, on the x axis by left and right", () => {
+    const h = harness("x", { x: "scroll", y: "visible" });
+    h.outer.dataset.gpFade = "x-both";
+    h.inner.rect = { left: 100, right: 200, top: 0, bottom: 500 };
+    h.resize();
+    expect(h.answers.at(-1)).toEqual({ start: false, end: false });
+    h.inner.rect = { left: 10, right: 290, top: 0, bottom: 500 };
+    h.inner.listeners.get("scroll")?.();
+    h.outer.listeners.get("scroll")?.();
+    expect(h.pendingFrames()).toBe(1);
+    h.flushFrames();
+    expect(h.answers.at(-1)).toEqual({ start: true, end: true });
+  });
+
+  it("delivers nothing after dispose and lets go of every listener and observer", () => {
+    const h = harness("y", { x: "visible", y: "auto" });
+    h.mutate();
+    const count = h.answers.length;
+    h.stop();
+    expect(h.pendingFrames()).toBe(0);
+    h.flushFrames();
+    h.resize();
+    expect(h.answers.length).toBe(count);
+    expect(h.inner.listeners.size).toBe(0);
+    expect(h.outer.listeners.size).toBe(0);
+    expect(h.held.size).toBe(0);
+    expect(h.moConnected()).toBe(false);
   });
 });
