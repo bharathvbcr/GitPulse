@@ -1030,6 +1030,7 @@ impl GitReader {
                 stash: &stash,
                 chunk,
                 last_start: skipped,
+                ahead_tried: std::cell::Cell::new(false),
             };
             Self::history_chunk(
                 &repo,
@@ -1058,6 +1059,7 @@ impl GitReader {
                 chunk,
                 // The loop below reads chunks while `start + 1 < end`.
                 last_start: first + ((end - 2 - first) / chunk) * chunk,
+                ahead_tried: std::cell::Cell::new(false),
             };
             let mut start = first;
             let mut taken_to = skipped;
@@ -1111,15 +1113,14 @@ impl GitReader {
             if let Some(text) = run.stash.borrow_mut().remove(&skip) {
                 return Ok((text, true));
             }
-            if run.last_start > skip {
+            if run.last_start > skip && !run.ahead_tried.replace(true) {
                 // Chunks follow this one in the window, and none is held:
                 // one walk from here to the window's last chunk answers all.
                 let wire = run.chunk.saturating_add(1);
                 let rows = run.last_start + wire - skip;
                 let long = history_log_args(skip, rows, revision, spec, scope)?;
                 let long: Vec<&str> = long.iter().map(String::as_str).collect();
-                let (text, cut) =
-                    git_cli::git_text_capped_shared(repo, &long, git_cli::MAX_OUTPUT_BYTES)?;
+                let (text, cut) = git_cli::git_text_capped_shared(repo, &long, history_walk_cap())?;
                 let mut pieces =
                     slice_history_walk(&text, skip, run.chunk, wire, run.last_start, cut.is_none())
                         .into_iter();
@@ -5403,6 +5404,11 @@ struct ChunkRun<'a> {
     /// Start of the window's last chunk. A chunk at this start has nothing
     /// after it to read ahead for.
     last_start: usize,
+    /// A read-ahead walk has been run for this window. Only one is: when it
+    /// ended early (the output cap or the deadline) a later chunk reads its
+    /// own rows, because a second walk to the same last chunk would be cut the
+    /// same way and cost the same deadline again for every chunk after it.
+    ahead_tried: std::cell::Cell<bool>,
 }
 
 /// The refs a history walk starts from, as a ref listing is stamped: a named
@@ -5545,6 +5551,39 @@ pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T 
         }
     }
     let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
+}
+
+/// Output bytes one read-ahead walk of a history window may print before it is
+/// cut: the engine's own backstop.
+#[cfg(not(test))]
+fn history_walk_cap() -> usize {
+    git_cli::MAX_OUTPUT_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    static WALK_CAP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_walk_cap() -> usize {
+    WALK_CAP_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(git_cli::MAX_OUTPUT_BYTES)
+}
+
+/// Runs `body` with a small read-ahead cap, so a test can cut a window's walk
+/// without printing 64 MiB.
+#[cfg(test)]
+fn with_history_walk_cap<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_CAP_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_CAP_OVERRIDE.with(|cell| cell.replace(Some(bytes))));
     body()
 }
 
@@ -14188,6 +14227,58 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(
             slice_history_walk("", 8, 4, 5, 16, true),
             vec![(8, String::new())]
+        );
+    }
+
+    /// A read-ahead walk cut at its output cap (or its deadline) is not
+    /// repeated: every chunk after it reads only its own rows, as the code did
+    /// before it read ahead, so a window costs one cut walk plus one read per
+    /// chunk, not a cut walk per chunk.
+    #[test]
+    fn a_cut_read_ahead_walk_is_not_repeated_for_every_later_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        // 400 bytes is three records: the walk covers no whole chunk of ten.
+        let rows = with_history_walk_cap(400, || {
+            with_history_chunk(10, || {
+                eager_unhurried(|| {
+                    GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+                })
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            whole.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            "a cut walk changed the window"
+        );
+        let logs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..]
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "log"))
+            .cloned()
+            .collect();
+        let long = logs
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "-n51"))
+            .count();
+        assert_eq!(long, 1, "one read-ahead walk, however it ended: {logs:?}");
+        assert_eq!(
+            logs.len(),
+            6,
+            "the cut walk plus one read for each of the five chunks: {logs:?}"
         );
     }
 
