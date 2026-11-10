@@ -3057,6 +3057,24 @@ describe("repoStore field stores", () => {
     statuses.stop(); branches.stop(); tabs.stop();
   });
 
+  it("with no repository open, a publish wakes no field-store subscriber", () => {
+    const { store } = makeStore();
+    const statuses = watch(store.statuses);
+    const branches = watch(store.branches);
+    const tabs = watch(store.openTabs);
+    const conflicts = watch(store.conflictedCount);
+    store.setError("first"); // the first projection replaces the constructor's placeholder arrays, once
+    const settled = [statuses.seen.length, branches.seen.length, tabs.seen.length, conflicts.seen.length];
+    store.setError("second");
+    store.setError(null);
+    store.setError("third");
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length, conflicts.seen.length]).toEqual(settled);
+    // The same shared empty array every time, and one nobody can push into.
+    expect(Object.isFrozen(get(store.statuses))).toBe(true);
+    expect(get(store.statuses)).toBe(get(store.branches));
+    statuses.stop(); branches.stop(); tabs.stop(); conflicts.stop();
+  });
+
   it("counts conflicted and staged files once per statuses array", async () => {
     const { store, set } = await open([file("a.ts", { is_conflicted: true }), file("b.ts", { is_staged: true }), file("c.ts", { is_staged: true })]);
     expect(get(store.conflictedCount)).toBe(1);

@@ -253,6 +253,16 @@ function projectTab(
     };
 }
 
+/**
+ * What a field reads as with no repository open. One frozen array rather than a
+ * fresh `[]` per publish: the field stores (`repoStore.statuses` and the rest)
+ * notify when the reference changes, so a new empty array each time woke every
+ * subscriber on every publish while nothing was open.
+ */
+const NONE: never[] = [];
+Object.freeze(NONE);
+const NO_SECTIONS: Record<string, string> = Object.freeze({});
+
 function projectRest(
   internal: InternalState,
   openTabs: OpenRepoTab[],
@@ -267,14 +277,14 @@ function projectRest(
     activeTabId: internal.workspace.activeId,
     recentRepos: internal.workspace.recents,
     lastClosed: internal.workspace.lastClosed,
-    collapsedGroups: internal.workspace.collapsedGroups ?? [],
-    groupColors: internal.workspace.groupColors ?? [],
+    collapsedGroups: internal.workspace.collapsedGroups ?? NONE,
+    groupColors: internal.workspace.groupColors ?? NONE,
     currentPath: active?.path ?? null,
-    branches: active?.branches ?? [],
-    tags: active?.tags ?? [],
+    branches: active?.branches ?? NONE,
+    tags: active?.tags ?? NONE,
     currentBranch: active?.currentBranch ?? null,
     defaultBranch: active?.defaultBranch ?? null,
-    statuses: active?.statuses ?? [],
+    statuses: active?.statuses ?? NONE,
     conflictedCount,
     stagedCount,
     selectedCommitId: active?.selectedCommitId ?? null,
@@ -289,7 +299,7 @@ function projectRest(
     selectedDiffError: active?.selectedDiffError ?? null,
     selectionKind: active?.selectionKind ?? "file",
     activeTab: active?.activeTab ?? "work",
-    viewSections: active?.viewSections ?? {},
+    viewSections: active?.viewSections ?? NO_SECTIONS,
     terminalOpen: active?.terminalOpen ?? false,
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
@@ -301,7 +311,7 @@ function projectRest(
     statsFailed: active?.statsFailed ?? false,
     statusUnavailableSince: active?.statusUnavailableSince ?? null,
     operation: active?.operation ?? IDLE_OPERATION,
-    stashEntries: active?.stashEntries ?? [],
+    stashEntries: active?.stashEntries ?? NONE,
     stashFailed: active?.stashFailed ?? false,
     stashTruncated: active?.stashTruncated ?? false,
     tagsTruncated: active?.tagsTruncated ?? false,
