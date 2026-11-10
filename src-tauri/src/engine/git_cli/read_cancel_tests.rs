@@ -4,6 +4,7 @@
 
 use super::read_cancel::{self, ReadScope, CANCELLED_MESSAGE};
 use super::*;
+use crate::procguard::LockedSpawn;
 use crate::test_support::{coverage_relaxed, process_alive, wait_gone};
 
 /// How long a cancelled child may take to leave: the ask, the grace
@@ -22,7 +23,7 @@ const RECORD_SELF: &str = r#"echo "$$ $(ps -o lstart= -p $$)""#;
 fn started_at(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
+        .output_locked()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !text.is_empty()).then_some(text)
@@ -488,7 +489,7 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
         .current_dir(&rig.cwd);
     let outcome = run_read_shared(cmd, "queued-test", Duration::from_secs(60), 4096, rig.gate);
     canceller.join().unwrap();
-    let error = outcome.err().expect("a cancelled read does not run");
+    let error = outcome.expect_err("a cancelled read does not run");
     assert!(
         error.message().ends_with(CANCELLED_BEFORE_SPAWN),
         "{}",
