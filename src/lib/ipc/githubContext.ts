@@ -74,6 +74,20 @@ export function invalidateGitHubContext(repoPath?: string): void {
   else entries.delete(repoPath);
 }
 
+/**
+ * Sign-in, sign-out and a token change happen outside the app (`gh auth login`
+ * in a terminal), so the app is never told. The only signal there is is the
+ * person coming back to the window, so a held answer for the previous identity
+ * is dropped then, and the next read asks `gh` again.
+ */
+export function invalidateOnReturn(target: Pick<EventTarget, "addEventListener" | "removeEventListener">): () => void {
+  const clear = () => invalidateGitHubContext();
+  target.addEventListener("focus", clear);
+  return () => target.removeEventListener("focus", clear);
+}
+
+if (typeof window !== "undefined") invalidateOnReturn(window);
+
 /** The GitHub context for a repository, through the shared read. Read-only. */
 export function readGitHubContext<T>(repoPath: string, options: { force?: boolean } = {}): Promise<T> {
   return sharedGitHubContext(repoPath, () => invoke<T>("cmd_github_context", { repoPath }), options);
