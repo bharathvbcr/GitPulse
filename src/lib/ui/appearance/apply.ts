@@ -74,8 +74,11 @@ export interface AppearancePrefs {
   readonly density: Density;
   /** Multiplies the radius ladder; 1 is the shipped shape. */
   readonly radiusScale: number;
-  /** 0 = the shipped alphas, 1 = opaque. Held to the measured floor while it draws. */
-  readonly materialIntensity: number;
+  /**
+   * 0 = the shipped alphas, 1 = opaque, stored per appearance so dragging light
+   * up to its floor leaves dark alone. Each is held to its own measured floor while it draws.
+   */
+  readonly materialIntensity: Readonly<Record<Appearance, number>>;
   /** Float blur radius in px. 0 means `backdrop-filter: none`. */
   readonly floatBlur: number;
   readonly fieldLevel: FieldLevel;
@@ -98,7 +101,7 @@ export const APPEARANCE_DEFAULTS: AppearancePrefs = {
   fontMono: "",
   density: "comfortable",
   radiusScale: SHIPPED_RADIUS_SCALE,
-  materialIntensity: 0,
+  materialIntensity: { light: 0, dark: 0 },
   floatBlur: FLOAT_BLUR_SHIPPED,
   fieldLevel: "vivid",
   fieldHue: 0,
@@ -159,6 +162,16 @@ function readTheme(value: unknown): GitPulseTheme | null {
   return checked.ok ? checked.theme : null;
 }
 
+/** A stored intensity: the per-appearance pair, or the single number older builds wrote (it seeds both). */
+function readIntensity(value: unknown): Readonly<Record<Appearance, number>> {
+  if (typeof value === "object" && value !== null) {
+    const pair = value as Readonly<Record<string, unknown>>;
+    return { light: clamp(finite(pair.light, 0), 0, 1), dark: clamp(finite(pair.dark, 0), 0, 1) };
+  }
+  const single = clamp(finite(value, 0), 0, 1);
+  return { light: single, dark: single };
+}
+
 /** Reads stored appearance preferences; anything unrecognised becomes its default. */
 export function sanitizeAppearance(raw: Readonly<Record<string, unknown>>): AppearancePrefs {
   const custom = typeof raw.customAccent === "string" ? parseHex(raw.customAccent) : null;
@@ -176,7 +189,7 @@ export function sanitizeAppearance(raw: Readonly<Record<string, unknown>>): Appe
       RADIUS_SCALE_RANGE.min,
       RADIUS_SCALE_RANGE.max,
     ),
-    materialIntensity: clamp(finite(raw.materialIntensity, 0), 0, 1),
+    materialIntensity: readIntensity(raw.materialIntensity),
     floatBlur: Math.round(clamp(finite(raw.floatBlur, FLOAT_BLUR_SHIPPED), 0, FLOAT_BLUR_MAX)),
     fieldLevel: isFieldLevel(raw.fieldLevel) ? raw.fieldLevel : APPEARANCE_DEFAULTS.fieldLevel,
     fieldHue: normalizeHue(finite(raw.fieldHue, 0)),
@@ -425,9 +438,10 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
   attributes["data-float-blur"] = null;
   if (context.nativeMaterial) {
     const floor = MATERIAL_FLOOR[theme];
-    const intensity = clamp(prefs.materialIntensity, floor, 1);
+    const wanted = prefs.materialIntensity[theme];
+    const intensity = clamp(wanted, floor, 1);
     if (intensity > 0) vars["--gp-material"] = String(Number(intensity.toFixed(3)));
-    if (prefs.materialIntensity < floor) {
+    if (wanted < floor) {
       notes.push({
         id: "material-floor",
         tone: "info",

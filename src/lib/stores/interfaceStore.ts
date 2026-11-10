@@ -34,6 +34,7 @@ import {
   type AppearancePrefs,
   type FieldLevel,
 } from "../ui/appearance/apply";
+import type { Appearance } from "../ui/color/derive";
 import { densityFromLegacy, type Density } from "../ui/appearance/density";
 import type { GitPulseTheme } from "../ui/appearance/themeSchema";
 import { themeStore } from "./themeStore";
@@ -707,7 +708,9 @@ function createInterfaceStore() {
     setFontMono: (family: string) => patch({ fontMono: family }),
     setDensity: (density: Density) => patch({ density }),
     setRadiusScale: (scale: number) => patch({ radiusScale: scale }),
-    setMaterialIntensity: (intensity: number) => patch({ materialIntensity: intensity }),
+    /** Sets one appearance's intensity; the other keeps its own. */
+    setMaterialIntensity: (theme: Appearance, intensity: number) =>
+      patch((prefs) => ({ materialIntensity: { ...prefs.materialIntensity, [theme]: intensity } })),
     setFloatBlur: (px: number) => patch({ floatBlur: Math.round(Math.min(FLOAT_BLUR_MAX, Math.max(0, px))) }),
     setFieldLevel: (level: FieldLevel) => patch({ fieldLevel: level }),
     setFieldHue: (degrees: number) => patch({ fieldHue: degrees }),

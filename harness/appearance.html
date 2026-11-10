@@ -237,7 +237,7 @@
     check("Reset appearance restores every default", () => { const p = get(interfaceStore); return p.density === "comfortable" && p.radiusScale === 1 && p.floatBlur === 34 && p.fieldLevel === "vivid" && p.customAccent === "" && !p.reduceTransparency && p.customTheme === null; });
     check("and leaves the document clean", () => root.style.getPropertyValue("--gp-material") === "" && !root.hasAttribute("data-float-blur") && !root.hasAttribute("data-radius-scale"));
     resetHostPlatformForTests({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false });
-    interfaceStore.setFloatBlur(0); interfaceStore.setMaterialIntensity(1); await settle();
+    interfaceStore.setFloatBlur(0); interfaceStore.setMaterialIntensity("dark", 1); await settle();
     check("without the capability the Material group explains itself instead of showing dead sliders", () => $("[data-material-unavailable]") && !$("[data-group='material']").hidden);
     check("and writes no glass token even when a stored value exists", () => !root.hasAttribute("data-float-blur") && !root.style.getPropertyValue("--gp-material"));
     check("density and corner style still work off macOS", () => !$('[data-setting="density"]').hidden && !$('[data-setting="corner-style"]').hidden);

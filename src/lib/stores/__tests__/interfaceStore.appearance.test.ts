@@ -37,7 +37,7 @@ describe("appearance preferences", () => {
     expect(prefs.customAccent).toBe("");
     expect(prefs.customTheme).toBeNull();
     expect(prefs.radiusScale).toBe(1);
-    expect(prefs.materialIntensity).toBe(0);
+    expect(prefs.materialIntensity).toEqual({ light: 0, dark: 0 });
     expect(prefs.floatBlur).toBe(34);
     expect(prefs.fieldLevel).toBe("vivid");
     expect(prefs.reduceTransparency).toBe(false);
@@ -130,12 +130,18 @@ describe("appearance preferences", () => {
     expect(prefs.diffWordWrap).toBe(true);
   });
 
+  it("setting one appearance's intensity leaves the other alone", async () => {
+    const { interfaceStore } = await fresh();
+    interfaceStore.setMaterialIntensity("light", 0.4);
+    expect(get(interfaceStore).materialIntensity).toEqual({ light: 0.4, dark: 0 });
+  });
+
   it("reset() restores the appearance preferences with everything else", async () => {
     const { interfaceStore } = await fresh();
     interfaceStore.setDensity("compact");
-    interfaceStore.setMaterialIntensity(0.8);
+    interfaceStore.setMaterialIntensity("light", 0.8);
     interfaceStore.reset();
     expect(get(interfaceStore).density).toBe("comfortable");
-    expect(get(interfaceStore).materialIntensity).toBe(0);
+    expect(get(interfaceStore).materialIntensity).toEqual({ light: 0, dark: 0 });
   });
 });

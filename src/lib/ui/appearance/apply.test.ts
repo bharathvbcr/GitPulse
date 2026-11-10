@@ -31,6 +31,8 @@ const mac = { theme: "dark", nativeMaterial: true } as const;
 const macLight = { theme: "light", nativeMaterial: true } as const;
 const elsewhere = { theme: "dark", nativeMaterial: false } as const;
 
+const both = (n: number) => ({ light: n, dark: n });
+
 function prefs(changes: Partial<AppearancePrefs> = {}): AppearancePrefs {
   return { ...APPEARANCE_DEFAULTS, ...changes };
 }
@@ -88,27 +90,44 @@ describe("planAppearance: float blur", () => {
 
 describe("planAppearance: material intensity", () => {
   it("never draws thinner than the measured floor, and says so", () => {
-    const plan = planAppearance(prefs({ materialIntensity: 0 }), macLight);
+    const plan = planAppearance(prefs({ materialIntensity: both(0) }), macLight);
     expect(Number(plan.vars["--gp-material"])).toBeCloseTo(MATERIAL_FLOOR.light, 5);
     expect(plan.notes.map((note) => note.id)).toContain("material-floor");
   });
 
   it("lets the dark theme sit at the shipped alphas with no note", () => {
-    const plan = planAppearance(prefs({ materialIntensity: 0 }), mac);
+    const plan = planAppearance(prefs({ materialIntensity: both(0) }), mac);
     expect(plan.vars["--gp-material"]).toBeUndefined();
     expect(plan.notes).toEqual([]);
   });
 
   it("passes a higher intensity through unchanged", () => {
-    expect(planAppearance(prefs({ materialIntensity: 0.6 }), mac).vars["--gp-material"]).toBe("0.6");
-    expect(planAppearance(prefs({ materialIntensity: 5 }), mac).vars["--gp-material"]).toBe("1");
+    expect(planAppearance(prefs({ materialIntensity: both(0.6) }), mac).vars["--gp-material"]).toBe("0.6");
+    expect(planAppearance(prefs({ materialIntensity: both(5) }), mac).vars["--gp-material"]).toBe("1");
+  });
+});
+
+describe("material intensity is stored per appearance", () => {
+  it("lets light sit at its floor while dark keeps its own value", () => {
+    const stored = prefs({ materialIntensity: { light: 0, dark: 0.6 } });
+    expect(Number(planAppearance(stored, macLight).vars["--gp-material"])).toBeCloseTo(MATERIAL_FLOOR.light, 5);
+    expect(planAppearance(stored, mac).vars["--gp-material"]).toBe("0.6");
+  });
+
+  it("seeds both appearances from the single number older builds stored", () => {
+    expect(sanitizeAppearance({ materialIntensity: 0.7 }).materialIntensity).toEqual({ light: 0.7, dark: 0.7 });
+  });
+
+  it("clamps each half of a stored pair on its own and ignores junk", () => {
+    expect(sanitizeAppearance({ materialIntensity: { light: 9, dark: "x" } }).materialIntensity).toEqual({ light: 1, dark: 0 });
+    expect(sanitizeAppearance({ materialIntensity: null }).materialIntensity).toEqual({ light: 0, dark: 0 });
   });
 });
 
 describe("planAppearance: capability gating", () => {
   it("writes no glass token where the host has no native material", () => {
     const plan = planAppearance(
-      prefs({ materialIntensity: 0.8, floatBlur: 0, fieldLevel: "off", fieldHue: 90, reduceTransparency: true }),
+      prefs({ materialIntensity: both(0.8), floatBlur: 0, fieldLevel: "off", fieldHue: 90, reduceTransparency: true }),
       elsewhere,
     );
     expect(plan.vars).toEqual({});
@@ -258,7 +277,7 @@ describe("imported theme", () => {
 describe("writeAppearance", () => {
   it("sets what the plan sets and clears what it no longer sets", () => {
     const root = new FakeRoot();
-    writeAppearance(planAppearance(prefs({ floatBlur: 0, materialIntensity: 0.5, density: "compact" }), mac), root);
+    writeAppearance(planAppearance(prefs({ floatBlur: 0, materialIntensity: both(0.5), density: "compact" }), mac), root);
     expect(root.attributes.get("data-float-blur")).toBe("off");
     expect(root.values.get("--gp-material")).toBe("0.5");
     expect(root.attributes.get("data-density")).toBe("compact");
@@ -272,7 +291,7 @@ describe("writeAppearance", () => {
     const root = new FakeRoot();
     root.values.set("--c-surface-tint", "keep");
     root.values.set("--mac-fill-surface", "keep");
-    writeAppearance(planAppearance(prefs({ materialIntensity: 1 }), mac), root);
+    writeAppearance(planAppearance(prefs({ materialIntensity: both(1) }), mac), root);
     expect(root.values.get("--c-surface-tint")).toBe("keep");
     // The OUTPUT variable the Reduce Transparency blocks redeclare is never written inline.
     expect(root.values.get("--mac-fill-surface")).toBe("keep");
@@ -339,7 +358,7 @@ describe("sanitizeAppearance", () => {
       fontMono: 5,
       density: "huge",
       radiusScale: 100,
-      materialIntensity: -3,
+      materialIntensity: both(-3),
       floatBlur: 900,
       fieldLevel: "loud",
       fieldHue: 725,
@@ -352,7 +371,7 @@ describe("sanitizeAppearance", () => {
     expect(read.fontMono).toBe("");
     expect(read.density).toBe("comfortable");
     expect(read.radiusScale).toBe(1.25);
-    expect(read.materialIntensity).toBe(0);
+    expect(read.materialIntensity).toEqual({ light: 0, dark: 0 });
     expect(read.floatBlur).toBe(40);
     expect(read.fieldLevel).toBe("vivid");
     expect(read.fieldHue).toBe(5);
@@ -374,7 +393,7 @@ describe("installAppearance", () => {
     const platform = writable({ native_material: true });
     const stop = installAppearance({ prefs: store, theme, platform, target: root });
     expect(root.attributes.get("data-density")).toBe("comfortable");
-    store.set(prefs({ materialIntensity: 0 }));
+    store.set(prefs({ materialIntensity: both(0) }));
     expect(root.values.has("--gp-material")).toBe(false);
     theme.set("light");
     expect(Number(root.values.get("--gp-material"))).toBeCloseTo(MATERIAL_FLOOR.light, 5);

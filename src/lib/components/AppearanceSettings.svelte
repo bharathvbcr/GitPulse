@@ -195,7 +195,7 @@
 
   // --- material ---------------------------------------------------------------
   const floor = $derived(MATERIAL_FLOOR[theme]);
-  const intensity = $derived(Math.max(prefs.materialIntensity, floor));
+  const intensity = $derived(Math.max(prefs.materialIntensity[theme], floor));
   const transparencyChoice = $derived(prefs.reduceTransparency ? "reduced" : "auto");
 </script>
 
@@ -455,7 +455,7 @@
         max={1}
         step={0.05}
         format={(n) => `${Math.round(n * 100)}%`}
-        oninput={(next) => interfaceStore.setMaterialIntensity(next)}
+        oninput={(next) => interfaceStore.setMaterialIntensity(theme, next)}
       />
       <p class="text-micro text-textMuted">
         More transparent on the left, more opaque on the right.
