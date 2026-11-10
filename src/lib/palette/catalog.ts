@@ -16,6 +16,8 @@ import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
 import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
 import { openManviFocus } from "../ui/openManviFocus";
 import { openConflicts } from "../ui/workConflicts";
+import { policyActivityVisible } from "../harness/policyPresentation";
+import { harnessStore } from "../stores/harnessStore";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
@@ -63,6 +65,8 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       throw Error(current.error || "The repository could not be opened.");
     }
   };
+  // Read once per build, like `state`: the palette is rebuilt when it opens.
+  const harness = get(harnessStore);
   const views: PaletteItem[] = Object.values(VIEW_REGISTRY).flatMap(view => [
     { id: view.id, label: view.paletteCommand ?? `Open ${view.label}`, description: view.summary, category: "Views", icon: icons[view.id], disabledReason: unavailable, action: () => {
       interfaceStore.setGlobalSurface("repository");
@@ -110,7 +114,9 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         id: `manvi:${target.id}`, label: MANVI_PALETTE_LABELS[target.id],
         description: `${target.destination.label} → ${target.label}`,
         keywords: `Manvi Policy ${target.destination.label.replace("→", "")} ${target.label}`, category: "Views", icon: icons.work,
-        disabledReason: target.destination.kind === "view" ? unavailable : undefined,
+        disabledReason: target.destination.kind === "settings" ? undefined
+          : unavailable ?? (target.id === "activity" && !policyActivityVisible(harness.harness, harness.actions.length, harness.error)
+            ? "Manvi is not installed and nothing has been recorded." : undefined),
         action: () => {
           if (target.destination.kind === "view") interfaceStore.setGlobalSurface("repository");
           openManviFocus(target.id);

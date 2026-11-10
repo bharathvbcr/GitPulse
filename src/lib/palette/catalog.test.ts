@@ -13,6 +13,7 @@ import { LAUNCHERS } from "../terminal/tabs";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { explorerLens, resetExplorerLens } from "../files/explorerLens";
 import { takeManviFocus } from "../ui/manviFocus";
+import { harnessStore } from "../stores/harnessStore";
 
 vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
@@ -111,6 +112,22 @@ describe("command catalog and context", () => {
     }
     await commands.find(command => command.id === "work:conflicts")?.action();
     expect(navigate).toHaveBeenLastCalledWith("work", "overview");
+  });
+
+  it("does not offer Policy activity when Overview would not render it", () => {
+    // Manvi absent and nothing journaled: Overview hides the card, so a door
+    // to it would land on nothing. Disabled with the reason instead.
+    const absent = { harness: { available: false, error: "", error_code: "not_installed" }, actions: [], error: null };
+    vi.spyOn(harnessStore, "subscribe").mockImplementation((run) => {
+      (run as (value: unknown) => void)(absent);
+      return () => {};
+    });
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.find(command => command.id === "manvi:activity")?.disabledReason)
+      .toBe("Manvi is not installed and nothing has been recorded.");
+    // Settings opens without a repository or Manvi, so its cards stay offered.
+    expect(commands.find(command => command.id === "manvi:harness")?.disabledReason).toBeUndefined();
+    expect(commands.find(command => command.id === "manvi:cleanup")?.disabledReason).toBeUndefined();
   });
 
   it("keeps a door to every card Policy held, landing where the catalog says", async () => {

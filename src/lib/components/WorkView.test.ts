@@ -237,6 +237,16 @@ describe("WorkView", () => {
 });
 
 describe("WorkView deep links", () => {
+  it("says why nothing opened when the card is not offered, instead of a dead click", () => {
+    // Policy activity is hidden while Manvi is absent and nothing is recorded.
+    // The request is already taken, so it cannot fire later; the reader is
+    // told rather than left at the top of Overview wondering.
+    const body = functionBody(source, "revealFocus");
+    const missing = body.slice(body.indexOf("if (!section) {"));
+    expect(missing).toContain("toastStore.info(");
+    expect(missing.indexOf("toastStore.info(")).toBeLessThan(missing.indexOf("return;"));
+  });
+
   it("takes only the requests whose card lives on a view, on mount and on every change", () => {
     expect(source).toContain('takeManviFocusFor("view")');
     expect(source).toContain("$manviFocusRequest");

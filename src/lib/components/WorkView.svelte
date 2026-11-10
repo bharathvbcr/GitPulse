@@ -71,14 +71,17 @@
   import { timestampFormat } from "../ui/timestampFormat";
   import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
   import BranchTagCleanup from "./BranchTagCleanup.svelte";
-  import PolicyActivity, { policyActivityVisible } from "./PolicyActivity.svelte";
+  import PolicyActivity from "./PolicyActivity.svelte";
+  import { policyActivityVisible } from "../harness/policyPresentation";
   import { openConflicts } from "../ui/workConflicts";
   import {
+    MANVI_FOCUS_TARGETS,
     manviFocusRequest,
     manviSectionId,
     takeManviFocusFor,
     type ManviFocusId,
   } from "../ui/manviFocus";
+  import { toastStore } from "../stores/toastStore";
 
   let projection = $state<WorkProjection | null>(null);
   let collisions = $state<CollisionRisk | null>(null);
@@ -387,7 +390,13 @@
     else if (id === "activity") showActivity = true;
     await tick();
     const section = document.getElementById(manviSectionId(id));
-    if (!section) return;
+    if (!section) {
+      // The card is not offered here (Policy activity with Manvi absent and
+      // nothing recorded). The request was taken, so it cannot fire later;
+      // say why nothing opened rather than leaving a dead click.
+      toastStore.info(`${MANVI_FOCUS_TARGETS[id].label} has nothing to show: Manvi is not installed and nothing has been recorded.`);
+      return;
+    }
     // Instant, like every other scroll-into-view in the app: a deep link should
     // land deterministically, and a smooth 2000px glide is both a lot of motion
     // and, in a webview that is not compositing, no scroll at all.

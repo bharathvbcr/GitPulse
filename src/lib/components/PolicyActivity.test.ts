@@ -11,7 +11,8 @@ import {
   adoptionOffered,
   createRepositoryRefreshTimer,
 } from "../harness/policyPresentation";
-import PolicyActivity, { policyActivityVisible } from "./PolicyActivity.svelte";
+import PolicyActivity from "./PolicyActivity.svelte";
+import { policyActivityVisible } from "../harness/policyPresentation";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "PolicyActivity.svelte"),
