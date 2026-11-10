@@ -413,7 +413,7 @@
           type="button"
           data-blame-suspects
           onclick={() => openSuspectsFor(filePath)}
-          class="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md font-sans text-[11px] text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          class="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md font-sans text-meta text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
           title="Find suspects for this file: which commit since the last known good could have broken it, ranked by what the call graph reaches"
         >
           <Bug size={12} /> Suspects

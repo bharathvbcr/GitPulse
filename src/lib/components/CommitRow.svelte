@@ -265,10 +265,7 @@
     {/if}
 
     {#if suspect}
-      <span
-        class="inline-flex items-center text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded-full border border-red-400/40 bg-red-400/10 text-red-400 font-medium"
-        title={suspect.title}
-      >suspect #{suspect.rank}</span>
+      <span class="gp-chip" data-tone="danger" title={suspect.title}>suspect #{suspect.rank}</span>
     {/if}
 
     {#if row.is_merge}

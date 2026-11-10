@@ -167,10 +167,11 @@ export function evidenceLabel(evidence: string): string {
   return evidence;
 }
 
-export function evidenceClass(evidence: string): string {
-  if (evidence === "body_changed") return "text-red-400 border-red-400/40";
-  if (evidence === "moved_only") return "text-amber-500 border-amber-500/40";
-  return "text-textMuted border-border/60";
+/** The chip tone for an evidence class (`gp-chip` `data-tone`). */
+export function evidenceTone(evidence: string): "danger" | "warn" | "unknown" {
+  if (evidence === "body_changed") return "danger";
+  if (evidence === "moved_only") return "warn";
+  return "unknown";
 }
 
 export function evidenceTitle(evidence: string): string {

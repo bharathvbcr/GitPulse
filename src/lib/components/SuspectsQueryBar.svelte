@@ -63,7 +63,7 @@
     aria-label="Symptom symbol"
     title="The symbol that is misbehaving: module::function, Class.method, or a file path"
     placeholder="Symptom: module::function, Class.method, or a file path"
-    class="gp-field h-7 min-w-0 flex-1 font-mono text-[11px]"
+    class="gp-field h-7 min-w-0 flex-1 font-mono text-meta"
   />
   <input
     type="text"
@@ -74,7 +74,7 @@
     aria-label="Last known good"
     title="The last ref the symptom was well at. The window runs from here to the indexed commit, not to HEAD."
     placeholder={DEFAULT_SUSPECTS_SINCE}
-    class="gp-field h-7 w-32 shrink-0 font-mono text-[11px]"
+    class="gp-field h-7 w-32 shrink-0 font-mono text-meta"
   />
   <input
     type="number"
@@ -84,7 +84,7 @@
     oninput={(e) => suspectsQuery.setInputs({ depth: e.currentTarget.valueAsNumber })}
     aria-label="Cone depth"
     title="How many call edges out from the symptom to walk (1–{MAX_SUSPECT_CONE_DEPTH})"
-    class="gp-field h-7 w-14 shrink-0 font-mono text-[11px] tabular-nums"
+    class="gp-field h-7 w-14 shrink-0 font-mono text-meta tabular-nums"
   />
   <button type="submit" class="gp-btn h-7 shrink-0" disabled={!canRun}>
     {#if $suspectsQuery.loading}

@@ -28,7 +28,7 @@
   import {
     suspectsQuery,
     suspectMarks,
-    evidenceClass,
+    evidenceTone,
     evidenceLabel,
     evidenceTitle,
     hopsLabel,
@@ -344,10 +344,7 @@
             >{filtered ? "Not in the loaded graph" : "Not in the graph"}</span>
           {/if}
           {#if suspect}
-            <span
-              class="shrink-0 rounded-full border border-red-400/40 bg-red-400/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-red-400"
-              title={suspect.title}
-            >suspect #{suspect.rank}</span>
+            <span class="gp-chip shrink-0" data-tone="danger" title={suspect.title}>suspect #{suspect.rank}</span>
           {/if}
           <button
             type="button"
@@ -390,7 +387,7 @@
         </button>
         <button
           type="button"
-          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-rose-400"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-danger"
           onclick={() => void resetKeepTo(selectedCommit.id, actionLabel)}
           title="Reset the current branch here (keeps local changes)… — previews which commits would leave the branch first"
           aria-label="Reset the current branch to this commit"
@@ -409,10 +406,12 @@
     </div>
 
     {#if suspect}
-      <!-- The Suspects verdict on this commit, under whichever list selected it. -->
-      <div class="flex items-center gap-2 border-b border-border/60 bg-red-400/5 px-4 py-1 text-[10px] text-textSecondary min-w-0" aria-label="Suspect verdict">
+      <!-- The Suspects verdict on this commit, under whichever list selected it.
+           Told apart from the header by its tint, not by a rule. -->
+      <div class="flex items-center gap-2 bg-danger/5 px-4 py-1 text-micro text-textSecondary min-w-0" aria-label="Suspect verdict">
         <span
-          class="shrink-0 rounded border px-1 text-[9px] uppercase tracking-wide {evidenceClass(suspect.suspect.evidence)}"
+          class="gp-chip shrink-0"
+          data-tone={evidenceTone(suspect.suspect.evidence)}
           title={evidenceTitle(suspect.suspect.evidence)}
         >{evidenceLabel(suspect.suspect.evidence)}</span>
         <span class="shrink-0 font-mono tabular-nums text-textMuted" title="Call edges from the symptom to the nearest symbol this commit touched.">

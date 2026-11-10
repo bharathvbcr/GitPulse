@@ -2071,7 +2071,7 @@
                    since the last known good could have broken it. -->
               <button
                 type="button"
-                class="shrink-0 rounded px-1 text-[10px] text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+                class="shrink-0 rounded px-1 text-micro text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
                 onclick={() => openSuspectsFor(currentHunkSymbol)}
                 title="Find suspects for {currentHunkSymbol}: which commit since the last known good could have broken it"
                 aria-label="Find suspects for {currentHunkSymbol}"

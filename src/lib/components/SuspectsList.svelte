@@ -35,7 +35,7 @@
   import {
     suspectsQuery,
     bodyChangedLabel,
-    evidenceClass,
+    evidenceTone,
     evidenceLabel,
     evidenceTitle,
     hopsLabel,
@@ -63,13 +63,13 @@
 <div class="flex-1 min-h-0 overflow-auto px-3 py-2 font-sans" aria-label="Regression suspects">
   <div class="flex flex-col gap-2">
     {#if $suspectsQuery.error}
-      <p class="rounded-lg border border-red-400/40 bg-red-400/5 p-2 text-[11px] text-red-400" role="alert">
+      <p class="gp-notice mx-0 mt-0" data-tone="danger" role="alert">
         {$suspectsQuery.error}
       </p>
     {/if}
 
     {#if $suspectsQuery.loading}
-      <div class="flex items-center gap-1.5 text-[10px] text-textMuted">
+      <div class="flex items-center gap-1.5 text-micro text-textMuted">
         <Loader2 size={11} class="animate-spin" />
         <span>Walking the cone and blaming the lines it reaches…</span>
       </div>
@@ -87,22 +87,22 @@
       {/if}
     {:else}
       {#if scope}
-        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg border border-border/60 bg-background/60 px-2 py-1.5">
-          <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Examined</span>
-          <span class="font-mono text-[10px] text-textSecondary">
-            <span title="The commit the code graph was built at. Commits made since it was built are outside this window, because the blamed lines and the graph's offsets have to describe the same content.">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg border border-border/65 bg-background/60 px-2 py-1.5">
+          <span class="gp-label">Examined</span>
+          <span class="font-mono text-micro text-textSecondary">
+            <span title="The commit the code map was built at. Commits made since it was built are outside this window, because the blamed lines and the graph's offsets have to describe the same content.">
               {shortHash(scope.indexed_head) || "unknown"}
             </span>
             <span class="text-textMuted">…back to…</span>
             <span>{scope.since || "unknown"}</span>
           </span>
-          <span class="font-mono text-[10px] tabular-nums text-textMuted">
+          <span class="font-mono text-micro tabular-nums text-textMuted">
             {scope.cone_size.toLocaleString()} symbol{scope.cone_size === 1 ? "" : "s"} in the cone ·
             {scope.blamed_symbols.toLocaleString()} blamed
           </span>
-          <span class="text-[10px] text-textMuted">The window ends at the indexed commit, not at HEAD.</span>
+          <span class="text-micro text-textMuted">The window ends at the indexed commit, not at HEAD.</span>
           {#if scope.refusals.length > 0}
-            <span class="text-[10px] text-amber-500" title={boundedJoin(scope.refusals, 12)}>
+            <span class="text-micro text-warn" title={boundedJoin(scope.refusals, 12)}>
               {scope.refusals.length} part{scope.refusals.length === 1 ? "" : "s"} of the walk refused
               — the ranking below is a lower bound.
             </span>
@@ -112,20 +112,20 @@
 
       {#if !answer.available}
         {@const reasonTitle = tooltipWalkIncomplete([answer.reason])}
-        <p class="min-w-0 line-clamp-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-[11px] text-amber-500" title={reasonTitle}>
+        <p class="gp-notice mx-0 mt-0 min-w-0 line-clamp-3" data-tone="warn" title={reasonTitle}>
           Suspects unavailable{reasonTitle ? `: ${reasonTitle}` : ""} — not the same as no suspects.
         </p>
       {:else if suspects.length === 0}
-        <p class="rounded-lg border border-border/60 bg-background/60 p-2 text-[11px] text-textSecondary">
+        <p class="gp-notice mx-0 mt-0 text-textSecondary">
           Nothing in the cone was touched in this window. The walk ran; it found
           no commit that reaches the symptom.
         </p>
       {:else}
         <div class="flex items-baseline justify-between gap-2">
-          <span class="min-w-0 truncate text-[10px] font-bold uppercase tracking-wider text-textMuted" title={answer.symptom}>
-            Ranked suspects for <span class="font-mono normal-case">{answer.symptom}</span>
+          <span class="gp-label min-w-0 truncate" title={answer.symptom}>
+            Ranked suspects for <span class="font-mono">{answer.symptom}</span>
           </span>
-          <span class="shrink-0 font-mono text-[10px] tabular-nums text-textMuted">
+          <span class="shrink-0 font-mono text-micro tabular-nums text-textMuted">
             {suspects.length} of {answer.total.toLocaleString()}
           </span>
         </div>
@@ -138,26 +138,27 @@
                 type="button"
                 aria-pressed={selected}
                 class="flex w-full flex-col gap-1 rounded-lg border p-2 text-left transition-colors {selected
-                  ? 'border-accent/60 bg-accent/10'
-                  : 'border-border/60 bg-background/60 hover:border-accent/50 hover:bg-surface/60'}"
+                  ? 'border-accent/65 bg-accent/10'
+                  : 'border-border/65 bg-background/60 hover:border-accent/65 hover:bg-surface/60'}"
                 onclick={() => select(suspect.commit, index + 1)}
                 title="Show this commit in the details below"
               >
                 <div class="flex items-center gap-2">
-                  <span class="w-5 shrink-0 font-mono text-[10px] tabular-nums text-textMuted">
+                  <span class="w-5 shrink-0 font-mono text-micro tabular-nums text-textMuted">
                     #{index + 1}
                   </span>
-                  <span class="font-mono text-[11px] text-textPrimary">{shortHash(suspect.commit)}</span>
+                  <span class="font-mono text-meta text-textPrimary">{shortHash(suspect.commit)}</span>
                   <span
-                    class="shrink-0 rounded border px-1 text-[9px] uppercase tracking-wide {evidenceClass(suspect.evidence)}"
+                    class="gp-chip shrink-0"
+                    data-tone={evidenceTone(suspect.evidence)}
                     title={evidenceTitle(suspect.evidence)}
                   >
                     {evidenceLabel(suspect.evidence)}
                   </span>
-                  <span class="min-w-0 flex-1 truncate text-[10px] text-textMuted">
+                  <span class="min-w-0 flex-1 truncate text-micro text-textMuted">
                     {suspect.author}
                   </span>
-                  <span class="shrink-0 text-[10px] text-textMuted" title={formatDate(suspect.author_time)}>
+                  <span class="shrink-0 text-micro text-textMuted" title={formatDate(suspect.author_time)}>
                     {formatRelativeTime(suspect.author_time)}
                   </span>
                 </div>
@@ -172,7 +173,7 @@
                     ></div>
                   </div>
                   <span
-                    class="shrink-0 font-mono text-[10px] tabular-nums text-textMuted"
+                    class="shrink-0 font-mono text-micro tabular-nums text-textMuted"
                     title="Call edges from the symptom to the nearest symbol this commit touched. Zero means it touched the symptom itself."
                   >
                     {hopsLabel(suspect.nearest_distance)}
@@ -182,7 +183,7 @@
                 {#if suspect.touched.length > 0}
                   <ul class="flex flex-col gap-0.5 pl-7">
                     {#each suspect.touched.slice(0, 4) as touch (touch.qualified_name + touch.file_path)}
-                      <li class="flex items-baseline gap-2 font-mono text-[10px] text-textSecondary">
+                      <li class="flex items-baseline gap-2 font-mono text-micro text-textSecondary">
                         <span class="min-w-0 truncate" title={touch.file_path}>
                           {touch.qualified_name}
                         </span>
@@ -190,7 +191,7 @@
                           {touch.distance} hop · {touch.lines} line{touch.lines === 1 ? "" : "s"}
                         </span>
                         <span
-                          class="shrink-0 {touch.body_changed === null ? 'text-amber-500' : 'text-textMuted'}"
+                          class="shrink-0 {touch.body_changed === null ? 'text-warn' : 'text-textMuted'}"
                           title={touch.body_changed === null
                             ? "Whether the body changed could not be established — not the same as unchanged."
                             : "Whether this commit changed the symbol's body or only moved it."}
@@ -201,7 +202,7 @@
                     {/each}
                     {#if suspect.touched.length > 4}
                       <li
-                        class="font-mono text-[10px] text-textMuted"
+                        class="font-mono text-micro text-textMuted"
                         title={boundedJoin(suspect.touched.slice(4).map((t) => t.qualified_name), 12)}
                       >
                         +{suspect.touched.length - 4} more symbol{suspect.touched.length - 4 === 1 ? "" : "s"}
@@ -215,7 +216,7 @@
         </ul>
 
         {#if answer.truncated}
-          <p class="text-[10px] text-amber-500">
+          <p class="text-micro text-warn">
             Suspect list truncated by token budget — commits below the cut are
             not ruled out.
           </p>
@@ -224,7 +225,7 @@
 
       {#if answer.walkIncomplete}
         {@const walkTitle = tooltipWalkIncomplete([answer.walkIncomplete])}
-        <p class="min-w-0 line-clamp-3 text-[10px] text-amber-500" title={walkTitle}>
+        <p class="min-w-0 line-clamp-3 text-micro text-warn" title={walkTitle}>
           Walk incomplete: {answer.walkIncomplete}
         </p>
       {/if}

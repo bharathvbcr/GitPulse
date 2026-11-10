@@ -204,10 +204,7 @@
                   {shortHash(entry.commit_id, 8)}
                   {#if marks.get(entry.commit_id)}
                     {@const mark = marks.get(entry.commit_id)!}
-                    <span
-                      class="ml-1 rounded border border-red-400/40 px-1 font-sans text-[9px] uppercase tracking-wide text-red-400"
-                      title={mark.title}
-                    >suspect #{mark.rank}</span>
+                    <span class="gp-chip ml-1 font-sans" data-tone="danger" title={mark.title}>suspect #{mark.rank}</span>
                   {/if}
                 </td>
                 <td class="px-3 py-1.5 text-textPrimary">{entry.action}</td>
