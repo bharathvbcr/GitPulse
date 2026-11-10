@@ -52,10 +52,10 @@ describe("diff and blame source text is selectable", () => {
     expect(clusters.length, "each layout's gutter cluster opts out").toBe(2);
     // The +/- markers are diff notation and must stay inside that cluster,
     // not out beside the code where a drag would collect them.
-    for (const marker of text.match(/<span\s+class="w-2 shrink-0 text-center font-bold/g) ?? []) {
+    for (const marker of text.match(/<span\s+class="w-2 shrink-0 text-center font-semibold/g) ?? []) {
       expect(text.indexOf(marker)).toBeGreaterThan(-1);
     }
-    expect(text.match(/w-2 shrink-0 text-center font-bold/g) ?? []).toHaveLength(2);
+    expect(text.match(/w-2 shrink-0 text-center font-semibold/g) ?? []).toHaveLength(2);
   });
 });
 

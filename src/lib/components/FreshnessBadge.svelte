@@ -17,20 +17,20 @@
   /**
    * Tone is a property of the claim, never of the kind's name: `unknown` and
    * `unverified` are both muted because neither is an accusation, and `stale`
-   * is amber because a decayed verification still is one.
+   * is the warn tone because a decayed verification still is one.
    */
   const DOT: Record<FreshnessTone, string> = {
-    good: "bg-emerald-500/80",
-    warn: "bg-amber-500",
-    bad: "bg-rose-500",
-    muted: "bg-muted-foreground/40",
+    good: "bg-ok/80",
+    warn: "bg-warn",
+    bad: "bg-danger",
+    muted: "bg-textMuted/40",
   };
 
-  const PILL: Record<FreshnessTone, string> = {
-    good: "text-emerald-600 dark:text-emerald-400 bg-emerald-500/10",
-    warn: "text-amber-600 dark:text-amber-400 bg-amber-500/10",
-    bad: "text-rose-600 dark:text-rose-400 bg-rose-500/10",
-    muted: "text-muted-foreground bg-muted-foreground/10",
+  const CHIP_TONE: Record<FreshnessTone, string> = {
+    good: "ok",
+    warn: "warn",
+    bad: "danger",
+    muted: "neutral",
   };
 </script>
 
@@ -51,9 +51,8 @@
     ></span>
   {:else}
     <span
-      class="px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 whitespace-nowrap {PILL[
-        badge.tone
-      ]}"
+      class="gp-chip shrink-0 whitespace-nowrap"
+      data-tone={CHIP_TONE[badge.tone]}
       title={badge.detail}
       data-testid="freshness-badge"
       data-kind={badge.kind}

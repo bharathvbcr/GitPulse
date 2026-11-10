@@ -78,7 +78,7 @@ describe("CommitComposer", () => {
     expect(source).toContain("previewStore.refresh");
     expect(source).toContain("What this commit breaks");
     expect(source).toContain("parse=");
-    expect(source).toContain("bodies_not_compared=");
+    expect(source).toContain("bodies not compared=");
     expect(source).toContain("walk incomplete:");
     expect(source).toContain("tooltipWalkIncomplete");
     expect(source).toContain('data-testid="commit-preview-breaks"');
@@ -118,8 +118,8 @@ describe("CommitComposer", () => {
     // The telemetry is kept, but behind a disclosure rather than above the
     // finding it was meant to support.
     const summaryRegion = source.slice(0, source.indexOf("Preview details"));
-    expect(summaryRegion).not.toContain("bodies_not_compared=");
-    expect(source).toContain("bodies_not_compared=");
+    expect(summaryRegion).not.toContain("bodies not compared=");
+    expect(source).toContain("bodies not compared=");
     expect(source).toContain("<details");
   });
 

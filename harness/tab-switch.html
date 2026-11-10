@@ -456,7 +456,7 @@
             return !!$("#merge-branch-title") && text(document.body).includes("The repository changed") && merge?.disabled === true && !!box;
           });
           $('button[aria-label="Close merge dialog"]')?.click();
-          await settle();
+          await sleepUntil(() => !$("#merge-branch-title"));
           check("…and closes from its own button", () => !$("#merge-branch-title"));
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));

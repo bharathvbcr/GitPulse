@@ -18,7 +18,8 @@
    * GitPulse provenance from the shared freshness table.
    */
   import { onMount } from "svelte";
-  import { GitCompareArrows, Loader2, Pencil, X } from "@lucide/svelte";
+  import { GitCompareArrows, Pencil, X } from "@lucide/svelte";
+  import Skeleton from "./Skeleton.svelte";
   import {
     GraphRenderer,
     primedRowRange,
@@ -471,7 +472,7 @@
        and the one change that is not in the graph. -->
   <button
     type="button"
-    class="flex w-full shrink-0 items-center gap-1.5 border-b border-border/60 px-2.5 py-1 text-left text-[11px] hover:bg-surfaceHover {onWorkingTree
+    class="flex w-full shrink-0 items-center gap-1.5 px-2.5 py-1 text-left text-meta hover:bg-surfaceHover {onWorkingTree
       ? 'bg-accent/10 text-accent'
       : 'text-textMuted'}"
     aria-current={onWorkingTree ? "true" : undefined}
@@ -485,15 +486,15 @@
     <!-- -1 is "not counted"; rendering it as 0 would report an unscanned
          working tree as clean. -->
     {#if workingTreeCount > 0}
-      <span class="shrink-0 font-mono text-[9px]">{workingTreeCount}</span>
+      <span class="shrink-0 font-mono text-micro">{workingTreeCount}</span>
     {:else if workingTreeCount === 0}
-      <span class="shrink-0 text-[9px]">clean</span>
+      <span class="shrink-0 text-micro">clean</span>
     {/if}
   </button>
 
   {#if armedBase}
     <div
-      class="flex shrink-0 items-center gap-1.5 border-b border-border/60 bg-accent/10 px-2.5 py-1 text-[10px] text-accent"
+      class="flex shrink-0 items-center gap-1.5 bg-accent/10 px-2.5 py-1 text-meta text-accent"
       role="status"
       data-compare-armed
     >
@@ -503,7 +504,8 @@
       </span>
       <button
         type="button"
-        class="gp-icon-btn p-0.5!"
+        class="gp-icon-btn"
+        data-size="sm"
         title="Cancel the comparison (Esc)"
         aria-label="Cancel the comparison"
         onclick={() => (armedPick = null)}
@@ -516,13 +518,13 @@
   {#if gutter.clipped}
     <!-- The lanes furthest from the mainline are cut, and the reader is told
          where the rest is, rather than lanes silently ending at an edge. -->
-    <p class="shrink-0 border-b border-border/60 px-2.5 py-0.5 text-[9px] text-textMuted" data-graph-clipped>
-      Some branch lanes are cut off — widen the rail or open Graph to see them all.
+    <p class="shrink-0 px-2.5 py-0.5 text-micro text-textMuted" data-graph-clipped>
+      Some branches are cut off — widen the rail or open Graph to see them all.
     </p>
   {/if}
 
   {#if rows.length === 0}
-    <p class="px-2.5 py-3 text-[11px] text-textMuted">No commits loaded yet.</p>
+    <p class="px-2.5 py-3 text-meta text-textMuted">No commits loaded yet.</p>
   {/if}
 
   <div class="relative min-h-0 flex-1" class:hidden={rows.length === 0}>
@@ -565,7 +567,7 @@
               tabindex="-1"
               aria-selected={active}
               data-commit-id={row.id}
-              class="group flex cursor-pointer items-center gap-1 pr-1 text-[11px] {active
+              class="group flex cursor-pointer items-center gap-1 pr-1 text-meta {active
                 ? 'bg-accent/10 text-accent'
                 : isBase || armed
                   ? 'bg-accent/5 text-textPrimary'
@@ -575,11 +577,12 @@
               onclick={(event) => activate(index, event.shiftKey)}
             >
               {#if isBase || armed}
-                <span class="shrink-0 rounded bg-accent/15 px-1 font-mono text-[8px] uppercase text-accent">base</span>
+                <span class="shrink-0 rounded bg-accent/15 px-1 font-mono text-micro text-accent">base</span>
               {/if}
               {#if refs.length > 0}
                 <span
-                  class="max-w-20 shrink-0 truncate rounded-full border border-border px-1 font-mono text-[9px] text-textPrimary/80"
+                  class="gp-chip max-w-20 shrink-0 font-mono"
+                  data-tone="neutral"
                   title={refs.map((ref) => ref.name).join(", ")}
                 >{refs[0].name}{refs.length > 1 ? ` +${refs.length - 1}` : ""}</span>
               {/if}
@@ -591,12 +594,13 @@
                   ? ", on screen"
                   : ""}
               </span>
-              <span class="shrink-0 font-mono text-[9px] opacity-60 group-hover:hidden">
+              <span class="shrink-0 font-mono text-micro opacity-60 group-hover:hidden">
                 {$timestampFormat.text(row.timestamp)}
               </span>
               <button
                 type="button"
-                class="gp-icon-btn hidden p-0.5! group-hover:inline-flex {armed ? 'text-accent' : ''}"
+                class="gp-icon-btn hidden group-hover:inline-flex {armed ? 'text-accent' : ''}"
+                data-size="sm"
                 title={armedBase && !armed
                   ? "Compare with the commit picked first"
                   : armed
@@ -617,16 +621,15 @@
       </div>
 
       {#if loadError}
-        <div class="flex items-center gap-2 px-2.5 py-1.5 text-[10px] text-amber-600 dark:text-amber-400" role="status">
-          <span class="min-w-0 flex-1 truncate" title={loadError}>Could not load older history: {loadError}</span>
-          <button type="button" class="gp-btn shrink-0 px-2 py-0.5 text-[10px]" onclick={onLoadMore}>Retry</button>
+        <div class="flex items-center gap-2 px-2.5 py-1.5 text-meta text-warn" role="status">
+          <span class="min-w-0 flex-1 truncate" title={loadError}>Couldn't load older history. {loadError}</span>
+          <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={onLoadMore}>Try again</button>
         </div>
       {:else if loadingMore}
-        <p class="flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] text-textMuted" role="status">
-          <Loader2 size={11} class="animate-spin" /> Loading older history…
-        </p>
+        <p class="px-2.5 py-1.5 text-meta text-textMuted" role="status">Loading older history…</p>
+        <Skeleton variant="tree-row" count={2} />
       {:else if !hasMore && rows.length > 0}
-        <p class="px-2.5 py-1.5 text-[9px] text-textMuted">Start of the loaded history.</p>
+        <p class="px-2.5 py-1.5 text-micro text-textMuted">Start of the loaded history.</p>
       {/if}
     </div>
     <canvas
@@ -662,11 +665,11 @@
       {mainlineName}
       {hasMore}
     >
-      <div class="max-h-56 overflow-hidden border-t border-border/40 px-3 py-2 text-[10px]" data-card-details>
+      <div class="max-h-56 overflow-hidden px-3 pb-2.5 text-meta" data-card-details>
         {#if !cardInfo || cardInfo.body.state === "loading"}
           <p class="text-textMuted">Reading the commit message…</p>
         {:else if cardInfo.body.state === "error"}
-          <p class="text-amber-600 dark:text-amber-400">Message body could not be read: {cardInfo.body.error}</p>
+          <p class="text-warn">Couldn't read the message body. {cardInfo.body.error}</p>
         {:else if cardInfo.body.value.trim().length > 0}
           <div class="max-h-28 overflow-hidden text-textPrimary" data-card-body>
             <MarkdownBody source={cardInfo.body.value} />
@@ -676,13 +679,13 @@
         {/if}
 
         {#if cardInfo && cardInfo.note.state === "ready" && cardInfo.note.value !== null}
-          <div class="mt-2 rounded border border-border/60 bg-background/60 px-2 py-1" data-card-note>
-            <div class="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-textMuted">Note</div>
+          <div class="mt-2 rounded-lg bg-background px-2 py-1" data-card-note>
+            <div class="gp-label mb-0.5">Note</div>
             <p class="whitespace-pre-wrap break-words text-textPrimary">{cardInfo.note.value}</p>
           </div>
         {:else if cardInfo && cardInfo.note.state === "error"}
-          <p class="mt-2 text-amber-600 dark:text-amber-400" data-card-note-error>
-            Notes could not be read: {cardInfo.note.error}
+          <p class="mt-2 text-warn" data-card-note-error>
+            Couldn't read the notes. {cardInfo.note.error}
           </p>
         {/if}
 
@@ -698,7 +701,7 @@
           {/if}
         {/if}
 
-        <p class="mt-2 text-[9px] text-textMuted">
+        <p class="mt-2 text-micro text-textMuted">
           {#if cardCompare}
             Click to compare <span class="font-mono">{compareLabel(cardCompare.base, cardCompare.target)}</span>
           {:else}

@@ -48,6 +48,8 @@
   import { liquidSelection } from "../ui/transitions";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
+  import { LAYERS } from "../ui/layers";
+  import EmptyState from "./EmptyState.svelte";
   import VirtualList from "./VirtualList.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import type { PreviewMarker } from "../codeintel/previewSummary";
@@ -166,14 +168,14 @@
   function statusTone(code: string): string {
     switch (code.charAt(0)) {
       case "A":
-        return "text-emerald-600 dark:text-emerald-400";
+        return "text-ok";
       case "D":
-        return "text-rose-600 dark:text-rose-400";
+        return "text-danger";
       case "R":
       case "C":
-        return "text-sky-600 dark:text-sky-400";
+        return "text-info";
       case "M":
-        return "text-amber-600 dark:text-amber-400";
+        return "text-warn";
       case "?":
         return "text-textMuted";
       default:
@@ -235,20 +237,20 @@
 </script>
 
 <aside
-  class="relative flex shrink-0 flex-col border-r border-border/60 bg-surface/40 font-sans"
+  class="relative flex shrink-0 flex-col bg-surface font-sans"
   style="width: {width}px"
   aria-label="Files in this diff"
 >
   <!-- Which tab, and which change is on screen. The change line answers
        "what am I looking at" from either tab, so neither has to be opened to
        find out. -->
-  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2 py-1">
+  <div class="gp-header">
     {#if history}
       <div class="gp-segmented p-0.5!" class:gp-liquid-tabs={macos} role="tablist" aria-label="File rail">
         <button
           type="button"
           role="tab"
-          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-[10px]"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-micro"
           aria-selected={!showingHistory}
           data-active={!showingHistory ? "true" : "false"}
           title="Files in this change"
@@ -271,7 +273,7 @@
         <button
           type="button"
           role="tab"
-          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-[10px]"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-micro"
           aria-selected={showingHistory}
           data-active={showingHistory ? "true" : "false"}
           title="Commit history — pick or compare commits ({shortcutTextLabel('⌥H', $hostPlatform.os)})"
@@ -294,12 +296,13 @@
       </div>
     {:else}
       <FileCode size={12} class="shrink-0 text-accent" />
-      <span class="text-[11px] font-semibold text-textPrimary">{filesHeading}</span>
+      <span class="text-meta font-semibold text-textPrimary">{filesHeading}</span>
     {/if}
     <span class="flex-1"></span>
     <button
       type="button"
-      class="gp-icon-btn p-1!"
+      class="gp-icon-btn"
+      data-size="sm"
       onclick={onCollapse}
       title="Hide the file list"
       aria-label="Hide the file list"
@@ -309,7 +312,7 @@
   </div>
 
   <div
-    class="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1 text-[10px]"
+    class="flex items-center gap-1.5 px-2.5 py-1 text-meta"
     data-change-line
   >
     {#if comparing}
@@ -320,7 +323,8 @@
       {#if onExitCompare}
         <button
           type="button"
-          class="gp-icon-btn p-0.5!"
+          class="gp-icon-btn"
+          data-size="sm"
           title="Stop comparing and show the newer commit alone"
           aria-label="Stop comparing"
           onclick={onExitCompare}
@@ -338,12 +342,12 @@
   {#if showingHistory && history}
     {@render history()}
   {:else}
-  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2.5 py-1.5">
+  <div class="flex items-center gap-1.5 px-2.5 py-1.5">
     <FileCode size={12} class="shrink-0 text-accent" />
-    <span class="text-[11px] font-semibold text-textPrimary">
+    <span class="text-meta font-semibold text-textPrimary">
       {filesHeading}
     </span>
-    <span class="ml-auto text-[10px] tabular-nums text-textMuted">{rail.entries.length}</span>
+    <span class="ml-auto text-micro tabular-nums text-textMuted">{rail.entries.length}</span>
     <div class="gp-segmented p-0.5!" role="group" aria-label="File list layout">
       <button
         type="button"
@@ -368,12 +372,12 @@
     </div>
   </div>
 
-  <div class="flex items-center gap-1 border-b border-border/60 gp-section-edge px-2 py-1">
+  <div class="flex items-center gap-1 px-2 py-1">
     <Filter size={11} class="shrink-0 text-textMuted" />
     <input
       bind:value={query}
       type="text"
-      class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
+      class="gp-field min-w-0 flex-1 py-0.5! text-meta!"
       placeholder="Filter files…"
       aria-label="Filter files in this diff"
       onkeydown={(e) => {
@@ -386,7 +390,8 @@
     {#if query}
       <button
         type="button"
-        class="gp-icon-btn p-0.5!"
+        class="gp-icon-btn"
+        data-size="sm"
         onclick={() => (query = "")}
         title="Clear the filter"
         aria-label="Clear the filter"
@@ -400,19 +405,19 @@
        as though they were all of them tells the reader they have seen the
        whole commit. -->
   {#if note}
-    <p class="border-b border-border/60 px-2.5 py-1 text-[10px] text-amber-600 dark:text-amber-400">
+    <p class="px-2.5 py-1 text-meta text-warn">
       {note}
     </p>
   {/if}
   {#if searchNote}
-    <p class="border-b border-border/60 px-2.5 py-1 text-[10px] text-textMuted">{searchNote}</p>
+    <p class="px-2.5 py-1 text-meta text-textMuted">{searchNote}</p>
   {/if}
 
   {#snippet railRow(row: RailRow | undefined, index: number)}
     {#if row?.kind === "dir"}
       <button
         type="button"
-        class="flex w-full items-center gap-1 py-0.5 pr-2 text-left text-[11px] text-textMuted hover:bg-surfaceHover"
+        class="flex w-full items-center gap-1 py-0.5 pr-2 text-left text-meta text-textMuted hover:bg-surfaceHover"
         style="height: {ROW_HEIGHT}px; padding-left: {8 + row.depth * 10}px"
         aria-expanded={!collapsed.has(row.path)}
         title={row.path}
@@ -424,7 +429,7 @@
           <ChevronDown size={11} class="shrink-0" />
         {/if}
         <span class="min-w-0 flex-1 truncate font-medium">{row.name}</span>
-        <span class="shrink-0 font-mono text-[9px] opacity-70">{row.fileCount}</span>
+        <span class="shrink-0 font-mono text-micro opacity-70">{row.fileCount}</span>
       </button>
     {:else if row?.kind === "file"}
       {@const active = isActiveRow(row, index)}
@@ -432,7 +437,7 @@
       {@const marker = previewMarkers?.get(row.entry.path) ?? null}
       <button
         type="button"
-        class="flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] hover:bg-surfaceHover {active
+        class="flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-meta hover:bg-surfaceHover {active
           ? 'bg-accent/10 text-accent'
           : 'text-textMuted'}"
         style="height: {ROW_HEIGHT}px; padding-left: {8 + row.depth * 10}px"
@@ -440,20 +445,20 @@
         title={marker ? `${row.title} — ${marker.title}` : row.title}
         onclick={() => onOpen(row.entry)}
       >
-        <span class="w-3 shrink-0 font-mono text-[10px] {statusTone(row.entry.statusCode)}">
+        <span class="w-3 shrink-0 font-mono text-micro {statusTone(row.entry.statusCode)}">
           {row.entry.statusCode.charAt(0) || "?"}
         </span>
         <span class="flex min-w-0 flex-1 items-baseline gap-0.5 truncate">
           {#if row.dir}
-            <span class="min-w-0 shrink truncate text-[10px] opacity-55">{row.dir}/</span>
+            <span class="min-w-0 shrink truncate text-micro opacity-55">{row.dir}/</span>
           {/if}
           <span class="shrink-0 truncate">{row.name}</span>
         </span>
         {#if marker && marker.kind !== "clean"}
           <span
-            class="shrink-0 rounded px-0.5 font-mono text-[9px] tabular-nums {marker.kind === 'breaks'
-              ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
-              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}"
+            class="shrink-0 rounded px-0.5 font-mono text-micro tabular-nums {marker.kind === 'breaks'
+              ? 'bg-danger/15 text-danger'
+              : 'bg-warn/15 text-warn'}"
             title={marker.title}
             data-preview-marker={marker.kind}
           >
@@ -461,19 +466,19 @@
           </span>
         {/if}
         {#if rail.source === "worktree" && row.entry.isStaged}
-          <span class="shrink-0 text-[9px] text-emerald-600 dark:text-emerald-400">staged</span>
+          <span class="shrink-0 text-micro text-ok">staged</span>
         {/if}
         {#if churn}
-          <span class="shrink-0 font-mono text-[9px] tabular-nums text-textMuted">{churn}</span>
+          <span class="shrink-0 font-mono text-micro tabular-nums text-textMuted">{churn}</span>
         {/if}
       </button>
     {/if}
   {/snippet}
 
-  {#if rows.length === 0}
-    <p class="px-2.5 py-3 text-[11px] text-textMuted">
-      {rail.entries.length === 0 ? "No files in this change." : "No file matches the filter."}
-    </p>
+  {#if rows.length === 0 && rail.entries.length === 0}
+    <EmptyState icon={FileCode} title="No files in this change." compact />
+  {:else if rows.length === 0}
+    <p class="px-2.5 py-3 text-meta text-textMuted">No file matches the filter.</p>
   {:else if virtualize}
     <VirtualList
       items={rows}
@@ -510,9 +515,10 @@
          classifies every separator as non-interactive, which is true only of
          the decorative kind. -->
     <div
-      class="absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize {dragging
+      class="absolute inset-y-0 -right-1 w-2 cursor-col-resize {dragging
         ? 'bg-accent/40'
         : 'hover:bg-accent/25'}"
+      style="z-index: {LAYERS.STICKY}"
       role="separator"
       aria-label="Resize the file list"
       aria-orientation="vertical"

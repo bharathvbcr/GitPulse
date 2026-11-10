@@ -158,7 +158,7 @@ describe("CommitTable failed and loading reloads", () => {
   it("exposes the error banner and progress bar to assistive tech", () => {
     const banner = source.slice(
       source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"),
-      source.indexOf("class=\"relative z-10 flex min-w-0 shrink-0"),
+      source.indexOf("class=\"relative isolate flex min-w-0 shrink-0"),
     );
     expect(banner).toContain('role="alert"');
     const bar = source.slice(source.indexOf("{#if $graphStore.isLoading}"), source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"));
