@@ -167,9 +167,7 @@ fn serve_bounded_in(
     work: impl FnOnce() -> AppFacets + Send + 'static,
 ) -> Result<AppFacets, String> {
     if abandoned.load(Ordering::Acquire) >= MAX_ABANDONED {
-        return Err(format!(
-            "{MAX_ABANDONED} earlier reads are still running"
-        ));
+        return Err(format!("{MAX_ABANDONED} earlier reads are still running"));
     }
     let state = Arc::new(AtomicU8::new(RUNNING));
     let (send, receive) = mpsc::channel();
@@ -208,7 +206,12 @@ fn serve_bounded_in(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             abandoned.fetch_add(1, Ordering::AcqRel);
             if state
-                .compare_exchange(RUNNING, ABANDONED_STATE, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    RUNNING,
+                    ABANDONED_STATE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return Ok(unscanned(
@@ -631,7 +634,10 @@ pub fn snapshot_from_app(
                 ));
             }
             if !partial.is_empty() {
-                return Err(format!("the app's answer is partial: {}", partial.join(", ")));
+                return Err(format!(
+                    "the app's answer is partial: {}",
+                    partial.join(", ")
+                ));
             }
             Ok(complete_snapshot(
                 repo_path,

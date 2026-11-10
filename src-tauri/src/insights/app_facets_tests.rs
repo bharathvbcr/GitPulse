@@ -68,7 +68,14 @@ fn spawned(farm: &Farm, marks: &[usize]) -> (usize, usize) {
 }
 
 fn ask(farm: &Farm, memo: &CollisionMemo) -> AppFacets {
-    serve_with(&farm.repo, &Vec::new(), memo, APP_TTL, APP_BUDGET, APP_BUDGET)
+    serve_with(
+        &farm.repo,
+        &Vec::new(),
+        memo,
+        APP_TTL,
+        APP_BUDGET,
+        APP_BUDGET,
+    )
 }
 
 #[test]
@@ -81,7 +88,11 @@ fn a_clean_farm_is_answered_whole_and_a_repeat_costs_no_git_child() {
     assert_eq!(worktrees.count, 4);
     assert!(first.agents.is_some() && first.changes.is_some());
     assert_eq!(
-        first.collisions.as_ref().expect("scanned").scanned_worktrees,
+        first
+            .collisions
+            .as_ref()
+            .expect("scanned")
+            .scanned_worktrees,
         4
     );
 
@@ -121,7 +132,10 @@ fn a_positive_collision_is_read_again_where_it_was_found() {
 fn an_untrusted_or_unrelated_repository_is_refused_not_answered_empty() {
     let farm = farm(1, false);
     crate::repository_trust::revoke(&farm.repo).expect("revoke trust");
-    assert!(serve(&farm.repo).is_err(), "an untrusted repository was read");
+    assert!(
+        serve(&farm.repo).is_err(),
+        "an untrusted repository was read"
+    );
 
     let elsewhere = tempfile::tempdir().expect("not a repository");
     assert!(
@@ -180,7 +194,14 @@ fn ask_observed(
     observation: &live_sessions::Observation,
     memo: &CollisionMemo,
 ) -> AppFacets {
-    serve_with(&farm.repo, observation, memo, APP_TTL, APP_BUDGET, APP_BUDGET)
+    serve_with(
+        &farm.repo,
+        observation,
+        memo,
+        APP_TTL,
+        APP_BUDGET,
+        APP_BUDGET,
+    )
 }
 
 /// A shared checkout that the kept read shows dirty is a positive: read again
@@ -238,7 +259,10 @@ fn a_dirty_shared_checkout_whose_reread_misses_the_bound_is_not_scanned() {
         APP_BUDGET,
         Duration::ZERO,
     );
-    let risk = missed.collisions.as_ref().expect("the facet is still there");
+    let risk = missed
+        .collisions
+        .as_ref()
+        .expect("the facet is still there");
     assert!(risk.unscanned_worktrees >= 1, "{risk:?}");
     assert!(
         risk.shared_worktrees
@@ -274,9 +298,8 @@ fn a_dirty_shared_checkout_whose_reread_misses_the_bound_is_not_scanned() {
 fn a_read_older_than_the_promised_age_is_read_again_and_a_younger_one_is_not() {
     let farm = farm(2, false);
     let memo = CollisionMemo::new(MEMO_TTL);
-    let serve = |ttl: Duration| {
-        serve_with(&farm.repo, &Vec::new(), &memo, ttl, APP_BUDGET, APP_BUDGET)
-    };
+    let serve =
+        |ttl: Duration| serve_with(&farm.repo, &Vec::new(), &memo, ttl, APP_BUDGET, APP_BUDGET);
     serve(Duration::from_secs(3600));
 
     // The kept reads are 50 ms old as far as the stamps are told: a young
@@ -313,7 +336,10 @@ fn slack() -> Duration {
 /// than `slack()` above it.
 fn assert_age_near(age_ms: u64, known: Duration) {
     let known_ms = known.as_millis() as u64;
-    assert!(age_ms >= known_ms, "{age_ms} ms understates a {known_ms} ms read");
+    assert!(
+        age_ms >= known_ms,
+        "{age_ms} ms understates a {known_ms} ms read"
+    );
     assert!(
         age_ms <= known_ms + slack().as_millis() as u64,
         "{age_ms} ms overstates a {known_ms} ms read"
@@ -332,11 +358,29 @@ fn the_age_is_the_oldest_read_used_even_when_other_worktrees_were_just_read() {
     let main = farm.repo.clone();
     let known = Duration::from_millis(1500);
     let answer = test_ages::with_ages(
-        move |dir| Some(if dir == Path::new(&main) { known } else { Duration::from_millis(100) }),
-        || serve_with(&farm.repo, &Vec::new(), &memo, Duration::from_secs(3600), APP_BUDGET, APP_BUDGET),
+        move |dir| {
+            Some(if dir == Path::new(&main) {
+                known
+            } else {
+                Duration::from_millis(100)
+            })
+        },
+        || {
+            serve_with(
+                &farm.repo,
+                &Vec::new(),
+                &memo,
+                Duration::from_secs(3600),
+                APP_BUDGET,
+                APP_BUDGET,
+            )
+        },
     );
     let risk = answer.collisions.as_ref().expect("scanned");
-    assert!(risk.overlapping_files >= 1, "the siblings are in a collision: {risk:?}");
+    assert!(
+        risk.overlapping_files >= 1,
+        "the siblings are in a collision: {risk:?}"
+    );
     assert_age_near(answer.age_ms, known);
 }
 
@@ -358,7 +402,16 @@ fn a_refresh_of_the_cache_after_the_reads_does_not_lower_the_age() {
             let first = asked_once.borrow_mut().insert(dir.to_path_buf());
             Some(if first { known } else { Duration::ZERO })
         },
-        || serve_with(&farm.repo, &Vec::new(), &memo, Duration::from_secs(3600), APP_BUDGET, APP_BUDGET),
+        || {
+            serve_with(
+                &farm.repo,
+                &Vec::new(),
+                &memo,
+                Duration::from_secs(3600),
+                APP_BUDGET,
+                APP_BUDGET,
+            )
+        },
     );
     assert_age_near(answer.age_ms, known);
 }
@@ -433,9 +486,7 @@ fn a_read_that_cannot_finish_in_time_is_abandoned_and_every_facet_is_not_scanned
         "abandoned reads never ended"
     );
     let patient = crate::test_support::coverage_relaxed(Duration::from_secs(2));
-    let after = serve_bounded_in(&MINE, "/r".into(), patient, || {
-        unscanned("/r".into(), "ok")
-    });
+    let after = serve_bounded_in(&MINE, "/r".into(), patient, || unscanned("/r".into(), "ok"));
     assert!(after.is_ok());
 }
 

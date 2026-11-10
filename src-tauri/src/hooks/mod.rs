@@ -2175,8 +2175,8 @@ fn usable(
 ) -> Result<(insights::InsightsSnapshot, u64), String> {
     let facets: insights::AppFacets = serde_json::from_value(answer)
         .map_err(|error| format!("the answer is malformed: {error}"))?;
-    let asked_about = std::fs::canonicalize(repo)
-        .map_err(|error| format!("cannot resolve {repo}: {error}"))?;
+    let asked_about =
+        std::fs::canonicalize(repo).map_err(|error| format!("cannot resolve {repo}: {error}"))?;
     if Path::new(&facets.repo) != asked_about {
         return Err(format!(
             "the app answered about {}, not {}",
@@ -6214,12 +6214,9 @@ done
             .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
 
         let marks = spawn_marks(&farm.dirs);
-        let (asked, age_ms) = insights_from_app_in(
-            app._profile.path().to_path_buf(),
-            &farm.repo,
-            unhurried(),
-        )
-        .expect("a fresh answer is believed");
+        let (asked, age_ms) =
+            insights_from_app_in(app._profile.path().to_path_buf(), &farm.repo, unhurried())
+                .expect("a fresh answer is believed");
         let with_app = spawn_cost(&farm.dirs, &marks);
 
         let marks = spawn_marks(&farm.dirs);
@@ -6391,7 +6388,11 @@ done
             .expect("canonical")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(canned["repo"], json!(canonical), "the reply names its repository");
+        assert_eq!(
+            canned["repo"],
+            json!(canonical),
+            "the reply names its repository"
+        );
         let mut other = canned.clone();
         other["repo"] = json!("/somewhere/else");
         let refused = insights_replayed(&farm, other, unhurried()).unwrap_err();
@@ -6505,9 +6506,16 @@ done
         for call in 1..=3 {
             let busy = insights_from_app_in(dir.clone(), &farm.repo, unhurried()).unwrap_err();
             assert!(busy.contains("busy"), "{busy}");
-            assert!(!busy.contains("not asking"), "call {call} was not asked: {busy}");
+            assert!(
+                !busy.contains("not asking"),
+                "call {call} was not asked: {busy}"
+            );
         }
-        assert_eq!(asked.load(Ordering::Acquire), 3, "a busy app was left alone");
+        assert_eq!(
+            asked.load(Ordering::Acquire),
+            3,
+            "a busy app was left alone"
+        );
     }
 
     /// An app that keeps answering without being usable stops being asked after
@@ -6546,15 +6554,25 @@ done
         mode.store(0, Ordering::Release);
         for _ in 0..2 {
             let err = ask().unwrap_err();
-            assert!(err.contains("partial") && !err.contains("not asking"), "{err}");
+            assert!(
+                err.contains("partial") && !err.contains("not asking"),
+                "{err}"
+            );
         }
         assert_eq!(asked.load(Ordering::Acquire), 5);
 
         // The third in a row starts the quiet, and the reason stays visible.
         assert!(ask().unwrap_err().contains("partial"));
         let quiet = ask().unwrap_err();
-        assert!(quiet.contains("not asking") && quiet.contains("partial"), "{quiet}");
-        assert_eq!(asked.load(Ordering::Acquire), 6, "an unusable app was asked again");
+        assert!(
+            quiet.contains("not asking") && quiet.contains("partial"),
+            "{quiet}"
+        );
+        assert_eq!(
+            asked.load(Ordering::Acquire),
+            6,
+            "an unusable app was asked again"
+        );
     }
 
     /// Two reads in one tool call (a deferral retry) pay a slow app's deadline
@@ -6600,7 +6618,10 @@ done
         assert!(serve_insights(&farm.repo).is_ok());
         crate::repository_trust::revoke(&farm.repo).expect("revoke trust");
         let refused = serve_insights(&farm.repo);
-        assert!(refused.is_err(), "an untrusted repository was read: {refused:?}");
+        assert!(
+            refused.is_err(),
+            "an untrusted repository was read: {refused:?}"
+        );
         let elsewhere = tempfile::tempdir().expect("not a repository");
         assert!(serve_insights(&elsewhere.path().to_string_lossy()).is_err());
     }

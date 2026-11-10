@@ -132,7 +132,10 @@ fn adv_a_served_insights_document_meets_the_schema_that_declares_served_by() {
         .map(validate::Violation::render)
         .collect();
     assert!(violations.is_empty(), "{violations:?}");
-    assert_eq!(document["served_by"], json!({"source": "app", "age_ms": 1234}));
+    assert_eq!(
+        document["served_by"],
+        json!({"source": "app", "age_ms": 1234})
+    );
 
     let mut wrong = document.clone();
     wrong["served_by"]["source"] = json!("cloud");
@@ -147,7 +150,10 @@ fn adv_a_served_insights_document_meets_the_schema_that_declares_served_by() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    assert!(described.contains("served_by") && described.contains("age_ms"), "{described}");
+    assert!(
+        described.contains("served_by") && described.contains("age_ms"),
+        "{described}"
+    );
 }
 
 #[test]

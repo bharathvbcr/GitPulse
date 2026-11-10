@@ -1726,7 +1726,10 @@ fn insights_reads_are_bounded_and_never_starve_the_edit_hooks() {
                 Secondary::connect(&socket)
                     .ok()
                     .expect("reach the owner")
-                    .insights(&insights_request(&format!("i-{n}")), Duration::from_secs(30))
+                    .insights(
+                        &insights_request(&format!("i-{n}")),
+                        Duration::from_secs(30),
+                    )
             })
         })
         .collect();
