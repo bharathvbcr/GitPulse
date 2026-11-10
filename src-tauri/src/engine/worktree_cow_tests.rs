@@ -248,6 +248,88 @@ fn attrs(
     }
 }
 
+/// A repository with files named so that `git hash-object --stdin-paths`
+/// would read a different file than the one named: it unquotes a line that
+/// starts with `"` and drops a trailing CR.
+fn repo_with_awkward_names(sandbox: &Path, same_content: bool) -> PathBuf {
+    let repo = sandbox.join("main");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-b", "main"]);
+    trust_repo(&repo);
+    let (quoted, cr) = if same_content {
+        ("one\n", "three\n")
+    } else {
+        ("two\n", "four\n")
+    };
+    std::fs::write(repo.join("x"), "one\n").unwrap();
+    std::fs::write(repo.join("\"x\""), quoted).unwrap();
+    std::fs::write(repo.join("y"), "three\n").unwrap();
+    std::fs::write(repo.join("y\r"), cr).unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-m", "initial"]);
+    repo
+}
+
+#[test]
+fn a_clone_is_never_verified_against_a_file_that_stdin_paths_would_name_instead() {
+    let sandbox = tempfile::TempDir::new().unwrap();
+    let repo = repo_with_awkward_names(sandbox.path(), false);
+    let ls = crate::engine::git_cli::git_captured(&repo, &["ls-files", "-s", "-z"]).unwrap();
+    let cloned: Vec<(String, String)> = parse_ls_files_stage0(&ls.stdout)
+        .into_iter()
+        .map(|(_, oid, rel)| (rel, oid))
+        .collect();
+    assert_eq!(cloned.len(), 4, "fixture: all four names are tracked");
+    // `"x"` and `y\r` are stale; the files `--stdin-paths` would open instead
+    // (`x`, `y`) hold exactly the bytes of the blobs those two should have.
+    std::fs::write(repo.join("\"x\""), "stale\n").unwrap();
+    std::fs::write(repo.join("x"), "two\n").unwrap();
+    std::fs::write(repo.join("y\r"), "stale\n").unwrap();
+    std::fs::write(repo.join("y"), "four\n").unwrap();
+
+    let wrong = clones_that_are_not_their_blob(&repo, &cloned).unwrap();
+    for name in ["\"x\"", "y\r"] {
+        assert!(
+            wrong.iter().any(|path| path == name),
+            "{name:?} is stale and must be reported, got {wrong:?}"
+        );
+    }
+}
+
+#[test]
+fn paths_stdin_paths_cannot_name_exactly_are_checked_out_by_git_not_cloned() {
+    let sandbox = tempfile::TempDir::new().unwrap();
+    let main = repo_with_awkward_names(sandbox.path(), true);
+    for rel in ["x", "\"x\"", "y", "y\r"] {
+        set_mtime(&main.join(rel));
+    }
+    let _ = crate::engine::git_cli::git_captured(&main, &["update-index", "--refresh"]).unwrap();
+    let lane = sandbox.path().join("lane");
+    add_worktree(
+        main.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("lane"),
+        None,
+        false,
+    )
+    .expect("add_worktree");
+
+    for rel in ["x", "y"] {
+        assert_eq!(mtime(&lane.join(rel)), old_time(), "{rel:?} is cloned");
+    }
+    for rel in ["\"x\"", "y\r"] {
+        assert_ne!(
+            mtime(&lane.join(rel)),
+            old_time(),
+            "{rel:?} cannot be named to `git hash-object --stdin-paths`, so it is not cloned"
+        );
+        assert_eq!(
+            std::fs::read(lane.join(rel)).unwrap(),
+            std::fs::read(main.join(rel)).unwrap()
+        );
+    }
+}
+
 #[test]
 fn conversion_decision_table() {
     let u = "unspecified";

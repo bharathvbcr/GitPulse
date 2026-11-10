@@ -3270,18 +3270,34 @@ fn paths_converted_on_checkout(
         .collect())
 }
 
+/// Whether `git hash-object --stdin-paths` opens exactly the file `rel` names.
+/// It reads one path per line, so a path with a newline is two paths; it
+/// unquotes a line that starts with `"` (C-style), so `"x"` opens `x`; and it
+/// drops a CR before the newline, so `y\r` opens `y`. Such a path cannot be
+/// verified by hashing, and is therefore never cloned.
+#[cfg(target_os = "macos")]
+fn named_exactly_by_stdin_paths(rel: &str) -> bool {
+    !rel.is_empty() && !rel.starts_with('"') && !rel.contains(['\n', '\r'])
+}
+
 /// The clones whose bytes, hashed as stored with no filter, are not their
-/// index blob. `cloned` is `(path, blob oid)` pairs, paths free of newlines.
+/// index blob. `cloned` is `(path, blob oid)` pairs. A path
+/// [`named_exactly_by_stdin_paths`] says cannot be named is reported as not
+/// matching, never hashed: the hash would be of some other file.
 #[cfg(target_os = "macos")]
 fn clones_that_are_not_their_blob(
     target: &Path,
     cloned: &[(String, String)],
 ) -> Result<Vec<String>, CommandError> {
-    if cloned.is_empty() {
-        return Ok(Vec::new());
+    let (hashable, unnameable): (Vec<&(String, String)>, Vec<&(String, String)>) = cloned
+        .iter()
+        .partition(|(rel, _)| named_exactly_by_stdin_paths(rel));
+    let mut wrong: Vec<String> = unnameable.iter().map(|(rel, _)| rel.clone()).collect();
+    if hashable.is_empty() {
+        return Ok(wrong);
     }
     let mut stdin = Vec::new();
-    for (rel, _) in cloned {
+    for (rel, _) in &hashable {
         stdin.extend_from_slice(rel.as_bytes());
         stdin.push(b'\n');
     }
@@ -3292,20 +3308,22 @@ fn clones_that_are_not_their_blob(
     )?;
     let hashed = String::from_utf8_lossy(&out);
     let oids: Vec<&str> = hashed.lines().collect();
-    if oids.len() != cloned.len() {
+    if oids.len() != hashable.len() {
         return Err(format!(
             "git hash-object returned {} oids for {} clones",
             oids.len(),
-            cloned.len()
+            hashable.len()
         )
         .into());
     }
-    Ok(cloned
-        .iter()
-        .zip(oids)
-        .filter(|((_, expected), actual)| expected != actual)
-        .map(|((rel, _), _)| rel.clone())
-        .collect())
+    wrong.extend(
+        hashable
+            .iter()
+            .zip(oids)
+            .filter(|((_, expected), actual)| expected != actual)
+            .map(|((rel, _), _)| rel.clone()),
+    );
+    Ok(wrong)
 }
 
 /// Zero-copy APFS tracked source materialization (`F15` / `P3.2`):
@@ -3443,7 +3461,7 @@ fn try_add_worktree_cow_macos(
             .iter()
             .filter(|(mode, oid, rel)| {
                 matches!(mode.as_str(), "100644" | "100755")
-                    && !rel.contains('\n')
+                    && named_exactly_by_stdin_paths(rel)
                     && donor_clean
                         .get(rel)
                         .is_some_and(|(d_mode, d_oid)| d_mode == mode && d_oid == oid)
@@ -3455,7 +3473,7 @@ fn try_add_worktree_cow_macos(
 
         for (mode, oid, rel) in target_entries {
             let can_clone = matches!(mode.as_str(), "100644" | "100755")
-                && !rel.contains('\n')
+                && named_exactly_by_stdin_paths(&rel)
                 && !converted.contains(&rel)
                 && donor_clean
                     .get(&rel)
