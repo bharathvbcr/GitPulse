@@ -18,6 +18,7 @@
   import { onDestroy, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { FolderOpen } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
   import { admitAnyway, HOST_PRESSURE_REFUSAL } from "../stores/hostLoadStore";
@@ -241,7 +242,7 @@
     provisionWorktree = pending.worktree === true;
     acknowledged = pending.acknowledge_bypass;
     settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode, keepWarm: settings.keepWarm });
-    note = "This attempt's earlier preparation was never answered. Retry it, or discard it to start over.";
+    note = "This run's earlier preparation was never answered. Try it again, or discard it to start over.";
   });
   $effect(() => {
     const best = preferredCheckout(candidates);
@@ -273,7 +274,7 @@
     releasePendingPreparation(pending.task_id, pending.id);
     pending = null;
     error = "";
-    note = "Discarded. If the store did create that attempt it is listed under this task's Agents, holds its checkout until it expires, and can be cancelled there.";
+    note = "Discarded. If the store did create that run it is listed under this task's Agents, holds its checkout until it expires, and can be cancelled there.";
     void loadHolding(selected);
   }
 
@@ -334,7 +335,7 @@
         const latest = await bounded(getTask(taskId));
         if (disposed) return;
         if (latest.revision !== revision) {
-          throw new Error("This task changed since it was loaded. Reload the saved task and launch its latest revision.");
+          throw new Error("This task changed since it was loaded. Refresh the saved task and run its latest revision.");
         }
         const repo = await bounded(getRepository(repository));
         if (disposed) return;
@@ -342,7 +343,7 @@
         if (!model.ok) throw new Error(model.reason);
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
-        if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the attempt appears here when it is ready.";
+        if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the run appears here when it is ready.";
         const prepared: RunPreparation = {
           kind: settings.kind,
           id: newID(),
@@ -403,13 +404,13 @@
       // refused, and replaying gets the same unreadable answer, so the retry
       // is dropped — but the attempt may well exist.
       if (sent && cause instanceof WorkbenchError && cause.code === "protocol_error") {
-        error = `${error} The store did answer, so this attempt may exist: check this task's Agents before launching again.`;
+        error = `${error} The store did answer, so this run may exist: check this task's Agents before running it again.`;
       }
       // The store saw an agent this form did not (a read that failed, or one
       // that started since). Select the worktree so the next press runs.
       if (cause instanceof WorkbenchError && cause.code === "checkout_busy" && pending === null) {
         provisionWorktree = true;
-        error = `${error} A new worktree is now selected for this attempt; launch again to run it beside that one.`;
+        error = `${error} A new worktree is now selected for this run; run it again to place it beside that one.`;
       }
     } finally {
       // The optimistic row is replaced by the run itself, or withdrawn.
@@ -490,20 +491,20 @@
   {/if}
 
   <label class="ack">
-    <input
-      type="checkbox"
+    <Checkbox
+      ariaLabel="Run in a new worktree"
       checked={useWorktree}
       disabled={locked || holder.kind !== "free"}
-      onchange={(e) => { provisionWorktree = e.currentTarget.checked; }}
+      onchange={(next) => { provisionWorktree = next; }}
     />
     Run in a new worktree, so other tasks can run at the same time
   </label>
   {#if occupant}
-    <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This attempt gets its own worktree and branch beside it.</p>
+    <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This run gets its own worktree and branch beside it.</p>
   {:else if holder.kind === "unknown"}
-    <p class="meta" role="status" data-testid="checkout-holder-unknown">Cannot tell whether an agent already works in this checkout ({holder.reason}), so this attempt runs in its own worktree. Launching in the checkout itself is disabled until that is known.</p>
+    <p class="meta" role="status" data-testid="checkout-holder-unknown">Cannot tell whether an agent already works in this checkout ({holder.reason}), so this run uses its own worktree. Running in the checkout itself is disabled until that is known.</p>
   {:else if useWorktree}
-    <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the attempt is refused.</p>
+    <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the run is refused.</p>
   {/if}
 
   <label>Permission mode
@@ -514,7 +515,7 @@
   <p class="meta" data-testid="permission-detail">{PERMISSION_LABELS[settings.permission]?.detail ?? ""}</p>
   {#if overrideFields.length}
     <fieldset class="model" data-testid="handoff-model-override">
-      <legend>Model for this launch</legend>
+      <legend>Model for this run</legend>
       <div class="pair">
         {#if overrideFields.includes("model")}
           {@const choices = modelOverrideChoices(settings.provider, "model")}
@@ -545,33 +546,32 @@
           {/if}
         {/if}
       </div>
-      <p class="meta">Blank fields keep the default from Settings. What this attempt runs with is recorded on it.</p>
+      <p class="meta">Blank fields keep the default from Settings. What this run uses is recorded on it.</p>
     </fieldset>
   {/if}
   <p class="meta">These are requested settings. {settings.kind === "managed" ? `Manvi verifies the effective ${PROVIDER_LABELS[settings.provider]} settings before sending the task.` : "The provider handles requests in its own terminal."}</p>
   {#if settings.kind === "managed"}
-    <label class="ack">
-      <input
-        type="checkbox"
-        data-testid="handoff-keep-warm"
+    <label class="ack" data-testid="handoff-keep-warm">
+      <Checkbox
+        ariaLabel="Keep session warm for follow-ups"
         checked={settings.keepWarm === true}
         disabled={locked}
-        onchange={(e) => choose({ keepWarm: e.currentTarget.checked })}
+        onchange={(next) => choose({ keepWarm: next })}
       />
       Keep session warm for follow-ups (park managed session between turns for multi-turn collaboration)
     </label>
   {/if}
   {#if settings.permission === "bypass"}
     <label class="ack">
-      <input type="checkbox" bind:checked={acknowledged} disabled={locked} />
-      I authorize bypass for this launch attempt. Worktrees do not isolate host access.
+      <Checkbox ariaLabel="I authorize bypass for this run" checked={acknowledged} disabled={locked} onchange={(next) => { acknowledged = next; }} />
+      I authorize bypass for this run. Worktrees do not isolate host access.
     </label>
   {/if}
 
   {#if pending}
     <p role="status" class="warn">
-      The preparation result is uncertain. Retry this exact attempt before creating another.
-      <button type="button" class="gp-btn discard" disabled={busy} onclick={discard}>Discard it</button>
+      The preparation result is uncertain. Try this exact run again before creating another.
+      <button type="button" class="gp-btn discard" data-size="sm" disabled={busy} onclick={discard}>Discard it</button>
     </p>
   {/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
@@ -580,7 +580,7 @@
     <!-- The load governor refused the launch (docs/LOAD_GOVERNOR.md). Retry
          asks again; Admit anyway asks in a system dialog, then asks again. -->
     <p class="meta" data-testid="handoff-pressure-actions">
-      <button type="button" class="gp-btn" disabled={locked} onclick={() => void launch()}>Retry</button>
+      <button type="button" class="gp-btn" disabled={locked} onclick={() => void launch()}>Try again</button>
       <button type="button" class="gp-btn" disabled={locked} onclick={() => void admitAndRetry()}>Admit anyway</button>
     </p>
   {/if}
@@ -591,16 +591,14 @@
   .pair{display:flex;gap:8px;flex-wrap:wrap}
   .model{border:0;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
   .model .pair > *{flex:1 1 8rem;width:auto}
-  .meta{margin:0;font-size:11px;color:rgb(var(--c-text-muted));line-height:1.5}
+  .meta{margin:0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));line-height:1.5}
   label{display:flex;flex-direction:column;gap:6px;margin:0}
   .checkout{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
   .checkout select{flex:1 1 12rem;min-width:0}
   .checkout input{flex:2 1 14rem;min-width:0}
-  select,input{padding:7px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg)/.6);color:inherit;font-size:12px;width:100%;min-width:0}
-  .ack{flex-direction:row;align-items:flex-start;gap:7px;font-size:11px;color:rgb(var(--c-text-muted))}
-  .ack input{width:auto}
-  .error{margin:0;font-size:11px;color:#dc6565}
-  .warn{margin:0;font-size:11px;color:rgb(180 83 9)}
-  .discard{margin-left:6px;font-size:11px;padding:2px 8px}
-  button:disabled{opacity:.5}
+  select.gp-select,input.gp-field{width:100%;min-width:0}
+  .ack{flex-direction:row;align-items:flex-start;gap:7px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .error{margin:0;font-size:var(--text-meta);color:rgb(var(--c-danger))}
+  .warn{margin:0;font-size:var(--text-meta);color:rgb(var(--c-warn))}
+  .discard{margin-left:6px}
 </style>

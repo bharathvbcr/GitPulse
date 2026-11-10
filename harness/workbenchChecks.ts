@@ -67,8 +67,8 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => editor().dataset.taskRevision === "1");
   const assistToggle = editor().querySelector('[data-testid="task-assist-toggle"]');
   if (assistToggle instanceof HTMLElement && assistToggle.getAttribute("aria-expanded") === "false") assistToggle.click();
-  await wait(() => (editor().querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
-  assert(Boolean(editor().querySelector(".manvi-assist .change-link")), "Merged Manvi section is missing the Change link");
+  await wait(() => (editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')?.getClientRects().length ?? 0) > 0);
+  assert(Boolean(editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')), "Merged Manvi section is missing the Change link");
   assert(![...editor().querySelectorAll(".manvi-assist label")].some((label) => label.firstChild?.textContent?.trim() === "Model"), "Merged Manvi section must not expose a Model input");
   await wait(() => !enhance().matches(":disabled"));
   enhance().click();
@@ -99,9 +99,9 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   check("Description", review()).click();
   button("Lose next acceptance reply").click();
   button("Accept selected fields", editor()).click();
-  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true || editor().textContent?.includes("The result is uncertain") === true);
+  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true || editor().textContent?.includes("Couldn't confirm the result") === true);
   assert(field("Title", "input").matches(":disabled"), "Uncertain acceptance allowed task edits");
-  button("Retry pending action", editor()).click();
+  button("Try again", editor()).click();
   await wait(() => editor().dataset.taskRevision === "2" && state("Accepted"));
   assert(field("Title", "input").value === revisedTitle, "Selected edited title was not applied");
   assert(field("Description", "textarea").value === description, "Unselected description changed");
@@ -159,8 +159,8 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   button("Stop automatic suggestions", automation).click();
   await wait(() => automation.textContent?.includes("Automatic suggestions are off") === true);
   assert(state("Ready for review"), "Disabling automatic work discarded a ready suggestion");
-  button("Reload automatic settings", automation).click();
-  await wait(() => !check("Suggest clearer task titles and descriptions automatically", automation).checked && !button("Reload automatic settings", automation).disabled);
+  button("Refresh automatic settings", automation).click();
+  await wait(() => !check("Suggest clearer task titles and descriptions automatically", automation).checked && !button("Refresh automatic settings", automation).disabled);
   results.push("Stopping automatic suggestions persists across settings reload and preserves ready reviews");
   assert(document.getElementById("errors")?.textContent === "Runtime errors: 0", "The browser reported runtime errors");
   return results;

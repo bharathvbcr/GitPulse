@@ -4,6 +4,8 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { fade, scale } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { DEFERRED_DELETE_MS, TaskBatch, type TaskAction } from "../workbench/taskActions";
   import type { TaskCard } from "../workbench/client";
   let { tasks, action, batch: existing, onDefer, onClose, onChanged }: {
@@ -45,23 +47,35 @@
   }
 </script>
 
-<div use:portal class="task-action-backdrop gp-scrim" role="presentation" style="z-index:{LAYERS.PROMPT}">
-  <div class="task-action-dialog gp-card gp-glass shadow-float" role="dialog" aria-modal="true" aria-label={deleting ? "Delete tasks" : "Update tasks"} tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}}>
-    <header><h2>{deleting ? "Delete tasks" : "Update tasks"}</h2><button class="gp-icon-btn" aria-label="Close task action" disabled={busy || uncertain} onclick={close}><X size={16} /></button></header>
+<div use:portal class="task-action-backdrop gp-scrim bg-black/50" role="presentation" style="z-index:{LAYERS.PROMPT}" in:fade={backdropFade()} out:fade={backdropFadeOut()}>
+  <div class="task-action-dialog gp-card gp-glass shadow-float" in:scale={cardScale()} out:scale={cardScaleOut()} role="dialog" aria-modal="true" aria-label={deleting ? "Delete tasks" : "Update tasks"} tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}}>
+    <header><h2>{deleting ? `Delete ${rows.length === 1 ? "task" : `${rows.length} tasks`}?` : "Update tasks"}</h2><button type="button" class="gp-icon-btn" data-size="md" aria-label="Close task action" disabled={busy || uncertain} onclick={close}><X size={16} /></button></header>
     <div class="body">
       {#if !started}<p>{deleting ? deferring ? `Delete these tasks from every linked repository and workspace? Nothing is deleted for ${DEFERRED_DELETE_MS / 1000} seconds, and Undo on the board keeps them. After that, deletion cannot be undone here. History is retained. Running agents continue.` : "Delete these tasks from every linked repository and workspace? History is retained, but deletion cannot be undone here. Running agents continue." : "Apply this change to the selected tasks? Existing descriptions, links and other fields are preserved."}</p>{/if}
       <ul>{#each rows as row (row.id)}<li><span>{row.title}</span>{#if started}<small>{row.state === "done" ? deleting ? "Deleted" : "Updated" : row.state === "uncertain" ? "Needs confirmation" : row.state === "failed" ? "Not changed" : row.state === "running" ? "Working…" : "Waiting"}</small>{/if}{#if row.error}<p class="error">{row.error}</p>{/if}</li>{/each}</ul>
       {#if started}<p role="status">{done} of {rows.length} {deleting ? "deleted" : "updated"}{failures ? ` · ${failures} not changed` : ""}{stopped ? " · Paused" : ""}.</p>{/if}
       {#if failures}<p>Refresh tasks and review changed items before trying them again.</p>{/if}
-      {#if uncertain}<p role="alert">Confirmation was lost. Retry the same action to recover its result before closing.</p>{/if}
+      {#if uncertain}<p role="alert">Confirmation was lost. Try the same action again to recover its result before closing.</p>{/if}
     </div>
     <footer>
-      <button bind:this={cancelButton} class="gp-btn" disabled={busy || uncertain} onclick={close}>{started ? "Done" : "Cancel"}</button>
-      {#if busy}<button class="gp-btn" disabled={stopped} onclick={() => { stopped = true; batch.stop(); }}>Pause after current task</button>
-      {:else if !started || uncertain || waiting}<button class:danger={deleting} class="gp-btn-primary" onclick={run}>{#if deleting}<Trash2 size={13} />{/if}{uncertain ? deleting ? "Retry deletion" : "Retry update" : started ? "Continue remaining tasks" : deleting ? `Delete ${rows.length} ${rows.length === 1 ? "task" : "tasks"}` : `Update ${rows.length} ${rows.length === 1 ? "task" : "tasks"}`}</button>{/if}
+      <button bind:this={cancelButton} type="button" class="gp-btn" data-variant="secondary" disabled={busy || uncertain} onclick={close}>{started ? "Done" : "Cancel"}</button>
+      {#if busy}<button type="button" class="gp-btn" data-variant="secondary" disabled={stopped} onclick={() => { stopped = true; batch.stop(); }}>Pause after current task</button>
+      {:else if !started || uncertain || waiting}<button type="button" class="gp-btn" data-variant={deleting ? "danger" : "primary"} onclick={run}>{#if deleting}<Trash2 size={13} />{/if}{uncertain ? "Try again" : started ? "Continue remaining tasks" : deleting ? `Delete ${rows.length} ${rows.length === 1 ? "task" : "tasks"}` : `Update ${rows.length} ${rows.length === 1 ? "task" : "tasks"}`}</button>{/if}
     </footer>
   </div>
 </div>
 <style>
-  .task-action-backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;background:#0005;color:rgb(var(--c-text))}.task-action-dialog{width:min(480px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:16px;overflow:hidden}header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}header{border-bottom:1px solid rgb(var(--c-border)/.5)}h2{font-size:15px;font-weight:650;margin:0}.body{padding:0 20px;overflow:auto;font-size:12px}p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}ul{list-style:none;padding:0;margin:0;max-height:260px;overflow:auto}li{padding:10px 0;border-bottom:1px solid rgb(var(--c-border)/.4);display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between}li span{overflow-wrap:anywhere;flex:1;min-width:160px}li p{flex-basis:100%;margin:4px 0}.error{color:#dc6565}small{color:rgb(var(--c-text-muted))}footer{justify-content:flex-end}.danger{background:#be3939;color:white}
+  .task-action-backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;color:rgb(var(--c-text))}
+  .task-action-dialog{width:min(480px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
+  header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}
+  h2{font-size:0.9375rem;font-weight:600;margin:0}
+  .body{padding:0 20px;overflow:auto;font-size:12px}
+  p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}
+  ul{list-style:none;padding:0;margin:0;max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+  li{padding:8px 0;display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between}
+  li span{overflow-wrap:anywhere;flex:1;min-width:160px}
+  li p{flex-basis:100%;margin:4px 0}
+  .error{color:rgb(var(--c-danger))}
+  small{color:rgb(var(--c-text-muted))}
+  footer{justify-content:flex-end}
 </style>

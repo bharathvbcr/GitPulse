@@ -89,7 +89,7 @@
       aria-label={`Saved views for ${boardName}`}
       data-testid="task-saved-views"
     >
-      <p class="px-1.5 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Views on {boardName}</p>
+      <p class="gp-label px-1.5 pb-1">Views on {boardName}</p>
       {#if views.length === 0}<p class="note">None yet. Arrange the board, then save it here by name.</p>{/if}
       {#each views as view (view.id)}
         <div class="view-row" data-task-view={view.id}>
@@ -112,9 +112,9 @@
   .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:5px;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .apply:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .apply[aria-pressed="true"]{color:rgb(var(--c-accent));font-weight:600}
-  .apply:focus-visible{outline:2px solid rgb(var(--c-accent) / 0.6);outline-offset:-1px}
-  .save{display:flex;gap:4px;padding-top:4px;border-top:1px solid rgb(var(--c-border) / 0.6)}
+  .apply:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
+  .save{display:flex;gap:4px;padding-top:6px}
   .save input{flex:1;min-width:0;font-size:11px;padding:3px 6px}
   .note{margin:0;padding:0 6px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
-  .note.failed{color:#d15a64}
+  .note.failed{color:rgb(var(--c-danger))}
 </style>

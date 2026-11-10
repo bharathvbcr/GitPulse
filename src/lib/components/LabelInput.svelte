@@ -48,9 +48,9 @@
 
 <div class="label-input" class:disabled aria-label="Labels">
   {#each value as label, index (label + index)}
-    <span class="chip">
+    <span class="gp-chip" data-kind="removable" data-tone="neutral">
       {label}
-      <button type="button" class="remove" aria-label={`Remove ${label}`} {disabled} onclick={() => remove(index)}>×</button>
+      <button type="button" class="gp-icon-btn" data-size="sm" aria-label={`Remove ${label}`} {disabled} onclick={() => remove(index)}>×</button>
     </span>
   {/each}
   <input
@@ -73,9 +73,7 @@
 </div>
 
 <style>
-  .label-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;padding:4px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6)}
+  .label-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;padding:4px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6)}
   .label-input.disabled{opacity:.5}
-  .chip{display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:999px;background:rgb(var(--c-surface-hover) / 0.85);font-size:11px}
-  .remove{border:0;background:transparent;color:inherit;cursor:pointer;padding:0 2px;line-height:1}
   .draft{flex:1;min-width:7rem;border:0 !important;background:transparent !important;padding:4px !important;margin:0}
 </style>
