@@ -202,6 +202,7 @@
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
       const { locMetric } = await import("../src/lib/metrics/repoMetrics.ts");
+      const { sectionsFor } = await import("../src/lib/views/viewRegistry.ts");
       const App = (await import("../src/App.svelte")).default;
       // The view is a lazy chunk; on a cold dev server compiling its graph is
       // seconds of work that has nothing to do with a switch. Pulled in now,
@@ -526,7 +527,9 @@
             await sleepUntil(() => !!flyout(), 1000);
             const fly = flyout();
             check("switcher: hovering a collapsed view opens its sections", () =>
-              fly?.dataset.viewFlyout === "work" && fly.querySelectorAll("[data-section]").length >= 4 &&
+              // Every section the registry gives Work (three since Resolve and
+              // Policy folded away), read from the registry rather than counted.
+              fly?.dataset.viewFlyout === "work" && fly.querySelectorAll("[data-section]").length === sectionsFor("work").length &&
               viewButton("work").getAttribute("aria-expanded") === "true");
             check("switcher: the flyout opens below its pill without moving any group", () =>
               !!fly && fly.getBoundingClientRect().top >= group("work").getBoundingClientRect().bottom &&
