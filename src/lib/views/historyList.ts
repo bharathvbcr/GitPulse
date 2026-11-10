@@ -1,44 +1,76 @@
 /**
  * Which list History › Graph draws above the commit details.
  *
- * `commits` is the graph walk. `moves` is the reflog: every movement of HEAD,
- * including commits a reset or amend left reachable only from there. The
- * reflog was its own History section; it folded into Graph because both are
- * lists of commits feeding the same details pane, and a reflog click used to
- * select a commit on a pane nobody was looking at.
+ * Three lists of commits, one details pane:
+ *
+ * - `commits` is the graph walk.
+ * - `moves` is the reflog: every movement of HEAD, including commits a reset
+ *   or amend left reachable only from there.
+ * - `suspects` reads the history backwards: from a misbehaving symbol to the
+ *   commits since a known-good ref that touched what it reaches, ranked by the
+ *   call graph rather than by date.
+ *
+ * Reflog and Suspects were History sections of their own. Both folded into
+ * Graph because each is a list of commits, and as separate panes a click
+ * either selected a commit on a Graph nobody was looking at (reflog) or left
+ * the list altogether for Diff (suspects). Here every list selects through one
+ * path (`repoStore.selectHistoryCommit`), the details pane stays underneath,
+ * and switching lists keeps the selection.
  */
-export type HistoryList = "commits" | "moves";
+export type HistoryList = "commits" | "moves" | "suspects";
+
+/** The toggle above the list, in order. Read by History and the palette. */
+export const HISTORY_LISTS: readonly { value: HistoryList; label: string; title: string }[] = [
+  { value: "commits", label: "Commits", title: "The commit graph: branches, merges and the selected commit" },
+  {
+    value: "moves",
+    label: "HEAD moves",
+    title: "Reflog: every movement of HEAD, with recovery points after a reset, checkout or amend",
+  },
+  {
+    value: "suspects",
+    label: "Suspects",
+    title:
+      "Regression suspects: which commit since a known-good ref could have caused a symptom, ranked by what the call graph reaches",
+  },
+];
 
 /** The section id History's reflog had before it folded into Graph. */
 export const RETIRED_REFLOG_SECTION = "reflog";
 
+/** The section id History's regression suspects had before they folded into Graph. */
+export const RETIRED_SUSPECTS_SECTION = "suspects";
+
 /**
- * Narrows a stored value. Strict: anything but the literal `"moves"` (absent,
- * a hand-edited blob, an older build's field) is the commit graph, which is
+ * Narrows a stored value. Strict: anything but a known list id (absent, a
+ * hand-edited blob, an older build's field) is the commit graph, which is
  * where History opens by default.
  */
 export function sanitizeHistoryList(raw: unknown): HistoryList {
-  return raw === "moves" ? "moves" : "commits";
+  return raw === "moves" || raw === "suspects" ? raw : "commits";
 }
 
 /**
  * The list a restored tab opens on.
  *
- * Besides the field itself, a session written before the fold says "moves" by
- * having been left on the retired Reflog section (`viewSections.history`) or
- * on the older top-level Reflog view (`viewTab`). Both land on Graph through
- * the registry's default; this is what keeps them on the reflog.
+ * Besides the field itself, a session written before a fold names its list by
+ * having been left on a retired section (`viewSections.history` = "reflog" or
+ * "suspects") or on the older top-level Reflog view (`viewTab`). Each lands on
+ * Graph through `RETIRED_SECTIONS`; this is what keeps it on the right list.
  */
 export function restoredHistoryList(record: {
   historyList?: unknown;
   viewSections?: unknown;
   viewTab?: unknown;
 }): HistoryList {
-  if (sanitizeHistoryList(record.historyList) === "moves") return "moves";
+  const stored = sanitizeHistoryList(record.historyList);
+  if (stored !== "commits") return stored;
   if (record.viewTab === RETIRED_REFLOG_SECTION) return "moves";
   const sections = record.viewSections;
   if (sections && typeof sections === "object" && !Array.isArray(sections)) {
-    if ((sections as Record<string, unknown>).history === RETIRED_REFLOG_SECTION) return "moves";
+    const history = (sections as Record<string, unknown>).history;
+    if (history === RETIRED_REFLOG_SECTION) return "moves";
+    if (history === RETIRED_SUSPECTS_SECTION) return "suspects";
   }
   return "commits";
 }

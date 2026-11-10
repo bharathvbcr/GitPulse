@@ -53,7 +53,7 @@ describe("restoring a session left on the reflog", () => {
   });
 
   it("reads anything but the literal \"moves\" as the commit graph", () => {
-    for (const junk of [true, "MOVES", "commits", 1, null, {}, ["moves"]]) {
+    for (const junk of [true, "MOVES", "commits", 1, null, {}, ["moves"], ["suspects"]]) {
       expect(load({ viewTab: "history", historyList: junk }).historyList, String(junk)).toBeUndefined();
     }
     expect(load({ viewTab: "history", historyList: "moves" }).historyList).toBe("moves");
@@ -73,12 +73,39 @@ describe("restoring a session left on the reflog", () => {
   });
 });
 
+describe("restoring a session left on regression suspects", () => {
+  // Suspects folded the same way, from a History section into Graph's third list.
+  it("restores a remembered Suspects section as Graph showing Suspects", () => {
+    const tab = load({ viewTab: "history", viewSections: { history: "suspects" } });
+    expect(tab.viewTab).toBe("history");
+    expect(tab.viewSections).toEqual({ history: "graph" });
+    expect(tab.historyList).toBe("suspects");
+  });
+
+  it("prefers the list a newer build wrote over a stale section", () => {
+    const tab = load({ viewTab: "history", viewSections: { history: "suspects" }, historyList: "moves" });
+    expect(tab.historyList).toBe("moves");
+  });
+
+  it("round-trips the Suspects list", () => {
+    const first = openTab(emptyWorkspace(), "/r/a", opts);
+    if (!first.ok) throw new Error("open");
+    const persisted = workspaceToPersisted(first.workspace, {
+      [first.id]: { activeTab: "history", historyList: "suspects" },
+    });
+    expect(persisted.tabs[0].historyList).toBe("suspects");
+    expect(load({ viewTab: "history", historyList: "suspects" }).historyList).toBe("suspects");
+  });
+});
+
 describe("historyList helpers", () => {
   it("narrows strictly", () => {
     expect(sanitizeHistoryList("moves")).toBe("moves");
     expect(sanitizeHistoryList("commits")).toBe("commits");
     expect(sanitizeHistoryList(undefined)).toBe("commits");
     expect(sanitizeHistoryList("reflog")).toBe("commits");
+    expect(sanitizeHistoryList("suspects")).toBe("suspects");
+    expect(sanitizeHistoryList("SUSPECTS")).toBe("commits");
   });
 
   it("does not read a hostile section map as the reflog", () => {

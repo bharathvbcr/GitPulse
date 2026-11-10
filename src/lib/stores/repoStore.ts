@@ -3024,6 +3024,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (selectionKind !== "file" || !filePath) return;
       void store.selectFileDiff(filePath, isStaged);
     },
+    /**
+     * Selects a commit in History from any of Graph's lists: the commit graph,
+     * HEAD moves or Suspects. One path for all three, so the graph's
+     * selection (header, files, ring on the canvas) and the diff below can
+     * never name different commits, whichever list the click came from.
+     *
+     * `pin` is for the lists that are not the graph: their row stays selected
+     * across a graph reload that stops drawing it (`graphStore.selectCommitById`).
+     * `summary` labels a commit the graph does not draw until its details land.
+     */
+    selectHistoryCommit: (commitId: string, opts: { summary?: string; pin?: boolean } = {}) => {
+      if (!commitId) return;
+      void graphStore.selectCommitById(commitId, opts);
+      void store.selectCommitDiff(commitId);
+    },
     selectCommitDiff: (commitId: string) =>
       diffSelection.select({
         read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_commit_diff", { repoPath, commitId }),

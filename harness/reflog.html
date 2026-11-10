@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en" class="dark">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reflog in Graph checks</title>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Graph lists checks</title>
 <style>body{margin:0}#preview{display:flex;flex-direction:column;height:720px;width:1100px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
 <body><div id="preview"></div><pre id="result"></pre>
 <script type="module">
@@ -13,7 +13,14 @@
  * place — including one the graph does not draw, which used to be the click
  * that changed nothing on screen — that the commit filter narrows the loaded
  * entries and says how many match, and that the list survives a section
- * switch but not an explicit "open Graph". Nothing here executes git.
+ * switch but not an explicit "open Graph".
+ *
+ * Then Graph's third list, Suspects: that the question replaces the filter in
+ * the context bar, that a ranked commit selects in place (it used to leave for
+ * Diff) and stays selected when a reload stops the graph drawing it, that the
+ * commit and HEAD-moves lists chip what it ranked, and that "Suspects since"
+ * in the details pane re-asks from the commit on screen. Nothing here
+ * executes git.
  */
 import "../src/app.css";
 import { createChecks } from "./checks.ts";
@@ -43,6 +50,7 @@ const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_cod
 const files=[status("worktree-only.ts")];
 const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
 let graphFail=false;
+let graphHonoursQuery=false;
 /** The working-tree file whose diff reads empty, for the empty-state checks. */
 let emptyDiffPath=null;
 const fixtures={
@@ -61,7 +69,9 @@ const fixtures={
   calls.push({cmd:"cmd_get_commit_graph",args:a});
   if(graphFail)throw new Error("walk exploded");
   const count=a.maxCommits>5000?TOTAL:FIRST_PAGE;
-  return {rows:graphRows(count),head_id:hex(0),refs:[{name:"main",kind:"local",commit_id:hex(0),is_head:true},{name:"feature",kind:"local",commit_id:hex(1),is_head:false}],has_more:count<TOTAL,mainline_id:hex(0),mainline_name:"main"};
+  // Off for the reflog checks, whose fixture has always ignored the query.
+  const rows=graphHonoursQuery&&a.query?graphRows(count).filter(r=>r.summary.includes(a.query)):graphRows(count);
+  return {rows,head_id:hex(0),refs:[{name:"main",kind:"local",commit_id:hex(0),is_head:true},{name:"feature",kind:"local",commit_id:hex(1),is_head:false}],has_more:count<TOTAL,mainline_id:hex(0),mainline_name:"main"};
  },
  cmd_get_file_diff:a=>{calls.push({cmd:"cmd_get_file_diff",args:a});return {text:a.filePath===emptyDiffPath?"":patch(a.filePath,"worktree change"),truncated:false};},
  cmd_get_commit_diff:a=>{calls.push({cmd:"cmd_get_commit_diff",args:a});return {text:patch("one.ts",`commit ${a.commitId.slice(0,4)}`),truncated:false};},
@@ -99,6 +109,12 @@ const reflog=[
 ];
 // The details pane's freshness badge asks about the one selected commit.
 fixtures.cmd_provenance_freshness=a=>({commit_sha:a.commitSha,distance:null,confidence:null,is_fresh:false,unmeasured_reason:"not measured in this fixture",notes_readable:true,verified:false,verification:null,session:null,landed_on_base:null});
+// Suspects: two drawn commits and the reflog's checkout target, ranked.
+const SUSPECTS=[hex(4),hex(30),hex(2)];
+fixtures.cmd_codeintel_suspects=a=>{calls.push({cmd:"cmd_codeintel_suspects",args:a});return {
+ response:{source_freshness:{fresh:true},available:true,items:SUSPECTS.map((commit,i)=>({commit,author:"Ada",author_time:1_700_000_000-i*3600,evidence:i===1?"moved_only":"body_changed",score:30-i*10,nearest_distance:i,touched:[{qualified_name:`parser::step_${i}`,file_path:"src/parser.rs",distance:i,lines:3,body_changed:i===1?false:true}]})),total:3,shown:3,truncated:false},
+ scope:{indexed_head:hex(0),since:a.since,cone_size:7,blamed_symbols:5,refusals:[]},
+};};
 fixtures.cmd_get_reflog=a=>{calls.push({cmd:"cmd_get_reflog",args:a});return reflog;};
 fixtures.cmd_get_commit_details=a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:a.commitId===ORPHAN?"Orphan Author":"Ada",author_email:"ada@example.com",author_date:"Tue Nov 14 2023",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:`details of ${a.commitId.slice(0,4)}`,body:"",co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};};
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
@@ -109,7 +125,8 @@ const {graphStore}=await import("../src/lib/stores/graphStore.ts");
 const {filterStore}=await import("../src/lib/stores/filterStore.ts");
 const HistoryView=(await import("../src/lib/components/HistoryView.svelte")).default;
 const loadReflog=()=>import("../src/lib/components/ReflogViewer.svelte");
-const loadSuspects=()=>import("../src/lib/components/RegressionSuspectsPanel.svelte");
+const loadSuspects=()=>import("../src/lib/components/SuspectsList.svelte");
+const {suspectsQuery}=await import("../src/lib/codeintel/suspectsQuery.ts");
 const {results,check,stopped}=createChecks();
 const preview=document.getElementById("preview");
 const wait=(ms=60)=>new Promise(r=>setTimeout(r,ms));
@@ -122,6 +139,10 @@ const entry=(selector)=>[...preview.querySelectorAll("tbody tr")].find(r=>r.text
 const inspect=(selector)=>entry(selector)?.querySelector('button[aria-label^="Inspect"]');
 const details=()=>preview.querySelector(".h-64");
 const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
+const symptomField=()=>preview.querySelector('input[aria-label="Symptom symbol"]');
+const filterField=()=>preview.querySelector('input[placeholder^="Search commits"]');
+const suspectRow=(n)=>[...preview.querySelectorAll('[aria-label="Regression suspects"] li > button')].find(b=>b.textContent.includes(`#${n}`));
+const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("input",{bubbles:true}));};
 (async()=>{try{
  await repoStore.openRepo(root);
  graphStore.showRepo(root);
@@ -204,6 +225,49 @@ const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
  await wait(300);
  check("arrow keys over the graph from an orphan selection keep a real selection",()=>{const id=get(graphStore).selectedCommit?.id;return typeof id==="string"&&id.length>0&&crashes.length===0;});
  check("the preview is not stuck reading after leaving the orphan",()=>!details().textContent.includes("Reading the diff…")||get(repoStore).selectedDiffPending);
+
+ // --- Suspects: Graph's third list -------------------------------------------
+ check("Graph offers Suspects as its third list",()=>option("Suspects")&&option("Suspects").title.startsWith("Regression suspects"));
+ check("History has no Suspects section tab any more",()=>![...preview.querySelectorAll('[role="tab"]')].some(t=>t.textContent.trim()==="Suspects"));
+ const hadFilter=Boolean(filterField());
+ option("Suspects").click();
+ await until(()=>symptomField()&&preview.querySelector('[aria-label="Regression suspects"]'),"suspects question and its lazy list");
+ check("the suspects question replaces the commit filter in the context bar",()=>hadFilter&&!filterField()&&get(repoStore).historyList==="suspects");
+ check("before a run the list asks its question rather than claiming no suspects",()=>text().includes("Which commit broke it?")&&!text().includes("Nothing in the cone"));
+ check("the details pane stays under the suspects list",()=>details()&&details().textContent.includes(ORPHAN.slice(0,8)));
+ type(symptomField(),"parser::parse");
+ await tick();
+ preview.querySelector('form[aria-label="Regression suspects query"] button[type="submit"]').click();
+ await until(()=>suspectRow(3),"ranked suspects");
+ check("the question reached the backend as asked",()=>{const c=callsOf("cmd_codeintel_suspects").at(-1)?.args;return c&&c.symptom==="parser::parse"&&c.since==="HEAD~20"&&c.depth===3;});
+ check("the ranking says what it examined and where the window ends",()=>text().includes("The window ends at the indexed commit, not at HEAD.")&&text().includes("7 symbols in the cone"));
+ suspectRow(2).click();
+ await until(()=>details()?.textContent.includes(hex(30).slice(0,8)),"suspect details");
+ check("a suspect selects in place: same section, same list, details below",()=>get(repoStore).viewSections.history!=="diff"&&get(repoStore).historyList==="suspects"&&suspectRow(2).getAttribute("aria-pressed")==="true");
+ check("the details pane carries the suspect's verdict",()=>details().textContent.includes("suspect #2")&&details().querySelector('[aria-label="Suspect verdict"]')?.textContent.includes("moved only"));
+ await until(()=>get(repoStore).selectedCommitId===hex(30),"suspect diff");
+ graphHonoursQuery=true;
+ // What App does when the filter changes, or a watcher refresh lands: reload
+ // the walk. This one no longer draws the suspect that was clicked.
+ filterStore.setSearch("commit number 4");
+ void graphStore.loadGraph(root,"commit number 4",null);
+ await until(()=>get(graphStore).rows.length>0&&!get(graphStore).rows.some(r=>r.id===hex(30)),"graph reloaded without the suspect");
+ await wait(150);
+ check("a reload that stops drawing the clicked suspect keeps it selected",()=>get(graphStore).selectedCommit?.id===hex(30)&&details().textContent.includes(hex(30).slice(0,8)));
+ check("and says the loaded graph leaves it out, not that a reset orphaned it",()=>details().textContent.includes("Not in the loaded graph"));
+ option("Commits").click();
+ await until(()=>!symptomField()&&preview.querySelector("canvas"),"commits with suspects answered");
+ await until(()=>text().includes("suspect #1"),"chip on commit row");
+ check("the commit list chips what the ranking found, naming the question",()=>{const chip=[...preview.querySelectorAll("span")].find(s=>s.textContent.trim()==="suspect #1");return chip&&chip.title.includes("parser::parse");});
+ filterStore.setSearch("");graphHonoursQuery=false;void graphStore.loadGraph(root,"",null);
+ option("HEAD moves").click();await until(()=>entry("HEAD@{2}"),"moves with suspects");
+ check("a HEAD move that is also a suspect is chipped",()=>entry("HEAD@{2}").textContent.includes("suspect #3")&&!entry("HEAD@{0}").textContent.includes("suspect"));
+ inspect("HEAD@{0}").click();
+ await until(()=>details()?.textContent.includes(hex(0).slice(0,8)),"head details");
+ const askedBefore=callsOf("cmd_codeintel_suspects").length;
+ [...details().querySelectorAll("button")].find(b=>b.textContent.includes("Suspects since")).click();
+ await until(()=>symptomField()&&callsOf("cmd_codeintel_suspects").length>askedBefore,"re-asked from the commit");
+ check("Suspects since re-asks from the commit on screen, on the Suspects list",()=>get(repoStore).historyList==="suspects"&&callsOf("cmd_codeintel_suspects").at(-1).args.since===hex(0)&&get(suspectsQuery).since===hex(0));
 
  option("HEAD moves").click();await until(()=>table(),"moves again");
  repoStore.setActiveTab("history","graph");

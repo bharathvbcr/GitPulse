@@ -57,6 +57,13 @@ before that tag is pushed.
 
 ### Fixed
 
+- **A commit clicked in HEAD moves or Suspects stays selected when the graph
+  reloads without it.** A filter typed above the reflog, the page size or a
+  watcher refresh dropped the clicked commit from the loaded graph and the
+  details pane jumped to the newest commit, under a highlight that had not
+  moved. Those lists now pin their selection; a click on the graph itself
+  still falls back as before when a filter drops it.
+
 - **A branch comparison in the Diff view no longer lists the working tree's
   files.** The file rail guessed the selection's kind from which ids were set, so
   a range diff (`main...feature`) read as a worktree file and offered your
@@ -88,6 +95,32 @@ before that tag is pushed.
   `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.
 
 ### Changed
+
+- **Regression suspects are Graph's third list, not their own section.**
+  Graph's toggle reads *Commits | HEAD moves | Suspects*, and the commit
+  details stay under whichever list is showing. History has two sections now
+  (Graph, Diff), so ⌥3 goes and the Go → History menu loses its Suspects item.
+  *Find regression suspects* in the command palette still opens it (same
+  command id), with the symptom field focused, and a session saved on the old
+  Suspects section reopens on the Suspects list.
+  - **The question replaces the commit filter** in History's context bar while
+    Suspects is showing: symptom, last known good, cone depth, *Find suspects*.
+    ⌘F focuses the symptom there. The filter does not narrow a ranking, whose
+    scores mean something only within one answer.
+  - **Clicking a suspect selects it in place.** It used to jump to the Diff
+    section, so the ranking and the commit it named were never on screen
+    together. The details pane now carries the suspect's verdict (evidence,
+    hops, touched symbols) whichever list selected the commit.
+  - **The other lists mark what was ranked.** Commit rows and HEAD moves show a
+    *suspect #n* chip whose tooltip names the symptom and window it came from;
+    the chips go when the answer does, or when the repository changes.
+  - **Any commit can start the question.** *Suspects since* in the details pane
+    makes the commit on screen the last known good and switches to the list,
+    running at once when a symptom is already named.
+  - **One selection path for all three lists** (`repoStore.selectHistoryCommit`).
+    The answer lives in a store (`codeintel/suspectsQuery.ts`) rather than in
+    the pane, so switching lists keeps it; the code-graph client still loads on
+    first run, not with History.
 
 - **The reflog is part of History › Graph, not its own section.** A
   *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's

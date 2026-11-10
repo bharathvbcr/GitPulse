@@ -42,13 +42,12 @@ views. Coverage and truncation counts still describe the original payload.
 
 ## History (`⌘2` / `Ctrl+2`)
 
-Three lenses on one **commit** and regression history.
+Lenses on one **commit** and regression history.
 
 | Section | Purpose |
 | --- | --- |
-| **Graph** | GPU canvas graph with a topological lane solver. Default branch pinned left. Filters (`author:`, `sha:`, `type:`, `path:`, text) run in Rust before lanes are solved, so the graph stays connected. Its *Commits \| HEAD moves* toggle swaps in the reflog: every HEAD movement, selected in place under the list (even commits a reset orphaned), with branch-here and `reset --keep` recovery. |
+| **Graph** | GPU canvas graph with a topological lane solver. Default branch pinned left. Filters (`author:`, `sha:`, `type:`, `path:`, text) run in Rust before lanes are solved, so the graph stays connected. Its *Commits \| HEAD moves* toggle swaps in the reflog: every HEAD movement, selected in place under the list (even commits a reset orphaned), with branch-here and `reset --keep` recovery. A third option, *Suspects*, ranks which commit since a known-good ref could have caused a symptom — by what the code graph reaches, not by recency — with the question in the context bar, the verdict in the details pane, and a chip on ranked commits in the other two lists. |
 | **Diff** | Unified or true side-by-side from one row model. Syntax under word-diff, find-in-diff, hunk/line staging, diff symbol groups, symbol-level collision notes, image diffs. Layered blast radius by hop over the change set; rung filter on flat impact; preview markers on the file rail. The header names what the patch actually contains. |
-| **Suspects** | Regression suspects: identifies which commit since a known-good ref could have caused a symptom. Candidates are ranked by what the code graph reaches rather than by recency, joining blame to the code graph. |
 
 ![Diff view: unified commit diff](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-diff.png)
 

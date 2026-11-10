@@ -25,6 +25,7 @@
   import { toastStore } from "../stores/toastStore";
   import { reportFailure } from "../stores/mutationOutcome";
   import { describeResetPreview } from "../branches/resetPreview";
+  import { suspectsQuery, suspectMarks } from "../codeintel/suspectsQuery";
 
   const REFLOG_ENTRY_LIMIT = 200;
 
@@ -40,6 +41,9 @@
   // branch chip cannot apply, because this is HEAD's log, not a branch's.
   let shown = $derived(filterReflogEntries(entries, $filterStore.searchQuery));
   let selectedCommitId = $derived($graphStore.selectedCommit?.id ?? null);
+  // Commits the Suspects list ranked, marked here too: a HEAD move that is
+  // also a suspect is the recovery point worth reading first.
+  let marks = $derived(suspectMarks($suspectsQuery, $currentRepoPath));
 
   async function load() {
     const repo = $repoStore.currentPath;
@@ -67,17 +71,21 @@
   }
 
   /**
-   * Shows the entry's commit in the details pane below this list, in place.
+   * Shows the entry's commit in the details pane below this list, in place,
+   * through the path every Graph list selects by (`selectHistoryCommit`).
    *
    * It used to hand off to `inspectCommitInHistory`, which selected the
    * commit on Graph while this pane, then its own section, stayed on screen:
    * the click changed nothing anyone could see. Selection by id also reaches
-   * commits the graph walk does not draw, which is what a reflog is for.
+   * commits the graph walk does not draw, which is what a reflog is for; the
+   * pin keeps it selected when a filter typed above stops the graph drawing it.
    */
   function inspectEntry(entry: ReflogEntry) {
     selectedSelector = entry.selector;
-    void graphStore.selectCommitById(entry.commit_id, { summary: `${entry.action}: ${entry.message}` });
-    void repoStore.selectCommitDiff(entry.commit_id);
+    repoStore.selectHistoryCommit(entry.commit_id, {
+      summary: `${entry.action}: ${entry.message}`,
+      pin: true,
+    });
   }
 
   /** The non-destructive way back: a new branch at the entry's commit. */
@@ -236,7 +244,16 @@
                     {entry.selector}
                   </button>
                 </td>
-                <td class="px-3 py-1.5 font-mono">{shortHash(entry.commit_id, 8)}</td>
+                <td class="px-3 py-1.5 font-mono whitespace-nowrap">
+                  {shortHash(entry.commit_id, 8)}
+                  {#if marks.get(entry.commit_id)}
+                    {@const mark = marks.get(entry.commit_id)!}
+                    <span
+                      class="ml-1 rounded border border-red-400/40 px-1 font-sans text-[9px] uppercase tracking-wide text-red-400"
+                      title={mark.title}
+                    >suspect #{mark.rank}</span>
+                  {/if}
+                </td>
                 <td class="px-3 py-1.5 text-textPrimary">{entry.action}</td>
                 <td class="px-3 py-1.5 text-textMuted truncate max-w-md">{entry.message}</td>
                 <td class="px-3 py-1.5 text-textMuted whitespace-nowrap">{formatDate(entry.timestamp)}</td>

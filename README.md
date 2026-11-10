@@ -46,10 +46,10 @@ GitPulse has 4 application views with 14 specialized sections. Each view keeps r
 | --- | --- | --- |
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **Code** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
-| **History** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
+| **History** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
-Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected
+Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected
 file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (scaling to 1,000 repositories with 24 active watches),
 **Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
 

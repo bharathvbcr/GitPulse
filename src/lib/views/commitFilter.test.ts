@@ -54,7 +54,6 @@ describe("commit-search chord", () => {
     // find bar inside it, for the same reason Code owns it.
     expect(ownsCommitSearchChord("history", "diff")).toBe(false);
     expect(ownsCommitSearchChord("history", "graph")).toBe(true);
-    expect(ownsCommitSearchChord("history", "suspects")).toBe(true);
     expect(ownsCommitSearchChord("history")).toBe(true);
   });
 

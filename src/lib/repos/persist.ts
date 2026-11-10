@@ -60,11 +60,11 @@ export interface PersistedTab {
   terminalOpen?: boolean;
   /**
    * Which list History › Graph was drawing (see `views/historyList.ts`).
-   * Written only as `"moves"`: absent is the commit graph, so a blob from a
-   * session that never opened the reflog is unchanged, and an older build
+   * Written only as `"moves"` or `"suspects"`: absent is the commit graph, so
+   * a blob from a session that never left it is unchanged, and an older build
    * ignores the field and opens on the graph.
    */
-  historyList?: "moves";
+  historyList?: "moves" | "suspects";
   searchQuery: string;
   selectedBranch: string | null;
 }
@@ -212,9 +212,10 @@ export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<
   // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
   // the file a saved session was searching or blaming is still the selection.
   code: { search: "explorer", blame: "explorer" },
-  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
-  // itself is restored from the same retired id by `restoredHistoryList`.
-  history: { reflog: "graph" },
+  // Reflog and Suspects became Graph's "HEAD moves" and "Suspects" lists
+  // (`views/historyList.ts`); each list is restored from the same retired id
+  // by `restoredHistoryList`.
+  history: { reflog: "graph", suspects: "graph" },
 };
 
 /** Where a remembered section of `view` lives now; unchanged when not retired. */
@@ -577,7 +578,9 @@ export function workspaceToPersisted(
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
-        ...(session?.historyList === "moves" ? { historyList: "moves" as const } : {}),
+        ...(session?.historyList && session.historyList !== "commits"
+          ? { historyList: session.historyList }
+          : {}),
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -617,8 +620,11 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
       // spawns a shell, so the permissive reading is the costly one.
       terminalOpen: record.terminalOpen === true,
       // Read from the raw record, before `sanitizeViewSections` narrows a
-      // retired `history: "reflog"` to Graph and the mode with it.
-      ...(restoredHistoryList(record) === "moves" ? { historyList: "moves" as const } : {}),
+      // retired `history: "reflog"` or `"suspects"` to Graph and the list with it.
+      ...(() => {
+        const list = restoredHistoryList(record);
+        return list === "commits" ? {} : { historyList: list };
+      })(),
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

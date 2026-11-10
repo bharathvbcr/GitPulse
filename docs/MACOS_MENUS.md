@@ -42,7 +42,7 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | View | Work, Code, History, Insights, Fleet, Show/Hide Terminal, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
 | Go → Work | Overview, Resolve, Remote, Policy, Tasks. |
 | Go → Code | Explorer, Map. (Search and Blame are toggles inside Explorer.) |
-| Go → History | Graph, Diff, Suspects. The reflog is Graph's *HEAD moves* list (command palette: *Open Reflog*). |
+| Go → History | Graph, Diff. The reflog and regression suspects are Graph's *HEAD moves* and *Suspects* lists (command palette: *Open Reflog*, *Find regression suspects*). |
 | Go → Insights | Pulse, Coverage, Health (with secrets), Storage. |
 | Repository | Fetch, Pull, Push, Stash Working Tree, Pop Stash, Stage All, Unstage All, Quick Commit, Interactive Rebase, Create Branch, Rename Current Branch, Continue/Abort/Skip Operation, Copy Repository Path, Copy Branch, Copy Selected Commit SHA or HEAD SHA, Reveal in Finder, Open Remote Website. |
 | Window | Minimize, maximize/zoom, Close Window. |

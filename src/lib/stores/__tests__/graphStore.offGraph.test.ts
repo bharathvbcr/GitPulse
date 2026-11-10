@@ -133,6 +133,36 @@ describe("graphStore.selectCommitById", () => {
     expect(get(store).selectedCommit?.id).toBe("a");
   });
 
+  // HEAD moves and Suspects select a commit by id from a list that is not the
+  // graph. When that commit happens to be drawn and a reload then drops it (a
+  // filter typed above the reflog, the commit cap, a watcher refresh), the
+  // details pane must stay on the row the reader clicked in that list rather
+  // than jump to the newest commit the list does not show.
+  it("keeps a pinned selection a reload stops drawing", async () => {
+    let rows = ["a", "b"];
+    const { store } = harness({ graph: () => payload(...rows) });
+    store.showRepo("/r");
+    await store.loadGraph("/r");
+    await store.selectCommitById("b", { pin: true });
+    rows = ["a"];
+    await store.loadGraph("/r", "only-a");
+    const state = get(store);
+    expect(state.selectedCommit?.id).toBe("b");
+    expect(state.selectedCommitDetails?.id).toBe("b");
+  });
+
+  it("drops the pin when the graph itself is clicked", async () => {
+    let rows = ["a", "b"];
+    const { store } = harness({ graph: () => payload(...rows) });
+    store.showRepo("/r");
+    await store.loadGraph("/r");
+    await store.selectCommitById("b", { pin: true });
+    await store.selectCommit(get(store).rows[1]!);
+    rows = ["a"];
+    await store.loadGraph("/r", "only-a");
+    expect(get(store).selectedCommit?.id).toBe("a");
+  });
+
   it("reports a pruned object as a details error, not an empty commit", async () => {
     const { store } = harness({ graph: () => payload("a"), failDetailsFor: "gone" });
     store.showRepo("/r");

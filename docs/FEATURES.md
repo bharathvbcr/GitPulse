@@ -22,10 +22,10 @@ GitPulse has 4 application views with 14 specialized sections. Each view keeps r
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
-| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
+| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
-Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
+Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
 
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
@@ -52,7 +52,7 @@ flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph (commits or HEAD moves) · Diff · Suspects — three lenses on commit history"]
+        History["<b>History</b> (<code>history</code>)<br/>Graph (commits, HEAD moves or suspects) · Diff — lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
     end
 
@@ -348,11 +348,11 @@ flowchart TD
 
 ## 3. History (`history`)
 
-Three lenses on one subject — what happened to this repository — switched by
-the segmented control in the view's own header (Graph, Diff, Suspects), which also carries the commit
-filter. Graph, Diff and Reflog were three top-level tabs, then sections; Reflog then folded into
-Graph as its *HEAD moves* list. With Suspects they share selected commit context, so switching
-lens keeps the commit or regression window you were looking at.
+Lenses on one subject — what happened to this repository — switched by
+the segmented control in the view's own header (Graph, Diff); the context bar below carries the commit
+filter, or the suspects question while Graph shows Suspects. Graph, Diff and Reflog were three top-level
+tabs, then sections; Reflog then folded into Graph as its *HEAD moves* list and Suspects as its third
+list. They share selected commit context, so switching list or lens keeps the commit you were looking at.
 The split was expensive in a way the code admitted: the Diff tab had to grow
 its own commit picker purely so you would not have to walk back to Graph for
 the commit you had just selected.
@@ -396,7 +396,7 @@ the commit you had just selected.
 - **Recovery Points**: Create a branch at an entry, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop.
 - **Restored Sessions**: A session saved on the old Reflog section or view reopens on Graph's HEAD-moves list.
 
-### 3.4 Suspects
+### 3.4 Suspects (Graph's third list)
 
 ```mermaid
 flowchart LR
@@ -412,10 +412,12 @@ flowchart LR
         GraphSearch --> Ranker
     end
 
-    subgraph Output["History → Suspects"]
+    subgraph Output["History → Graph → Suspects"]
         Results["Ranked Suspects List<br/>(Commit OID, Author, Evidence Chip)"]
-        DiffJump["Click Suspect → Jump to Unified/Split Diff"]
-        Ranker --> Results --> DiffJump
+        Details["Click Suspect → Commit Details Below<br/>(verdict, files, diff preview)"]
+        Chips["Commits / HEAD moves<br/>chip ranked commits"]
+        Ranker --> Results --> Details
+        Results --> Chips
     end
 
     Input --> Analysis
@@ -424,6 +426,8 @@ flowchart LR
 - **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
 - **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.
 - **Indexed Search Window**: Analyzes the historical commit window up to the currently indexed commit, reporting exact commit reachability and blame attribution.
+- **One of Graph's Lists**: The question (symptom, last known good, cone depth) sits in History's context bar in place of the commit filter. A click selects the suspect in place, above the same details pane as the commit graph and HEAD moves, and stays selected when a graph reload stops drawing it. The details pane shows the suspect's verdict whichever list selected the commit, the other lists chip ranked commits (the tooltip names the symptom and window), and *Suspects since* on any commit's details asks again from that commit.
+- **Restored Sessions**: A session saved on the old Suspects section reopens on Graph's Suspects list; the palette's *Find regression suspects* keeps its id and opens it with the symptom focused.
 
 ---
 
@@ -731,8 +735,8 @@ stop per checkout.
 | **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
-Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
-Suspects, Insights' Pulse / Coverage / Health / Storage — are switched by that
+Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff,
+Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
 section directly, including all five Work sections.

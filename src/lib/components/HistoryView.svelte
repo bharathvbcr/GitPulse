@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewContextBar from "./ViewContextBar.svelte";
@@ -15,16 +15,12 @@
   import DiffViewer from "./DiffViewer.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import SettingSegment from "./SettingSegment.svelte";
-  import type { HistoryList } from "../views/historyList";
-
-  /**
-   * The two lists Graph can draw above the commit details. "HEAD moves" is
-   * the reflog, which was its own section; the title keeps the word findable.
-   */
-  const HISTORY_LISTS: readonly { value: HistoryList; label: string; title: string }[] = [
-    { value: "commits", label: "Commits", title: "The commit graph: branches, merges and the selected commit" },
-    { value: "moves", label: "HEAD moves", title: "Reflog: every movement of HEAD, with recovery points after a reset, checkout or amend" },
-  ];
+  import SuspectsQueryBar from "./SuspectsQueryBar.svelte";
+  import { suspectsQuery } from "../codeintel/suspectsQuery";
+  // The lists Graph can draw above the commit details. "HEAD moves" is the
+  // reflog and "Suspects" the regression ranking, each once its own section;
+  // their titles keep those words findable.
+  import { HISTORY_LISTS } from "../views/historyList";
 
   /**
    * History: everything that answers "what happened to this repository".
@@ -36,16 +32,17 @@
    * back to Graph for the commit they had just been looking at.
    *
    * The sections share `selectedCommitId`, so switching keeps the subject.
-   * Reflog then folded into Graph as its second list (`historyList`): both
-   * are lists of commits feeding the same details pane. The commit filter
-   * lives in the section bar rather than as a full-width strip, because this
-   * is the only view it filters.
+   * Reflog then folded into Graph as its second list and Suspects as its
+   * third (`historyList`): all three are lists of commits feeding the same
+   * details pane, selecting through one path (`selectHistoryCommit`). The
+   * context bar carries the commit filter for the first two and the suspects
+   * question for the third, because a ranking is not a list text narrows.
    */
 
   let {
     /** Reflog's loader, declared at module scope by App so it is stable. */
     loadReflog,
-    /** Suspects' loader, same contract: stable identity or LazyView remounts. */
+    /** The Suspects list's loader, same contract: stable identity or LazyView remounts. */
     loadSuspects,
   }: {
     loadReflog: ViewLoader;
@@ -54,6 +51,13 @@
 
   const section = $derived(activeSectionFor("history", $repoStore.viewSections));
   const list = $derived($repoStore.historyList);
+  const asksSuspects = $derived(section === "graph" && list === "suspects");
+
+  // The suspects answer belongs to one repository; a switch drops it before
+  // any list or chip can draw it under another repository's name.
+  $effect(() => {
+    suspectsQuery.bindRepo($currentRepoPath);
+  });
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
@@ -66,11 +70,17 @@
         onselect={(next) => repoStore.setHistoryList(next)}
       />
     {/if}
-    <!-- The filter applies to every section here: the graph walk and the
-         diff's commit list are drawn from it, and the reflog list narrows
-         its loaded entries by the same text (the branch chip cannot apply to
-         HEAD's log). -->
-    <FilterBar />
+    {#if asksSuspects}
+      <!-- A ranking is one answer, not a list text narrows: the Suspects list
+           takes its question here instead of the commit filter. -->
+      <SuspectsQueryBar />
+    {:else}
+      <!-- The filter applies to every other list here: the graph walk and
+           the diff's commit list are drawn from it, and the reflog list
+           narrows its loaded entries by the same text (the branch chip cannot
+           apply to HEAD's log). -->
+      <FilterBar />
+    {/if}
   </ViewContextBar>
   <ViewSectionPanel {view} {section}>
 
@@ -79,11 +89,6 @@
          re-hydrate its virtual window from scratch. -->
     {#if section === "diff"}
       <DiffViewer />
-    {:else if section === "suspects"}
-      <!-- The one section that reads the history backwards: from a symptom to
-           the commits that could have caused it. Lazy like the reflog — it
-           pulls the code-graph client, which no other History section needs. -->
-      <LazyView load={loadSuspects} name="regression suspects" />
     {:else}
       <div class="flex-1 flex flex-col min-h-0">
         <!-- What this graph is NOT drawing, above the graph it is about.
@@ -94,13 +99,17 @@
           <!-- Lazy: the reflog's chunk stays out of the entry bundle until
                someone opens it. -->
           <LazyView load={loadReflog} name="the reflog" />
+        {:else if list === "suspects"}
+          <!-- The list that reads the history backwards: from a symptom to
+               the commits that could have caused it. Lazy like the reflog. -->
+          <LazyView load={loadSuspects} name="regression suspects" />
         {:else}
           <GraphNotices notices={$graphStore.notices} />
           <CommitTable />
         {/if}
-        <!-- Under either list: the diff follows the selection whichever one
+        <!-- Under every list: the diff follows the selection whichever one
              is on screen, including when History opens straight onto HEAD's
-             moves and the commit table never mounts. -->
+             moves or Suspects and the commit table never mounts. -->
         <CommitReconciler />
         <CommitDetails />
       </div>

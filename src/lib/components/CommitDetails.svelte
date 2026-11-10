@@ -19,7 +19,16 @@
     AlertTriangle,
     Copy,
     Check,
+    Bug,
   } from "@lucide/svelte";
+  import {
+    suspectsQuery,
+    suspectMarks,
+    evidenceClass,
+    evidenceLabel,
+    evidenceTitle,
+    hopsLabel,
+  } from "../codeintel/suspectsQuery";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import MarkdownBody from "./MarkdownBody.svelte";
@@ -63,6 +72,11 @@
   let offGraph = $derived(
     selectedCommit !== null && !$graphStore.rows.some((r) => r.id === selectedCommit.id),
   );
+  // Where Graph's Suspects list ranked this commit, whichever list it was
+  // selected from: the verdict travels with the commit, not with the list.
+  let suspect = $derived(
+    selectedCommit ? (suspectMarks($suspectsQuery, $currentRepoPath).get(selectedCommit.id) ?? null) : null,
+  );
   let readDetails = $derived(details !== null && details.id === selectedCommit?.id ? details : null);
   let headerSummary = $derived(
     offGraph && readDetails ? readDetails.summary : (selectedCommit?.summary ?? ""),
@@ -90,6 +104,16 @@
       ($repoStore.selectedDiff === null && !$repoStore.selectedDiffError),
   );
   let diffError = $derived($repoStore.selectedDiffError);
+
+  /**
+   * "Find suspects since this commit": the commit on screen becomes the last
+   * known good and Graph switches to the Suspects list. Runs at once when a
+   * symptom is already named, otherwise puts the cursor in the symptom field.
+   */
+  function findSuspectsSince(commitId: string) {
+    repoStore.setHistoryList("suspects");
+    void suspectsQuery.seedSince($currentRepoPath, commitId);
+  }
 
   function retryDetails() {
     if (selectedCommit) void graphStore.selectCommit(selectedCommit);
@@ -296,10 +320,20 @@
         <div class="flex items-center gap-1.5 min-w-0 group/msg">
           <span class="text-xs font-medium text-textPrimary truncate select-text">{headerSummary}</span>
           {#if offGraph}
+            <!-- A suspect is an ancestor of the indexed commit, so the graph
+                 not drawing it is the filter or the page size, not a reset. -->
             <span
               class="shrink-0 rounded px-1.5 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-300"
-              title="The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there."
-            >Not in the graph</span>
+              title={suspect
+                ? "The loaded graph does not draw this commit: the commit filter or the page size leaves it out. It was selected from the Suspects list."
+                : "The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there."}
+            >{suspect ? "Not in the loaded graph" : "Not in the graph"}</span>
+          {/if}
+          {#if suspect}
+            <span
+              class="shrink-0 rounded-full border border-red-400/40 bg-red-400/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-red-400"
+              title={suspect.title}
+            >suspect #{suspect.rank}</span>
           {/if}
           <button
             type="button"
@@ -328,8 +362,34 @@
           {sig.text}
         </span>
         <FreshnessBadge freshness={provenance} />
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+          onclick={() => findSuspectsSince(selectedCommit.id)}
+          title="Find suspects since this commit: treat it as the last known good and rank the commits after it by what the call graph reaches from a symptom"
+        >
+          <Bug size={13} /> Suspects since
+        </button>
       </div>
     </div>
+
+    {#if suspect}
+      <!-- The Suspects verdict on this commit, under whichever list selected it. -->
+      <div class="flex items-center gap-2 border-b border-border/60 bg-red-400/5 px-4 py-1 text-[10px] text-textSecondary min-w-0" aria-label="Suspect verdict">
+        <span
+          class="shrink-0 rounded border px-1 text-[9px] uppercase tracking-wide {evidenceClass(suspect.suspect.evidence)}"
+          title={evidenceTitle(suspect.suspect.evidence)}
+        >{evidenceLabel(suspect.suspect.evidence)}</span>
+        <span class="shrink-0 font-mono tabular-nums text-textMuted" title="Call edges from the symptom to the nearest symbol this commit touched.">
+          {hopsLabel(suspect.suspect.nearest_distance)}
+        </span>
+        {#if suspect.suspect.touched.length > 0}
+          <span class="min-w-0 truncate font-mono" title={suspect.suspect.touched.map((t) => t.qualified_name).join("\n")}>
+            touched {suspect.suspect.touched.slice(0, 3).map((t) => t.qualified_name).join(", ")}{suspect.suspect.touched.length > 3 ? ` +${suspect.suspect.touched.length - 3} more` : ""}
+          </span>
+        {/if}
+      </div>
+    {/if}
 
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">

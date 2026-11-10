@@ -34,6 +34,7 @@
   import { popover } from "../ui/popover";
 
   import type { RefItem } from "../graph/graphDecorations";
+  import type { SuspectMark } from "../codeintel/suspectsQuery";
 
   let {
     row,
@@ -45,6 +46,7 @@
     mergeTarget = null,
     onFocusRow,
     onBlurRow,
+    suspect = null,
   }: {
     row: VisualCommitRow;
     isSelected?: boolean;
@@ -72,6 +74,12 @@
      */
     onFocusRow?: (element: HTMLElement, keyboardVisible: boolean) => void;
     onBlurRow?: () => void;
+    /**
+     * Where Graph's Suspects list ranked this commit, if it did. A chip, not a
+     * row colour: the rank belongs to one answer (its title names the symptom
+     * and window), and it goes when that answer does.
+     */
+    suspect?: SuspectMark | null;
   } = $props();
 
   let isCopied = $state(false);
@@ -258,6 +266,13 @@
       <span class="inline-flex items-center text-[9px] font-semibold px-1.5 py-0.5 rounded-full border {conventional.color}">
         {conventional.type}
       </span>
+    {/if}
+
+    {#if suspect}
+      <span
+        class="inline-flex items-center text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded-full border border-red-400/40 bg-red-400/10 text-red-400 font-medium"
+        title={suspect.title}
+      >suspect #{suspect.rank}</span>
     {/if}
 
     {#if row.is_merge}

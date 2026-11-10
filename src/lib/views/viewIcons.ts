@@ -1,7 +1,6 @@
 import {
   Activity,
   Briefcase,
-  Bug,
   ChartNoAxesCombined,
   Cloud,
   CodeXml,
@@ -55,7 +54,6 @@ export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, Vie
   history: {
     graph: GitGraph,
     diff: FileDiff,
-    suspects: Bug,
   },
   insights: {
     pulse: Activity,
