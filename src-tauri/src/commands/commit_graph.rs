@@ -288,7 +288,11 @@ pub fn assemble_commit_graph(
 /// repository's state the answer is `unchanged`: no history walk, no lane
 /// solve, no rows on the wire. It only ever short-circuits — a page is always
 /// one lane solve over its whole window, never stitched from two.
+// The IPC arguments are flat, as for the other wide commands (cmd_add_worktree,
+// cmd_terminal_spawn): request_id (read cancellation) and known_token (graph
+// token) each joined a six-argument command.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_get_commit_graph(
     repo_path: String,
     max_commits: usize,
