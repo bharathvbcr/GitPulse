@@ -23,7 +23,7 @@ describe("view icons", () => {
       }
     }
     // The control: the loop above ran over the real catalog.
-    expect(checked).toBeGreaterThanOrEqual(14);
+    expect(checked).toBeGreaterThanOrEqual(13);
   });
 
   it("maps no section the catalog does not have", () => {

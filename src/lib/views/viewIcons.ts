@@ -9,7 +9,6 @@ import {
   FolderTree,
   GitCommitHorizontal,
   GitGraph,
-  GitMerge,
   HardDrive,
   HeartPulse,
   LayoutDashboard,
@@ -43,7 +42,6 @@ export const VIEW_ICONS: Readonly<Record<ViewTab, ViewIcon>> = {
 export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, ViewIcon>>>> = {
   work: {
     overview: LayoutDashboard,
-    resolve: GitMerge,
     remote: Cloud,
     policy: ShieldCheck,
     tasks: ListChecks,
