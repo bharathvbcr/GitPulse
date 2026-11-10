@@ -873,9 +873,12 @@ collision scan, with a shorter promise. The app reads with a clock that began
 accepted and nothing older, and a memoised listing older than 2 s is listed
 again (`CollisionMemo::listing`). **Why 2 s and not the collision scan's 5 s:**
 a *negative* ("nothing overlaps") is the answer an agent about to edit acts on,
-and the asker's own scan is fresh at the call; 2 s still lets the many MCP
-processes of many sessions asking together share one set of reads, and the edit
-hook, which is the gate and checks again at edit time, keeps its own 5 s. The
+and the asker's own scan is fresh at the call. 2 s lets asks that arrive within
+it share the reads already made, but at most four are served at once
+(`MAX_INSIGHTS_HANDLERS`); with 26 sessions asking together, the rest scan for
+themselves for that call, so the saving is the reads and listing the served
+asks share, not 26 into 1. The edit hook, which is the gate and checks again at
+edit time, keeps its own 5 s. The
 asker refuses an answer older than `INSIGHTS_MAX_AGE_MS` (4 s, twice the
 promise, so a clock hiccup does not discard a good answer). **Trust is checked
 first, for every request** (`validate_repo`), because a listing served from
@@ -890,9 +893,27 @@ under the re-read's own bound), never served from the kept read. A facet the app
 could not read is `None` with a reason, and the asker also refuses an answer
 with `deadline_expired`, or with any unscanned or failed worktree, or a
 worktree with no dirty count (the app's budget is shorter than the asker's own
-scan's), and one about another repository: it scans for itself. `age_ms` is the
-oldest of the listing's age and the shared cell's age for each worktree
-(inferred from `status_age`, not stamped per read).
+scan's), and one about another repository: it scans for itself.
+
+**What `age_ms` is.** The age, at the moment the facets were derived, of the
+oldest read the answer stands on: the worktree listing, the status behind
+`changes`, and the status of every worktree that was read. Each is stamped
+*before* it is read, from the cache's report of the kept read's age (a newer
+read handed over only makes the stamp older, never younger), or with the ask's
+own instant when the cache would not hand its read over; a worktree read again
+because it is a positive is stamped with the instant its re-read began. The
+stamps are taken once and the age is computed from them, so a concurrent asker
+refreshing the cache afterwards cannot lower it, and one re-read worktree does
+not make the answer look fresh. When the checkout `changes` describes is itself
+a positive, `changes` is taken again from the re-read, so its row and the facet
+are one moment (and if that re-read missed its bound `changes` is not scanned).
+The asker refuses `age_ms` above `INSIGHTS_MAX_AGE_MS` (4 s).
+
+**Limits, stated plainly.** A shared checkout that was clean at its kept read
+and has been dirtied since goes unseen for at most about 2 s, where `main`
+scanned on every ask. "One status child" for a dirty shared checkout is per
+ask, not per coalesced window. The child counts below are n=1, in one test
+process, on a synthetic farm, taken at the load recorded with them.
 
 **Bounds.** At most `MAX_INSIGHTS_HANDLERS` (4) reads at once, drawn from the
 `MAX_GATE_HANDLERS` slots, so the MCP processes cannot fill the slots the edit
@@ -911,10 +932,18 @@ absolute path of at most 1024 bytes.
 **Asker backoff.** After an ask that failed in transport (a missed deadline, a
 refusal, nobody answering) the same app is not asked again for 30 s
 (`ask_backoff`), so a wedged app costs each MCP process one deadline, not one
-per call, and a deferral retry never pays it twice. The app is named by its
-socket's identity, so a new instance is asked at once. An answer that was
-received but not believed (too old, partial, another repository) does not start
-a backoff.
+per call, and a deferral retry never pays it twice. Three answers in a row that
+could not be used (partial, too old, another repository, malformed) start the
+same 30 s, and the first usable answer resets the count: one partial answer is
+ordinary on a loaded host and two can be chance, but an app that cannot serve a
+repository (more worktrees than its budget reads) would otherwise cost every
+call the app's time and then its own scan. The reason is kept and shown in
+"not asking: <reason>". **A "busy" refusal is neither**: the app is alive and
+answering, so that call scans for itself and the next call asks again. The
+refusal is immediate (no deadline paid), askers retry on their own calls'
+schedules rather than a shared timer, and the four slots bound the app's load
+however many ask, so there is nothing to synchronise into a herd. The app is
+named by its socket's identity, so a new instance is asked at once.
 
 **Version skew.** `PROTOCOL` is not bumped, and should not be: the greeting is
 strictly parsed, so a bump would make a new app refuse every installed old hook
@@ -944,6 +973,10 @@ two sibling worktrees, nothing contended), were: **clean** main checkout
 **dirty** main checkout `worktree list` 0, `status` 1, the main checkout itself
 (`a_dirty_shared_checkout_is_read_again_on_every_ask`). This repository is
 always the second shape, so its ask costs one status child, not zero.
+Re-run on 2026-11-10 with the final tree, n=1 each, in one test process on a
+synthetic farm, load average 16.8 (1 min) before and 22.6 after the run: asker
+alone 13 children, asker with a fake app 1, handler second ask 0 (clean shared
+checkout) and 1 (dirty shared checkout), the same as above.
 The live re-sample needs the app, `gitpulse-mcp` and `gitpulse-hook` rebuilt
 and reinstalled.
 
