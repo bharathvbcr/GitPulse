@@ -901,7 +901,10 @@ mod mac {
                     Err(e) => check.that(false, format!("browse: {e}")),
                 }
             }
-            Err(e) => check.that(false, format!("browse: the page did not start listening: {e}")),
+            Err(e) => check.that(
+                false,
+                format!("browse: the page did not start listening: {e}"),
+            ),
         }
         check
     }
