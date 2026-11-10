@@ -25,6 +25,7 @@
   import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "../ipc/invoke";
+  import { readGitHubContext } from "../ipc/githubContext";
   import {
     FolderGit2,
     GitPullRequest,
@@ -409,13 +410,14 @@
     };
   }
 
-  async function loadFor(repo: string) {
+  /** `force` is every refresh a person or an action asked for; only the mount read may reuse a fresh one. */
+  async function loadFor(repo: string, force = true) {
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
     try {
-      const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
+      const next = await readGitHubContext<GitHubContext>(repo, { force });
       if (!guard.isLive()) return;
       // gh reports a rate limit or an outage as a context carrying `error`. On
       // a panel already showing a good read, that is a failed refresh, not the
@@ -593,7 +595,7 @@
         workflowsLoading = false;
         return undefined;
       }
-      void loadFor(repo);
+      void loadFor(repo, false);
       void loadWorkflowsFor(repo);
       const startedCtx = inflight;
       const startedWf = workflowsInflight;

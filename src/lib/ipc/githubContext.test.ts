@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const calls: string[] = [];
@@ -16,6 +17,7 @@ import {
   GITHUB_CONTEXT_FRESH_MS,
   githubContextDegraded,
   invalidateGitHubContext,
+  readGitHubContext,
   sharedGitHubContext,
 } from "./githubContext";
 
@@ -97,6 +99,89 @@ describe("shared GitHub context read", () => {
     expect(githubContextDegraded({ ...clean, warnings: ["w"] })).toBe(true);
     expect(githubContextDegraded({ ...clean, releases_error: null, warnings: [] })).toBe(false);
     expect(githubContextDegraded(null)).toBe(true);
+  });
+});
+
+describe("Work, GitHubPanel and ManviOpsPanel share one read", () => {
+  // The panels cannot be mounted here (no DOM in vitest), so each consumer is
+  // exercised the way it calls the owner: Work through `loadWork`, GitHubPanel
+  // and ManviOpsPanel through `readGitHubContext` with the `force` their read
+  // sites pass (mount: false; Refresh and post-action reloads: true).
+  const githubCalls = () => calls.filter((c) => c === "cmd_github_context").length;
+
+  it("all three asking inside the window invoke the command once", async () => {
+    await Promise.all([
+      loadWork("/repo"),
+      readGitHubContext("/repo", { force: false }),
+      readGitHubContext("/repo", { force: false }),
+    ]);
+    expect(githubCalls()).toBe(1);
+    await loadWork("/repo");
+    await readGitHubContext("/repo", { force: false });
+    expect(githubCalls()).toBe(1);
+  });
+
+  it("an explicit refresh in a panel forces a new read, and the next reuse sees it", async () => {
+    await readGitHubContext("/repo", { force: false });
+    await readGitHubContext("/repo", { force: true });
+    expect(githubCalls()).toBe(2);
+    await loadWork("/repo");
+    expect(githubCalls()).toBe(2);
+  });
+
+  it("a failed read fails for each of the three, and none of them gets an empty success", async () => {
+    answer = () => {
+      throw new Error("gh not authenticated");
+    };
+    const [work, panel, ops] = await Promise.allSettled([
+      loadWork("/repo"),
+      readGitHubContext("/repo", { force: false }),
+      readGitHubContext("/repo", { force: false }),
+    ]);
+    expect(work.status).toBe("fulfilled");
+    if (work.status === "fulfilled") {
+      expect(work.value.sources.github.ok).toBe(false);
+      expect(work.value.sources.github.detail).toContain("gh not authenticated");
+    }
+    expect(panel.status).toBe("rejected");
+    expect(ops.status).toBe("rejected");
+    expect(githubCalls()).toBe(1);
+  });
+
+  it("a partial read reaches each consumer with its degradation intact, and the next ask reads again", async () => {
+    const partial = { ...clean, releases_error: "rate limited", warnings: ["PR listing failed to parse"] };
+    answer = () => partial;
+    const [work, panel, ops] = await Promise.all([
+      loadWork("/repo"),
+      readGitHubContext<typeof partial>("/repo", { force: false }),
+      readGitHubContext<typeof partial>("/repo", { force: false }),
+    ]);
+    expect(panel).toBe(partial);
+    expect(ops.releases_error).toBe("rate limited");
+    expect(ops.warnings).toEqual(["PR listing failed to parse"]);
+    expect(work.sources.github.detail).not.toBe("");
+    expect(githubCalls()).toBe(1);
+    await readGitHubContext("/repo", { force: false });
+    expect(githubCalls()).toBe(2);
+  });
+});
+
+describe("the panels read through the owner", () => {
+  const panel = readFileSync(new URL("../components/GitHubPanel.svelte", import.meta.url), "utf8");
+  const ops = readFileSync(new URL("../components/ManviOpsPanel.svelte", import.meta.url), "utf8");
+
+  it("neither asks the backend for the context itself", () => {
+    expect(panel).not.toContain('"cmd_github_context"');
+    expect(ops).not.toContain('"cmd_github_context"');
+    expect(panel).toContain("readGitHubContext<GitHubContext>(repo, { force })");
+    expect(ops).toContain("readGitHubContext<GitHubContext>(repo, { force: !opts.background && !opts.reuse })");
+  });
+
+  it("only the mount read may reuse; every refresh forces", () => {
+    expect(panel).toContain("async function loadFor(repo: string, force = true)");
+    expect(panel.match(/loadFor\(repo, false\)/g)).toHaveLength(1);
+    expect(ops).toContain("loadIssues(repo, { reuse: true })");
+    expect(ops.match(/reuse: true/g)).toHaveLength(1);
   });
 });
 
