@@ -174,19 +174,34 @@ fn serve_bounded_in(
     let state = Arc::new(AtomicU8::new(RUNNING));
     let (send, receive) = mpsc::channel();
     let worker_state = Arc::clone(&state);
-    std::thread::Builder::new()
-        .name("insights-read".into())
-        .spawn(move || {
-            let answer = work();
-            let _ = send.send(answer);
-            if worker_state
-                .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                abandoned.fetch_sub(1, Ordering::AcqRel);
+    // A reading outlives the request that asked for it when it is abandoned, so
+    // it starts under the supervisor: a panic is recorded in Diagnostics (several
+    // readings may be alive at once, hence one-of-many) instead of vanishing.
+    crate::supervisor::spawn_one_of_many("insights-read", "insights read", move || {
+        // Settles the hand-over however the reading ends, a panic included: an
+        // abandoned reading that panicked must still give its slot back.
+        struct Settle {
+            state: Arc<AtomicU8>,
+            abandoned: &'static AtomicUsize,
+        }
+        impl Drop for Settle {
+            fn drop(&mut self) {
+                if self
+                    .state
+                    .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    self.abandoned.fetch_sub(1, Ordering::AcqRel);
+                }
             }
-        })
-        .map_err(|error| format!("cannot start the read: {error}"))?;
+        }
+        let _settle = Settle {
+            state: worker_state,
+            abandoned,
+        };
+        let _ = send.send(work());
+    })
+    .map_err(|error| format!("cannot start the read: {error}"))?;
     match receive.recv_timeout(wait) {
         Ok(answer) => Ok(answer),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err("the read ended without an answer".into()),

@@ -6271,8 +6271,12 @@ done
         // host cannot make the app on time or the asker slow.
         let deadline = crate::test_support::coverage_relaxed(Duration::from_millis(300));
         let lateness = deadline * 8;
+        // Held on a gate nobody opens until the test ends: a wait on the
+        // channel, not a sleep, and it ends the moment the test drops it.
+        let (_gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
         app._owner.attach_insights(std::sync::Arc::new(move |_| {
-            std::thread::sleep(lateness);
+            let _ = gate_rx.lock().expect("gate").recv_timeout(lateness);
             Ok(late.clone())
         }));
         let started = std::time::Instant::now();
@@ -6424,20 +6428,19 @@ done
 
         // An app from before insights reads: it greets, then refuses the frame.
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
         let connections = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let old_app = {
             let (connections, stop) = (connections.clone(), stop.clone());
             std::thread::spawn(move || {
                 use std::io::{BufRead, Write};
-                while !stop.load(Ordering::Acquire) {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    };
+                // Blocking accept: the test wakes it with one last connection
+                // after raising `stop`.
+                while let Ok((mut stream, _)) = listener.accept() {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     connections.fetch_add(1, Ordering::AcqRel);
-                    stream.set_nonblocking(false).expect("blocking");
                     let _ = writeln!(stream, "{{\"v\":1,\"pid\":{}}}", std::process::id());
                     let mut line = String::new();
                     let _ = std::io::BufReader::new(stream.try_clone().expect("clone"))
@@ -6466,6 +6469,7 @@ done
 
         // A new instance binds a new socket, and is asked at once.
         stop.store(true, Ordering::Release);
+        drop(std::os::unix::net::UnixStream::connect(&socket));
         old_app.join().expect("the stand-in app ends");
         std::fs::remove_file(&socket).expect("old socket");
         let Claim::Primary(owner) = claim(profile.path(), Duration::from_millis(200)) else {
@@ -6566,24 +6570,25 @@ done
         let counter = asked.clone();
         let slow = crate::test_support::coverage_relaxed(Duration::from_millis(300));
         let lateness = slow * 5;
+        let (_gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
         app._owner.attach_insights(Arc::new(move |_| {
             counter.fetch_add(1, Ordering::AcqRel);
-            std::thread::sleep(lateness);
+            let _ = gate_rx.lock().expect("gate").recv_timeout(lateness);
             Err("too late".into())
         }));
         let dir = app._profile.path().to_path_buf();
-        let first = std::time::Instant::now();
         assert!(insights_from_app_in(dir.clone(), &farm.repo, slow).is_err());
-        let paid = first.elapsed();
-        let second = std::time::Instant::now();
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+        // The second read is refused before it asks: no second deadline is
+        // paid, which the sink's ask count shows without a stopwatch.
         let again = insights_from_app_in(dir, &farm.repo, slow).unwrap_err();
         assert!(again.contains("not asking"), "{again}");
-        assert!(
-            second.elapsed() < paid / 2 + Duration::from_millis(50),
-            "the second read paid the deadline again: {:?} after {paid:?}",
-            second.elapsed()
+        assert_eq!(
+            asked.load(Ordering::Acquire),
+            1,
+            "the second read asked the slow app again"
         );
-        assert_eq!(asked.load(Ordering::Acquire), 1);
     }
 
     /// The app reads only what the asker could read: an untrusted repository

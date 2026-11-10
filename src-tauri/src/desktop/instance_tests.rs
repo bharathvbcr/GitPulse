@@ -1730,14 +1730,12 @@ fn insights_reads_are_bounded_and_never_starve_the_edit_hooks() {
             })
         })
         .collect();
-    let started = Instant::now();
-    while entered.load(Ordering::Acquire) < MAX_INSIGHTS_HANDLERS {
-        assert!(
-            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
-            "reads never filled"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            entered.load(Ordering::Acquire) >= MAX_INSIGHTS_HANDLERS
+        }),
+        "reads never filled"
+    );
 
     // One past the cap is told it is busy, at once.
     let over = Secondary::connect(&socket)
@@ -1800,14 +1798,12 @@ fn a_burst_of_insights_asks_past_the_accept_cap_never_starves_a_relaunch_or_a_ho
     let held: Vec<_> = (0..MAX_INSIGHTS_HANDLERS)
         .map(|n| ask(n, Duration::from_secs(30)))
         .collect();
-    let started = Instant::now();
-    while entered.load(Ordering::Acquire) < MAX_INSIGHTS_HANDLERS {
-        assert!(
-            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
-            "reads never filled"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            entered.load(Ordering::Acquire) >= MAX_INSIGHTS_HANDLERS
+        }),
+        "reads never filled"
+    );
 
     let burst: Vec<_> = (0..(MAX_HANDLERS + MAX_GATE_HANDLERS) * 2)
         .map(|n| ask(100 + n, Duration::from_secs(5)))
@@ -1815,14 +1811,10 @@ fn a_burst_of_insights_asks_past_the_accept_cap_never_starves_a_relaunch_or_a_ho
     // A relaunch and a hook reach the owner while the burst is in flight,
     // retrying as a real one does if the accept cap turns a connection away.
     let patiently = |attempt: &dyn Fn() -> bool| {
-        let begun = Instant::now();
-        while !attempt() {
-            assert!(
-                begun.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
-                "the owner never took it"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            crate::test_support::env::wait_until(Duration::from_secs(10), attempt),
+            "the owner never took it"
+        );
     };
     patiently(&|| {
         Secondary::connect(&socket)
@@ -1855,14 +1847,12 @@ fn a_burst_of_insights_asks_past_the_accept_cap_never_starves_a_relaunch_or_a_ho
     for asker in held {
         assert!(asker.join().unwrap().is_some_and(|answer| answer.is_ok()));
     }
-    let waited = Instant::now();
-    while !seen.lock().unwrap().contains(&Request::Reveal) {
-        assert!(
-            waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
-            "the relaunch was acknowledged but never delivered"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(5), || {
+            seen.lock().unwrap().contains(&Request::Reveal)
+        }),
+        "the relaunch was acknowledged but never delivered"
+    );
 }
 
 #[test]

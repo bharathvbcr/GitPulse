@@ -402,9 +402,9 @@ fn a_read_that_cannot_finish_in_time_is_abandoned_and_every_facet_is_not_scanned
     static MINE: AtomicUsize = AtomicUsize::new(0);
     static RELEASED: AtomicBool = AtomicBool::new(false);
     let reading = || {
-        while !RELEASED.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_support::env::wait_until(Duration::from_secs(60), || {
+            RELEASED.load(Ordering::Acquire)
+        });
         unscanned("/r".into(), "stand-in")
     };
     let wait = crate::test_support::coverage_relaxed(Duration::from_millis(100));
@@ -426,19 +426,43 @@ fn a_read_that_cannot_finish_in_time_is_abandoned_and_every_facet_is_not_scanned
     let refused = serve_bounded_in(&MINE, "/r".into(), wait, reading);
     assert!(refused.unwrap_err().contains("still running"));
     RELEASED.store(true, Ordering::Release);
-    let ended = Instant::now();
-    while MINE.load(Ordering::Acquire) > 0 {
-        assert!(
-            ended.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
-            "abandoned reads never ended"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            MINE.load(Ordering::Acquire) == 0
+        }),
+        "abandoned reads never ended"
+    );
     let patient = crate::test_support::coverage_relaxed(Duration::from_secs(2));
     let after = serve_bounded_in(&MINE, "/r".into(), patient, || {
         unscanned("/r".into(), "ok")
     });
     assert!(after.is_ok());
+}
+
+/// An abandoned reading that panics still gives its slot back, and the panic is
+/// recorded under the supervisor instead of leaking the count forever.
+#[test]
+fn an_abandoned_read_that_panics_gives_its_slot_back() {
+    use std::sync::atomic::AtomicBool;
+    static MINE: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    let wait = crate::test_support::coverage_relaxed(Duration::from_millis(100));
+    let gave_up = serve_bounded_in(&MINE, "/p".into(), wait, || {
+        crate::test_support::env::wait_until(Duration::from_secs(60), || {
+            RELEASED.load(Ordering::Acquire)
+        });
+        panic!("a stand-in read that fails");
+    })
+    .expect("an abandoned read is still an answer");
+    assert!(gave_up.deadline_expired);
+    assert_eq!(MINE.load(Ordering::Acquire), 1);
+    RELEASED.store(true, Ordering::Release);
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            MINE.load(Ordering::Acquire) == 0
+        }),
+        "a panicked read kept its slot"
+    );
 }
 
 /// Every read is of the canonical path validation returned: asked through a
