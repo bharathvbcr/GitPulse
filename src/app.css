@@ -542,6 +542,58 @@
      needs doing. The tone utilities below tint it; the layout inside is the
      call site's. */
   @apply mx-3 mt-2 rounded-xl border border-border/65 bg-surface/60 px-3 py-2 text-xs;
+
+  /* The honesty surface (design language §1.7, §9): `data-tone` is ok | warn |
+     danger | info | unknown. A toned notice says what happened, or that it
+     could not be determined, and is the only way to say the second: never an
+     EmptyState ("nothing exists"), a green tick or a "0". It is a rounded
+     rectangle, left-aligned, tinted by its tone, with an optional icon, a body
+     and an action:
+
+       <div class="gp-notice" data-tone="unknown" role="status">
+         <Icon class="shrink-0" style="color: var(--gp-notice-ink)" />
+         <div class="min-w-0 flex-1">Couldn't check coverage. …</div>
+         <button class="gp-btn shrink-0" data-size="sm">Rescan</button>
+       </div>
+
+     The fill is opaque (the tone laid 6% over `--c-surface`), so it needs
+     no Reduce Transparency twin and its contrast is the blend itself, pinned
+     for every tone in both themes by primitives.contract.test.ts. 6% keeps
+     muted and faint text at 4.5:1 on every tone (10% dropped them to 4.42 on
+     some). Body
+     text is `--c-text`; the tone shows in the fill and the edge, and
+     `--gp-notice-ink` is the tone as ink for an icon or a title. Unknown has a
+     dashed edge, so it is told apart from the rest without relying on color.
+     The legacy `gp-notice-error` / `gp-notice-warn` modifiers keep working on
+     a bare `gp-notice`; new code writes `data-tone`. */
+  &[data-tone] {
+    margin: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--gp-space-2);
+    border-radius: var(--gp-r-md);
+    border-color: rgb(var(--gp-notice-tone) / 0.35);
+    background-color: rgb(var(--c-surface));
+    background-image: linear-gradient(rgb(var(--gp-notice-tone) / 0.06), rgb(var(--gp-notice-tone) / 0.06));
+    color: rgb(var(--c-text));
+    --gp-notice-ink: rgb(var(--gp-notice-tone));
+  }
+  &[data-tone="ok"] {
+    --gp-notice-tone: var(--c-ok);
+  }
+  &[data-tone="warn"] {
+    --gp-notice-tone: var(--c-warn);
+  }
+  &[data-tone="danger"] {
+    --gp-notice-tone: var(--c-danger);
+  }
+  &[data-tone="info"] {
+    --gp-notice-tone: var(--c-info);
+  }
+  &[data-tone="unknown"] {
+    --gp-notice-tone: var(--c-unknown);
+    border-style: dashed;
+  }
 }
 
 @utility gp-notice-error {
@@ -587,7 +639,37 @@
 }
 
 @utility gp-field-multi {
-  @apply rounded-xl;
+  /* The multiline field (design language §5, §9): anything that can grow past
+     one line is a rounded rectangle, radius `--gp-r-md`, not a pill. It wears
+     the whole `gp-field` (so `gp-field gp-field-multi` and `gp-field-multi`
+     alone are the same control) and adds the states a field has:
+       focus     the accent edge and `--ring-focus` (from gp-field);
+       invalid   `data-invalid` (not "false") or `aria-invalid="true"` turns the
+                 edge and the focus ring to the danger role;
+       disabled  `:disabled` or `aria-disabled="true"`, dimmed to the .4 every
+                 control uses, not resizable. */
+  @apply gp-field;
+  /* `&&` doubles the class. Tailwind emits `gp-field` after `gp-field-multi`,
+     so with both classes on an element (every call site today) the pill radius
+     and the one-line padding of `gp-field` would otherwise win the tie. */
+  && {
+    border-radius: var(--gp-r-md);
+    padding-block: var(--gp-space-2);
+  }
+  resize: vertical;
+  &[data-invalid]:not([data-invalid="false"]),
+  &[aria-invalid="true"] {
+    border-color: rgb(var(--c-danger));
+    &:focus {
+      border-color: rgb(var(--c-danger));
+      box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);
+    }
+  }
+  &:disabled,
+  &[aria-disabled="true"] {
+    @apply cursor-not-allowed opacity-40;
+    resize: none;
+  }
 }
 
 @utility gp-chip {
@@ -1495,7 +1577,7 @@ html.macos.light {
   --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.82);
 }
 
-html.macos :where([class~="bg-background"], .gp-field, .gp-select) {
+html.macos :where([class~="bg-background"], .gp-field, .gp-field-multi, .gp-select) {
   background-color: var(--mac-fill-bg);
 }
 
@@ -1982,7 +2064,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
     animation: none !important;
   }
 
-  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
     transition: none !important;
   }
 
@@ -1995,7 +2077,7 @@ html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, 
   animation: none !important;
 }
 
-html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
   transition: none !important;
 }
 
