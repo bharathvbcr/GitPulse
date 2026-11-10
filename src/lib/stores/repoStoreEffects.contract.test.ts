@@ -126,6 +126,69 @@ describe("file tree array identity", () => {
   });
 });
 
+/**
+ * A component that walks a list out of `$repoStore` — in a `$derived`, in
+ * markup, in a handler — is subscribed to every publish, and the walk (a
+ * `.map`, `.filter`, a spread) builds a fresh array each time, so everything
+ * downstream of it re-runs too. The field stores (`repoStore.statuses`,
+ * `.branches`, `.openTabs`, the counts) notify only when the value is
+ * replaced.
+ *
+ * This is a ratchet. `KNOWN` is what the tree does today, per file; a new
+ * whole-store array read in a component fails here, and so does fixing one
+ * without lowering its count, so the list can only shrink. Migrate a file to
+ * the field stores and delete its line.
+ */
+describe("array operations on $repoStore", () => {
+  const LISTS = "statuses|branches|openTabs|tags|stashEntries|recentRepos";
+  const METHODS = "map|filter|flatMap|reduce|slice|sort|toSorted|concat|find|some|every|forEach";
+  const reads = (source: string): number =>
+    (source.match(new RegExp(`\\$repoStore\\s*\\.\\s*(?:${LISTS})\\s*(?:\\?\\.|\\.)\\s*(?:${METHODS})\\s*\\(`, "g")) ?? []).length +
+    (source.match(new RegExp(`\\.\\.\\.\\s*\\$repoStore\\.(?:${LISTS})\\b`, "g")) ?? []).length;
+
+  it("counts a method call or spread on a list, and nothing else", () => {
+    expect(reads("{#each $repoStore.statuses.filter(f) as s}")).toBe(1);
+    expect(reads("const x = $derived([...$repoStore.branches, b]);")).toBe(1);
+    expect(reads("const s = $derived($repoStore.statuses);")).toBe(0);
+    expect(reads("{$repoStore.statuses.length} {$repoStore.currentPath}")).toBe(0);
+    expect(reads("const n = $statuses.filter(f);")).toBe(0);
+  });
+
+  const KNOWN: Record<string, number> = {
+    "App.svelte": 2,
+    "lib/components/BlameViewer.svelte": 2,
+    "lib/components/BranchList.svelte": 6,
+    "lib/components/CommandPalette.svelte": 1,
+    "lib/components/CommitComposer.svelte": 2,
+    "lib/components/ConflictEditor.svelte": 2,
+    "lib/components/DiffViewer.svelte": 1,
+    "lib/components/FileViewer.svelte": 3,
+    "lib/components/FleetView.svelte": 1,
+    "lib/components/GitHubPanel.svelte": 2,
+    "lib/components/RepoPanel.svelte": 1,
+    "lib/components/RepoTabBar.svelte": 12,
+    "lib/components/StatusBar.svelte": 3,
+    "lib/components/TaskAgentPanel.svelte": 1,
+    "lib/components/TaskBoard.svelte": 1,
+    "lib/components/TerminalDock.svelte": 2,
+    "lib/components/WorkView.svelte": 1,
+    "lib/components/WorkspaceActions.svelte": 1,
+    "lib/components/WorkspaceView.svelte": 1,
+    "lib/components/WorktreesPanel.svelte": 3,
+    "lib/components/files/FileTreePanel.svelte": 1,
+    "lib/components/pulse/PulseView.svelte": 1,
+  };
+
+  it("matches the known list: no new whole-store array reads, none left uncounted", () => {
+    const found: Record<string, number> = {};
+    for (const file of svelteFiles(SRC)) {
+      const count = reads(readFileSync(file, "utf8"));
+      if (count > 0) found[relative(SRC, file)] = count;
+    }
+    expect(found).toEqual(KNOWN);
+  });
+});
+
 describe("effects never read $repoStore", () => {
   it("finds a read in an effect, and nothing in comments, strings or outside effects", () => {
     const fixture = [
