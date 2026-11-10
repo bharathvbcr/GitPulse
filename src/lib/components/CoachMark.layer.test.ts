@@ -12,7 +12,7 @@ import { LAYERS } from "../ui/layers";
  * (`bottom-10 right-6`) only ever say where, never whether.
  */
 function rootTag(): string {
-  resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: true });
+  resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: true, native_material: false });
   const body = render(CoachMark, {
     props: {
       id: "coach-test-layer",

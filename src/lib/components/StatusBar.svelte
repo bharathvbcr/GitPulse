@@ -38,7 +38,6 @@
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { terminalPillView } from "../terminal/statusPill";
   import { launcherLabel } from "../terminal/tabs";
-  import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
 
   let {
