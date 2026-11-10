@@ -3898,7 +3898,8 @@ pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, Co
 }
 
 /// [`config_snapshot`] straight from git, never from the cache. For a caller
-/// that refuses on what is missing, so a stale "unset" cannot block it.
+/// that decides on what the config says (the commit identity gate), since the
+/// cache's stamp does not see a file pulled in by `include.path`.
 pub(crate) fn config_snapshot_fresh(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
     config_snapshot_with(repo, Reads::Fresh)
 }
@@ -6360,7 +6361,11 @@ const MAX_NUMSTAT_PATHSPEC_BYTES: usize = 16 * 1024;
 ///   could pair what the status did not; the count bound keeps the two apart;
 /// - a path is not valid UTF-8: it was decoded with replacement characters, and
 ///   a pathspec built from those names a file that does not exist, which would
-///   read as zero churn.
+///   read as zero churn;
+/// - a path is one [`listing_must_match_path_exactly`] names (`*?[` or `:`):
+///   Git for Windows glob-expands `*?[` after `:(literal)` and reads `X:rest`
+///   as a drive ("is outside repository"), which would fail the whole report.
+///   The predicate is the same on every platform so the decision is testable.
 fn numstat_pathspecs<'a>(
     rows: impl Iterator<Item = &'a RawStatusRecord>,
     reach: NumstatReach,
@@ -6371,7 +6376,7 @@ fn numstat_pathspecs<'a>(
     let mut paths = std::collections::BTreeSet::new();
     for row in rows {
         for path in std::iter::once(&row.path).chain(row.old_path.as_ref()) {
-            if undecodable_path_warning(path).is_some() {
+            if undecodable_path_warning(path).is_some() || listing_must_match_path_exactly(path) {
                 return None;
             }
             paths.insert(path.as_str());
@@ -13560,9 +13565,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "sp ace.txt",
             "new\nline.txt",
             "-dash.txt",
-            "glob*.txt",
             "glob_decoy.txt",
-            ":colon.txt",
             "ünï.txt",
             "ren_src.txt",
             "gone.txt",
@@ -13617,9 +13620,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "sp ace.txt",
             "new\nline.txt",
             "-dash.txt",
-            "glob*.txt",
             "glob_decoy.txt",
-            ":colon.txt",
             "ünï.txt",
             "dir/nested.txt",
         ] {
@@ -13658,7 +13659,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             );
         }
         let worktree = spawned.iter().find(|a| !a.iter().any(|x| x == "--cached")).unwrap();
-        for wanted in [":(literal)glob*.txt", ":(literal)-dash.txt", ":(literal)new\nline.txt"] {
+        for wanted in [":(literal)-dash.txt", ":(literal)new\nline.txt"] {
             assert!(worktree.iter().any(|spec| spec == wanted), "{wanted}: {worktree:?}");
         }
         assert!(
@@ -13669,6 +13670,108 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         for wanted in [":(literal)ren_src.txt", ":(literal)ren_dst.txt"] {
             assert!(staged.iter().any(|spec| spec == wanted), "both sides: {staged:?}");
         }
+    }
+
+    /// Git for Windows reads `:(literal)X:rest` as a drive path ("is outside
+    /// repository") and glob-expands `*?[` after `:(literal)`, so a status
+    /// that names such a path cannot take the limited read there. The decision
+    /// is the same everywhere (it reuses [`listing_must_match_path_exactly`]),
+    /// so it is checked here on every platform; the Windows behaviour itself is
+    /// not exercised by this test.
+    #[test]
+    fn numstat_pathspecs_are_withheld_for_paths_a_pathspec_cannot_name_exactly() {
+        let row = |path: &str| RawStatusRecord {
+            index_status: ' ',
+            work_status: 'M',
+            path: path.to_string(),
+            old_path: None,
+        };
+        for hostile in ["glob*.txt", "q?.txt", "br[ac].txt", ":colon.txt", "C:rest.txt", "d/a:b"] {
+            let rows = [row("fine.txt"), row(hostile)];
+            assert_eq!(
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
+                None,
+                "{hostile}"
+            );
+            let renamed = [RawStatusRecord {
+                old_path: Some(hostile.to_string()),
+                ..row("fine.txt")
+            }];
+            assert_eq!(
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths),
+                None,
+                "old side {hostile}"
+            );
+        }
+        assert!(numstat_pathspecs([row("fine.txt")].iter(), NumstatReach::ChangedPaths).is_some());
+    }
+
+    /// The same names through a real status: the report still carries their
+    /// churn, read over the whole tree.
+    #[test]
+    fn status_numstat_with_glob_and_drive_like_names_reads_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+            std::fs::write(root.join(name), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+            std::fs::write(root.join(name), "a\nb\n").unwrap();
+        }
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(limited.contains("additions: 1"), "churn counted: {limited}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "whole-tree read: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// Exactly [`MAX_NUMSTAT_PATHSPECS`] paths are limited; one more is not.
+    /// The same line for their bytes: [`MAX_NUMSTAT_PATHSPEC_BYTES`] fit, one
+    /// byte more does not.
+    #[test]
+    fn numstat_pathspecs_fall_back_exactly_past_the_count_and_byte_bounds() {
+        let rows = |paths: Vec<String>| -> Vec<RawStatusRecord> {
+            paths
+                .into_iter()
+                .map(|path| RawStatusRecord {
+                    index_status: ' ',
+                    work_status: 'M',
+                    path,
+                    old_path: None,
+                })
+                .collect()
+        };
+        let limited = |rows: &[RawStatusRecord]| {
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths).map(|specs| specs.len())
+        };
+        let short = |count: usize| rows((0..count).map(|n| format!("f{n:04}")).collect());
+        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS)), Some(MAX_NUMSTAT_PATHSPECS));
+        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS + 1)), None);
+        // 16 paths of 1024 bytes each are exactly the byte bound.
+        let long = |count: usize, tail: usize| {
+            rows((0..count)
+                .map(|n| format!("{n:04}{}", "x".repeat(1020 + usize::from(n == 0) * tail)))
+                .collect())
+        };
+        let per_path = MAX_NUMSTAT_PATHSPEC_BYTES / 16;
+        assert_eq!(per_path, 1024);
+        assert_eq!(limited(&long(16, 0)), Some(16));
+        assert_eq!(limited(&long(16, 1)), None);
+        // Both sides of a rename count, once each, and a path is not counted twice.
+        let rename = || RawStatusRecord {
+            index_status: 'R',
+            work_status: ' ',
+            path: "b".into(),
+            old_path: Some("a".into()),
+        };
+        assert_eq!(limited(&[rename()]), Some(2));
+        assert_eq!(limited(&[rename(), rename()]), Some(2));
     }
 
     /// Past the bound the list would not fit a command line, so the whole tree
