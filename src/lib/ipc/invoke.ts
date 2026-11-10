@@ -269,9 +269,12 @@ class Waiters extends Set<Interest> {
       return this;
     }
     super.add(interest);
-    let owners = waitersOf.get(interest);
-    if (!owners) waitersOf.set(interest, (owners = new Set()));
-    owners.add(this);
+    // Only a caller that can leave is indexed; see `leaveIndex`.
+    if (signalled.has(interest)) {
+      let owners = leaveIndex.get(interest);
+      if (!owners) leaveIndex.set(interest, (owners = new Set()));
+      owners.add(this);
+    }
     return this;
   }
 
@@ -315,9 +318,24 @@ class Waiters extends Set<Interest> {
   }
 }
 
-const waitersOf = new WeakMap<Interest, Set<Waiters>>();
-/** The callers that carry an abort signal, i.e. can leave. */
-const signalled = new WeakSet<Interest>();
+/**
+ * The callers that carry an abort signal, i.e. can leave, and have not settled.
+ * Entered when the call is made and removed when it settles (`bound`).
+ */
+const signalled = new Set<Interest>();
+
+/**
+ * Which request sets each signalled caller is waiting in, so that its abort can
+ * ask them whether anyone is left.
+ *
+ * Invariant: `leaveIndex` holds only live, signalled callers of unsettled
+ * calls. A caller that can never leave (no signal) is never entered, so the
+ * index does not grow with the number of calls made; an entry made for one that
+ * can is removed, together with its `signalled` mark, by the one place that
+ * settles it (`bound`'s `done`), whichever way the call ends. Nothing else adds
+ * or removes.
+ */
+const leaveIndex = new Map<Interest, Set<Waiters>>();
 
 /**
  * A caller has stopped waiting. The calls it was waiting on are looked at one
@@ -327,8 +345,16 @@ const signalled = new WeakSet<Interest>();
  */
 function callerLeft(interest: Interest): void {
   setTimeout(() => {
-    for (const waiters of waitersOf.get(interest) ?? []) waiters.stopIfAbandoned();
+    for (const waiters of leaveIndex.get(interest) ?? []) waiters.stopIfAbandoned();
+    // The caller has left: this is its one removal (see `leaveIndex`).
+    releaseCaller(interest);
   }, 0);
+}
+
+/** Removes a caller from the leave index; the only removal. */
+function releaseCaller(interest: Interest): void {
+  signalled.delete(interest);
+  leaveIndex.delete(interest);
 }
 
 /** Whether `rest` is one plain-object argument, the only shape an id can be added to. */
@@ -574,14 +600,28 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     return result;
   }
 
-  return function invoke<T>(cmd: string, ...given: Given): Promise<T> {
+  function invoke<T>(cmd: string, ...given: Given): Promise<T> {
     if (given.length < 2) return bound(cmd, given.length === 0 ? [] : [given[0]], COMMAND_DEADLINES_MS[cmd], undefined);
     const [args, options] = given;
     if (options === undefined) return bound(cmd, [args], COMMAND_DEADLINES_MS[cmd], undefined);
     const { deadlineMs, signal, headers } = options;
     const rest: Rest = headers !== undefined ? [args, { headers }] : args === undefined ? [] : [args];
     return bound(cmd, rest, deadlineMs ?? COMMAND_DEADLINES_MS[cmd], signal);
-  };
+  }
+
+  /**
+   * What this wrapper still holds per call, for the test that asserts nothing
+   * is kept once every call has settled. Counts only; hands out no state.
+   */
+  function retained() {
+    return {
+      sharing: sharing.size,
+      retrying: retrying.size,
+      leaving: leaveIndex.size + signalled.size,
+    };
+  }
+
+  return Object.assign(invoke, { retained });
 
   /** `dispatch` under the caller's wait bound; a call with neither adds nothing. */
   function bound<T>(cmd: string, rest: Rest, deadlineMs: number | undefined, signal: AbortSignal | undefined): Promise<T> {
@@ -593,19 +633,30 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     // another command goes out.
     const startedAt = Date.now();
     const interest: Interest = () => !signal?.aborted && !(limited && Date.now() - startedAt >= (deadlineMs as number));
+    // Before the call is made: `openWaiters` and `Waiters.add` read it.
+    if (signal) signalled.add(interest);
     const answer = withDeadline(() => dispatch<T>(cmd, rest, interest), limited ? deadlineMs : Infinity, {
       signal,
       message: `${cmd} timed out after ${Math.round((deadlineMs ?? 0) / 1000)} s without an answer`,
     });
     if (signal) {
-      signalled.add(interest);
       // An abort is this caller leaving. When it was the last one waiting on a
       // read the backend can stop, the backend is told (see `Waiters`). A
       // deadline passing is also leaving but has no event to hear: that read
       // is simply not stopped early.
-      const left = () => callerLeft(interest);
-      signal.addEventListener("abort", left, { once: true });
-      const done = () => signal.removeEventListener("abort", left);
+      let left = false;
+      const onAbort = () => {
+        left = true;
+        callerLeft(interest);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      // Settling is the other way a caller ends. One that left by abort is
+      // released by `callerLeft`, one task after, once its sets have been
+      // asked; every other is released here. Never both.
+      const done = () => {
+        signal.removeEventListener("abort", onAbort);
+        if (!left) releaseCaller(interest);
+      };
       answer.then(done, done);
     }
     return answer;

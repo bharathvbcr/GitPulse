@@ -21,7 +21,9 @@ import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./s
  *  (iii) no request is sent under an id a cancel was already sent for;
  *  (iv)  a cancel is sent only when no live caller is attached to that request:
  *        no caller that did not abort is ever answered from a request that was
- *        told to stop.
+ *        answered after its cancel was sent;
+ *  (v)   once everything has settled and every timer has fired the wrapper holds
+ *        nothing: no shared or retrying entry, no caller in the leave index.
  *
  * The seeds are fixed; a failure names its seed and prints the steps taken.
  */
@@ -30,6 +32,15 @@ const CMD = "cmd_get_commit_graph";
 const CANCELLATION = { kind: "read_cancelled", message: "git read cancelled: its caller is gone" };
 const DEFERRED = { kind: "deferred_under_load", message: "git log deferred under load after 1s" };
 const SEEDS = Array.from({ length: 400 }, (_, i) => i);
+/**
+ * Seeds pinned because they are the first to fire a property when a merged set
+ * stops forwarding to its owner (`from.into = to` removed): 893 breaks (i), 2962
+ * breaks (iv). The range above reaches that mutation only through (ii).
+ */
+const PINNED: Array<[seed: number, why: string]> = [
+  [893, "(i): a never-aborted caller is handed the cancellation"],
+  [2962, "(iv): a never-aborted caller is answered by a request told to stop"],
+];
 const STEPS = 40;
 
 /** mulberry32: a small seeded generator, so a run is a function of its seed. */
@@ -66,6 +77,10 @@ async function run(seed: number): Promise<void> {
   const pending: Request[] = [];
   const naps: Array<() => void> = [];
   const cancelled = new Set<string>();
+  /** Tags of requests that were answered after their cancel was sent. */
+  const answeredAfterCancel = new Set<string>();
+  /** (iii) violations, recorded where they happen and reported as themselves. */
+  const sentUnderCancelledId: string[] = [];
   let tags = 0;
   let deferrals = MAX_DEFERRED_RETRIES;
 
@@ -76,7 +91,7 @@ async function run(seed: number): Promise<void> {
     }
     if (cmd !== CMD) return Promise.resolve(null);
     const id = typeof args?.requestId === "string" ? args.requestId : null;
-    if (id !== null && cancelled.has(id)) fail(`(iii) a request was sent under the cancelled id ${id}`);
+    if (id !== null && cancelled.has(id)) sentUnderCancelledId.push(id);
     return new Promise<unknown>((answer, failWith) => {
       pending.push({ tag: `req${(tags += 1)}`, id, answer, fail: failWith });
     });
@@ -94,16 +109,18 @@ async function run(seed: number): Promise<void> {
   const tick = () => vi.advanceTimersByTimeAsync(0);
 
   const check = () => {
+    if (sentUnderCancelledId.length > 0) fail(`(iii) a request was sent under the cancelled id ${sentUnderCancelledId[0]}`);
     for (const caller of callers) {
       if (caller.aborted) continue;
       const o = caller.outcome;
       if (o.state === "error" && isCancellation(o.error)) fail(`(i) caller ${caller.n} (never aborted) was handed the cancellation`);
-      if (o.state === "data" && cancelled.has(String(o.value))) fail(`(iv) caller ${caller.n} (never aborted) was answered by request ${String(o.value)} that was told to stop`);
+      if (o.state === "data" && answeredAfterCancel.has(String(o.value))) fail(`(iv) caller ${caller.n} (never aborted) was answered by request ${String(o.value)} that was told to stop`);
     }
   };
 
   const answerOne = (request: Request, how: "deferred" | "data" | "cancellation") => {
     pending.splice(pending.indexOf(request), 1);
+    if (request.id !== null && cancelled.has(request.id)) answeredAfterCancel.add(request.tag);
     trace.push(`answer ${request.tag}${request.id ? `(${request.id.slice(-3)})` : ""} ${how}`);
     if (how === "deferred") request.fail(DEFERRED);
     else if (how === "cancellation") request.fail(CANCELLATION);
@@ -172,6 +189,11 @@ async function run(seed: number): Promise<void> {
   await tick();
   check();
   if (pending.length > 0 || naps.length > 0) fail("the model did not drain");
+  // (v) nothing is retained once everything has settled and every timer fired:
+  // the leave index holds only live signalled callers of unsettled calls.
+  await vi.runAllTimersAsync();
+  const held = invoke.retained();
+  if (held.sharing + held.retrying + held.leaving > 0) fail(`(v) retained after everything settled: ${JSON.stringify(held)}`);
   for (const caller of callers) {
     if (caller.aborted) continue;
     if (caller.outcome.state !== "data") fail(`(ii) caller ${caller.n} (never aborted) ended ${JSON.stringify(caller.outcome)}`);
@@ -194,7 +216,11 @@ describe("a cancellable shared read, under random interleavings", () => {
     vi.useRealTimers();
   });
 
-  it(`holds (i) to (iv) on ${SEEDS.length} seeded runs of ${STEPS} steps`, async () => {
+  it.each(PINNED)("holds on pinned seed %i, which once broke %s", async (seed) => {
+    await run(seed);
+  });
+
+  it(`holds (i) to (v) on ${SEEDS.length} seeded runs of ${STEPS} steps`, async () => {
     const failures: string[] = [];
     for (const seed of SEEDS) {
       try {
