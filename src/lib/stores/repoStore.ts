@@ -1,5 +1,5 @@
 import type { RebaseStep } from "../rebase/planner";
-import { derived, get, writable } from "svelte/store";
+import { derived, get, readable, writable, type Readable } from "svelte/store";
 import { invalidateSharedReads, invoke, ipcErrorKind } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -354,6 +354,24 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   };
 
   const { subscribe, set } = writable<RepoState>(emptyProjected());
+
+  /**
+   * One field of the projection as a store of its own, notifying only when the
+   * field's reference changes. A plain `derived` would fire every publish for
+   * an array or object (Svelte treats every object set as a change), so each
+   * subscriber would re-run for a publish that left its field alone.
+   */
+  function field<T>(select: (state: RepoState) => T): Readable<T> {
+    return readable(select(get({ subscribe })), (setValue) => {
+      let held: { value: T } | null = null;
+      return subscribe((state) => {
+        const value = select(state);
+        if (held !== null && Object.is(held.value, value)) return;
+        held = { value };
+        setValue(value);
+      });
+    });
+  }
   // A full watcher/manual refresh can observe M→M content edits while every
   // status field stays equal. Keep this signal separate from the UI snapshot
   // so content readers update without invalidating every repository subscriber.
@@ -1981,6 +1999,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * out of effect bodies.
      */
     currentPath: derived({ subscribe }, (state) => state.currentPath),
+    /**
+     * The active repository's changed files, branches, and the open tab list,
+     * each notifying only when its array is replaced (see `field`), plus the
+     * conflicted and staged counts the projection took once per statuses array.
+     * A component that needs one of these reads it here, not through
+     * `$repoStore`, so a publish it did not cause costs it nothing.
+     */
+    statuses: field((state) => state.statuses),
+    branches: field((state) => state.branches),
+    openTabs: field((state) => state.openTabs),
+    conflictedCount: field((state) => state.conflictedCount),
+    stagedCount: field((state) => state.stagedCount),
     /** The active tab's commit message; see `commitDraftStore`. */
     commitDraft: commitDrafts,
     mutationActivity: { subscribe: mutationActivity.subscribe },

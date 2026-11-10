@@ -3021,6 +3021,58 @@ describe("repoStore openTabs identity", () => {
   });
 });
 
+describe("repoStore field stores", () => {
+  const file = (path: string, extra: Record<string, unknown> = {}) => ({
+    path, status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0, ...extra,
+  });
+
+  async function open(statuses: unknown[]) {
+    let current = statuses;
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => current as never }));
+    await store.openRepo("/r/fields");
+    return { store, set: (next: unknown[]) => { current = next; } };
+  }
+
+  function watch<T>(readable: { subscribe: (run: (value: T) => void) => () => void }) {
+    const seen: T[] = [];
+    const stop = readable.subscribe((value) => seen.push(value));
+    return { seen, stop };
+  }
+
+  it("statuses, branches and openTabs notify only when their array is replaced", async () => {
+    const { store, set } = await open([file("a.ts")]);
+    const statuses = watch(store.statuses);
+    const branches = watch(store.branches);
+    const tabs = watch(store.openTabs);
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length]).toEqual([1, 1, 1]);
+
+    store.selectFilePath("a.ts"); // a publish that touches none of the three
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length]).toEqual([1, 1, 1]);
+
+    set([file("a.ts"), file("b.ts")]);
+    await store.refresh("/r/fields", "status");
+    expect(statuses.seen).toHaveLength(2);
+    expect(statuses.seen[1]).toHaveLength(2);
+    expect(branches.seen).toHaveLength(1);
+    statuses.stop(); branches.stop(); tabs.stop();
+  });
+
+  it("counts conflicted and staged files once per statuses array", async () => {
+    const { store, set } = await open([file("a.ts", { is_conflicted: true }), file("b.ts", { is_staged: true }), file("c.ts", { is_staged: true })]);
+    expect(get(store.conflictedCount)).toBe(1);
+    expect(get(store.stagedCount)).toBe(2);
+    expect(get(store).conflictedCount).toBe(1);
+    const conflicts = watch(store.conflictedCount);
+    store.selectFilePath("b.ts");
+    expect(conflicts.seen).toEqual([1]);
+    set([file("a.ts")]);
+    await store.refresh("/r/fields", "status");
+    expect(conflicts.seen).toEqual([1, 0]);
+    expect(get(store.stagedCount)).toBe(0);
+    conflicts.stop();
+  });
+});
+
 describe("repoStore index and worktree mutations refresh the status facet only", () => {
   const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
   const unit = async () => undefined as never;

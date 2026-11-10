@@ -7,7 +7,7 @@ import { familyFromCommonDir } from "./repoFamily";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { WATCH_UNKNOWN } from "./watchState";
 import { IDLE_OPERATION } from "./operation";
-import type { OpenRepoTab, RepoSession, RepoState, InternalState } from "./storeTypes";
+import type { FileStatus, OpenRepoTab, RepoSession, RepoState, InternalState } from "./storeTypes";
 
 /**
  * Session generations never restart — not on close+reopen, not on workspace
@@ -35,6 +35,8 @@ export function emptyProjected(): RepoState {
     currentBranch: null,
     defaultBranch: null,
     statuses: [],
+    conflictedCount: 0,
+    stagedCount: 0,
     selectedCommitId: null,
     selectedCompareBase: null,
     selectedFilePath: null,
@@ -145,10 +147,25 @@ export interface ProjectionCache {
   rows: Map<string, { tab: TabRecord; session: RepoSession | undefined; active: boolean; label: string; row: OpenRepoTab }>;
   /** The array `project` returned last, handed back while no row changed or moved. */
   openTabs: OpenRepoTab[] | null;
+  /** Counts for the statuses array they were taken from; recounted only for a different array. */
+  counts: { statuses: readonly FileStatus[]; conflicted: number; staged: number } | null;
 }
 
 export function createProjectionCache(): ProjectionCache {
-  return { tabs: null, labels: new Map(), rows: new Map(), openTabs: null };
+  return { tabs: null, labels: new Map(), rows: new Map(), openTabs: null, counts: null };
+}
+
+function countStatuses(cache: ProjectionCache, statuses: readonly FileStatus[]) {
+  if (cache.counts?.statuses !== statuses) {
+    let conflicted = 0;
+    let staged = 0;
+    for (const file of statuses) {
+      if (file.is_conflicted) conflicted += 1;
+      if (file.is_staged) staged += 1;
+    }
+    cache.counts = { statuses, conflicted, staged };
+  }
+  return cache.counts;
 }
 
 /** Every `OpenRepoTab` field is a primitive, so equal keys and values is equal. */
@@ -198,7 +215,8 @@ export function project(
   const active = internal.workspace.activeId
     ? internal.sessions[internal.workspace.activeId]
     : undefined;
-  return projectRest(internal, openTabs, active);
+  const counts = active ? countStatuses(cache, active.statuses) : null;
+  return projectRest(internal, openTabs, active, counts?.conflicted ?? 0, counts?.staged ?? 0);
 }
 
 function projectTab(
@@ -239,6 +257,8 @@ function projectRest(
   internal: InternalState,
   openTabs: OpenRepoTab[],
   active: RepoSession | undefined,
+  conflictedCount: number,
+  stagedCount: number,
 ): RepoState {
   const base = emptyProjected();
   return {
@@ -255,6 +275,8 @@ function projectRest(
     currentBranch: active?.currentBranch ?? null,
     defaultBranch: active?.defaultBranch ?? null,
     statuses: active?.statuses ?? [],
+    conflictedCount,
+    stagedCount,
     selectedCommitId: active?.selectedCommitId ?? null,
     selectedCompareBase: active?.selectedCompareBase ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
