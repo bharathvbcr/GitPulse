@@ -269,21 +269,10 @@ fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandErro
     }
     let lease = devmap_query::stacked::StackLease::read_from(&lease_path)
         .map_err(|e| CommandError::from(format!("failed to read stack lease: {e}")))?;
-    let manifest_path = PathBuf::from(&lease.base_dir).join("manifest.json");
-    let raw = read_bounded_file(&manifest_path, 64 * 1024)?.ok_or_else(|| {
-        CommandError::from(format!(
-            "stacked base manifest {} is missing or oversized",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest: devmap_query::stacked::BaseManifest =
-        serde_json::from_slice(&raw).map_err(|e| {
-            CommandError::from(format!(
-                "failed to parse stacked base manifest {}: {e}",
-                manifest_path.display()
-            ))
-        })?;
-    let donor = validate_repo(&manifest.source_repo_root)?;
+    // The lane owns its base: the lease itself records the donor checkout, so
+    // there is no shared-cache manifest to read (and nothing outside the lane
+    // to trust).
+    let donor = validate_repo(&lease.source_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let donor_common = crate::engine::git_cli::resolve_git_common_dir(&donor)?;
     if repo_common != donor_common || !devmap_extract::paths::same_registered_repo(repo, &donor) {
@@ -308,7 +297,7 @@ pub(super) fn open_verified_stacked_store(
     }
     let stacked = devmap_query::StackedStore::open(repo)
         .map_err(|e| CommandError::from(format!("failed to open stacked store: {e}")))?;
-    let anchor_root = validate_repo(&stacked.manifest().source_repo_root)?;
+    let anchor_root = validate_repo(&stacked.lease().source_repo_root)?;
     let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
     let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
     if repo_common != anchor_common
@@ -320,7 +309,7 @@ pub(super) fn open_verified_stacked_store(
             anchor_root.display()
         )));
     }
-    let base_sqlite = stacked.base_sqlite_path().to_path_buf();
+    let base_sqlite = stacked.lease().base_sqlite_path();
     let wt_root_str = repo.to_string_lossy().into_owned();
     let store = Store::open_immutable_snapshot(&base_sqlite, Some(wt_root_str)).map_err(|e| {
         CommandError::from(format!(
@@ -332,11 +321,17 @@ pub(super) fn open_verified_stacked_store(
         .latest_generation_head_sha()
         .ok()
         .flatten()
-        .or_else(|| Some(stacked.manifest().head_sha.clone()));
+        .or_else(|| Some(stacked.lease().head_sha.clone()));
+    // The lease records whether the lane holds a CSR sidecar and its sha256.
+    let base_csr_path = stacked
+        .lease()
+        .csr
+        .as_ref()
+        .map(|_| devmap_extract::paths::csr_path_for_store(&base_sqlite));
     let meta = StackedBaseMeta {
         anchor_repo_root: anchor_root,
         base_db_path: base_sqlite.to_string_lossy().into_owned(),
-        base_csr_path: stacked.base_csr_path().map(Path::to_path_buf),
+        base_csr_path,
         generation_id: stacked.lease().generation_id,
         base_head_sha,
     };
@@ -1636,6 +1631,31 @@ pub(super) fn verify_zero_copy_affected_tests_disjoint_from_deltas(
     true
 }
 
+/// Maps the lane's CSR sidecar after checking it against the sha256 the stack
+/// lease admitted. `Ok(None)` means the lease records no sidecar; a sidecar
+/// that fails its hash is an error, never mapped.
+pub(super) fn open_verified_stacked_csr(
+    meta: &StackedBaseMeta,
+    stacked: &devmap_query::StackedStore,
+) -> Result<Option<devmap_store::CsrGraphReader>, CommandError> {
+    let (Some(record), Some(csr_path)) = (stacked.lease().csr.as_ref(), meta.base_csr_path.as_ref())
+    else {
+        return Ok(None);
+    };
+    let actual = devmap_query::stacked::sha256_file_hex(csr_path)
+        .map_err(|e| CommandError::from(format!("Failed to verify stacked CSR graph: {e}")))?;
+    if actual != record.sha256 {
+        return Err(CommandError::from(format!(
+            "Failed to verify stacked CSR graph: {} hashes to {actual}, but the stack lease admitted {}",
+            csr_path.display(),
+            record.sha256
+        )));
+    }
+    devmap_store::CsrGraphReader::open_mmap(csr_path)
+        .map(Some)
+        .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))
+}
+
 /// Opens the mmap [`devmap_store::CsrGraphReader`] for `repo`, preferring the
 /// verified `StackedStore` base snapshot in sparse checkouts (`F2`).
 pub(crate) fn open_worktree_or_anchor_csr(
@@ -1651,15 +1671,10 @@ pub(crate) fn open_worktree_or_anchor_csr(
         }
     }
     if let Ok(Some((base_store, meta, stacked))) = open_verified_stacked_store(repo) {
-        match stacked.csr_reader() {
-            Ok(Some(arc_reader)) => {
-                let gen = arc_reader.generation();
-                if let Some(ref csr_path) = meta.base_csr_path {
-                    if let Ok(reader) = devmap_store::CsrGraphReader::open_mmap(csr_path) {
-                        return Some((reader, gen));
-                    }
-                }
-                return None;
+        match open_verified_stacked_csr(&meta, &stacked) {
+            Ok(Some(reader)) => {
+                let gen = reader.generation();
+                return Some((reader, gen));
             }
             Ok(None) => {
                 if let Ok(Some(reader)) = base_store.open_latest_csr_sidecar() {

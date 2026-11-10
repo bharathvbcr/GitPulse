@@ -483,18 +483,8 @@ pub fn open_repo_csr_graph(repo_path: &str) -> Result<devmap_store::CsrGraphRead
             store,
             meta,
             stacked,
-        } => match stacked
-            .csr_reader()
-            .map_err(|e| CommandError::from(format!("Failed to verify stacked CSR graph: {e}")))?
-        {
-            Some(_) => match meta.base_csr_path {
-                Some(ref csr_path) => Some(
-                    devmap_store::CsrGraphReader::open_mmap(csr_path).map_err(|e| {
-                        CommandError::from(format!("Failed to open CSR graph: {e}"))
-                    })?,
-                ),
-                None => None,
-            },
+        } => match worktree_overlay::open_verified_stacked_csr(&meta, &stacked)? {
+            Some(reader) => Some(reader),
             None => store
                 .open_latest_csr_sidecar()
                 .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))?,
