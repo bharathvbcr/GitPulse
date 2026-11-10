@@ -48,6 +48,8 @@
     disabled?: boolean;
     /** DOM id of the input, so a caller-owned `<label for>` can point at it. */
     id?: string;
+    /** Sets `data-testid` on the native input, for a harness or test that selects the box. */
+    testId?: string;
     onchange?: (next: boolean) => void;
   };
 
@@ -59,6 +61,7 @@
     disabled = false,
     ariaLabel = "",
     id,
+    testId,
     onchange,
   }: Props = $props();
 
@@ -80,6 +83,7 @@
 {#snippet control()}
   <input
     id={boxId}
+    data-testid={testId}
     type="checkbox"
     class="gp-check"
     {checked}

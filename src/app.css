@@ -694,27 +694,11 @@
   &::placeholder {
     -webkit-text-fill-color: rgb(var(--c-text-muted) / 0.6);
   }
-}
-
-@utility gp-field-multi {
-  /* The multiline field (design language §5, §9): anything that can grow past
-     one line is a rounded rectangle, radius `--gp-r-md`, not a pill. It wears
-     the whole `gp-field` (so `gp-field gp-field-multi` and `gp-field-multi`
-     alone are the same control) and adds the states a field has:
-       focus     the accent edge and `--ring-focus` (from gp-field);
+  /* The states a field has, shared with `gp-field-multi`:
        invalid   `data-invalid` (not "false") or `aria-invalid="true"` turns the
                  edge and the focus ring to the danger role;
        disabled  `:disabled` or `aria-disabled="true"`, dimmed to the .4 every
-                 control uses, not resizable. */
-  @apply gp-field;
-  /* `&&` doubles the class. Tailwind emits `gp-field` after `gp-field-multi`,
-     so with both classes on an element (every call site today) the pill radius
-     and the one-line padding of `gp-field` would otherwise win the tie. */
-  && {
-    border-radius: var(--gp-r-md);
-    padding-block: var(--gp-space-2);
-  }
-  resize: vertical;
+                 control uses. */
   &[data-invalid]:not([data-invalid="false"]),
   &[aria-invalid="true"] {
     border-color: rgb(var(--c-danger));
@@ -726,6 +710,26 @@
   &:disabled,
   &[aria-disabled="true"] {
     @apply cursor-not-allowed opacity-40;
+  }
+}
+
+@utility gp-field-multi {
+  /* The multiline field (design language §5, §9): anything that can grow past
+     one line is a rounded rectangle, radius `--gp-r-md`, not a pill. It wears
+     the whole `gp-field` (so `gp-field gp-field-multi` and `gp-field-multi`
+     alone are the same control, focus, invalid and disabled states included)
+     and adds the shape and the resize handle, which a disabled one loses. */
+  @apply gp-field;
+  /* `&&` doubles the class. Tailwind emits `gp-field` after `gp-field-multi`,
+     so with both classes on an element (every call site today) the pill radius
+     and the one-line padding of `gp-field` would otherwise win the tie. */
+  && {
+    border-radius: var(--gp-r-md);
+    padding-block: var(--gp-space-2);
+  }
+  resize: vertical;
+  &:disabled,
+  &[aria-disabled="true"] {
     resize: none;
   }
 }
