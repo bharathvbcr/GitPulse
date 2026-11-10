@@ -5987,12 +5987,17 @@ mod tests {
             start_watch_inner(state, path.to_string(), |_| {}).unwrap();
             let filter = skip_of(state, path);
             wait_for_a_still_epoch(filter.skip());
-            filter
-                .skip()
-                .set_timings(Duration::from_millis(1500), Duration::from_millis(1000));
+            // The shortened cap goes through the suite's load-scaling helper (the
+            // one `hermetic_contract` requires for wall-clock limits), so a slow
+            // read on a busy host stretches the cap with it instead of eating it.
+            let cap = crate::test_support::coverage_relaxed(Duration::from_millis(1500));
+            filter.skip().set_timings(
+                cap,
+                crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            );
             let first = poll(state, path);
             assert!(first.len() >= 2_100, "{} rows", first.len());
-            thread::sleep(Duration::from_millis(1600));
+            thread::sleep(cap + Duration::from_millis(100));
             poll(state, path);
             // Straight after the cap read: served (the cap is measured from
             // when that read began, so a slow read must not eat it).

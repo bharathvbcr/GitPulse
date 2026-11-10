@@ -180,9 +180,39 @@ impl Counts {
 
 static TOTALS: Counts = Counts::new();
 
-/// The process-wide counts since start, for the periodic gate log line.
+/// The process-wide counts since start.
 pub(crate) fn summary() -> String {
     TOTALS.line()
+}
+
+/// Remembers the last line it let through, so reading the diagnostics twice
+/// with nothing new in between records the counters once.
+#[derive(Default)]
+pub(crate) struct Changed(Mutex<Option<String>>);
+
+impl Changed {
+    /// True when `line` differs from the last one let through.
+    pub(crate) fn fresh(&self, line: &str) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.as_deref() == Some(line) {
+            return false;
+        }
+        *last = Some(line.to_string());
+        true
+    }
+}
+
+static LAST_RECORDED: Changed = Changed(Mutex::new(None));
+
+/// The process-wide counters as one line, for the diagnostics export, once per
+/// change. `None` when no poll has been decided yet (an untouched process
+/// logs nothing, so an empty log still reads as empty) or nothing changed.
+pub(crate) fn summary_if_changed() -> Option<String> {
+    let line = summary();
+    if TOTALS.0.iter().all(|c| c.load(Ordering::Relaxed) == 0) {
+        return None;
+    }
+    LAST_RECORDED.fresh(&line).then_some(line)
 }
 
 /// The part of a status row that is a function of the tree alone.
@@ -752,6 +782,15 @@ mod portable_tests {
         let now = Instant::now();
         assert!(skip.begin(now, true).keep_under.is_none());
         assert_eq!(skip.counts.get(Outcome::Unavailable(Why::NoRoot)), 1);
+    }
+
+    /// Reading the diagnostics twice with nothing new records the counters once.
+    #[test]
+    fn the_counters_are_recorded_once_per_change() {
+        let seen = Changed::default();
+        assert!(seen.fresh("a"));
+        assert!(!seen.fresh("a"));
+        assert!(seen.fresh("b"));
     }
 
     /// The process-wide line is the same text over the process totals.
