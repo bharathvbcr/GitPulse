@@ -34,11 +34,14 @@ export interface PollRestInput {
  * {@link STATUS_POLL_INTERVAL_MS}, and never shorter than
  * {@link STATUS_POLL_COST_FACTOR} times what the last poll cost.
  *
- * There is deliberately NO longer rest for a repository that looks quiet. The
- * worktree watch is non-recursive (`watcher/debouncer.rs`), so an unstaged
- * edit to a nested file writes nothing under `.git` and raises no event: this
- * poll is the primary detector of ordinary edits, and a quiet minute must not
- * make the first edit after it up to a minute late.
+ * There is deliberately NO longer rest for a repository that looks quiet. On
+ * Linux and Windows the worktree watch is non-recursive
+ * (`watcher/debouncer.rs`), so an unstaged edit to a nested file writes
+ * nothing under `.git` and raises no event: this poll is the primary detector
+ * of ordinary edits there, and a quiet minute must not make the first edit
+ * after it up to a minute late. On macOS the watch is recursive and the
+ * backend answers a poll that finds nothing moved from the read it kept
+ * ({@link statusPollRequest}), so the cadence stays and the git process goes.
  */
 export function statusPollRestMs(input: PollRestInput): number {
   const base = STATUS_POLL_INTERVAL_MS;
@@ -47,6 +50,20 @@ export function statusPollRestMs(input: PollRestInput): number {
       ? input.lastDurationMs * STATUS_POLL_COST_FACTOR
       : 0;
   return Math.min(STATUS_POLL_MAX_INTERVAL_MS, Math.max(base, cost));
+}
+
+/**
+ * The poll's `cmd_get_status` arguments. `skipIfUnchanged` lets the backend
+ * return the status it kept from an earlier read, with no git spawned, when the
+ * repository's watch can show that nothing under the worktree has changed
+ * since that read began (`watcher::status_through_watch`). The backend says
+ * nothing of the sort unless the worktree has a live recursive watch, so
+ * everywhere else, and for a watch that is parked, lost events, or has not
+ * finished loading, the call reads exactly as it did before. Only the poll
+ * passes it: a refresh the user or the watcher asked for always reads.
+ */
+export function statusPollRequest(repoPath: string): { repoPath: string; skipIfUnchanged: true } {
+  return { repoPath, skipIfUnchanged: true };
 }
 
 /**
@@ -183,10 +200,10 @@ const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
  * The change a status poll observed, in the watcher's vocabulary, or null when
  * the two lists are the same.
  *
- * The worktree watch is non-recursive, so an edit to `docs/guide.md` reaches
- * no `repo-changed` event and the code index and document vault stayed stale
- * until something touched the index. The poll already reads the whole
- * worktree's status, so it names what moved: every row that appeared,
+ * Where the worktree watch is non-recursive (Linux, Windows), an edit to
+ * `docs/guide.md` reaches no `repo-changed` event and the code index and
+ * document vault stayed stale until something touched the index. The poll
+ * already reads the whole worktree's status, so it names what moved: every row that appeared,
  * disappeared or changed. An entry that is, or may contain, a document (a
  * Markdown name, or no extension) also marks `documents`, as the watcher does.
  */
