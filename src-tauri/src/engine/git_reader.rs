@@ -1508,7 +1508,7 @@ impl GitReader {
         if let Some(reason) = incomplete {
             return Err(format!("Blame unavailable: {}", reason.describe()).into());
         }
-        parse_blame_porcelain(&stdout, false)
+        bound_blame_payload(parse_blame_porcelain(&stdout, false)?)
     }
 
     /// Lists every path the file explorer may show: tracked files plus
@@ -6227,7 +6227,7 @@ fn blame_at_revision(
     if let Some(reason) = incomplete {
         return Err(format!("Blame unavailable: {}", reason.describe()).into());
     }
-    parse_blame_porcelain(&stdout, false)
+    bound_blame_payload(parse_blame_porcelain(&stdout, false)?)
 }
 
 /// A new file has content but no committed author. Preserve every line while
@@ -6274,14 +6274,52 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, Co
             previous_commit: None,
             previous_path: None,
         };
-        payload_bytes += serde_json::to_vec(&line)
-            .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?
-            .len()
-            + 1;
+        payload_bytes += blame_wire_bytes(&line)?;
         if payload_bytes > budget::MAX_BLAME_BYTES {
             return Err("Blame unavailable: uncommitted lines exceeded the output budget".into());
         }
         lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// Bytes `line` costs on the IPC wire as JSON, with the comma after it.
+fn blame_wire_bytes(line: &BlameLine) -> Result<usize, CommandError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, line)
+        .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?;
+    Ok(count.0 + 1)
+}
+
+/// Refuses a blame whose JSON would outgrow [`budget::MAX_BLAME_BYTES`].
+///
+/// The git read is capped on what git PRINTS, which `--porcelain` made a small
+/// fraction of what each line costs once it is a `BlameLine` (a 40-byte oid, the
+/// author's name and email and the key names are repeated per line): a file of
+/// short lines could print 13 MB and send 44. The budget is the one the
+/// uncommitted-file path already spends, counted in the same unit, on what
+/// crosses IPC. Over it is an error by name, never a prefix.
+fn bound_blame_payload(lines: Vec<BlameLine>) -> Result<Vec<BlameLine>, CommandError> {
+    let mut bytes = 2;
+    for line in &lines {
+        bytes += blame_wire_bytes(line)?;
+        if bytes > budget::MAX_BLAME_BYTES {
+            return Err(format!(
+                "Blame unavailable: exceeded {} MB of blame payload",
+                budget::MAX_BLAME_BYTES / (1024 * 1024)
+            )
+            .into());
+        }
     }
     Ok(lines)
 }
@@ -11466,35 +11504,84 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(parse_blame_porcelain(&short_group, true).unwrap().len(), 1);
     }
 
-    /// A repository holding one commit that adds `lines` lines of 100 bytes
-    /// (101 with the newline) to `big.txt`.
-    fn one_commit_big_file(lines: usize) -> tempfile::TempDir {
+    /// A repository holding one commit by `author` with message `summary` that
+    /// adds `lines` lines of `width` bytes (`width + 1` with the newline) to
+    /// `big.txt`.
+    fn one_commit_big_file(
+        lines: usize,
+        width: usize,
+        author: &str,
+        summary: &str,
+    ) -> tempfile::TempDir {
         let dir = init_repo_with_remotes(&[], "main");
         let body: String = (0..lines)
-            .map(|n| format!("{n:06} {}\n", "x".repeat(93)))
+            .map(|n| format!("{n:06} {}\n", "x".repeat(width - 7)))
             .collect();
         std::fs::write(dir.path().join("big.txt"), body).unwrap();
         git_in(dir.path(), &["add", "big.txt"]);
-        git_in(dir.path(), &["commit", "-q", "-m", "big"]);
+        let author = format!("{author} <a@example.com>");
+        git_in(
+            dir.path(),
+            &["commit", "-q", "--author", &author, "-m", summary],
+        );
         dir
     }
 
-    /// `--line-porcelain` repeated a commit's metadata for EVERY line, so a
-    /// one-commit file of 100,000 lines (10 MB of text) outgrew the 16 MiB cap
-    /// and was refused ("exceeded 16 MB"). `--porcelain` states a commit's
-    /// metadata once, so the same file is its text plus one header per line
-    /// and blames whole.
+    /// `--line-porcelain` repeated a commit's metadata for EVERY line: with an
+    /// 80-byte author and a 300-byte summary, 40,000 lines print ~26 MB and
+    /// were refused at the 16 MiB cap ("exceeded 16 MB"). `--porcelain` states
+    /// the metadata once, so the same file is a header per line and blames
+    /// whole, and its IPC JSON (~12 MB here) is inside the same bound.
     #[test]
     fn blame_past_the_old_line_porcelain_ceiling_is_complete() {
-        let dir = one_commit_big_file(100_000);
+        let (author, summary) = ("a".repeat(80), "s".repeat(300));
+        let dir = one_commit_big_file(40_000, 20, &author, &summary);
         let path = dir.path().to_str().unwrap();
+        let old = git_text_capped(
+            dir.path(),
+            &["blame", "--line-porcelain", "HEAD", "--", "big.txt"],
+            32 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(
+            old.1.is_none() && old.0.len() > budget::MAX_BLAME_BYTES,
+            "the old format is past the cap for this file: {} bytes",
+            old.0.len()
+        );
         let lines = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
-            .expect("a 100,000-line one-commit file is under the cap");
-        assert_eq!(lines.len(), 100_000);
+            .expect("a 40,000-line one-commit file is under the bound");
+        assert_eq!(lines.len(), 40_000);
         assert_eq!(lines[0].line_no, 1);
-        assert_eq!(lines[99_999].line_no, 100_000);
-        assert!(lines[99_999].content.starts_with("099999 "));
+        assert_eq!(lines[39_999].line_no, 40_000);
+        assert!(lines[39_999].content.starts_with("039999 "));
         assert!(lines.iter().all(|l| l.commit_id == lines[0].commit_id));
+        assert!(blame_json(&lines).len() < budget::MAX_BLAME_BYTES);
+    }
+
+    /// What is SENT is bounded, not only what git prints: `--porcelain` is ~66
+    /// bytes a line here, but each line crosses IPC as ~220 bytes of JSON plus
+    /// its text. 200,000 short lines are 13 MB of git output (under the read
+    /// cap) and ~44 MB of JSON (over [`budget::MAX_BLAME_BYTES`]): refused by
+    /// name on both single-file paths, never truncated, never whole.
+    #[test]
+    fn a_blame_whose_json_outgrows_the_ipc_budget_is_refused() {
+        let dir = one_commit_big_file(200_000, 10, "Test User", "big");
+        let path = dir.path().to_str().unwrap();
+        for revision in [Some("HEAD"), None] {
+            let error = GitReader::get_file_blame(path, "big.txt", revision)
+                .expect_err("a blame over the IPC budget must not be returned");
+            let message = error.message();
+            assert!(
+                message.contains("Blame unavailable") && message.contains("exceeded"),
+                "{revision:?}: the refusal must name the size limit: {message}"
+            );
+        }
+        // The same payload is accepted below the bound.
+        let small = one_commit_big_file(50_000, 10, "Test User", "big");
+        let lines =
+            GitReader::get_file_blame(small.path().to_str().unwrap(), "big.txt", None).unwrap();
+        assert_eq!(lines.len(), 50_000);
+        assert!(blame_json(&lines).len() < budget::MAX_BLAME_BYTES);
     }
 
     /// The cap itself still holds: a file whose porcelain exceeds
@@ -11502,7 +11589,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     /// returned as an empty or partial blame.
     #[test]
     fn blame_over_the_porcelain_cap_is_refused_for_size_never_partial() {
-        let dir = one_commit_big_file(120_000);
+        let dir = one_commit_big_file(120_000, 100, "Test User", "big");
         let path = dir.path().to_str().unwrap();
         let error = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
             .expect_err("a blame over the cap must not be returned");
