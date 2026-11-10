@@ -420,6 +420,15 @@
     .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
     .status-shell[data-material] :is(.metric, .detail-action, .repositories, .chip, .mark) { background:var(--surface); border-color:var(--line); }
   }
+  /* WKWebView does not implement prefers-reduced-transparency, so the query above
+     never fires for the macOS Reduce Transparency setting. The native bridge
+     (lib/ui/transparencyPreference.ts) stamps this attribute instead. These are
+     the query block's first two rules; keep them identical. Its third rule
+     (inner cards: background var(--surface), border var(--line)) has nothing to
+     add here: the glass rule above already gives those cards var(--surface) and
+     var(--glass-edge), and --line is var(--glass-edge). */
+  :global(html[data-transparency="reduced"]) .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
+  :global(html[data-transparency="reduced"]) .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
   button { font:inherit; cursor:pointer; border:0; color:inherit; background:none; padding:0; }
   button:disabled { cursor:default; }
   button:focus-visible,.details:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }

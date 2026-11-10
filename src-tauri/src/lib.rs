@@ -573,6 +573,7 @@ pub fn run() {
             cmd_take_pending_open,
             cmd_set_recent_menu,
             desktop::cmd_set_menu_state,
+            desktop::accessibility::cmd_get_accessibility_display,
             desktop::popover::cmd_get_status_state,
             desktop::popover::cmd_status_action,
             desktop::popover::cmd_resize_status,

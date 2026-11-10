@@ -125,3 +125,46 @@ describe("compact status popover", () => {
     }
   });
 });
+
+describe("reduced transparency in the status popover", () => {
+  // WKWebView does not implement prefers-reduced-transparency, so the media
+  // query alone never fires for the macOS setting. The attribute selector is
+  // what the native bridge reaches; the two must say the same thing.
+  const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
+
+  function mediaBody(): string {
+    const start = styles.indexOf("@media (prefers-reduced-transparency: reduce)");
+    expect(start).toBeGreaterThan(-1);
+    const open = styles.indexOf("{", start);
+    let depth = 0;
+    for (let i = open; i < styles.length; i += 1) {
+      if (styles[i] === "{") depth += 1;
+      if (styles[i] === "}" && --depth === 0) return styles.slice(open + 1, i);
+    }
+    throw new Error("unterminated reduced-transparency block");
+  }
+
+  it("keeps the media query beside the attribute", () => {
+    expect(styles).toContain("@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active)");
+  });
+
+  it("restyles under html[data-transparency=reduced] with the media block's declarations", () => {
+    const attribute = [...styles.matchAll(/:global\(html\[data-transparency="reduced"\]\)\s*([^{}]+)\{([^}]*)\}/g)]
+      .map(([, selector, body]) => [normalize(selector), normalize(body)]);
+    const media = [...mediaBody().matchAll(/([^{}]+)\{([^}]*)\}/g)]
+      .map(([, selector, body]) => [normalize(selector), normalize(body)]);
+    expect(media).toHaveLength(3);
+    // The shell and the panel. The media block's third rule (inner cards) is
+    // already satisfied by the glass rule through --surface and --line, and
+    // repeating it would only add scoped widget-dialect selectors (rule 12).
+    expect(attribute).toEqual(media.slice(0, 2));
+    const [, , cards] = media;
+    expect(cards[1]).toBe("background:var(--surface); border-color:var(--line);");
+    expect(styles).toMatch(/--line:var\(--glass-edge\)/);
+  });
+
+  it("does not react to the unknown state", () => {
+    expect(styles).not.toContain('data-transparency="unknown"');
+  });
+});

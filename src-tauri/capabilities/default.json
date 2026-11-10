@@ -131,6 +131,7 @@
     "allow-cmd-firebase-status",
     "allow-cmd-fleet-record-metrics",
     "allow-cmd-fleet-snapshot",
+    "allow-cmd-get-accessibility-display",
     "allow-cmd-get-commit-details",
     "allow-cmd-verify-commit-signature",
     "allow-cmd-get-commit-diff",
