@@ -2662,6 +2662,12 @@ What would flood the bounded event queue (a build writing thousands of files und
 
 Only delivery. The 6 s status poll reads every time, exactly as before this change, and nothing treats the absence of an event as proof that the worktree is unchanged. A path wrongly dropped therefore costs one refresh at most one poll late, which is what a nested edit cost before. The ignore list behind the filter is `git ls-files -o -i --directory`: it says which directories hold only ignored files now, not which are excluded by a rule (a `:build/` holding only a swap file is listed), and it can be stale (renaming a directory that holds a `.gitignore` leaves its old names listed). Two reproductions of exactly those cases are tests (`a_renamed_ancestor_of_a_rule_file_costs_at_most_a_poll`, `a_directory_listed_as_ignored_only_because_of_its_contents_costs_at_most_a_poll`): the event is dropped, the poll reads and shows the file.
 
+Ignored FILES (not directories) that the same listing prints one by one, such as a nested `.claude/settings.local.json`, `crates/x/lcov.info` or `.DS_Store`, are dropped too when an event names nothing else: main produced no event at all for a nested file (the backend discarded every nested path), so forwarding them would be a new refresh per write. The list is bounded (4,096 names, 256 KiB of names); past either bound a file is forwarded, never dropped. An editor's atomic save (write a temporary file, rename it over the tracked file) is still forwarded: the event that names the tracked path is not all-ignored, and the tracked path alone is not listed.
+
+A `.gitignore` event under a directory the list names, or under a build-looking name (`node_modules/pkg/.gitignore`), is itself dropped by the callback and never reaches the loop, so it cannot ask for a reload. That does not matter for delivery: git ignores a `.gitignore` inside an ignored directory, and in a directory listed only because its files are ignored a stale list costs a refresh now and then, which the poll covers. Forwarding them would hand a reload to every `npm install`.
+
+On Linux and Windows nothing below the root is delivered, so a new directory does not ask for a reload there (a stale list hides nothing); only the recursive macOS watch does.
+
 Never dropped: a backend error, a must-rescan flag, an event with no path, an event naming the worktree root (the only trace of a repository that moved away).
 
 ### When the ignore list is reloaded
@@ -2671,6 +2677,16 @@ One bounded (3 s) `git ls-files` on the watch thread, when a `.gitignore` or `in
 ### Event volume
 
 Asserted, not timed, by `ten_thousand_writes_under_an_ignored_directory_are_never_announced` through the real watcher and loop: 10,000 files written under a directory a `.gitignore` names announce nothing, the callback classifies each delivered path once (no git is spawned per event), and nothing reloads the rules.
+
+Callback cost, measured (`measure_callback_cost_of_ignored_churn_main_versus_stage_1`, `#[ignore]`, `cargo test --lib watcher::tests::measure_callback_cost -- --ignored --nocapture`): 50,000 file creations in an ignored directory, three arms interleaved per repetition (no watcher, main's non-recursive watch, the recursive watch with the filter), n = 3.
+
+| arm | callbacks | forwarded | process CPU ms (3 runs) |
+| --- | --- | --- | --- |
+| no watcher | 0 | 0 | 3979, 3625, 2771 |
+| main (non-recursive) | 0 | 0 | 3977, 3645, 3111 |
+| recursive + filter | 165039, 158964, 160596 | 0 | 4727, 3306, 3375 |
+
+The recursive watch costs about 3.2 callback invocations per created file (create, modify and flag events) and forwards none of them; main's callback never ran because the backend dropped the nested paths before it. The CPU difference between the arms is inside the spread of the no-watcher arm (2771 to 3979 ms), so it is not resolved at n = 3, and the bulk of the process time is the test's own file creation. Load average (1 min) was 26.6 at the start and 24.5 at the end of a busy host, below the 30 line but not quiet: an indication of order of magnitude, not a precise cost.
 
 ### The status poll skips its read only when nothing happened
 
