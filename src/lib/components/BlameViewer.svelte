@@ -37,6 +37,7 @@
   import { paneDetails } from "../diagnostics/paneCrash";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { describeFailure } from "../ui/copy/describeFailure";
 
   /** Tallest timeline column, in px. The strip is chrome, not a chart pane. */
@@ -605,8 +606,12 @@
     <!-- Blame Lines -->
     <div class="flex-1 min-w-0 flex flex-col">
       {#if isLoading && blameLines.length === 0}
-        <div class="h-full flex items-center justify-center text-textMuted font-sans text-xs">
-          Loading blame for {filePath}…
+        <div class="h-full p-3 overflow-hidden">
+          <!-- No hold: this branch names the file being loaded, and a held
+               outro would keep the previous file's name on screen after a
+               selection change or clear. -->
+          <Skeleton variant="code-lines" count={16} hold={false} />
+          <span class="sr-only">Loading blame for {filePath}…</span>
         </div>
       {:else if errorMsg}
         <div class="h-full flex flex-col items-center justify-center gap-3 text-danger font-sans text-xs p-4 text-center">

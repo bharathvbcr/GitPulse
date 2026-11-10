@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en" class="macos dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hidden pane under overlays</title>
+  <style>
+    body { margin: 0; background: rgb(11 14 23); }
+    #result { position: fixed; right: 8px; bottom: 8px; font: 11px ui-monospace, monospace; color: #aab; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<pre id="result">Running…</pre>
+<script type="module">
+  // OVERHAUL_PLAN §10: a pane hidden under an overlay can stop its
+  // ResizeObserver from firing, and a VirtualList whose last measurement was
+  // zero renders only its overscan band. The sidebar and the terminal dock now
+  // open as overlays over a VirtualList pane; this page opens, closes, storms
+  // and hides them and asks the list, each time, whether it re-measured and
+  // draws full rows. "Full" is judged by where the rows are, not by a counter.
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { get } from "svelte/store";
+  import { createChecks } from "./checks.ts";
+  import Host from "./HiddenPaneHost.svelte";
+
+  const params = new URLSearchParams(location.search);
+  const errors = [];
+  addEventListener("error", (event) => errors.push(event.message));
+  addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+  const root = "/workspace/alpha";
+  const fixtures = {
+    cmd_devcouncil_init: () => ({ repo: root, state_dir: `${root}/.devmap`, exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false }),
+    cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
+    cmd_get_language_stats: () => ({ stats: [], truncated: false }),
+    cmd_last_fetch_at: () => null,
+    cmd_note_tab_activated: () => null,
+    cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
+    cmd_list_worktrees: () => [{ path: root, name: "alpha", branch: "main", head: "a".repeat(40), is_main: true, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 2 }],
+    cmd_repository_trust: () => ({ path: root, git_dir: `${root}/.git`, common_dir: `${root}/.git`, identity: "fixture-identity", scope: "repository", worktrees: 1 }),
+    cmd_worktree_task: () => null,
+    cmd_ledger_tail: () => [],
+    cmd_grants_view: () => ({ available: false, path: "", grants: [], error: "" }),
+    cmd_collision_risk: () => ({ ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [], shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "" }),
+  };
+  const unexpected = [];
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (cmd.startsWith("plugin:event|")) return 1;
+      if (fixtures[cmd]) return fixtures[cmd](args);
+      unexpected.push(cmd);
+      return null;
+    },
+    transformCallback: (cb) => cb,
+  };
+
+  const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+  const { layoutStore } = await import("../src/lib/sidebar/layoutStore.ts");
+  const { panelModes } = await import("../src/lib/ui/panelMode.ts");
+  const { themeStore } = await import("../src/lib/stores/themeStore.ts");
+  const { setReduceMotionOverride } = await import("../src/lib/motion/easing.ts");
+  await repoStore.openRepo(root);
+
+  const { results, check, stopped } = createChecks();
+  const $ = (selector, scope = document) => scope.querySelector(selector);
+  const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
+  const frame = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  const settle = async () => { await tick(); await frame(); await frame(); await tick(); };
+  async function until(test, label, ms = 3000) {
+    const end = performance.now() + ms;
+    while (performance.now() < end) { await tick(); if (test()) return true; await frame(); }
+    throw new Error(`Timed out: ${label}`);
+  }
+
+  const host = mount(Host, { target: document.getElementById("app") });
+  await settle();
+
+  const pane = () => $("#pane");
+  const row = () => $("#row");
+  const sidebar = () => $("aside.gp-sidebar");
+  const panel = () => $("[data-sidebar-panel]");
+  const rail = () => $("[data-sidebar-rail-slot]");
+  const dock = () => $("[data-terminal-dock]");
+  const dockShown = () => !!dock() && getComputedStyle(dock()).display !== "none";
+  const scroller = () => {
+    let el = $("[data-row]");
+    while (el && el !== pane()) {
+      const style = getComputedStyle(el);
+      if ((style.overflowY === "auto" || style.overflowY === "scroll") && el.clientHeight > 0) return el;
+      el = el.parentElement;
+    }
+    return null;
+  };
+  /** Where the rows are against where the viewport is: judged by position, not by count. */
+  function fullRows() {
+    const el = scroller();
+    if (!el) return { ok: false, why: "no scroller" };
+    const indexes = $$("[data-row]").map((node) => Number(node.dataset.row));
+    if (!indexes.length) return { ok: false, why: "no rows" };
+    const min = Math.min(...indexes), max = Math.max(...indexes);
+    const first = Math.floor(el.scrollTop / 24), last = Math.floor((el.scrollTop + el.clientHeight - 1) / 24);
+    return { ok: min <= first && max >= last, min, max, first, last, viewport: el.clientHeight };
+  }
+  const full = () => fullRows().ok;
+  const fullEventually = async (label) => { await until(full, `${label}: ${JSON.stringify(fullRows())}`); return true; };
+  const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  const clickBtn = (selector) => { const el = $(selector); if (!el) throw new Error(`missing ${selector}`); click(el); };
+  const width = (el) => el.getBoundingClientRect().width;
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function shot() {
+    const scene = params.get("shot");
+    themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+    document.body.style.background = params.get("theme") === "light" ? "#e9ebf4" : "rgb(11 14 23)";
+    document.documentElement.classList.toggle("light", params.get("theme") === "light");
+    document.documentElement.classList.toggle("dark", params.get("theme") !== "light");
+    if (scene === "sidebar-overlay") panelModes.set("sidebar", "overlay");
+    if (scene === "rail") layoutStore.toggleCollapsed();
+    if (scene === "rail-overlay") { panelModes.set("sidebar", "overlay"); layoutStore.toggleCollapsed(); }
+    if (scene === "dock" || scene === "dock-overlay") { if (scene === "dock-overlay") panelModes.set("dock", "overlay"); host.setDockOpen(true); }
+    if (scene === "skeleton") {
+      const Skeleton = (await import("../src/lib/components/Skeleton.svelte")).default;
+      const stage = document.createElement("div");
+      stage.style.cssText = "position:fixed;inset:0;padding:24px;background:rgb(var(--c-bg));display:grid;gap:16px;align-content:start;max-width:520px";
+      document.body.append(stage);
+      mount(Skeleton, { target: stage, props: { variant: "text", width: "35%", height: "1rem" } });
+      mount(Skeleton, { target: stage, props: { variant: "card" } });
+      mount(Skeleton, { target: stage, props: { variant: "code-lines", count: 8 } });
+      mount(Skeleton, { target: stage, props: { variant: "tree-row", count: 4 } });
+    }
+    await settle(); await wait(500); await settle();
+    document.getElementById("result").textContent = "";
+    document.title = "hidden-pane shot ready";
+  }
+
+  async function run() {
+    // ---- docked, the default -------------------------------------------------
+    await fullEventually("initial mount");
+    check("the sidebar starts docked and the list draws full rows", () => sidebar().dataset.sidebarMode === "docked" && full());
+    const startWidth = width(pane());
+    const rowHeightBefore = scroller().clientHeight;
+    check("the list was measured (a non-zero viewport)", () => rowHeightBefore > 100);
+
+    clickBtn('button[aria-label="Collapse sidebar"]');
+    await tick();
+    check("a docked toggle plays the one-shot width slide", () => sidebar().classList.contains("gp-slide-docked"));
+    await until(() => Math.round(width(sidebar())) === 44, "docked collapse to the 44 px rail");
+    check("collapsed, the docked sidebar is the 44 px rail with its expand button", () => !!$('[data-sidebar-rail] button[aria-label="Expand sidebar"]'));
+    await until(() => !sidebar().classList.contains("gp-slide-docked"), "the slide class is dropped again");
+    check("the slide class does not linger after the toggle", () => !sidebar().classList.contains("gp-slide-docked"));
+    check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
+    clickBtn('button[aria-label="Expand sidebar"]');
+    await until(() => Math.abs(width(pane()) - startWidth) < 2, "docked expand settles back to the original pane width");
+    await fullEventually("after docked expand");
+    check("expanding restores the pane width and full rows", () => Math.abs(width(pane()) - startWidth) < 2 && full());
+
+    // ---- sidebar overlay ------------------------------------------------------
+    clickBtn("[data-sidebar-mode-toggle]");
+    await settle();
+    check("the mode toggle persists overlay", () => get(panelModes).sidebar === "overlay");
+    check("overlay keeps a 44 px rail in the column and floats the panel", () => !!rail() && Math.round(width(rail())) === 44 && !!panel());
+    const overlayPaneWidth = width(pane());
+    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - (width(row()) - 44)) < 2);
+    check("the panel floats over the workspace and wins the hit test", () => {
+      const p = panel().getBoundingClientRect();
+      const hit = document.elementFromPoint(p.left + p.width / 2, p.top + p.height / 2);
+      return p.right > pane().getBoundingClientRect().left + 100 && panel().contains(hit);
+    });
+    check("the list under the open panel still draws full rows", full);
+
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "overlay panel leaves");
+    await fullEventually("after the overlay closes");
+    check("closing the overlay leaves the rail live and the list full", () => !rail().hasAttribute("inert") && full());
+
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "overlay panel opens from the rail");
+    panel().querySelector("input")?.focus();
+    panel().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await until(() => !panel(), "Escape closes the floating panel");
+    check("Escape inside the floating panel closes it", () => !panel() && full());
+
+    for (let i = 0; i < 20; i += 1) {
+      clickBtn(panel() ? "[data-sidebar-panel] button[aria-label='Collapse sidebar']" : '[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+      await frame();
+    }
+    await wait(400);
+    await settle();
+    check("a 20-toggle storm leaves at most one panel and a full list", () => $$("[data-sidebar-panel]").length <= 1 && full());
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "reopen"); }
+
+    // ---- the hidden-pane class, sidebar overlay open -------------------------
+    host.setShellSize(1000, 680);
+    await settle();
+    await fullEventually("after the shell grew under an open overlay");
+    check("the list re-measures when the shell grows under an open overlay", () => scroller().clientHeight > rowHeightBefore + 100 && full());
+    host.setPaneHidden(true);
+    await settle();
+    host.setShellSize(1000, 520);
+    await settle();
+    host.setPaneHidden(false);
+    await fullEventually("after a hidden pane was resized and shown");
+    check("a pane hidden under the overlay and resized while hidden redraws full rows when shown", () => full() && scroller().clientHeight <= rowHeightBefore + 2);
+    check("it is not left with only its overscan band", () => $$("[data-row]").length * 24 >= scroller().clientHeight);
+
+    // collapse overlay panel, then hide/show with the rail only
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "overlay closes");
+    host.setPaneHidden(true); await settle();
+    host.setPaneHidden(false);
+    await fullEventually("after hide and show with the rail");
+    check("hide and show with only the rail leaves the list full", full);
+
+    // back to docked for the dock cases
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "overlay reopens");
+    clickBtn("[data-sidebar-mode-toggle]");
+    await until(() => !panel() && sidebar().dataset.sidebarMode === "docked", "back to docked");
+    await fullEventually("after returning to docked");
+
+    // ---- terminal dock, docked ----------------------------------------------
+    const listHeight = scroller().clientHeight;
+    host.setDockOpen(true);
+    await until(dockShown, "dock opens");
+    await fullEventually("docked dock open");
+    check("a docked dock takes its own row and the list shrinks to fit", () => dock().dataset.dockMode === "docked" && scroller().clientHeight < listHeight - 50);
+    check("the shrunken list still draws full rows", full);
+    host.setDockOpen(false);
+    await until(() => !dockShown(), "docked dock hides");
+    await fullEventually("after the docked dock closes");
+    check("closing the docked dock re-measures: the list is back to its full height with full rows", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+
+    // ---- terminal dock, overlay ---------------------------------------------
+    panelModes.set("dock", "overlay");
+    await settle();
+    host.setDockOpen(true);
+    await until(dockShown, "overlay dock opens");
+    // The slide-in runs 320 ms; geometry is read once it has landed.
+    // The spring overshoots, so crossing the final position is not landing:
+    // wait for the animation itself to finish.
+    await until(() => dock().getAnimations().every((animation) => animation.playState === "finished"), "the dock's slide-in finishes");
+    await settle();
+    check("an overlay dock floats over the pane's bottom edge", () => {
+      const d = dock().getBoundingClientRect(), p = pane().getBoundingClientRect();
+      const ok = dock().dataset.dockMode === "overlay" && getComputedStyle(dock()).position === "absolute" && Math.abs(d.bottom - p.bottom) < 2;
+      if (!ok) throw new Error(`mode=${dock().dataset.dockMode} position=${getComputedStyle(dock()).position} dock.bottom=${d.bottom} pane.bottom=${p.bottom}`);
+      return ok;
+    });
+    check("it does not shrink the list under it, which still draws full rows", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+    check("it rises with the slide-in phase", () => dock().dataset.phase === "slide-in");
+    host.setDockOpen(false);
+    await tick();
+    check("it is held for its exit with the slide-out phase", () => dock().dataset.phase === "slide-out" && dockShown());
+    await until(() => !dockShown(), "overlay dock hides after its exit");
+    check("then hidden, never unmounted, so a shell would survive", () => !!dock() && full());
+
+    for (let i = 0; i < 15; i += 1) { host.setDockOpen(i % 2 === 0); await frame(); }
+    host.setDockOpen(false);
+    await wait(300);
+    await settle();
+    check("a 15-toggle storm ends hidden with a full list", () => !dockShown() && full());
+
+    // ---- both overlays at once ----------------------------------------------
+    panelModes.set("sidebar", "overlay");
+    await settle();
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "sidebar overlay"); }
+    host.setDockOpen(true);
+    await until(dockShown, "dock over sidebar");
+    await settle();
+    check("both overlays open over the list leave it full", () => !!panel() && dockShown() && full());
+    host.setPaneHidden(true); await settle(); host.setPaneHidden(false);
+    await fullEventually("both overlays, hide and show");
+    host.setDockOpen(false);
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel() && !dockShown(), "both close");
+    await fullEventually("after both close");
+    check("after both close the list is full at its original height", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+
+    // ---- reduced motion ------------------------------------------------------
+    setReduceMotionOverride(true);
+    document.documentElement.dataset.motion = "reduced";
+    panelModes.set("dock", "overlay");
+    host.setDockOpen(true); await until(dockShown, "dock under reduced motion");
+    host.setDockOpen(false); await tick(); await frame();
+    check("under reduced motion the overlay dock hides at once, with no held exit", () => !dockShown());
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "panel under reduced motion");
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "panel leaves under reduced motion", 300);
+    check("and the sidebar panel snaps shut", () => !panel() && full());
+    setReduceMotionOverride(false);
+    delete document.documentElement.dataset.motion;
+    panelModes.set("sidebar", "docked"); panelModes.set("dock", "docked");
+
+    check("no runtime errors", () => errors.length === 0);
+    document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+  }
+
+  if (params.has("shot")) { await shot(); } else
+  try { await run(); } catch (error) { document.getElementById("result").textContent = stopped(error); }
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ checks: results.length, unexpected: [...new Set(unexpected)].length }) }));
+  if (!params.has("shot") && params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+</script>
+</body>
+</html>

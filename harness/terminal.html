@@ -1026,7 +1026,7 @@
             const link = taskRow?.querySelector('[data-testid="session-open-task"]');
             check("a session working on a task offers a link to it", () => Boolean(link));
             check("a session that is not a task offers none",
-              () => rows().filter((el) => !el.textContent.includes("task attempt")).every((el) => !el.querySelector('[data-testid="session-open-task"]')));
+              () => rows().filter((el) => !el.textContent.includes("task run")).every((el) => !el.querySelector('[data-testid="session-open-task"]')));
             link?.click();
             await wait(300);
             check("the link reads the run and asks the task board for its task",

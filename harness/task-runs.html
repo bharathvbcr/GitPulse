@@ -234,7 +234,7 @@
       const dockShown=()=>{const el=dock();return !!el&&el.offsetParent!==null&&getComputedStyle(el).display!=="none";};
       const pane=()=>document.querySelector('[data-testid="task-agent-panel"]');
       const paneSessions=()=>[...pane().querySelectorAll('[data-testid="agent-session"]')];
-      button("Run in Claude Code").click();await wait(()=>button("Reconnect attempt"));
+      button("Run in Claude Code").click();await wait(()=>button("Reconnect run"));
       check("Launching keeps the reader on the task: no surface switch, no dock opened",
         read(interfaceStore).globalSurface==="tasks"&&!read(repoStore).terminalOpen&&!dockShown());
       check(`The agent starts unseen, at a usable terminal grid${report.launchGrid.rows>=10&&report.launchGrid.cols>=40?"":` (got ${JSON.stringify(report.launchGrid)})`}`,report.taskSpawns===1&&report.launchGrid.rows>=10&&report.launchGrid.cols>=40);
@@ -251,7 +251,7 @@
         &&pane().querySelector('[data-testid="agents-working"]').compareDocumentPosition(formToggle())&Node.DOCUMENT_POSITION_FOLLOWING);
       button("Show terminal").click();await wait(()=>dockShown()&&read(interfaceStore).globalSurface==="repository");
       check("Show terminal is what brings the attempt's terminal on screen",read(repoStore).terminalOpen&&report.taskSpawns===1);
-      button("Reconnect attempt").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect attempt"));
+      button("Reconnect run").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect run"));
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
       await wait(()=>paneSessions().some(el=>el.dataset.phase==="running"));
       check("The pane shows the session running in this window, with a Stop agent control",!!button("Stop agent"));
@@ -430,7 +430,7 @@
         check("Declining keeps the agent running and its tab open",report.kills===0&&document.querySelector('textarea[aria-label="Terminal input"]'));
         document.querySelector('[aria-label="All terminal sessions"]').click();
         const listed=await (async()=>{let row=null;await wait(()=>{row=[...(document.querySelector('[aria-label="Sessions across repositories"]')?.children??[])].find(el=>el.textContent.includes(task.title));return row;});return row;})();
-        check("The Sessions list names the task a session is working on",listed.textContent.includes("task attempt"));
+        check("The Sessions list names the task a session is working on",listed.textContent.includes("task run"));
         [...listed.querySelectorAll("button")].find(el=>el.textContent.trim()==="Close session").click();
         await wait(()=>get(promptState));
         check("Closing it from the Sessions list asks the same question",get(promptState).options.message.includes("ends this attempt")&&report.kills===0);

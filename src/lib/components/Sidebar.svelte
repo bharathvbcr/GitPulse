@@ -84,15 +84,74 @@
     ChevronRight,
     DownloadCloud,
     FolderGit2,
-    FolderOpen,
     GitBranch,
     Minus,
     PanelLeftClose,
     PanelLeftOpen,
+    Pin,
+    PinOff,
     Plus,
     Search,
   } from "@lucide/svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import { onDestroy } from "svelte";
+  import { DURATION_MS, motionExitMs, motionMs } from "../motion/tokens";
+  import { panelModes } from "../ui/panelMode";
+  import { springEasing } from "../ui/transitions";
+
+  /* --- Mode, collapse and the slide ------------------------------------------ */
+
+  let overlay = $derived($panelModes.sidebar === "overlay");
+  let collapsed = $derived($layoutStore.collapsed);
+  /** True for one `fast` window after a docked toggle: the one-shot width slide. */
+  let settling = $state(false);
+  let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function toggleCollapsed() {
+    if (!overlay) {
+      // The class and the new width land in the same flush, so the width
+      // transition runs once; it is dropped again before the next gesture.
+      settling = true;
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => {
+        settling = false;
+        settleTimer = null;
+      }, DURATION_MS.fast + 40);
+    }
+    layoutStore.toggleCollapsed();
+  }
+
+  function toggleMode() {
+    panelModes.toggle("sidebar");
+  }
+
+  /** Escape closes a floating panel, unless something inside it (a menu) took the key. */
+  function escapeCloses(event: KeyboardEvent) {
+    if (event.key !== "Escape" || event.defaultPrevented || !overlay || collapsed) return;
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest("[data-sidebar-panel]")) return;
+    layoutStore.toggleCollapsed();
+  }
+
+  const slideEase = springEasing("spatial");
+
+  /** The floating panel rises out of the rail's edge: transform and opacity only. */
+  function panelIn(_node: Element) {
+    return {
+      duration: motionMs("base"),
+      easing: slideEase,
+      css: (t: number, u: number) => `opacity: ${t}; transform: translate3d(${-u * 100}%, 0, 0)`,
+    };
+  }
+
+  /** Leaves in an exit: opacity only, shorter than the entrance. */
+  function panelOut(_node: Element) {
+    return { duration: motionExitMs("base"), css: (t: number) => `opacity: ${t}` };
+  }
+
+  onDestroy(() => {
+    if (settleTimer) clearTimeout(settleTimer);
+  });
 
   // An agent can touch thousands of files in one pass; lists mount a window
   // and grow on demand so the sidebar never becomes the bottleneck.
@@ -261,39 +320,36 @@
   }
 </script>
 
-<aside
-  class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
-    ? 'transition-[width] duration-(--gp-dur-fast)'
-    : ''}"
-  style="width:{$layoutStore.collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
->
-  {#if !$layoutStore.collapsed}
-    <!-- Repo Header & Open Button -->
+{#snippet expanded()}
+    <!-- Repository header. Opening another repository is the title bar's
+         "Open" (decision D3, HEADER_SPEC §9): the sidebar no longer repeats it. -->
     <div class="p-3 flex items-center justify-between bg-surfaceHover/30 gap-1">
       <div class="flex items-center gap-2 truncate">
         <FolderGit2 size={15} class="text-accent shrink-0" />
         <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No repository"}>
-          {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No Repository"}
+          {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No repository"}
         </span>
       </div>
       <div class="flex items-center shrink-0">
         <button
           type="button"
-          onclick={() => layoutStore.toggleCollapsed()}
+          onclick={toggleMode}
+          title={overlay ? "Dock the sidebar beside the workspace" : "Float the sidebar over the workspace"}
+          aria-label="Float sidebar over the workspace"
+          aria-pressed={overlay}
+          data-sidebar-mode-toggle
+          class="gp-icon-btn p-1! hover:text-accent"
+        >
+          {#if overlay}<PinOff size={14} />{:else}<Pin size={14} />{/if}
+        </button>
+        <button
+          type="button"
+          onclick={toggleCollapsed}
           title="Collapse sidebar"
           aria-label="Collapse sidebar"
           class="gp-icon-btn p-1! hover:text-accent"
         >
           <PanelLeftClose size={14} />
-        </button>
-        <button
-          type="button"
-          onclick={() => repoStore.pickAndOpenRepo()}
-          title="Open Repository"
-          aria-label="Open Repository"
-          class="gp-icon-btn p-1! hover:text-accent"
-        >
-          <FolderOpen size={14} />
         </button>
       </div>
     </div>
@@ -638,12 +694,15 @@
     </div>
 
     <CommitComposer />
-  {:else}
-    <!-- Collapsed rail -->
-    <div class="flex flex-col items-center gap-3 pt-3 pb-2 flex-1 overflow-hidden">
+{/snippet}
+
+{#snippet rail()}
+    <!-- Collapsed rail: a 44 px column of icons. Everything the open sidebar
+         does at a glance stays one click away. -->
+    <div class="flex flex-col items-center gap-3 pt-3 pb-2 flex-1 overflow-hidden" data-sidebar-rail>
       <button
         type="button"
-        onclick={() => layoutStore.toggleCollapsed()}
+        onclick={toggleCollapsed}
         title="Expand sidebar"
         aria-label="Expand sidebar"
         class="gp-icon-btn hover:text-accent"
@@ -663,11 +722,41 @@
         {#if dirtyCount > 0}
           <AgentCommitMenu compact={true} align="left" />
         {/if}
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.fetch()}
+          disabled={$repoStore.isLoading}
+          title="Fetch from remote"
+          aria-label="Fetch from remote"
+        >
+          <DownloadCloud size={14} />
+        </button>
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.pull()}
+          disabled={$repoStore.isLoading}
+          title="Pull from upstream"
+          aria-label="Pull from upstream"
+        >
+          <ArrowDownToLine size={14} />
+        </button>
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.push()}
+          disabled={$repoStore.isLoading}
+          title="Push to upstream"
+          aria-label="Push to upstream"
+        >
+          <ArrowUpFromLine size={14} />
+        </button>
       {/if}
     </div>
-  {/if}
+{/snippet}
 
-  {#if !$layoutStore.collapsed}
+{#snippet resizer()}
     <!-- Resize handle: drag, double-click resets, arrow keys step.
          WAI-ARIA adjustable separator: focusable + keyboard-operable by design,
          so the div-with-role warnings are intentional. -->
@@ -697,5 +786,51 @@
       }}
     >
     </div>
+{/snippet}
+
+<!-- The window's one sidebar, in one of two modes (panelMode.ts).
+     Docked: the aside owns a column, the workspace reflows, and the open or
+     close animates once (`gp-slide-docked`, never while a drag writes the
+     width). Overlay: a 44 px rail keeps the column and the open panel floats
+     over the workspace, sliding on transform and opacity. -->
+<svelte:window onkeydown={escapeCloses} />
+
+{#if overlay}
+  <aside
+    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane"
+    style="width:{SIDEBAR_COLLAPSED_WIDTH}px"
+    data-sidebar-mode="overlay"
+    data-sidebar-rail-slot
+    inert={!collapsed}
+  >
+    {@render rail()}
+  </aside>
+  {#if !collapsed}
+    <aside
+      class="gp-glass gp-sidebar bg-surface flex flex-col font-sans select-none text-xs h-full gp-pane shadow-float"
+      style="position:absolute; top:0; bottom:0; left:0; width:{$layoutStore.width}px; z-index:{LAYERS.STICKY}"
+      data-sidebar-mode="overlay"
+      data-sidebar-panel
+      in:panelIn
+      out:panelOut
+    >
+      {@render expanded()}
+      {@render resizer()}
+    </aside>
   {/if}
-</aside>
+{:else}
+  <aside
+    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {settling && !dragging
+      ? 'gp-slide-docked'
+      : ''}"
+    style="width:{collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
+    data-sidebar-mode="docked"
+  >
+    {#if !collapsed}
+      {@render expanded()}
+      {@render resizer()}
+    {:else}
+      {@render rail()}
+    {/if}
+  </aside>
+{/if}

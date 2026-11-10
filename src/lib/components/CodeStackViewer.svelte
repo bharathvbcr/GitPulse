@@ -42,6 +42,7 @@
   import { timestampFormat } from "../ui/timestampFormat";
   import { describeFailure } from "../ui/copy/describeFailure";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
 
   /**
    * The stacked-branch page.
@@ -495,10 +496,7 @@
       </p>
     </div>
   {:else if isLoading}
-    <div class="space-y-3 max-w-3xl" aria-hidden="true">
-      <div class="gp-card p-3.5 animate-pulse h-16"></div>
-      <div class="gp-card p-3.5 animate-pulse h-16 w-11/12"></div>
-    </div>
+    <Skeleton variant="card" count={2} class="max-w-3xl" />
     <p class="sr-only">Loading stack hierarchy…</p>
   {:else if !loadError}
     <div class="flex-1 flex">

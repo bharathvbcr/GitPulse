@@ -101,6 +101,35 @@ describe("TerminalDock", () => {
   });
 });
 
+describe("TerminalDock modes", () => {
+  it("renders docked by default, in its own row, settling in once", () => {
+    const body = render(TerminalDock, {
+      props: { open: true, onClose: () => {}, load: loader },
+    }).body;
+    expect(body).toContain('data-dock-mode="docked"');
+    expect(body).toContain('data-phase="in"');
+    expect(body).toContain("gp-dock-motion");
+    expect(body).toContain("shrink-0");
+    expect(body).not.toContain("absolute inset-x-0 bottom-0");
+  });
+
+  it("floats over the view in overlay mode, held for its exit and then hidden", () => {
+    expect(source).toContain("absolute inset-x-0 bottom-0 shadow-float");
+    expect(source).toContain('const phase = $derived(leaving ? "slide-out" : overlay ? "slide-in" : "in");');
+    expect(source).toContain("class:hidden={!open && !leaving}");
+    expect(source).toContain('motionExitMs("slow")');
+    // Never unmounted: hiding is display:none, so the PTY survives the exit.
+    expect(source).toContain("{#if mounted}");
+  });
+
+  it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
+    expect(source).toContain('onToggleDockMode: () => panelModes.toggle("dock")');
+    expect(source).toContain('aria-label="Resize the terminal dock"');
+    expect(source).toContain("data-terminal-host={tab.id}");
+    expect(source).toContain("data-terminal-dock");
+  });
+});
+
 describe("App hosts the terminal as a dock, not a view", () => {
   it("renders the dock inside the view column", () => {
     expect(app).toContain("<TerminalDock");

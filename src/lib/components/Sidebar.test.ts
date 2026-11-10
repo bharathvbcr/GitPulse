@@ -16,7 +16,18 @@ describe("Sidebar", () => {
     const { body } = render(Sidebar);
     // Gold standard (FilterBar): every icon-only button carries an explicit
     // aria-label alongside its title.
-    expect(body).toContain('aria-label="Open Repository"');
+    expect(body).toContain('aria-label="Collapse sidebar"');
+    expect(body).toContain('aria-label="Float sidebar over the workspace"');
+  });
+
+  it("no longer carries its own Open button (decision D3)", () => {
+    // Was: expect(body).toContain('aria-label="Open Repository"'). The title
+    // bar's "Open" is the one place to open a repository (HEADER_SPEC §9 D3),
+    // so the sidebar's icon was a third copy and is retired.
+    const { body } = render(Sidebar);
+    expect(body).not.toContain('aria-label="Open Repository"');
+    expect(source).not.toContain("pickAndOpenRepo");
+    expect(source).not.toContain("FolderOpen");
   });
 
   it("keeps the per-file stage/unstage affordances titled", () => {
@@ -62,26 +73,65 @@ describe("Sidebar resize shell", () => {
 
   it("drives width from the persisted layout store, not a hardcoded class", () => {
     expect(source).not.toContain("w-80 ");
-    expect(source).toMatch(/style="width:\{\$layoutStore/);
-    // No width transition mid-drag; smooth otherwise.
-    expect(source).toContain("transition-[width] duration-(--gp-dur-fast)");
+    expect(source).toMatch(/style="width:\{collapsed \? SIDEBAR_COLLAPSED_WIDTH : \$layoutStore\.width\}px"/);
+    // Was: "transition-[width] duration-(--gp-dur-fast)" on every non-drag
+    // frame. Now the width slide is the one-shot `gp-slide-docked` utility
+    // (the sanctioned exception), applied for one toggle and never mid-drag;
+    // the overlay mode slides on transform and opacity instead.
+    expect(source).not.toContain("transition-[width]");
+    expect(source).toMatch(/settling && !dragging\s*\?\s*'gp-slide-docked'/);
     expect(source).toContain("if (!dragging) return;");
   });
 
+  it("slides the overlay panel on transform and opacity only, from the motion tokens", () => {
+    const panel = source.slice(source.indexOf("function panelIn("), source.indexOf("onDestroy("));
+    expect(panel).toContain('motionMs("base")');
+    expect(panel).toContain('motionExitMs("base")');
+    expect(panel).toContain("translate3d(");
+    expect(panel).not.toMatch(/\b(width|height|margin|left|top)\s*:/);
+    expect(source).toContain("in:panelIn");
+    expect(source).toContain("out:panelOut");
+  });
+
+  it("keeps a 44 px rail in the column while the overlay panel floats", () => {
+    expect(source).toContain("data-sidebar-rail-slot");
+    expect(source).toContain("style=\"width:{SIDEBAR_COLLAPSED_WIDTH}px\"");
+    expect(source).toContain("inert={!collapsed}");
+    expect(source).toContain("data-sidebar-panel");
+  });
+
   it("hides the resizer while collapsed", () => {
-    const resizer = source.slice(source.indexOf('role="separator"'));
     const railStart = source.indexOf("Collapsed rail");
     expect(railStart).toBeGreaterThan(-1);
-    expect(resizer.length).toBeGreaterThan(0);
-    // The separator block is gated behind the same !collapsed condition as the
-    // expanded shell (the only {#if} wrapping it).
-    expect(source.match(/\{#if !\$layoutStore\.collapsed\}/g)?.length).toBe(2);
+    // The resizer snippet is rendered only beside the expanded shell: once in
+    // the docked aside and once in the overlay panel, each inside its own
+    // `{#if !collapsed}`, and never in the rail.
+    expect(source.match(/\{#if !collapsed\}/g)?.length).toBe(2);
+    expect(source.match(/\{@render resizer\(\)\}/g)?.length).toBe(2);
+    const rail = source.slice(source.indexOf("{#snippet rail()}"), source.indexOf("{#snippet resizer()}"));
+    expect(rail).not.toContain('role="separator"');
+  });
+});
+
+describe("Sidebar mode", () => {
+  it("offers a docked or overlay toggle in the header, persisted by panelMode", () => {
+    expect(source).toContain('panelModes.toggle("sidebar")');
+    expect(source).toContain("data-sidebar-mode-toggle");
+    expect(source).toContain("aria-pressed={overlay}");
+  });
+
+  it("lets Escape close a floating panel only when the key was not taken inside it", () => {
+    expect(source).toContain("event.defaultPrevented");
+    expect(source).toContain('closest("[data-sidebar-panel]")');
   });
 });
 
 describe("Sidebar collapse toggle", () => {
   it("toggles and persists collapse state from the header and the rail", () => {
-    expect((source.match(/layoutStore\.toggleCollapsed\(\)/g) ?? []).length).toBe(2);
+    // The header and the rail both call the shared toggle, which plays the
+    // one-shot docked slide before it flips the persisted flag.
+    expect((source.match(/onclick=\{toggleCollapsed\}/g) ?? []).length).toBe(2);
+    expect(source).toContain("layoutStore.toggleCollapsed();");
     expect(source).toContain("PanelLeftClose");
     expect(source).toContain("PanelLeftOpen");
     expect(source).toContain('aria-label="Collapse sidebar"');
