@@ -40,6 +40,17 @@ describe("recomputeWhileActive", () => {
   });
 });
 
+describe("App hands FleetView its real active state", () => {
+  const app = readFileSync(new URL("../../App.svelte", import.meta.url), "utf8");
+
+  it("mounts Fleet with props={{ active: fleetOpen }} through LazyView, like TaskBoard", () => {
+    const mount = app.match(/<LazyView load=\{loadFleetView\}[^>]*\/>/)?.[0] ?? "";
+    expect(mount).toContain("props={{ active: fleetOpen }}");
+    expect(app).toMatch(/const fleetOpen = \$derived\(\$interfaceStore\.globalSurface === "fleet"\)/);
+    expect(app).toContain('props={{ active: $interfaceStore.globalSurface === "tasks"');
+  });
+});
+
 describe("FleetView hidden cost", () => {
   const source = readFileSync(new URL("../components/FleetView.svelte", import.meta.url), "utf8");
 

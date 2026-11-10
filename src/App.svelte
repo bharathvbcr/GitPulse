@@ -1341,7 +1341,7 @@
          than unmounted for the same reason the terminal is. -->
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
-        <LazyView load={loadFleetView} name="the Fleet dashboard" />
+        <LazyView load={loadFleetView} name="the Fleet dashboard" props={{ active: fleetOpen }} />
       </div>
     </svelte:boundary>
   {/if}
