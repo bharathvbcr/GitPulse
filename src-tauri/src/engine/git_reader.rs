@@ -13559,7 +13559,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let root = dir.path().canonicalize().unwrap();
         let git = |args: &[&str]| crate::test_support::git_in(&root, args);
         git(&["init", "-q", "-b", "main"]);
-        let body = |tag: &str| (1..=12).map(|n| format!("{tag} line {n}\n")).collect::<String>();
+        let body = |tag: &str| {
+            (1..=12)
+                .map(|n| format!("{tag} line {n}\n"))
+                .collect::<String>()
+        };
         let tracked = [
             "plain.txt",
             "sp ace.txt",
@@ -13646,29 +13650,55 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
         let (limited, whole, spawned) = status_both_ways(&root);
         assert_eq!(limited, whole, "limited numstat must read the same churn");
-        for token in ["ren_dst.txt", "ren_src.txt", "itm.txt", "conflict.txt", "sub"] {
-            assert!(limited.contains(token), "{token} is in the report: {limited}");
+        for token in [
+            "ren_dst.txt",
+            "ren_src.txt",
+            "itm.txt",
+            "conflict.txt",
+            "sub",
+        ] {
+            assert!(
+                limited.contains(token),
+                "{token} is in the report: {limited}"
+            );
         }
 
         assert_eq!(spawned.len(), 2, "one numstat each way: {spawned:?}");
         for argv in &spawned {
-            let at = argv.iter().position(|arg| arg == "--").expect("pathspec fence");
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("pathspec fence");
             assert!(
-                argv[at + 1..].iter().all(|spec| spec.starts_with(":(literal)")),
+                argv[at + 1..]
+                    .iter()
+                    .all(|spec| spec.starts_with(":(literal)")),
                 "every pathspec is literal: {argv:?}"
             );
         }
-        let worktree = spawned.iter().find(|a| !a.iter().any(|x| x == "--cached")).unwrap();
+        let worktree = spawned
+            .iter()
+            .find(|a| !a.iter().any(|x| x == "--cached"))
+            .unwrap();
         for wanted in [":(literal)-dash.txt", ":(literal)new\nline.txt"] {
-            assert!(worktree.iter().any(|spec| spec == wanted), "{wanted}: {worktree:?}");
+            assert!(
+                worktree.iter().any(|spec| spec == wanted),
+                "{wanted}: {worktree:?}"
+            );
         }
         assert!(
             !worktree.iter().any(|spec| spec.contains("bystander")),
             "paths status did not report stay out: {worktree:?}"
         );
-        let staged = spawned.iter().find(|a| a.iter().any(|x| x == "--cached")).unwrap();
+        let staged = spawned
+            .iter()
+            .find(|a| a.iter().any(|x| x == "--cached"))
+            .unwrap();
         for wanted in [":(literal)ren_src.txt", ":(literal)ren_dst.txt"] {
-            assert!(staged.iter().any(|spec| spec == wanted), "both sides: {staged:?}");
+            assert!(
+                staged.iter().any(|spec| spec == wanted),
+                "both sides: {staged:?}"
+            );
         }
     }
 
@@ -13686,7 +13716,14 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             path: path.to_string(),
             old_path: None,
         };
-        for hostile in ["glob*.txt", "q?.txt", "br[ac].txt", ":colon.txt", "C:rest.txt", "d/a:b"] {
+        for hostile in [
+            "glob*.txt",
+            "q?.txt",
+            "br[ac].txt",
+            ":colon.txt",
+            "C:rest.txt",
+            "d/a:b",
+        ] {
             let rows = [row("fine.txt"), row(hostile)];
             assert_eq!(
                 numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
@@ -13751,13 +13788,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths).map(|specs| specs.len())
         };
         let short = |count: usize| rows((0..count).map(|n| format!("f{n:04}")).collect());
-        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS)), Some(MAX_NUMSTAT_PATHSPECS));
+        assert_eq!(
+            limited(&short(MAX_NUMSTAT_PATHSPECS)),
+            Some(MAX_NUMSTAT_PATHSPECS)
+        );
         assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS + 1)), None);
         // 16 paths of 1024 bytes each are exactly the byte bound.
         let long = |count: usize, tail: usize| {
-            rows((0..count)
-                .map(|n| format!("{n:04}{}", "x".repeat(1020 + usize::from(n == 0) * tail)))
-                .collect())
+            rows(
+                (0..count)
+                    .map(|n| format!("{n:04}{}", "x".repeat(1020 + usize::from(n == 0) * tail)))
+                    .collect(),
+            )
         };
         let per_path = MAX_NUMSTAT_PATHSPEC_BYTES / 16;
         assert_eq!(per_path, 1024);
@@ -13847,12 +13889,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             ]),
             "both sides of the rename, sorted and literal"
         );
-        assert_eq!(numstat_pathspecs(rows.iter(), NumstatReach::WholeTree), None);
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::WholeTree),
+            None
+        );
         for odd in [
             [row("odd\u{FFFD}.txt", None)],
             [row("new.txt", Some("odd\u{FFFD}.txt"))],
         ] {
-            assert_eq!(numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths), None);
+            assert_eq!(
+                numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths),
+                None
+            );
         }
     }
 

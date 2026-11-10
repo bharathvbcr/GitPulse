@@ -1193,8 +1193,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
         let run = git_captured(repo, &["config", "--get", name])?;
         match run.status_code {
-            0 => Ok(Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
-                .filter(|value| !value.is_empty())),
+            0 => Ok(
+                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            ),
             1 => Ok(None),
             code => Err(format!(
                 "Could not read {name} from git config (exit {code}): {}",
@@ -7003,12 +7005,15 @@ mod tests {
         // Warm the cached listing the display path reads.
         let none = |_: &str| None;
         assert_eq!(
-            GitWriter::identity_with(&repo, &none).unwrap().email.as_deref(),
+            GitWriter::identity_with(&repo, &none)
+                .unwrap()
+                .email
+                .as_deref(),
             Some("included@example.org")
         );
         std::fs::write(&included, "[user]\n").unwrap();
-        let refused = GitWriter::require_identity(&repo)
-            .expect_err("no identity is configured any more");
+        let refused =
+            GitWriter::require_identity(&repo).expect_err("no identity is configured any more");
         assert!(
             refused.message().starts_with(IDENTITY_MISSING),
             "{}",
