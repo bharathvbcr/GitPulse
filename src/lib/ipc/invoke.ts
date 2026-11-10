@@ -439,6 +439,15 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 
 /** Wraps `raw` so a deferral is retried with the shared backoff. */
 export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) {
+  return withDeferralRetryProbed(raw, options).invoke;
+}
+
+/**
+ * [`withDeferralRetry`] with a count of what the wrapper still holds per call
+ * (`retained`), for the tests that assert it holds nothing once every call has
+ * settled. Counts only; hands out no state.
+ */
+export function withDeferralRetryProbed(raw: Raw, options: DeferralRetryOptions = {}) {
   const sleep = options.sleep ?? defaultSleep;
   const random = options.random ?? Math.random;
   const whenShown = options.whenShown ?? whenDocumentShown;
@@ -621,7 +630,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     };
   }
 
-  return Object.assign(invoke, { retained });
+  return { invoke, retained };
 
   /** `dispatch` under the caller's wait bound; a call with neither adds nothing. */
   function bound<T>(cmd: string, rest: Rest, deadlineMs: number | undefined, signal: AbortSignal | undefined): Promise<T> {

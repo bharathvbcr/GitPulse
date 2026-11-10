@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { configureReadCancellation, configureSharedReads, withDeferralRetry } from "./invoke";
+import { configureReadCancellation, configureSharedReads, withDeferralRetryProbed } from "./invoke";
 import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./sharedReads";
 
 /**
@@ -15,7 +15,8 @@ const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
 
 function backend() {
   const raw = (cmd: string) => Promise.resolve(cmd === "cmd_get_status" || cmd === "cmd_get_commit_graph" ? { ok: true } : null);
-  return withDeferralRetry(raw as never, { random: () => 0, whenShown: () => Promise.resolve(), sleep: () => Promise.resolve() });
+  const probed = withDeferralRetryProbed(raw as never, { random: () => 0, whenShown: () => Promise.resolve(), sleep: () => Promise.resolve() });
+  return Object.assign(probed.invoke, { retained: probed.retained });
 }
 
 const none = { sharing: 0, retrying: 0, leaving: 0 };
@@ -78,11 +79,12 @@ describe("what the wrapper holds after its calls have settled", () => {
             pending.push(resolve);
             failures.push(reject);
           });
-    const invoke = withDeferralRetry(raw as never, {
+    const probed = withDeferralRetryProbed(raw as never, {
       random: () => 0,
       whenShown: () => Promise.resolve(),
       sleep: () => new Promise<void>((wake) => naps.push(wake)),
     });
+    const invoke = Object.assign(probed.invoke, { retained: probed.retained });
     const a = new AbortController();
     const b = new AbortController();
     const first = invoke("cmd_get_commit_graph", { repoPath: "/r" }, { signal: a.signal });

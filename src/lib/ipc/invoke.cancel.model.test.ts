@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_DEFERRED_RETRIES } from "../async/deferral";
-import { configureReadCancellation, configureSharedReads, ipcErrorKind, withDeferralRetry } from "./invoke";
+import { configureReadCancellation, configureSharedReads, ipcErrorKind, withDeferralRetryProbed } from "./invoke";
 import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./sharedReads";
 
 /**
@@ -96,7 +96,7 @@ async function run(seed: number): Promise<void> {
       pending.push({ tag: `req${(tags += 1)}`, id, answer, fail: failWith });
     });
   };
-  const invoke = withDeferralRetry(raw as never, {
+  const { invoke, retained } = withDeferralRetryProbed(raw as never, {
     random: () => 0,
     whenShown: () => Promise.resolve(),
     sleep: () => new Promise<void>((wake) => naps.push(wake)),
@@ -192,7 +192,7 @@ async function run(seed: number): Promise<void> {
   // (v) nothing is retained once everything has settled and every timer fired:
   // the leave index holds only live signalled callers of unsettled calls.
   await vi.runAllTimersAsync();
-  const held = invoke.retained();
+  const held = retained();
   if (held.sharing + held.retrying + held.leaving > 0) fail(`(v) retained after everything settled: ${JSON.stringify(held)}`);
   for (const caller of callers) {
     if (caller.aborted) continue;
