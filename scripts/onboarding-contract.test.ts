@@ -24,7 +24,7 @@ describe("onboarding integration and native permission purposes", () => {
     expect(app).toContain('repoStore.setActiveTab(view)');
     expect(app).toContain('repositoryPath={$repoStore.currentPath}');
     expect(app).toContain('settingsOpen={isSettingsModalOpen}');
-    expect(read("src/lib/components/HeaderRepoMenu.svelte")).toContain('data-tour="repository"');
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="repository"');
     expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
     expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="tasks"');
   });

@@ -4,7 +4,7 @@
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -902,6 +902,13 @@
   let checkoutRevision = 0;
   const checkoutKey = $derived(repositories.map((repo) => `${repo.id}|${repo.identity_key}`).join("\n"));
   const uncheckedCheckouts = $derived([...checkouts.values()].filter((health) => health.state === "unknown"));
+  /** The failure a red notice above the read notes already states. */
+  const statedFailure = $derived(catalogError || error);
+  /** A read note's cause, or a pointer to the notice above when it says the same thing. */
+  function noteCause(reason: string): string {
+    return reason === statedFailure ? "the same failure as above" : reason;
+  }
+  const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error || uncheckedCheckouts.length));
   $effect(() => {
     checkoutToken;
     void checkoutKey;
@@ -2514,9 +2521,9 @@
     </nav>
   {/if}
   <main class="board-main">
-    <header class="gp-glass">
+    <header class="gp-glass gp-surface-header">
       <div class="heading">
-        <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+        <h1 class="gp-surface-title">{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
         {#if inProgressCount > 0}<span class="gp-pill">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
              the boards for every task and for its workspaces. -->
@@ -2527,8 +2534,10 @@
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repo:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
-          <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
-          <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
+          <!-- inline-flex: an icon is a block-level svg, so without it the
+               label wrapped under the icon and doubled the header's height. -->
+          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
+          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
         </div>
         {#if initialized}<AutomaticEnhancements {active} compact />{/if}
         {#if initialized}
@@ -2796,7 +2805,7 @@
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
     {/if}
-    {#if pendingUpdate && !moving}<div class="banner error" role="alert">Confirm the interrupted task update before making another change.<button class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Retry task update</button></div>{/if}
+    {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Retry task update</button></div>{/if}
     {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
     {#if showArchive}
       <TaskArchive
@@ -2811,22 +2820,29 @@
         repository={(id) => repositoryById.get(id)}
       />
     {/if}
-    {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
-    {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
-    {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
-    {#if liveNotice}<div class="banner" role="status" data-testid="task-live-unavailable">{liveNotice}</div>{/if}
-    {#if error}<div class="banner error" role="alert">{error}</div>{/if}
-    <!-- Cards carry no agent marks while this stands: an old reading would
-         claim agents nobody checked. -->
-    {#if verdictError}<p class="agents-unread" role="status" data-testid="board-verdicts-error">Verification verdicts could not be read, so cards show none: {verdictError}</p>{/if}
-    {#if lineageError}<p class="agents-unread" role="status" data-testid="board-lineage-error">Subtask progress could not be read, so cards show none: {lineageError}</p>{/if}
-    {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
-    <!-- A check that could not run is said, not shown as a healthy checkout:
-         those rows and cards carry no mark either way. -->
-    {#if uncheckedCheckouts.length}<p class="agents-unread" role="status" data-testid="checkout-unchecked">{plural(uncheckedCheckouts.length, "checkout")} could not be checked, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</p>{/if}
+    {#if relinkPending}<div class="banner error gp-notice gp-notice-error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
+    {#if catalogError}<div class="banner error gp-notice gp-notice-error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
+    {#if issueProgress}<div class="banner gp-notice" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
+    {#if liveNotice}<div class="banner gp-notice" role="status" data-testid="task-live-unavailable">{liveNotice}</div>{/if}
+    {#if error}<div class="banner error gp-notice gp-notice-error" role="alert">{error}</div>{/if}
+    <!-- One card for every board detail that could not be read, so the
+         reasons line up instead of trailing off the pane edge. A cause the red
+         notice above already states is pointed at, not repeated. -->
+    {#if hasReadNotes}
+      <ul class="read-notes gp-notice gp-notice-warn" aria-label="Board details not read" data-testid="board-read-notes">
+        <!-- Cards carry no agent marks while this stands: an old reading would
+             claim agents nobody checked. -->
+        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>Verification verdicts could not be read, so cards show none: {noteCause(verdictError)}</span></li>{/if}
+        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>Subtask progress could not be read, so cards show none: {noteCause(lineageError)}</span></li>{/if}
+        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>Agents working on these tasks could not be read: {noteCause($boardAgents.error)}</span></li>{/if}
+        <!-- A check that could not run is said, not shown as a healthy checkout:
+             those rows and cards carry no mark either way. -->
+        {#if uncheckedCheckouts.length}<li class="agents-unread" role="status" data-testid="checkout-unchecked"><CircleAlert size={12} aria-hidden="true" /><span>{plural(uncheckedCheckouts.length, "checkout")} could not be checked, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</span></li>{/if}
+      </ul>
+    {/if}
     <!-- Its own banner, not part of `error`: a board reload clears `error`,
          and the issue would still exist with nothing on screen to link it. -->
-    {#each relinks as entry (entry.taskId)}<div class="banner error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
+    {#each relinks as entry (entry.taskId)}<div class="banner error gp-notice gp-notice-error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
     <div class="sr-only" role="status" aria-live="polite">{announce}</div>
     {#if !initialized && loading}
       <div class="pad"><Skeleton variant="card" count={4} /></div>
@@ -3070,8 +3086,11 @@
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
-  .navigator{width:188px;flex-shrink:0;border-right:1px solid rgb(var(--c-border) / 0.65);padding:10px 8px;overflow:auto}
-  .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;background:transparent}
+  /* A rounded card that fills the board's left edge, top to bottom, with no
+     gutter: its corners meet the pane's own rounded corners, the same rule
+     as the app sidebar beside it. */
+  .navigator{width:188px;flex-shrink:0;margin:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:14px;padding:10px 8px;overflow:auto}
+  .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;background:transparent}
   .navigator button:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
   .navigator.gp-liquid-tabs{padding:10px 8px}
@@ -3107,8 +3126,9 @@
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-toggle{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
-  header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border) / 0.65)}
-  h1{font-size:15px;line-height:1.2;font-weight:650;margin:0;display:flex;align-items:baseline;gap:8px}
+  /* The header's box and the title's type are the shared gp-surface-header
+     and gp-surface-title (app.css), so Tasks and Agents read as one chrome. */
+  h1{display:flex;align-items:baseline;gap:8px}
   h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
   .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
@@ -3210,7 +3230,11 @@
   .paging-note{flex-basis:100%;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
   .column-empty{margin:10px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}
-  .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);display:flex;align-items:center;justify-content:space-between;gap:10px}
+  /* The card skin is gp-notice (app.css); this is only the row inside it. */
+  .banner{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .read-notes{list-style:none;display:flex;flex-direction:column;gap:4px;color:rgb(var(--c-text-muted))}
+  .read-notes li{display:flex;align-items:flex-start;gap:8px;font-size:11px;line-height:1.45}
+  .read-notes li :global(svg){flex-shrink:0;margin-top:2px;color:#f59e0b}
   .error{color:#d15a64}
   .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:12px;font-weight:550;overflow:hidden;overflow-wrap:anywhere}
   .pad{padding:16px}

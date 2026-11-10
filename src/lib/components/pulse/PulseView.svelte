@@ -419,7 +419,7 @@
       />
     </div>
   {:else if report}
-    <div class="p-6 space-y-5 max-w-7xl">
+    <div class="p-6 space-y-5">
       {#if workspaceLoc.length > 1}
         <div class="gp-card p-3 rounded-xl border border-border/70 bg-surface/40 flex flex-wrap items-center gap-3 text-xs">
           <span class="text-textMuted font-medium uppercase tracking-wider text-[10px]">Open repos</span>

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
-  import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewContextBar from "./ViewContextBar.svelte";
   import ViewSectionPanel from "./ViewSectionPanel.svelte";
 
   /** Named once: the tab and its panel must agree on the id. */
@@ -44,12 +44,13 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewSectionBar view="work">
-    <!-- Resolve stopped being a tab, so the count that used to ride its
-         header label rides here instead. A parked merge must never be
-         quieter than it was: Work is always in the header, its rows sort
-         blocked worktrees first, and the status bar keeps its own chip. -->
-    {#if conflictedCount > 0}
+  <!-- Resolve stopped being a header tab, so its count rides here as well as
+       on the header's Resolve icon. A parked merge must never be quieter than
+       it was: Work is always in the header, its rows sort blocked worktrees
+       first, and the status bar keeps its own chip. With no conflicts there is
+       nothing for this row to say, so it is not drawn. -->
+  {#if conflictedCount > 0}
+    <ViewContextBar label="Conflicts">
       <button
         type="button"
         onclick={() => repoStore.setViewSection("work", "resolve")}
@@ -58,8 +59,8 @@
       >
         {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
       </button>
-    {/if}
-  </ViewSectionBar>
+    </ViewContextBar>
+  {/if}
   <ViewSectionPanel {view} {section}>
 
     {#if section === "tasks"}

@@ -6,8 +6,9 @@
   /**
    * The panel half of a view's section tablist.
    *
-   * `ViewSectionBar` declared `role="tab"` and `aria-controls` pointing at
-   * nothing, because no element in the app carried `role="tabpanel"`. A tab
+   * The section switcher (now `ViewSectionTabs`, in the header) once declared
+   * `role="tab"` and `aria-controls` pointing at nothing, because no element
+   * in the app carried `role="tabpanel"`. A tab
    * that controls a panel which does not exist is an announcement without a
    * referent: assistive technology reports the relationship and then cannot
    * follow it. This is the referent.

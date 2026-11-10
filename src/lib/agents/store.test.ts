@@ -87,6 +87,23 @@ describe("createAgentPlaneStore", () => {
     expect(probes.find((probe) => probe.path === "/bad")?.skipped).toBe(false);
   });
 
+  it("names an empty answer as the failure instead of leaving it unexplained", async () => {
+    // A read that resolves to nothing is not a snapshot. Stored as one with
+    // no error, it reached the page as the generic "could not be read".
+    const store = createAgentPlaneStore({
+      snapshot: async (path) => (path === "/empty" ? (null as unknown as InsightsSnapshot) : { ...snap, repo_path: path }),
+      paths: { caseInsensitive: false },
+    });
+    await store.refresh([
+      { path: "/ok", label: "Ok" },
+      { path: "/empty", label: "Empty" },
+    ]);
+    const empty = get(store).probes.find((probe) => probe.path === "/empty");
+    expect(empty?.snapshot).toBeNull();
+    expect(empty?.error).toBe("The insights read returned no snapshot.");
+    expect(get(store).probes.find((probe) => probe.path === "/ok")?.error).toBe("");
+  });
+
   it("skips repositories past the cap without reading them", async () => {
     const seen: string[] = [];
     const store = createAgentPlaneStore({

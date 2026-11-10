@@ -17,7 +17,7 @@
    * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, ChevronDown, ChevronRight, CircleAlert, FolderOpen, Inbox, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { Bot, ChevronDown, LayoutList, ChevronRight, CircleAlert, FolderOpen, Inbox, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
   import AgentInbox from "./AgentInbox.svelte";
   import { tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
@@ -36,6 +36,8 @@
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentDirectories } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
+  import { isMacOS } from "../platform";
+  import { gapGroupTitle, gapsBlockReading, groupGaps, type GapNote } from "../agents/gapGroups";
   import { agentKindLabel } from "../work/agentWorktree";
   import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
   import { displayName } from "../repos/paths";
@@ -127,14 +129,19 @@
     entries.some((entry) => entry.row.id === focusedId) ? focusedId : (entries[0]?.row.id ?? null),
   );
   const scanning = $derived($agentPlaneStore.scanning);
-  const notes = $derived([
+  const macos = isMacOS();
+  const notes = $derived<GapNote[]>([
     ...plane.gaps,
     ...($registeredStatus.error
-      ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${$registeredStatus.error}` }]
+      ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${$registeredStatus.error}` }]
       : !$registeredStatus.complete
-        ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some attempts may not name their repository." }]
+        ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some attempts may not name their repository." }]
         : []),
   ]);
+  // The same failure in every repository is one line naming them all, not
+  // one line each; see agents/gapGroups.ts.
+  const noteGroups = $derived(groupGaps(notes));
+  const notesBlock = $derived(gapsBlockReading(noteGroups));
 
   const FILTERS: { id: AgentFilter; label: string }[] = [
     { id: "all", label: "All" },
@@ -315,35 +322,43 @@
   role="region"
   aria-label="Agents"
 >
-  <header class="shrink-0 border-b border-border gp-section-edge px-4 py-3 flex flex-col gap-3">
-    <div class="flex items-start gap-3">
-      <div class="flex items-center gap-2 min-w-0 flex-1">
-        <Bot size={16} class="text-accent shrink-0" />
-        <div class="min-w-0">
-          <h1 class="text-sm font-semibold text-textPrimary">Agents</h1>
-          <p class="text-[11px] text-textMuted truncate" data-testid="agents-headline">{headline}</p>
-        </div>
-        <div class="ml-4 flex items-center gap-1 bg-surface/50 p-0.5 rounded-md border border-border">
-          <button
-            type="button"
-            class="px-2 py-0.5 text-[11px] font-medium rounded transition-colors {activeView === 'plane' ? 'bg-accent text-white' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => (activeView = "plane")}
-            data-testid="agents-view-mode-plane"
-          >
-            Plane
-          </button>
-          <button
-            type="button"
-            class="px-2 py-0.5 text-[11px] font-medium rounded transition-colors flex items-center gap-1.5 {activeView === 'inbox' ? 'bg-accent text-white' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => (activeView = "inbox")}
-            data-testid="agents-view-mode-inbox"
-          >
-            <Inbox size={12} />
-            <span>Inbox</span>
-          </button>
-        </div>
+  <!-- The same header as Tasks (gp-surface-header): title and what it counts on
+       the left; the view switch and actions on the right, where Tasks keeps
+       Board/List. -->
+  <header class="gp-surface-header">
+    <div class="flex items-center gap-2.5 min-w-0 flex-1">
+      <Bot size={16} class="text-accent shrink-0" />
+      <div class="min-w-0">
+        <h1 class="gp-surface-title">Agents</h1>
+        <p class="text-[11px] text-textMuted truncate" data-testid="agents-headline" title={headline}>{headline}</p>
       </div>
-      <div class="flex items-center gap-1.5 shrink-0">
+    </div>
+    <div class="flex items-center gap-1.5 shrink-0">
+      <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Agents view">
+        <button
+          type="button"
+          class="gp-seg-btn inline-flex items-center gap-1.5"
+          data-active={activeView === "plane"}
+          aria-pressed={activeView === "plane"}
+          onclick={() => (activeView = "plane")}
+          data-testid="agents-view-mode-plane"
+        >
+          <LayoutList size={12} />
+          <span>Plane</span>
+        </button>
+        <button
+          type="button"
+          class="gp-seg-btn inline-flex items-center gap-1.5"
+          data-active={activeView === "inbox"}
+          aria-pressed={activeView === "inbox"}
+          onclick={() => (activeView = "inbox")}
+          data-testid="agents-view-mode-inbox"
+        >
+          <Inbox size={12} />
+          <span>Inbox</span>
+        </button>
+      </div>
+      <span class="mx-0.5 h-4 w-px bg-border" aria-hidden="true"></span>
         <button
           type="button"
           class="gp-btn py-1! px-2! text-[11px]!"
@@ -361,26 +376,20 @@
         <button
           type="button"
           class="gp-icon-btn"
-          aria-pressed={compact}
-          title={compact ? "Comfortable rows" : "Compact rows"}
-          aria-label={compact ? "Use comfortable rows" : "Use compact rows"}
-          onclick={() => interfaceStore.toggleAgentsCompact()}
-        >
-          <Rows3 size={14} />
-        </button>
-        <button
-          type="button"
-          class="gp-icon-btn"
           onclick={() => interfaceStore.setAgentsOpen(false)}
           title="Close Agents"
           aria-label="Close Agents"
         >
           <X size={14} />
         </button>
-      </div>
     </div>
+  </header>
 
-    <div class="flex flex-wrap items-center gap-1.5">
+  <!-- Filters and columns act on the plane's table, so they live with it: the
+       Inbox has neither, and showing them there offered controls that did
+       nothing. Each group is labelled rather than told apart by a divider. -->
+  {#if activeView === "plane"}
+    <div class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2" data-testid="agents-toolbar">
       {#if scopeLabel}
         <span
           class="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 pl-2 pr-0.5 py-0.5 text-[11px] text-textPrimary"
@@ -397,53 +406,100 @@
             <X size={10} />
           </button>
         </span>
-        <span class="mx-1 h-3 w-px bg-border" aria-hidden="true"></span>
       {/if}
-      {#each FILTERS as item (item.id)}
-        <button
-          type="button"
-          class="gp-btn py-0.5! px-2! text-[11px]!"
-          aria-pressed={filter === item.id}
-          data-testid="agents-filter-{item.id}"
-          onclick={() => interfaceStore.setAgentsFilter(item.id)}
-        >
-          {item.label}
-        </button>
-      {/each}
-      <span class="mx-1 h-3 w-px bg-border" aria-hidden="true"></span>
-      {#each AGENT_COLUMNS as column (column.key)}
-        <button
-          type="button"
-          class="gp-btn py-0.5! px-2! text-[11px]!"
-          aria-pressed={columnVisible(column.key)}
-          onclick={() => interfaceStore.toggleAgentsColumn(column.key)}
-        >
-          {column.label}
-        </button>
-      {/each}
-      {#if hidden.size > 0}
-        <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" onclick={() => interfaceStore.showAllAgentsColumns()}>
-          Show columns
-        </button>
-      {/if}
+      <!-- One filter at a time, so a segmented switch, not toggles. -->
+      <div class="flex items-center gap-1.5" role="group" aria-label="Show">
+        <span class="text-[10px] font-semibold uppercase tracking-wider text-textMuted">Show</span>
+        <div class="gp-segmented" class:gp-liquid-tabs={macos}>
+          {#each FILTERS as item (item.id)}
+            <button
+              type="button"
+              class="gp-seg-btn py-0.5! px-2.5! text-[11px]!"
+              data-active={filter === item.id}
+              aria-pressed={filter === item.id}
+              data-testid="agents-filter-{item.id}"
+              onclick={() => interfaceStore.setAgentsFilter(item.id)}
+            >
+              {item.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Columns">
+        <span class="text-[10px] font-semibold uppercase tracking-wider text-textMuted">Columns</span>
+        {#each AGENT_COLUMNS as column (column.key)}
+          <button
+            type="button"
+            class="gp-btn py-0.5! px-2! text-[11px]!"
+            aria-pressed={columnVisible(column.key)}
+            onclick={() => interfaceStore.toggleAgentsColumn(column.key)}
+          >
+            {column.label}
+          </button>
+        {/each}
+        {#if hidden.size > 0}
+          <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" onclick={() => interfaceStore.showAllAgentsColumns()}>
+            Show columns
+          </button>
+        {/if}
+      </div>
+      <button
+        type="button"
+        class="gp-icon-btn ml-auto"
+        aria-pressed={compact}
+        title={compact ? "Comfortable rows" : "Compact rows"}
+        aria-label={compact ? "Use comfortable rows" : "Use compact rows"}
+        onclick={() => interfaceStore.toggleAgentsCompact()}
+      >
+        <Rows3 size={14} />
+      </button>
     </div>
-  </header>
+  {/if}
 
   {#if activeView === "inbox"}
-    <div class="flex-1 min-h-0 min-w-0 p-3 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
+    <!-- No inset: the Inbox spans the pane like the Plane's table does. -->
+    <div class="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
       <AgentInbox repoPath={activeRepoPath} embedded={true} onopenTask={openInboxTask} />
     </div>
   {:else}
-    {#if notes.length > 0}
-      <ul class="shrink-0 border-b border-border px-4 py-2 flex flex-col gap-1" data-testid="agents-gaps">
-      {#each notes as gap, index (`${gap.kind}:${gap.repoPath}:${index}`)}
-        <li class="flex items-start gap-2 text-[11px] text-textSecondary" role="status">
-          <CircleAlert size={12} class="shrink-0 mt-0.5 text-amber-500" />
-          <span><span class="font-medium text-textPrimary">{gap.label}.</span> {gap.reason}</span>
-        </li>
-      {/each}
-    </ul>
-  {/if}
+    {#if noteGroups.length > 0}
+      <!-- One card, above the table so a hidden column never hides it. A
+           failure every repository shares is one line naming them all. -->
+      <section
+        class="gp-notice gp-notice-warn shrink-0 px-0! py-0!"
+        data-testid="agents-gaps"
+        aria-label="What the plane could not read"
+      >
+        <div class="flex items-center gap-2 px-3 pt-2 pb-1">
+          <CircleAlert size={13} class="shrink-0 text-amber-500" />
+          <span class="text-[11px] font-semibold text-textPrimary">
+            {notesBlock ? "Not everything could be read" : "Some of this is partial"}
+          </span>
+          <span class="text-[11px] text-textMuted">{plural(notes.length, "note", "notes")}</span>
+          <button
+            type="button"
+            class="gp-btn ml-auto py-0.5! px-2! text-[11px]!"
+            onclick={refresh}
+            disabled={scanning}
+            data-testid="agents-gaps-retry"
+          >
+            <RefreshCw size={11} class={scanning ? "animate-spin" : ""} />
+            <span>{scanning ? "Reading…" : "Retry"}</span>
+          </button>
+        </div>
+        <ul class="flex flex-col gap-1.5 px-3 pb-2.5 pl-[33px] max-h-56 overflow-y-auto">
+          {#each noteGroups as group (group.key)}
+            <li class="text-[11px] text-textSecondary min-w-0" role="status" data-gap-kind={group.kind}>
+              <span class="font-medium text-textPrimary">{gapGroupTitle(group)}.</span> {group.reason}
+              {#if group.labels.length > 1}
+                <!-- Every name, wrapped: the card scrolls, so none is dropped. -->
+                <span class="mt-0.5 block text-textMuted" data-gap-names>{group.labels.join(", ")}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
   <div class="flex-1 min-h-0 min-w-0 overflow-auto">
     {#if visible.length === 0}

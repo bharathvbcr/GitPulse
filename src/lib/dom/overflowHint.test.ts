@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CUE_BAND_PX,
+  cueYield,
   EMPTY_OVERFLOW_HINT,
   applyHorizontalScrollDelta,
   bindHorizontalWheel,
@@ -586,5 +588,42 @@ describe("observeOverflow", () => {
     expect(h.held.size).toBe(0);
     expect(h.moConnected()).toBe(false);
     expect(h.el.removeEventListener).toHaveBeenCalledWith("scroll", onScroll);
+  });
+});
+
+describe("cueYield", () => {
+  // The sidebar case: the branch list is h-full inside the sidebar body, so at
+  // rest its bottom edge sits the body's 12px padding above the body's own.
+  const body = { start: 100, end: 800 };
+  const list = { start: 140, end: 788 };
+
+  it("gives way at an edge where the enclosing scroller draws its own chevron", () => {
+    expect(cueYield(list, body, "y-end", "y")).toEqual({ start: false, end: true });
+    expect(cueYield(list, body, "y-both", "y")).toEqual({ start: false, end: true });
+  });
+
+  it("keeps its chevron when the enclosing scroller draws none at that edge", () => {
+    expect(cueYield(list, body, null, "y")).toEqual({ start: false, end: false });
+    expect(cueYield(list, body, undefined, "y")).toEqual({ start: false, end: false });
+    expect(cueYield(list, body, "y-start", "y")).toEqual({ start: false, end: false });
+  });
+
+  it("keeps its chevron once its edge is clear of the enclosing chevron's band", () => {
+    // Scrolled so the list ends well above the body's bottom: two edges, two cues.
+    const clear = { start: 20, end: body.end - CUE_BAND_PX - 1 };
+    expect(cueYield(clear, body, "y-end", "y").end).toBe(false);
+    const touching = { start: 20, end: body.end - CUE_BAND_PX + 1 };
+    expect(cueYield(touching, body, "y-end", "y").end).toBe(true);
+  });
+
+  it("applies the same rule to the start edge", () => {
+    const top = { start: body.start + 4, end: 600 };
+    expect(cueYield(top, body, "y-start", "y")).toEqual({ start: true, end: false });
+    expect(cueYield({ start: body.start + CUE_BAND_PX + 1, end: 600 }, body, "y-both", "y").start).toBe(false);
+  });
+
+  it("never reads another axis's token as its own", () => {
+    expect(cueYield(list, body, "x-both", "y")).toEqual({ start: false, end: false });
+    expect(cueYield({ start: 0, end: 300 }, { start: 0, end: 310 }, "y-end", "x").end).toBe(false);
   });
 });

@@ -381,3 +381,108 @@ export function observeOverflow(
     mo.disconnect();
   };
 }
+
+/**
+ * The strip at an edge that a cue's chevron occupies: `gp-scroll-cue-y` is
+ * `h-8` and the horizontal cue is the same size across.
+ */
+export const CUE_BAND_PX = 32;
+
+/** Which of a scroller's own cue chevrons give way to an enclosing one. */
+export interface CueYield {
+  start: boolean;
+  end: boolean;
+}
+
+export const NO_CUE_YIELD: CueYield = Object.freeze({ start: false, end: false });
+
+/** A box's extent along one axis, in viewport pixels. */
+export interface AxisSpan {
+  start: number;
+  end: number;
+}
+
+/**
+ * Nested scrollers each draw their own chevron, so a list that fills its
+ * parent scroller (the sidebar's branch list does: it is `h-full` inside the
+ * sidebar body) put two "scroll down" arrows on top of each other. One edge
+ * gets one chevron: the inner scroller's gives way while its edge sits inside
+ * the band where the enclosing scroller is drawing its own chevron for that
+ * same edge. The inner scroller keeps its fade, so its overflow still shows;
+ * the chevron that stays is the one that reveals what is below the list.
+ */
+export function cueYield(
+  inner: AxisSpan,
+  outer: AxisSpan,
+  outerToken: string | null | undefined,
+  axis: OverflowAxis,
+): CueYield {
+  const outerStart = outerToken === `${axis}-start` || outerToken === `${axis}-both`;
+  const outerEnd = outerToken === `${axis}-end` || outerToken === `${axis}-both`;
+  return {
+    start: outerStart && inner.start < outer.start + CUE_BAND_PX,
+    end: outerEnd && inner.end > outer.end - CUE_BAND_PX,
+  };
+}
+
+/** The nearest ancestor that scrolls on `axis`, the one whose cue can collide. */
+function enclosingScroller(el: HTMLElement, axis: OverflowAxis): HTMLElement | null {
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    const overflow = axis === "x" ? style.overflowX : style.overflowY;
+    if (overflow === "auto" || overflow === "scroll") return node;
+  }
+  return null;
+}
+
+function axisSpan(el: Element, axis: OverflowAxis): AxisSpan {
+  const box = el.getBoundingClientRect();
+  return axis === "x" ? { start: box.left, end: box.right } : { start: box.top, end: box.bottom };
+}
+
+/**
+ * Watches a scroller against the scroller enclosing it and reports which of
+ * its own chevrons must give way (see `cueYield`). Re-read when either one
+ * scrolls or resizes, and when the enclosing scroller's fade token changes,
+ * which is how its own cue says which edges it is drawing.
+ */
+export function observeCueYield(
+  el: HTMLElement,
+  axis: OverflowAxis,
+  onChange: (next: CueYield) => void,
+  options: ObserveResizeOptions = {},
+): () => void {
+  const outer = enclosingScroller(el, axis);
+  if (!outer) {
+    onChange(NO_CUE_YIELD);
+    return () => {};
+  }
+  let frame = 0;
+  let disposed = false;
+  const deliver = () => {
+    if (!disposed) onChange(cueYield(axisSpan(el, axis), axisSpan(outer, axis), outer.dataset.gpFade, axis));
+  };
+  const notify = () => {
+    if (frame) cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      deliver();
+    });
+  };
+  outer.addEventListener("scroll", notify, { passive: true });
+  el.addEventListener("scroll", notify, { passive: true });
+  const resize = createResizeObservation(deliver, options);
+  resize.observe(el);
+  resize.observe(outer);
+  const mo = new MutationObserver(notify);
+  mo.observe(outer, { attributes: true, attributeFilter: ["data-gp-fade"] });
+  deliver();
+  return () => {
+    disposed = true;
+    if (frame) cancelAnimationFrame(frame);
+    outer.removeEventListener("scroll", notify);
+    el.removeEventListener("scroll", notify);
+    resize.disconnect();
+    mo.disconnect();
+  };
+}

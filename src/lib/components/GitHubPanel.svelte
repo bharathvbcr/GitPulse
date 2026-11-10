@@ -1042,7 +1042,7 @@
          the runs they produce by a row. The pull requests, which are what a
          reader acts on, get the wide column; everything about CI sits
          together in the rail. -->
-    <div class="grid grid-cols-1 xl:grid-cols-3 gap-5 max-w-7xl items-start">
+    <div class="grid grid-cols-1 xl:grid-cols-3 gap-5 items-start">
       <div class="xl:col-span-2 space-y-5 min-w-0">
         <section>
           <div class="flex items-center justify-between gap-3 mb-2">

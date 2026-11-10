@@ -734,8 +734,12 @@
   <!-- Top Navigation & Summary Toolbar -->
   <header class="inbox-toolbar">
     <div class="toolbar-title">
-      <Inbox class="w-4 h-4 text-accent" />
-      <span class="font-semibold text-sm">Agent Inbox</span>
+      <!-- Embedded, the Agents header above already names this view (its
+           Inbox switch), so a second title would only repeat it. -->
+      {#if !embedded}
+        <Inbox class="w-4 h-4 text-accent" />
+        <span class="font-semibold text-sm">Agent Inbox</span>
+      {/if}
       {#if openAsksCount > 0}
         <span class="badge-open-asks" data-testid="open-asks-badge">
           {openAsksCount} open {openAsksCount === 1 ? "ask" : "asks"}
@@ -823,7 +827,7 @@
 
       <button
         type="button"
-        class="refresh-btn gp-btn"
+        class="refresh-btn"
         onclick={() => refreshInbox()}
         disabled={busy}
         aria-label="Refresh inbox"
@@ -1594,9 +1598,30 @@
     overflow: hidden;
   }
 
+  /* Embedded in the Agents pane it is part of that pane, not a panel laid on
+     it: the pane's own background shows through, the outer box goes, and the
+     toolbar and thread list take the pane's divider tone rather than an
+     opaque surface of their own. That opaque surface read as a darker slab
+     with a different contrast from the rest of the app. */
   .agent-inbox.embedded {
-    border: 1px solid rgb(var(--c-border, 45 50 65));
-    border-radius: 8px;
+    background: transparent;
+    border-radius: 0;
+    min-height: 0;
+  }
+
+  .agent-inbox.embedded .inbox-toolbar {
+    background: transparent;
+    border-bottom-color: transparent;
+    padding: 8px 14px;
+  }
+
+  .agent-inbox.embedded .threads-pane {
+    background: transparent;
+    border-right-color: rgb(var(--c-border) / 0.65);
+  }
+
+  .agent-inbox.embedded .thread-detail-pane {
+    background: transparent;
   }
 
   /* Toolbar */
@@ -1634,25 +1659,32 @@
     flex-wrap: wrap;
   }
 
+  /* The app's pill button (gp-btn): the inbox used to draw its own 6px boxes
+     on dark wells, which read as a different app inside this one. */
   .action-btn {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 4px 10px;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgb(var(--c-border, 45 50 65));
-    border-radius: 6px;
+    padding: 4px 11px;
+    background: rgb(var(--c-surface) / 0.7);
+    border: 1px solid rgb(var(--c-border) / 0.7);
+    border-radius: 9999px;
     font-size: 11px;
     font-weight: 500;
     color: inherit;
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: color 150ms, background-color 150ms, border-color 150ms;
   }
 
-  .action-btn.active,
   .action-btn:hover {
-    border-color: rgb(var(--c-accent, 79 70 229));
-    background: rgba(79, 70, 229, 0.16);
+    border-color: rgb(var(--c-accent) / 0.5);
+    background: rgb(var(--c-surface-hover) / 0.7);
+  }
+
+  .action-btn.active {
+    border-color: rgb(var(--c-accent) / 0.5);
+    background: rgb(var(--c-accent) / 0.12);
+    color: rgb(var(--c-accent));
   }
 
   .lanes-strip {
@@ -1736,14 +1768,21 @@
     margin-bottom: 8px;
   }
 
+  /* Search, status filters and refresh take the app's field, segmented and
+     icon-button shapes (gp-field / gp-segmented / gp-icon-btn). */
   .search-box {
     display: flex;
     align-items: center;
     gap: 6px;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgb(var(--c-border, 45 50 65));
-    border-radius: 6px;
-    padding: 3px 8px;
+    background: rgb(var(--c-bg) / 0.5);
+    border: 1px solid rgb(var(--c-border) / 0.7);
+    border-radius: 9999px;
+    padding: 4px 11px;
+    color: rgb(var(--c-text-muted));
+  }
+
+  .search-box:focus-within {
+    border-color: rgb(var(--c-accent) / 0.6);
   }
 
   .search-box input {
@@ -1757,36 +1796,49 @@
 
   .filter-tabs {
     display: flex;
-    background: rgba(0, 0, 0, 0.2);
-    border-radius: 6px;
+    gap: 2px;
+    background: rgb(var(--c-bg) / 0.7);
+    border-radius: 9999px;
     padding: 2px;
-    border: 1px solid rgb(var(--c-border, 45 50 65));
+    border: 1px solid rgb(var(--c-border) / 0.7);
   }
 
   .filter-tab {
     background: transparent;
     border: none;
-    color: rgb(var(--c-text-muted, 140 145 160));
+    color: rgb(var(--c-text-muted));
     font-size: 11px;
     padding: 3px 10px;
-    border-radius: 4px;
+    border-radius: 9999px;
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: color 150ms, background-color 150ms;
+  }
+
+  .filter-tab:hover {
+    color: rgb(var(--c-text));
   }
 
   .filter-tab.active {
-    background: rgb(var(--c-accent, 79 70 229));
-    color: #fff;
-    font-weight: 500;
+    background: rgb(var(--c-surface) / 0.9);
+    color: rgb(var(--c-accent));
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.05);
   }
 
   .refresh-btn {
-    padding: 5px 8px;
+    display: inline-flex;
+    align-items: center;
+    padding: 5px;
     background: transparent;
-    border: 1px solid rgb(var(--c-border, 45 50 65));
-    border-radius: 6px;
+    border: 0;
+    border-radius: 9999px;
     cursor: pointer;
-    color: inherit;
+    color: rgb(var(--c-text-muted));
+  }
+
+  .refresh-btn:hover:not(:disabled) {
+    background: rgb(var(--c-surface-hover) / 0.7);
+    color: rgb(var(--c-text));
   }
 
   /* Alerts */

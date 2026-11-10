@@ -968,15 +968,6 @@
 
                   <div class="gp-separator" aria-hidden="true"></div>
                   <div class="space-y-0.5 pt-1">
-                    <div data-setting="header-labels" hidden={!shown("header-labels")}>
-                      <SettingToggle
-                        label="Header button labels"
-                        description="Word beside the Open menu in the title bar."
-                        ariaLabel="Show labels on header action buttons"
-                        checked={$interfaceStore.showHeaderActionLabels}
-                        onchange={(next) => interfaceStore.setShowHeaderActionLabels(next)}
-                      />
-                    </div>
                     <div data-setting="repo-tabs" hidden={!shown("repo-tabs")}>
                       <SettingToggle
                         label="Hide repository tabs when alone"

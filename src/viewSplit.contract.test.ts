@@ -102,7 +102,7 @@ describe("view code splitting follows the registry", () => {
         // is imported by every host by design. Narrowing this by name keeps
         // the check on what it is actually about — a heavy pane sneaking back
         // into the entry chunk — instead of on a spelling.
-        const SECTION_CHROME = ["ViewSectionBar", "ViewSectionPanel"];
+        const SECTION_CHROME = ["ViewContextBar", "ViewSectionPanel"];
         const staticPanes = [...(host ?? "").matchAll(/import\s+(\w*(?:Panel|Viewer))\s+from/g)]
           .map(([, name]) => name)
           .filter((name) => !SECTION_CHROME.includes(name));

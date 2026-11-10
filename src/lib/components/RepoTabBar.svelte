@@ -16,6 +16,7 @@
   import {
     ChevronDown,
     ChevronRight,
+    Download,
     Pin,
     Plus,
     X,
@@ -62,8 +63,10 @@
 
   let {
     onOpen,
+    onClone,
   }: {
     onOpen?: () => void;
+    onClone?: () => void;
   } = $props();
 
   /**
@@ -1392,23 +1395,32 @@
       </div>
     {/if}
 
+    <!-- `ml-auto` pins Open, its menu and the workspace actions to the
+         strip's right edge at every window width, wherever the tabs end. The
+         tab list itself stays shrink-wrapped (no flex-1), so its overflow cue
+         marks the last tab rather than empty space.
+         Open and its menu arrow are one split pill: Open's square right edge
+         is the divider, the arrow drops its own left border, and `-ml-1.5`
+         takes back the strip's gap between them. -->
     <button
       type="button"
       title="Open repository"
       aria-label="Open repository"
       data-testid="open-repo-tab"
+      data-tour="repository"
       onclick={() => onOpen?.()}
-      class="gp-btn py-1! px-2.5! shrink-0"
+      class="gp-btn h-[26px] py-0! pl-2.5! pr-2! shrink-0 ml-auto rounded-r-none! active:transform-none!"
     >
       <Plus size={13} class="text-accent" />
       <span>Open</span>
     </button>
 
-    <div class="relative shrink-0" data-recents-menu>
+    <div class="relative shrink-0 -ml-1.5" data-recents-menu>
       <button
         bind:this={recentsTriggerEl}
         type="button"
-        title="Recent repositories"
+        title="Clone or open a recent repository"
+        aria-label="Clone or open a recent repository"
         aria-haspopup="menu"
         aria-expanded={recentsOpen}
         aria-controls="recent-repositories-menu"
@@ -1416,7 +1428,8 @@
           menu = null;
           recentsOpen = !recentsOpen;
         }}
-        class="gp-icon-btn p-1! h-full"
+        data-testid="open-repo-menu"
+        class="gp-btn h-[26px] py-0! px-1.5! rounded-l-none! border-l-0! active:transform-none!"
       >
         <ChevronDown size={13} />
       </button>
@@ -1426,12 +1439,28 @@
           use:popover={recentsDismissal}
           id="recent-repositories-menu"
           role="menu"
-          aria-label="Recent repositories"
+          aria-label="Clone or open a recent repository"
           tabindex="-1"
           onkeydown={handlePopupKeydown}
           class="absolute right-0 top-full mt-1.5 w-80 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(28rem,calc(100vh-7.5rem))] shadow-float"
           style="z-index: {LAYERS.MENU}"
         >
+          {#if onClone}
+            <button
+              type="button"
+              role="menuitem"
+              data-testid="clone-repo-item"
+              class="gp-menu-item shrink-0"
+              onclick={() => {
+                recentsOpen = false;
+                onClone?.();
+              }}
+            >
+              <Download size={13} class="text-accent" />
+              Clone Repository…
+            </button>
+            <div class="gp-separator shrink-0" aria-hidden="true"></div>
+          {/if}
           <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0">
             Recent repositories
           </div>

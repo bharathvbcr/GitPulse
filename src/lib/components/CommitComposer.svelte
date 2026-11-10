@@ -253,7 +253,9 @@
   }
 </script>
 
-<div class="p-3 border-t border-border/60 gp-section-edge bg-surface flex flex-col gap-2 shrink-0">
+<!-- Full width and flush to the sidebar's foot: rounded top corners mark it
+     off the list above, and the sidebar's own rounded edge clips its bottom. -->
+<div class="rounded-t-xl border-t border-border/70 p-3 bg-surface flex flex-col gap-2 shrink-0">
   <div class="flex items-center justify-between">
     <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Commit</span>
     <button

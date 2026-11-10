@@ -181,7 +181,8 @@ describe("SettingsModal layout options", () => {
     const layout = panel(body, "layout");
     expect(layout).toContain('aria-label="Status bar detail"');
     expect(layout).toContain('aria-label="Diagnostics button visibility"');
-    expect(layout).toContain('aria-label="Show labels on header action buttons"');
+    // Retired with the title bar's Open menu, the only control it labelled.
+    expect(layout).not.toContain('aria-label="Show labels on header action buttons"');
     expect(layout).toContain(
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );

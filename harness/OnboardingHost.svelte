@@ -11,7 +11,6 @@
 <script lang="ts">
   import type { Writable } from "svelte/store";
   import ProductTour from "../src/lib/components/onboarding/ProductTour.svelte";
-  import HeaderRepoMenu from "../src/lib/components/HeaderRepoMenu.svelte";
   import Logo from "../src/lib/components/Logo.svelte";
   import { VIEW_REGISTRY } from "../src/lib/views/viewRegistry";
   import type { ProductTourStore } from "../src/lib/tools/productTour";
@@ -29,7 +28,7 @@
 <div class="gp-shell bg-background text-textPrimary font-sans min-h-screen">
   <header class="bg-surface border-b border-border flex items-center gap-5 px-5 h-14">
     <Logo size={24} variant="badge" /><strong>GitPulse</strong>
-    <div class:hidden={$workspace.hideTargets}><HeaderRepoMenu onOpen={() => void openRepository()} onClone={() => void openRepository()} /></div>
+    <button class:hidden={$workspace.hideTargets} data-tour="repository" class="gp-btn" aria-label="Open repository" onclick={() => void openRepository()}>Open</button>
     {#if $workspace.path && !$workspace.hideTargets}
       <div data-tour="views" class="flex gap-2" role="tablist" aria-label="Workspace views">
         {#each Object.values(VIEW_REGISTRY) as entry}

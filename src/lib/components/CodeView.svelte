@@ -1,7 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
-  import ViewSectionBar from "./ViewSectionBar.svelte";
   import ViewSectionPanel from "./ViewSectionPanel.svelte";
 
   /** Named once: the tab and its panel must agree on the id. */
@@ -32,7 +31,6 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewSectionBar view="code" />
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane

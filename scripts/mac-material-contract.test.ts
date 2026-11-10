@@ -643,6 +643,23 @@ describe("macOS material", () => {
     expect(tokens).not.toContain("gp-gpu");
   });
 
+  it("draws the sidebar and workspace as rounded cards with no gutter", () => {
+    // Both panes take their margin and radius from the same two tokens, so
+    // the gap between them matches the gap around them and the corners
+    // agree. The gutter is zero: any band of shell hue around the panes was
+    // reported as wasted space.
+    const tokens = css.match(/html\.macos \{\s*--gp-pane-gutter:\s*(\d+)px;\s*--gp-pane-radius:\s*(\d+)px;/);
+    expect(Number(tokens?.[1])).toBe(0);
+    expect(Number(tokens?.[2])).toBeGreaterThan(0);
+    const workspace = css.match(/html\.macos \.gp-workspace \{([^}]+)\}/)?.[1];
+    expect(workspace).toMatch(/margin:\s*var\(--gp-pane-gutter\);/);
+    expect(workspace).toMatch(/border-radius:\s*var\(--gp-pane-radius\);/);
+    const sidebar = css.match(/html\.macos \.gp-sidebar \{([^}]+)\}/)?.[1];
+    expect(sidebar).toMatch(/margin:\s*var\(--gp-pane-gutter\) 0 var\(--gp-pane-gutter\) var\(--gp-pane-gutter\);/);
+    expect(sidebar).toMatch(/border-radius:\s*var\(--gp-pane-radius\);/);
+    expect(sidebar).toMatch(/height:\s*auto;/);
+  });
+
   it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
     const rule = css.match(
       /html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/,

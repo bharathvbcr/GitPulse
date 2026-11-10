@@ -105,85 +105,94 @@
 </script>
 
 <div class="flex items-center gap-1.5">
-  <!-- Harness state. The three states are distinct on purpose: connected,
+  <!-- One pill, two segments: the harness and the local model are separate
+       facts with separate states, so each segment keeps its own tint inside
+       the shared outline rather than the pill taking one colour for both.
+       The harness segment's three states stay distinct on purpose: connected,
        unavailable, and "a rule fired on the last action" never collapse into
        one another. -->
-  <button
-    onclick={() => openManvi("harness")}
-    disabled={!reachable}
-    title={harnessTitle}
-    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors shadow-xs disabled:cursor-default
-      {permissionMode === 'connected'
-        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400 enabled:hover:bg-emerald-500/20'
-        : permissionMode === 'blocked'
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-400 enabled:hover:bg-rose-500/20'
-          : permissionMode === 'unguarded'
-            ? 'border-amber-500/30 bg-amber-500/10 text-amber-400 enabled:hover:bg-amber-500/20'
-            : 'border-border/80 bg-surfaceHover text-textMuted enabled:hover:text-textPrimary'}"
-  >
-    {#if permissionMode === "connected"}
-      <ShieldCheck size={12} />
-    {:else if permissionMode === "not-probed"}
-      <ShieldQuestion size={12} />
-    {:else}
-      <ShieldAlert size={12} />
-    {/if}
-    <span class="font-medium">MANVI</span>
-  </button>
-
-  <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
   <div
-    class="flex max-w-[180px] items-center rounded-full border text-[11px] shadow-xs transition-colors
-      {$harnessStore.error && !$harnessStore.isProbing
-        ? 'border-rose-500/30 bg-rose-500/10 text-rose-400'
-        : modelReady
-          ? 'border-accent/30 bg-accent/10 text-accent'
-          : 'border-border/80 bg-surfaceHover text-textMuted'}"
+    role="group"
+    aria-label="MANVI and local model"
+    class="flex max-w-[300px] items-stretch overflow-hidden rounded-full border border-border/80 text-[11px] shadow-xs"
   >
-    <div class="relative min-w-0 flex-1">
-      <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden="true">
-        {#if modelAttention}
-          <CircleAlert size={12} />
-        {:else}
-          <Sparkles size={12} />
-        {/if}
-      </span>
-      <select
-        aria-label="Local model"
-        aria-describedby="{instanceId}-model-status"
-        aria-busy={$harnessStore.isProbing}
-        title={modelTitle}
-        value={preferredKey}
-        onchange={(event) => pickModel(event.currentTarget.value)}
-        class="w-full cursor-pointer appearance-none truncate rounded-l-full bg-transparent py-1 pl-7 pr-5 text-[11px] transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:outline-accent"
-      >
-        <option value="">Automatic{automaticDetail}</option>
-        {#if preferred && !preferredListed}
-          <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
-        {/if}
-        {#each endpoints as endpoint}
-          <optgroup label={endpoint.base_url}>
-            {#each endpoint.models as model}
-              <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
-            {/each}
-          </optgroup>
-        {/each}
-        {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
-          <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
-        {/if}
-      </select>
-      <ChevronDown size={11} class="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" aria-hidden="true" />
-    </div>
     <button
-      type="button"
-      aria-label={refreshLabel}
-      title={refreshLabel}
-      disabled={$harnessStore.isProbing}
-      onclick={() => { if (!$harnessStore.isProbing) void harnessStore.refreshAi(); }}
-      class="flex w-7 shrink-0 self-stretch items-center justify-center rounded-r-full border-l border-current/15 transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-wait"
+      onclick={() => openManvi("harness")}
+      disabled={!reachable}
+      title={harnessTitle}
+      class="flex shrink-0 items-center gap-1.5 px-2.5 py-1 transition-colors disabled:cursor-default focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent
+        {permissionMode === 'connected'
+          ? 'bg-emerald-500/10 text-emerald-400 enabled:hover:bg-emerald-500/20'
+          : permissionMode === 'blocked'
+            ? 'bg-rose-500/10 text-rose-400 enabled:hover:bg-rose-500/20'
+            : permissionMode === 'unguarded'
+              ? 'bg-amber-500/10 text-amber-400 enabled:hover:bg-amber-500/20'
+              : 'bg-surfaceHover text-textMuted enabled:hover:text-textPrimary'}"
     >
-      <RefreshCw size={11} class={$harnessStore.isProbing ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
+      {#if permissionMode === "connected"}
+        <ShieldCheck size={12} />
+      {:else if permissionMode === "not-probed"}
+        <ShieldQuestion size={12} />
+      {:else}
+        <ShieldAlert size={12} />
+      {/if}
+      <span class="font-medium">MANVI</span>
     </button>
+
+    <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
+    <div
+      class="flex min-w-0 max-w-[180px] items-center border-l border-border/60 transition-colors
+        {$harnessStore.error && !$harnessStore.isProbing
+          ? 'bg-rose-500/10 text-rose-400'
+          : modelReady
+            ? 'bg-accent/10 text-accent'
+            : 'bg-surfaceHover text-textMuted'}"
+    >
+      <div class="relative min-w-0 flex-1">
+        <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden="true">
+          {#if modelAttention}
+            <CircleAlert size={12} />
+          {:else}
+            <Sparkles size={12} />
+          {/if}
+        </span>
+        <select
+          aria-label="Local model"
+          aria-describedby="{instanceId}-model-status"
+          aria-busy={$harnessStore.isProbing}
+          title={modelTitle}
+          value={preferredKey}
+          onchange={(event) => pickModel(event.currentTarget.value)}
+          class="w-full cursor-pointer appearance-none truncate bg-transparent py-1 pl-7 pr-5 text-[11px] transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+        >
+          <option value="">Automatic{automaticDetail}</option>
+          {#if preferred && !preferredListed}
+            <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
+          {/if}
+          {#each endpoints as endpoint}
+            <optgroup label={endpoint.base_url}>
+              {#each endpoint.models as model}
+                <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
+              {/each}
+            </optgroup>
+          {/each}
+          {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
+            <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
+          {/if}
+        </select>
+        <ChevronDown size={11} class="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" aria-hidden="true" />
+      </div>
+      <button
+        type="button"
+        aria-label={refreshLabel}
+        title={refreshLabel}
+        disabled={$harnessStore.isProbing}
+        onclick={() => { if (!$harnessStore.isProbing) void harnessStore.refreshAi(); }}
+        class="flex w-7 shrink-0 self-stretch items-center justify-center border-l border-current/15 transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent disabled:cursor-wait"
+      >
+        <RefreshCw size={11} class={$harnessStore.isProbing ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
+      </button>
+    </div>
   </div>
   <span id="{instanceId}-model-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{modelStatus}</span>
 

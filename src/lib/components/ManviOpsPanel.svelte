@@ -766,7 +766,7 @@
 </script>
 
 <div class="flex-1 overflow-auto bg-background p-4 text-xs text-textPrimary">
-  <div class="mx-auto flex w-full max-w-6xl flex-col gap-4">
+  <div class="flex w-full flex-col gap-4">
     <div class="flex items-start justify-between gap-4">
       <div>
         <div class="flex items-center gap-2">

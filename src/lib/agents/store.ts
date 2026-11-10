@@ -140,13 +140,18 @@ export function createAgentPlaneStore(deps: AgentPlaneStoreDeps = {}): AgentPlan
         return;
       }
       try {
-        const read = await snapshot(target.path);
+        // Typed as a snapshot, but IPC does not enforce the type at runtime.
+        const read: InsightsSnapshot | null | undefined = await snapshot(target.path);
         if (mine !== epoch) return;
+        // An answer that is not an object is a failed read with a known
+        // cause. Kept as a snapshot with no error, it reached the page as an
+        // unexplained "could not be read".
+        const usable = read !== null && typeof read === "object" ? read : null;
         probes[index] = {
           path: target.path,
           label: target.label,
-          snapshot: read,
-          error: "",
+          snapshot: usable,
+          error: usable ? "" : "The insights read returned no snapshot.",
           skipped: false,
           skipReason: "",
         };

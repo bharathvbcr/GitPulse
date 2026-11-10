@@ -200,17 +200,25 @@ describe("BranchList two-line branch rows", () => {
     // through the row's edge and under the hover actions on a narrow sidebar.
     const line2 = source.slice(source.indexOf("{@render branchNumbers(branch, statsMissing)}") - 900);
     expect(line2).toContain("overflow-hidden");
-    // The fade only consumes pixels when content reaches them, so a clipped
-    // row looks clipped rather than looking like a smaller number.
-    expect(source).toContain("mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent)");
-    expect(source).toContain("-webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent)");
+    // The fade covers exactly the line's right padding (pr-2.5 = 10px), so it
+    // only ever touches content that has already overflowed: the author's
+    // ellipsis ends before it and stays crisp, a clipped number still fades.
+    expect(line2).toContain("overflow-hidden pr-2.5");
+    expect(source).toContain("mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent)");
+    expect(source).toContain("-webkit-mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent)");
   });
 
-  it("reserves the hover actions' width so they never overlap the text", () => {
-    // The rail is absolutely positioned; pr-11 is the space it sits in.
-    // Measured: 20px copy + 16px menu + 2px gap + 4px inset = 42px < 44px.
-    expect(source).toContain('"flex-1 min-w-0 flex items-center gap-1.5 text-left pr-11"');
-    expect(source).toContain('class="absolute right-1 top-0 h-full flex items-center gap-0.5"');
+  it("reserves the hover actions' width on line one only, so line two gets the full row", () => {
+    // The rail is absolutely positioned level with the name; pr-11 on line
+    // one is the space it sits in. Measured: 16px copy + 16px menu + 2px gap
+    // + 4px inset = 38px < 44px (the copy button is p-0.5 in the rail, 16px,
+    // so the rail ends above line two). Line two runs under nothing.
+    expect(source).toContain('<span class="w-full flex items-center gap-1.5 min-w-0 leading-none pr-11">');
+    expect(source).toContain('"flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"');
+    expect(source).toContain('class="absolute right-1 top-[5px] h-4 flex items-center"');
+    // At rest the status dots hold the row's right edge; they yield to the
+    // actions on hover and focus rather than sitting beside them.
+    expect(source).toContain("group-hover:opacity-0 group-focus-within:opacity-0");
   });
 
   it("drops the stale chip only where the tinted age replaces it", () => {
