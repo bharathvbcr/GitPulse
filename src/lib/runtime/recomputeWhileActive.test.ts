@@ -45,9 +45,9 @@ describe("App hands FleetView its real active state", () => {
 
   it("mounts Fleet with props={{ active: fleetOpen }} through LazyView, like TaskBoard", () => {
     const mount = app.match(/<LazyView load=\{loadFleetView\}[^>]*\/>/)?.[0] ?? "";
-    expect(mount).toContain("props={{ active: fleetOpen }}");
+    expect(mount).toMatch(/props=\{\{\s*active:\s*fleetOpen\s*\}\}/);
     expect(app).toMatch(/const fleetOpen = \$derived\(\$interfaceStore\.globalSurface === "fleet"\)/);
-    expect(app).toContain('props={{ active: $interfaceStore.globalSurface === "tasks"');
+    expect(app).toMatch(/props=\{\{\s*active:\s*\$interfaceStore\.globalSurface\s*===\s*"tasks"/);
   });
 });
 

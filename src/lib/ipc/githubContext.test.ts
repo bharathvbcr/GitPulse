@@ -216,14 +216,14 @@ describe("the panels read through the owner", () => {
   it("neither asks the backend for the context itself", () => {
     expect(panel).not.toContain('"cmd_github_context"');
     expect(ops).not.toContain('"cmd_github_context"');
-    expect(panel).toContain("readGitHubContext<GitHubContext>(repo, { force })");
-    expect(ops).toContain("readGitHubContext<GitHubContext>(repo, { force: !opts.background && !opts.reuse })");
+    expect(panel).toMatch(/readGitHubContext<GitHubContext>\(\s*repo\s*,\s*\{\s*force\s*\}\s*\)/);
+    expect(ops).toMatch(/readGitHubContext<GitHubContext>\(\s*repo\s*,\s*\{\s*force:\s*!opts\.background\s*&&\s*!opts\.reuse\s*\}\s*\)/);
   });
 
   it("only the mount read may reuse; every refresh forces", () => {
-    expect(panel).toContain("async function loadFor(repo: string, force = true)");
-    expect(panel.match(/loadFor\(repo, false\)/g)).toHaveLength(1);
-    expect(ops).toContain("loadIssues(repo, { reuse: true })");
+    expect(panel).toMatch(/async function loadFor\(\s*repo: string,\s*force = true\s*\)/);
+    expect(panel.match(/loadFor\(\s*repo\s*,\s*false\s*\)/g)).toHaveLength(1);
+    expect(ops).toMatch(/loadIssues\(\s*repo\s*,\s*\{\s*reuse: true\s*\}\s*\)/);
     expect(ops.match(/reuse: true/g)).toHaveLength(1);
   });
 });
