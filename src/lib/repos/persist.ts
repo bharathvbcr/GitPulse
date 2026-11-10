@@ -178,9 +178,10 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // path box so a user would not have to walk back to Files for the file they
   // already had open — the same tell Diff gave. As sections of Code the
   // selection survives the switch, so the second set of pickers is what the
-  // merge removes.
+  // merge removes. Blame then folded further, into a toggle on Explorer's
+  // open file, so a restored "blame" lands on Explorer with that file open.
   files: { tab: "code", section: "explorer" },
-  blame: { tab: "code", section: "blame" },
+  blame: { tab: "code", section: "explorer" },
 };
 
 /** The retirement record for a persisted id, or null when it is not retired. */

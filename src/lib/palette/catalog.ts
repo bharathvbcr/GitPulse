@@ -6,6 +6,7 @@ import { interfaceStore } from "../stores/interfaceStore";
 import { askText } from "../stores/modalStore";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
+import { setEditorLens, showExplorerRail } from "../files/explorerLens";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
 import { LAUNCHERS } from "../terminal/tabs";
@@ -65,6 +66,22 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       },
     })),
   ]);
+  // Search and Blame were sections of Code; they are toggles inside Explorer
+  // now (`files/explorerLens.ts`), so the registry no longer generates their
+  // doors. They keep the ids and labels they had, so a remembered command
+  // still finds them, and each lands on Explorer already showing its toggle.
+  const explorerToggles: PaletteItem[] = [
+    { id: "code:search", label: "Open Search — find text across the repository", description: "Code → Explorer → Search · Search file contents across the working tree or a revision, beside the editor. A capped, cut or cancelled result says it is partial.", keywords: "Code Explorer Search find grep text contents", category: "Views", icon: icons.code, disabledReason: unavailable, action: () => {
+      interfaceStore.setGlobalSurface("repository");
+      repoStore.setActiveTab("code", "explorer");
+      showExplorerRail("search");
+    } },
+    { id: "code:blame", label: "Open Blame — line authorship and code age", description: "Code → Explorer → Blame · Who last touched each line of the open file, and how old that code is.", keywords: "Code Explorer Blame authorship annotate age", category: "Views", icon: icons.code, disabledReason: unavailable, action: () => {
+      interfaceStore.setGlobalSurface("repository");
+      repoStore.setActiveTab("code", "explorer");
+      setEditorLens("blame");
+    } },
+  ];
   return [
     { id: "open_repo", label: "Open Repository…", description: "Choose a local Git repository", category: "Repositories", icon: FolderOpen, shortcut: "⌘T", closeBefore: true, action: () => repoStore.pickAndOpenRepo() },
     { id: "clone_repo", label: "Clone Repository…", description: "Clone a remote repository to a local folder", category: "Repositories", icon: Download, closeBefore: true, disabledReason: host.onClone ? undefined : "Cloning is unavailable in this window.", action: () => host.onClone?.() },
@@ -121,6 +138,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "stash", label: "Stash Working Tree", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.statuses.length ? undefined : "The working tree is clean."), action: () => repoStore.stashSave(undefined, undefined, target) },
     { id: "stash_pop", label: "Pop Stash", description: state.stashEntries[0]?.subject ?? "Apply and remove the latest stash", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.stashFailed ? "Stash status is unavailable. Refresh first." : !state.stashEntries.length ? "No stash entries in this repository." : undefined), action: () => repoStore.stashPop(target) },
     ...views,
+    ...explorerToggles,
     ...PALETTE_MODES.filter(entry => entry.mode !== "commands").map(entry => ({ id: `search:${entry.mode}`, label: `Search ${entry.label}`, description: entry.hint, category: "Search", icon: Search, keepOpen: true, action: () => changeMode(entry.mode) })),
     { id: "close_tab", label: "Close Repository Tab", category: "Repositories", icon: X, shortcut: "⌘⇧W", disabledReason: unavailable, action: () => repoStore.closeActiveTab() },
     { id: "next_tab", label: "Next Repository Tab", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+Tab", disabledReason: state.openTabs.length < 2 ? "Open another repository tab first." : undefined, action: () => repoStore.nextTab() },

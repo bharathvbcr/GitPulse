@@ -117,31 +117,20 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "code",
     label: "Code",
     summary:
-      "The working tree. Open a file in Explorer, inspect Blame, or navigate the code map.",
-    paletteCommand: "Open Code — the file explorer, editor, blame and map",
-    // Three readings of one repository. Explorer and Blame still share
-    // `selectedFilePath`; Map is the structural navigator over
+      "The working tree. Open, search and blame files in Explorer, or navigate the code map.",
+    paletteCommand: "Open Code — the file explorer, editor, search, blame and map",
+    // Two readings of one repository. Explorer is the file: its rail toggles
+    // between the tree and content search, and the open file between the
+    // editor and its blame (both were sections here once, and each sent the
+    // user back to Explorer for the file it had just named — see
+    // `files/explorerLens.ts`). Map is the structural navigator over
     // `.devcouncil/repo_map.json` plus docs search, doc graph, and workspace links.
     sections: [
       {
         id: "explorer",
         label: "Explorer",
         summary:
-          "Browse and edit files. The tree, editor tabs and the live pulse dashboard live here.",
-      },
-      {
-        id: "blame",
-        label: "Blame",
-        summary:
-          "Who last touched each line, and how old that code is. Keeps the file Explorer had open.",
-        paletteCommand: "Open Blame — line authorship and code age",
-      },
-      {
-        id: "search",
-        label: "Search",
-        summary:
-          "Search file contents across the working tree or a revision. A capped, cut or cancelled result says it is partial.",
-        paletteCommand: "Open Search — find text across the repository",
+          "Browse, search and edit files, and toggle the open file to its blame. The tree, content search, editor tabs and the live pulse dashboard live here.",
       },
       {
         id: "map",

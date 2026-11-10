@@ -21,7 +21,7 @@ GitPulse has 4 application views with 18 specialized sections. Each view keeps r
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
+| **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
@@ -51,7 +51,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Search · Map — file selection, text search and code/docs map"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
     end
@@ -253,12 +253,15 @@ copy limits and the distinction between terminal handoffs and managed runs.
 
 ## 2. Code (`code`)
 
-Four sections under one view. Explorer and Blame are two lenses on one **file**
-(`selectedFilePath` survives the switch). Search scans file contents across the
-working tree or revisions. Map is the structural navigator over the DevMap repo
-map, the code/doc graph, and repository markdown — not a fourth reading of the
-same open file. Sections switch from the segmented control
-(`⌥1` / `⌥2` / `⌥3` / `⌥4` while Code is active) or by name in the command palette.
+Two sections under one view. Explorer is the **file**: its side column toggles
+between the tree and content search, and the open file toggles between the
+editor and its blame — Search and Blame were sections of their own once, and
+each sent the reader back to Explorer for the file it had just named. Map is
+the structural navigator over the DevMap repo map, the code/doc graph, and
+repository markdown — not another reading of the same open file. Sections
+switch from the segmented control (`⌥1` / `⌥2` while Code is active) or by
+name in the command palette, which also keeps `Open Search — …` and
+`Open Blame — …` commands that open Explorer with the toggle on.
 
 ### 2.1 Explorer
 
@@ -280,7 +283,9 @@ same open file. Sections switch from the segmented control
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
 - **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. Toggles between lines-of-code (`loc`) and percentage (`percentage`) mode. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
 
-### 2.2 Blame
+### 2.2 Blame (an Explorer toggle)
+
+Blame is a lens on the file open in Explorer, not a separate section: the **Blame** toggle in the open file's path bar swaps the editor for that file's blame, beside Explorer's own tree, and follows the active tab until it is toggled off. The command palette's `Open Blame — line authorship and code age` opens Explorer with it on.
 
 - **Line Authorship Viewer**: Interactive gutter displaying commit author, commit age and commit SHA for every line. Hardened with an SWR (stale-while-revalidate) architecture and deep equality guards to eliminate unnecessary re-renders. The age follows the shared timestamp preference (relative or `YYYY-MM-DD`), with the other form on hover.
 - **Commit Blocks**: Consecutive lines from one commit state their hash and author once, at the head of the block; a continuation line keeps its hash reachable on hover or focus, and hovering any line marks the whole commit down the left edge.
@@ -293,13 +298,15 @@ same open file. Sections switch from the segmented control
 - **Commit Navigation**: One-click navigation from any blamed line directly to its full commit diff and history details.
 - **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
 
-### 2.3 Search
+### 2.3 Search (an Explorer toggle)
+
+Content search lives in Explorer's side column: the search button beside the Explorer toggle swaps the file tree for the search pane (the tree keeps its folds and filter), and a hit opens in the editor beside its results.
 
 - **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision via `git grep`.
 - **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
 - **Honest Outcome Reporting**: A search that is cancelled, timed out, capped, or truncated explicitly declares its partial status and reason, rather than presenting a partial match count as complete.
-- **Search Controls**: Case-sensitive (`Aa`), regular expressions (`.*`), and path-pattern scopes with previous/next match navigation.
-- **Navigation & Shortcuts**: Reached via `⌥3` while in Code view, `⌘⇧F` / `Ctrl+Shift+F`, the command palette (`Open Search — find text across the repository`), or the View menu. Selecting a match opens the target file in Explorer at the exact matched line.
+- **Search Controls**: Regular expressions, match case, and an optional revision to search instead of the working tree. Cancel stops the search in flight and keeps its partial answer, labelled.
+- **Navigation**: Reached with the search button in Explorer's tab strip or the command palette (`Open Search — find text across the repository`). Selecting a match opens the file in the editor beside the results, at the matched line (a search run at a revision opens the working-tree file without a line), and turns Blame off so the line is visible.
 
 ### 2.4 Map
 

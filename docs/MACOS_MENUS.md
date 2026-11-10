@@ -41,7 +41,7 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | Edit | Native Undo, Redo, Cut, Copy, Paste, Select All for the focused control. |
 | View | Work, Code, History, Insights, Fleet, Show/Hide Terminal, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
 | Go → Work | Overview, Resolve, Remote, Policy, Tasks. |
-| Go → Code | Explorer, Blame, Map. |
+| Go → Code | Explorer, Map. (Search and Blame are toggles inside Explorer.) |
 | Go → History | Graph, Diff, Reflog, Suspects. |
 | Go → Insights | Pulse, Coverage, Health, Secrets, Storage. |
 | Repository | Fetch, Pull, Push, Stash Working Tree, Pop Stash, Stage All, Unstage All, Quick Commit, Interactive Rebase, Create Branch, Rename Current Branch, Continue/Abort/Skip Operation, Copy Repository Path, Copy Branch, Copy Selected Commit SHA or HEAD SHA, Reveal in Finder, Open Remote Website. |

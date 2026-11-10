@@ -88,8 +88,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         title: "Code",
         entries: &[
             ("section:code:explorer", "Explorer"),
-            ("section:code:blame", "Blame"),
-            ("section:code:search", "Search"),
             ("section:code:map", "Map"),
         ],
     },
@@ -331,14 +329,16 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        // 18 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // 16 is owned by `scripts/view-menu-contract.test.ts`, which compares
         // this catalog against the frontend view registry entry by entry and
         // label by label. This assertion is the cheap smoke check beside it —
         // it went stale at 16 once when the section count dropped, again at 15
         // when History gained Suspects, and again at 16 when Insights gained
-        // Secrets, and at 17 when Code gained Search; the parity contract is what proves the number is the
-        // right one rather than just the current one.
-        assert_eq!(entries.len(), 18);
+        // Secrets, at 17 when Code gained Search, and at 18 before Code's
+        // Search and Blame became toggles inside Explorer; the parity contract
+        // is what proves the number is the right one rather than just the
+        // current one.
+        assert_eq!(entries.len(), 16);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -352,6 +352,9 @@ mod tests {
             "section:work:diff",
             "section:history:diff:extra",
             "section:__proto__:graph",
+            // Retired: Search and Blame are toggles inside Code's Explorer.
+            "section:code:search",
+            "section:code:blame",
         ] {
             assert_eq!(NativeAction::parse(id), None);
         }

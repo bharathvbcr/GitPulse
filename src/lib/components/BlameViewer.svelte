@@ -1,13 +1,11 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { hostPlatform } from "../stores/platformStore";
-  import { shortcutTextLabel } from "../ui/platformCopy";
   import type { BlameLine } from "../files/types";
   import { densityStore } from "../stores/densityStore";
   import { rowHeight } from "../ui/density";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
-  import { CornerLeftUp, FileCode, PanelLeftClose, PanelLeftOpen, Search, Undo2, X } from "@lucide/svelte";
+  import { CornerLeftUp, FileCode, Search, Undo2, X } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
@@ -39,7 +37,6 @@
   import { paneDetails } from "../diagnostics/paneCrash";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import FileTreePanel from "./files/FileTreePanel.svelte";
 
   /** Tallest timeline column, in px. The strip is chrome, not a chart pane. */
   const AXIS_HEIGHT = 30;
@@ -72,7 +69,6 @@
   let coverageFailed = $state(false);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
-  let explorerOpen = $state(true);
   let inflight: AsyncGuard | null = null;
   const contentRevisions = repoStore.contentRevisions;
   /**
@@ -199,7 +195,7 @@
    * Retry used to mean re-typing the path into Blame's own box and pressing
    * Enter — the box was the only way back, and it existed only because Blame
    * was a destination you could arrive at with nothing selected. Code's
-   * Explorer section owns picking a file now, so what is left here is the one
+   * Explorer owns picking a file now, so what is left here is the one
    * thing a selection cannot express: asking for the same file again. The
    * store does not notify for an unchanged value, so this calls the loader
    * directly.
@@ -394,37 +390,18 @@
     const ratio = ratioFromPointer(event.clientY, rect.top, rect.height);
     listScroll = scrollForRatio(ratio, visibleLines.length, ROW, railHeight);
   }
-
-  function handleWindowKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b" && !e.shiftKey) {
-      e.preventDefault();
-      explorerOpen = !explorerOpen;
-    }
-  }
 </script>
-
-<svelte:window onkeydown={handleWindowKeydown} />
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
   <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between gap-3 font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
-      <button
-        type="button"
-        onclick={() => (explorerOpen = !explorerOpen)}
-        title="{explorerOpen ? 'Hide' : 'Show'} Explorer ({shortcutTextLabel('⌘B', $hostPlatform.os)})"
-        class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-surfaceHover transition-colors"
-      >
-        {#if explorerOpen}
-          <PanelLeftClose size={15} />
-        {:else}
-          <PanelLeftOpen size={15} />
-        {/if}
-      </button>
       <FileCode size={16} class="text-accent" />
-      <!-- The file, named rather than typed. Blame reads the selection Code's
-           Explorer section sets, so a second path box here would be a second
-           way to say the same thing — and the one that could disagree. -->
+      <!-- The file, named rather than typed. Blame is Explorer's other lens
+           on the open file and reads the selection its tabs set, so a second
+           path box here would be a second way to say the same thing — and the
+           one that could disagree. Explorer's tree and its ⌘B toggle sit
+           beside this pane; Blame no longer carries a tree of its own. -->
       <span data-blame-path class="truncate font-mono text-xs text-textPrimary" title={filePath || undefined}>
         {filePath || "No file selected"}
       </span>
@@ -617,12 +594,6 @@
 
   <!-- Body -->
   <div class="flex-1 min-h-0 flex">
-    {#if explorerOpen}
-      <div class="w-72 shrink-0 h-full overflow-hidden">
-        <FileTreePanel />
-      </div>
-    {/if}
-
     <!-- Blame Lines -->
     <div class="flex-1 min-w-0 flex flex-col">
       {#if isLoading && blameLines.length === 0}
@@ -786,9 +757,9 @@
         <EmptyState
           icon={Search}
           title={filePath ? "Empty file" : "No blame loaded"}
-          hint={filePath ? "This file has no lines to annotate." : explorerOpen
-            ? "Pick a file in the explorer to see line authorship and code age."
-            : `Open the explorer (${shortcutTextLabel("⌘B", $hostPlatform.os)}), or pick a file in Code → Explorer.`}
+          hint={filePath
+            ? "This file has no lines to annotate."
+            : "Open a file in Explorer to see line authorship and code age."}
         />
       {/if}
     </div>

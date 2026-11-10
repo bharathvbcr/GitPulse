@@ -75,8 +75,9 @@ describe("dispatchNativeMenu", () => {
       }
     }
     // Written out so a registry that collapsed to nothing could not make the
-    // comparison below pass against an equally empty call list.
-    expect(expected).toHaveLength(18);
+    // comparison below pass against an equally empty call list. 16 since
+    // Code's Search and Blame became toggles inside Explorer.
+    expect(expected).toHaveLength(16);
     expect(h.calls).toEqual(expected);
   });
 
@@ -84,7 +85,9 @@ describe("dispatchNativeMenu", () => {
     const h = handlers();
     for (const id of ["section:", "section:work", "section:work:", "section:work:diff",
       "section:unknown:graph", "section:history:diff:extra", "section:__proto__:graph",
-      "section:history:Diff", `section:history:${"x".repeat(10000)}`]) {
+      "section:history:Diff", `section:history:${"x".repeat(10000)}`,
+      // Retired: Search and Blame are toggles inside Code's Explorer now.
+      "section:code:search", "section:code:blame"]) {
       expect(dispatchNativeMenu({ id }, h)).toBe(false);
     }
     expect(h.calls).toEqual([]);

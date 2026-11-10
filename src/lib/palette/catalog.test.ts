@@ -11,6 +11,7 @@ import { openSetupWizard } from "../tools/onboardingStore";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { LAUNCHERS } from "../terminal/tabs";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
+import { explorerLens, resetExplorerLens } from "../files/explorerLens";
 
 vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
@@ -39,6 +40,33 @@ describe("command catalog and context", () => {
         expect(navigate).toHaveBeenLastCalledWith(view.id, section.id);
       }
     }
+  });
+  it("keeps a door to Search and Blame, which are toggles inside Explorer rather than sections", async () => {
+    // They were sections of Code, and the registry generated their commands.
+    // Folding them into Explorer must not cost the palette its way to them:
+    // each still answers to its old id and label, lands on Explorer, and
+    // arrives with its toggle on.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    resetExplorerLens();
+    const commands = buildCommands(ready(), () => {});
+    const search = commands.find(command => command.id === "code:search");
+    expect(search?.label).toBe("Open Search — find text across the repository");
+    expect(search?.disabledReason).toBeUndefined();
+    await search?.action();
+    expect(navigate).toHaveBeenLastCalledWith("code", "explorer");
+    expect(surface).toHaveBeenLastCalledWith("repository");
+    expect(get(explorerLens)).toMatchObject({ rail: "search", searchFocusPending: true, lens: "edit" });
+    const blame = commands.find(command => command.id === "code:blame");
+    expect(blame?.label).toBe("Open Blame — line authorship and code age");
+    await blame?.action();
+    expect(navigate).toHaveBeenLastCalledWith("code", "explorer");
+    expect(get(explorerLens).lens).toBe("blame");
+    expect(buildCommands(snapshot({ currentPath: null }), () => {}).find(command => command.id === "code:search")?.disabledReason).toBeTruthy();
+    // Ids stay unique now that two are hand-written beside the generated ones.
+    const ids = commands.map(command => command.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    resetExplorerLens();
   });
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});

@@ -7,10 +7,20 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "../FileViewer.svelte"), "utf8");
 
 describe("FileViewer", () => {
-  it("imports and orchestrates FileTreePanel, MediaViewer, and LivePulseDashboard", () => {
-    expect(source).toContain("FileTreePanel");
+  it("imports and orchestrates the Explorer rail, MediaViewer, and LivePulseDashboard", () => {
+    // The rail holds the file tree and content search (ExplorerRail.svelte).
+    expect(source).toContain("<ExplorerRail");
     expect(source).toContain("MediaViewer");
     expect(source).toContain("LivePulseDashboard");
+  });
+
+  it("fetches Blame, the editor's other lens, only when it is first toggled on", () => {
+    // Blame was its own lazily loaded section. As a toggle it renders inside
+    // this component, and a static import would pull the whole blame view and
+    // its timeline into the Code chunk for a reader who never asks for it.
+    expect(source).not.toMatch(/^\s*import\s+BlameViewer\b/m);
+    expect(source).toContain('const loadBlame = () => import("./BlameViewer.svelte");');
+    expect(source).toContain("<LazyView load={loadBlame}");
   });
 
   it("loads file content via cmd_get_file_blob with async protection", () => {
