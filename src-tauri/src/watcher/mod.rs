@@ -5618,6 +5618,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
     fn load_average_1m() -> f64 {
         let mut load = [0f64; 3];
         // SAFETY: `getloadavg` writes at most `3` doubles into the array.
