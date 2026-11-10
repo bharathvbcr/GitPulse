@@ -203,6 +203,65 @@ fn a_change_the_stamp_cannot_see_is_picked_up_once_the_token_expires() {
     });
 }
 
+fn spawn_shapes(root: &std::path::Path) -> Vec<Vec<String>> {
+    let needle = root.to_string_lossy().into_owned();
+    let mut shapes: Vec<Vec<String>> = crate::engine::git_cli::spawn_log::spawns_in(root)
+        .into_iter()
+        .map(|argv| {
+            argv.iter()
+                .map(|arg| arg.replace(&needle, "<repo>"))
+                .collect()
+        })
+        .collect();
+    shapes.sort();
+    shapes
+}
+
+/// A token that is already stale (here: issued for another repository, so its
+/// view differs) must cost what no token costs. Which requests wait for the
+/// probes is decided by [`token_may_hold`] from the view, the stamp and the
+/// clock alone, so a stale token is turned away before any probe, and the
+/// work it then does is the work a request without a token does: the same git
+/// children, the same page.
+#[test]
+fn a_stale_token_is_turned_away_before_the_probes_and_does_the_work_of_no_token() {
+    crate::engine::ref_cache::eager(|| {
+        let clock = crate::engine::ref_cache::ManualClock::install();
+        let holder = graph_token_repo();
+        let root = holder.path().to_string_lossy().into_owned();
+        let token = page(&root, 100, None).unwrap().graph_token.unwrap();
+        let view = view_key(&root, 100, None, RefScope::Named);
+        let stamp = graph_stamp(&root, RefScope::Named).expect("a settled stamp");
+
+        assert!(token_may_hold(&token, view, stamp), "the state it names");
+        assert!(!token_may_hold(&token, view, stamp ^ 1), "a moved ref");
+        assert!(!token_may_hold(&token, view ^ 1, stamp), "another window");
+        assert!(!token_may_hold("garbage", view, stamp), "not a token");
+        assert!(
+            !token_may_hold("0000000000000000-1", view, stamp),
+            "too short"
+        );
+        clock.advance(crate::engine::ref_cache::TTL);
+        assert!(!token_may_hold(&token, view, stamp), "past the TTL");
+
+        let with_token = graph_token_repo();
+        let without = graph_token_repo();
+        let stale = page(with_token.path().to_str().unwrap(), 100, Some(&token)).unwrap();
+        let none = page(without.path().to_str().unwrap(), 100, None).unwrap();
+        assert!(!stale.unchanged);
+        assert_eq!(stale.rows.len(), none.rows.len());
+        let summaries = |p: &CommitGraphPayload| -> Vec<String> {
+            p.rows.iter().map(|r| r.summary.clone()).collect()
+        };
+        assert_eq!(summaries(&stale), summaries(&none));
+        assert_eq!(
+            spawn_shapes(with_token.path()),
+            spawn_shapes(without.path()),
+            "a stale token spawns exactly what no token spawns"
+        );
+    });
+}
+
 /// A write inside the stamp's tick cannot be told apart from the state
 /// stamped, so no token is issued and nothing is answered unchanged.
 #[test]

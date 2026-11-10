@@ -312,51 +312,84 @@ pub async fn cmd_get_commit_graph(
     .await
 }
 
-/// A state hash of everything a graph page is drawn from, or `None` when the
-/// page cannot be vouched for.
+/// A token names a graph page by three hashes and the second it was issued.
 ///
-/// The page is a function of the ref tips it starts from (the decorations and
-/// HEAD, which are compared by content), of immutable objects, and of the
-/// files that rewrite history (`shallow`, grafts, replace refs) or change how
-/// refs resolve (config, packed and reftable stores), which `stamp` covers.
-/// The stamp must be settled: within the filesystem's timestamp tick a write
-/// is indistinguishable from the state stamped. A degraded facet (any
-/// warning) is never vouched for, so a probe that failed is retried on the
-/// next reload instead of being answered `unchanged` forever. The view's own
-/// arguments are part of the hash, so a token for one window cannot answer
-/// for another.
-#[allow(clippy::too_many_arguments)]
-fn graph_token(
-    stamp: Option<u64>,
+/// * **view**: the arguments the page was asked for (repository, window size,
+///   query, ref scope), so a token for one window cannot answer for another.
+/// * **stamp**: the settled fingerprint of the files that rewrite history
+///   (`shallow`, grafts, replace refs) or change how refs resolve (config,
+///   packed and reftable stores) and of every loose ref. It must be settled:
+///   within the filesystem's timestamp tick a write is indistinguishable from
+///   the state stamped.
+/// * **content**: the ref tips the page starts from (HEAD, decorations, default
+///   branch, notices), compared by content. A degraded facet (any warning) has
+///   none, so a probe that failed is retried on the next reload instead of
+///   being answered `unchanged` forever.
+///
+/// The first two are known before anything is read, which is what lets a
+/// request decide whether the token can still hold without waiting for the
+/// probes; see [`token_may_hold`].
+struct TokenParts<'a> {
+    view: &'a str,
+    stamp: &'a str,
+    content: &'a str,
+    issued: u64,
+}
+
+/// Hex digits per hash in a token.
+const HASH_HEX: usize = 16;
+
+fn split_token(token: &str) -> Option<TokenParts<'_>> {
+    let (hashes, issued) = token.split_once('-')?;
+    if hashes.len() != 3 * HASH_HEX || !hashes.is_ascii() {
+        return None;
+    }
+    Some(TokenParts {
+        view: &hashes[..HASH_HEX],
+        stamp: &hashes[HASH_HEX..2 * HASH_HEX],
+        content: &hashes[2 * HASH_HEX..],
+        issued: issued.parse().ok()?,
+    })
+}
+
+fn hex(hash: u64) -> String {
+    format!("{hash:016x}")
+}
+
+fn hash_of(parts: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parts.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The hash of the arguments a page is asked for.
+pub(super) fn view_key(
     repo_path: &str,
     max_commits: usize,
     query: Option<&str>,
     ref_scope: RefScope,
+) -> u64 {
+    hash_of((repo_path, max_commits, query, ref_scope == RefScope::All))
+}
+
+/// The hash of the ref tips a page starts from, or `None` when the page cannot
+/// be vouched for (any warning).
+fn content_key(
     head_id: Option<&str>,
     refs: &[RefDecoration],
     default_branch: Option<&str>,
     notes: &GraphNotes,
-) -> Option<String> {
-    use std::hash::{Hash, Hasher};
+) -> Option<u64> {
     if !notes.warnings.is_empty() {
         return None;
     }
-    let stamp = stamp?;
     let refs = serde_json::to_vec(refs).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (
-        stamp,
-        repo_path,
-        max_commits,
-        query,
-        ref_scope == RefScope::All,
-        head_id,
-        &refs,
-        default_branch,
-        &notes.notices,
-    )
-        .hash(&mut hasher);
-    Some(format!("{:016x}", hasher.finish()))
+    Some(hash_of((head_id, &refs, default_branch, &notes.notices)))
+}
+
+fn issued_token(view: u64, stamp: u64, content: u64, issued: u64) -> String {
+    format!("{}{}{}-{issued}", hex(view), hex(stamp), hex(content))
 }
 
 /// Seconds since the Unix epoch on the clock the ref cache judges stamps by.
@@ -366,33 +399,43 @@ fn issue_seconds() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The token a client holds: the state hash and the second the load that
-/// issued it began. The stamp cannot see everything a graph is a function of
-/// (a file pulled in by `include.path` can switch off replace refs without
-/// touching any stamped file), which is why the ref cache bounds every answer
-/// by [`crate::engine::ref_cache::TTL`]. A token carries the same bound.
-fn issued_token(hash: &str, issued: u64) -> String {
-    format!("{hash}-{issued}")
+/// True while a token is younger than the ref cache's TTL. The stamp cannot
+/// see everything a graph is a function of (a file pulled in by `include.path`
+/// can switch off replace refs without touching any stamped file), which is
+/// why the ref cache bounds every answer by [`crate::engine::ref_cache::TTL`];
+/// a token carries the same bound. An issue time in the future (the clock
+/// stepped back) is not trusted. Judged on the clock a test can pin.
+fn token_fresh(issued: u64) -> bool {
+    issue_seconds()
+        .checked_sub(issued)
+        .is_some_and(|age| age < crate::engine::ref_cache::TTL.as_secs())
 }
 
-/// True when `known` was issued for state `hash` and is younger than the ref
-/// cache's TTL. An issue time in the future (the clock stepped back) is not
-/// trusted. It is judged on the same clock a test can pin.
-fn token_names(known: &str, hash: &str) -> bool {
-    let Some((known_hash, issued)) = known.split_once('-') else {
-        return false;
-    };
-    let Ok(issued) = issued.parse::<u64>() else {
-        return false;
-    };
-    known_hash == hash
-        && issue_seconds()
-            .checked_sub(issued)
-            .is_some_and(|age| age < crate::engine::ref_cache::TTL.as_secs())
+/// Whether `known` can still hold for this request, from what is known before
+/// any probe runs: the same view, the same stamp, not expired. A request whose
+/// token fails this is certain to be answered in full, so it starts its walk at
+/// once beside the probes, exactly as a request with no token does; only a
+/// token that passes waits for the probes to compare tip content. This is one
+/// comparison of a stamp already read, not a second read of anything.
+pub(super) fn token_may_hold(known: &str, view: u64, stamp: u64) -> bool {
+    split_token(known).is_some_and(|parts| {
+        parts.view == hex(view) && parts.stamp == hex(stamp) && token_fresh(parts.issued)
+    })
+}
+
+/// True when `known` names exactly this view, stamp and tip content and is
+/// still fresh.
+fn token_names(known: &str, view: u64, stamp: u64, content: u64) -> bool {
+    split_token(known).is_some_and(|parts| {
+        parts.view == hex(view)
+            && parts.stamp == hex(stamp)
+            && parts.content == hex(content)
+            && token_fresh(parts.issued)
+    })
 }
 
 /// The settled fingerprint of the files [`graph_token`] stands on, read now.
-fn graph_stamp(repo_path: &str, ref_scope: RefScope) -> Option<u64> {
+pub(super) fn graph_stamp(repo_path: &str, ref_scope: RefScope) -> Option<u64> {
     crate::engine::ref_cache::stamp(
         Path::new(repo_path),
         crate::graph::decoration_patterns(ref_scope),
@@ -465,10 +508,17 @@ pub(super) fn commit_graph_page(
         } else {
             None
         };
-        // With a token to check, the cheap probes run first and the walk only
-        // if they say the page moved; without one the walk starts at once and
-        // overlaps them, as it always has.
-        let probe_first = known_token.is_some() && stamp_before.is_some();
+        let view = view_key(&repo_path, max_commits, query.as_deref(), ref_scope);
+        // The probes run before the walk only for a token that can still hold
+        // (same view, same stamp, unexpired): then the likeliest answer is
+        // `unchanged` and a walk started beside the probes would be wasted. Any
+        // other request, including one whose token is already stale, starts the
+        // walk at once and overlaps it with the probes, as it always has, so a
+        // stale token costs one comparison and nothing more than no token.
+        let probe_first = known_token
+            .as_deref()
+            .zip(stamp_before)
+            .is_some_and(|(known, stamp)| token_may_hold(known, view, stamp));
         // A test's governor injection is thread-local, so the helper that walks
         // history takes the command's, as `off_thread` does for the pool thread.
         #[cfg(test)]
@@ -611,21 +661,14 @@ pub(super) fn commit_graph_page(
         // otherwise.
         let current = tokenable
             .then(|| {
-                graph_token(
-                    stamp_before,
-                    &repo_path,
-                    max_commits,
-                    query.as_deref(),
-                    ref_scope,
-                    head_id.as_deref(),
-                    &refs,
-                    default_branch.as_deref(),
-                    &notes,
-                )
+                let stamp = stamp_before?;
+                let content =
+                    content_key(head_id.as_deref(), &refs, default_branch.as_deref(), &notes)?;
+                Some((stamp, content))
             })
             .flatten();
-        if let (Some(known), Some(current)) = (known_token.as_deref(), current.as_deref()) {
-            if token_names(known, current) {
+        if let (Some(known), Some((stamp, content))) = (known_token.as_deref(), current) {
+            if token_names(known, view, stamp, content) {
                 return Ok(CommitGraphPayload {
                     rows: Vec::new(),
                     head_id,
@@ -670,7 +713,8 @@ pub(super) fn commit_graph_page(
         // them to one state.
         if tokenable && stamp_before.is_some() && graph_stamp(&repo_path, ref_scope) == stamp_before
         {
-            payload.graph_token = current.map(|hash| issued_token(&hash, issued));
+            payload.graph_token =
+                current.map(|(stamp, content)| issued_token(view, stamp, content, issued));
         }
         Ok(payload)
     }
