@@ -1,7 +1,10 @@
 <script lang="ts">
   import type { DoraReport } from "../../pulse/types";
   import PulseStaleNotice from "./PulseStaleNotice.svelte";
-  import { Rocket, RefreshCw, Info } from "@lucide/svelte";
+  import EmptyState from "../EmptyState.svelte";
+  import Skeleton from "../Skeleton.svelte";
+  import { describeFailure } from "../../ui/copy/describeFailure";
+  import { Rocket, RefreshCw, Info, TriangleAlert } from "@lucide/svelte";
 
   let {
     dora = null,
@@ -19,16 +22,22 @@
     onRefresh?: () => void;
   } = $props();
 
-  function getRatingBadge(rating: string) {
+  /**
+   * The tone a rating wears. An unrecognised rating is "unknown", not the
+   * worst tier: a label the view cannot read must not pass for a verdict.
+   */
+  function ratingTone(rating: string): "ok" | "info" | "warn" | "danger" | "unknown" {
     switch (rating) {
       case "Elite":
-        return "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+        return "ok";
       case "High":
-        return "bg-sky-500/10 text-sky-400 border-sky-500/20";
+        return "info";
       case "Medium":
-        return "bg-amber-500/10 text-amber-400 border-amber-500/20";
+        return "warn";
+      case "Low":
+        return "danger";
       default:
-        return "bg-rose-500/10 text-rose-400 border-rose-500/20";
+        return "unknown";
     }
   }
 
@@ -38,6 +47,8 @@
     const days = (hours / 24).toFixed(1);
     return `${days}d`;
   }
+
+  const failure = $derived(error ? describeFailure({ verb: "scan", object: "release tags" }, error) : null);
 
   /**
    * One sentence, appended to both commit-derived cards.
@@ -57,16 +68,14 @@
   );
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
+<div class="gp-card p-4 flex flex-col gap-4">
   <!-- Header -->
-  <div class="flex items-center justify-between border-b border-border/40 pb-3">
+  <div class="flex items-center justify-between gap-3">
     <div>
       <div class="flex items-center gap-2">
-        <Rocket size={18} class="text-sky-400" />
-        <h3 class="text-sm font-semibold text-textPrimary">Delivery & Operations (DORA)</h3>
-        <span class="text-xs px-2 py-0.5 rounded-full bg-surfaceMuted text-textMuted border border-border/60">
-          Local-First
-        </span>
+        <Rocket size={18} class="text-info" />
+        <h3 class="text-sm font-semibold text-textPrimary">Delivery and operations (DORA)</h3>
+        <span class="gp-chip" data-tone="neutral">Local-first</span>
       </div>
       <p class="text-xs text-textMuted mt-0.5">
         Deployment frequency and change lead times computed directly from git release tags and commit ancestry.
@@ -74,91 +83,100 @@
     </div>
 
     {#if onRefresh}
-      <button
-        type="button"
-        class="px-2.5 py-1 text-xs rounded-md bg-surface border border-border/70 text-textMuted hover:text-textPrimary flex items-center gap-1.5 transition-colors"
-        disabled={loading}
-        onclick={onRefresh}
-      >
+      <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={loading} onclick={onRefresh}>
         <RefreshCw size={12} class={loading ? "animate-spin text-accent" : ""} />
-        <span>{loading ? "Calculating..." : "Refresh DORA"}</span>
+        <span>{loading ? "Refreshing…" : "Refresh"}</span>
       </button>
     {/if}
   </div>
 
   {#if loading && !dora}
-    <div class="py-12 text-center text-textMuted text-xs flex flex-col items-center gap-2">
-      <RefreshCw size={20} class="animate-spin text-accent" />
-      <span>Analyzing release tags and commit ancestry...</span>
+    <div class="flex flex-col gap-3">
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        {#each [0, 1, 2, 3] as slot (slot)}
+          <Skeleton variant="rect" height="6rem" />
+        {/each}
+      </div>
+      <p class="m-0 text-xs text-textMuted">Analyzing release tags and commit ancestry…</p>
     </div>
   {:else if error && !dora}
-    <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
-      <span class="text-rose-400 font-medium">Delivery scan failed — this is not a delivery frequency of zero.</span>
-      <span class="font-mono text-[11px] text-textMuted wrap-break-word max-w-lg">{error}</span>
+    <div class="gp-notice" data-tone="unknown" role="status">
+      <TriangleAlert size={14} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+      <div class="min-w-0 flex-1">
+        <p class="m-0 font-medium">{failure?.headline} This is not a delivery frequency of zero.</p>
+        {#if failure?.detail}
+          <p class="m-0 mt-0.5 font-mono text-meta text-textMuted wrap-break-word">{failure.detail}</p>
+        {/if}
+      </div>
+      {#if onRefresh}
+        <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={loading} onclick={onRefresh}>
+          {failure?.retryLabel ?? "Try again"}
+        </button>
+      {/if}
     </div>
   {:else if !dora}
-    <div class="py-8 text-center text-textMuted text-xs">
-      No delivery or release data available.
-    </div>
+    <EmptyState
+      compact
+      icon={Rocket}
+      title="No delivery report yet"
+      hint="Refresh to measure deployment frequency and lead time from release tags."
+      action={onRefresh ? { label: "Refresh", onClick: onRefresh, variant: "secondary" } : undefined}
+    />
   {:else}
     {#if error}
       <PulseStaleNotice {error} {measuredAt} />
     {/if}
-    <!-- 4 DORA Cards Grid -->
+    <!-- The four DORA tiles -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-      <!-- 1. Deployment Frequency -->
-      <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
-        <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Deploy Frequency</span>
-          <span class="px-1.5 py-0.5 rounded text-[10px] font-bold border {getRatingBadge(dora.deploy_rating)}">
-            {dora.deploy_rating}
-          </span>
+      <!-- 1. Deployment frequency -->
+      <div class="p-3.5 rounded-xl bg-surfaceHover/40 flex flex-col justify-between">
+        <div class="flex items-center justify-between gap-2 text-textMuted text-xs">
+          <span class="gp-label">Deploy frequency</span>
+          <span class="gp-chip" data-tone={ratingTone(dora.deploy_rating)}>{dora.deploy_rating}</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">{dora.deploy_frequency_per_week}</span>
+          <span class="text-3xl font-semibold text-textPrimary">{dora.deploy_frequency_per_week}</span>
           <span class="text-xs text-textMuted">/ week</span>
         </div>
-        <p class="text-[11px] text-textMuted mt-2">
+        <p class="text-meta text-textMuted mt-2">
           {dora.total_releases} release tags in last {dora.window_days}d
         </p>
       </div>
 
-      <!-- 2. Lead Time for Changes -->
-      <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
-        <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Lead Time</span>
-          <span class="px-1.5 py-0.5 rounded text-[10px] font-bold border {getRatingBadge(dora.lead_time_rating)}">
-            {dora.lead_time_rating}
-          </span>
+      <!-- 2. Lead time for changes -->
+      <div class="p-3.5 rounded-xl bg-surfaceHover/40 flex flex-col justify-between">
+        <div class="flex items-center justify-between gap-2 text-textMuted text-xs">
+          <span class="gp-label">Lead time</span>
+          <span class="gp-chip" data-tone={ratingTone(dora.lead_time_rating)}>{dora.lead_time_rating}</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">{formatHours(dora.median_lead_time_hours)}</span>
+          <span class="text-3xl font-semibold text-textPrimary">{formatHours(dora.median_lead_time_hours)}</span>
         </div>
-        <p class="text-[11px] text-textMuted mt-2">
+        <p class="text-meta text-textMuted mt-2">
           Commit authored → release tag
         </p>
       </div>
 
-      <!-- 3. Change Failure Rate -->
-      <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
-        <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Change Failure Rate</span>
+      <!-- 3. Change failure rate -->
+      <div class="p-3.5 rounded-xl bg-surfaceHover/40 flex flex-col justify-between">
+        <div class="flex items-center justify-between gap-2 text-textMuted text-xs">
+          <span class="gp-label">Change failure rate</span>
           <!-- Derived from the flag the backend already sends, not hard-coded.
                `is_cfr_approximation` was declared, set by Rust and read by
                nobody, so a measured change-failure rate would have arrived and
                still been labelled a heuristic — a stale label on a number is
                worse than no label, because it is believed. Card 4 has read its
                own flag all along; this one now matches it. -->
-          <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surfaceMuted text-textMuted border border-border/50">
+          <span class="gp-chip" data-tone="neutral">
             {dora.is_cfr_approximation ? "Heuristic" : "Measured"}
           </span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">
+          <span class="text-3xl font-semibold text-textPrimary">
             {dora.cfr_sample_commits <= 0 ? "—" : `${dora.change_failure_rate_pct}%`}
           </span>
         </div>
-        <p class="text-[11px] text-textMuted mt-2">
+        <p class="text-meta text-textMuted mt-2">
           <!-- Three guards, and the nesting is the decision. The empty-sample
                check is outermost so this line always agrees with the value
                above it, which shows an em dash on an empty sample whatever the
@@ -173,35 +191,33 @@
           {dora.cfr_sample_commits <= 0
             ? "No commits in this window to examine"
             : dora.is_cfr_approximation
-              ? `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}${scanCaveat}`
+              ? `Approximated from reverts and hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}${scanCaveat}`
               : "From recorded deployment outcomes"}
         </p>
       </div>
 
-      <!-- 4. Time to Restore Service -->
-      <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
-        <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Time to Restore</span>
-          <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surfaceMuted text-textMuted border border-border/50">
-            Estimated
-          </span>
+      <!-- 4. Time to restore service -->
+      <div class="p-3.5 rounded-xl bg-surfaceHover/40 flex flex-col justify-between">
+        <div class="flex items-center justify-between gap-2 text-textMuted text-xs">
+          <span class="gp-label">Time to restore</span>
+          <span class="gp-chip" data-tone="neutral">Estimated</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">
+          <span class="text-3xl font-semibold text-textPrimary">
             {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "—" : formatHours(dora.mttr_hours)}
           </span>
         </div>
-        <p class="text-[11px] text-textMuted mt-2">
-          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Could not estimate from commit patterns" : `Time to follow-up patch (heuristic)${scanCaveat}`}
+        <p class="text-meta text-textMuted mt-2">
+          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Couldn't estimate from commit patterns" : `Time to follow-up patch (heuristic)${scanCaveat}`}
         </p>
       </div>
     </div>
 
-    <!-- Honesty Invariant Explanation Banner -->
-    <div class="p-2.5 rounded-lg bg-surfaceMuted/40 border border-border/40 text-[11px] text-textMuted flex items-start gap-2">
-      <Info size={14} class="text-accent shrink-0 mt-0.5" />
-      <span>
-        <strong>Local-First Measurement:</strong> Deployment frequency and lead times are directly calculated using <code class="font-mono text-textPrimary">git tag</code> and <code class="font-mono text-textPrimary">git describe --contains</code>. Change failure rate and restore times are honest heuristic approximations derived from commit patterns.
+    <!-- How the numbers are measured -->
+    <div class="gp-notice" data-tone="info">
+      <Info size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+      <span class="min-w-0 flex-1 text-meta">
+        <span class="font-semibold">Local-first measurement:</span> Deployment frequency and lead times are calculated directly from <code class="font-mono text-textPrimary">git tag</code> and <code class="font-mono text-textPrimary">git describe --contains</code>. Change failure rate and restore time are heuristic approximations derived from commit patterns.
       </span>
     </div>
   {/if}

@@ -2,7 +2,8 @@
   // `ShieldQuestionMark`, not the `ShieldQuestion` alias: that one is
   // deprecated upstream and resolves through the aliases barrel.
   import { ShieldAlert, ShieldCheck, ShieldQuestionMark } from "@lucide/svelte";
-  import { toneCardClass, toneChipClass, toneLabel } from "../../health/format";
+  import { toneLabel } from "../../health/format";
+  import { roleTextClass, roleTone } from "./tone";
   import { healthSectionDomId } from "../../health/sections";
   import type { HealthSummary } from "../../health/summary";
 
@@ -49,22 +50,20 @@
   }
 </script>
 
-<div
-  class="rounded-2xl border p-4 space-y-3 shadow-card {toneCardClass(summary.tone)}"
->
+<!-- The verdict is a notice: its tone is the summary's tone, and `unknown` is
+     drawn dashed by the notice itself, so a verdict that could not be
+     established never looks like one that came back clear. -->
+<div class="gp-notice p-4 shadow-card" data-tone={roleTone(summary.tone)}>
+  <div class="min-w-0 flex-1 space-y-3">
   <div class="flex items-start gap-2.5">
     {#if summary.tone === "clear"}
-      <ShieldCheck size={18} class="text-emerald-300 shrink-0 mt-px" aria-hidden="true" />
+      <ShieldCheck size={18} class="{roleTextClass(roleTone(summary.tone))} shrink-0 mt-px" aria-hidden="true" />
     {:else if summary.tone === "unknown"}
-      <ShieldQuestionMark size={18} class="text-amber-300 shrink-0 mt-px" aria-hidden="true" />
+      <ShieldQuestionMark size={18} class="{roleTextClass(roleTone(summary.tone))} shrink-0 mt-px" aria-hidden="true" />
     {:else}
-      <ShieldAlert
-        size={18}
-        class="{summary.tone === 'critical' ? 'text-rose-300' : 'text-amber-300'} shrink-0 mt-px"
-        aria-hidden="true"
-      />
+      <ShieldAlert size={18} class="{roleTextClass(roleTone(summary.tone))} shrink-0 mt-px" aria-hidden="true" />
     {/if}
-    <p class="text-[13px] leading-snug text-textPrimary font-medium">
+    <p class="text-sm leading-snug text-textPrimary font-medium">
       {summary.headline}
     </p>
   </div>
@@ -76,9 +75,9 @@
           <button
             type="button"
             onclick={() => jump(facet.id)}
-            class="px-2 py-1 rounded-full border text-[11px] hover:brightness-125 transition focus-visible:outline-2 focus-visible:outline-accent {toneChipClass(
-              facet.tone,
-            )}"
+            class="gp-chip cursor-pointer hover:brightness-125 focus-visible:outline-2 focus-visible:outline-accent"
+            data-kind="label"
+            data-tone={roleTone(facet.tone)}
             title={facet.caveat ?? `${facet.label}: ${facet.value}`}
           >
             <span class="font-medium">{facet.label}</span>
@@ -87,7 +86,9 @@
           </button>
         {:else}
           <span
-            class="px-2 py-1 rounded-full border text-[11px] {toneChipClass(facet.tone)}"
+            class="gp-chip"
+            data-kind="label"
+            data-tone={roleTone(facet.tone)}
             title={facet.caveat ?? `${facet.label}: ${facet.value}`}
           >
             <span class="font-medium">{facet.label}</span>
@@ -102,7 +103,7 @@
   {#if summary.caveats.length > 0}
     <details class="group">
       <summary
-        class="cursor-pointer text-[11px] text-amber-300 marker:content-[''] select-none"
+        class="cursor-pointer text-meta text-warn marker:content-[''] select-none"
       >
         <span class="group-open:hidden">
           {summary.caveats.length}
@@ -111,15 +112,16 @@
         </span>
         <span class="hidden group-open:inline">Hide what this scan could not establish</span>
       </summary>
-      <ul class="mt-2 space-y-1 text-[11px] text-textSecondary list-disc pl-4">
+      <ul class="mt-2 space-y-1 text-meta text-textSecondary list-disc pl-4">
         {#each summary.caveats as caveat, index (`${index}:${caveat}`)}
           <li class="leading-relaxed">{caveat}</li>
         {/each}
       </ul>
     </details>
   {:else}
-    <p class="text-[11px] text-emerald-300">
+    <p class="text-meta text-ok">
       Every scanner this repository supports ran to completion.
     </p>
   {/if}
+  </div>
 </div>

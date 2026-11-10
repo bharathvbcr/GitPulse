@@ -16,7 +16,7 @@ describe("HealthPanel rendering", () => {
     const { body } = render(HealthPanel);
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
-    expect(body).toContain("GitHub alerts are checked when GitPulse launches");
+    expect(body).toContain("GitHub alerts are checked when GitPulse starts");
     // With no repository open there is nothing to have checked, so the
     // Dependabot state chip stays out of the header entirely.
     expect(body).not.toContain("Dependabot not checked");
@@ -91,6 +91,6 @@ describe("HealthPanel source contracts", () => {
 describe("HealthPanel scan-failure banner", () => {
   it("strips a trailing full stop from the error before adding its own", () => {
     // errorMsg often ends in "." already; appending another read "..".
-    expect(source).toContain("Scan failed: {withoutTrailingPeriod(errorMsg ?? \"\")}");
+    expect(source).toContain("{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? \"\")}");
   });
 });

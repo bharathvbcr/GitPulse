@@ -253,15 +253,17 @@
 
           // ---- hiding a column cannot hide a failure ----------------------------------
           $("button", cellOf("beta", "Storage")).click();
-          await until(() => words(cellOf("beta", "Storage")).includes("could not read"));
-          check("a failed scan says could not read in its own cell", () => words(cellOf("beta", "Storage")).includes("could not read"));
+          await until(() => words(cellOf("beta", "Storage")).includes("couldn't read"));
+          check("a failed scan says couldn't read in its own cell", () => words(cellOf("beta", "Storage")).includes("couldn't read"));
           $('[data-testid="fleet-columns-toggle"]').click();
           await settle();
           const menu = $('[data-testid="fleet-columns-menu"]');
-          const switches = $$('[role="switch"]', menu).map(words);
+          // The shared Toggle names its switch with aria-label; the visible text is its sibling label.
+          const switchName = (el) => el.getAttribute("aria-label") ?? words(el);
+          const switches = $$('[role="switch"]', menu).map(switchName);
           check("the column menu never offers the Repository column", () =>
             switches.includes("Storage") && !switches.includes("Repository") && !switches.includes("Severity"));
-          $$('[role="switch"]', menu).find((el) => words(el) === "Storage").click();
+          $$('[role="switch"]', menu).find((el) => switchName(el) === "Storage").click();
           await settle();
           check("hiding Storage removes the column…", () => !th("Storage") && get(interfaceStore).fleetHiddenColumns.includes("storage"));
           check("…and says, by column and count, what hiding it costs", () =>

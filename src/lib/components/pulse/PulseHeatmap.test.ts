@@ -13,4 +13,14 @@ describe("PulseHeatmap", () => {
     expect(source).toContain("handleDayKey");
     expect(source).toContain('event.key === "Enter"');
   });
+
+  it("switches between commits and lines changed through the shared segmented control", () => {
+    expect(source).toContain('import SettingSegment from "../SettingSegment.svelte"');
+    expect(source).toContain('{ value: "count", label: "Commits" }');
+    expect(source).toContain('{ value: "churn", label: "Lines changed" }');
+  });
+
+  it("keeps empty days visible on the opaque card by stepping up a tone", () => {
+    expect(source).toContain('"bg-surfaceHover hover:bg-border/60"');
+  });
 });

@@ -224,7 +224,7 @@
           check("failed scan keeps actions available", !button("Run in Claude Code").disabled);
           Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("fixture denied"); } } });
           document.execCommand = () => false;
-          button("Copy agent prompt").click(); await until(() => document.body.textContent.includes("Could not copy."));
+          button("Copy agent prompt").click(); await until(() => document.body.textContent.includes("Couldn't copy the prompt.") && document.body.textContent.includes("Select and copy it from the preview."));
           check("failed copy exposes manual preview", document.querySelector("details").open && !button("Copy agent prompt").disabled);
           mode = "empty";
           const expectedPrompt = prompt();
@@ -355,7 +355,7 @@
           // Plan steps and coverage scripts share one cancellation guard, so
           // neither may start while the other runs: the one cancelled stayed
           // "running" forever and disabled every run control with it.
-          button("MANVI: analyze coverage with the local model").click(); await tick();
+          button("Manvi: analyze coverage with the local model").click(); await tick();
           byText("Generate AI report").click();
           await until(() => !!button("Execute this command step directly"));
           runDelay = 500;
@@ -369,7 +369,7 @@
           await until(() => !byText("Run Rust coverage").disabled);
           check("no run is left running once both finished", settled() && !region().textContent.includes("Running…"));
           runDelay = 0;
-          button("MANVI: analyze coverage with the local model").click(); await tick();
+          button("Manvi: analyze coverage with the local model").click(); await tick();
           mode = "measured"; button("Measured coverage").click(); button("Rescan coverage artifacts").click();
           await until(() => !document.querySelector("[data-coverage-family-strip]") || !document.querySelector("[data-coverage-family]"));
 

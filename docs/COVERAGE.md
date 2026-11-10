@@ -60,7 +60,7 @@ The status strip distinguishes measured, unmeasured, partial and failed scans.
 **Last scanned** is when GitPulse read the report. Artifact generation timestamps
 and test outcomes are unavailable to the scanner, so it explicitly shows
 **Artifact age unknown**. A failed rescan retains the previous snapshot with a
-stale label and **Retry scan** action.
+stale label and **Try again** action.
 
 The launch syntax uses the interactive positional prompt supported by
 [Codex](https://developers.openai.com/codex/cli/reference/) and

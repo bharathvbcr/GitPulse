@@ -50,6 +50,9 @@
     Play,
     Check,
     Terminal,
+    FolderOpen,
+    ShieldCheck,
+    Code,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
@@ -74,13 +77,12 @@
   import {
     dependabotBadgeClass as badgeClassFor,
     formatAuditCoverage,
-    issueClass,
-    severityClass,
-    toneChipClass,
     toneLabel,
     updateKind,
-    updateKindClass,
   } from "../health/format";
+  import { issueNoticeTone, roleTone, severityTone, updateKindTextClass } from "./health/tone";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import EmptyState from "./EmptyState.svelte";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
   import { HEALTH_CONTENT_WIDTH, HEALTH_PREVIEW_ROWS, HEALTH_PROSE_WIDTH } from "../health/sections";
   import { previewSlice } from "../ui/previewList";
@@ -108,6 +110,10 @@
   import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
   import type { CodeintelDeadSymbol, CodeintelStatus } from "../codeintel/types";
   import Skeleton from "./Skeleton.svelte";
+
+  /** Headlines of the two failures whose reason is the scanner's or the model's own text. */
+  const SCAN_FAILED = describeFailure({ verb: "scan", object: "this repository" }, "").headline;
+  const PLAN_FAILED = describeFailure({ verb: "plan", object: "the fix with Manvi" }, "").headline;
 
   let report = $state<DepsHealthReport | null>(null);
   /**
@@ -850,7 +856,8 @@
       agentNotice = `${PROVIDER_LABELS[launcher]} session opened in the terminal. Rescan Health after it finishes.`;
     } catch (err) {
       if (agentLaunchController !== controller) return;
-      agentError = formatError(err);
+      const failure = describeFailure({ verb: "open", object: "the agent session" }, err);
+      agentError = failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
     } finally {
       if (agentLaunchController === controller) agentLaunchController = null;
       agentLaunching = false;
@@ -865,7 +872,7 @@
     if (ok) {
       agentCopyFlash.flash();
     } else {
-      agentError = "Could not copy. Open Preview prompt and copy it from there.";
+      agentError = "Couldn't copy the prompt. Open Preview prompt and copy it from there.";
       agentPreviewOpen = true;
     }
   }
@@ -985,26 +992,19 @@
   <!-- The local scan failed. When an earlier report of this repository is still
        on screen the banner says so, so its findings are not read as current. -->
   {#snippet scanFailureBanner()}
-    <div
-      role="alert"
-      class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 flex flex-wrap items-center justify-between gap-2 {HEALTH_PROSE_WIDTH}"
-    >
+    <div role="alert" class="gp-notice flex-wrap items-center justify-between {HEALTH_PROSE_WIDTH}" data-tone="danger">
       <span class="min-w-0 wrap-break-word"
-        >Scan failed: {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
+        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
       >
       <span class="flex items-center gap-2 shrink-0">
-        <button
-          type="button"
-          onclick={() => scan()}
-          disabled={loading}
-          class="gp-btn py-1! px-2.5! text-[11px]! disabled:opacity-40 disabled:cursor-not-allowed"
-        >
+        <button type="button" onclick={() => scan()} disabled={loading} class="gp-btn" data-size="sm">
           Try again
         </button>
         <button
           type="button"
           onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
-          class="gp-btn py-1! px-2.5! text-[11px]!"
+          class="gp-btn"
+          data-size="sm"
         >
           Open Diagnostics
         </button>
@@ -1013,13 +1013,13 @@
   {/snippet}
   {#snippet dependabotRows()}
     {#each keyedList(previewed("dependabot", dependabot?.alerts ?? []), (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
-      <tr class="border-t border-border/40 align-top">
+      <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(alert.severity)}">{alert.severity || "unranked"}</span>
+          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
         </td>
         <td class="px-3 py-1.5">
           <div class="font-mono text-textPrimary">{alert.package}</div>
-          <div class="text-[10px] text-textMuted">
+          <div class="text-micro text-textMuted">
             {alert.ecosystem}{alert.scope ? ` · ${alert.scope}` : ""}
             {#if alert.manifest_path} · {alert.manifest_path}{/if}
             {#if alert.vulnerable_range} · {alert.vulnerable_range}{/if}
@@ -1028,7 +1028,7 @@
         <td class="px-3 py-1.5 text-textPrimary">
           {alert.title}
           {#if alert.advisory_id || alert.cve_id}
-            <div class="text-[10px] font-mono text-textMuted">
+            <div class="text-micro font-mono text-textMuted">
               {[alert.advisory_id, alert.cve_id].filter(Boolean).join(" · ")}
             </div>
           {/if}
@@ -1049,13 +1049,13 @@
 
   {#snippet codeScanningRows()}
     {#each keyedList(previewed("code-scanning", codeScanning?.alerts ?? []), (alert) => `${alert.number}:${alert.rule_id}:${alert.path}:${alert.start_line}`) as { item: alert, key } (key)}
-      <tr class="border-t border-border/40 align-top">
+      <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(alert.severity)}">{alert.severity || "unranked"}</span>
+          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
         </td>
         <td class="px-3 py-1.5">
           <div class="font-mono text-textPrimary">{alert.rule_id || alert.rule_name || "rule"}</div>
-          <div class="text-[10px] text-textMuted">{alert.title}</div>
+          <div class="text-micro text-textMuted">{alert.title}</div>
         </td>
         <td class="px-3 py-1.5 font-mono text-textMuted">
           {#if alert.path}
@@ -1116,7 +1116,7 @@
     <SecretsSection bind:report={secretsReport} tone={facetTone("secrets")} onagent={sendSecretsToAgent} />
   {/snippet}
 
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between gap-3 shrink-0">
+  <div class="gp-header justify-between gap-3">
     <div class="flex items-center gap-2 min-w-0">
       <ShieldAlert size={16} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary shrink-0">Health</span>
@@ -1133,7 +1133,9 @@
            what the header badge is for; the full sentence stays on the title. -->
       {#if summary}
         <span
-          class="shrink-0 px-2 py-0.5 rounded-full border text-[11px] font-medium capitalize {toneChipClass(summary.tone)}"
+          class="gp-chip shrink-0 first-letter:uppercase"
+          data-kind="label"
+          data-tone={roleTone(summary.tone)}
           title={summary.headline}
         >{toneLabel(summary.tone)}</span>
       {/if}
@@ -1157,7 +1159,7 @@
         aria-describedby="dependabot-permission-note"
         onclick={() => scanDependabot(undefined, { force: true })}
         disabled={checkingGithub}
-        class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
+        class="gp-btn" data-size="md"
         title="Use the GitHub CLI, its credentials, and the network to check Dependabot and code scanning alerts"
       >
         <ShieldAlert size={13} class={checkingGithub ? "animate-pulse" : ""} />
@@ -1177,17 +1179,18 @@
           type="button"
           onclick={fixWithManvi}
           disabled={fixing}
-          class="gp-btn-primary"
+          class="gp-btn"
+          data-variant="primary"
           title={aiReady
-            ? "Ask the local model (via the MANVI harness) for a remediation plan"
-            : "Needs a local model server — see the MANVI view. The exact error will be reported if none is running."}
+            ? "Ask the local model, through Manvi, for a remediation plan"
+            : "Needs a local model server. See the Manvi view. The exact error is reported if none is running."}
         >
           {#if fixing}
             <LoaderCircle size={13} class="animate-spin" />
             Planning…
           {:else}
             <Sparkles size={13} />
-            Fix with MANVI
+            Fix with Manvi
           {/if}
         </button>
       {/if}
@@ -1195,7 +1198,7 @@
         type="button"
         onclick={() => scan()}
         disabled={loading}
-        class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
+        class="gp-btn" data-size="md"
         title="Rescan local vulnerabilities, updates, and code health"
       >
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
@@ -1212,19 +1215,21 @@
     <div
       role="group"
       aria-label="Send a health task to a coding agent"
-      class="px-4 py-1.5 border-b border-border/60 bg-surface/40 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-[11px]"
+      class="px-4 py-1.5 bg-surface/40 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-meta"
     >
       <Terminal size={13} class="shrink-0 text-textMuted" />
       <span class="shrink-0 text-textMuted">Agent</span>
-      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40 py-1 text-[11px]">
+      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40">
         {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
       </select>
-      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44 py-1 text-[11px]">
+      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44">
         {#each HEALTH_AGENT_ACTIONS as action (action.id)}<option value={action.id}>{action.label}</option>{/each}
       </select>
       <button
         type="button"
-        class="gp-btn-primary py-1! px-2.5! text-[11px]!"
+        class="gp-btn"
+        data-variant="primary"
+        data-size="sm"
         bind:this={agentRunButton}
         aria-label={`Run ${agentActionLabel} in ${PROVIDER_LABELS[agentLauncher]}`}
         title="Runs in GitPulse’s terminal with this repository as the working directory"
@@ -1236,7 +1241,8 @@
       </button>
       <button
         type="button"
-        class="gp-btn py-1! px-2.5! text-[11px]!"
+        class="gp-btn"
+        data-size="sm"
         title="Copy the prompt for an agent session you already have open"
         aria-label={agentCopied ? "Health agent prompt copied" : "Copy health agent prompt"}
         disabled={!agentPrompt}
@@ -1247,7 +1253,8 @@
       </button>
       <button
         type="button"
-        class="gp-chip ml-auto shrink-0 border-border/70 text-textMuted hover:text-textPrimary"
+        class="gp-btn ml-auto shrink-0"
+        data-size="sm"
         aria-expanded={agentPreviewOpen}
         aria-controls="health-agent-prompt-preview"
         onclick={() => (agentPreviewOpen = !agentPreviewOpen)}
@@ -1270,13 +1277,17 @@
             readonly
             value={agentPrompt}
             spellcheck={false}
-            class="gp-field gp-field-multi h-48 w-full resize-y p-3 font-mono text-[11px] leading-relaxed"
+            class="gp-field gp-field-multi h-48 w-full resize-y p-3 font-mono text-meta leading-relaxed"
           ></textarea>
         </div>
       {/if}
       {#if agentLaunching}<p role="status" class="w-full text-textMuted">Opening agent terminal…</p>{/if}
       {#if agentCopied}<p role="status" class="sr-only">Health agent prompt copied</p>{/if}
-      {#if agentError}<p role="alert" class="w-full text-rose-400">{agentError}</p>{/if}
+      {#if agentError}
+        <div role="alert" class="gp-notice w-full" data-tone="danger">
+          <div class="min-w-0 flex-1">{agentError}</div>
+        </div>
+      {/if}
       {#if agentNotice}<p role="status" class="w-full text-textMuted">{agentNotice}</p>{/if}
     </div>
   {/if}
@@ -1290,7 +1301,7 @@
          line, and the permission text is one click away rather than four
          lines of column height on every visit. -->
     <details
-      class="rounded-xl border border-border/70 bg-surface px-3 py-1.5 text-[11px] text-textMuted {HEALTH_PROSE_WIDTH}"
+      class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted {HEALTH_PROSE_WIDTH}"
     >
       <!-- `role="status"` belongs on the text, not on the `<summary>`: a
            summary is an interactive disclosure control and cannot also be a
@@ -1307,7 +1318,7 @@
         </span>
       </summary>
       <p id="dependabot-permission-note" class="pt-2 leading-relaxed">
-        GitHub alerts are checked when GitPulse launches and when this repository
+        GitHub alerts are checked when GitPulse starts and when this repository
         opens, unless turned off in Settings → Analysis. The check uses the GitHub CLI,
         its credentials, and the network to fetch Dependabot and code scanning alerts.
         Critical and high findings raise a warning.
@@ -1317,8 +1328,8 @@
          visible in every state instead of shadowing (or being shadowed by) the
          load-error branch. Same shape as GitHubPanel's actionError banner. -->
     {#if actionError}
-      <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 {HEALTH_PROSE_WIDTH}">
-        {actionError}
+      <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+        <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
     {#if loading && !report}
@@ -1346,8 +1357,11 @@
       {/if}
 
       {#if planError}
-        <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 {HEALTH_PROSE_WIDTH}">
-          Fix with MANVI failed: {planError}
+        <div role="alert" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="danger">
+          <div class="min-w-0 flex-1">
+            <span class="font-medium">{PLAN_FAILED}</span>
+            {planError}
+          </div>
         </div>
       {/if}
 
@@ -1361,8 +1375,10 @@
                     type="button"
                     onclick={runAllSteps}
                     disabled={runningAll || Object.values(stepResults).some((r) => r.running)}
-                    class="gp-btn-primary py-1! text-[11px]!"
-                    title="Execute all executable plan steps sequentially"
+                    class="gp-btn"
+                    data-variant="primary"
+                    data-size="sm"
+                    title="Run every executable plan step, one after another"
                   >
                     {#if runningAll}
                       <LoaderCircle size={12} class="animate-spin" />
@@ -1376,45 +1392,44 @@
                 <button
                   type="button"
                   onclick={() => repoStore.setTerminalOpen(true)}
-                  class="gp-btn py-1! text-[11px]!"
+                  class="gp-btn"
+                  data-size="sm"
                   title="Open the terminal below this panel, so the plan stays on screen while you run it"
                 >
                   <Terminal size={12} />
                   <span>Terminal</span>
                 </button>
-                <button type="button" onclick={copyPlan} class="gp-btn py-1! text-[11px]!" title="Copy the remediation plan">
+                <button type="button" onclick={copyPlan} class="gp-btn" data-size="sm" title="Copy the remediation plan">
                   <Clipboard size={12} />
                   {planCopied ? "Copied" : "Copy plan"}
                 </button>
               {/if}
             </div>
           {/snippet}
-          <div class="space-y-3 rounded-2xl border border-accent/30 bg-surface shadow-card p-4">
+          <div class="space-y-3 rounded-2xl border border-accent/35 bg-surface shadow-card p-4">
             {#if fixing && !plan}
-              <div class="flex items-center gap-2 text-textMuted py-2">
-                <LoaderCircle size={14} class="animate-spin" />
-                Sending the health report to the local model…
+              <div class="space-y-2 py-2">
+                <p class="text-textMuted">Sending the health report to the local model…</p>
+                <Skeleton variant="text" count={3} height="1.25rem" />
               </div>
             {:else if plan}
-              <p class="text-[11px] text-textMuted font-mono truncate">
+              <p class="text-meta text-textMuted font-mono truncate">
                 {plan.model} @ {plan.base_url} · {plan.elapsed_ms} ms
               </p>
               {#each keyedList(plan.warnings, (warning) => warning) as { item: warning, key } (key)}
-                <div class="text-amber-400 leading-relaxed">{warning}</div>
+                <div class="text-warn leading-relaxed">{warning}</div>
               {/each}
 
               {#if planSteps.length > 0}
                 <div class="space-y-2.5 pt-1">
                   {#each planSteps as step (step.id)}
                     {@const res = stepResults[step.id]}
-                    <div class="p-3 rounded-xl border border-border/70 bg-background/60 space-y-2">
+                    <div class="p-3 rounded-xl border border-edge bg-background/60 space-y-2">
                       <div class="flex items-start justify-between gap-2">
                         <div class="space-y-1 min-w-0">
                           <div class="flex items-center gap-2">
                             {#if step.number !== null}
-                              <span class="px-1.5 py-0.2 rounded bg-surface border border-border text-[10px] font-bold text-accent">
-                                {step.number}
-                              </span>
+                              <span class="gp-chip" data-kind="count" data-tone="accent">{step.number}</span>
                             {/if}
                             <span class="font-medium text-textPrimary text-xs">{step.text}</span>
                           </div>
@@ -1425,18 +1440,19 @@
                             type="button"
                             onclick={() => void runStep(step, beginSteps())}
                             disabled={res?.running || runningAll}
-                            class="gp-btn py-1! px-2.5! text-xs shrink-0 disabled:opacity-50"
-                            title="Execute this command step directly"
+                            class="gp-btn shrink-0"
+                            data-size="sm"
+                            title="Run this command step directly"
                           >
                             {#if res?.running}
                               <LoaderCircle size={12} class="animate-spin text-accent" />
                               <span>Running…</span>
                             {:else if res?.status === "passed"}
-                              <Check size={12} class="text-emerald-400" />
+                              <Check size={12} class="text-ok" />
                               <span>Run again</span>
                             {:else if res?.status === "failed"}
-                              <Play size={12} class="text-rose-400" />
-                              <span>Retry</span>
+                              <Play size={12} class="text-danger" />
+                              <span>Try again</span>
                             {:else}
                               <Play size={12} class="text-accent" />
                               <span>Run</span>
@@ -1446,10 +1462,10 @@
                       </div>
 
                       {#if step.command}
-                        <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-surface border border-border/60 font-mono text-[11px]">
+                        <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-surface border border-edge font-mono text-meta">
                           <span class="text-textPrimary truncate">{step.command}</span>
                           {#if res?.status}
-                            <span class="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0 {res.status === 'passed' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30' : 'bg-rose-500/10 text-rose-300 border border-rose-500/30'}">
+                            <span class="gp-chip shrink-0" data-kind="label" data-tone={res.status === "passed" ? "ok" : "danger"}>
                               {res.status} {res.duration_ms ? `(${res.duration_ms}ms)` : ""}
                             </span>
                           {/if}
@@ -1457,13 +1473,13 @@
                       {/if}
 
                       {#if step.error}
-                        <div class="text-[10px] text-amber-300">
+                        <div class="text-micro text-warn">
                           {step.error}
                         </div>
                       {/if}
 
                       {#if res?.detail}
-                        <div class="p-2 rounded bg-surface/80 border border-border/40 font-mono text-[10px] text-textMuted whitespace-pre-wrap max-h-32 overflow-y-auto">
+                        <div class="p-2 rounded bg-surface/80 border border-edgeSoft font-mono text-micro text-textMuted whitespace-pre-wrap max-h-32 overflow-y-auto">
                           {res.detail}
                         </div>
                       {/if}
@@ -1474,13 +1490,14 @@
                 <div class="whitespace-pre-wrap leading-relaxed text-textSecondary">{plan.text}</div>
               {/if}
 
-              <div class="pt-2 border-t border-border/40 flex items-center justify-between gap-2 text-textMuted text-[11px]">
+              <div class="pt-2 flex items-center justify-between gap-2 text-textMuted text-meta">
                 <p>Review each remediation step. Run commands individually or execute all sequentially.</p>
                 <button
                   type="button"
                   onclick={() => void scan()}
                   disabled={loading}
-                  class="gp-btn py-1! text-xs shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                  class="gp-btn shrink-0"
+                  data-size="sm"
                   title="Rescan repository health"
                 >
                   <RefreshCw size={11} class={loading ? "animate-spin" : ""} />
@@ -1503,14 +1520,14 @@
               type="button"
               aria-pressed={filter === "all"}
               data-active={filter === "all" ? "true" : "false"}
-              class="gp-seg-btn text-[11px]! py-0.5!"
+              class="gp-seg-btn"
               onclick={() => (filter = "all")}
             >All</button>
             <button
               type="button"
               aria-pressed={filter === "direct"}
               data-active={filter === "direct" ? "true" : "false"}
-              class="gp-seg-btn text-[11px]! py-0.5!"
+              class="gp-seg-btn"
               onclick={() => (filter = "direct")}
             >Direct</button>
           </div>
@@ -1519,27 +1536,35 @@
           <p class="text-textMuted {HEALTH_PROSE_WIDTH}" data-testid="audit-coverage">{auditCensus}.</p>
         {/if}
         {#if !report.npm_cli_present && report.manifests.length > 0}
-          <p class="text-textMuted {HEALTH_PROSE_WIDTH}">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</p>
+          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</div>
+          </div>
         {:else if visibleVulns.length === 0}
-          <p class="text-textMuted">
-            {report.audit.total === 0
-              ? auditComplete
-                ? "No vulnerabilities found by completed local audits."
-                : auditsRan
+          {#if report.audit.total !== 0}
+            <p class="text-textMuted">{vulnerabilityEmptyMessage(filter, vulnerabilitiesCapped)}</p>
+          {:else if auditComplete}
+            <EmptyState icon={ShieldCheck} title="No vulnerabilities found by completed local audits." compact />
+          {:else}
+            <!-- An audit that did not finish, or never ran, is not "none": the
+                 unknown tone is drawn dashed so it cannot pass for a clean one. -->
+            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+              <div class="min-w-0 flex-1">
+                {auditsRan
                   ? `Local audit incomplete${gap ? ` (${gap})` : ""}; no all-clear is available.`
-                  : `Local audit did not run${gap ? ` (${gap})` : ""}.`
-              : vulnerabilityEmptyMessage(filter, vulnerabilitiesCapped)}
-          </p>
+                  : `Local audit did not run${gap ? ` (${gap})` : ""}.`}
+              </div>
+            </div>
+          {/if}
         {:else}
           <HealthTable caption="Known vulnerabilities in this repository's dependencies" columns={VULNERABILITY_COLUMNS}>
             {#each keyedList(previewed("vulnerabilities", visibleVulns), (vuln) => `${vuln.ecosystem}:${vuln.name}:${vuln.range}:${vuln.title}`) as { item: vuln, key } (key)}
-              <tr class="border-t border-border/40 align-top">
+              <tr class="align-top">
                 <td class="px-3 py-1.5">
-                  <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(vuln.severity)}">{vuln.severity}</span>
+                  <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(vuln.severity)}>{vuln.severity}</span>
                 </td>
                 <td class="px-3 py-1.5">
                   <div class="font-mono text-textPrimary">{vuln.name}</div>
-                  <div class="text-[10px] text-textMuted">
+                  <div class="text-micro text-textMuted">
                     {vuln.ecosystem}{vuln.is_direct ? " · direct" : " · transitive"}
                     {#if vuln.range} · {vuln.range}{/if}
                   </div>
@@ -1571,22 +1596,22 @@
 
       <HealthSection id="issues" count={issuesCount} tone={facetTone("issues")}>
         {#if report.issues.length === 0}
-          <p class="text-textMuted">No repository configuration issues were reported by this scan.</p>
+          <EmptyState icon={ShieldCheck} title="No repository configuration issues were reported by this scan." compact />
         {:else}
           <div class="space-y-1.5 {HEALTH_PROSE_WIDTH}">
             {#each keyedList(previewed("issues", report.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
-              <div class="px-3 py-2 rounded-xl border {issueClass(issue.severity)}">
-                <div class="flex items-center gap-2 min-w-0">
-                  <AlertTriangle size={12} class="shrink-0" aria-hidden="true" />
-                  <span class="font-medium uppercase text-[10px] shrink-0">{issue.severity}</span>
+              <div class="gp-notice flex-col" data-tone={issueNoticeTone(issue.severity)}>
+                <div class="flex items-center gap-2 min-w-0 w-full">
+                  <AlertTriangle size={12} class="shrink-0" style="color: var(--gp-notice-ink)" aria-hidden="true" />
+                  <span class="font-medium capitalize text-micro shrink-0">{issue.severity}</span>
                   <!-- A flex item has to be allowed to shrink before `truncate`
                        can clip it; without `min-w-0` it sizes to its content. -->
-                  <span class="font-mono text-[10px] opacity-70 truncate min-w-0">{issue.code}</span>
+                  <span class="font-mono text-micro opacity-70 truncate min-w-0">{issue.code}</span>
                   {#if issue.path}
                     <span class="font-mono truncate opacity-70 min-w-0">{issue.path}</span>
                   {/if}
                 </div>
-                <p class="mt-1 leading-relaxed [overflow-wrap:anywhere]">{issue.message}</p>
+                <p class="w-full min-w-0 leading-relaxed [overflow-wrap:anywhere]">{issue.message}</p>
               </div>
             {/each}
           </div>
@@ -1596,20 +1621,24 @@
 
       <HealthSection id="outdated" count={outdatedCount} tone={facetTone("outdated")}>
         {#if report.outdated.length === 0}
-          <p class="text-textMuted">
-            {report.npm_cli_present ? "No outdated npm packages reported." : "Outdated checks need npm on PATH."}
-          </p>
+          {#if report.npm_cli_present}
+            <EmptyState icon={Package} title="No outdated npm packages reported." compact />
+          {:else}
+            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+              <div class="min-w-0 flex-1">Outdated checks need npm on PATH.</div>
+            </div>
+          {/if}
         {:else}
           <HealthTable caption="npm packages behind their latest published release" columns={OUTDATED_COLUMNS}>
             {#each keyedList(previewed("outdated", report.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
               {@const kind = updateKind(pkg.current, pkg.latest)}
-              <tr class="border-t border-border/40">
+              <tr>
                 <td class="px-3 py-1.5 font-mono text-textPrimary">{pkg.name}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.current}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.wanted}</td>
-                <td class="px-3 py-1.5 font-mono {updateKindClass(kind)}">
+                <td class="px-3 py-1.5 font-mono {updateKindTextClass(kind)}">
                   {pkg.latest}
-                  <span class="text-[10px] ml-1 uppercase">{kind}</span>
+                  <span class="text-micro ml-1">{kind}</span>
                 </td>
                 <td class="px-3 py-1.5 text-textMuted">{pkg.dep_type || "—"}</td>
               </tr>
@@ -1632,20 +1661,25 @@
           <!-- Optional chaining, not the branch's narrowing: a snippet is
                compiled as its own function, so `report` is not narrowed here
                even though the branch that declares it has checked. -->
-          <span class="text-[11px] text-textMuted font-mono">
+          <span class="text-meta text-textMuted font-mono">
             {report?.node_version ? `node ${report.node_version}` : "node —"}
             ·
             {report?.npm_version ? `npm ${report.npm_version}` : "npm —"}
           </span>
         {/snippet}
         {#if report.manifests.length === 0}
-          <p class="text-textMuted">No package.json found. Other ecosystems are listed below when detected.</p>
+          <EmptyState
+            icon={Package}
+            title="No package.json found"
+            hint="Other ecosystems are listed below when detected."
+            compact
+          />
         {:else}
           <div class="grid gap-2 md:grid-cols-2">
             {#each keyedList(previewed("packages", report.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
               <!-- Grid items default to `min-width: auto`, so a long manifest
                    path widens its column instead of wrapping inside it. -->
-              <div class="p-3.5 rounded-2xl border border-border/70 bg-surface shadow-card min-w-0 [overflow-wrap:anywhere]">
+              <div class="p-3.5 rounded-2xl border border-edge bg-surface shadow-card min-w-0 [overflow-wrap:anywhere]">
                 <div class="flex items-center gap-2 text-textPrimary font-medium">
                   <Package size={13} class="text-accent shrink-0" aria-hidden="true" />
                   <span class="truncate">{pkg.name || pkg.path}</span>
@@ -1653,10 +1687,10 @@
                     <span class="font-mono text-textMuted font-normal">{pkg.version}</span>
                   {/if}
                   {#if pkg.private}
-                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-surfaceHover text-textMuted">private</span>
+                    <span class="gp-chip" data-kind="label" data-tone="neutral">private</span>
                   {/if}
                 </div>
-                <div class="mt-1.5 text-[11px] text-textMuted font-mono space-y-0.5">
+                <div class="mt-1.5 text-meta text-textMuted font-mono space-y-0.5">
                   <div>{pkg.path} · {pkg.package_manager}{pkg.lockfile ? ` · ${pkg.lockfile}` : ""}</div>
                   <div>
                     {pkg.dep_count} deps · {pkg.dev_dep_count} dev
@@ -1667,7 +1701,7 @@
                     <div>engines.node {pkg.engines_node}</div>
                   {/if}
                   {#if pkg.lifecycle_scripts.length > 0}
-                    <div class="text-amber-300">scripts: {pkg.lifecycle_scripts.join(", ")}</div>
+                    <div class="text-warn">scripts: {pkg.lifecycle_scripts.join(", ")}</div>
                   {/if}
                 </div>
               </div>
@@ -1696,12 +1730,12 @@
                 <dt class="text-textPrimary font-medium truncate">{eco.family}</dt>
                 <dd class="text-textMuted min-w-0">
                   <div>{eco.note}</div>
-                  <ul class="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] opacity-70 [overflow-wrap:anywhere]">
+                  <ul class="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-micro opacity-70 [overflow-wrap:anywhere]">
                     {#each keyedList(shown, (path) => path) as { item: path, key: pathKey } (pathKey)}
                       <li class="min-w-0 max-w-full">{path}</li>
                     {/each}
                     {#if seen > shown.length}
-                      <li class="text-amber-300">+{seen - shown.length} more</li>
+                      <li class="text-warn">+{seen - shown.length} more</li>
                     {/if}
                   </ul>
                 </dd>
@@ -1713,44 +1747,47 @@
 
       <!-- Stated whether or not there is anything to show. Impact edges,
            symbol search and the dead-code table all go quiet without a code
-           graph, and this is the only thing that says which kind of quiet
+           map, and this is the only thing that says which kind of quiet
            it is. -->
       <HealthSection id="code-graph">
         {#if codegraph?.available}
-          <div class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card">
+          <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card">
             <div class="grid grid-cols-3 gap-2 text-center">
               <div>
-                <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_files ?? "—"}</div>
-                <div class="text-[10px] uppercase tracking-wider text-textMuted">files</div>
+                <div class="text-base font-semibold text-textPrimary">{codegraph.total_files ?? "—"}</div>
+                <div class="gp-label">Files</div>
               </div>
               <div>
-                <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_symbols ?? "—"}</div>
-                <div class="text-[10px] uppercase tracking-wider text-textMuted">symbols</div>
+                <div class="text-base font-semibold text-textPrimary">{codegraph.total_symbols ?? "—"}</div>
+                <div class="gp-label">Symbols</div>
               </div>
               <div>
-                <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_edges ?? "—"}</div>
-                <div class="text-[10px] uppercase tracking-wider text-textMuted">edges</div>
+                <div class="text-base font-semibold text-textPrimary">{codegraph.total_edges ?? "—"}</div>
+                <div class="gp-label">Edges</div>
               </div>
             </div>
             {#if codegraph.generation_id != null}
-              <p class="mt-2 text-[10px] font-mono text-textMuted">generation {codegraph.generation_id}</p>
+              <p class="mt-2 text-micro font-mono text-textMuted">generation {codegraph.generation_id}</p>
             {/if}
-            <p class="mt-2 text-[11px] text-textMuted">
-              Agents query this map through <code class="font-mono">gitpulse_codeintel_search</code>,
-              <code class="font-mono">impact</code>, <code class="font-mono">trace</code> and
-              <code class="font-mono">dead_symbols</code>. A dash means that count was not stored — not that it is zero.
+            <p class="mt-2 text-meta text-textMuted">
+              Agents query this map for symbol search, impact, traces and dead symbols. A dash means that count was
+              not stored, not that it is zero.
             </p>
           </div>
         {:else if codegraph}
-          <p class="text-[11px] text-amber-300">
-            No code graph for this repository — impact edges, symbol search and dead-code
-            detection have nothing to read.
-            {#if codegraph.reason}
-              <span class="text-textMuted font-mono">({codegraph.reason})</span>
-            {/if}
-          </p>
+          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+            <div class="min-w-0 flex-1">
+              No code map for this repository — impact edges, symbol search and dead-code
+              detection have nothing to read.
+              {#if codegraph.reason}
+                <span class="text-textMuted font-mono">({codegraph.reason})</span>
+              {/if}
+            </div>
+          </div>
         {:else}
-          <p class="text-[11px] text-textMuted">Code graph status has not been read for this repository.</p>
+          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div class="min-w-0 flex-1">Code map status has not been read for this repository.</div>
+          </div>
         {/if}
       </HealthSection>
 
@@ -1761,30 +1798,36 @@
         caveat={deadCodeCaveat}
       >
         {#if codegraph?.available && !deadSymbolsAvailable}
-          <p class="text-[11px] text-amber-300">
-            Dead-code check could not run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
-            That is not the same as finding no unreferenced symbols.
-          </p>
+          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div class="min-w-0 flex-1">
+              Dead-code check could not run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
+              That is not the same as finding no unreferenced symbols.
+            </div>
+          </div>
         {:else if deadSymbolsAvailable && deadSymbols.length === 0 && !deadSymbolsIncomplete}
-          <p class="text-[11px] {deadSymbolsTruncated ? 'text-amber-300' : 'text-textMuted'}">
-            {deadSymbolsTruncated
-              ? "The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear."
-              : "No dead-code candidates in the indexed graph."}
-          </p>
+          {#if deadSymbolsTruncated}
+            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+              <div class="min-w-0 flex-1">
+                The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear.
+              </div>
+            </div>
+          {:else}
+            <EmptyState icon={Code} title="No dead-code candidates in the indexed graph." compact />
+          {/if}
         {:else if deadSymbolsAvailable && deadSymbols.length > 0}
-          <HealthTable caption="Symbols the code graph found no reference to" columns={DEAD_CODE_COLUMNS}>
+          <HealthTable caption="Symbols the code map found no reference to" columns={DEAD_CODE_COLUMNS}>
             {#each keyedList(previewed("dead-code", deadSymbols), (sym) => `${sym.file_path}:${sym.symbol_name}`) as { item: sym, key } (key)}
-              <tr class="border-t border-border/40">
+              <tr>
                 <td class="px-3 py-1.5 font-mono text-textPrimary font-medium">{sym.symbol_name}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{sym.file_path}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{(sym.confidence * 100).toFixed(0)}%</td>
                 <td class="px-3 py-1.5 text-textMuted">
                   {#if sym.is_exempt}
-                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-surfaceHover text-textMuted">
+                    <span class="gp-chip" data-kind="label" data-tone="neutral">
                       Exempt{sym.exemption_reason ? `: ${sym.exemption_reason}` : ""}
                     </span>
                   {:else}
-                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 font-medium">
+                    <span class="gp-chip" data-kind="label" data-tone="warn">
                       {formatDeadCodeStatus(sym)}
                     </span>
                   {/if}
@@ -1798,9 +1841,9 @@
             bind:expanded={expandedLists["dead-code"]}
           />
         {:else}
-          <p class="text-[11px] text-textMuted">
-            No dead-code result for this repository yet.
-          </p>
+          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div class="min-w-0 flex-1">No dead-code result for this repository yet.</div>
+          </div>
         {/if}
       </HealthSection>
 
@@ -1813,7 +1856,7 @@
         <HostLoadSection />
       </HealthSection>
     {:else}
-      <div class="text-textMuted">Open a repository to scan dependency health.</div>
+      <EmptyState icon={FolderOpen} title="Open a repository to scan dependency health" />
     {/if}
   </div>
 </div>

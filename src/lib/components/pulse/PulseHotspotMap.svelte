@@ -2,7 +2,10 @@
   import { computeHotspotRisks } from "../../pulse/metrics";
   import type { HotspotRiskItem, PulseFileChurn } from "../../pulse/types";
   import type { CoverageReport } from "../../coverage/types";
-  import { Flame, FileCode } from "@lucide/svelte";
+  import EmptyState from "../EmptyState.svelte";
+  import SettingSegment from "../SettingSegment.svelte";
+  import { LAYERS } from "../../ui/layers";
+  import { Flame, FileCode, TriangleAlert } from "@lucide/svelte";
 
   let {
     topFiles = [],
@@ -10,16 +13,21 @@
     coverageFailed = false,
     coveragePending = false,
     onSelectFile,
+    onRescanCoverage,
   }: {
     topFiles: readonly PulseFileChurn[];
     coverageReport: CoverageReport | null;
     coverageFailed?: boolean;
     coveragePending?: boolean;
     onSelectFile?: (path: string) => void;
+    /** Re-runs the coverage scan that failed. */
+    onRescanCoverage?: () => void;
   } = $props();
 
+  type RiskFilter = "all" | HotspotRiskItem["riskLevel"];
+
   let searchFilter = $state("");
-  let selectedLevel = $state<"all" | "critical" | "high" | "medium" | "low">("all");
+  let selectedLevel = $state<RiskFilter>("all");
 
   const allHotspots = $derived(computeHotspotRisks(topFiles, coverageReport));
 
@@ -27,6 +35,13 @@
   const highCount = $derived(allHotspots.filter((h) => h.riskLevel === "high").length);
   const mediumCount = $derived(allHotspots.filter((h) => h.riskLevel === "medium").length);
   const lowCount = $derived(allHotspots.filter((h) => h.riskLevel === "low").length);
+
+  const levelOptions = $derived([
+    { value: "critical" as const, label: `Critical (${criticalCount})` },
+    { value: "high" as const, label: `High (${highCount})` },
+    { value: "medium" as const, label: `Medium (${mediumCount})` },
+    { value: "low" as const, label: `Low (${lowCount})` },
+  ]);
 
   const filteredHotspots = $derived(
     allHotspots.filter((h) => {
@@ -38,91 +53,86 @@
     }),
   );
 
+  /** Choosing the level that is already chosen clears the filter, as the buttons always did. */
+  function toggleLevel(next: RiskFilter) {
+    selectedLevel = selectedLevel === next ? "all" : next;
+  }
+
+  /** Risk tiers wear the status roles; medium is neutral because the roles have no fifth severity. */
   function getRiskBadge(level: HotspotRiskItem["riskLevel"]) {
     switch (level) {
       case "critical":
-        return { bg: "bg-red-500/10 text-red-400 border-red-500/20", label: "Critical" };
+        return { tone: "danger", label: "Critical" };
       case "high":
-        return { bg: "bg-orange-500/10 text-orange-400 border-orange-500/20", label: "High" };
+        return { tone: "warn", label: "High" };
       case "medium":
-        return { bg: "bg-amber-500/10 text-amber-400 border-amber-500/20", label: "Medium" };
+        return { tone: "neutral", label: "Medium" };
       default:
-        return { bg: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20", label: "Low" };
+        return { tone: "ok", label: "Low" };
     }
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
-  <!-- Header & Risk Summary Banner -->
-  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/40 pb-3">
-    <div>
+<div class="gp-card p-4 flex flex-col gap-4">
+  <!-- Header & risk summary -->
+  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+    <div class="min-w-0">
       <div class="flex items-center gap-2">
-        <Flame size={18} class="text-orange-400" />
-        <h3 class="text-sm font-semibold text-textPrimary">Hotspot Risk Map</h3>
-        <span class="text-xs px-2 py-0.5 rounded-full bg-surfaceMuted text-textMuted border border-border/60">
-          Churn × Coverage
-        </span>
+        <Flame size={18} class="text-warn" />
+        <h3 class="text-sm font-semibold text-textPrimary">Hotspot risk map</h3>
+        <span class="gp-chip" data-tone="neutral">Churn × coverage</span>
       </div>
-      <p class="text-xs text-textMuted mt-0.5">
-        {#if coveragePending}
-          Scanning coverage. Until it lands, ranking is churn-only — not “untested”.
-        {:else if coverageFailed}
-          Coverage scan failed. Ranking is churn-only; missing coverage is not treated as 0%.
-        {:else if !coverageReport}
-          Coverage has not been scanned. Ranking is churn-only.
-        {:else}
-          Files with high modification frequency and low test coverage. A file missing from the coverage report is treated as untested.
-        {/if}
-      </p>
+      {#if coverageFailed}
+        <!-- A scan that could not run says so in the unknown tone: the ranking
+             below is churn-only and must not read as a coverage verdict. -->
+        <div class="gp-notice mt-1" data-tone="unknown" role="status">
+          <TriangleAlert size={14} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+          <div class="min-w-0 flex-1">
+            Couldn't scan coverage. Ranking is churn-only; missing coverage is not treated as 0%.
+          </div>
+          {#if onRescanCoverage}
+            <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRescanCoverage?.()}>Rescan</button>
+          {/if}
+        </div>
+      {:else}
+        <p class="text-xs text-textMuted mt-0.5">
+          {#if coveragePending}
+            Scanning coverage. Until it lands, ranking is churn-only — not “untested”.
+          {:else if !coverageReport}
+            Coverage has not been scanned. Ranking is churn-only.
+          {:else}
+            Files with high modification frequency and low test coverage. A file missing from the coverage report is treated as untested.
+          {/if}
+        </p>
+      {/if}
     </div>
 
-    <!-- Severity Counts -->
-    <div class="flex items-center gap-2 text-xs">
-      <button
-        type="button"
-        class="px-2 py-1 rounded-md border text-xs font-medium transition-colors {selectedLevel === 'critical' ? 'bg-red-500/20 border-red-500/50 text-red-300' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
-        onclick={() => (selectedLevel = selectedLevel === "critical" ? "all" : "critical")}
-      >
-        Critical ({criticalCount})
-      </button>
-      <button
-        type="button"
-        class="px-2 py-1 rounded-md border text-xs font-medium transition-colors {selectedLevel === 'high' ? 'bg-orange-500/20 border-orange-500/50 text-orange-300' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
-        onclick={() => (selectedLevel = selectedLevel === "high" ? "all" : "high")}
-      >
-        High ({highCount})
-      </button>
-      <button
-        type="button"
-        class="px-2 py-1 rounded-md border text-xs font-medium transition-colors {selectedLevel === 'medium' ? 'bg-amber-500/20 border-amber-500/50 text-amber-300' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
-        onclick={() => (selectedLevel = selectedLevel === "medium" ? "all" : "medium")}
-      >
-        Medium ({mediumCount})
-      </button>
-      <button
-        type="button"
-        class="px-2 py-1 rounded-md border text-xs font-medium transition-colors {selectedLevel === 'low' ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
-        onclick={() => (selectedLevel = selectedLevel === "low" ? "all" : "low")}
-      >
-        Low ({lowCount})
-      </button>
-    </div>
+    <!-- Severity counts -->
+    <SettingSegment
+      ariaLabel="Risk level"
+      options={levelOptions}
+      value={selectedLevel}
+      onselect={toggleLevel}
+    />
   </div>
 
-  <!-- Search and Filter Row -->
+  <!-- Search and filter row -->
   <div class="flex items-center gap-3">
     <div class="relative flex-1">
       <input
         type="text"
-        placeholder="Filter hotspots by filename..."
+        placeholder="Filter hotspots by file name…"
+        aria-label="Filter hotspots by file name"
         bind:value={searchFilter}
-        class="w-full bg-surface text-textPrimary text-xs rounded-lg px-3 py-1.5 border border-border/70 focus:outline-hidden focus:border-accent"
+        class="gp-field w-full"
       />
     </div>
     {#if selectedLevel !== "all" || searchFilter}
       <button
         type="button"
-        class="text-xs text-accent hover:underline shrink-0"
+        class="gp-btn shrink-0"
+        data-variant="ghost"
+        data-size="sm"
         onclick={() => {
           selectedLevel = "all";
           searchFilter = "";
@@ -133,29 +143,36 @@
     {/if}
   </div>
 
-  <!-- Hotspots Table -->
-  {#if filteredHotspots.length === 0}
+  <!-- Hotspots table -->
+  {#if allHotspots.length === 0}
+    <EmptyState
+      compact
+      icon={Flame}
+      title="No hotspots yet"
+      hint="Files with churn appear here once commits change them."
+    />
+  {:else if filteredHotspots.length === 0}
     <div class="py-8 text-center text-textMuted text-xs">
       No hotspots match the current filter.
     </div>
   {:else}
-    <div class="overflow-x-auto max-h-80 overflow-y-auto border border-border/50 rounded-lg">
+    <div class="overflow-x-auto max-h-80 overflow-y-auto rounded-lg">
       <table class="w-full text-left text-xs border-collapse">
-        <thead class="bg-surfaceMuted/50 text-textMuted uppercase text-[10px] tracking-wider sticky top-0 backdrop-blur-sm">
-          <tr class="border-b border-border/60">
-            <th class="py-2 px-3 font-semibold">File</th>
-            <th class="py-2 px-3 font-semibold">Churn</th>
-            <th class="py-2 px-3 font-semibold">Commits</th>
-            <th class="py-2 px-3 font-semibold">Coverage</th>
-            <th class="py-2 px-3 font-semibold">Risk Score</th>
-            <th class="py-2 px-3 font-semibold text-right">Risk Level</th>
+        <thead class="bg-surfaceHover text-textMuted sticky top-0" style="z-index: {LAYERS.STICKY}">
+          <tr>
+            <th class="gp-label py-2 px-3">File</th>
+            <th class="gp-label py-2 px-3">Churn</th>
+            <th class="gp-label py-2 px-3">Commits</th>
+            <th class="gp-label py-2 px-3">Coverage</th>
+            <th class="gp-label py-2 px-3">Risk score</th>
+            <th class="gp-label py-2 px-3 text-right">Risk level</th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-border/30">
+        <tbody>
           {#each filteredHotspots as hotspot (hotspot.path)}
             {@const badge = getRiskBadge(hotspot.riskLevel)}
             <tr
-              class="hover:bg-surfaceMuted/40 transition-colors group cursor-pointer"
+              class="hover:bg-surfaceHover/60 transition-colors duration-(--gp-dur-instant) group cursor-pointer"
               onclick={() => onSelectFile?.(hotspot.path)}
             >
               <td class="py-2 px-3 font-mono text-textPrimary flex items-center gap-1.5 truncate max-w-xs sm:max-w-md">
@@ -163,8 +180,8 @@
                 <span class="truncate" title={hotspot.path}>{hotspot.path}</span>
               </td>
               <td class="py-2 px-3 whitespace-nowrap">
-                <span class="text-emerald-400">+{hotspot.additions.toLocaleString()}</span>
-                <span class="text-rose-400 ml-1">-{hotspot.deletions.toLocaleString()}</span>
+                <span class="text-ok">+{hotspot.additions.toLocaleString()}</span>
+                <span class="text-danger ml-1">-{hotspot.deletions.toLocaleString()}</span>
               </td>
               <td class="py-2 px-3 text-textMuted whitespace-nowrap">
                 {hotspot.commitsCount}
@@ -172,31 +189,35 @@
               <td class="py-2 px-3 whitespace-nowrap">
                 {#if hotspot.coveragePercentage !== null}
                   <div class="flex items-center gap-1.5">
-                    <span class={hotspot.coveragePercentage < 50 ? "text-rose-400 font-semibold" : hotspot.coveragePercentage < 80 ? "text-amber-400" : "text-emerald-400"}>
+                    <span class={hotspot.coveragePercentage < 50 ? "text-danger font-semibold" : hotspot.coveragePercentage < 80 ? "text-warn" : "text-ok"}>
                       {hotspot.coveragePercentage}%
                     </span>
                     {#if hotspot.uncoveredLines !== null && hotspot.uncoveredLines > 0}
-                      <span class="text-[10px] text-textMuted">({hotspot.uncoveredLines} uncov)</span>
+                      <span class="text-micro text-textMuted">({hotspot.uncoveredLines} uncovered)</span>
                     {/if}
                   </div>
                 {:else if hotspot.coverageStatus === "unscanned"}
-                  <span class="text-textMuted italic text-[11px]">Unknown</span>
+                  <span class="gp-chip" data-tone="unknown" title="Coverage was not scanned for this file">Unknown</span>
                 {:else}
-                  <span class="text-textMuted italic text-[11px]">Not in report</span>
+                  <span class="text-textMuted text-meta">Not in report</span>
                 {/if}
               </td>
               <td class="py-2 px-3 font-mono font-medium text-textPrimary whitespace-nowrap">
                 {hotspot.riskScore.toLocaleString()}
               </td>
               <td class="py-2 px-3 text-right whitespace-nowrap">
-                <span class="inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border {badge.bg}">
-                  {badge.label}
-                </span>
+                <span class="gp-chip" data-tone={badge.tone}>{badge.label}</span>
               </td>
             </tr>
           {/each}
         </tbody>
       </table>
     </div>
+    <!-- The table lists the files the report ranked, not the repository, so
+         say how many survive the filters rather than letting a short list
+         read as the whole picture. -->
+    <p class="m-0 text-meta text-textMuted">
+      Showing {filteredHotspots.length} of {allHotspots.length} ranked {allHotspots.length === 1 ? "file" : "files"}
+    </p>
   {/if}
 </div>

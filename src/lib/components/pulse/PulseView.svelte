@@ -15,6 +15,8 @@
   import PulseExportModal from "./PulseExportModal.svelte";
   import PulseExtensionChurn from "./PulseExtensionChurn.svelte";
   import EmptyState from "../EmptyState.svelte";
+  import Skeleton from "../Skeleton.svelte";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import type { CoverageReport } from "../../coverage/types";
   import type { LanguageStatsReport } from "../../language/barStats";
   import { computeCommitWindow, computeHygiene } from "../../pulse/metrics";
@@ -126,6 +128,13 @@
     );
   });
 
+  // Rescan goes through the same shared metric as the subscription above, so
+  // this view and CoverageViewer still see one measurement.
+  function rescanCoverage() {
+    const path = $currentRepoPath;
+    if (path) void coverageMetric.refresh(path, { force: true });
+  }
+
   // Per-tab line counts for the workspace comparison strip. Same metric, so a
   // repository open in two places is measured once.
   $effect(() => {
@@ -191,6 +200,9 @@
   const doraLoading = $derived($pulseStore.doraLoading);
   const error = $derived($pulseStore.error);
   const knowledgeError = $derived($pulseStore.knowledgeError);
+  const pulseFailure = $derived(
+    describeFailure({ verb: "generate", object: "repository pulse metrics" }, error),
+  );
   const doraError = $derived($pulseStore.doraError);
   const knowledgeMeasuredAt = $derived($pulseStore.knowledgeMeasuredAt);
   const doraMeasuredAt = $derived($pulseStore.doraMeasuredAt);
@@ -244,22 +256,24 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0 bg-background overflow-y-auto">
-  <div class="px-6 py-4 border-b border-border/80 gp-section-edge bg-surface/40 shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+  <div class="px-6 py-4 bg-surface shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
     <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-xl bg-accent/10 border border-accent/25 flex items-center justify-center text-accent shadow-xs">
+      <div class="w-9 h-9 rounded-xl bg-accent/10 flex items-center justify-center text-accent shadow-xs">
         <Activity size={18} />
       </div>
       <div>
         <div class="flex items-center gap-2">
-          <h1 class="text-sm font-bold text-textPrimary tracking-tight">Repository Pulse</h1>
+          <h1 class="text-sm font-semibold text-textPrimary tracking-tight">Repository pulse</h1>
           {#if report}
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-surface border border-border text-textMuted">
+            <span class="gp-chip font-mono" data-kind="label" data-tone="neutral">
               {report.total_commits_scanned.toLocaleString()} commits
             </span>
           {/if}
           {#if report?.has_mailmap}
             <span
-              class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 border border-emerald-500/25 flex items-center gap-1"
+              class="gp-chip"
+              data-kind="label"
+              data-tone="ok"
               title=".mailmap active: author aliases are canonicalized."
             >
               <Mail size={10} />
@@ -267,31 +281,37 @@
             </span>
           {:else if report}
             <span
-              class="text-[10px] px-2 py-0.5 rounded-full bg-surface border border-border text-textMuted"
+              class="gp-chip"
+              data-kind="label"
+              data-tone="neutral"
               title="No .mailmap. The same person with work and personal emails counts as two contributors."
             >
               no .mailmap
             </span>
           {/if}
         </div>
-        <p class="text-[11px] text-textMuted mt-0.5">
+        <p class="text-meta text-textMuted mt-0.5">
           Local cadence, churn, hotspots, knowledge concentration, and tag-based delivery. All branches, computed on this machine.
         </p>
       </div>
     </div>
 
     <div class="flex items-center gap-2">
-      <div class="flex items-center bg-surface border border-border/70 rounded-lg p-0.5 text-xs">
+      <div class="gp-segmented" role="group" aria-label="Pulse section">
         <button
           type="button"
-          class="px-2.5 py-1 rounded-md transition-colors {activeTab === 'overview' ? 'bg-accent text-white font-medium shadow-xs' : 'text-textMuted hover:text-textPrimary'}"
+          class="gp-seg-btn"
+          aria-pressed={activeTab === "overview"}
+          data-active={activeTab === "overview" ? "true" : "false"}
           onclick={() => (activeTab = "overview")}
         >
           Overview
         </button>
         <button
           type="button"
-          class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1 {activeTab === 'hotspots' ? 'bg-accent text-white font-medium shadow-xs' : 'text-textMuted hover:text-textPrimary'}"
+          class="gp-seg-btn inline-flex items-center gap-1"
+          aria-pressed={activeTab === "hotspots"}
+          data-active={activeTab === "hotspots" ? "true" : "false"}
           onclick={() => (activeTab = "hotspots")}
         >
           <Flame size={12} />
@@ -299,15 +319,19 @@
         </button>
         <button
           type="button"
-          class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1 {activeTab === 'knowledge' ? 'bg-accent text-white font-medium shadow-xs' : 'text-textMuted hover:text-textPrimary'}"
+          class="gp-seg-btn inline-flex items-center gap-1"
+          aria-pressed={activeTab === "knowledge"}
+          data-active={activeTab === "knowledge" ? "true" : "false"}
           onclick={() => (activeTab = "knowledge")}
         >
           <Users size={12} />
-          <span>Knowledge & Age</span>
+          <span>Knowledge and age</span>
         </button>
         <button
           type="button"
-          class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1 {activeTab === 'dora' ? 'bg-accent text-white font-medium shadow-xs' : 'text-textMuted hover:text-textPrimary'}"
+          class="gp-seg-btn inline-flex items-center gap-1"
+          aria-pressed={activeTab === "dora"}
+          data-active={activeTab === "dora" ? "true" : "false"}
           onclick={() => (activeTab = "dora")}
         >
           <Rocket size={12} />
@@ -319,18 +343,22 @@
         type="button"
         onclick={() => (exportModalOpen = true)}
         disabled={!report}
-        class="gp-btn py-1.5! px-3! text-xs inline-flex items-center gap-1.5"
-        title="Export Pulse Summary Card for README"
+        class="gp-btn"
+        data-variant="secondary"
+        data-size="md"
+        title="Export the pulse summary card for your README"
       >
         <Download size={12} />
-        <span class="hidden md:inline">Export Card</span>
+        <span class="hidden md:inline">Export card</span>
       </button>
 
       <button
         type="button"
         onclick={() => pulseStore.reload()}
         disabled={loading}
-        class="gp-btn py-1.5! px-3! text-xs inline-flex items-center gap-1.5"
+        class="gp-btn"
+        data-variant="secondary"
+        data-size="md"
       >
         <RefreshCw size={12} class={loading ? 'animate-spin text-accent' : ''} />
         <span>{loading ? 'Refreshing…' : 'Refresh'}</span>
@@ -339,59 +367,69 @@
   </div>
 
   {#if report?.truncated}
-    <div class="mx-6 mt-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-textPrimary flex items-center justify-between gap-3">
-      <div class="flex items-center gap-2 text-amber-500">
-        <AlertCircle size={15} class="shrink-0" />
-        {#if report.payload_truncated}
-          <!-- Named, not assumed: the flag is also set by a stream we could
-               not read to the end, which is not a budget problem. -->
-          <span class="font-medium"
-            >Log output {report.payload_truncation_reason ?? "is incomplete"}.</span
+    <div class="mx-6 mt-4">
+      <div class="gp-notice" data-tone="warn" role="status">
+        <AlertCircle size={15} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 flex flex-wrap items-center gap-x-2">
+          {#if report.payload_truncated}
+            <!-- Named, not assumed: the flag is also set by a stream we could
+                 not read to the end, which is not a budget problem. -->
+            <span class="font-medium"
+              >Log output {report.payload_truncation_reason ?? "is incomplete"}.</span
+            >
+            <span class="text-textMuted hidden sm:inline">Tiles below are a prefix, not the full history. Raising the commit cap would make this worse.</span>
+          {:else}
+            <span class="font-medium">History bounded at {report.total_commits_scanned.toLocaleString()} commits.</span>
+            <span class="text-textMuted hidden sm:inline">Older commits exist in this repository. Longest-gap is only as old as this scan.</span>
+          {/if}
+        </div>
+        {#if canDeepen}
+          <button
+            type="button"
+            onclick={handleDeepenScan}
+            disabled={loading}
+            class="gp-btn shrink-0"
+            data-variant="secondary"
+            data-size="sm"
           >
-          <span class="text-textMuted hidden sm:inline">Tiles below are a prefix, not the full history. Raising the commit cap would make this worse.</span>
-        {:else}
-          <span class="font-medium">History bounded at {report.total_commits_scanned.toLocaleString()} commits.</span>
-          <span class="text-textMuted hidden sm:inline">Older commits exist in this repository. Longest-gap is only as old as this scan.</span>
+            Scan deeper (25k)
+          </button>
         {/if}
       </div>
-      {#if canDeepen}
-        <button
-          type="button"
-          onclick={handleDeepenScan}
-          disabled={loading}
-          class="gp-btn py-1! px-2.5! text-[11px]! shrink-0 font-medium"
-        >
-          Scan Deeper (25k)
-        </button>
-      {/if}
     </div>
   {/if}
 
   {#if error}
-    <div class="m-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-500 flex items-start gap-3">
-      <AlertCircle size={16} class="shrink-0 mt-0.5" />
-      <div class="flex-1">
-        <p class="font-semibold">Unable to generate repository pulse metrics</p>
-        <p class="mt-1 font-mono text-[11px] opacity-90 wrap-break-word">{error}</p>
-        <p class="mt-2 text-[11px] text-textMuted">
-          Recorded under <span class="font-mono">pulse</span> in Diagnostics, which carries the
-          backend log tail — where a backend crash writes its location and backtrace.
-        </p>
-        <div class="flex items-center gap-2 mt-3">
-          <button
-            type="button"
-            onclick={() => pulseStore.reload()}
-            class="gp-btn py-1! px-2.5! text-xs"
-          >
-            Try Again
-          </button>
-          <button
-            type="button"
-            onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
-            class="gp-btn py-1! px-2.5! text-xs"
-          >
-            Open Diagnostics
-          </button>
+    <div class="m-6">
+      <div class="gp-notice" data-tone="danger" role="alert">
+        <AlertCircle size={16} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+        <div class="flex-1 min-w-0">
+          <p class="font-semibold text-danger">{pulseFailure.headline}</p>
+          <p class="mt-1 font-mono text-meta wrap-break-word">{error}</p>
+          <p class="mt-2 text-meta text-textMuted">
+            Recorded under <span class="font-mono">pulse</span> in Diagnostics, which carries the
+            backend log tail — where a backend crash writes its location and backtrace.
+          </p>
+          <div class="flex items-center gap-2 mt-3">
+            <button
+              type="button"
+              onclick={() => pulseStore.reload()}
+              class="gp-btn"
+              data-variant="secondary"
+              data-size="sm"
+            >
+              Try again
+            </button>
+            <button
+              type="button"
+              onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
+              class="gp-btn"
+              data-variant="secondary"
+              data-size="sm"
+            >
+              Open Diagnostics
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -399,11 +437,11 @@
     <div class="p-6 space-y-4">
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {#each [1, 2, 3, 4] as n (n)}
-          <div class="h-20 bg-surface/60 rounded-xl border border-border animate-pulse"></div>
+          <Skeleton variant="rect" height="5rem" />
         {/each}
       </div>
-      <div class="h-44 bg-surface/60 rounded-xl border border-border animate-pulse"></div>
-      <div class="h-48 bg-surface/60 rounded-xl border border-border animate-pulse"></div>
+      <Skeleton variant="rect" height="11rem" />
+      <Skeleton variant="rect" height="12rem" />
     </div>
   {:else if report && report.commits.length === 0}
     <div class="flex-1 flex items-center justify-center p-8">
@@ -412,7 +450,7 @@
         title="No commit activity found"
         hint="This repository does not have any commits yet, or the history could not be reached."
         action={{
-          label: "Refresh Pulse",
+          label: "Refresh",
           onClick: () => pulseStore.reload(),
           icon: RefreshCw,
         }}
@@ -421,18 +459,20 @@
   {:else if report}
     <div class="p-6 space-y-5">
       {#if workspaceLoc.length > 1}
-        <div class="gp-card p-3 rounded-xl border border-border/70 bg-surface/40 flex flex-wrap items-center gap-3 text-xs">
-          <span class="text-textMuted font-medium uppercase tracking-wider text-[10px]">Open repos</span>
+        <div class="gp-card p-3 flex flex-wrap items-center gap-3 text-xs">
+          <span class="gp-label">Open repositories</span>
           {#each workspaceLoc as row (row.path)}
             <span
-              class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border {row.path === $repoStore.currentPath ? 'border-accent/40 bg-accent/10 text-textPrimary' : 'border-border/60 text-textMuted'}"
+              class="gp-chip"
+              data-kind="label"
+              data-tone={row.path === $repoStore.currentPath ? "accent" : "neutral"}
               title={row.path}
             >
               <span class="font-medium">{row.name}</span>
               {#if row.failed}
-                <span class="font-mono text-rose-400">LOC unknown</span>
+                <span class="font-mono text-unknown">LOC unknown</span>
               {:else if row.value !== null}
-                <span class="font-mono">{row.value.toLocaleString()} loc{row.truncated ? '*' : ''}</span>
+                <span class="font-mono">{row.value.toLocaleString()} LOC{row.truncated ? '*' : ''}</span>
               {/if}
             </span>
           {/each}
@@ -441,12 +481,9 @@
 
       {#if activeTab === "overview"}
         <div class="flex items-center justify-between gap-3 flex-wrap">
-          <label class="text-[11px] text-textMuted flex items-center gap-2">
+          <label class="text-meta text-textMuted flex items-center gap-2">
             <span>Author scope</span>
-            <select
-              class="bg-surface border border-border/70 rounded-md px-2 py-1 text-xs text-textPrimary"
-              bind:value={authorFilter}
-            >
+            <select class="gp-select" bind:value={authorFilter}>
               <option value="all">All contributors (every local and remote branch)</option>
               {#each authors as [email, name] (email)}
                 <option value={email}>{name} &lt;{email}&gt;</option>
@@ -454,9 +491,9 @@
             </select>
           </label>
           {#if locState.status === "partial"}
-            <span class="text-[11px] text-amber-500">LOC is a partial language scan, not a complete count.</span>
+            <span class="text-meta text-warn">LOC is a partial language scan, not a complete count.</span>
           {:else if locState.status === "failed"}
-            <span class="text-[11px] text-rose-400">Language scan failed — LOC is not shown as zero.</span>
+            <span class="text-meta text-danger">Couldn't scan languages. LOC is not shown as zero.</span>
           {/if}
         </div>
 
@@ -479,6 +516,7 @@
           {coverageReport}
           coverageFailed={coverageFailed}
           coveragePending={coverageRequested && coverageReport === null && !coverageFailed}
+          onRescanCoverage={rescanCoverage}
         />
 
       {:else if activeTab === "knowledge"}
@@ -495,6 +533,7 @@
           loading={knowledgeLoading}
           measuredAt={knowledgeMeasuredAt}
           staleNotice={false}
+          onRefresh={() => pulseStore.loadKnowledge()}
         />
 
       {:else if activeTab === "dora"}

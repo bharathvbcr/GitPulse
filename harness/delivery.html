@@ -111,7 +111,7 @@
       // --- a listing that could not run is a failure, not an absence -------
       await remount({ rows: [], checked: false, error: "gh: could not resolve host" });
       check("an unchecked listing says it could not read, not that there is nothing",
-        () => flat().includes("Could not read runs — this is not an absence of runs"));
+        () => flat().includes("Couldn't read runs. This is not an absence of runs"));
       check("and it carries the reason it failed",
         () => text().includes("could not resolve host"));
       check("an unchecked listing draws no bars",
@@ -122,7 +122,7 @@
       check("a checked empty listing reads as a real absence",
         () => flat().includes("No runs recorded for this repository"));
       check("and does not claim a failure",
-        () => !flat().includes("Could not read"));
+        () => !flat().includes("Couldn't read"));
 
       // --- a rate needs its denominator ------------------------------------
       // Distinct durations, so the figure proves a real median rather than
@@ -195,7 +195,7 @@
       // Hiding them behind "could not read" would be the opposite dishonesty
       // from the one `checked` exists to prevent.
       check("a paused poll still shows the rows it already has",
-        () => rowStates().length === 1 && !flat().includes("Could not read"));
+        () => rowStates().length === 1 && !flat().includes("Couldn't read"));
       check("and still states the sample it is showing",
         () => flat().includes("Sample: last 1"));
 

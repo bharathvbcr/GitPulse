@@ -143,12 +143,12 @@ describe("FleetCell", () => {
     expect(body).not.toContain(">0<");
   });
 
-  it("says could not read, and carries the reason, when a scan failed", () => {
+  it("says couldn't read, and carries the reason, when a scan failed", () => {
     const { body } = render(FleetCell, {
       props: { cell: failedCell("npm is not installed"), label: "Vulnerabilities" },
     });
     expect(body).toContain('data-state="failed"');
-    expect(body).toContain("could not read");
+    expect(body).toContain("couldn't read");
     expect(body).toContain("npm is not installed");
   });
 
@@ -179,7 +179,7 @@ describe("FleetCell", () => {
       props: { cell: failedCell("npm is not installed"), label: "Vulns", onScan: () => {} },
     });
     expect(body).toContain('data-state="failed"');
-    expect(body).toContain("could not read");
+    expect(body).toContain("couldn't read");
     expect(body).toContain("npm is not installed");
     expect(body).toContain("Click to try this repository again");
   });
@@ -226,7 +226,7 @@ describe("FleetCell while a scan is running", () => {
       props: { cell: failedCell("npm is missing"), label: "Vulns", scanning: true },
     });
     expect(body).toContain('data-state="scanning"');
-    expect(body).not.toContain("could not read");
+    expect(body).not.toContain("couldn't read");
   });
 
   it("is absent by default, so a still cell never looks busy", () => {
@@ -269,8 +269,10 @@ describe("FleetCell change chips", () => {
   it("colours by the column's own goal, not by the sign", () => {
     const better = render(FleetCell, { props: withDelta(-6, "lower") }).body;
     const worse = render(FleetCell, { props: withDelta(-6, "higher") }).body;
-    expect(better).toContain("emerald");
-    expect(worse).toContain("amber");
+    expect(better).toContain("text-ok");
+    expect(better).not.toContain("text-warn");
+    expect(worse).toContain("text-warn");
+    expect(worse).not.toContain("text-ok");
   });
 
   it("stays quiet for an unchanged measurement", () => {

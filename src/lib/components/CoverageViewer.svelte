@@ -40,6 +40,9 @@
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError, isMissingFileError } from "../ui/formatError";
+  import { describeFailure, type FailureCopy } from "../ui/copy/describeFailure";
+  import { shortcutTextLabel } from "../ui/platformCopy";
+  import { hostPlatform } from "../stores/platformStore";
   import { diagnostics } from "../diagnostics/diagnostics";
   import { reportPanelError } from "../diagnostics/report";
   import { coverageMetric } from "../metrics/repoMetrics";
@@ -563,7 +566,7 @@
       const outcome = await repoStore.reportIssue(draft.title, draft.body, []);
       if ($repoStore.currentPath !== repo) return;
       if (!outcome.ok) {
-        issueError = outcome.error ?? "Coverage issue creation failed.";
+        issueError = outcome.error ?? "No reason was reported.";
         return;
       }
       issueUrl = outcome.output ?? null;
@@ -1414,6 +1417,23 @@
     selectedPath = path;
     repoStore.selectFilePath(path);
   }
+
+  // Every error headline is "Couldn't <verb> <object>." from describeFailure;
+  // the backend text rides along as the reason, never as the headline.
+  const scanFailure = $derived<FailureCopy | null>(
+    scanError === null ? null : describeFailure({ verb: report ? "rescan" : "scan", object: "coverage" }, scanError),
+  );
+  const issueFailure = $derived<FailureCopy | null>(
+    issueError === null ? null : describeFailure({ verb: "create", object: "the issue" }, issueError),
+  );
+  const aiFailure = $derived<FailureCopy | null>(
+    aiError === null ? null : describeFailure({ verb: "analyze", object: "coverage" }, aiError),
+  );
+  const fileFailure = $derived<FailureCopy | null>(
+    fileError === null ? null : describeFailure({ verb: "read", object: "line coverage" }, fileError),
+  );
+  const prevBlockTip = $derived(`Previous missed block (${shortcutTextLabel("⌥↑", $hostPlatform.os)})`);
+  const nextBlockTip = $derived(`Next missed block (${shortcutTextLabel("⌥↓", $hostPlatform.os)})`);
 </script>
 
 <!-- The individual generate commands for one family, offered as chips.
@@ -1426,8 +1446,9 @@
   {#each view.commands as cmd (`${view.family}:${cmd}`)}
     <button
       type="button"
-      class="min-w-0 max-w-full truncate px-1.5 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
-      title="Run with MANVI: {cmd}"
+      class="gp-btn min-w-0 max-w-full truncate font-mono"
+      data-size="sm"
+      title="Run with Manvi: {cmd}"
       disabled={runControlsDisabled}
       onclick={() => void runCoverageScript(view.family, cmd, { durationHint: view.durationHint })}
     >{cmd}</button>
@@ -1441,7 +1462,7 @@
        and the facts about the scan belong to the same statement, and splitting
        them across stacked full-width strips cost ~100px above the data while
        leaving "Partial coverage" sitting alone with no cause beside it. -->
-  <div data-coverage-header class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-x-3 gap-y-1.5 items-center justify-between font-sans shrink-0">
+  <div data-coverage-header class="px-4 py-2 bg-surface/60 flex flex-wrap gap-x-3 gap-y-1.5 items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-x-2.5 gap-y-1 min-w-0 flex-wrap">
       <Percent size={16} class="text-accent shrink-0" />
       {#if report && report.overall.lines_found > 0}
@@ -1472,33 +1493,35 @@
            raises had no answer anywhere on screen. -->
       <span
         role="status"
-        class="gp-chip shrink-0 {scanStatusPartial ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-border/60 text-textMuted'}"
+        class="gp-chip shrink-0"
+        data-tone={scanStatusPartial ? "warn" : "neutral"}
+        data-kind="label"
         title={scanStatusTitle}
       >
         {#if scanStatusPartial}<TriangleAlert size={11} class="shrink-0" />{/if}
         {coverageScanStatus(report, isScanning, scanError !== null, coverageExclusions.length > 0)}
       </span>
       {#if scanReasons.length > 0}
-        <span class="text-[11px] text-amber-300/90 truncate min-w-0" title={scanStatusTitle}>{scanReasons[0]}{scanReasons.length > 1 ? ` · +${scanReasons.length - 1} more` : ""}</span>
+        <span class="text-meta text-warn truncate min-w-0" title={scanStatusTitle}>{scanReasons[0]}{scanReasons.length > 1 ? ` · +${scanReasons.length - 1} more` : ""}</span>
       {/if}
-      <span class="text-[11px] text-textMuted truncate min-w-0">
+      <span class="text-meta text-textMuted truncate min-w-0">
         Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}
       </span>
       <!-- Qualifies a report that was read. With nothing parsed there is no
            artifact whose age could be unknown, and the caveat was noise. -->
       {#if report?.artifacts.some((artifact) => !artifact.skipped)}
         <span
-          class="text-[11px] text-textMuted/70 shrink-0"
+          class="text-meta text-faint shrink-0"
           title="The scanner does not receive artifact generation timestamps or test outcomes, so it cannot say how old a report on disk is."
         >Artifact age unknown</span>
       {/if}
-      {#if scanError}<button type="button" class="gp-btn py-0.5! px-2! shrink-0" disabled={isScanning} onclick={rescan}>Retry scan</button>{/if}
+      {#if scanError}<button type="button" class="gp-btn shrink-0" data-size="sm" disabled={isScanning} onclick={rescan}>Try again</button>{/if}
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <button
         type="button"
-        class="gp-icon-btn p-1! hover:text-accent"
-        class:text-emerald-400={reportCopied}
+        class="gp-icon-btn" data-size="sm"
+        class:text-ok={reportCopied}
         title={reportCopied ? "Coverage report copied" : "Copy coverage report"}
         aria-label={reportCopied ? "Coverage report copied" : "Copy coverage report"}
         onclick={() => void copyCoverageReport()}
@@ -1512,9 +1535,10 @@
       </button>
       <button
         type="button"
-        class="gp-icon-btn p-1! hover:text-accent"
+        class="gp-icon-btn" data-size="sm"
         class:text-accent={aiOpen}
-        title="MANVI: analyze coverage with the local model"
+        title="Manvi: analyze coverage with the local model"
+        aria-label="Manvi: analyze coverage with the local model"
         onclick={() => (aiOpen = !aiOpen)}
         disabled={!report}
       >
@@ -1522,8 +1546,9 @@
       </button>
       <button
         type="button"
-        class="gp-icon-btn p-1! hover:text-accent"
+        class="gp-icon-btn" data-size="sm"
         title="Create a guarded GitHub issue from this coverage snapshot"
+        aria-label="Create a guarded GitHub issue from this coverage snapshot"
         onclick={() => void reportCoverageIssue()}
         disabled={!report || issueSubmitting || isScanning || generating || runningAll || runningMissing || anyScriptRunning}
       >
@@ -1536,8 +1561,10 @@
       {#if missingPipelines.length > 0}
         <button
           type="button"
-          class="gp-btn-primary py-1! px-2.5! text-[11px]!"
-          title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
+          class="gp-btn"
+          data-variant="primary"
+          data-size="sm"
+          title="Generate each missing language with Manvi. Rust needs cargo-llvm-cov; a full run can take several minutes."
           onclick={() => void runMissingCoverage()}
           disabled={runControlsDisabled}
         >
@@ -1546,7 +1573,7 @@
             Running…
           {:else}
             <Play size={11} />
-            Run with MANVI
+            Run with Manvi
           {/if}
         </button>
       {/if}
@@ -1555,7 +1582,7 @@
            read by someone about to press this button. -->
       <button
         type="button"
-        class="gp-icon-btn p-1! hover:text-accent"
+        class="gp-icon-btn" data-size="sm"
         aria-label="Rescan coverage artifacts"
         title="Rescan coverage artifacts — re-reads the reports already on disk; it does not rerun tests"
         onclick={rescan}
@@ -1567,36 +1594,53 @@
   </div>
 
   {#if report && scanError}
-    <div class="px-4 py-1.5 border-b border-border bg-red-500/10 text-red-400 font-sans shrink-0 flex items-center justify-between gap-2">
-      <span class="truncate" title={scanError}>Rescan failed: {scanError} — showing previous results.</span>
-      <button
-        type="button"
-        onclick={() => void copyScanError()}
-        class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
-        title="Copy scan error"
-      >
-        {#if scanErrorCopied}
-          <Check size={10} class="text-emerald-400" />
-          <span>Copied</span>
-        {:else}
-          <Clipboard size={10} />
-          <span>Copy error</span>
-        {/if}
-      </button>
+    <div class="px-4 py-1.5 font-sans shrink-0">
+      <div class="gp-notice" data-tone="danger" role="alert">
+        <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 truncate" title={scanError}>
+          <span class="font-medium">{scanFailure?.headline}</span>
+          {#if scanFailure?.detail}<span class="text-textMuted"> {scanFailure.detail}</span>{/if}
+          <span class="text-textMuted"> Showing previous results.</span>
+        </div>
+        <button
+          type="button"
+          onclick={() => void copyScanError()}
+          class="gp-btn shrink-0"
+          data-size="sm"
+          title="Copy scan error"
+        >
+          {#if scanErrorCopied}
+            <Check size={10} class="text-ok" />
+            <span>Copied</span>
+          {:else}
+            <Clipboard size={10} />
+            <span>Copy error</span>
+          {/if}
+        </button>
+      </div>
     </div>
   {/if}
 
   {#if issueNotice || issueError}
-    <div class="px-4 py-1.5 border-b border-border bg-surface/80 font-sans shrink-0 flex items-center gap-2">
+    <div class="px-4 py-1.5 font-sans shrink-0">
       {#if issueError}
-        <span class="text-rose-400 truncate" title={issueError}>Issue creation failed: {issueError}</span>
+        <div class="gp-notice" data-tone="danger" role="alert">
+          <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+          <div class="min-w-0 flex-1 truncate" title={issueError}>
+            <span class="font-medium">{issueFailure?.headline}</span>
+            {#if issueFailure?.detail}<span class="text-textMuted"> {issueFailure.detail}</span>{/if}
+          </div>
+        </div>
       {:else}
-        <span class="text-emerald-400 truncate">{issueNotice}</span>
-        {#if issueUrl}
-          <button type="button" class="gp-btn py-0.5! px-2! text-[10px]! shrink-0" onclick={() => void openCoverageIssue()}>
-            Open issue
-          </button>
-        {/if}
+        <div class="gp-notice" data-tone="ok" role="status">
+          <Check size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+          <div class="min-w-0 flex-1 truncate">{issueNotice}</div>
+          {#if issueUrl}
+            <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => void openCoverageIssue()}>
+              Open issue
+            </button>
+          {/if}
+        </div>
       {/if}
     </div>
   {/if}
@@ -1608,7 +1652,7 @@
        into `unfoundViews`'s trailing summary, which keeps the found families
        and their expected paths one hover away. -->
   {#if report && (stripFamilies.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
-    <div data-coverage-family-strip class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
+    <div data-coverage-family-strip class="bg-surface/40 font-sans shrink-0">
       <!-- Wraps; it does not scroll. With `overflow-x-auto` a long reason on
            one family (Python's "No Python tests found …") pushed every family
            after it past the right edge, behind a scrollbar macOS hides, so the
@@ -1621,13 +1665,14 @@
             <span class="text-textPrimary/80 shrink-0">{view.status.languages.join(", ") || view.label}</span>
             <span class="text-textMuted/60 shrink-0">no report</span>
             {#if view.toolDetail}
-              <span class="text-amber-400/90 truncate min-w-0 max-w-[32rem]" title={view.toolDetail}>{view.toolDetail}</span>
+              <span class="text-warn truncate min-w-0 max-w-[32rem]" title={view.toolDetail}>{view.toolDetail}</span>
             {/if}
             {#if view.pipeline}
               <button
                 type="button"
-                class="shrink-0 px-1.5 py-0.5 rounded-full border border-accent/40 bg-accent/10 font-sans text-[10px] text-textPrimary hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-40"
-                title={view.durationHint || "Generate coverage artifacts with MANVI"}
+                class="gp-btn shrink-0"
+                data-size="sm"
+                title={view.durationHint || "Generate coverage artifacts with Manvi"}
                 disabled={runControlsDisabled}
                 onclick={() => void runCoverageFamily(view.family)}
               >Run {view.label} coverage</button>
@@ -1647,9 +1692,9 @@
                retained/observed counts, name them: the totals above are a
                sample of that size, not the whole tree. -->
           <span
-            class="text-amber-400 shrink-0 font-medium"
+            class="text-warn shrink-0 font-medium"
             title={cappedDetail || "Some coverage data was dropped to bound the scan"}
-          >scan capped{cappedDetail ? `: ${cappedDetail}` : ""}</span>
+          >Scan capped{cappedDetail ? `: ${cappedDetail}` : ""}</span>
         {/if}
       </div>
       {/if}
@@ -1657,16 +1702,18 @@
         <div class="px-4 pb-1.5 space-y-0.5 max-h-24 overflow-auto {stripFamilies.length === 0 && !report.truncated ? 'pt-1.5' : ''}">
           {#if unsuccessfulScripts.length > 0}
             <div class="flex items-center justify-between gap-2 pb-0.5">
-              <span class="text-[9px] uppercase tracking-wider text-rose-400 font-semibold">Unsuccessful coverage</span>
+              <span class="gp-label">Unsuccessful coverage</span>
               <button
                 type="button"
                 onclick={() => void copyAllFailedScripts()}
-                class="text-[10px] text-rose-400 hover:text-rose-300 underline inline-flex items-center gap-1 shrink-0"
+                class="gp-btn shrink-0"
+                data-variant="ghost"
+                data-size="sm"
                 title="Copy diagnostics for every coverage command that did not produce coverage"
               >
                 {#if copiedAllFailed}
-                  <Check size={10} class="text-emerald-400" />
-                  <span class="text-emerald-400">Copied</span>
+                  <Check size={10} class="text-ok" />
+                  <span class="text-ok">Copied</span>
                 {:else}
                   <Clipboard size={10} />
                   <span>Copy failure diagnostics{unsuccessfulScripts.length > 1 ? ` (${unsuccessfulScripts.length})` : ""}</span>
@@ -1675,7 +1722,7 @@
             </div>
           {/if}
           {#each Object.entries(scriptStatuses) as [key, status] (key)}
-            <div class="flex items-center gap-2 text-[10px] min-w-0">
+            <div class="flex items-center gap-2 text-micro min-w-0">
               {#if status.running}
                 <LoaderCircle size={10} class="animate-spin text-accent shrink-0" />
                 <span class="text-textMuted shrink-0">running</span>
@@ -1684,26 +1731,26 @@
                      from measurement. Deliberately not the green checkmark:
                      the coverage behind it covers fewer files than the
                      command was asked to measure. -->
-                <Check size={10} class="text-amber-400 shrink-0" />
-                <span class="text-amber-400/90 shrink-0 whitespace-nowrap">passed (recovered)</span>
+                <Check size={10} class="text-warn shrink-0" />
+                <span class="text-warn/90 shrink-0 whitespace-nowrap">passed (recovered)</span>
               {:else if status.status === "passed"}
-                <Check size={10} class="text-emerald-400 shrink-0" />
-                <span class="text-emerald-400/90 shrink-0">passed</span>
+                <Check size={10} class="text-ok shrink-0" />
+                <span class="text-ok/90 shrink-0">passed</span>
               {:else if status.status === "no_data"}
                 <!-- Ran cleanly and produced nothing. Deliberately not a
                      checkmark: the command succeeded, the generation did not. -->
-                <X size={10} class="text-amber-400 shrink-0" />
-                <span class="text-amber-400/90 shrink-0 whitespace-nowrap">no coverage produced</span>
+                <X size={10} class="text-warn shrink-0" />
+                <span class="text-warn/90 shrink-0 whitespace-nowrap">no coverage produced</span>
               {:else if status.status === "cancelled"}
                 <X size={10} class="text-textMuted shrink-0" />
                 <span class="text-textMuted shrink-0 whitespace-nowrap">not recorded</span>
               {:else}
-                <X size={10} class="text-rose-400 shrink-0" />
-                <span class="text-rose-400/90 shrink-0">failed</span>
+                <X size={10} class="text-danger shrink-0" />
+                <span class="text-danger/90 shrink-0">failed</span>
               {/if}
               <span class="font-mono text-textPrimary/80 truncate min-w-0 max-w-[45%] shrink-0" title={status.label}>{status.label}</span>
               {#if status.recovery}
-                <span class="text-amber-400/80 truncate" title={status.recovery.note}
+                <span class="text-warn/80 truncate" title={status.recovery.note}
                   >{status.recovery.note}</span
                 >
               {:else if status.summary || briefDetail(status.detail)}
@@ -1720,12 +1767,13 @@
                 <button
                   type="button"
                   onclick={() => void copyFailedScript(key, status)}
-                  class="ml-auto p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-textPrimary shrink-0"
+                  class="gp-icon-btn ml-auto shrink-0"
+                  data-size="sm"
                   title="Copy failure diagnostics for {status.label}"
                   aria-label="Copy failure diagnostics for {status.label}"
                 >
                   {#if copiedScriptKey === key}
-                    <Check size={10} class="text-emerald-400" />
+                    <Check size={10} class="text-ok" />
                   {:else}
                     <Clipboard size={10} />
                   {/if}
@@ -1741,9 +1789,9 @@
   {#if report && report.languages.length > 0}
     <!-- The shared cue, not a fade class on the strip itself: a fade utility
          on the scroller painted its gradient across the whole bar. -->
-    <div class="relative border-b border-border/40 gp-section-edge bg-surface/20">
+    <div class="relative bg-surface/20">
     <div bind:this={languageStrip} class="px-4 py-2 flex items-center gap-3 overflow-x-auto font-sans">
-      <span class="text-[10px] uppercase tracking-wider text-textMuted/60 shrink-0">by language</span>
+      <span class="gp-label shrink-0">By language</span>
       <!-- Fixed track width, not `min-w-36`. The bar length encodes the
            percentage, so a track that grows with the label made 98.2% Rust and
            80.2% Go paint near-identical fills: the one comparison this row
@@ -1754,7 +1802,7 @@
             <span class="flex items-center gap-1.5 min-w-0">
               <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {lang.color_hex}"></span>
               <span class="truncate text-textPrimary/80">{lang.language}</span>
-              <span class="text-[10px] text-textMuted/50 shrink-0">{lang.files}</span>
+              <span class="text-micro text-faint shrink-0">{lang.files}</span>
             </span>
             <span class="tabular-nums shrink-0" style="color: {coverageBarColor(lang.percentage)}">{formatCoveragePercent(lang.percentage)}</span>
           </div>
@@ -1781,7 +1829,7 @@
   {/key}
 
   <div class="flex-1 flex min-h-0 min-w-0">
-    <div class="w-72 max-w-[40%] min-w-40 shrink-0 border-r border-border/60 flex flex-col bg-surface/40 p-1.5 min-h-0">
+    <div class="w-72 max-w-[40%] min-w-40 shrink-0 flex flex-col bg-surface/40 p-1.5 min-h-0">
       {#if isScanning && !report}
         <div class="flex-1 flex items-center justify-center text-textMuted font-sans">Scanning coverage…</div>
       {:else if report && report.files.length > 0}
@@ -1790,25 +1838,25 @@
              only square-cornered system widgets in the window, which is most
              of why this pane read as unfinished next to the rest. -->
         <div class="p-1 space-y-1.5 font-sans shrink-0">
-          <input type="search" aria-label="Search coverage files" placeholder="Search files…" bind:value={fileQuery} class="gp-field w-full py-1! text-[11px]!" />
+          <input type="search" aria-label="Search coverage files" placeholder="Search files…" bind:value={fileQuery} class="gp-field w-full" />
           <div class="flex gap-1">
-            <select aria-label="Filter coverage language" bind:value={languageFilter} class="gp-select flex-1 min-w-0 py-1 text-[11px]">
+            <select aria-label="Filter coverage language" bind:value={languageFilter} class="gp-select flex-1 min-w-0">
               <option value="">All languages</option>{#each filterLanguages as language}<option value={language}>{language}</option>{/each}
             </select>
-            <select aria-label="Filter coverage gaps" bind:value={coverageFilter} class="gp-select flex-1 min-w-0 py-1 text-[11px]">
+            <select aria-label="Filter coverage gaps" bind:value={coverageFilter} class="gp-select flex-1 min-w-0">
               <option value="all">All files</option><option value="missed">With missed lines</option><option value="below80">Below 80%</option>
             </select>
           </div>
-          <select aria-label="Sort coverage files" bind:value={fileSort} class="gp-select w-full py-1 text-[11px]">
+          <select aria-label="Sort coverage files" bind:value={fileSort} class="gp-select w-full">
             <option value="missed">Sort: most missed lines</option><option value="coverage">Sort: lowest coverage</option><option value="path">Sort: file path</option>
           </select>
-          <div class="flex flex-wrap items-center justify-between gap-1 px-1 text-[10px] text-textMuted">
+          <div class="flex flex-wrap items-center justify-between gap-1 px-1 text-micro text-textMuted">
             <span role="status">Showing {visibleFiles.length} of {report.files.length} scanned files{report.truncated ? " · partial scan" : ""}</span>
-            {#if fileQuery || languageFilter || coverageFilter !== "all"}<button type="button" class="text-accent hover:underline" onclick={clearFileFilters}>Clear filters</button>{/if}
+            {#if fileQuery || languageFilter || coverageFilter !== "all"}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={clearFileFilters}>Clear filters</button>{/if}
           </div>
         </div>
         {#if visibleFiles.length === 0}
-          <div class="p-3 text-textMuted font-sans">No files match these filters. <button type="button" class="text-accent hover:underline" onclick={clearFileFilters}>Show all files</button></div>
+          <div class="p-3 text-textMuted font-sans">No files match these filters. <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={clearFileFilters}>Show all files</button></div>
         {/if}
         <!-- Virtualized: the scan cap allows 4,000 files, and a keyed each of
              that size mounts ~20k nodes and re-diffs them on every selection. -->
@@ -1825,8 +1873,8 @@
                 class="w-full px-2.5 rounded-full text-left flex items-center gap-2 transition-colors {selectedPath === file.path ? 'bg-accent/15 ring-1 ring-inset ring-accent/30' : 'hover:bg-surfaceHover'}"
               >
                 <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {file.color_hex}"></span>
-                <span class="min-w-0 flex-1 truncate font-mono text-[11px] text-textPrimary" title={file.path}
-                  >{label.name}{#if label.dir}<span class="ml-1.5 text-[10px] text-textMuted"
+                <span class="min-w-0 flex-1 truncate font-mono text-meta text-textPrimary" title={file.path}
+                  >{label.name}{#if label.dir}<span class="ml-1.5 text-micro text-textMuted"
                       >{label.dir}</span
                     >{/if}</span
                 >
@@ -1840,27 +1888,36 @@
              only says why it is empty. -->
         <div data-coverage-sidebar-empty class="p-3 text-textMuted font-sans space-y-1">
           <p>No covered files yet.</p>
-          <p class="text-[11px] text-textMuted/80">
+          <p class="text-meta text-textMuted">
             {familyViews.length === 0 ? "No programming languages were found to scan." : "Generate a report for each language on the right, then they appear here."}
           </p>
         </div>
       {:else if scanError}
-        <div class="p-3 text-rose-400 font-sans space-y-2">
-          <div>{scanError}</div>
-          <button
-            type="button"
-            onclick={() => void copyScanError()}
-            class="gp-btn py-1! text-[11px]!"
-            title="Copy scan error diagnostics"
-          >
-            {#if scanErrorCopied}
-              <Check size={12} class="text-emerald-400" />
-              <span>Copied</span>
-            {:else}
-              <Clipboard size={12} />
-              <span>Copy error</span>
-            {/if}
-          </button>
+        <div class="p-1 font-sans">
+          <div class="gp-notice flex-wrap" data-tone="danger" role="alert">
+            <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+            <div class="min-w-0 flex-1 space-y-2">
+              <div title={scanError}>
+                <span class="font-medium">{scanFailure?.headline}</span>
+                {#if scanFailure?.detail}<span class="text-textMuted"> {scanFailure.detail}</span>{/if}
+              </div>
+              <button
+                type="button"
+                onclick={() => void copyScanError()}
+                class="gp-btn"
+                data-size="sm"
+                title="Copy scan error diagnostics"
+              >
+                {#if scanErrorCopied}
+                  <Check size={12} class="text-ok" />
+                  <span>Copied</span>
+                {:else}
+                  <Clipboard size={12} />
+                  <span>Copy error</span>
+                {/if}
+              </button>
+            </div>
+          </div>
         </div>
       {:else}
         <EmptyState
@@ -1871,13 +1928,13 @@
       {/if}
 
       {#if report && report.artifacts.length > 0}
-        <div class="border-t border-border/60 p-2 text-[10px] text-textMuted font-sans max-h-28 overflow-auto">
+        <div class="p-2 text-micro text-textMuted font-sans max-h-28 overflow-auto">
           {#each report.artifacts as artifact, i (`${i}:${artifact.path}`)}
             <div class="truncate" title={artifact.skip_reason || artifact.format}>
               {artifact.path}
               <span class="text-textMuted/70">({artifact.format})</span>
               {#if artifact.skipped}
-                <span class="text-amber-400"> skipped</span>
+                <span class="text-warn"> skipped</span>
               {/if}
             </div>
           {/each}
@@ -1891,21 +1948,21 @@
              the gutter beneath all belong to the same pane; the legend in
              particular used to sit in the app header, a pane away from the
              only thing it explains. -->
-        <div class="px-3 py-1.5 border-b border-border/60 font-sans flex flex-wrap items-center gap-x-2 gap-y-1 shrink-0">
+        <div class="px-3 py-1.5 bg-surface/30 font-sans flex flex-wrap items-center gap-x-2 gap-y-1 shrink-0">
           <span class="min-w-0 flex-1 truncate text-textPrimary" title={selectedPath}>{selectedPath}</span>
           <div class="flex items-center gap-1 shrink-0">
-            <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" aria-label="Previous missed block" title="Previous missed block (Alt+Up)" aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Prev</button>
-            <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" aria-label="Next missed block" title="Next missed block (Alt+Down)" aria-keyshortcuts="Alt+ArrowDown" disabled={!missedBlocks.length} onclick={() => jumpMissed(1)}>↓ Next</button>
+            <button type="button" class="gp-btn" data-size="sm" aria-label="Previous missed block" title={prevBlockTip} aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Prev</button>
+            <button type="button" class="gp-btn" data-size="sm" aria-label="Next missed block" title={nextBlockTip} aria-keyshortcuts="Alt+ArrowDown" disabled={!missedBlocks.length} onclick={() => jumpMissed(1)}>↓ Next</button>
           </div>
-          <span class="text-[11px] text-textMuted shrink-0 tabular-nums" role="status">{isLoadingFile ? "Loading line details…" : !fileLoaded || fileError ? "Line details unavailable" : missedBlocks.length ? `${activeBlockIndex < 0 ? missedBlocks.length : `${activeBlockIndex + 1} of ${missedBlocks.length}`} missed blocks${activeBlock ? ` · lines ${activeBlock.start}–${activeBlock.end}` : ""}` : "No missed lines in available details"}</span>
-          {#if selectedFile && !selectedVisible}<span class="text-[11px] text-textMuted shrink-0">Selected file is outside the current filters.</span>{/if}
+          <span class="text-meta text-textMuted shrink-0 tabular-nums" role="status">{isLoadingFile ? "Loading line details…" : !fileLoaded || fileError ? "Line details unavailable" : missedBlocks.length ? `${activeBlockIndex < 0 ? missedBlocks.length : `${activeBlockIndex + 1} of ${missedBlocks.length}`} missed blocks${activeBlock ? ` · lines ${activeBlock.start}–${activeBlock.end}` : ""}` : "No missed lines in available details"}</span>
+          {#if selectedFile && !selectedVisible}<span class="text-meta text-textMuted shrink-0">Selected file is outside the current filters.</span>{/if}
           <span class="w-px self-stretch bg-border/60 shrink-0" aria-hidden="true"></span>
-          <div class="flex items-center gap-2 text-[10px] text-textMuted/80 shrink-0" aria-label="Gutter legend">
-            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500/50"></span> hit</span>
-            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-red-500/50"></span> missed</span>
-            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-gray-500/30"></span> uninstrumented</span>
+          <div class="flex items-center gap-2 text-micro text-textMuted shrink-0" aria-label="Gutter legend">
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-ok/50"></span> hit</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-danger/50"></span> missed</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-unknown/30"></span> uninstrumented</span>
           </div>
-          {#if selectedFile}<button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
+          {#if selectedFile}<button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
         </div>
       {/if}
       {#if scanTruncated && !noCoverageFiles}
@@ -1914,13 +1971,19 @@
              or a directory window dropped candidates — and only some of them
              are caps. Saying "hit a cap" named one of the three for all of
              them; what the reader has to act on is the same either way. -->
-        <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
-          The scan did not read every artifact — missing gutters here mean unknown, not uncovered.
+        <div class="px-4 py-1.5 font-sans shrink-0">
+          <div class="gp-notice text-meta" data-tone="unknown" role="status">
+            <TriangleAlert size={12} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+            <div class="min-w-0 flex-1">The scan did not read every artifact — missing gutters here mean unknown, not uncovered.</div>
+          </div>
         </div>
       {/if}
       {#if linesTruncated && !noCoverageFiles}
-        <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
-          Gutter view capped for display; totals still reflect the full file.
+        <div class="px-4 py-1.5 font-sans shrink-0">
+          <div class="gp-notice text-meta" data-tone="warn" role="status">
+            <TriangleAlert size={12} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+            <div class="min-w-0 flex-1">Gutter view capped for display; totals still reflect the full file.</div>
+          </div>
         </div>
       {/if}
       {#if noCoverageFiles && report}
@@ -1931,7 +1994,7 @@
         <div data-coverage-empty class="h-full min-h-0 overflow-auto p-4 font-sans space-y-3">
           <div class="space-y-1">
             <h3 class="text-sm font-medium text-textPrimary">No coverage data yet</h3>
-            <p class="text-[11px] text-textMuted">
+            <p class="text-meta text-textMuted">
               No report on disk contributed line records{report.truncated ? ", and the scan did not read every artifact" : ""}.
               That is unmeasured, not 0%. Generate a report for each language below; the panel rescans when a run finishes.
             </p>
@@ -1941,17 +2004,19 @@
             <section
               data-coverage-family-card={view.family}
               aria-label="{view.label} coverage"
-              class="max-w-3xl rounded-xl border border-border/60 bg-surface/40 p-3 space-y-2"
+              class="max-w-3xl rounded-xl border border-edge bg-surface/40 p-3 space-y-2"
             >
               <div class="flex flex-wrap items-center gap-2">
                 <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
                 <span class="text-textPrimary font-medium">{view.status.languages.join(", ") || view.label}</span>
-                <span class="text-[11px] text-textMuted/70">no report</span>
+                <span class="text-meta text-faint">no report</span>
                 {#if view.pipeline}
                   <button
                     type="button"
-                    class="gp-btn-primary py-1! px-2.5! text-[11px]! ml-auto"
-                    title={view.durationHint || "Generate missing coverage artifacts with MANVI"}
+                    class="gp-btn ml-auto"
+                    data-variant="primary"
+                    data-size="sm"
+                    title={view.durationHint || "Generate missing coverage artifacts with Manvi"}
                     onclick={() => void runCoverageFamily(view.family)}
                     disabled={runControlsDisabled}
                   >
@@ -1966,37 +2031,37 @@
                 {/if}
               </div>
               {#if view.toolDetail}
-                <p class="text-[11px] text-amber-400/90">{view.toolDetail}</p>
+                <p class="text-meta text-warn">{view.toolDetail}</p>
               {/if}
               {#each skipped as artifact, i (`${i}:${artifact.path}`)}
                 <!-- Found but unusable is a different fact from not found:
                      a failed `go test` leaves exactly this empty profile. -->
-                <p class="text-[11px] text-amber-300/90">
+                <p class="text-meta text-warn">
                   Found <span class="font-mono">{artifact.path}</span> but skipped it{artifact.skip_reason ? `: ${artifact.skip_reason}` : ""}.
                 </p>
               {/each}
               {#if view.pipeline}
                 {@const setup = view.pipeline.steps.filter((step) => step.kind === "setup")}
                 {#if setup.length > 0}
-                  <p class="text-[11px] text-textMuted">
+                  <p class="text-meta text-textMuted">
                     First installs: {#each setup as step, i (step.command)}<code class="font-mono text-textPrimary/80">{step.command}</code>{i < setup.length - 1 ? ", " : ""}{/each}
                   </p>
                 {/if}
                 {#if view.commands.length > 0}
                   <div class="flex flex-wrap items-center gap-1.5">
-                    <span class="text-[11px] text-textMuted shrink-0">Runs</span>
+                    <span class="text-meta text-textMuted shrink-0">Runs</span>
                     {@render commandChips(view)}
                   </div>
                 {:else}
-                  <p class="text-[11px] text-textMuted">
+                  <p class="text-meta text-textMuted">
                     Then runs: {#each view.pipeline.steps.filter((step) => step.kind === "generate") as step (step.command)}<code class="font-mono text-textPrimary/80">{step.command}</code>{" "}{/each}
                   </p>
                 {/if}
                 {#if view.durationHint}
-                  <p class="text-[11px] text-textMuted/80">{view.durationHint}</p>
+                  <p class="text-meta text-textMuted">{view.durationHint}</p>
                 {/if}
               {/if}
-              <p class="text-[10px] text-textMuted/70">
+              <p class="text-micro text-faint">
                 Reads {view.status.expected_formats.join(", ")} reports, such as {view.status.expected_paths.join(", ")}.
               </p>
             </section>
@@ -2008,14 +2073,22 @@
       {:else if isLoadingFile && sourceLines.length === 0}
         <div class="h-full flex items-center justify-center text-textMuted font-sans">Loading {selectedPath}…</div>
       {:else if fileError}
-        <div class="h-full flex items-center justify-center text-rose-400 font-sans p-4">{fileError}</div>
+        <div class="h-full flex items-center justify-center font-sans p-4">
+          <div class="gp-notice max-w-lg" data-tone="danger" role="alert">
+            <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+            <div class="min-w-0 flex-1" title={fileError}>
+              <span class="font-medium">{fileFailure?.headline}</span>
+              {#if fileFailure?.detail}<span class="text-textMuted"> {fileFailure.detail}</span>{/if}
+            </div>
+          </div>
+        </div>
       {:else if sourceLines.length > 0}
         <VirtualList items={sourceLines} contentWidth bind:scrollTop={sourceScrollTop} rowHeight={rowHeight("coverageSource", $densityStore)} overscan={15} class="flex-1 min-h-0">
           {#snippet row(line, index)}
             {#if line !== undefined}
               {@const hits = hitMap.get(index + 1)}
               <div data-coverage-line={index + 1} data-missed-active={activeBlock && index + 1 >= activeBlock.start && index + 1 <= activeBlock.end ? "true" : undefined} class="flex items-center hover:bg-surfaceHover/40 {coverageHitClass(hits)}" class:ring-1={activeBlock && index + 1 >= activeBlock.start && index + 1 <= activeBlock.end} class:ring-inset={!!activeBlock} class:ring-accent={!!activeBlock} style:height={`${rowHeight("coverageSource", $densityStore)}px`}>
-                <span class="w-10 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{index + 1}</span>
+                <span class="w-10 px-2 text-right text-faint text-micro select-none shrink-0">{index + 1}</span>
                 <span class={hitBadgeClass(hits)}>{hits === undefined ? "·" : hits}</span>
                 <span class="px-3 whitespace-pre overflow-hidden text-textPrimary">{line}</span>
               </div>
@@ -2048,19 +2121,21 @@
     </div>
 
     {#if aiOpen && report}
-      <aside class="w-88 shrink-0 border-l border-border/60 flex flex-col bg-surface/30 overflow-hidden font-sans">
-        <div class="px-3 py-2 border-b border-border/60 space-y-2 shrink-0">
-          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+      <aside class="w-88 shrink-0 flex flex-col bg-surface/30 overflow-hidden font-sans">
+        <div class="px-3 py-2 bg-surface/40 space-y-2 shrink-0">
+          <h3 class="gp-label flex items-center gap-1.5">
             <Sparkles size={11} class="text-accent" />
-            MANVI coverage analysis
+            Manvi coverage analysis
           </h3>
           <button
             type="button"
             onclick={generateAiReport}
             disabled={generating}
-            class="gp-btn-primary w-full justify-center"
+            class="gp-btn w-full justify-center"
+            data-variant="primary"
+            data-size="md"
             title={aiReady
-              ? "Send the rendered coverage report to the local model (via the MANVI harness)"
+              ? "Send the rendered coverage report to the local model through Manvi"
               : "Needs a local model server. The exact error will be reported if none is reachable."}
           >
             {#if generating}
@@ -2074,15 +2149,21 @@
         </div>
 
         {#if !aiReady}
-          <div class="px-3 py-2 border-b border-border/40 text-[11px] text-textMuted shrink-0">
-            No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.
+          <div class="px-3 py-2 shrink-0">
+            <div class="gp-notice text-meta" data-tone="info" role="status">
+              <div class="min-w-0 flex-1">No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.</div>
+            </div>
           </div>
         {/if}
 
         <div class="flex-1 overflow-auto p-3 space-y-3 min-h-0">
           {#if aiError}
-            <div class="p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-300">
-              Analysis failed: {aiError}
+            <div class="gp-notice" data-tone="danger" role="alert">
+              <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
+              <div class="min-w-0 flex-1">
+                <span class="font-medium">{aiFailure?.headline}</span>
+                {#if aiFailure?.detail}<span class="text-textMuted"> {aiFailure.detail}</span>{/if}
+              </div>
             </div>
           {/if}
 
@@ -2092,33 +2173,35 @@
               Sending the coverage report to the local model…
             </div>
           {:else if aiGeneration}
-            <p class="text-[11px] text-textMuted font-mono truncate" title="{aiGeneration.model} · {aiGeneration.context_source}">
+            <p class="text-meta text-textMuted font-mono truncate" title="{aiGeneration.model} · {aiGeneration.context_source}">
               {aiGeneration.model} · {aiGeneration.elapsed_ms} ms · {aiGeneration.prompt_tokens}/{aiGeneration.completion_tokens} tokens · {aiGeneration.context_source}
             </p>
             {#if aiGeneration.warnings.length > 0}
               <ul class="space-y-1">
                 {#each aiGeneration.warnings as warning}
-                  <li class="text-amber-400 leading-relaxed">{warning}</li>
+                  <li class="text-warn leading-relaxed">{warning}</li>
                 {/each}
               </ul>
             {/if}
             <div class="whitespace-pre-wrap select-all leading-relaxed text-textSecondary">{aiGeneration.text}</div>
             <div class="flex justify-end">
-              <button type="button" onclick={copyGeneration} class="gp-btn py-1! text-[11px]!" title="Copy the analysis">
+              <button type="button" onclick={copyGeneration} class="gp-btn" data-size="sm" title="Copy the analysis">
                 <Clipboard size={12} />
                 {generationCopied ? "Copied" : "Copy"}
               </button>
             </div>
 
             {#if aiSteps.length > 0}
-              <div class="space-y-2 pt-1 border-t border-border/40">
+              <div class="space-y-2 pt-3">
                 <div class="flex items-center justify-between gap-2 pt-1">
-                  <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Runnable steps</h4>
+                  <h4 class="gp-label">Runnable steps</h4>
                   <button
                     type="button"
                     onclick={runAllSteps}
                     disabled={runControlsDisabled}
-                    class="gp-btn-primary py-1! text-[11px]!"
+                    class="gp-btn"
+                    data-variant="primary"
+                    data-size="sm"
                     title="Execute all executable steps sequentially, stopping at the first failure"
                   >
                     {#if runningAll}
@@ -2132,12 +2215,12 @@
                 </div>
                 {#each aiSteps as step (step.id)}
                   {@const res = stepResults[step.id]}
-                  <div class="p-2.5 rounded-xl border border-border/70 bg-background/60 space-y-1.5">
+                  <div class="p-2.5 rounded-xl border border-edge bg-background/60 space-y-1.5">
                     <div class="flex items-start justify-between gap-2">
                       <div class="space-y-1 min-w-0">
                         <div class="flex items-center gap-2">
                           {#if step.number !== null}
-                            <span class="px-1.5 py-0.2 rounded bg-surface border border-border text-[10px] font-bold text-accent">
+                            <span class="gp-chip" data-tone="accent" data-kind="count">
                               {step.number}
                             </span>
                           {/if}
@@ -2149,18 +2232,19 @@
                           type="button"
                           onclick={() => void runStep(step, beginOps())}
                           disabled={runControlsDisabled}
-                          class="gp-btn py-1! px-2.5! text-xs shrink-0 disabled:opacity-50"
+                          class="gp-btn shrink-0"
+                          data-size="sm"
                           title="Execute this command step directly"
                         >
                           {#if res?.running}
                             <LoaderCircle size={11} class="animate-spin text-accent" />
                             <span>Running…</span>
                           {:else if res?.status === "passed"}
-                            <Check size={11} class="text-emerald-400" />
+                            <Check size={11} class="text-ok" />
                             <span>Run again</span>
                           {:else if res?.status === "failed"}
-                            <Play size={11} class="text-rose-400" />
-                            <span>Retry</span>
+                            <Play size={11} class="text-danger" />
+                            <span>Try again</span>
                           {:else}
                             <Play size={11} class="text-accent" />
                             <span>Run</span>
@@ -2170,29 +2254,30 @@
                     </div>
 
                     {#if step.command}
-                      <div class="px-2.5 py-1.5 rounded-lg bg-surface border border-border/60 font-mono text-[11px] text-textPrimary truncate">
+                      <div class="px-2.5 py-1.5 rounded-lg bg-surface border border-edgeSoft font-mono text-meta text-textPrimary truncate">
                         {step.command}
                       </div>
                     {/if}
 
                     {#if step.error}
-                      <div class="text-[10px] text-amber-300">{step.error}</div>
+                      <div class="text-micro text-warn">{step.error}</div>
                     {/if}
 
                     {#if res?.detail}
                       <div class="relative group">
-                        <div class="p-2 pr-7 rounded bg-surface/80 border border-border/40 font-mono text-[10px] text-textMuted whitespace-pre-wrap max-h-32 overflow-y-auto">
+                        <div class="p-2 pr-7 rounded bg-surface/80 border border-edgeSoft font-mono text-micro text-textMuted whitespace-pre-wrap max-h-32 overflow-y-auto">
                           {res.detail}
                         </div>
                         <button
                           type="button"
                           onclick={() => void copyStepOutput(step, res)}
-                          class="absolute top-1.5 right-1.5 p-1 rounded bg-surface/90 border border-border/60 text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+                          class="gp-icon-btn absolute top-1.5 right-1.5"
+                          data-size="sm"
                           title="Copy step diagnostics"
                           aria-label="Copy step diagnostics"
                         >
                           {#if copiedStepId === step.id}
-                            <Check size={11} class="text-emerald-400" />
+                            <Check size={11} class="text-ok" />
                           {:else}
                             <Clipboard size={11} />
                           {/if}
@@ -2204,7 +2289,7 @@
               </div>
             {/if}
           {:else}
-            <p class="text-textMuted text-[11px] leading-relaxed">
+            <p class="text-textMuted text-meta leading-relaxed">
               Ask the local model what these results mean and which commands would raise coverage.
             </p>
           {/if}

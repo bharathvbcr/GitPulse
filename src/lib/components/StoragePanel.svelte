@@ -21,6 +21,8 @@
   import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
   import { createCopyFlash } from "../desktop/clipboard";
   import Skeleton from "./Skeleton.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import { describeFailure, unknownState } from "../ui/copy/describeFailure";
   import HygienePanel from "./HygienePanel.svelte";
   import CommitGraphWrite from "./CommitGraphWrite.svelte";
   import TuningApply from "./TuningApply.svelte";
@@ -174,14 +176,16 @@
       {
         label: "Build output",
         bytes: current.totals.build_artifacts_bytes,
-        class: "bg-amber-400",
+        class: "bg-warn",
       },
-      { label: "Caches", bytes: current.totals.cache_artifacts_bytes, class: "bg-sky-400" },
-      { label: "Other files", bytes: otherWorktreeBytes, class: "bg-emerald-400" },
+      { label: "Caches", bytes: current.totals.cache_artifacts_bytes, class: "bg-info" },
+      { label: "Other files", bytes: otherWorktreeBytes, class: "bg-ok" },
     ].filter((s) => s.bytes > 0) as Segment[];
   });
 
   let commitGraph = $derived(commitGraphHint(report?.commit_graph));
+  // The headline is built from the action alone; the metric's error text is the reason.
+  let failure = $derived(errorMsg ? describeFailure({ verb: "scan", object: "disk usage" }, errorMsg) : null);
   let hygieneGaps = $derived.by(() => {
     const current = report;
     if (!current) return [] as ArtifactDir[];
@@ -302,7 +306,7 @@
   }
 
   function openManviCleanup() {
-    // Names the section, not just the view: MANVI opens on its Ops pane and
+    // Names the section, not just the view: Manvi opens on its Ops pane and
     // branch cleanup is one card among several down the page.
     requestManviFocus("cleanup");
     repoStore.setActiveTab("work", "policy");
@@ -335,10 +339,10 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
-    <div class="flex items-center gap-2 min-w-0">
+  <div class="gp-header">
+    <div class="flex items-center gap-2 min-w-0 flex-1">
       <HardDrive size={16} class="text-accent shrink-0" />
-      <span class="font-semibold text-textPrimary">Storage</span>
+      <span class="shrink-0 text-sm font-semibold text-textPrimary">Storage</span>
       {#if report}
         <span class="text-textMuted truncate">
           {humanBytes(report.totals.grand_bytes)} total
@@ -346,37 +350,33 @@
           · {humanBytes(report.totals.build_artifacts_bytes + report.totals.cache_artifacts_bytes)} artifacts
         </span>
         {#if report.scan.truncated}
-          <span class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold">
-            partial scan
-          </span>
+          <span class="gp-chip shrink-0" data-tone="warn" data-kind="label">Partial scan</span>
         {/if}
         {#if staleNote && !report.scan.truncated}
           <!--
             A retained report from before the last change must not read as a
             current measurement. This badge is the difference between the two.
           -->
-          <span
-            class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold"
-            title={staleNote}
-          >
-            {loading ? "rescanning" : "out of date"}
+          <span class="gp-chip shrink-0" data-tone="warn" data-kind="label" title={staleNote}>
+            {loading ? "Rescanning" : "Out of date"}
           </span>
         {/if}
       {/if}
     </div>
-    <div class="flex items-center gap-2">
+    <div class="gp-header-actions">
       {#if report}
         <button
           type="button"
           onclick={copyReport}
           class="gp-btn"
+          data-size="sm"
           title="Copy the full storage report as text"
         >
           <Clipboard size={13} />
           {copied ? "Copied" : "Copy report"}
         </button>
       {/if}
-      <button type="button" onclick={() => scan()} class="gp-btn" title="Rescan disk usage">
+      <button type="button" onclick={() => scan()} class="gp-btn" data-size="sm" title="Rescan disk usage">
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Rescan
       </button>
@@ -393,44 +393,53 @@
           <Skeleton variant="text" count={5} height="2rem" />
         </div>
       </div>
-    {:else if errorMsg}
-      <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-2xl">
-        {errorMsg}
+    {:else if errorMsg && failure}
+      <div class="gp-notice max-w-2xl" data-tone="danger" role="alert">
+        <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1">
+          <p class="font-medium">{failure.headline}</p>
+          {#if failure.detail}
+            <p class="mt-1 text-textMuted wrap-break-word">{failure.detail}</p>
+          {/if}
+        </div>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => scan()}>
+          {failure.retryLabel}
+        </button>
       </div>
     {:else if report}
       <!-- Overview -->
       <section class="space-y-3 max-w-4xl">
         <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
-          <div class="p-3 rounded-2xl border border-border/70 bg-surface shadow-card">
-            <div class="text-[10px] uppercase tracking-wider text-textMuted">Total</div>
+          <div class="gp-card p-3">
+            <div class="gp-label">Total</div>
             <div class="text-base font-semibold text-textPrimary">{humanBytes(report.totals.grand_bytes)}</div>
           </div>
-          <div class="p-3 rounded-2xl border border-border/70 bg-surface shadow-card">
-            <div class="text-[10px] uppercase tracking-wider text-textMuted">Git data</div>
+          <div class="gp-card p-3">
+            <div class="gp-label">Git data</div>
             <div class="text-base font-semibold text-textPrimary">{humanBytes(report.totals.git_dir_bytes)}</div>
           </div>
-          <div class="p-3 rounded-2xl border border-border/70 bg-surface shadow-card">
-            <div class="text-[10px] uppercase tracking-wider text-textMuted">Build + caches</div>
-            <div class="text-base font-semibold text-amber-300">
+          <div class="gp-card p-3">
+            <div class="gp-label">Build + caches</div>
+            <div class="text-base font-semibold text-warn">
               {humanBytes(report.totals.build_artifacts_bytes + report.totals.cache_artifacts_bytes)}
             </div>
           </div>
-          <div class="p-3 rounded-2xl border border-border/70 bg-surface shadow-card">
-            <div class="text-[10px] uppercase tracking-wider text-textMuted">Reclaimable hints</div>
+          <div class="gp-card p-3">
+            <div class="gp-label">Reclaimable hints</div>
             <div class="text-base font-semibold text-textPrimary">
               {hygieneGaps.length}{report.git.gc_recommended ? "+gc" : ""}
             </div>
           </div>
         </div>
 
-        <div class="rounded-2xl border border-border/70 bg-surface shadow-card p-3 space-y-2">
-          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Where the bytes are</h3>
+        <div class="gp-card p-3 space-y-2">
+          <h3 class="gp-label">Where the bytes are</h3>
           <div class="h-3 w-full rounded-full overflow-hidden flex bg-surfaceHover">
             {#each segments as segment (segment.label)}
               <div class={segment.class} style="width: {pctOf(segment.bytes, report.totals.grand_bytes).toFixed(2)}%"></div>
             {/each}
           </div>
-          <div class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-textMuted">
+          <div class="flex flex-wrap gap-x-4 gap-y-1 text-meta text-textMuted">
             {#each segments as segment (segment.label)}
               <span class="inline-flex items-center gap-1.5">
                 <span class="inline-block h-2 w-2 rounded-sm {segment.class}"></span>
@@ -446,47 +455,49 @@
       <!-- Hygiene gaps -->
       {#if hygieneGaps.length > 0}
         <section class="space-y-2 max-w-4xl">
-          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
-            <AlertTriangle size={11} class="text-amber-300" />
+          <h3 class="gp-label flex items-center gap-1.5">
+            <AlertTriangle size={11} class="text-warn" />
             Hygiene gaps ({hygieneGaps.length})
           </h3>
           {#each hygieneGaps as artifact (artifact.path)}
-            <div class="px-3 py-2 rounded-xl border border-amber-500/30 bg-amber-500/5">
-              <div class="flex items-center gap-2">
-                <span class="font-mono text-textPrimary truncate">{artifact.path}</span>
-                <span class="text-[10px] uppercase px-1.5 py-0.5 rounded-full bg-surfaceHover text-textMuted">{artifact.kind}</span>
+            <div class="gp-notice" data-tone="warn">
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2">
+                  <span class="font-mono text-textPrimary truncate">{artifact.path}</span>
+                  <span class="gp-chip shrink-0 capitalize" data-tone="neutral" data-kind="label">{artifact.kind}</span>
+                  {#if artifact.checks_unexamined}
+                    <span class="gp-chip shrink-0" data-tone="warn" data-kind="label">Not checked</span>
+                  {:else if artifact.unignored}
+                    <span class="gp-chip shrink-0" data-tone="warn" data-kind="label">Not ignored</span>
+                  {/if}
+                  {#if !artifact.scan_complete}
+                    <span class="gp-chip shrink-0" data-tone="warn" data-kind="label">Not read in full</span>
+                  {/if}
+                  {#if artifact.tracked_files > 0}
+                    <span class="gp-chip shrink-0" data-tone="danger" data-kind="label">
+                      {artifact.tracked_files} file{artifact.tracked_files === 1 ? "" : "s"} committed
+                    </span>
+                  {/if}
+                  <span class="ml-auto font-mono text-textMuted">{humanBytes(artifact.bytes)}</span>
+                </div>
                 {#if artifact.checks_unexamined}
-                  <span class="text-[10px] uppercase font-semibold text-amber-300">not checked</span>
+                  <p class="mt-1 text-meta text-textMuted">
+                    Git did not answer whether this directory is ignored or tracked, so it is not treated as disposable.
+                  </p>
+                {:else if !artifact.scan_complete}
+                  <p class="mt-1 text-meta text-textMuted">
+                    The walk did not reach the end of this directory, so its size is a floor and what the rest of it holds is unknown.
+                  </p>
                 {:else if artifact.unignored}
-                  <span class="text-[10px] uppercase font-semibold text-amber-300">not ignored</span>
+                  <p class="mt-1 text-meta text-textMuted">
+                    No ignore rule covers this directory — it shows up in every status listing and can slip into commits.
+                  </p>
+                {:else}
+                  <p class="mt-1 text-meta text-textMuted">
+                    Ignored today, but committed copies stay in history forever. Removing them needs a history rewrite.
+                  </p>
                 {/if}
-                {#if !artifact.scan_complete}
-                  <span class="text-[10px] uppercase font-semibold text-amber-300">not read in full</span>
-                {/if}
-                {#if artifact.tracked_files > 0}
-                  <span class="text-[10px] uppercase font-semibold text-rose-300">
-                    {artifact.tracked_files} file{artifact.tracked_files === 1 ? "" : "s"} committed
-                  </span>
-                {/if}
-                <span class="ml-auto font-mono text-textMuted">{humanBytes(artifact.bytes)}</span>
               </div>
-              {#if artifact.checks_unexamined}
-                <p class="mt-1 text-[11px] text-textMuted">
-                  Git did not answer whether this directory is ignored or tracked, so it is not treated as disposable.
-                </p>
-              {:else if !artifact.scan_complete}
-                <p class="mt-1 text-[11px] text-textMuted">
-                  The walk did not reach the end of this directory, so its size is a floor and what the rest of it holds is unknown.
-                </p>
-              {:else if artifact.unignored}
-                <p class="mt-1 text-[11px] text-textMuted">
-                  No ignore rule covers this directory — it shows up in every status listing and can slip into commits.
-                </p>
-              {:else}
-                <p class="mt-1 text-[11px] text-textMuted">
-                  Ignored today, but committed copies stay in history forever. Removing them needs a history rewrite.
-                </p>
-              {/if}
             </div>
           {/each}
         </section>
@@ -494,60 +505,60 @@
 
       <!-- Git internals -->
       <section class="space-y-2 max-w-4xl">
-        <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+        <h3 class="gp-label flex items-center gap-1.5">
           <FolderTree size={11} />
           Git internals · {humanBytes(report.git.total_bytes)}
         </h3>
-        <div class="border border-border/70 rounded-2xl overflow-hidden max-w-4xl shadow-card">
+        <div class="gp-card overflow-hidden max-w-4xl">
           <table class="w-full text-left">
             <tbody>
-              <tr class="border-b border-border/40">
+              <tr class="even:bg-surfaceHover/40">
                 <td class="px-3 py-1.5 text-textPrimary">Packfiles</td>
                 <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.pack_bytes)}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{report.git.pack_file_count} pack(s)</td>
               </tr>
-              <tr class="border-b border-border/40">
+              <tr class="even:bg-surfaceHover/40">
                 <td class="px-3 py-1.5 text-textPrimary">
                   Loose objects
                   {#if report.git.gc_recommended}
-                    <span class="ml-1 text-[10px] uppercase font-semibold text-amber-300">git gc advised</span>
+                    <span class="gp-chip ml-1" data-tone="warn" data-kind="label">git gc advised</span>
                   {/if}
                 </td>
                 <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.loose_bytes)}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{report.git.loose_object_count} object(s)</td>
               </tr>
-              <tr class="border-b border-border/40">
+              <tr class="even:bg-surfaceHover/40">
                 <td class="px-3 py-1.5 text-textPrimary">Reflogs</td>
                 <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.reflog_bytes)}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">grows until expired</td>
               </tr>
               {#if report.git.lfs_bytes > 0}
-                <tr class="border-b border-border/40">
+                <tr class="even:bg-surfaceHover/40">
                   <td class="px-3 py-1.5 text-textPrimary">Git LFS</td>
                   <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.lfs_bytes)}</td>
                   <td></td>
                 </tr>
               {/if}
               {#if report.git.modules_bytes > 0}
-                <tr class="border-b border-border/40">
+                <tr class="even:bg-surfaceHover/40">
                   <td class="px-3 py-1.5 text-textPrimary">Submodules (.git/modules)</td>
                   <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.modules_bytes)}</td>
                   <td></td>
                 </tr>
               {/if}
               {#if report.git.worktrees_admin_bytes > 0}
-                <tr class="border-b border-border/40">
+                <tr class="even:bg-surfaceHover/40">
                   <td class="px-3 py-1.5 text-textPrimary">Linked-worktree admin</td>
                   <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.worktrees_admin_bytes)}</td>
                   <td></td>
                 </tr>
               {/if}
-              <tr class="border-b border-border/40">
+              <tr class="even:bg-surfaceHover/40">
                 <td class="px-3 py-1.5 text-textPrimary">Index</td>
                 <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.index_bytes)}</td>
                 <td></td>
               </tr>
-              <tr>
+              <tr class="even:bg-surfaceHover/40">
                 <td class="px-3 py-1.5 text-textPrimary">Other (.git)</td>
                 <td class="px-3 py-1.5 font-mono text-textSecondary">{humanBytes(report.git.other_bytes)}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">hooks, info, temp objects</td>
@@ -558,17 +569,17 @@
         {#if commitGraph}
           <!-- The hint itself is display text; the confirmed, gated write is CommitGraphWrite below. -->
           <div
-            class="rounded-2xl border border-border/70 bg-surface p-3 space-y-1"
+            class="gp-card p-3 space-y-1"
             data-testid="commit-graph-hint"
             data-tone={commitGraph.tone}
           >
-            <div class="text-[11px] font-semibold {commitGraph.tone === 'advice' ? 'text-amber-300' : 'text-textSecondary'}">
+            <div class="text-meta font-semibold {commitGraph.tone === 'advice' ? 'text-warn' : 'text-textSecondary'}">
               {commitGraph.title}
             </div>
-            <p class="text-[11px] text-textMuted">{commitGraph.detail}</p>
+            <p class="text-meta text-textMuted">{commitGraph.detail}</p>
             {#if commitGraph.command}
-              <p class="text-[11px] text-textMuted">Run this in the repository to build one:</p>
-              <code class="block select-all font-mono text-[11px] text-textPrimary" data-testid="commit-graph-command">{commitGraph.command}</code>
+              <p class="text-meta text-textMuted">Run this in the repository to build one:</p>
+              <code class="block select-all font-mono text-meta text-textPrimary" data-testid="commit-graph-command">{commitGraph.command}</code>
             {/if}
           </div>
         {/if}
@@ -600,7 +611,7 @@
       -->
       {#if report.reclaim.length > 0}
         <section class="space-y-2 max-w-4xl">
-          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          <h3 class="gp-label flex items-center gap-1.5">
             <Trash2 size={11} />
             Reclaim audit ({report.reclaim_summary.item_count})
           </h3>
@@ -619,14 +630,14 @@
               </span>
             {/if}
             {#if report.reclaim_summary.partial}
-              <span class="text-amber-300">
+              <span class="text-warn">
                 scan was cut short — this is a floor, not a total
               </span>
             {/if}
           </div>
           <div class="space-y-1">
             {#each keyedList(report.reclaim, (item) => JSON.stringify([item.category, item.label])) as { item, key: renderKey } (renderKey)}
-              <div class="rounded border border-border/60 bg-surface/40 px-3 py-2 space-y-1">
+              <div class="rounded-xl bg-surface px-3 py-2 space-y-1">
                 <div class="flex items-baseline justify-between gap-3">
                   <span class="font-mono text-textPrimary truncate" title={item.label}>
                     {item.label}
@@ -634,23 +645,19 @@
                   <span class="shrink-0 text-textMuted">
                     {item.bytes > 0 ? humanBytes(item.bytes) : "—"}
                     {#if item.confidence === "estimated"}
-                      <span class="text-[10px] uppercase">est.</span>
+                      <span class="text-micro">est.</span>
                     {/if}
                   </span>
                 </div>
                 <div class="text-textMuted">{item.detail}</div>
                 <div class="flex flex-wrap items-center gap-2">
-                  <code class="text-[11px] text-accent">{item.action}</code>
+                  <code class="text-meta text-accent">{item.action}</code>
                   {#if item.safety === "needs_review"}
-                    <span
-                      class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold"
-                    >
-                      needs review
-                    </span>
+                    <span class="gp-chip" data-tone="warn" data-kind="label">Needs review</span>
                   {/if}
                 </div>
                 {#if item.blocked_reason}
-                  <div class="text-amber-300">{item.blocked_reason}</div>
+                  <div class="text-warn">{item.blocked_reason}</div>
                 {/if}
               </div>
             {/each}
@@ -665,24 +672,24 @@
       <!-- Build & cache dirs -->
       {#if report.artifacts.length > 0}
         <section class="space-y-2 max-w-4xl">
-          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          <h3 class="gp-label flex items-center gap-1.5">
             <Boxes size={11} />
             Build &amp; cache directories ({report.artifacts.length})
           </h3>
           <div class="space-y-1">
             {#each report.artifacts as artifact (artifact.path)}
-              <div class="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-border/50 bg-surface/60">
+              <div class="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-surface">
                 <span class="font-mono text-textPrimary truncate max-w-[40%]" title={artifact.path}>{artifact.path}</span>
                 <div class="flex-1 h-1.5 rounded-full bg-surfaceHover overflow-hidden min-w-16">
                   <div
-                    class={artifact.kind === "build" ? "bg-amber-400" : "bg-sky-400"}
+                    class={artifact.kind === "build" ? "bg-warn" : "bg-info"}
                     style="width: {artifactBar(artifact.bytes).toFixed(1)}%"
                   ></div>
                 </div>
                 <span class="font-mono text-textSecondary w-20 text-right">{humanBytes(artifact.bytes)}</span>
-                {#if artifact.checks_unexamined}<span title="Git did not answer whether this directory is ignored or tracked"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if !artifact.scan_complete}<span title="The walk did not reach the end of this directory, so its size is a floor"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-amber-300" /></span>{/if}
+                {#if artifact.checks_unexamined}<span title="Git did not answer whether this directory is ignored or tracked"><AlertTriangle size={12} class="text-warn" /></span>{:else if !artifact.scan_complete}<span title="The walk did not reach the end of this directory, so its size is a floor"><AlertTriangle size={12} class="text-warn" /></span>{:else if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-warn" /></span>{/if}
                 {#if artifact.tracked_files > 0}
-                  <span class="text-[10px] font-mono text-rose-300" title="Committed files inside an artifact directory">
+                  <span class="text-micro font-mono text-danger" title="Committed files inside an artifact directory">
                     {artifact.tracked_files}✓
                   </span>
                 {/if}
@@ -695,14 +702,14 @@
       <!-- Largest files -->
       {#if report.largest_files.length > 0}
         <section class="space-y-2 max-w-4xl">
-          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          <h3 class="gp-label">
             Largest working-tree files ({report.largest_files.length}, ≥10 MB)
           </h3>
-          <div class="border border-border/70 rounded-2xl overflow-hidden max-w-4xl shadow-card">
+          <div class="gp-card overflow-hidden max-w-4xl">
             <table class="w-full text-left">
               <tbody>
                 {#each report.largest_files as file (file.path)}
-                  <tr class="border-b border-border/40 last:border-b-0">
+                  <tr class="even:bg-surfaceHover/40">
                     <td class="px-3 py-1.5 font-mono text-textPrimary truncate max-w-md" title={file.path}>{file.path}</td>
                     <td class="px-3 py-1.5 font-mono text-textSecondary text-right whitespace-nowrap">{humanBytes(file.bytes)}</td>
                   </tr>
@@ -716,14 +723,14 @@
       <!-- Linked worktrees -->
       {#if report.worktrees.length > 0}
         <section class="space-y-2 max-w-4xl">
-          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          <h3 class="gp-label">
             Linked worktrees ({report.worktrees.length})
           </h3>
-          <div class="border border-border/70 rounded-2xl overflow-hidden max-w-4xl shadow-card">
+          <div class="gp-card overflow-hidden max-w-4xl">
             <table class="w-full text-left">
               <tbody>
                 {#each report.worktrees as worktree (worktree.path)}
-                  <tr class="border-b border-border/40 last:border-b-0">
+                  <tr class="even:bg-surfaceHover/40">
                     <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={worktree.path}>{worktree.name}</td>
                     <td class="px-3 py-1.5 text-textSecondary">{worktree.branch ?? "detached"}</td>
                     <td class="px-3 py-1.5 font-mono text-textSecondary text-right whitespace-nowrap">
@@ -739,32 +746,41 @@
 
       <!-- Branch weight -->
       <section class="space-y-2 max-w-4xl">
-        <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+        <h3 class="gp-label flex items-center gap-1.5">
           <GitBranch size={11} />
           Branch weight
         </h3>
         {#if report.branches.error}
-          <div class="px-3 py-2 rounded-xl border border-amber-500/30 bg-amber-500/5 text-amber-200">
-            Could not summarize branches: {report.branches.error}
+          <!-- The summary did not run, so the counts are unknown rather than zero. -->
+          {@const unknown = unknownState("branch weight", report.branches.error)}
+          <div class="gp-notice" data-tone="unknown" role="status">
+            <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+            <div class="min-w-0 flex-1">
+              <p class="font-medium">{unknown.title}</p>
+              <p class="mt-1 text-textMuted wrap-break-word">{unknown.reason}</p>
+            </div>
+            <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => scan()}>
+              {unknown.actionLabel}
+            </button>
           </div>
         {:else}
-          <div class="px-3 py-2 rounded-xl border border-border/70 bg-surface/60 flex flex-wrap items-center gap-x-4 gap-y-1">
+          <div class="px-3 py-2 rounded-xl bg-surface flex flex-wrap items-center gap-x-4 gap-y-1">
             <span><span class="font-semibold text-textPrimary">{report.branches.local_count}</span> <span class="text-textMuted">local</span></span>
             <span><span class="font-semibold text-textPrimary">{report.branches.remote_tracking_count}</span> <span class="text-textMuted">remote-tracking</span></span>
-            <span><span class="font-semibold text-amber-300">{report.branches.merged_stale_count}</span> <span class="text-textMuted">merged-stale</span></span>
+            <span><span class="font-semibold text-warn">{report.branches.merged_stale_count}</span> <span class="text-textMuted">merged-stale</span></span>
             {#if report.branches.merged_unchecked_count > 0}
-              <span class="text-amber-300" title="Their squash/rebase comparison did not run, so merged-stale may undercount">{report.branches.merged_unchecked_count} not checked for squash merges</span>
+              <span class="text-warn" title="Their squash/rebase comparison did not run, so merged-stale may undercount">{report.branches.merged_unchecked_count} not checked for squash merges</span>
             {/if}
-            <span><span class="font-semibold text-rose-300">{report.branches.gone_upstream_count}</span> <span class="text-textMuted">upstream gone</span></span>
+            <span><span class="font-semibold text-danger">{report.branches.gone_upstream_count}</span> <span class="text-textMuted">upstream gone</span></span>
             {#if report.branches.merged_stale_count > 0}
-              <button type="button" onclick={openManviCleanup} class="gp-btn py-0.5! ml-auto" title="Review the conservative cleanup plan in the MANVI view">
+              <button type="button" onclick={openManviCleanup} class="gp-btn ml-auto" data-size="sm" title="Review the conservative cleanup plan in the Manvi view">
                 <Sparkles size={11} />
-                Clean up in MANVI
+                Clean up in Manvi
               </button>
             {/if}
           </div>
           {#if report.branches.sample_merged_stale.length > 0}
-            <p class="text-[11px] text-textMuted font-mono truncate">
+            <p class="text-meta text-textMuted font-mono truncate">
               merged-stale: {report.branches.sample_merged_stale.join(", ")}
             </p>
           {/if}
@@ -774,38 +790,41 @@
       <!-- Usage history -->
       <section class="space-y-2 max-w-4xl pb-4">
         <div class="flex items-center justify-between">
-          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          <h3 class="gp-label flex items-center gap-1.5">
             <Clock size={11} />
             Usage history
             {#if series.length > 0}
-              <span class="normal-case font-normal text-textMuted">· {series.length} snapshot{series.length === 1 ? "" : "s"}, since {formatAge(series[0].t)}</span>
+              <span class="font-normal text-textMuted">· {series.length} snapshot{series.length === 1 ? "" : "s"}, since {formatAge(series[0].t)}</span>
             {/if}
           </h3>
           {#if series.length > 0}
-            <button type="button" onclick={clearHistory} class="gp-btn py-0.5!" title="Forget this repository's stored snapshots">
+            <button type="button" onclick={clearHistory} class="gp-btn" data-size="sm" title="Forget this repository's stored snapshots">
               <Trash2 size={11} />
               Clear
             </button>
           {/if}
         </div>
-        {#if series.length < 2}
-          <p class="text-textMuted">
-            {series.length === 0
-              ? "No snapshots yet. Every completed scan records one here."
-              : "One snapshot so far — rescan later (≥15 minutes apart) to start the trend."}
-          </p>
+        {#if series.length === 0}
+          <EmptyState
+            compact
+            icon={Clock}
+            title="No snapshots yet"
+            hint="Every completed scan records one here."
+          />
+        {:else if series.length === 1}
+          <p class="text-textMuted">One snapshot so far — rescan later (≥15 minutes apart) to start the trend.</p>
         {:else}
-          <div class="rounded-2xl border border-border/70 bg-surface shadow-card p-3 space-y-2">
-            <svg viewBox="0 0 100 28" preserveAspectRatio="none" class="w-full h-14" role="img" aria-label="Total size over time">
+          <div class="gp-card p-3 space-y-2">
+            <svg viewBox="0 0 100 28" preserveAspectRatio="none" class="w-full h-14 text-accent" role="img" aria-label="Total size over time">
               <polyline
                 points={sparkPoints}
                 fill="none"
-                stroke="var(--accent-color, #8b5cf6)"
+                stroke="currentColor"
                 stroke-width="1.2"
                 vector-effect="non-scaling-stroke"
               />
             </svg>
-            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-meta">
               <span class="text-textMuted">
                 {formatDelta(lastDelta?.bytes ?? 0)}
                 <span class="opacity-70">since {formatAge(series[series.length - 2].t, series[series.length - 1].t) === "just now" ? "previous scan" : `previous scan (${formatSnapshotTime(series[series.length - 2].t)})`}</span>
@@ -822,21 +841,27 @@
           </div>
         {/if}
         {#if report.scan.permission_denied > 0 || report.scan.unreadable > 0 || report.scan.unaudited > 0 || report.scan.non_utf8 > 0 || report.scan.truncated}
-          <p class="text-[11px] text-amber-300">
-            {report.scan.permission_denied > 0 ? `${report.scan.permission_denied} location(s) unreadable. ` : ""}
-            {report.scan.unreadable > 0 ? `${report.scan.unreadable} location(s) failed to read and are not counted. ` : ""}
-            {report.scan.unaudited > 0 ? `${report.scan.unaudited} item(s) were beyond an audit cap and not examined. ` : ""}
-            {report.scan.non_utf8 > 0 ? `${report.scan.non_utf8} name(s) are not valid UTF-8 (measured, shown approximately). ` : ""}
-            {report.scan.truncated ? "Scan hit a safety budget or skipped unreadable locations; totals are floors." : ""}
-          </p>
+          <div class="gp-notice" data-tone="warn" role="status">
+            <p class="min-w-0 flex-1 text-meta">
+              {report.scan.permission_denied > 0 ? `${report.scan.permission_denied} location(s) unreadable. ` : ""}
+              {report.scan.unreadable > 0 ? `${report.scan.unreadable} location(s) couldn't be read and are not counted. ` : ""}
+              {report.scan.unaudited > 0 ? `${report.scan.unaudited} item(s) were beyond an audit cap and not examined. ` : ""}
+              {report.scan.non_utf8 > 0 ? `${report.scan.non_utf8} name(s) are not valid UTF-8 (measured, shown approximately). ` : ""}
+              {report.scan.truncated ? "Scan hit a safety budget or skipped unreadable locations; totals are floors." : ""}
+            </p>
+          </div>
         {:else}
-          <p class="text-[11px] text-textMuted">
+          <p class="text-meta text-textMuted">
             {report.scan.files_visited.toLocaleString()} files visited in {report.scan.elapsed_ms} ms.
           </p>
         {/if}
       </section>
     {:else}
-      <div class="text-textMuted">Open a repository to measure its disk usage.</div>
+      <EmptyState
+        icon={HardDrive}
+        title="No storage report yet"
+        hint="Open a repository to measure its disk usage."
+      />
     {/if}
   </div>
 </div>
