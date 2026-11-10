@@ -20,7 +20,11 @@
     Copy,
     Check,
     Bug,
+    GitBranchPlus,
+    RotateCcw,
   } from "@lucide/svelte";
+  import { createBranchAt, resetKeepTo } from "../branches/commitActions";
+  import { historySelectionLabel, labelFor } from "../views/historyList";
   import {
     suspectsQuery,
     suspectMarks,
@@ -81,6 +85,9 @@
   let filterActive = $derived(
     $filterStore.searchQuery.trim() !== "" || Boolean($filterStore.selectedBranch),
   );
+  // What the list that selected this commit calls it (a reflog selector), for
+  // the branch-here and reset-here prompts.
+  let actionLabel = $derived(labelFor($historySelectionLabel, selectedCommit?.id));
   let readDetails = $derived(details !== null && details.id === selectedCommit?.id ? details : null);
   let headerSummary = $derived(
     offGraph && readDetails ? readDetails.summary : (selectedCommit?.summary ?? ""),
@@ -369,6 +376,27 @@
           {sig.text}
         </span>
         <FreshnessBadge freshness={provenance} />
+        <!-- What can be done to this commit, whichever list selected it. HEAD
+             moves used to carry these on every row; they are the same two
+             actions as the graph's row menu, from one owner. -->
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+          onclick={() => void createBranchAt(selectedCommit.id, actionLabel)}
+          title="Create a branch at this commit — the non-destructive way back to it"
+          aria-label="Create a branch at this commit"
+        >
+          <GitBranchPlus size={13} /> Branch
+        </button>
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-rose-400"
+          onclick={() => void resetKeepTo(selectedCommit.id, actionLabel)}
+          title="Reset the current branch here (keeps local changes)… — previews which commits would leave the branch first"
+          aria-label="Reset the current branch to this commit"
+        >
+          <RotateCcw size={13} /> Reset
+        </button>
         <button
           type="button"
           class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-textPrimary"

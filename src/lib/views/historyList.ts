@@ -1,3 +1,5 @@
+import { writable } from "svelte/store";
+
 /**
  * Which list History › Graph draws above the commit details.
  *
@@ -73,4 +75,19 @@ export function restoredHistoryList(record: {
     if (history === RETIRED_SUSPECTS_SECTION) return "suspects";
   }
   return "commits";
+}
+
+/**
+ * What the selected commit is called in the list that selected it, when that
+ * is more than its hash: a reflog selector (`HEAD@{3}`). The details pane's
+ * actions name it in their prompts. Keyed by commit, so a selection made
+ * anywhere else reads as unlabelled rather than inheriting a stale name.
+ */
+export const historySelectionLabel = writable<{ commitId: string; label: string } | null>(null);
+
+export function labelFor(
+  held: { commitId: string; label: string } | null,
+  commitId: string | null | undefined,
+): string | undefined {
+  return held && commitId && held.commitId === commitId ? held.label : undefined;
 }

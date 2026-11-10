@@ -115,6 +115,11 @@ fixtures.cmd_codeintel_suspects=a=>{calls.push({cmd:"cmd_codeintel_suspects",arg
  response:{source_freshness:{fresh:true},available:true,items:SUSPECTS.map((commit,i)=>({commit,author:"Ada",author_time:1_700_000_000-i*3600,evidence:i===1?"moved_only":"body_changed",score:30-i*10,nearest_distance:i,touched:[{qualified_name:`parser::step_${i}`,file_path:"src/parser.rs",distance:i,lines:3,body_changed:i===1?false:true}]})),total:3,shown:3,truncated:false},
  scope:{indexed_head:hex(0),since:a.since,cone_size:7,blamed_symbols:5,refusals:[]},
 };};
+// The details pane's commit actions.
+const PREVIEW={head:hex(0),target:hex(2),branch:"main",leaving:[{commit_id:hex(0),summary:"commit number 0"},{commit_id:hex(1),summary:"commit number 1"}],leaving_total:2,unreachable_total:1,gaining_total:0};
+fixtures.cmd_reset_preview=a=>{calls.push({cmd:"cmd_reset_preview",args:a});return {...PREVIEW,target:a.target};};
+fixtures.cmd_reset=a=>{calls.push({cmd:"cmd_reset",args:a});return null;};
+fixtures.cmd_create_branch=a=>{calls.push({cmd:"cmd_create_branch",args:a});return null;};
 fixtures.cmd_get_reflog=a=>{calls.push({cmd:"cmd_get_reflog",args:a});return reflog;};
 fixtures.cmd_get_commit_details=a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:a.commitId===ORPHAN?"Orphan Author":"Ada",author_email:"ada@example.com",author_date:"Tue Nov 14 2023",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:`details of ${a.commitId.slice(0,4)}`,body:"",co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};};
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
@@ -127,6 +132,7 @@ const HistoryView=(await import("../src/lib/components/HistoryView.svelte")).def
 const loadReflog=()=>import("../src/lib/components/ReflogViewer.svelte");
 const loadSuspects=()=>import("../src/lib/components/SuspectsList.svelte");
 const {suspectsQuery}=await import("../src/lib/codeintel/suspectsQuery.ts");
+const {promptState,completePrompt}=await import("../src/lib/stores/modalStore.ts");
 const {results,check,stopped}=createChecks();
 const preview=document.getElementById("preview");
 const wait=(ms=60)=>new Promise(r=>setTimeout(r,ms));
@@ -189,6 +195,24 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  await until(()=>details()?.textContent.includes("commit number 2"),"drawn details");
  check("a drawn entry's commit opens with its graph row, unmarked",()=>!details().textContent.includes("Not in the graph"));
  check("the current mark follows the click",()=>entry("HEAD@{2}").getAttribute("aria-current")==="true"&&!entry("HEAD@{1}").hasAttribute("aria-current"));
+
+ // --- the commit's actions live in the details pane ------------------------
+ check("reflog rows carry no branch or reset buttons of their own",()=>!entry("HEAD@{2}").querySelector('button[aria-label^="Create a branch"],button[aria-label^="Reset"]'));
+ const resetButton=()=>details().querySelector('button[aria-label="Reset the current branch to this commit"]');
+ const branchButton=()=>details().querySelector('button[aria-label="Create a branch at this commit"]');
+ check("the details pane offers branch-here and reset-here for the selected entry",()=>resetButton()&&branchButton());
+ resetButton().click();
+ await until(()=>get(promptState),"reset confirmation");
+ check("reset previews first, then asks, naming the entry and what leaves the branch",()=>{const p=get(promptState).options;return callsOf("cmd_reset_preview").at(-1)?.args.target===hex(2)&&p.message.includes("(HEAD@{2})")&&p.message.includes("2 commits would leave the branch")&&p.destructive===true&&callsOf("cmd_reset").length===0;});
+ completePrompt(true);
+ await until(()=>callsOf("cmd_reset").length>0,"reset ran");
+ check("and resets with --keep to the previewed commit",()=>{const a=callsOf("cmd_reset").at(-1).args;return a.mode==="keep"&&a.target===hex(2);});
+ branchButton().click();
+ await until(()=>get(promptState),"branch prompt");
+ check("branch-here asks for a name at the entry",()=>get(promptState).options.message.includes("(HEAD@{2})"));
+ completePrompt("recovered/parser");
+ await until(()=>callsOf("cmd_create_branch").length>0,"branch created");
+ check("and creates it at that commit",()=>{const a=callsOf("cmd_create_branch").at(-1).args;return JSON.stringify(a).includes("recovered/parser")&&JSON.stringify(a).includes(hex(2));});
 
  // --- a reload that stops drawing the clicked entry ------------------------
  // What App does when the filter changes or a watcher refresh lands: reload

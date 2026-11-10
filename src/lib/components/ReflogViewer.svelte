@@ -8,23 +8,18 @@
 </script>
 
 <script lang="ts">
-  import type { ReflogEntry, ResetPreview } from "../branches/types";
+  import type { ReflogEntry } from "../branches/types";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { filterReflogEntries } from "../branches/reflogFilter";
   import { invoke } from "../ipc/invoke";
-  import { GitBranchPlus, History, RotateCcw } from "@lucide/svelte";
+  import { History } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatDate, plural, shortHash } from "../format";
-  import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
-  import { askConfirm, askText } from "../stores/modalStore";
-  import { toastStore } from "../stores/toastStore";
-  import { reportFailure } from "../stores/mutationOutcome";
-  import { describeResetPreview } from "../branches/resetPreview";
   import { suspectsQuery, suspectMarks } from "../codeintel/suspectsQuery";
 
   const REFLOG_ENTRY_LIMIT = 200;
@@ -85,67 +80,26 @@
     repoStore.selectHistoryCommit(entry.commit_id, {
       summary: `${entry.action}: ${entry.message}`,
       pin: true,
+      // The details pane's branch-here and reset-here name it by this.
+      label: entry.selector,
     });
-  }
-
-  /** The non-destructive way back: a new branch at the entry's commit. */
-  async function branchHere(entry: ReflogEntry) {
-    // The repository this was asked about, held across the prompt.
-    const target = repoStore.captureTarget();
-    const name = await askText({
-      title: "Create Branch Here",
-      message: `New branch at ${shortHash(entry.commit_id, 8)} (${entry.selector}: ${entry.message})`,
-      placeholder: "recovered/work",
-      confirmLabel: "Create Branch",
-    });
-    const trimmed = name?.trim();
-    if (!trimmed) return;
-    const outcome = await repoStore.createBranch(trimmed, entry.commit_id, target);
-    if (!reportFailure(outcome, "Could not create the branch")) return;
-    toastStore.success(`Created branch "${trimmed}" at ${shortHash(entry.commit_id)}`);
-    void load();
   }
 
   /**
-   * Moves the current branch to the entry's commit with `reset --keep`.
-   *
-   * The preview is read first so the confirmation names every commit the
-   * branch would drop — and how many of them nothing else still reaches.
-   * `--keep` never destroys uncommitted work: git refuses the reset when a
-   * local change would be overwritten, and that refusal is what is shown.
+   * HEAD moved (a reset or checkout from the details pane, a commit made in
+   * the terminal): the reflog gained an entry. Keyed on the graph's head for
+   * the same repository only — a repository switch is the effect below's.
    */
-  async function resetHere(entry: ReflogEntry) {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const target = repoStore.captureTarget();
-    let preview: ResetPreview;
-    try {
-      preview = await invoke<ResetPreview>("cmd_reset_preview", {
-        repoPath: repo,
-        target: entry.commit_id,
-      });
-    } catch (err) {
-      toastStore.error(`Could not preview the reset: ${formatError(err)}`);
-      return;
-    }
-    if (repo !== $repoStore.currentPath) return;
-    const described = describeResetPreview(preview, entry.selector);
-    const confirmed = await askConfirm({
-      title: described.title,
-      message: described.message,
-      confirmLabel: "Reset",
-      destructive: preview.leaving_total > 0,
+  let seenHead: { repo: string | null; head: string | null } | null = null;
+  $effect(() => {
+    const repo = $currentRepoPath;
+    const head = $graphStore.headId;
+    untrack(() => {
+      const prev = seenHead;
+      seenHead = { repo, head };
+      if (prev && prev.repo === repo && head && prev.head !== head) void load();
     });
-    if (!confirmed) return;
-    // The peeled oid, not the name: what was previewed is what moves.
-    const outcome = await repoStore.resetTo("keep", preview.target, target);
-    if (!reportFailure(outcome, "Could not reset")) return;
-    toastStore.success(
-      `${preview.branch ?? "HEAD"} reset to ${shortHash(preview.target)}` +
-        (preview.leaving_total > 0 ? ` — ${plural(preview.leaving_total, "commit")} left the branch` : ""),
-    );
-    void load();
-  }
+  });
 
   $effect(() => {
     return () => inflight?.cancel();
@@ -223,7 +177,6 @@
               <th class="px-3 py-2 font-medium">Action</th>
               <th class="px-3 py-2 font-medium">Message</th>
               <th class="px-3 py-2 font-medium">When</th>
-              <th class="px-3 py-2 font-medium"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -237,7 +190,7 @@
                   <button
                     type="button"
                     aria-label={`Inspect ${entry.selector}, commit ${shortHash(entry.commit_id, 8)}, ${entry.action}: ${entry.message}, ${formatDate(entry.timestamp)}`}
-                    title="Show this commit below"
+                    title="Show this commit below, where it can be branched from or reset to"
                     onclick={() => inspectEntry(entry)}
                     class="rounded px-1 -mx-1 text-accent hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
                   >
@@ -256,29 +209,7 @@
                 </td>
                 <td class="px-3 py-1.5 text-textPrimary">{entry.action}</td>
                 <td class="px-3 py-1.5 text-textMuted truncate max-w-md">{entry.message}</td>
-                <td class="px-3 py-1.5 text-textMuted whitespace-nowrap">{formatDate(entry.timestamp)}</td>
-                <td class="px-2 py-1 whitespace-nowrap rounded-r-lg">
-                  <div class="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
-                    <button
-                      type="button"
-                      aria-label={`Create a branch at ${entry.selector}`}
-                      title="Create a branch at this commit"
-                      onclick={() => branchHere(entry)}
-                      class="rounded p-1 text-textMuted hover:text-accent hover:bg-surfaceHover focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
-                    >
-                      <GitBranchPlus size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Reset the current branch to ${entry.selector}`}
-                      title="Reset the current branch here (keeps local changes)…"
-                      onclick={() => resetHere(entry)}
-                      class="rounded p-1 text-textMuted hover:text-rose-400 hover:bg-surfaceHover focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
-                    >
-                      <RotateCcw size={13} />
-                    </button>
-                  </div>
-                </td>
+                <td class="px-3 py-1.5 text-textMuted whitespace-nowrap rounded-r-lg">{formatDate(entry.timestamp)}</td>
               </tr>
             {/each}
           </tbody>

@@ -393,7 +393,7 @@ the commit you had just selected.
 
 - **Reference Log Browser**: The *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's reflog: every movement of HEAD, checkouts, commits, rebases and resets, newest first (the 200 most recent, with the cap named). The commit filter narrows the loaded entries by selector, sha, action or message.
 - **Selected In Place**: Clicking an entry shows its commit in the details pane below the list, including a commit a reset or amend left reachable only from the reflog (marked *Not in the graph*). A pruned object shows the details error and Retry, not an empty commit.
-- **Recovery Points**: Create a branch at an entry, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop.
+- **Recovery Points**: Select an entry and use *Branch* or *Reset* in the details pane below to create a branch at its commit, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop. The same two actions act on any commit the pane describes, whichever list selected it, and sit in the graph's row menu (`branches/commitActions.ts` owns both). The list reloads when HEAD moves.
 - **Restored Sessions**: A session saved on the old Reflog section or view reopens on Graph's HEAD-moves list.
 
 ### 3.4 Suspects (Graph's third list)
@@ -426,6 +426,7 @@ flowchart LR
 - **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
 - **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.
 - **Indexed Search Window**: Analyzes the historical commit window up to the currently indexed commit, reporting exact commit reachability and blame attribution.
+- **Ways In**: Blame's toolbar (*Suspects* — the blamed file is the symptom), a diff hunk's symbol (*suspects*), a code-graph node's connections panel (*Find suspects for …*, by its DevMap id), the palette (*Find regression suspects*, and *Find suspects for the open file*), and *Suspects since* on any commit's details. All go through `openSuspectsFor`, which lands on Graph's Suspects list and asks at once when a symptom was named.
 - **One of Graph's Lists**: The question (symptom, last known good, cone depth) sits in History's context bar in place of the commit filter. A click selects the suspect in place, above the same details pane as the commit graph and HEAD moves, and stays selected when a graph reload stops drawing it. The details pane shows the suspect's verdict whichever list selected the commit, the other lists chip ranked commits (the tooltip names the symptom and window), and *Suspects since* on any commit's details asks again from that commit.
 - **Restored Sessions**: A session saved on the old Suspects section reopens on Graph's Suspects list; the palette's *Find regression suspects* keeps its id and opens it with the symptom focused.
 

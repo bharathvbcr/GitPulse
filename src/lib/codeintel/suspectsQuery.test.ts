@@ -259,6 +259,22 @@ describe("createSuspectsQuery", () => {
     expect(suspectMarks(get(q), "/r").size).toBe(0);
   });
 
+  it("asks about a symptom named elsewhere, against the window already set", async () => {
+    const calls: unknown[][] = [];
+    const q = createSuspectsQuery({
+      fetch: async (...args) => {
+        calls.push(args);
+        return payload([]);
+      },
+    });
+    q.bindRepo("/r");
+    q.setInputs({ since: "v2" });
+    await q.askAbout("/r", "  src/a.rs::run  ");
+    expect(calls).toEqual([["/r", "src/a.rs::run", "v2", 3]]);
+    await q.askAbout("/r", "   ");
+    expect(calls).toHaveLength(1);
+  });
+
   it("keeps a focus request across the first bind", () => {
     // The palette door asks before History has mounted and bound the repo.
     const q = createSuspectsQuery({ fetch: async () => payload([]) });

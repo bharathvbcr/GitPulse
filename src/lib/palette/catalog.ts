@@ -6,7 +6,7 @@ import { interfaceStore } from "../stores/interfaceStore";
 import { askText } from "../stores/modalStore";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
-import { suspectsQuery } from "../codeintel/suspectsQuery";
+import { openSuspectsFor } from "../codeintel/openSuspects";
 import { setEditorLens, showExplorerRail } from "../files/explorerLens";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
@@ -88,12 +88,17 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       id: "history:suspects", label: "Find regression suspects — which commit broke this symbol",
       description: "History → Graph → Suspects · Which commit since a known-good ref could have caused a symptom. Ranked by what the call graph reaches, not by how recent they are; the window ends at the indexed commit, not at HEAD.",
       keywords: "History Graph suspects regression bisect blame symptom broke", category: "Views", icon: icons.history, disabledReason: unavailable,
-      action: () => {
-        interfaceStore.setGlobalSurface("repository");
-        repoStore.setActiveTab("history", "graph");
-        repoStore.setHistoryList("suspects");
-        suspectsQuery.requestFocus();
-      },
+      action: () => openSuspectsFor(),
+    }, {
+      // Explorer's way in: the open file is the symptom. The file node is the
+      // one graph node that answers for a whole file.
+      id: "history:suspects-file", label: "Find suspects for the open file — which commit broke it",
+      description: state.selectedFilePath
+        ? `History → Graph → Suspects · Rank the commits since the last known good by what the call graph reaches from ${state.selectedFilePath}.`
+        : "History → Graph → Suspects · Open a file in Explorer first; its path becomes the symptom.",
+      keywords: "History Graph suspects regression file symptom broke explorer", category: "Views", icon: icons.history,
+      disabledReason: unavailable ?? (state.selectedFilePath ? undefined : "Open a file in Explorer first"),
+      action: () => openSuspectsFor(state.selectedFilePath),
     }] : []),
   ]);
   // Search and Blame were sections of Code; they are toggles inside Explorer

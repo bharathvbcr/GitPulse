@@ -21,13 +21,14 @@
     GitCommit,
     Undo2,
     Hash,
+    RotateCcw,
   } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
   import { reportFailure } from "../stores/mutationOutcome";
   import { repoStore } from "../stores/repoStore";
   import { filterStore } from "../stores/filterStore";
-  import { askText } from "../stores/modalStore";
+  import { createBranchAt, resetKeepTo } from "../branches/commitActions";
   import { shortRefLabel } from "../graph/refScope";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
@@ -157,21 +158,16 @@
     isMenuOpen = false;
   }
 
+  // One owner for both (branches/commitActions.ts), shared with the details
+  // pane under every Graph list.
   async function createBranchHere() {
     closeMenu();
-    // The repository this commit belongs to, held across the prompt.
-    const target = repoStore.captureTarget();
-    const name = await askText({
-      title: "Create Branch at Commit",
-      message: `Branch name from ${row.id.slice(0, 7)}:`,
-      placeholder: "feat/new-branch",
-      confirmLabel: "Create Branch",
-    });
-    if (name?.trim()) {
-      const outcome = await repoStore.createBranch(name.trim(), row.id, target);
-      if (!reportFailure(outcome, "Could not create the branch")) return;
-      toastStore.success(`Created branch "${name.trim()}" at ${row.id.slice(0, 7)}`);
-    }
+    await createBranchAt(row.id);
+  }
+
+  async function resetHere() {
+    closeMenu();
+    await resetKeepTo(row.id);
   }
 
   async function checkoutHere() {
@@ -426,6 +422,14 @@
     >
       <Plus size={12} class="text-textMuted" />
       <span>Create Branch Here…</span>
+    </button>
+    <button
+      role="menuitem"
+      class="gp-menu-item"
+      onclick={() => void resetHere()}
+    >
+      <RotateCcw size={12} class="text-textMuted" />
+      <span>Reset Branch Here (keep changes)…</span>
     </button>
     <button
       role="menuitem"

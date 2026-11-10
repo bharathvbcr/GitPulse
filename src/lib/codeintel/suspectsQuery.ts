@@ -310,6 +310,18 @@ export function createSuspectsQuery(deps: SuspectsQueryDeps = {}) {
       store.update((s) => ({ ...s, focusPending: true }));
       return Promise.resolve();
     },
+    /**
+     * Asks about a symptom named somewhere else (Blame's file, a diff hunk's
+     * symbol, a node on the code graph): it becomes the symptom and the
+     * question runs against the window already set.
+     */
+    askAbout: (repoPath: string | null, symptom: string) => {
+      const named = symptom.trim().slice(0, MAX_SYMPTOM_LENGTH);
+      if (!named) return Promise.resolve();
+      bindRepo(repoPath);
+      store.update((s) => ({ ...s, symptom: named }));
+      return run(repoPath);
+    },
     /** Asks the symptom field for focus, once it is on screen. */
     requestFocus: () => store.update((s) => ({ ...s, focusPending: true })),
     /** The symptom field took focus. */

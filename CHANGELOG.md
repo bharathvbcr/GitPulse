@@ -117,6 +117,20 @@ before that tag is pushed.
   - **Any commit can start the question.** *Suspects since* in the details pane
     makes the commit on screen the last known good and switches to the list,
     running at once when a symptom is already named.
+  - **Blame, a diff hunk and the code graph can ask too.** Blame's toolbar has
+    *Suspects* for the blamed file, a diff hunk names the symbol it changes
+    with *suspects* beside it, and a code-graph node's connections panel offers
+    *Find suspects for …* by its DevMap id. The palette gains *Find suspects
+    for the open file*. All of them land on Graph's Suspects list through one
+    entry point (`codeintel/openSuspects.ts`) and ask at once.
+  - **Branch and Reset act on the commit in the details pane**, whichever list
+    selected it, instead of sitting on every HEAD-moves row. They are the same
+    two actions as the graph's row menu, which gains *Reset Branch Here (keep
+    changes)…*; one module owns both (`branches/commitActions.ts`), where the
+    row menu and the reflog each had their own branch-at-commit. The reset
+    still previews every commit that would leave the branch, still names the
+    reflog entry it came from, and still uses `reset --keep`. HEAD moves now
+    reloads whenever HEAD moves, not only after its own buttons.
   - **One selection path for all three lists** (`repoStore.selectHistoryCommit`).
     The answer lives in a store (`codeintel/suspectsQuery.ts`) rather than in
     the pane, so switching lists keeps it; the code-graph client still loads on
