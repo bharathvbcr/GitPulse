@@ -204,7 +204,7 @@ impl Pair {
 
     /// Runs `a` and `b` in the order this round's parity picks.
     fn round(&mut self, round: usize, mut a: impl FnMut() -> Obs, mut b: impl FnMut() -> Obs) {
-        let a_first = round % 2 == 0;
+        let a_first = round.is_multiple_of(2);
         let (oa, ob) = if a_first {
             let oa = a();
             (oa, b())
