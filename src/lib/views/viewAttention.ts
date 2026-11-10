@@ -7,8 +7,8 @@ import type { PolicyStatus } from "../stores/harnessStore";
  * The switcher collapses every view but the active one into a single pill,
  * and a collapsed pill must never hide a problem: a parked merge was never
  * allowed to be quieter than it was when Resolve had its own header tab, and
- * a blocked MANVI verdict is the same kind of fact. Both now belong to Policy,
- * which holds the conflict editor since Resolve folded into it. So the facts that already
+ * a blocked MANVI verdict is the same kind of fact. Both now belong to Overview,
+ * which leads with the conflict editor since Resolve and Policy folded into it. So the facts that already
  * exist are carried onto the section that owns them, and from there onto the
  * view's pill. Nothing here is fetched for the switcher's sake.
  */

@@ -242,7 +242,7 @@ export function sectionsFor(id: ViewTab): readonly ViewSection[] {
  * A destination's name, the way the header and section bar spell it.
  *
  * For UI elsewhere in the app that sends the reader to a pane and has to say
- * where they are about to land ("Work → Policy"). Derived from the registry
+ * where they are about to land ("Work → Remote"). Derived from the registry
  * rather than written out at the call site, so renaming a section renames
  * every promise made about it. An unknown section id degrades to the view's
  * own name instead of inventing one.

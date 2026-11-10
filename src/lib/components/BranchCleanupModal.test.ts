@@ -16,13 +16,14 @@ describe("BranchCleanupModal backups read failure", () => {
     expect(source).toContain("let backupsError = $state<string | null>(null);");
     const [ok, failed] = load.split("} catch");
     expect(ok).toContain("backupsError = null;");
-    expect(failed).toContain('backupsError = reportPanelError("ops", err);');
+    expect(failed).toContain('backupsError = reportPanelError("branch-cleanup", err);');
   });
 
-  it("records the failure in diagnostics, redacted, as the Ops pane's own", () => {
+  it("records the failure in diagnostics, redacted, under its own name", () => {
     // formatError would show the text but leave no record and skip the
     // credential redaction the diagnostics seam applies. The modal opens from
-    // the Ops pane (ui/manviFocus.ts: cleanup -> ops), so "ops" is its source.
+    // several surfaces (the Ops pane that named it is retired), so it reports
+    // as itself.
     expect(source).toContain('import { reportPanelError } from "../diagnostics/report";');
     expect(source).not.toContain("formatError");
   });

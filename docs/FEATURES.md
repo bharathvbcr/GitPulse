@@ -755,11 +755,11 @@ stop per checkout.
 | **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
-Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
+Sections within a view — Work's Overview / Remote / Tasks, Code's Explorer / Map, History's Graph / Diff /
 Suspects, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
-section directly, including all five Work sections.
+section directly, including all three Work sections.
 
 ### 6.3 Inside Fleet
 

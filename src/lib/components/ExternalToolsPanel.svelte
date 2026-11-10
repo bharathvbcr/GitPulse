@@ -2,8 +2,8 @@
   /**
    * Probe + install UI for `devmap` and `manvi`.
    *
-   * Used from Settings → Agents, Code → Map (when missing), and the MANVI
-   * harness pane. One owner so the three surfaces cannot disagree about which
+   * Used from Settings → Agents (where the Manvi policy card points at it) and
+   * Code → Map (when missing). One owner so the surfaces cannot disagree about which
    * path answered or what command runs.
    */
   import { onMount } from "svelte";

@@ -1183,7 +1183,7 @@
           data-variant="primary"
           title={aiReady
             ? "Ask the local model, through Manvi, for a remediation plan"
-            : "Needs a local model server. See the Manvi view. The exact error is reported if none is running."}
+            : "Needs a local model server. See Settings → Agents → Local model servers. The exact error is reported if none is running."}
         >
           {#if fixing}
             <LoaderCircle size={13} class="animate-spin" />

@@ -209,7 +209,7 @@ export function formatAgentDescription(issue: Partial<IssueInfo>, guidance?: str
   sections.push("");
   sections.push("### Context & Objective");
   sections.push(
-    `This task was imported from GitHub issue #${num} via the policy page issue monitor so autonomous coding agents can resolve it.`,
+    `This task was imported from GitHub issue #${num} via Remote's issue import so autonomous coding agents can resolve it.`,
   );
 
   if (guidance?.trim()) {

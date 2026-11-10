@@ -89,6 +89,28 @@ before that tag is pushed.
 
 ### Changed
 
+- **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
+  are gone as pages; their content lives with the subject it acts on.
+  - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or
+    revert is parked (or its state could not be read), and is absent otherwise.
+    Every way in — the status bar, the tray and its `3` key, the merge dialog,
+    blocked rows, the palette's *Resolve conflicts* — lands on the editor, even
+    when you were already on Overview and scrolled into the rows.
+  - **Overview** gains two collapsed disclosures: *Branch and tag cleanup*
+    (always listed, no count until a scan has run; *Stale branches…* opens the
+    dead-branch cleanup) and *Policy activity* (grants and the agent journal).
+  - **Remote** gains *Outgoing commits* (checked before you push, works without
+    `gh`), *Report issue…*, *Add to tasks* / *Add all to tasks*, and *Push
+    release tag…* on Releases. Its issue list stays the only one.
+  - **Settings → Agents** holds *Manvi policy*, *Capability boundary* and
+    *Local model servers*; branch naming moved beside the new-branch field of
+    the Worktrees panel.
+  - Quick pull and Quick push are gone; they ran the same pull and push the
+    sidebar, palette and branch menu offer.
+  - A saved Resolve or Policy selection, an old native menu build, and the
+    palette's Manvi phrases all land on the card that answers them. The Go →
+    Work menu and the tray drop `section:work:policy` (12 sections now).
+
 - **The reflog is part of History › Graph, not its own section.** A
   *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
   reflog, with the commit details below either list. History has three

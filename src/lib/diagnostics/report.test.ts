@@ -59,7 +59,7 @@ describe("createReporter", () => {
     const sink = makeSink();
     const report = createReporter(sink);
     expect(report("github", "  trimmed  ")).toBe("trimmed");
-    expect(report("ops", { code: 7 })).toBe('{"code":7}');
+    expect(report("branch-cleanup", { code: 7 })).toBe('{"code":7}');
     expect(report("conflict", null)).toBe("Unknown error");
     expect(report("rebase", "")).toBe("Unknown error");
   });
