@@ -1,23 +1,13 @@
 {
   "schema": 1,
-  "commit": "2920973635694c98226dbe84be40a8114585d7a3",
+  "commit": "365729b7684a05732db143ff0d7aac5ea054d303",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 183,
+      "total": 54,
       "files": {
-        "src/lib/components/AgentDefaultsSettings.svelte": 7,
-        "src/lib/components/AgentLimitSetting.svelte": 4,
-        "src/lib/components/AgentModelSettings.svelte": 11,
-        "src/lib/components/AgentSettingSourcesSetting.svelte": 4,
-        "src/lib/components/ExternalToolsPanel.svelte": 14,
-        "src/lib/components/HostLoadSetting.svelte": 3,
-        "src/lib/components/KeepTerminalsSetting.svelte": 6,
-        "src/lib/components/LappiSettings.svelte": 3,
-        "src/lib/components/ManviClaudeModel.svelte": 5,
-        "src/lib/components/SessionAlertSettings.svelte": 6,
-        "src/lib/components/SettingsModal.svelte": 72,
+        "src/lib/components/StatusBar.svelte": 6,
         "src/lib/components/TerminalDock.svelte": 1,
         "src/lib/components/TerminalPanel.svelte": 27,
         "src/lib/components/TerminalSession.svelte": 20
@@ -25,29 +15,17 @@
     },
     "2": {
       "name": "weight-and-case",
-      "total": 12,
+      "total": 6,
       "files": {
-        "src/lib/components/ManviClaudeModel.svelte": 2,
-        "src/lib/components/SessionAlertSettings.svelte": 2,
-        "src/lib/components/SettingsModal.svelte": 2,
         "src/lib/components/TerminalPanel.svelte": 6
       }
     },
     "3": {
       "name": "palette-colors",
-      "total": 101,
+      "total": 56,
       "files": {
-        "src/lib/components/AgentDefaultsSettings.svelte": 4,
-        "src/lib/components/AgentLimitSetting.svelte": 2,
-        "src/lib/components/AgentModelSettings.svelte": 6,
-        "src/lib/components/AgentSettingSourcesSetting.svelte": 2,
-        "src/lib/components/ExternalToolsPanel.svelte": 10,
-        "src/lib/components/HostLoadSetting.svelte": 1,
-        "src/lib/components/HygieneDefaultsPanel.svelte": 1,
-        "src/lib/components/KeepTerminalsSetting.svelte": 8,
-        "src/lib/components/LappiSettings.svelte": 2,
-        "src/lib/components/ManviClaudeModel.svelte": 2,
-        "src/lib/components/SettingsModal.svelte": 10,
+        "src/lib/components/RepoTabBar.svelte": 1,
+        "src/lib/components/StatusBar.svelte": 2,
         "src/lib/components/TerminalPanel.svelte": 35,
         "src/lib/components/TerminalSession.svelte": 7,
         "src/lib/files/syntaxHighlight.ts": 11
@@ -55,10 +33,9 @@
     },
     "4": {
       "name": "color-literals",
-      "total": 83,
+      "total": 82,
       "files": {
         "src/lib/components/Logo.svelte": 8,
-        "src/lib/components/NativeNotificationSettings.svelte": 1,
         "src/lib/components/files/MarkDevLogo.svelte": 9,
         "src/lib/desktop/StatusPopover.svelte": 65
       }
@@ -75,9 +52,8 @@
     },
     "7": {
       "name": "hairlines",
-      "total": 34,
+      "total": 17,
       "files": {
-        "src/lib/components/SettingsModal.svelte": 17,
         "src/lib/components/TerminalDock.svelte": 2,
         "src/lib/components/TerminalPanel.svelte": 11,
         "src/lib/components/TerminalSession.svelte": 4
@@ -85,11 +61,9 @@
     },
     "8": {
       "name": "border-opacity",
-      "total": 54,
+      "total": 32,
       "files": {
-        "src/lib/components/ExternalToolsPanel.svelte": 3,
-        "src/lib/components/HygieneDefaultsPanel.svelte": 1,
-        "src/lib/components/SettingsModal.svelte": 21,
+        "src/lib/components/StatusBar.svelte": 3,
         "src/lib/components/TerminalDock.svelte": 1,
         "src/lib/components/TerminalPanel.svelte": 24,
         "src/lib/components/TerminalSession.svelte": 4
@@ -105,10 +79,8 @@
     },
     "10": {
       "name": "motion-literals",
-      "total": 1,
-      "files": {
-        "src/lib/components/SettingsModal.svelte": 1
-      }
+      "total": 0,
+      "files": {}
     },
     "11": {
       "name": "backdrop-blur",
@@ -133,14 +105,10 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 35,
+      "total": 16,
       "files": {
-        "src/lib/components/AgentModelSettings.svelte": 2,
-        "src/lib/components/AgentSettingSourcesSetting.svelte": 2,
         "src/lib/components/FirebasePanel.svelte": 7,
-        "src/lib/components/HygieneDefaultsPanel.svelte": 1,
         "src/lib/components/RepoPanel.svelte": 2,
-        "src/lib/components/SettingsModal.svelte": 14,
         "src/lib/components/TerminalPanel.svelte": 5,
         "src/lib/components/TerminalSession.svelte": 2
       }
