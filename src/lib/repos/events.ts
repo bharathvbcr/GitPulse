@@ -19,9 +19,10 @@ export type ChangeKind =
   | "unknown";
 
 /**
- * Read from the same paths the watcher's noise gate admitted. `paths` names
- * top-level worktree entries only (the worktree watch is non-recursive), so
- * it means "at least these", never "only these".
+ * Read from the same paths the watcher's noise gate admitted. On Linux and
+ * Windows `paths` names top-level worktree entries only (the worktree watch
+ * is non-recursive there; on macOS it is recursive and `paths` names files),
+ * so it means "at least these", never "only these".
  */
 export interface RepoChange {
   kinds: ChangeKind[];

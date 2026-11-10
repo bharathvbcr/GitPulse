@@ -31,9 +31,36 @@ pub async fn cmd_branch_stats(repo_path: String) -> Result<BranchStatsReport, Ip
     off_thread(move || GitReader::branch_stats(&repo_path)).await
 }
 
+/// `skip_if_unchanged` is the status poll's: when the repository's watch can
+/// show that nothing under the worktree has changed since the read it kept,
+/// that read is returned and no git is spawned (see
+/// [`crate::watcher::status_through_watch`]). Every other caller omits it and
+/// always reads.
 #[tauri::command(async)]
-pub async fn cmd_get_status(repo_path: String) -> Result<Vec<FileStatus>, IpcError> {
-    off_thread(move || GitReader::get_status(&repo_path)).await
+pub async fn cmd_get_status(
+    watcher: State<'_, WatcherState>,
+    repo_path: String,
+    skip_if_unchanged: Option<bool>,
+) -> Result<Vec<FileStatus>, IpcError> {
+    get_status_through_watch(
+        watcher.inner().clone(),
+        repo_path,
+        skip_if_unchanged.unwrap_or(false),
+    )
+    .await
+}
+
+pub(crate) async fn get_status_through_watch(
+    watcher: WatcherState,
+    repo_path: String,
+    may_reuse: bool,
+) -> Result<Vec<FileStatus>, IpcError> {
+    off_thread(move || {
+        crate::watcher::status_through_watch(&watcher, &repo_path, may_reuse, || {
+            GitReader::get_status(&repo_path)
+        })
+    })
+    .await
 }
 
 #[tauri::command(async)]

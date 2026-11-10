@@ -12,8 +12,8 @@
  *
  * - **`index` counts as content.** Every git command that rewrites tracked
  *   files — checkout, reset, merge, stash, rebase — writes the index, and the
- *   worktree watch is non-recursive, so a deep file rewritten by git often
- *   surfaces as nothing else. A commit writes it too; that costs a refresh,
+ *   worktree watch is non-recursive on Linux and Windows, so a deep file
+ *   rewritten by git often surfaces as nothing else there. A commit writes it too; that costs a refresh,
  *   not a missed one.
  * - **No change, or `unknown`, is everything.** A payload this build cannot
  *   read, or a backend error the watcher could not classify, refreshes every

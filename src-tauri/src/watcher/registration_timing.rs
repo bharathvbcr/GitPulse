@@ -74,7 +74,7 @@ fn full_register(state: &WatcherState, root: &Path) -> Duration {
     started.elapsed()
 }
 
-/// Writes a top-level file (covered by the non-recursive worktree watch) and
+/// Writes a top-level file (covered by the worktree watch on every platform) and
 /// waits for an event naming it. Earlier unrelated events are skipped.
 fn first_event_after_write(watcher: &RepoFileWatcher, root: &Path, tag: &str) -> Option<Duration> {
     let probe = root.join(format!("probe-{tag}"));

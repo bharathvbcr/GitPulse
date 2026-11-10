@@ -136,6 +136,7 @@ import {
   changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
+  statusPollRequest,
   statusPollRestMs,
   statusesEqual,
 } from "../repos/statusPoll";
@@ -536,9 +537,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     try {
       let statuses: FileStatus[];
       try {
-        statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
-          repoPath: path,
-        });
+        statuses = await invokeFn<FileStatus[]>("cmd_get_status", statusPollRequest(path));
       } catch (error) {
         // Only a refused read counts. One failure is a repo that vanished (the
         // next full refresh reports it) or a blip; a run of them is a status
@@ -593,9 +592,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         const before = live && live.generation === generation ? live.statuses : [];
         applyToSession(sessionId, generation, { statuses });
-        // The watcher cannot see nested edits (its worktree watch is
-        // non-recursive); the poll can, so it announces them to the views
-        // derived from files.
+        // The watcher can miss nested edits (non-recursive on Linux and
+        // Windows, filtered on macOS); the poll cannot, so it announces them to
+        // the views derived from files.
         const polled = changeFromStatusPoll(before, statuses);
         if (polled) for (const listener of polledChangeListeners) listener(path, polled);
       } catch (error) {

@@ -1003,8 +1003,23 @@ fn note_reentrant_drops(log: &mut PersistedLog, dropped: u64) {
     });
 }
 
+/// Writes the status-poll skip counters into the log as an ordinary `watcher`
+/// entry, so the diagnostics export (ring and durable log) carries them on a
+/// healthy host too. Called when the export is read, so it adds no timer and
+/// no log site of its own; a line is written only when the counters changed.
+pub(crate) fn record_poll_skip() {
+    if let Some(line) = crate::watcher::skip::summary_if_changed() {
+        record_poll_skip_into(LOGGER.get_or_init(build_logger), &line);
+    }
+}
+
+fn record_poll_skip_into(logger: &RingLogger, line: &str) {
+    logger.write_entry(Level::Info, "watcher", line);
+}
+
 #[tauri::command]
 pub fn cmd_diagnostic_log_tail(max_lines: Option<usize>) -> Vec<String> {
+    record_poll_skip();
     diagnostic_tail(max_lines.unwrap_or(DEFAULT_TAIL_LINES))
 }
 
@@ -2317,5 +2332,56 @@ mod tests {
             // and must never end mid-character.
             assert!(out.is_char_boundary(out.len()));
         }
+    }
+
+    /// The diagnostics export carries the status-poll skip counters on a
+    /// healthy host: one watch that skipped, one that read after events and
+    /// one that is unavailable with its reason, all through the real
+    /// recorder into a ring that otherwise holds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_export_carries_the_poll_skip_counters_of_all_three_states() {
+        use crate::watcher::skip::PollSkip;
+        use std::time::Instant;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let now = Instant::now();
+
+        let firing = PollSkip::new(Some(&root), true);
+        let first = firing.begin(now, true);
+        firing.settle(first.keep_under.unwrap(), &[], now);
+        assert!(firing.begin(now, true).served.is_some());
+
+        let busy = PollSkip::new(Some(&root), true);
+        let first = busy.begin(now, true);
+        busy.settle(first.keep_under.unwrap(), &[], now);
+        busy.event();
+        assert!(busy.begin(now, true).served.is_none());
+
+        let unavailable = PollSkip::new(Some(&root), false);
+        assert!(unavailable.begin(now, true).served.is_none());
+
+        let line = crate::watcher::skip::summary_if_changed()
+            .expect("decisions were made, so there is something to record");
+        let logger = RingLogger::new(LevelFilter::Info);
+        record_poll_skip_into(&logger, &line);
+        let tail = logger.snapshot_tail(10);
+        assert_eq!(tail.len(), 1, "{tail:?}");
+        let exported = &tail[0];
+        assert!(exported.contains("[watcher] [poll-skip] "), "{exported}");
+        let count = |key: &str| -> u64 {
+            let at = exported
+                .find(key)
+                .unwrap_or_else(|| panic!("{key} in {exported}"));
+            exported[at + key.len()..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap()
+        };
+        // Other tests share the process totals, so each state is at least ours.
+        assert!(count("skipped=") >= 1, "{exported}");
+        assert!(count("read_after_events=") >= 2, "{exported}");
+        assert!(count("unavailable_not_recursive=") >= 1, "{exported}");
     }
 }
