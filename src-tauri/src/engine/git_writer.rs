@@ -1615,7 +1615,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             ],
             &input,
         )
-        .map(|output| String::from_utf8_lossy(&output).into_owned())
+        .map(crate::engine::git_cli::text_from_bytes)
     }
 
     /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the

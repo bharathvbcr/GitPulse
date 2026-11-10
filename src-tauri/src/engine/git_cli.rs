@@ -1070,7 +1070,19 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, CommandError> {
 
 pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
     let bytes = git(repo, args)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
+}
+
+/// The text of captured output, decoded lossily: the one owner of that
+/// decode for buffers the caller owns. Valid UTF-8, which is nearly every
+/// git output, becomes the `String` over the SAME allocation; only a buffer
+/// with invalid bytes is copied, once, into its lossy form.
+/// `String::from_utf8_lossy(&bytes).into_owned()` copies a buffer it just
+/// proved valid, which for a 100k-row graph window or a large diff is one
+/// extra memcpy of up to the whole stream.
+pub(crate) fn text_from_bytes(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
 }
 
 /// Like [`git_text`], but an over-cap stream is data rather than an error:
@@ -1079,10 +1091,7 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
 /// scan would be worse than reading part of the listing.
 pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), CommandError> {
     let (bytes, incomplete) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
-    Ok((
-        String::from_utf8_lossy(&bytes).into_owned(),
-        incomplete.is_some(),
-    ))
+    Ok((text_from_bytes(bytes), incomplete.is_some()))
 }
 
 /// Runs `git` with an explicit stdout budget, returning the text plus whether
@@ -1098,7 +1107,7 @@ pub fn git_text_capped(
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+    Ok((text_from_bytes(bytes), incomplete))
 }
 
 /// [`git_text_capped`] without the UTF-8 decode: git's exact stdout bytes plus
@@ -1516,7 +1525,7 @@ pub fn git_text_with_timeout(
     timeout: Duration,
 ) -> Result<String, CommandError> {
     let bytes = git_with_timeout(repo, args, timeout)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
 }
 
 /// Runs network-bound git plumbing in `repo` under [`NETWORK_TIMEOUT`].
@@ -6047,7 +6056,7 @@ pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, Comm
     if let Some(reason) = incomplete {
         return Err(incomplete_is_failure(sub, reason).into());
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
 }
 
 /// [`git_text_capped`] for a read that identical callers may share, under the
@@ -6060,7 +6069,7 @@ pub(crate) fn git_text_capped_shared(
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_run_inner(Some(repo), args, DEFAULT_TIMEOUT, None, cap, true)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+    Ok((text_from_bytes(bytes), incomplete))
 }
 
 fn git_run_inner(
@@ -6361,6 +6370,31 @@ pub fn repo_name_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::procguard::LockedSpawn;
+
+    /// F-10. Decoding captured output that is valid UTF-8 hands the buffer
+    /// over: the text is over the allocation the process read into, not a
+    /// second copy of it. The old expression is asserted to copy, so this
+    /// test discriminates.
+    #[test]
+    fn decoding_valid_captured_output_does_not_copy_the_buffer() {
+        let bytes = "commit \u{e9}\u{4e16}\n".repeat(4096).into_bytes();
+        let at = bytes.as_ptr();
+        let old = String::from_utf8_lossy(&bytes).into_owned();
+        assert_ne!(old.as_ptr(), at, "the previous decode copied");
+        let text = super::text_from_bytes(bytes);
+        assert_eq!(text.as_ptr(), at, "valid UTF-8 was copied again");
+        assert_eq!(text, old);
+    }
+
+    /// Invalid bytes still decode the way `from_utf8_lossy` does, once.
+    #[test]
+    fn decoding_invalid_captured_output_replaces_the_bad_bytes() {
+        let bytes = b"ok \xff\xfe tail \xe4\xb8".to_vec();
+        let expected = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(super::text_from_bytes(bytes), expected);
+        assert!(expected.contains('\u{fffd}'));
+        assert_eq!(super::text_from_bytes(Vec::new()), "");
+    }
     /// S3-08. One status argv, shared by the file list and the worktree scans,
     /// and `status.showUntrackedFiles=all` pinned beside the other settings a
     /// developer's own config must not change.
