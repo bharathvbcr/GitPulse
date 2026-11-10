@@ -38,6 +38,7 @@
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { filterStore } from "../stores/filterStore";
   // The canonical wire types, not local copies: both were declared here as
   // well, and the CommitDetails one had silently fallen four fields behind.
   // `import type` is erased, so this pulls in no store at runtime.
@@ -76,6 +77,9 @@
   // selected from: the verdict travels with the commit, not with the list.
   let suspect = $derived(
     selectedCommit ? (suspectMarks($suspectsQuery, $currentRepoPath).get(selectedCommit.id) ?? null) : null,
+  );
+  let filterActive = $derived(
+    $filterStore.searchQuery.trim() !== "" || Boolean($filterStore.selectedBranch),
   );
   let readDetails = $derived(details !== null && details.id === selectedCommit?.id ? details : null);
   let headerSummary = $derived(
@@ -116,7 +120,7 @@
   }
 
   function retryDetails() {
-    if (selectedCommit) void graphStore.selectCommit(selectedCommit);
+    if (selectedCommit) void graphStore.retryDetails();
   }
 
   function retryDiff() {
@@ -320,14 +324,17 @@
         <div class="flex items-center gap-1.5 min-w-0 group/msg">
           <span class="text-xs font-medium text-textPrimary truncate select-text">{headerSummary}</span>
           {#if offGraph}
-            <!-- A suspect is an ancestor of the indexed commit, so the graph
-                 not drawing it is the filter or the page size, not a reset. -->
+            <!-- HEAD moves and Suspects keep their selection when a reload
+                 stops drawing it, so "not drawn" has two causes. A suspect is
+                 an ancestor of the indexed commit, and with a filter active
+                 the filter is the likelier one: those say "loaded". -->
+            {@const filtered = Boolean(suspect) || filterActive}
             <span
               class="shrink-0 rounded px-1.5 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-300"
-              title={suspect
-                ? "The loaded graph does not draw this commit: the commit filter or the page size leaves it out. It was selected from the Suspects list."
-                : "The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there."}
-            >{suspect ? "Not in the loaded graph" : "Not in the graph"}</span>
+              title={filtered
+                ? "The loaded graph does not draw this commit: the commit filter or the page size leaves it out. It stays selected because it was chosen from HEAD's moves or Suspects."
+                : "The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there, or the page size leaves it out."}
+            >{filtered ? "Not in the loaded graph" : "Not in the graph"}</span>
           {/if}
           {#if suspect}
             <span

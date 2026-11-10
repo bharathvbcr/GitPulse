@@ -163,6 +163,18 @@ describe("graphStore.selectCommitById", () => {
     expect(get(store).selectedCommit?.id).toBe("a");
   });
 
+  it("keeps the pin when the details are retried", async () => {
+    let rows = ["a", "b"];
+    const { store } = harness({ graph: () => payload(...rows) });
+    store.showRepo("/r");
+    await store.loadGraph("/r");
+    await store.selectCommitById("b", { pin: true });
+    await store.retryDetails();
+    rows = ["a"];
+    await store.loadGraph("/r", "only-a");
+    expect(get(store).selectedCommit?.id).toBe("b");
+  });
+
   it("reports a pruned object as a details error, not an empty commit", async () => {
     const { store } = harness({ graph: () => payload("a"), failDetailsFor: "gone" });
     store.showRepo("/r");

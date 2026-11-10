@@ -248,9 +248,12 @@ export function createSuspectsQuery(deps: SuspectsQueryDeps = {}) {
    * would be read as that repository's, and its symbols are not this one's.
    */
   function bindRepo(repoPath: string | null) {
-    if (get(store).repoPath === repoPath) return;
+    const held = get(store);
+    if (held.repoPath === repoPath) return;
     cancel();
-    store.set(initialSuspectsState(repoPath));
+    // A focus request outlives the bind: the palette asks for the symptom
+    // field before History has mounted and bound its repository.
+    store.set({ ...initialSuspectsState(repoPath), focusPending: held.focusPending });
   }
 
   /** Inputs change the question, not the answer: the last run stays until the next one lands. */

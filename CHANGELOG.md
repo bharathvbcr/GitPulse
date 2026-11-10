@@ -124,9 +124,10 @@ before that tag is pushed.
 
 - **The reflog is part of History › Graph, not its own section.** A
   *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
-  reflog, with the commit details below either list. History has three
-  sections now (Graph, Diff, Suspects), so Suspects moves from ⌥4 to ⌥3 and
-  the Go → History menu loses its Reflog item. *Open Reflog — HEAD movements
+  reflog, with the commit details below either list. History had three
+  sections after this (Graph, Diff, Suspects; Suspects then folded into Graph
+  too, above), so Suspects moved from ⌥4 to ⌥3 and the Go → History menu lost
+  its Reflog item. *Open Reflog — HEAD movements
   and recovery points* in the command palette still opens it, and a session
   saved on the old Reflog section reopens on the HEAD-moves list.
   - **Clicking an entry selects it in place.** It used to select the commit on

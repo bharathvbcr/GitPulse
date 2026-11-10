@@ -16,7 +16,7 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 14 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 13 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 14 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 13 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection

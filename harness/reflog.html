@@ -190,6 +190,20 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  check("a drawn entry's commit opens with its graph row, unmarked",()=>!details().textContent.includes("Not in the graph"));
  check("the current mark follows the click",()=>entry("HEAD@{2}").getAttribute("aria-current")==="true"&&!entry("HEAD@{1}").hasAttribute("aria-current"));
 
+ // --- a reload that stops drawing the clicked entry ------------------------
+ // What App does when the filter changes or a watcher refresh lands: reload
+ // the walk. This one no longer draws the commit clicked in HEAD moves.
+ graphHonoursQuery=true;
+ filterStore.setSearch("commit number 1");
+ void graphStore.loadGraph(root,"commit number 1",null);
+ await until(()=>get(graphStore).rows.length>0&&!get(graphStore).rows.some(r=>r.id===hex(2)),"graph reloaded without the entry");
+ await wait(150);
+ check("a reload that stops drawing the clicked HEAD move keeps it selected",()=>get(graphStore).selectedCommit?.id===hex(2)&&details().textContent.includes(hex(2).slice(0,8)));
+ check("and names the filter as why, not a reset",()=>details().textContent.includes("Not in the loaded graph"));
+ filterStore.setSearch("");graphHonoursQuery=false;
+ void graphStore.loadGraph(root,"",null);
+ await until(()=>get(graphStore).rows.some(r=>r.id===hex(2))&&entry("HEAD@{0}"),"graph and reflog restored");
+
  // --- the commit filter -----------------------------------------------------
  filterStore.setSearch("parser");
  await until(()=>!entry("HEAD@{0}"),"filtered");

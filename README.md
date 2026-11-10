@@ -40,7 +40,7 @@ walks through a review, task creation, and optional setup.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 14 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 13 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
@@ -127,7 +127,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 14 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 13 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end

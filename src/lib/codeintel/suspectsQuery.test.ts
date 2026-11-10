@@ -259,6 +259,14 @@ describe("createSuspectsQuery", () => {
     expect(suspectMarks(get(q), "/r").size).toBe(0);
   });
 
+  it("keeps a focus request across the first bind", () => {
+    // The palette door asks before History has mounted and bound the repo.
+    const q = createSuspectsQuery({ fetch: async () => payload([]) });
+    q.requestFocus();
+    q.bindRepo("/r");
+    expect(get(q).focusPending).toBe(true);
+  });
+
   it("seeds the window from a commit and runs when a symptom is named", async () => {
     const calls: unknown[][] = [];
     const q = createSuspectsQuery({

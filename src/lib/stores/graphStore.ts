@@ -962,6 +962,16 @@ export function createGraphStore(
     /** Selects a drawn row, as a click on the graph does. Clears any pin. */
     selectCommit: (commit: VisualCommitRow, repoPath?: string) => select(commit, repoPath, false),
     /**
+     * Reads the selected commit's details again (the details pane's Retry),
+     * keeping the selection's pin: retrying is not choosing a commit.
+     */
+    retryDetails: (repoPath?: string) => {
+      const path = repoPath ?? visiblePath;
+      const commit = (path ? cache.get(path)?.selectedCommit : undefined) ?? latestState?.selectedCommit ?? null;
+      if (!commit) return Promise.resolve();
+      return select(commit, repoPath, path !== null && pinned.get(path) === commit.id);
+    },
+    /**
      * Selects a commit by id, whether or not the loaded rows draw it.
      *
      * A drawn commit is selected exactly as a click would. One the walk does
