@@ -324,13 +324,14 @@ mod tests {
     }
 
     /// Where the root watch is not recursive nothing is counted: the poll
-    /// there always reads (see `PollSkip::cover_at`).
+    /// there always reads (see `PollSkip::begin`).
     #[test]
     fn a_non_recursive_watch_cannot_vouch_for_anything() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let filter = filter(&root, RecursiveMode::NonRecursive);
-        assert_eq!(filter.skip().cover_at(std::time::Instant::now()), None);
+        let begun = filter.skip().begin(std::time::Instant::now(), true);
+        assert!(begun.served.is_none() && begun.keep_under.is_none());
     }
 
     /// Ten thousand writes under an ignored directory: each is classified once,

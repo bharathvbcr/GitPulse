@@ -3,9 +3,9 @@
 pub mod bench_seam;
 pub mod debouncer;
 pub(crate) mod filter;
-pub(crate) mod skip;
 #[cfg(test)]
 mod registration_timing;
+pub(crate) mod skip;
 #[cfg(all(test, unix))]
 mod storm;
 
@@ -1660,14 +1660,12 @@ where
     };
     let skip = filter.skip();
     let started = Instant::now();
-    let covered = skip.cover_at(started);
-    if may_reuse {
-        if let Some(rows) = covered.and_then(|epoch| skip.serve(epoch, started)) {
-            return Ok(rows.as_ref().clone());
-        }
+    let begun = skip.begin(started, may_reuse);
+    if let Some(rows) = begun.served {
+        return Ok(rows.as_ref().clone());
     }
     let rows = read()?;
-    if let Some(epoch) = covered {
+    if let Some(epoch) = begun.keep_under {
         skip.settle(epoch, &rows, started);
     }
     Ok(rows)
@@ -5739,6 +5737,7 @@ mod tests {
         .expect("status")
     }
 
+    #[cfg(target_os = "macos")]
     fn skip_of(state: &WatcherState, path: &str) -> Arc<filter::EventFilter> {
         state.filter_for(path).expect("a live session has a filter")
     }
@@ -5783,12 +5782,26 @@ mod tests {
                 poll(state, path);
             }
             thread::sleep(Duration::from_millis(1500));
-            assert_eq!(filter.skip().epoch_now(), epoch, "GitPulse's own reads moved the epoch");
+            assert_eq!(
+                filter.skip().epoch_now(),
+                epoch,
+                "GitPulse's own reads moved the epoch"
+            );
             let before = reads_of(reads);
+            let skipped_before = filter.skip().counted(skip::Outcome::Skipped);
             for _ in 0..5 {
                 poll(state, path);
             }
-            assert_eq!(reads_of(reads), before, "nothing happened: the polls are skipped");
+            assert_eq!(
+                reads_of(reads),
+                before,
+                "nothing happened: the polls are skipped"
+            );
+            assert_eq!(
+                filter.skip().counted(skip::Outcome::Skipped) - skipped_before,
+                5,
+                "the counters saw the five skips"
+            );
         });
     }
 
@@ -5824,7 +5837,11 @@ mod tests {
                 act(root);
                 wait_for(what, || filter.skip().epoch_now() != epoch);
                 poll(state, path);
-                assert_eq!(reads_of(reads), before + 1, "{what} must make the poll read");
+                assert_eq!(
+                    reads_of(reads),
+                    before + 1,
+                    "{what} must make the poll read"
+                );
                 poll(state, path);
                 assert_eq!(reads_of(reads), before + 1, "and the read is kept again");
             }
@@ -5883,7 +5900,10 @@ mod tests {
             });
             let rows = poll(state, path);
             assert_eq!(reads_of(reads), before + 1);
-            assert!(rows.iter().any(|r| r.path.starts_with(":build")), "{rows:?}");
+            assert!(
+                rows.iter().any(|r| r.path.starts_with(":build")),
+                "{rows:?}"
+            );
         });
     }
 
@@ -5928,7 +5948,10 @@ mod tests {
             let filter = skip_of(state, path);
             wait_for_a_still_epoch(filter.skip());
             git_in(root, &["add", "-f", "out/sub/f.txt"]);
-            git_in(root, &["commit", "-m", "track a file under an ignored directory"]);
+            git_in(
+                root,
+                &["commit", "-m", "track a file under an ignored directory"],
+            );
             wait_for_a_still_epoch(filter.skip());
             poll(state, path);
             poll(state, path);
@@ -5965,14 +5988,18 @@ mod tests {
             wait_for_a_still_epoch(filter.skip());
             filter
                 .skip()
-                .set_timings(Duration::from_millis(500), Duration::from_millis(200));
+                .set_timings(Duration::from_millis(1500), Duration::from_millis(1000));
             let first = poll(state, path);
             assert!(first.len() >= 2_100, "{} rows", first.len());
-            thread::sleep(Duration::from_millis(600));
+            thread::sleep(Duration::from_millis(1600));
             poll(state, path);
-            thread::sleep(Duration::from_millis(300));
+            // Straight after the cap read: served (the cap is measured from
+            // when that read began, so a slow read must not eat it).
             poll(state, path);
-            assert!(!filter.skip().is_convicted(), "a healthy watch was convicted");
+            assert!(
+                !filter.skip().is_convicted(),
+                "a healthy watch was convicted"
+            );
             assert_eq!(reads_of(reads), 2, "the cap forced one more real read");
         });
     }
@@ -5980,7 +6007,9 @@ mod tests {
     /// A stream that registers and says nothing, simulated by a session whose
     /// filter is never fed. A real change under it is served stale for at most
     /// the cap, then the read at the cap disagrees and the watch is convicted:
-    /// every poll reads from then on.
+    /// every poll reads from then on. Gated to `unix` like the skip's own unit
+    /// tests: it arms a recursive filter by hand, which needs a root inode.
+    #[cfg(unix)]
     #[test]
     fn a_silent_stream_is_stale_at_most_until_the_cap_then_convicted() {
         watched_repo_counting_status_reads(|state, path, root, reads| {
@@ -6097,7 +6126,8 @@ mod tests {
                                 thread::spawn(move || {
                                     let mut n = 0u32;
                                     while !stop.load(Ordering::Acquire) {
-                                        let _ = std::fs::write(out.join(format!("f{}.o", n % 64)), "x");
+                                        let _ =
+                                            std::fs::write(out.join(format!("f{}.o", n % 64)), "x");
                                         n += 1;
                                         thread::sleep(Duration::from_millis(200));
                                     }

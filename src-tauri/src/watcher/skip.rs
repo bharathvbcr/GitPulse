@@ -14,9 +14,19 @@
 //! number, so an event that lands while the read runs leaves it older than the
 //! epoch the watch reports next: a read in flight never covers an event.
 //!
+//! # Where it runs
+//!
+//! The skip is owned by `target_os = "macos"`: only there is the root watch
+//! recursive ([`super::filter::ROOT_WATCH_MODE`]). On Linux and Windows
+//! [`PollSkip::begin`] answers [`Outcome::Unavailable`] every time and the poll
+//! reads as it always did. The module itself compiles everywhere; its unit
+//! tests that arm a watch need a root identity (an inode), so they run on
+//! `unix`, the cases that need none run everywhere, and the one case about a
+//! platform with no identity runs where `unix` is off.
+//!
 //! # Unknown is never clean
 //!
-//! [`PollSkip::cover_at`] says nothing (the caller reads, as it always did)
+//! [`PollSkip::begin`] says nothing (the caller reads, as it always did)
 //! unless the root watch is recursive (macOS only; Linux and Windows are
 //! non-recursive, see [`super::filter::ROOT_WATCH_MODE`]), the watch has not
 //! ended, the worktree root is still the directory that was registered (a moved
@@ -77,6 +87,104 @@ fn root_id(_path: &Path) -> Option<RootId> {
     None
 }
 
+/// Why a watch cannot vouch for a worktree at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// A bare repository: there is no worktree root to watch.
+    NoRoot,
+    /// The root watch is not recursive (Linux and Windows).
+    NotRecursive,
+    /// The watch was shut down, parked or evicted.
+    Ended,
+    /// The platform gave no identity for the root at registration (no inode).
+    NoIdentity,
+    /// The directory at the root is no longer the one that was registered.
+    RootMoved,
+}
+
+/// What one poll decision came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Answered from the kept read; no git process was spawned.
+    Skipped,
+    /// Read because an event arrived since the kept read began, or nothing was
+    /// kept yet.
+    ReadAfterEvents,
+    /// Read because the kept read reached the age cap.
+    ReadAged,
+    /// Read because the watch is suspect (a cap read disagreed; see above).
+    ReadSuspect,
+    /// Read because the watch is convicted, until it is re-registered.
+    ReadConvicted,
+    /// Read because this watch cannot vouch for the worktree.
+    Unavailable(Why),
+}
+
+const OUTCOMES: usize = 10;
+
+impl Outcome {
+    const fn slot(self) -> usize {
+        match self {
+            Outcome::Skipped => 0,
+            Outcome::ReadAfterEvents => 1,
+            Outcome::ReadAged => 2,
+            Outcome::ReadSuspect => 3,
+            Outcome::ReadConvicted => 4,
+            Outcome::Unavailable(Why::NoRoot) => 5,
+            Outcome::Unavailable(Why::NotRecursive) => 6,
+            Outcome::Unavailable(Why::Ended) => 7,
+            Outcome::Unavailable(Why::NoIdentity) => 8,
+            Outcome::Unavailable(Why::RootMoved) => 9,
+        }
+    }
+}
+
+/// Poll decisions by outcome. One per watch (its own log text) and one for the
+/// process (the line [`summary`] feeds to the existing periodic gate log).
+struct Counts([AtomicU64; OUTCOMES]);
+
+impl Counts {
+    const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; OUTCOMES])
+    }
+
+    fn add(&self, outcome: Outcome) {
+        self.0[outcome.slot()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get(&self, outcome: Outcome) -> u64 {
+        self.0[outcome.slot()].load(Ordering::Relaxed)
+    }
+
+    /// One line that tells the four states apart: `skipped` above zero is a
+    /// skip that is alive and firing; `skipped=0` with `read_after_events`
+    /// climbing is a skip that is alive but whose events never stop;
+    /// `read_convicted` is a conviction; any `unavailable_*` names why this
+    /// watch never could.
+    fn line(&self) -> String {
+        format!(
+            "[poll-skip] skipped={} read_after_events={} read_aged={} read_suspect={} read_convicted={} unavailable_no_root={} unavailable_not_recursive={} unavailable_ended={} unavailable_no_identity={} unavailable_root_moved={}",
+            self.get(Outcome::Skipped),
+            self.get(Outcome::ReadAfterEvents),
+            self.get(Outcome::ReadAged),
+            self.get(Outcome::ReadSuspect),
+            self.get(Outcome::ReadConvicted),
+            self.get(Outcome::Unavailable(Why::NoRoot)),
+            self.get(Outcome::Unavailable(Why::NotRecursive)),
+            self.get(Outcome::Unavailable(Why::Ended)),
+            self.get(Outcome::Unavailable(Why::NoIdentity)),
+            self.get(Outcome::Unavailable(Why::RootMoved)),
+        )
+    }
+}
+
+static TOTALS: Counts = Counts::new();
+
+/// The process-wide counts since start, for the periodic gate log line.
+pub(crate) fn summary() -> String {
+    TOTALS.line()
+}
+
 /// The part of a status row that is a function of the tree alone.
 fn deterministic(rows: &[FileStatus]) -> Vec<(&str, Option<&str>, &str, bool, bool)> {
     rows.iter()
@@ -110,10 +218,19 @@ struct Trust {
     convicted: bool,
 }
 
+/// What a poll decision hands the caller.
+pub(crate) struct Begin {
+    /// The kept answer, when the poll may be answered without a read.
+    pub(crate) served: Option<Arc<Vec<FileStatus>>>,
+    /// The epoch a real read is kept under, `None` when nothing may be kept.
+    pub(crate) keep_under: Option<u64>,
+}
+
 pub(crate) struct PollSkip {
     /// The root watch is recursive. Where it is not, nothing can show a
     /// worktree unchanged and the poll always reads.
     recursive: bool,
+    has_root: bool,
     epoch: AtomicU64,
     ended: AtomicBool,
     root: std::path::PathBuf,
@@ -123,12 +240,14 @@ pub(crate) struct PollSkip {
     oversize_reported: AtomicBool,
     max_age_ms: AtomicU64,
     grace_ms: AtomicU64,
+    counts: Counts,
 }
 
 impl PollSkip {
     pub(crate) fn new(root: Option<&Path>, recursive: bool) -> Self {
         Self {
-            recursive: recursive && root.is_some(),
+            recursive,
+            has_root: root.is_some(),
             epoch: AtomicU64::new(0),
             ended: AtomicBool::new(false),
             root: root.map(Path::to_path_buf).unwrap_or_default(),
@@ -137,6 +256,7 @@ impl PollSkip {
             oversize_reported: AtomicBool::new(false),
             max_age_ms: AtomicU64::new(KEPT_STATUS_MAX_AGE.as_millis() as u64),
             grace_ms: AtomicU64::new(SUSPECT_GRACE.as_millis() as u64),
+            counts: Counts::new(),
         }
     }
 
@@ -159,7 +279,7 @@ impl PollSkip {
         self.trust.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_timings(&self, max_age: Duration, grace: Duration) {
         self.max_age_ms
             .store(max_age.as_millis() as u64, Ordering::Release);
@@ -167,27 +287,37 @@ impl PollSkip {
             .store(grace.as_millis() as u64, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn is_convicted(&self) -> bool {
         self.lock().convicted
     }
 
-    fn available(&self) -> bool {
-        self.recursive
-            && !self.ended.load(Ordering::Acquire)
-            && self.root_id.is_some()
-            && root_id(&self.root) == self.root_id
+    /// Why this watch cannot vouch for the worktree, if it cannot.
+    fn unavailable(&self) -> Option<Why> {
+        if !self.has_root {
+            Some(Why::NoRoot)
+        } else if !self.recursive {
+            Some(Why::NotRecursive)
+        } else if self.ended.load(Ordering::Acquire) {
+            Some(Why::Ended)
+        } else if self.root_id.is_none() {
+            Some(Why::NoIdentity)
+        } else if root_id(&self.root) != self.root_id {
+            Some(Why::RootMoved)
+        } else {
+            None
+        }
     }
 
-    /// The epoch a read starting now is kept under, or `None` when the watch
-    /// vouches for nothing and the caller must read and keep nothing.
-    pub(crate) fn cover_at(&self, now: Instant) -> Option<u64> {
-        if !self.available() {
-            return None;
+    /// The epoch a read starting now is kept under, or why the watch vouches
+    /// for nothing and the caller must read and keep nothing.
+    fn cover(&self, now: Instant) -> Result<u64, Outcome> {
+        if let Some(why) = self.unavailable() {
+            return Err(Outcome::Unavailable(why));
         }
         let mut trust = self.lock();
         if trust.convicted {
-            return None;
+            return Err(Outcome::ReadConvicted);
         }
         let epoch = self.epoch_now();
         if let Some(suspicion) = &trust.suspect {
@@ -202,31 +332,83 @@ impl PollSkip {
                 trust.kept = None;
                 log::warn!(
                     target: "watcher",
-                    "{}: a status read returned a different answer from the previous one although the watch saw no event; the status poll now reads every time for this worktree until the watch is re-registered (the cause may be a change no worktree watch can see, such as a global git setting, rather than a lost event)",
-                    self.root.display()
+                    "{}: a status read returned a different answer from the previous one although the watch saw no event; the status poll now reads every time for this worktree until the watch is re-registered (the cause may be a change no worktree watch can see, such as a global git setting, rather than a lost event); poll decisions so far: {}",
+                    self.root.display(),
+                    self.counts.line()
                 );
-                return None;
+                return Err(Outcome::ReadConvicted);
             }
         }
-        Some(epoch)
+        Ok(epoch)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn cover_at(&self, now: Instant) -> Option<u64> {
+        self.cover(now).ok()
     }
 
     /// The kept read, if it was taken at `epoch`, no event has arrived since,
     /// and it is younger than the cap. A suspect watch serves nothing.
-    pub(crate) fn serve(&self, epoch: u64, now: Instant) -> Option<Arc<Vec<FileStatus>>> {
+    fn serve_kept(&self, epoch: u64, now: Instant) -> Result<Arc<Vec<FileStatus>>, Outcome> {
         let trust = self.lock();
-        if trust.suspect.is_some() || trust.convicted {
-            return None;
+        if trust.convicted {
+            return Err(Outcome::ReadConvicted);
         }
-        let kept = trust.kept.as_ref()?;
+        if trust.suspect.is_some() {
+            return Err(Outcome::ReadSuspect);
+        }
+        let Some(kept) = trust.kept.as_ref() else {
+            return Err(Outcome::ReadAfterEvents);
+        };
+        // The live epoch is read here, under the lock and after the decision to
+        // serve was taken: an event that landed in between must not be covered.
+        if kept.epoch != epoch || self.epoch_now() != epoch {
+            return Err(Outcome::ReadAfterEvents);
+        }
         let max_age = Duration::from_millis(self.max_age_ms.load(Ordering::Acquire));
-        (kept.epoch == epoch
-            && self.epoch_now() == epoch
-            && now.saturating_duration_since(kept.at) < max_age)
-            .then(|| Arc::clone(&kept.rows))
+        if now.saturating_duration_since(kept.at) >= max_age {
+            return Err(Outcome::ReadAged);
+        }
+        Ok(Arc::clone(&kept.rows))
     }
 
-    /// Records the answer of a real read that began when `cover_at` said
+    #[cfg(all(test, unix))]
+    pub(crate) fn serve(&self, epoch: u64, now: Instant) -> Option<Arc<Vec<FileStatus>>> {
+        self.serve_kept(epoch, now).ok()
+    }
+
+    /// One poll decision. `may_reuse` is false for a refresh that followed an
+    /// event, which is a read by definition and is not counted as a poll.
+    pub(crate) fn begin(&self, now: Instant, may_reuse: bool) -> Begin {
+        let covered = self.cover(now);
+        let mut served = None;
+        if may_reuse {
+            let outcome = match covered.and_then(|epoch| self.serve_kept(epoch, now)) {
+                Ok(rows) => {
+                    served = Some(rows);
+                    Outcome::Skipped
+                }
+                Err(outcome) => outcome,
+            };
+            self.count(outcome);
+        }
+        Begin {
+            served,
+            keep_under: covered.ok(),
+        }
+    }
+
+    fn count(&self, outcome: Outcome) {
+        self.counts.add(outcome);
+        TOTALS.add(outcome);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn counted(&self, outcome: Outcome) -> u64 {
+        self.counts.get(outcome)
+    }
+
+    /// Records the answer of a real read that began when `begin` said
     /// `epoch`. A read that disagrees with the kept one while the epoch has not
     /// moved makes the watch suspect.
     pub(crate) fn settle(&self, epoch: u64, rows: &[FileStatus], now: Instant) {
@@ -243,9 +425,10 @@ impl PollSkip {
         if rows.len() > MAX_KEPT_ROWS && !self.oversize_reported.swap(true, Ordering::AcqRel) {
             log::info!(
                 target: "watcher",
-                "{}: a status answer of {} rows is too large to keep; the status poll reads every time for this worktree while it stays that large",
+                "{}: a status answer of {} rows is too large to keep; the status poll reads every time for this worktree while it stays that large; poll decisions so far: {}",
                 self.root.display(),
-                rows.len()
+                rows.len(),
+                self.counts.line()
             );
         }
         trust.kept = (rows.len() <= MAX_KEPT_ROWS).then(|| Kept {
@@ -256,7 +439,7 @@ impl PollSkip {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -300,7 +483,10 @@ mod tests {
         assert_eq!(served[0].path, "a.txt");
         skip.event();
         let next = skip.cover_at(t0).unwrap();
-        assert!(skip.serve(next, t0).is_none(), "an event ends the kept read");
+        assert!(
+            skip.serve(next, t0).is_none(),
+            "an event ends the kept read"
+        );
     }
 
     /// The race the epoch exists for: an event that lands while a read runs
@@ -328,21 +514,103 @@ mod tests {
         assert!(skip.serve(epoch, t0 + KEPT_STATUS_MAX_AGE).is_none());
     }
 
-    /// Unknown is never clean, one case each.
+    /// Unknown is never clean: a watch that has ended vouches for nothing.
     #[test]
-    fn an_unarmed_watch_vouches_for_nothing() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+    fn an_ended_watch_vouches_for_nothing() {
+        let (_temp, ended) = armed();
         let now = Instant::now();
-        // Linux and Windows: the root watch is not recursive.
-        assert_eq!(PollSkip::new(Some(&root), false).cover_at(now), None);
-        // No worktree root (a bare repository).
-        assert_eq!(PollSkip::new(None, true).cover_at(now), None);
-        // A watch that has ended.
-        let ended = PollSkip::new(Some(&root), true);
         assert!(ended.cover_at(now).is_some());
         ended.end();
         assert_eq!(ended.cover_at(now), None);
+        assert_eq!(ended.begin(now, true).keep_under, None);
+        assert_eq!(ended.counted(Outcome::Unavailable(Why::Ended)), 1);
+    }
+
+    /// The live-epoch guard in `serve`, which no test pinned (deleting it left the suite green),
+    /// was untested: the decision to serve is taken on the epoch `cover_at`
+    /// returned, and an event can land between that and the serve. Without
+    /// the live-epoch comparison the kept read, whose epoch still equals the
+    /// stale number, would be served over the event.
+    #[test]
+    fn an_event_between_the_decision_and_the_serve_is_not_covered() {
+        let (_temp, skip) = armed();
+        let t0 = Instant::now();
+        let epoch = read_and_keep(&skip, &[row("a.txt")], t0);
+        let decided = skip.cover_at(t0).expect("armed");
+        assert_eq!(
+            decided, epoch,
+            "nothing happened yet: the decision is to serve"
+        );
+        skip.event();
+        assert!(
+            skip.serve(decided, t0).is_none(),
+            "an event landed after the decision; the kept read must not cover it"
+        );
+    }
+
+    /// The counters tell the four states apart.
+    #[test]
+    fn the_counters_tell_firing_from_event_bound_from_convicted() {
+        let (_temp, skip) = armed();
+        let t0 = Instant::now();
+        // First poll: nothing kept, a real read.
+        let first = skip.begin(t0, true);
+        assert!(first.served.is_none());
+        skip.settle(first.keep_under.unwrap(), &[row("a.txt")], t0);
+        assert_eq!(skip.counted(Outcome::ReadAfterEvents), 1);
+        // Alive and firing.
+        assert!(skip.begin(t0, true).served.is_some());
+        assert!(skip.begin(t0, true).served.is_some());
+        assert_eq!(skip.counted(Outcome::Skipped), 2);
+        // Events keep arriving: every poll reads.
+        for _ in 0..3 {
+            skip.event();
+            let begun = skip.begin(t0, true);
+            assert!(begun.served.is_none());
+            skip.settle(begun.keep_under.unwrap(), &[row("a.txt")], t0);
+        }
+        assert_eq!(skip.counted(Outcome::ReadAfterEvents), 4);
+        assert_eq!(skip.counted(Outcome::Skipped), 2);
+        // The age cap.
+        let aged = skip.begin(t0 + KEPT_STATUS_MAX_AGE, true);
+        assert!(aged.served.is_none());
+        assert_eq!(skip.counted(Outcome::ReadAged), 1);
+        // A refresh that followed an event is a read, not a poll decision.
+        let before = skip
+            .counts
+            .0
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum::<u64>();
+        skip.begin(t0, false);
+        let after = skip
+            .counts
+            .0
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum::<u64>();
+        assert_eq!(before, after, "may_reuse=false is not counted");
+        // Suspect, then convicted.
+        let (_temp, skip) = armed();
+        convict(&skip, t0);
+        skip.begin(t0 + KEPT_STATUS_MAX_AGE + SUSPECT_GRACE, true);
+        assert!(skip.counted(Outcome::ReadConvicted) >= 1);
+        let line = skip.counts.line();
+        assert!(
+            line.contains("read_convicted=") && !line.contains("read_convicted=0"),
+            "{line}"
+        );
+    }
+
+    /// A suspect watch says so in the counters before it is convicted.
+    #[test]
+    fn a_suspect_watch_counts_as_suspect() {
+        let (_temp, skip) = armed();
+        let t0 = Instant::now();
+        let epoch = read_and_keep(&skip, &[row("a.txt")], t0);
+        skip.settle(epoch, &[row("b.txt")], t0);
+        skip.begin(t0, true);
+        assert_eq!(skip.counted(Outcome::ReadSuspect), 1);
     }
 
     /// A root that moved away sends no event; its identity is the witness.
@@ -359,16 +627,18 @@ mod tests {
         std::fs::rename(&root, base.join("moved")).unwrap();
         assert_eq!(skip.cover_at(now), None, "the root is gone");
         std::fs::create_dir(&root).unwrap();
-        assert_eq!(skip.cover_at(now), None, "a different directory stands there");
+        assert_eq!(
+            skip.cover_at(now),
+            None,
+            "a different directory stands there"
+        );
     }
 
     #[test]
     fn a_read_over_the_row_cap_is_not_kept() {
         let (_temp, skip) = armed();
         let t0 = Instant::now();
-        let rows: Vec<FileStatus> = (0..=MAX_KEPT_ROWS)
-            .map(|i| row(&format!("f{i}")))
-            .collect();
+        let rows: Vec<FileStatus> = (0..=MAX_KEPT_ROWS).map(|i| row(&format!("f{i}"))).collect();
         let epoch = read_and_keep(&skip, &rows, t0);
         assert!(skip.serve(epoch, t0).is_none());
     }
@@ -444,5 +714,85 @@ mod tests {
             .cover_at(t0 + KEPT_STATUS_MAX_AGE + SUSPECT_GRACE * 5)
             .is_some());
         assert!(!skip.is_convicted());
+    }
+}
+
+/// The cases that need no root identity run everywhere; they are the whole
+/// story on Linux and Windows, where the root watch is not recursive.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    fn root() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        (temp, root)
+    }
+
+    /// Where the skip is unavailable the poll reads every time and says why.
+    #[test]
+    fn a_non_recursive_watch_reads_every_poll_and_says_so() {
+        let (_temp, root) = root();
+        let skip = PollSkip::new(Some(&root), false);
+        let now = Instant::now();
+        for _ in 0..2 {
+            let begun = skip.begin(now, true);
+            assert!(begun.served.is_none() && begun.keep_under.is_none());
+        }
+        assert_eq!(skip.counts.get(Outcome::Unavailable(Why::NotRecursive)), 2);
+        assert_eq!(skip.counts.get(Outcome::Skipped), 0);
+        let line = skip.counts.line();
+        assert!(line.contains("unavailable_not_recursive=2"), "{line}");
+        assert!(line.contains("skipped=0"), "{line}");
+    }
+
+    #[test]
+    fn a_watch_with_no_worktree_root_reads_every_poll_and_says_so() {
+        let skip = PollSkip::new(None, true);
+        let now = Instant::now();
+        assert!(skip.begin(now, true).keep_under.is_none());
+        assert_eq!(skip.counts.get(Outcome::Unavailable(Why::NoRoot)), 1);
+    }
+
+    /// The process-wide line is the same text over the process totals.
+    #[test]
+    fn the_summary_line_names_every_state() {
+        let line = summary();
+        for key in [
+            "skipped=",
+            "read_after_events=",
+            "read_aged=",
+            "read_suspect=",
+            "read_convicted=",
+            "unavailable_no_root=",
+            "unavailable_not_recursive=",
+            "unavailable_ended=",
+            "unavailable_no_identity=",
+            "unavailable_root_moved=",
+        ] {
+            assert!(line.contains(key), "{line}");
+        }
+        assert!(line.starts_with("[poll-skip] "));
+    }
+}
+
+/// Where the platform gives no root identity (Windows) a recursive watch still
+/// cannot vouch: the poll reads every time. Compiled only there, so it is
+/// checked for Windows by clippy from the Mac and run by Windows CI.
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    #[test]
+    fn without_a_root_identity_every_poll_reads_and_says_why() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let skip = PollSkip::new(Some(&root), true);
+        let now = Instant::now();
+        assert!(skip.cover(now).is_err());
+        for _ in 0..2 {
+            assert!(skip.begin(now, true).served.is_none());
+        }
+        assert_eq!(skip.counts.get(Outcome::Unavailable(Why::NoIdentity)), 2);
     }
 }

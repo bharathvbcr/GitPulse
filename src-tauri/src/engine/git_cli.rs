@@ -5024,9 +5024,10 @@ fn log_refusals(
     );
     log::warn!(
         target: "spawn_gate",
-        "{} | {refused_by} | {}",
+        "{} | {refused_by} | {} | {}",
         format_gate_report(counters, sharing),
-        top()
+        top(),
+        crate::watcher::skip::summary()
     );
 }
 
