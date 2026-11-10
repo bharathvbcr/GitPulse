@@ -4743,9 +4743,11 @@ fn abandon_if_all_gone(key: &SharedReadKey, flight: &Arc<SharedRead>) -> bool {
         return true;
     }
     let all_gone = |waiters: &[Option<read_cancel::ReadCancel>]| {
-        waiters
-            .iter()
-            .all(|waiter| waiter.as_ref().is_some_and(read_cancel::ReadCancel::is_cancelled))
+        waiters.iter().all(|waiter| {
+            waiter
+                .as_ref()
+                .is_some_and(read_cancel::ReadCancel::is_cancelled)
+        })
     };
     // Without the table: nearly every poll of a flight someone still wants.
     if !all_gone(
@@ -4968,13 +4970,7 @@ fn run_read_shared_once(
             None => &mut (),
         };
         return SharedAttempt::Done(run_with_gate(
-            cmd,
-            label,
-            timeout,
-            None,
-            stdout_cap,
-            observer,
-            gate,
+            cmd, label, timeout, None, stdout_cap, observer, gate,
         ));
     };
     let key = SharedReadKey {
@@ -4999,11 +4995,8 @@ fn run_read_shared_once(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         // A flight that was cancelled is joined by no one, however it is found.
-        let live = |flight: &Arc<SharedRead>| {
-            !flight
-                .abandoned
-                .load(std::sync::atomic::Ordering::Acquire)
-        };
+        let live =
+            |flight: &Arc<SharedRead>| !flight.abandoned.load(std::sync::atomic::Ordering::Acquire);
         let known = retry
             .as_deref()
             .and_then(Clone::clone)
@@ -5084,7 +5077,11 @@ fn run_read_shared_once(
         }
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
-        if let Some(error) = shared.as_ref().err().filter(|error| !is_cancellation(error)) {
+        if let Some(error) = shared
+            .as_ref()
+            .err()
+            .filter(|error| !is_cancellation(error))
+        {
             note_process_failure(error);
         }
         return SharedAttempt::Done(shared);
@@ -5625,7 +5622,11 @@ fn run_admitted(
         }
         other => other,
     };
-    if let Some(error) = result.as_ref().err().filter(|error| !is_cancellation(error)) {
+    if let Some(error) = result
+        .as_ref()
+        .err()
+        .filter(|error| !is_cancellation(error))
+    {
         note_process_failure(error);
     }
     result
@@ -6254,7 +6255,10 @@ fn git_run_inner(
         // A cancelled request starts nothing more: a reader that falls back to
         // a second command when the first fails must not spawn it for a caller
         // who has gone.
-        if cancel.as_ref().is_some_and(read_cancel::ReadCancel::is_cancelled) {
+        if cancel
+            .as_ref()
+            .is_some_and(read_cancel::ReadCancel::is_cancelled)
+        {
             return Err(read_cancel::CANCELLED_MESSAGE.into());
         }
         let cmd = git_command(repo, args);

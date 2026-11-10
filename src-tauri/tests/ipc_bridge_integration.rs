@@ -419,7 +419,11 @@ fn a_cancel_for_a_read_that_is_not_running_answers_false_not_an_error() {
     assert!(value.get("rows").is_some(), "payload: {value}");
     let value = invoke("cmd_cancel_read", json!({ "requestId": "rc-bridge-1" }))
         .expect("cancelling a finished read is not a failure");
-    assert_eq!(value, json!(false), "a finished read is no longer registered");
+    assert_eq!(
+        value,
+        json!(false),
+        "a finished read is no longer registered"
+    );
 }
 
 #[test]

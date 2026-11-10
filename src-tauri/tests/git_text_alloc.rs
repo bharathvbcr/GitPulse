@@ -97,7 +97,8 @@ fn text_entries_allocate_no_second_copy_of_the_output() {
     let slack = PAYLOAD / 3;
 
     // The runner's own cost for this output, with no decode.
-    let (bytes, baseline) = allocated_by(|| git_bytes_capped(path, &args, MAX_OUTPUT_BYTES).unwrap());
+    let (bytes, baseline) =
+        allocated_by(|| git_bytes_capped(path, &args, MAX_OUTPUT_BYTES).unwrap());
     assert!(
         bytes.0.len() >= PAYLOAD - 24,
         "the fixture printed {} bytes",
@@ -106,10 +107,19 @@ fn text_entries_allocate_no_second_copy_of_the_output() {
     drop(bytes);
 
     let routes: [(&str, usize); 4] = [
-        ("git_text", allocated_by(|| git_text(path, &args).unwrap().len()).1),
+        (
+            "git_text",
+            allocated_by(|| git_text(path, &args).unwrap().len()).1,
+        ),
         (
             "git_text_capped",
-            allocated_by(|| git_text_capped(path, &args, MAX_OUTPUT_BYTES).unwrap().0.len()).1,
+            allocated_by(|| {
+                git_text_capped(path, &args, MAX_OUTPUT_BYTES)
+                    .unwrap()
+                    .0
+                    .len()
+            })
+            .1,
         ),
         (
             "git_text_partial",

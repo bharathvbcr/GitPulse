@@ -42,7 +42,10 @@ fn recorded_children(file: &Path) -> Vec<(u32, String)> {
 
 /// The pids a test's scripts have written to `file` so far.
 fn recorded(file: &Path) -> Vec<u32> {
-    recorded_children(file).into_iter().map(|(pid, _)| pid).collect()
+    recorded_children(file)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect()
 }
 
 /// Kills, at the end of the test, any child the code under test left running.
@@ -89,7 +92,10 @@ impl Rig {
 
     /// `tag` makes the argv, so the sharing key, differ between flights.
     fn script(&self, tag: &str, body: &str) -> String {
-        format!(": {tag}; {RECORD_SELF} >> '{}'; {body}", self.pids.display())
+        format!(
+            ": {tag}; {RECORD_SELF} >> '{}'; {body}",
+            self.pids.display()
+        )
     }
 
     fn read(
@@ -139,7 +145,11 @@ impl Rig {
             if pids.len() >= count {
                 return pids;
             }
-            assert!(Instant::now() < until, "only {} child(ren) started", pids.len());
+            assert!(
+                Instant::now() < until,
+                "only {} child(ren) started",
+                pids.len()
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -163,10 +173,7 @@ fn text(run: &BoundedRun) -> String {
 #[test]
 fn a_sole_waiters_read_is_cancelled_and_its_child_is_killed() {
     let rig = Rig::new(4);
-    let reader = rig.read(
-        Some("rc-sole"),
-        rig.script("sole", "exec sleep 60"),
-    );
+    let reader = rig.read(Some("rc-sole"), rig.script("sole", "exec sleep 60"));
     let pid = rig.wait_started(1)[0];
     let asked = Instant::now();
     assert!(read_cancel::cancel("rc-sole"), "a live read is signalled");
@@ -228,9 +235,13 @@ fn a_cancelled_request_starts_no_further_child() {
     let scope = ReadScope::open(Some("rc-no-more"));
     let _in = scope.enter();
     assert!(read_cancel::cancel("rc-no-more"));
-    let (outcome, spawned) = spawn_labels_during(|| git_text(repo.path(), &["status", "--porcelain"]));
+    let (outcome, spawned) =
+        spawn_labels_during(|| git_text(repo.path(), &["status", "--porcelain"]));
     assert_eq!(outcome.unwrap_err().message(), CANCELLED_MESSAGE);
-    assert!(spawned.is_empty(), "spawned for a cancelled request: {spawned:?}");
+    assert!(
+        spawned.is_empty(),
+        "spawned for a cancelled request: {spawned:?}"
+    );
 }
 
 /// Two requests wait on one child. One of them leaving does not stop it, and
@@ -239,17 +250,26 @@ fn a_cancelled_request_starts_no_further_child() {
 #[test]
 fn a_read_with_another_waiter_is_not_cancelled_by_the_leader_leaving() {
     let rig = Rig::new(1);
-    let held = rig.gate.acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let script = rig.script("two", "sleep 0.6; echo answer");
     let leader = rig.lead(Some("rc-lead"), script.clone());
     let joiner = rig.read(Some("rc-join"), script);
     rig.wait_joined(1);
     assert!(read_cancel::cancel("rc-lead"));
     drop(held);
-    let led = leader.join().unwrap().expect("the leader's caller still gets the answer");
+    let led = leader
+        .join()
+        .unwrap()
+        .expect("the leader's caller still gets the answer");
     let joined = joiner.join().unwrap().expect("the joiner gets the answer");
     assert!(!led.cancelled && !joined.cancelled);
-    assert_eq!((text(&led), text(&joined)), ("answer".into(), "answer".into()));
+    assert_eq!(
+        (text(&led), text(&joined)),
+        ("answer".into(), "answer".into())
+    );
     assert_eq!(rig.started().len(), 1, "one child serves both");
 }
 
@@ -261,7 +281,10 @@ fn a_joiner_leaving_returns_promptly_and_the_leader_is_untouched() {
     // A joiner reaches the leader's flight only while it is queued: hold the
     // gate's one slot.
     let rig = Rig::new(1);
-    let held = rig.gate.acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let script = rig.script("joiner", "sleep 1.5; echo answer");
     let leader = rig.lead(Some("rc-l2"), script.clone());
     let joiner = rig.read(Some("rc-j2"), script);
@@ -284,7 +307,10 @@ fn a_joiner_leaving_returns_promptly_and_the_leader_is_untouched() {
 #[test]
 fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
     let rig = Rig::new(1);
-    let held = rig.gate.acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let script = rig.script("late", "echo fresh");
     let first = rig.lead(Some("rc-late-1"), script.clone());
     let second = rig.read(Some("rc-late-2"), script.clone());
@@ -299,7 +325,10 @@ fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
         .keys()
         .any(|key| key.cwd == rig.cwd)
     {
-        assert!(Instant::now() < until, "the cancelled flight stayed joinable");
+        assert!(
+            Instant::now() < until,
+            "the cancelled flight stayed joinable"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     let late = rig.read(None, script);
@@ -307,9 +336,19 @@ fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
     let fresh = late.join().unwrap().expect("a fresh read");
     assert_eq!(text(&fresh), "fresh");
     assert!(!fresh.cancelled);
-    assert!(first.join().unwrap().is_err(), "the cancelled leader got no answer");
-    assert!(second.join().unwrap().is_err(), "the cancelled joiner got no answer");
-    assert_eq!(rig.started().len(), 1, "only the fresh read started a child");
+    assert!(
+        first.join().unwrap().is_err(),
+        "the cancelled leader got no answer"
+    );
+    assert!(
+        second.join().unwrap().is_err(),
+        "the cancelled joiner got no answer"
+    );
+    assert_eq!(
+        rig.started().len(),
+        1,
+        "only the fresh read started a child"
+    );
 }
 
 /// A read that never named an id is a waiter that never leaves.
@@ -317,7 +356,10 @@ fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
 #[test]
 fn a_waiter_without_an_id_keeps_the_read_alive() {
     let rig = Rig::new(1);
-    let held = rig.gate.acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let script = rig.script("plain", "sleep 0.3; echo answer");
     let named = rig.lead(Some("rc-named"), script.clone());
     let plain = rig.read(None, script);
@@ -358,7 +400,10 @@ fn a_cancel_racing_the_reads_end_loses_cleanly() {
                 error.message()
             ),
         }
-        assert!(!read_cancel::cancel(&id), "a finished read is not registered");
+        assert!(
+            !read_cancel::cancel(&id),
+            "a finished read is not registered"
+        );
         let again = rig.read(Some(&id), rig.script(&format!("after{round}"), "echo ok"));
         assert_eq!(text(&again.join().unwrap().unwrap()), "ok", "round {round}");
     }
@@ -417,13 +462,21 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
 #[test]
 fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure() {
     let rig = Rig::new(1);
-    let held = rig.gate.acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let scope = ReadScope::open(Some("rc-queued"));
     let _in = scope.enter();
     let cwd = rig.cwd.clone();
     let canceller = thread::spawn(move || {
         let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        while !super::shared_reads().lock().unwrap().keys().any(|key| key.cwd == cwd) {
+        while !super::shared_reads()
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.cwd == cwd)
+        {
             assert!(Instant::now() < until, "the read never queued");
             thread::sleep(Duration::from_millis(5));
         }
@@ -436,8 +489,16 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
     let outcome = run_read_shared(cmd, "queued-test", Duration::from_secs(60), 4096, rig.gate);
     canceller.join().unwrap();
     let error = outcome.err().expect("a cancelled read does not run");
-    assert!(error.message().ends_with(CANCELLED_BEFORE_SPAWN), "{}", error.message());
-    assert_eq!(PROCESS_FAILURES.get(), before, "a cancel was counted as a failure");
+    assert!(
+        error.message().ends_with(CANCELLED_BEFORE_SPAWN),
+        "{}",
+        error.message()
+    );
+    assert_eq!(
+        PROCESS_FAILURES.get(),
+        before,
+        "a cancel was counted as a failure"
+    );
     assert_eq!(
         as_read_cancellation(error, true).message(),
         CANCELLED_MESSAGE,
@@ -452,7 +513,10 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
 fn only_a_cancellation_is_exempt_from_the_failure_count() {
     let cancelled: CommandError = CANCELLED_MESSAGE.into();
     assert!(is_cancellation(&cancelled));
-    assert!(is_cancellation(&refusal_message("git log", Refusal::Cancelled)));
+    assert!(is_cancellation(&refusal_message(
+        "git log",
+        Refusal::Cancelled
+    )));
     for other in [
         "git log timed out after 90s",
         "Failed to spawn git log: forced by test",
@@ -481,7 +545,8 @@ fn a_cancelled_history_read_ahead_keeps_nothing_and_leaks_nothing_into_the_next_
         );
     }
     let path = repo.path().to_str().unwrap().to_string();
-    let window = |path: &str| GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named);
+    let window =
+        |path: &str| GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named);
     crate::engine::ref_cache::eager(|| {
         with_history_chunk(3, || {
             // The window's first walk is cancelled as it starts, by the caller
@@ -496,7 +561,10 @@ fn a_cancelled_history_read_ahead_keeps_nothing_and_leaks_nothing_into_the_next_
                     || window(&path),
                 )
             };
-            assert!(outcome.is_err(), "the cancelled window must not return rows");
+            assert!(
+                outcome.is_err(),
+                "the cancelled window must not return rows"
+            );
             drop(scope);
 
             // Nothing was kept: the same window, asked again, walks.

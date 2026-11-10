@@ -210,7 +210,10 @@ mod tests {
     fn a_live_id_is_signalled_and_a_duplicate_is_not_cancellable() {
         let first = ReadScope::open(Some("rc-test-live"));
         let second = ReadScope::open(Some("rc-test-live"));
-        assert!(second.handle().is_none(), "a duplicate id must not share a flag");
+        assert!(
+            second.handle().is_none(),
+            "a duplicate id must not share a flag"
+        );
         assert!(cancel("rc-test-live"));
         assert!(first.handle().unwrap().is_cancelled());
         // The duplicate's drop must not remove the first's registration.
