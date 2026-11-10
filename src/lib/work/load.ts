@@ -2,6 +2,7 @@ import { withDeadline } from "../async/deadline";
 import { WORK_DEADLINE_MESSAGE, workTimeout } from "./request";
 import { validateWorkResponse } from "./contracts";
 import { invoke } from "../ipc/invoke";
+import { invokeSharingGitHubContext } from "../ipc/githubContext";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
@@ -80,7 +81,9 @@ export async function loadWork(
   repoPath: string,
   deps: WorkLoadDeps = {},
 ): Promise<WorkProjection> {
-  const nativeCall = deps.invoke ?? invoke;
+  // The real IPC shares one GitHub read with the other panels; an injected
+  // `invoke` is a test's private seam and is called as given.
+  const nativeCall = deps.invoke ?? invokeSharingGitHubContext;
   const deadline = Date.now() + workTimeout(deps.timeoutMs);
   const call: typeof invoke = async <T>(command: string, args?: Parameters<typeof invoke>[1], options?: Parameters<typeof invoke>[2]): Promise<T> => {
     if (deps.signal?.aborted) throw new Error("Overview refresh superseded");
