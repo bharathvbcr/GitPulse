@@ -21,6 +21,7 @@ import { reportFailure } from "../stores/mutationOutcome";
 import { formatError } from "../ui/formatError";
 import { plural, shortHash } from "../format";
 import { describeResetPreview } from "./resetPreview";
+import { historySelectionLabel } from "../views/historyList";
 import type { ResetPreview } from "./types";
 
 /**
@@ -78,6 +79,9 @@ export async function resetKeepTo(commitId: string, label?: string): Promise<boo
   if (!confirmed) return false;
   const outcome = await repoStore.resetTo("keep", preview.target, target);
   if (!reportFailure(outcome, "Could not reset")) return false;
+  // HEAD moved, so every reflog selector shifted: the label the details pane
+  // would put in the next prompt (`HEAD@{2}`) now names a different entry.
+  historySelectionLabel.set(null);
   toastStore.success(
     `${preview.branch ?? "HEAD"} reset to ${shortHash(preview.target)}` +
       (preview.leaving_total > 0 ? ` — ${plural(preview.leaving_total, "commit")} left the branch` : ""),

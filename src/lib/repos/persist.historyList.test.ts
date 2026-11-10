@@ -82,9 +82,19 @@ describe("restoring a session left on regression suspects", () => {
     expect(tab.historyList).toBe("suspects");
   });
 
-  it("prefers the list a newer build wrote over a stale section", () => {
+  it("restores Suspects even when an older build saved another list beside it", () => {
+    // A build that still had the Suspects section wrote `historyList: "moves"`
+    // whenever Graph had last been left on HEAD moves, whatever section was on
+    // screen. No newer build writes `history: "suspects"` (the section is
+    // retired), so the section is the truer record of what was showing.
     const tab = load({ viewTab: "history", viewSections: { history: "suspects" }, historyList: "moves" });
-    expect(tab.historyList).toBe("moves");
+    expect(tab.historyList).toBe("suspects");
+    expect(tab.viewSections).toEqual({ history: "graph" });
+  });
+
+  it("keeps a list a newer build wrote when the section is a live one", () => {
+    expect(load({ viewTab: "history", viewSections: { history: "graph" }, historyList: "moves" }).historyList).toBe("moves");
+    expect(load({ viewTab: "history", viewSections: { history: "diff" }, historyList: "suspects" }).historyList).toBe("suspects");
   });
 
   it("round-trips the Suspects list", () => {
