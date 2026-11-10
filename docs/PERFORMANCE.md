@@ -1153,11 +1153,58 @@ The last row serializes a hand-built `unchanged` struct and nothing else: its
 208 bytes are the size of the answer on the wire, but its 4 us is not the cost
 of an unchanged reload. A real hit still stats every ref file and runs the
 HEAD, ref-decoration, default-branch and hidden-ref probes before it can
-answer, and **that cost is not measured**. Likewise, a reload whose token is
-stale now runs those probes before the history walk instead of overlapping it
-with them, and **that added latency is not measured either**. The token is also
+answer; the real hit and the stale-token reload, whose probes now run before
+the history walk instead of beside it, are timed in the `graph_hit_path` table
+below. The token is also
 refused once it is older than the ref cache's 60 s TTL (the stamp cannot see
 files pulled in by `include.path`), so a reload after a minute is a full one.
+
+`graph_hit_path` (perf1109-graph-blame-reads): the real command
+(`cmd_get_commit_graph` plus the JSON the IPC layer writes) with and without a
+revision token, on `main` plus 20 branches of empty commits, 6,000 commits with
+the default 5,000-row window and 100,000 commits with a 30,000-row window. 23
+rounds, the first 2 discarded, n = 21; the arm that goes first alternates by
+round parity; each cold arm reads its own fresh APFS clone (a path the process
+has never read); each warm pair starts from one untimed read. Load average 14.3
+at the start and 17.5 at the end (18 cores, both below 30). `old` is the
+command with no token, which is the previous path plus one stamp read and one
+token hash (the merge-base build has no token argument and cannot be called
+from the bench); `new-hit` is the unchanged answer; `new-stale` is a
+well-formed token that no longer names the state, so the new path runs the
+probes and then the walk. Times in ms; the paired difference is second minus
+first; git processes come from an untimed trace2 pass.
+
+| pair (window) | first arm: median / min / max | second arm: median / min / max | paired diff median [IQR] | second faster | git processes (first / second) |
+| --- | --- | --- | --- | --- | --- |
+| warm null, old vs old (5k) | 5.07 / 3.93 / 6.86 | 5.12 / 4.34 / 13.36 | +0.06 [-0.19, 0.30] | 10/21 | 0 / 0 |
+| warm, old vs new-hit (5k) | 5.18 / 4.09 / 5.87 | 1.14 / 0.90 / 1.55 | -4.02 [-4.10, -3.65] | 21/21 | 0 / 0 |
+| cold null, old vs old (5k) | 136.43 / 112.65 / 154.18 | 136.66 / 109.78 / 175.74 | -2.87 [-7.85, 7.87] | 12/21 | 11 / 11 |
+| cold, old vs new-stale (5k) | 135.63 / 119.90 / 162.16 | 185.48 / 137.63 / 253.73 | +53.26 [43.92, 63.80] | 0/21 | 11 / 11 |
+| warm null, old vs old (30k) | 26.68 / 22.61 / 40.05 | 26.35 / 23.18 / 34.72 | +0.19 [-0.99, 0.44] | 10/21 | 0 / 0 |
+| warm, old vs new-hit (30k) | 25.71 / 22.54 / 44.13 | 1.15 / 0.85 / 3.62 | -24.70 [-26.76, -23.68] | 21/21 | 0 / 0 |
+| cold null, old vs old (30k) | 1896.02 / 1807.35 / 3068.26 | 1878.52 / 1752.96 / 3223.10 | -0.86 [-57.85, 97.10] | 11/21 | 16 / 16 |
+| cold, old vs new-stale (30k) | 1909.11 / 1785.11 / 3052.46 | 2019.98 / 1809.55 / 2767.20 | +118.37 [41.50, 148.32] | 4/21 | 16 / 16 |
+
+Git child CPU (median) was 0 in every warm arm (no git process ran) and
+110.9 / 108.3 ms (5k) and 1727 / 1720 ms (30k) in the old / new-stale cold arms.
+All four null pairs are valid (median within half the IQR of its own paired
+differences), so the noise floor is about 0.3 ms warm and about 8 ms (5k) and
+77 ms (30k) cold.
+
+Reading it: a warm unchanged reload is 4.0 ms faster at 5,000 rows (5.2 to 1.1
+ms) and 24.7 ms faster at 30,000 (25.7 to 1.2 ms), in 21 of 21 rounds, against
+a noise floor of 0.3 ms, and none of it is git (both arms spawn nothing: the
+old warm path was already answered from the ref cache, so the saving is the
+walk's cached text, the lane solve and the serialization). A cold reload with a
+stale token is **slower**, not faster: +53 ms at 5,000 rows (about 39 percent,
+0 of 21 rounds faster, well outside the 8 ms noise) and +118 ms at 30,000
+(about 6 percent, 4 of 21 rounds faster, but the paired IQR [41, 148] overlaps
+the null pair's [-58, 97], so at that size the cost is real in direction and
+not well resolved in size). That is the probes now running before the walk
+instead of beside it. There is no read-ahead on this branch, so scrolling to an
+older window is the `old` path and is not a separate arm. Only the first window
+of one view carries a token, and only while the stamp has settled (3 s after
+the last ref write).
 
 So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
 fixture) and the lane solve is tens of milliseconds, so on the payload side the
