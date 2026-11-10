@@ -128,6 +128,13 @@
     );
   });
 
+  // Rescan goes through the same shared metric as the subscription above, so
+  // this view and CoverageViewer still see one measurement.
+  function rescanCoverage() {
+    const path = $currentRepoPath;
+    if (path) void coverageMetric.refresh(path, { force: true });
+  }
+
   // Per-tab line counts for the workspace comparison strip. Same metric, so a
   // repository open in two places is measured once.
   $effect(() => {
@@ -509,6 +516,7 @@
           {coverageReport}
           coverageFailed={coverageFailed}
           coveragePending={coverageRequested && coverageReport === null && !coverageFailed}
+          onRescanCoverage={rescanCoverage}
         />
 
       {:else if activeTab === "knowledge"}
@@ -525,6 +533,7 @@
           loading={knowledgeLoading}
           measuredAt={knowledgeMeasuredAt}
           staleNotice={false}
+          onRefresh={() => pulseStore.loadKnowledge()}
         />
 
       {:else if activeTab === "dora"}

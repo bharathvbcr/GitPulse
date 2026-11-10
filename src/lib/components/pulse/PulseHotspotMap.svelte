@@ -13,12 +13,15 @@
     coverageFailed = false,
     coveragePending = false,
     onSelectFile,
+    onRescanCoverage,
   }: {
     topFiles: readonly PulseFileChurn[];
     coverageReport: CoverageReport | null;
     coverageFailed?: boolean;
     coveragePending?: boolean;
     onSelectFile?: (path: string) => void;
+    /** Re-runs the coverage scan that failed. */
+    onRescanCoverage?: () => void;
   } = $props();
 
   type RiskFilter = "all" | HotspotRiskItem["riskLevel"];
@@ -87,6 +90,9 @@
           <div class="min-w-0 flex-1">
             Couldn't scan coverage. Ranking is churn-only; missing coverage is not treated as 0%.
           </div>
+          {#if onRescanCoverage}
+            <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRescanCoverage?.()}>Rescan</button>
+          {/if}
         </div>
       {:else}
         <p class="text-xs text-textMuted mt-0.5">

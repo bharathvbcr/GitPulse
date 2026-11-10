@@ -34,3 +34,21 @@ describe("PulseCodeAge failure state", () => {
     expect(source.match(/\{#each cohorts as cohort/g)?.length).toBe(2);
   });
 });
+
+describe("PulseCodeAge rescan action", () => {
+  it("offers Rescan on a blame scan that measured nothing, only when the parent can refresh", async () => {
+    const { render } = await import("svelte/server");
+    const { default: PulseCodeAge } = await import("./PulseCodeAge.svelte");
+    const failed = { knowledge: null, error: "blame timed out" };
+    expect(render(PulseCodeAge, { props: failed }).body).not.toContain("Rescan");
+    const withRefresh = render(PulseCodeAge, { props: { ...failed, onRefresh: () => {} } }).body;
+    expect(withRefresh).toContain("Rescan");
+    expect(withRefresh).toContain('data-tone="unknown"');
+  });
+
+  it("calls the parent's refresh from the button, and the parent hands it the knowledge refresh", () => {
+    expect(source).toContain("onclick={() => onRefresh?.()}");
+    const view = readFileSync(new URL("./PulseView.svelte", import.meta.url), "utf8");
+    expect(view).toMatch(/<PulseCodeAge[\s\S]*?onRefresh=\{\(\) => pulseStore\.loadKnowledge\(\)\}[\s\S]*?\/>/);
+  });
+});

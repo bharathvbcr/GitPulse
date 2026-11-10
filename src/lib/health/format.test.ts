@@ -3,14 +3,9 @@ import {
   dependabotBadgeClass,
   formatAuditCounts,
   formatAuditCoverage,
-  issueClass,
   normalizeSeverity,
-  severityClass,
-  toneCardClass,
-  toneChipClass,
   toneLabel,
   updateKind,
-  updateKindClass,
 } from "./format";
 import type { HealthTone } from "./summary";
 
@@ -19,13 +14,6 @@ describe("health format", () => {
     expect(normalizeSeverity("CRITICAL")).toBe("critical");
     expect(normalizeSeverity("medium")).toBe("moderate");
     expect(normalizeSeverity("whatever")).toBe("info");
-  });
-
-  it("styles severities distinctly", () => {
-    expect(severityClass("critical")).toContain("rose");
-    expect(severityClass("high")).toContain("red");
-    expect(severityClass("moderate")).toContain("amber");
-    expect(severityClass("low")).toContain("sky");
   });
 
   it("classifies semver gaps between current and latest", () => {
@@ -39,8 +27,6 @@ describe("health format", () => {
       updateKind("7.0.0-dev.20260514.1", "7.0.0-dev.20260707.2"),
     ).toBe("prerelease");
     expect(updateKind("1.0.0-rc.1", "1.0.0")).toBe("prerelease");
-    expect(updateKindClass("major")).toContain("rose");
-    expect(updateKindClass("patch")).toContain("sky");
   });
 
   it("summarises audit counts without implying a clean scan when empty", () => {
@@ -172,8 +158,7 @@ describe("health format", () => {
     ).toBe("1 critical · 3 unclassified");
   });
 
-  it("styles unrated severities as muted, not alarming", () => {
-    expect(severityClass("unknown")).toBe(severityClass("info"));
+  it("ranks unrated severities as info, not alarming", () => {
     expect(normalizeSeverity("unknown")).toBe("info");
   });
 });
@@ -206,17 +191,17 @@ describe("dependabotBadgeClass — severity casing (regression)", () => {
     // github/mod.rs passes `security_vulnerability.severity` through verbatim
     // and only lowercases for ranking, so "HIGH"/"Critical" reach the UI.
     const lower = dependabotBadgeClass([{ severity: "high" }]);
-    expect(lower).toBe("text-rose-300");
+    expect(lower).toBe("text-danger");
     expect(dependabotBadgeClass([{ severity: "HIGH" }])).toBe(lower);
     expect(dependabotBadgeClass([{ severity: "Critical" }])).toBe(lower);
     expect(dependabotBadgeClass([{ severity: " high " }])).toBe(lower);
   });
 
   it("maps GitHub's 'medium' onto the moderate tier and leaves the rest muted", () => {
-    expect(dependabotBadgeClass([{ severity: "medium" }])).toBe("text-amber-300");
-    expect(dependabotBadgeClass([{ severity: "MEDIUM" }])).toBe("text-amber-300");
-    expect(dependabotBadgeClass([{ severity: "low" }])).toBe("text-sky-300");
-    expect(dependabotBadgeClass([{ severity: "" }])).toBe("text-sky-300");
+    expect(dependabotBadgeClass([{ severity: "medium" }])).toBe("text-warn");
+    expect(dependabotBadgeClass([{ severity: "MEDIUM" }])).toBe("text-warn");
+    expect(dependabotBadgeClass([{ severity: "low" }])).toBe("text-info");
+    expect(dependabotBadgeClass([{ severity: "" }])).toBe("text-info");
     expect(dependabotBadgeClass([])).toBe("");
   });
 
@@ -226,37 +211,27 @@ describe("dependabotBadgeClass — severity casing (regression)", () => {
     expect(normalizeSeverity("warning")).toBe("moderate");
     expect(normalizeSeverity("NOTE")).toBe("info");
     expect(normalizeSeverity("none")).toBe("info");
-    expect(dependabotBadgeClass([{ severity: "error" }])).toBe("text-rose-300");
-    expect(dependabotBadgeClass([{ severity: "warning" }])).toBe("text-amber-300");
+    expect(dependabotBadgeClass([{ severity: "error" }])).toBe("text-danger");
+    expect(dependabotBadgeClass([{ severity: "warning" }])).toBe("text-warn");
   });
 
   it("takes the worst severity in the list, not the first", () => {
     expect(
       dependabotBadgeClass([{ severity: "low" }, { severity: "CRITICAL" }]),
-    ).toBe("text-rose-300");
+    ).toBe("text-danger");
   });
 });
 
 describe("health tone presentation", () => {
   const tones: HealthTone[] = ["clear", "note", "unknown", "warn", "critical"];
 
-  it("gives every tone its own chip, card and accessible label", () => {
-    for (const render of [toneChipClass, toneCardClass, toneLabel]) {
-      expect(new Set(tones.map(render)).size).toBe(tones.length);
-    }
+  it("gives every tone its own accessible label", () => {
+    expect(new Set(tones.map(toneLabel)).size).toBe(tones.length);
   });
 
   it("never renders a check that could not run like one that came back clear", () => {
     expect(toneLabel("unknown")).toBe("not established");
-    expect(toneChipClass("unknown")).toContain("border-dashed");
-    expect(toneChipClass("unknown")).not.toBe(toneChipClass("clear"));
-    expect(toneCardClass("unknown")).not.toBe(toneCardClass("clear"));
-  });
-
-  it("styles issues by trimmed, case-insensitive severity", () => {
-    expect(issueClass(" ERROR ")).toContain("rose");
-    expect(issueClass("Warning")).toContain("amber");
-    expect(issueClass("info")).toBe(issueClass("anything else"));
+    expect(toneLabel("unknown")).not.toBe(toneLabel("clear"));
   });
 });
 

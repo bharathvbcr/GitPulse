@@ -41,7 +41,7 @@ export function formatDelta(deltaBytes: number): string {
 /** CSS class for a signed delta: growth reads as warning, shrink as good. */
 export function deltaClass(deltaBytes: number): string {
   if (!Number.isFinite(deltaBytes) || deltaBytes === 0) return "text-textMuted";
-  return deltaBytes > 0 ? "text-amber-300" : "text-emerald-300";
+  return deltaBytes > 0 ? "text-warn" : "text-ok";
 }
 
 const ABSOLUTE_TIME = new Intl.DateTimeFormat(undefined, {

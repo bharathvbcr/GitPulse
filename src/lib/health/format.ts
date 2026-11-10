@@ -19,28 +19,6 @@ export function normalizeSeverity(severity: string): AuditSeverity {
   return "info";
 }
 
-export function severityClass(severity: string): string {
-  switch (normalizeSeverity(severity)) {
-    case "critical":
-      return "text-rose-300 bg-rose-500/15";
-    case "high":
-      return "text-red-300 bg-red-500/15";
-    case "moderate":
-      return "text-amber-300 bg-amber-500/15";
-    case "low":
-      return "text-sky-300 bg-sky-500/15";
-    default:
-      return "text-textMuted bg-surfaceHover";
-  }
-}
-
-export function issueClass(severity: string): string {
-  const key = severity.trim().toLowerCase();
-  if (key === "error") return "border-rose-500/30 bg-rose-500/10 text-rose-200";
-  if (key === "warning") return "border-amber-500/30 bg-amber-500/10 text-amber-200";
-  return "border-border bg-surface text-textMuted";
-}
-
 export type UpdateKind = "major" | "minor" | "patch" | "prerelease" | "same" | "unknown";
 
 interface ParsedSemver {
@@ -95,20 +73,6 @@ export function updateKind(current: string, latest: string): UpdateKind {
     comparePrerelease(a.prerelease, b.prerelease) < 0
   ) return "prerelease";
   return "same";
-}
-
-export function updateKindClass(kind: UpdateKind): string {
-  switch (kind) {
-    case "major":
-      return "text-rose-300";
-    case "minor":
-      return "text-amber-300";
-    case "patch":
-    case "prerelease":
-      return "text-sky-300";
-    default:
-      return "text-textMuted";
-  }
 }
 
 /**
@@ -201,57 +165,14 @@ export function formatAuditCounts(
  * `security_vulnerability.severity` verbatim and lowercases only when
  * ranking — so "HIGH" and "Critical" are both live inputs. Comparing raw
  * strings here silently demoted them to the muted tier; normalization is
- * shared with `severityClass` so one field cannot be read two ways.
+ * shared with the severity tiers so one field cannot be read two ways.
  */
 export function dependabotBadgeClass(alerts: { severity: string }[]): string {
   if (alerts.length === 0) return "";
   const tiers = new Set(alerts.map((alert) => normalizeSeverity(alert.severity)));
-  if (tiers.has("critical") || tiers.has("high")) return "text-rose-300";
-  if (tiers.has("moderate")) return "text-amber-300";
-  return "text-sky-300";
-}
-
-/**
- * Tone colours for the Health verdict, beside the severity colours they sit
- * next to, so one module owns what this view's states look like.
- *
- * The `HealthTone` import is type-only: `summary.ts` reads `normalizeSeverity`
- * and `formatAuditCounts` from here, so a value import back would be a cycle.
- *
- * `unknown` is amber and dashed, not grey. Grey reads as "nothing here",
- * which is the exact misreading the honesty invariant exists to prevent: a
- * check that could not run has to look different from one that ran and found
- * nothing, and muted grey is already what "found nothing" looks like.
- */
-export function toneChipClass(tone: HealthTone): string {
-  switch (tone) {
-    case "critical":
-      return "text-rose-200 bg-rose-500/15 border-rose-500/40";
-    case "warn":
-      return "text-amber-200 bg-amber-500/15 border-amber-500/40";
-    case "unknown":
-      return "text-amber-200 bg-amber-500/10 border-amber-500/30 border-dashed";
-    case "note":
-      return "text-sky-200 bg-sky-500/10 border-sky-500/30";
-    default:
-      return "text-emerald-200 bg-emerald-500/10 border-emerald-500/30";
-  }
-}
-
-/** Card surface for the verdict, in the same tiers as `toneChipClass`. */
-export function toneCardClass(tone: HealthTone): string {
-  switch (tone) {
-    case "critical":
-      return "border-rose-500/40 bg-rose-500/10";
-    case "warn":
-      return "border-amber-500/40 bg-amber-500/10";
-    case "unknown":
-      return "border-amber-500/30 bg-amber-500/5";
-    case "note":
-      return "border-sky-500/30 bg-sky-500/5";
-    default:
-      return "border-emerald-500/30 bg-emerald-500/5";
-  }
+  if (tiers.has("critical") || tiers.has("high")) return "text-danger";
+  if (tiers.has("moderate")) return "text-warn";
+  return "text-info";
 }
 
 /**

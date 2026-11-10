@@ -269,8 +269,10 @@ describe("FleetCell change chips", () => {
   it("colours by the column's own goal, not by the sign", () => {
     const better = render(FleetCell, { props: withDelta(-6, "lower") }).body;
     const worse = render(FleetCell, { props: withDelta(-6, "higher") }).body;
-    expect(better).toContain("emerald");
-    expect(worse).toContain("amber");
+    expect(better).toContain("text-ok");
+    expect(better).not.toContain("text-warn");
+    expect(worse).toContain("text-warn");
+    expect(worse).not.toContain("text-ok");
   });
 
   it("stays quiet for an unchanged measurement", () => {

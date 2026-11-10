@@ -13,7 +13,6 @@ import {
   dependabotBadgeClass,
   formatAuditCounts,
   normalizeSeverity,
-  severityClass,
   updateKind,
 } from "./format";
 import {
@@ -169,7 +168,6 @@ describe("health renderers survive hostile scanner output", () => {
       expect(() => formatHealthReport(report, s, dependabot, codeScanning, deadCode)).not.toThrow();
       expect(() => skippedAudits(report)).not.toThrow();
       expect(() => normalizeSeverity(s)).not.toThrow();
-      expect(() => severityClass(s)).not.toThrow();
       expect(() => dependabotBadgeClass(dependabot.alerts)).not.toThrow();
       expect(() => dependabotBadgeClass(codeScanning.alerts)).not.toThrow();
       expect(() => updateKind(s, s)).not.toThrow();
@@ -184,7 +182,7 @@ describe("health renderers survive hostile scanner output", () => {
     }
     // Casing must never change the rendered tier — the bug this suite guards.
     for (const s of ["critical", "high", "medium", "moderate", "low", "info", "error", "warning", "note", "none", "bogus"]) {
-      expect(severityClass(s.toUpperCase())).toBe(severityClass(s));
+      expect(normalizeSeverity(s.toUpperCase())).toBe(normalizeSeverity(s));
       expect(dependabotBadgeClass([{ severity: s.toUpperCase() }])).toBe(
         dependabotBadgeClass([{ severity: s }]),
       );
@@ -193,9 +191,9 @@ describe("health renderers survive hostile scanner output", () => {
 
   it("keeps the badge monotonic: adding a worse alert never softens the tint", () => {
     const rank: Record<string, number> = {
-      "text-rose-300": 3,
-      "text-amber-300": 2,
-      "text-sky-300": 1,
+      "text-danger": 3,
+      "text-warn": 2,
+      "text-info": 1,
       "": 0,
     };
     const ladder = ["low", "medium", "high", "critical"];
@@ -207,7 +205,7 @@ describe("health renderers survive hostile scanner output", () => {
       expect(rank[next]).toBeGreaterThanOrEqual(rank[previous]);
       previous = next;
     }
-    expect(previous).toBe("text-rose-300");
+    expect(previous).toBe("text-danger");
   });
 
   it("never reports a capped scan as complete coverage", () => {

@@ -44,15 +44,13 @@ export function formatDelta(delta: CellDelta, unit: DeltaUnit): string {
   return `${sign}${magnitude(delta.change, unit)}`;
 }
 
-/** Tone for the chip: green for the direction the column wants, amber against. */
+/** Tone for the chip: the ok role for the direction the column wants, the warn role against. */
 export function deltaTone(delta: CellDelta, goal: DeltaGoal): string {
   if (!Number.isFinite(delta.change) || delta.change === 0 || goal === "neutral") {
     return "text-textMuted";
   }
   const improved = goal === "lower" ? delta.change < 0 : delta.change > 0;
-  return improved
-    ? "text-emerald-600 dark:text-emerald-400"
-    : "text-amber-600 dark:text-amber-400";
+  return improved ? "text-ok" : "text-warn";
 }
 
 /**

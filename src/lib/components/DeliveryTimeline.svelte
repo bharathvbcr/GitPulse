@@ -60,6 +60,7 @@
     error = null,
     sampleNoun = "runs",
     live = { kind: "idle", reason: "" },
+    onRescan,
   }: {
     title: string;
     rows: readonly TimelineRow[];
@@ -69,6 +70,8 @@
     error?: string | null;
     sampleNoun?: string;
     live?: LiveState;
+    /** Re-lists the runs. When the parent supplies it, the "couldn't read" notice offers it. */
+    onRescan?: () => void;
   } = $props();
 
   let expanded = $state(false);
@@ -138,6 +141,9 @@
           <p class="font-mono text-meta text-textMuted wrap-break-word mt-1">{failure.detail}</p>
         {/if}
       </div>
+      {#if onRescan}
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRescan?.()}>Rescan</button>
+      {/if}
     </div>
   {:else if rows.length === 0}
     <EmptyState

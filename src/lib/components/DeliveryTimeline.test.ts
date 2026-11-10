@@ -178,3 +178,23 @@ describe("DeliveryTimeline collapsed listing", () => {
     expect(countAttr(body, "data-delivery-row=")).toBe(0);
   });
 });
+
+describe("DeliveryTimeline rescan action", () => {
+  const unread = { title: "Runs", rows: [], now: T0, checked: false, error: "gh not signed in" };
+
+  it("offers Rescan on the couldn't-read notice only when the parent supplies one", () => {
+    expect(render(DeliveryTimeline, { props: unread }).body).not.toContain("Rescan");
+    const body = render(DeliveryTimeline, { props: { ...unread, onRescan: () => {} } }).body;
+    expect(body).toContain("Rescan");
+    expect(body).toContain('data-tone="unknown"');
+  });
+
+  it("calls the parent's rescan from the button", () => {
+    expect(source).toContain("onclick={() => onRescan?.()}");
+  });
+
+  it("does not offer it when the listing was read", () => {
+    const body = render(DeliveryTimeline, { props: { ...unread, checked: true, onRescan: () => {} } }).body;
+    expect(body).not.toContain("Rescan");
+  });
+});

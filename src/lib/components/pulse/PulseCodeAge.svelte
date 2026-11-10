@@ -11,6 +11,7 @@
     loading = false,
     measuredAt = null,
     staleNotice = true,
+    onRefresh,
   }: {
     knowledge: KnowledgeReport | null;
     /** Why the blame scan produced nothing. Never rendered as "no data". */
@@ -24,6 +25,8 @@
      * turns this copy off rather than announcing the failure twice.
      */
     staleNotice?: boolean;
+    /** Re-runs the blame scan. Offered on the notices for a scan that measured nothing. */
+    onRefresh?: () => void;
   } = $props();
 
   const dist = $derived(knowledge?.age_distribution);
@@ -93,6 +96,9 @@
           <p class="m-0 mt-0.5 font-mono text-meta text-textMuted wrap-break-word">{failure.detail}</p>
         {/if}
       </div>
+      {#if onRefresh}
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRefresh?.()}>Rescan</button>
+      {/if}
     </div>
   {:else if !knowledge || total === 0}
     <div class="gp-notice" data-tone="unknown" role="status">
@@ -101,6 +107,9 @@
         <p class="m-0 font-medium">Couldn't measure code age.</p>
         <p class="m-0 mt-0.5 text-textMuted">The blame scan did not date any lines.</p>
       </div>
+      {#if onRefresh}
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRefresh?.()}>Rescan</button>
+      {/if}
     </div>
   {:else}
     {#if error && staleNotice}
