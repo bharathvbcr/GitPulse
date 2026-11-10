@@ -593,9 +593,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         const before = live && live.generation === generation ? live.statuses : [];
         applyToSession(sessionId, generation, { statuses });
-        // The watcher cannot see nested edits (its worktree watch is
-        // non-recursive); the poll can, so it announces them to the views
-        // derived from files.
+        // The watcher can miss nested edits (non-recursive on Linux and
+        // Windows, filtered on macOS); the poll cannot, so it announces them to
+        // the views derived from files.
         const polled = changeFromStatusPoll(before, statuses);
         if (polled) for (const listener of polledChangeListeners) listener(path, polled);
       } catch (error) {

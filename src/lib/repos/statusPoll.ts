@@ -34,11 +34,15 @@ export interface PollRestInput {
  * {@link STATUS_POLL_INTERVAL_MS}, and never shorter than
  * {@link STATUS_POLL_COST_FACTOR} times what the last poll cost.
  *
- * There is deliberately NO longer rest for a repository that looks quiet. The
- * worktree watch is non-recursive (`watcher/debouncer.rs`), so an unstaged
- * edit to a nested file writes nothing under `.git` and raises no event: this
- * poll is the primary detector of ordinary edits, and a quiet minute must not
- * make the first edit after it up to a minute late.
+ * There is deliberately NO longer rest for a repository that looks quiet. On
+ * Linux and Windows the worktree watch is non-recursive
+ * (`watcher/debouncer.rs`), so an unstaged edit to a nested file writes
+ * nothing under `.git` and raises no event: this poll is the primary detector
+ * of ordinary edits there. On macOS the watch is recursive but its event
+ * filter may be wrong about delivery (`watcher/filter.rs`), and a wrongly
+ * dropped event is covered by this poll, so it keeps its cadence too. Either
+ * way a quiet minute must not make the first edit after it up to a minute
+ * late.
  */
 export function statusPollRestMs(input: PollRestInput): number {
   const base = STATUS_POLL_INTERVAL_MS;
@@ -183,11 +187,11 @@ const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
  * The change a status poll observed, in the watcher's vocabulary, or null when
  * the two lists are the same.
  *
- * The worktree watch is non-recursive, so an edit to `docs/guide.md` reaches
- * no `repo-changed` event and the code index and document vault stayed stale
- * until something touched the index. The poll already reads the whole
- * worktree's status, so it names what moved: every row that appeared,
- * disappeared or changed. An entry that is, or may contain, a document (a
+ * Where the worktree watch is non-recursive (Linux, Windows), or dropped the
+ * event, an edit to `docs/guide.md` reaches no `repo-changed` event and the
+ * code index and document vault stayed stale until something touched the
+ * index. The poll already reads the whole worktree's status, so it names what
+ * moved: every row that appeared, disappeared or changed. An entry that is, or may contain, a document (a
  * Markdown name, or no extension) also marks `documents`, as the watcher does.
  */
 export function changeFromStatusPoll(
