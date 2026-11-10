@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { wallClockBudget } from "../testing/wallClock";
 import {
   MAX_PITCH, clampPitch, layoutOnSphere, lerpRotation, projectOrthographic, rotateByDrag, rotationToFace,
   type GlobeModelInput, type SpherePoint,
@@ -109,7 +110,7 @@ describe("layoutOnSphere", () => {
       const elapsed = performance.now() - started;
       expect(pts).toHaveLength(5000);
       expect(Math.hypot(pts[4999].x, pts[4999].y, pts[4999].z)).toBeCloseTo(1, 9);
-      expect(elapsed).toBeLessThan(3000);
+      expect(elapsed).toBeLessThan(wallClockBudget(3_000));
     }
   });
 });
