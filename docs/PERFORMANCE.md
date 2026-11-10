@@ -1165,46 +1165,72 @@ revision token, on `main` plus 20 branches of empty commits, 6,000 commits with
 the default 5,000-row window and 100,000 commits with a 30,000-row window. 23
 rounds, the first 2 discarded, n = 21; the arm that goes first alternates by
 round parity; each cold arm reads its own fresh APFS clone (a path the process
-has never read); each warm pair starts from one untimed read. Load average 14.3
-at the start and 17.5 at the end (18 cores, both below 30). `old` is the
+has never read); each warm pair starts from one untimed read. Load average 8.4
+at the start and 11.5 at the end (18 cores, both below 30). `old` is the
 command with no token, which is the previous path plus one stamp read and one
 token hash (the merge-base build has no token argument and cannot be called
 from the bench); `new-hit` is the unchanged answer; `new-stale` is a
-well-formed token that no longer names the state, so the new path runs the
-probes and then the walk. Times in ms; the paired difference is second minus
-first; git processes come from an untimed trace2 pass.
+well-formed token that names nothing real; `new-moved` is the genuine token the
+same repository issued before one ref moved by one commit (4 s earlier, so the
+stamp has settled). Times in ms; the paired difference is second minus first;
+git processes come from an untimed trace2 pass. These are the numbers after the
+fix below. A first run of the same bench before the fix measured the cold
+stale-token reload at +53 ms (5k) and +118 ms (30k), and a second run's
+moved-ref null pair was biased (the second-prepared clone always went to one
+arm, 16 of 21 rounds), so it was thrown away and the harness counterbalanced.
 
 | pair (window) | first arm: median / min / max | second arm: median / min / max | paired diff median [IQR] | second faster | git processes (first / second) |
 | --- | --- | --- | --- | --- | --- |
-| warm null, old vs old (5k) | 5.07 / 3.93 / 6.86 | 5.12 / 4.34 / 13.36 | +0.06 [-0.19, 0.30] | 10/21 | 0 / 0 |
-| warm, old vs new-hit (5k) | 5.18 / 4.09 / 5.87 | 1.14 / 0.90 / 1.55 | -4.02 [-4.10, -3.65] | 21/21 | 0 / 0 |
-| cold null, old vs old (5k) | 136.43 / 112.65 / 154.18 | 136.66 / 109.78 / 175.74 | -2.87 [-7.85, 7.87] | 12/21 | 11 / 11 |
-| cold, old vs new-stale (5k) | 135.63 / 119.90 / 162.16 | 185.48 / 137.63 / 253.73 | +53.26 [43.92, 63.80] | 0/21 | 11 / 11 |
-| warm null, old vs old (30k) | 26.68 / 22.61 / 40.05 | 26.35 / 23.18 / 34.72 | +0.19 [-0.99, 0.44] | 10/21 | 0 / 0 |
-| warm, old vs new-hit (30k) | 25.71 / 22.54 / 44.13 | 1.15 / 0.85 / 3.62 | -24.70 [-26.76, -23.68] | 21/21 | 0 / 0 |
-| cold null, old vs old (30k) | 1896.02 / 1807.35 / 3068.26 | 1878.52 / 1752.96 / 3223.10 | -0.86 [-57.85, 97.10] | 11/21 | 16 / 16 |
-| cold, old vs new-stale (30k) | 1909.11 / 1785.11 / 3052.46 | 2019.98 / 1809.55 / 2767.20 | +118.37 [41.50, 148.32] | 4/21 | 16 / 16 |
+| warm null, old vs old (5k) | 4.75 / 3.84 / 5.98 | 4.69 / 3.80 / 6.30 | +0.06 [-0.05, 0.14] | 9/21 | 0 / 0 |
+| warm, old vs new-hit (5k) | 4.79 / 3.81 / 10.57 | 1.15 / 0.69 / 4.37 | -3.66 [-3.85, -3.40] | 21/21 | 0 / 0 |
+| cold null, old vs old (5k) | 130.11 / 101.95 / 173.23 | 130.37 / 103.51 / 150.89 | +0.35 [-9.62, 3.90] | 10/21 | 11 / 11 |
+| cold, old vs new-stale (5k) | 133.35 / 120.37 / 206.68 | 130.53 / 118.59 / 147.93 | -1.04 [-13.58, 8.20] | 12/21 | 11 / 11 |
+| moved null, old vs old (5k) | 101.55 / 85.51 / 159.35 | 103.16 / 94.29 / 122.12 | -0.41 [-5.63, 2.95] | 13/21 | |
+| one ref moved, old vs new-moved (5k) | 103.98 / 82.78 / 128.50 | 104.23 / 88.03 / 160.01 | -1.02 [-5.71, 3.28] | 12/21 | |
+| warm null, old vs old (30k) | 26.44 / 21.94 / 31.74 | 25.51 / 22.28 / 37.41 | +0.28 [-0.33, 0.61] | 7/21 | 0 / 0 |
+| warm, old vs new-hit (30k) | 25.19 / 22.08 / 37.83 | 1.11 / 0.78 / 1.72 | -24.06 [-26.56, -22.03] | 21/21 | 0 / 0 |
+| cold null, old vs old (30k) | 1802.66 / 1622.58 / 2143.66 | 1805.21 / 1626.35 / 2192.85 | -10.23 [-21.13, 45.91] | 11/21 | 16 / 16 |
+| cold, old vs new-stale (30k) | 1845.16 / 1581.91 / 2104.27 | 1730.51 / 1598.72 / 2120.15 | -31.93 [-105.80, 9.02] | 13/21 | 16 / 16 |
+| moved null, old vs old (30k) | 1644.62 / 1521.41 / 2020.79 | 1668.69 / 1535.05 / 2061.33 | +5.90 [-45.85, 41.18] | 10/21 | |
+| one ref moved, old vs new-moved (30k) | 1655.00 / 1539.31 / 2074.76 | 1641.83 / 1557.01 / 2008.49 | -11.44 [-71.26, 34.98] | 11/21 | |
 
-Git child CPU (median) was 0 in every warm arm (no git process ran) and
-110.9 / 108.3 ms (5k) and 1727 / 1720 ms (30k) in the old / new-stale cold arms.
-All four null pairs are valid (median within half the IQR of its own paired
-differences), so the noise floor is about 0.3 ms warm and about 8 ms (5k) and
-77 ms (30k) cold.
+Git child CPU (median) was 0 in every warm arm (no git process ran) and within
+a few percent between the two arms of every cold and moved pair. All six null
+pairs are valid (median within half the IQR of its own paired differences), so
+the noise floor is about 0.1 ms warm at 5k and 0.5 ms at 30k, about 7 ms cold
+and 4 ms moved at 5k, and about 34 ms cold and 44 ms moved at 30k. Where a
+cold reload's time goes, cold, n = 21 (probes alone, then walk alone, each on
+its own fresh clone): 127 / 58 ms at 5k and 122 / 1931 ms at 30k.
 
-Reading it: a warm unchanged reload is 4.0 ms faster at 5,000 rows (5.2 to 1.1
-ms) and 24.7 ms faster at 30,000 (25.7 to 1.2 ms), in 21 of 21 rounds, against
-a noise floor of 0.3 ms, and none of it is git (both arms spawn nothing: the
-old warm path was already answered from the ref cache, so the saving is the
-walk's cached text, the lane solve and the serialization). A cold reload with a
-stale token is **slower**, not faster: +53 ms at 5,000 rows (about 39 percent,
-0 of 21 rounds faster, well outside the 8 ms noise) and +118 ms at 30,000
-(about 6 percent, 4 of 21 rounds faster, but the paired IQR [41, 148] overlaps
-the null pair's [-58, 97], so at that size the cost is real in direction and
-not well resolved in size). That is the probes now running before the walk
-instead of beside it. There is no read-ahead on this branch, so scrolling to an
-older window is the `old` path and is not a separate arm. Only the first window
-of one view carries a token, and only while the stamp has settled (3 s after
-the last ref write).
+Reading it. **Faster:** a warm unchanged reload, 4.8 to 1.15 ms at 5,000 rows
+(3.7 ms faster) and 25.2 to 1.11 ms at 30,000 (24.1 ms faster), in 21 of 21
+rounds, far outside the noise; none of it is git (both arms spawn nothing, the
+old warm path being answered from the ref cache), so the saving is the cached
+walk text, the lane solve and the serialization. **Not slower, not faster:** a
+cold reload with a stale token and a reload after one ref moved by one commit
+are level with no token (differences of -1 and -1 ms at 5k, -32 and -11 ms at
+30k, each inside its null pair's spread, 11 to 13 of 21 rounds); the earlier
++53 ms (5k) and +118 ms (30k) are gone. The cause was that any request
+carrying a token waited for the four probes before starting its walk, so a
+stale one paid the probes and the walk in series where no token overlaps them,
+a cost equal to the smaller of the two (probes 122 to 127 ms, walk 58 ms at 5k
+and 1,931 ms at 30k). A token that cannot hold (another view, another stamp,
+expired) now starts the walk at once, decided by one comparison of the stamp
+already read. A token that does hold (same view and stamp) still waits for the
+probes to compare tip content, and if the content then differs the walk runs
+after them: that rare case still pays the series cost and is not measured. A
+reload after a ref moved is still a full re-read, about 100 ms at 5k and
+1.65 s at 30k, of which the probes are 122 to 127 ms and, at 5k, more than the
+walk itself. **Recommendation, not built:** at 30k and above the walk is the
+cost (1.9 s), and a window can be patched after a one-commit ref move by
+walking only `old-tips..new-tips` and re-solving lanes over the spliced rows,
+which would take the reload to about the probes; at 5k the probes (the
+for-each-ref, HEAD, default-branch and hidden-ref reads) are the larger cost,
+and speeding them up, or sharing one ref listing between them, would pay more
+than patching. There is no read-ahead on this branch, so scrolling to an older
+window is the `old` path and is not a separate arm. Only the first window of
+one view carries a token, and only while the stamp has settled (3 s after the
+last ref write).
 
 So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
 fixture) and the lane solve is tens of milliseconds, so on the payload side the
