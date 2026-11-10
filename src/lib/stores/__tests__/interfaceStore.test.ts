@@ -967,6 +967,35 @@ describe("tasks board view preferences", () => {
     });
   });
 
+  it("keeps the scope navigator docked until the reader collapses it, and a view reset docks it again", () => {
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(false);
+    interfaceStore.setTaskNavigatorCollapsed(true);
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(true);
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(false);
+  });
+
+  it("remembers a collapsed scope navigator across a reload and ignores a stored value that is not a boolean", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: unknown) => {
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ taskNavigatorCollapsed: stored }) }) },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore).taskNavigatorCollapsed;
+    };
+    try {
+      expect(await load(true)).toBe(true);
+      expect(await load("yes")).toBe(false);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
   it("hides repositories one at a time and shows them all again in one action", () => {
     expect(get(interfaceStore).taskHiddenRepositories).toEqual([]);
     interfaceStore.toggleTaskRepositoryHidden("repo-1");

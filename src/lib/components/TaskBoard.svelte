@@ -1,10 +1,11 @@
 <script lang="ts">
   import { createFrameScheduler } from "../motion/frameScheduler";
-  import { crossfade } from "svelte/transition";
-  import { liquidSelection } from "../ui/transitions";
-  import { onMount, untrack } from "svelte";
+  import { crossfade, fly } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, liquidSelection } from "../ui/transitions";
+  import { createResizeObservation } from "../dom/observeResize";
+  import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -370,6 +371,97 @@
     },
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
+  /**
+   * The scope navigator is a rail beside the board only while the board is wide
+   * enough for it AND the reader has not collapsed it. The rail is 188px and a
+   * column is at least 196px, so below this width the board kept a column and a
+   * half behind a horizontal scroller, with the third column cut off at the
+   * window's edge. Collapsed or narrow, the same navigator opens from the
+   * toolbar as an overlay over the board instead.
+   */
+  const RAIL_MIN_BOARD_PX = 860;
+  /** 0 until the board has been measured; a hidden pane measures 0 and keeps the last real width. */
+  let boardWidth = $state(0);
+  const railNarrow = $derived(boardWidth > 0 && boardWidth < RAIL_MIN_BOARD_PX);
+  const railPinnedAway = $derived($interfaceStore.taskNavigatorCollapsed);
+  const railDocked = $derived(!railNarrow && !railPinnedAway);
+  let railOpen = $state(false);
+  /** Where the overlay starts: under the toolbar, measured when it opens. */
+  let railTop = $state(0);
+  let railToggleEl: HTMLButtonElement | undefined = $state();
+  let railEl: HTMLElement | undefined = $state();
+  $effect(() => {
+    const el = boardEl;
+    if (!el) return;
+    const read = () => { if (el.clientWidth > 0) boardWidth = el.clientWidth; };
+    read();
+    const observation = createResizeObservation(read);
+    observation.observe(el);
+    return () => observation.disconnect();
+  });
+  $effect(() => { if (railDocked) railOpen = false; });
+  function closeRail(options?: { restoreFocus?: boolean }) {
+    if (!railOpen) return;
+    railOpen = false;
+    if (options?.restoreFocus) restoreFocusTo(railToggleEl);
+  }
+  function toggleRail() {
+    if (railDocked) { interfaceStore.setTaskNavigatorCollapsed(true); return; }
+    if (railOpen) { closeRail({ restoreFocus: true }); return; }
+    // Below the toolbar, so the toggle that opened it stays in reach to close it.
+    const header = boardEl?.querySelector("header");
+    railTop = header && boardEl ? Math.max(0, Math.round(header.getBoundingClientRect().bottom - boardEl.getBoundingClientRect().top)) : 0;
+    railOpen = true;
+    void tick().then(() => (railEl?.querySelector<HTMLElement>('.nav-scope[aria-pressed="true"]') ?? railEl?.querySelector<HTMLElement>(".nav-scope"))?.focus());
+  }
+  /** Back beside the board, for a reader who collapsed the rail on a wide window. */
+  function dockRail() {
+    interfaceStore.setTaskNavigatorCollapsed(false);
+    railOpen = false;
+    restoreFocusTo(railToggleEl);
+  }
+  /** Picking a scope from the overlay is the end of that visit: the board is what they came for. */
+  function chooseScope(next: Scope) {
+    scope = next;
+    closeRail({ restoreFocus: true });
+  }
+  const railDismissal = $derived({
+    dismiss: {
+      inside: "[data-task-rail], [data-nav-toggle], [data-add-repo-popup]",
+      pointer: "pointerdown" as const,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      // Escape belongs to the add-repository menu while it is open; it closes
+      // itself, and the rail stays for the next one.
+      if (reason === "escape" && addMenu) return;
+      closeRail({ restoreFocus: reason === "escape" });
+    },
+  });
+  /**
+   * Up and Down move between scope rows, Home and End jump to the ends. Focus
+   * only: Enter or Space picks, as on any list of buttons. Alt+Up and Alt+Down
+   * are the workspace reorder (handled on the row, which has already prevented
+   * default by the time this runs) and are never claimed here.
+   */
+  function onRailKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!keys.includes(event.key) || !railEl) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const rows = [...railEl.querySelectorAll<HTMLElement>(".nav-scope")];
+    if (rows.length === 0) return;
+    const fromSearch = target.matches('[data-testid="task-nav-search"]');
+    const index = rows.indexOf(target);
+    if (index < 0 && !(fromSearch && event.key === "ArrowDown")) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? rows.length - 1
+      : event.key === "ArrowDown" ? Math.min(rows.length - 1, index + 1)
+      : Math.max(0, index - 1);
+    rows[next]?.focus();
+  }
   const loadedCards = $derived(allLoadedCards(displayColumns));
   /** Titles of the cards loaded, so a subtask can name its parent when the parent is on the board. */
   const loadedTitles = $derived(new Map(loadedCards.map((card) => [card.id, card.title])));
@@ -2435,101 +2527,142 @@
 {/snippet}
 {#snippet repositoryRow(repo: Repository, hidden: boolean)}
   {@const health = checkouts.get(repo.id)}
-  <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
-  {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
-  </button>{#if hidden}<button type="button" class="icon gp-icon-btn" data-testid="repository-show" aria-label={`Show ${repo.name}'s tasks on the board`} title={`Show ${repo.name}'s tasks on the All and workspace boards again`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><Eye size={12} /></button>{:else}<span class="row-reveal"><button type="button" class="icon gp-icon-btn" data-testid="repository-hide" aria-label={`Hide ${repo.name}'s tasks from the board`} title={`Hide ${repo.name}'s tasks from the All and workspace boards — its own board still shows them`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><EyeOff size={12} /></button></span>{/if}{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+  {@const selected = scope.kind === "repository" && scope.id === repo.id}
+  <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}>
+    <button type="button" class="gp-seg-btn nav-scope" class:selected aria-pressed={selected} data-active={selected} onclick={() => chooseScope({ kind: "repository", id: repo.id })} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
+      {@render scopeSelection(selected)}<span class="nav-name">{repo.name}</span>{#if health?.state === "missing"}<span class="nav-meta checkout-mark" data-testid="repository-checkout-missing"><AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="nav-meta" data-testid="repository-remote-only">Remote only</span>{:else if health?.state === "unknown"}<span class="nav-meta" data-testid="repository-checkout-unknown">Not checked</span>{/if}
+    </button>
+    <span class="nav-trail">
+      {#if hidden}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-persist data-testid="repository-show" aria-label={`Show ${repo.name}'s tasks on the board`} title={`Show ${repo.name}'s tasks on the All and workspace boards again`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><Eye size={12} /></button>
+      {:else}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-testid="repository-hide" aria-label={`Hide ${repo.name}'s tasks from the board`} title={`Hide ${repo.name}'s tasks from the All and workspace boards — its own board still shows them`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><EyeOff size={12} /></button>
+      {/if}
+      {#if health?.state === "remote"}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-persist aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>
+      {:else}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" class:urgent={health?.state === "missing"} data-persist={health?.state === "missing" || undefined} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>
+      {/if}
+    </span>
+  </div>
 {/snippet}
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
+{#snippet scopeRail(overlay: boolean)}
+  <!-- The keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
+    {#if overlay && !railNarrow}
+      <div class="nav-heading gp-label nav-dock">Task scopes<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dock the task scopes beside the board" title="Dock the task scopes beside the board" onclick={dockRail}><PanelLeft size={12} /></button></div>
+    {/if}
+    <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
+    <div class="nav-heading gp-label">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="gp-icon-btn" data-size="sm" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="gp-icon-btn" data-size="sm" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
+    <div class="nav-row"><button type="button" class="gp-seg-btn nav-scope" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => chooseScope({ kind: "global" })}>{@render scopeSelection(scope.kind === "global")}<span class="nav-name">All</span></button></div>
+    {#each orderedWorkspaces as group, index (group.id)}
+      {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
+      {#if navShowsWorkspace(group)}
+        {@const selected = scope.kind === "workspace" && scope.id === group.id}
+        {@const meta = [group.repository_count === 0 ? "Empty" : "", group.archived ? "Archived" : ""].filter(Boolean).join(" · ")}
+        <div class="nav-row" data-workspace-row={group.id}>
+          <button type="button" class="gp-seg-btn nav-scope" aria-pressed={selected} data-active={selected} class:selected aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => chooseScope({ kind: "workspace", id: group.id })} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(selected)}<span class="nav-name">{group.icon} {group.name}</span>{#if meta}<span class="nav-meta">{meta}</span>{/if}</button>
+          <span class="nav-trail">
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={12} /></button>
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={12} /></button>
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Edit ${group.name}`} title={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}><Ellipsis size={12} /></button>
+          </span>
+        </div>
+      {/if}
+    {/each}
+    {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
+    {#if workspaceCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
+    {#if workspaces.some((group) => group.archived)}
+      <!-- "workspaces", not just "archived": this page also has an Archive
+           that holds completed tasks, and two unqualified uses of the word
+           on one screen read as one feature with a broken control. -->
+      <div class="archive-pick"><Checkbox label="Show archived workspaces" checked={showArchived} onchange={(next) => interfaceStore.setTaskShowArchivedWorkspaces(next)} /></div>
+    {/if}
+    <!-- In a workspace scope this control has a second effect: whatever it
+         adds also joins the workspace. It says so rather than leaving the
+         membership write to be discovered. -->
+    <div class="nav-heading gp-label" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="gp-icon-btn" data-size="sm" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
+    {#if addMenu}
+      <div
+        bind:this={addMenuEl}
+        use:portal={"body"}
+        use:popover={addMenuDismissal}
+        id="task-add-repo-menu"
+        data-add-repo-popup
+        data-testid="task-add-repo-menu"
+        class="add-menu gp-menu gp-pop fixed"
+        role="menu"
+        aria-label={addRepoLabel}
+        tabindex="-1"
+        style="z-index: {LAYERS.MENU}"
+        onkeydown={onAddMenuKey}
+      >
+        {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
+        {#each menuTabs as tab (tab.path)}
+          <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
+            <span class="add-name">{tab.label}</span>
+            <span class="add-path">{tab.path}</span>
+          </button>
+        {/each}
+        {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
+        {#if attachable.length}
+          <div class="add-menu-label">Registered</div>
+          {#each attachable as repo (repo.id)}
+            <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
+              <span class="add-name">{repo.name}</span>
+            </button>
+          {/each}
+          {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
+        {/if}
+        <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
+      </div>
+    {/if}
+    {#each repositories as repo (repo.id)}
+      {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
+    {/each}
+    <!-- Hidden repositories keep their rows: their own boards still open
+         from here, and Show is one click away. Collapsed unless the reader
+         opened it, is on one of their boards, or is searching the navigator. -->
+    {#if hiddenRepositories.length}
+      {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
+      <div class="nav-heading gp-label" data-testid="task-hidden-repositories">
+        <button type="button" class="gp-btn nav-disclosure" data-variant="ghost" data-size="sm" data-testid="task-hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
+        <button type="button" class="gp-icon-btn" data-size="sm" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
+      </div>
+      {#if expanded}
+        <div id="task-hidden-repository-rows">
+          {#each repositories as repo (repo.id)}
+            {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
+          {/each}
+          {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
+        </div>
+      {/if}
+    {/if}
+    {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
+    {#if repositoryCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
+  </nav>
+{/snippet}
 <svelte:window onkeydown={onBoardKeydown} onpointermove={onCardPointerMove} onpointerup={onCardPointerUp} onpointercancel={onCardPointerCancel} onlostpointercapture={onCardPointerCancel} onblur={cancelDrag} />
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
-    <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
-      <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find workspace or repository" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
-      <div class="nav-heading gp-label">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="icon gp-icon-btn" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
-      <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
-      {#each orderedWorkspaces as group, index (group.id)}
-        {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
-        {#if navShowsWorkspace(group)}
-        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
-        {/if}
-      {/each}
-      {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
-      {#if workspaceCursor}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
-      {#if workspaces.some((group) => group.archived)}
-        <!-- "workspaces", not just "archived": this page also has an Archive
-             that holds completed tasks, and two unqualified uses of the word
-             on one screen read as one feature with a broken control. -->
-        <div class="archive-pick"><Checkbox label="Show archived workspaces" checked={showArchived} onchange={(next) => interfaceStore.setTaskShowArchivedWorkspaces(next)} /></div>
-      {/if}
-      <!-- In a workspace scope this control has a second effect: whatever it
-           adds also joins the workspace. It says so rather than leaving the
-           membership write to be discovered. -->
-      <div class="nav-heading gp-label" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
-      {#if addMenu}
-        <div
-          bind:this={addMenuEl}
-          use:portal={"body"}
-          use:popover={addMenuDismissal}
-          id="task-add-repo-menu"
-          data-add-repo-popup
-          data-testid="task-add-repo-menu"
-          class="add-menu gp-menu gp-pop fixed"
-          role="menu"
-          aria-label={addRepoLabel}
-          tabindex="-1"
-          style="z-index: {LAYERS.MENU}"
-          onkeydown={onAddMenuKey}
-        >
-          {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
-          {#each menuTabs as tab (tab.path)}
-            <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
-              <span class="add-name">{tab.label}</span>
-              <span class="add-path">{tab.path}</span>
-            </button>
-          {/each}
-          {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
-          {#if attachable.length}
-            <div class="add-menu-label">Registered</div>
-            {#each attachable as repo (repo.id)}
-              <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
-                <span class="add-name">{repo.name}</span>
-              </button>
-            {/each}
-            {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
-          {/if}
-          <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
-        </div>
-      {/if}
-      {#each repositories as repo (repo.id)}
-        {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
-      {/each}
-      <!-- Hidden repositories keep their rows: their own boards still open
-           from here, and Show is one click away. Collapsed unless the reader
-           opened it, is on one of their boards, or is searching the navigator. -->
-      {#if hiddenRepositories.length}
-        {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
-        <div class="nav-heading gp-label" data-testid="task-hidden-repositories">
-          <button type="button" class="gp-btn nav-disclosure" data-variant="ghost" data-size="sm" data-testid="task-hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
-          <button type="button" class="icon gp-icon-btn" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
-        </div>
-        {#if expanded}
-          <div id="task-hidden-repository-rows">
-            {#each repositories as repo (repo.id)}
-              {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
-            {/each}
-            {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
-          </div>
-        {/if}
-      {/if}
-      {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
-      {#if repositoryCursor}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
-    </nav>
+    {#if railDocked}
+      {@render scopeRail(false)}
+    {:else if railOpen}
+      <div class="rail-overlay" style="z-index: {LAYERS.SCROLL_CUE}; top: {railTop}px" use:popover={railDismissal} in:fly={{ x: -16, opacity: 0, ...backdropFade() }} out:fly={{ x: -16, opacity: 0, ...backdropFadeOut() }}>
+        {@render scopeRail(true)}
+      </div>
+    {/if}
   {/if}
   <main class="board-main">
     <header class="gp-glass gp-surface-header">
       <div class="heading">
+        {#if !repositoryPath}
+          <button bind:this={railToggleEl} type="button" class="gp-icon-btn" data-nav-toggle data-testid="task-nav-toggle" aria-expanded={railDocked || railOpen} aria-controls="task-scope-rail" aria-label={railDocked ? "Hide task scopes" : "Show task scopes"} title={railDocked ? "Hide task scopes" : "Show task scopes"} onclick={toggleRail}><PanelLeft size={13} /></button>
+        {/if}
         <h1 class="gp-surface-title">{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
         {#if inProgressCount > 0}<span class="gp-chip" data-kind="label" data-tone="accent">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
@@ -3093,21 +3226,39 @@
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
-  /* A rounded card that fills the board's left edge, top to bottom, with no
-     gutter: its corners meet the pane's own rounded corners, the same rule
-     as the app sidebar beside it. */
-  .navigator{width:188px;flex-shrink:0;margin:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:14px;padding:10px 8px;overflow:auto}
-  .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.75rem;background:transparent}
-  .navigator button:hover{background:rgb(var(--c-surface-hover) / 0.7)}
-  .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
-  .navigator.gp-liquid-tabs{padding:10px 8px}
-  .navigator.gp-liquid-tabs button.selected{background:transparent}
-  .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
-  .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px}
-  /* Icon buttons have to beat `.navigator button { width: 100% }`. Show, on a
-     hidden repository, is not the row's last child, so a bare `.icon` rule
-     lost and the button took the row — the name collapsed to nothing. */
-  .nav-heading > button,.nav-row>button:last-child,.navigator button.icon{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+  /* A docked rail, not a floating card. In flow beside the board it separates
+     from it by one tonal step and its own padding: no outline, no radius (the
+     pane's rounded corner clips it where it meets the plate), no glass. Glass
+     is for the overlay below, because only that one floats over the board. */
+  /* `gp-glass` paints only on macOS and its rule is more specific than this
+     fill, so the overlay is glass there and the same solid surface elsewhere. */
+  .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
+  .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
+  .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
+  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:9px;font-size:0.75rem;font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
+  .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
+  .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
+  .navigator.nav-liquid .nav-scope.selected{background:transparent}
+  .navigator .nav-scope:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-2px}
+  .navigator .nav-scope > :not(:global(.gp-liquid-selection)){position:relative}
+  .navigator .nav-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .navigator .nav-meta{flex-shrink:0;font-size:0.6875rem;color:rgb(var(--c-text-muted));white-space:nowrap}
+  .navigator .nav-meta.checkout-mark{color:rgb(var(--c-warn))}
+  /* Every trailing control on a row is one 24px gp-icon-btn, revealed together
+     on hover or focus-within. `data-persist` keeps the ones that carry state
+     or the row's main action (a hidden repository's Show, a checkout that
+     needs relinking); touch has no hover, so it shows them all. */
+  .navigator .nav-row{display:flex;align-items:center;min-width:0}
+  .navigator .nav-trail{display:inline-flex;flex-shrink:0}
+  .navigator .trail-item{display:none;flex-shrink:0}
+  .navigator .nav-row:hover .trail-item,.navigator .nav-row:focus-within .trail-item,.navigator .trail-item[data-persist]{display:inline-flex}
+  @media (hover:none){.navigator .trail-item{display:inline-flex}}
+  .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 0 4px 8px;min-height:24px}
+  .nav-heading > button,.heading-actions>button{flex-shrink:0}
+  .heading-actions{display:inline-flex}
+  .navigator .nav-more{display:block;width:100%;text-align:left}
+  .navigator .nav-disclosure{display:inline-flex;align-items:center;justify-content:flex-start;gap:2px;width:auto;min-width:0;flex:1;padding:0;overflow:hidden;font:inherit;color:inherit;text-align:left}
+  .navigator .nav-disclosure :global(svg){flex-shrink:0}
   /* Portaled: `fixed` + the popover owner set left/top. Width and height are
      viewport-capped so a long path or a long registered list cannot grow the
      panel off the window the way the old 260px-in-188px absolute menu did.
@@ -3118,17 +3269,6 @@
   .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0}
   .add-name,.add-path{display:block;min-width:0;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
   .add-path{font-size:0.625rem;color:rgb(var(--c-text-muted))}
-  .nav-row{display:flex;align-items:center}
-  .nav-row .reorder{display:none;flex-shrink:0}
-  .nav-row:hover .reorder,.nav-row:focus-within .reorder{display:inline-flex}
-  .reorder>button{width:18px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-  .heading-actions{display:inline-flex;gap:2px}
-  .heading-actions>button{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-  .nav-row>button:first-child{min-width:0;flex:1}
-  .nav-row .row-reveal{display:none;flex-shrink:0}
-  .nav-row:hover .row-reveal,.nav-row:focus-within .row-reveal{display:inline-flex}
-  .navigator .nav-disclosure{display:inline-flex;align-items:center;justify-content:flex-start;gap:2px;width:auto;min-width:0;flex:1;padding:0;overflow:hidden;font:inherit;color:inherit}
-  .navigator .nav-disclosure :global(svg){flex-shrink:0}
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-pick{padding:0 8px}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}

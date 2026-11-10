@@ -1323,7 +1323,8 @@ if (params.has("check")) {
     // still runs against a build whose navigator says nothing about members.
     await click("Global fixture"); await settle(400);
     check("the navigator says which workspaces are empty before one is opened",
-      workspaceTab("Fresh space").textContent.trim() === "Fresh space · Empty");
+      workspaceTab("Fresh space").querySelector(".nav-name")?.textContent.trim() === "Fresh space"
+      && workspaceTab("Fresh space").querySelector(".nav-meta")?.textContent.trim() === "Empty");
     workspaceTab("Fresh space").click(); await settle(400);
     check("an empty workspace still offers New task, and says what the sheet will ask for",
       button("New task").disabled === false
@@ -3842,6 +3843,65 @@ if (params.has("check")) {
             Boolean(picked?.querySelector(".gp-liquid-selection")) && getComputedStyle(label(picked)).position === "relative");
         }
       } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
+
+      // The navigator is a docked rail (a tonal step, no outline, no glass), moves by keyboard,
+      // and gives the board its width back — collapsed or narrow — as an overlay opened from the toolbar.
+      const appBox = document.getElementById("app");
+      try {
+        step = "navigator rail";
+        const nav = scopesNav();
+        const style = getComputedStyle(nav);
+        check("the docked navigator is a rail: no outline, no corner radius, no glass",
+          style.borderTopWidth === "0px" && style.borderTopLeftRadius === "0px" && !nav.classList.contains("gp-glass"));
+        const toggle = () => root.querySelector('[data-testid="task-nav-toggle"]');
+        const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
+        const press = (el, key, init = {}) => el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));
+        const rows = () => [...scopesNav().querySelectorAll(".nav-scope")];
+        rows()[0].focus(); press(document.activeElement, "ArrowDown");
+        check("ArrowDown moves focus to the next scope row", document.activeElement === rows()[1]);
+        press(document.activeElement, "End");
+        check("End jumps to the last scope row", document.activeElement === rows().at(-1));
+        press(document.activeElement, "ArrowDown");
+        check("ArrowDown stays on the last row", document.activeElement === rows().at(-1));
+        press(document.activeElement, "Home");
+        check("Home jumps to the first scope row", document.activeElement === rows()[0]);
+        const firstSpace = scopesNav().querySelector("[data-workspace-row] > .nav-scope");
+        firstSpace.focus(); press(firstSpace, "ArrowUp", { altKey: true }); await settle(100);
+        check("Alt+ArrowUp on the first workspace is the reorder shortcut, not row navigation: focus stays put", document.activeElement === firstSpace);
+
+        step = "navigator collapse";
+        check("the toolbar offers to hide the navigator while it is docked", toggle()?.getAttribute("aria-label") === "Hide task scopes" && toggle().getAttribute("aria-expanded") === "true");
+        toggle().click(); await wait(() => !scopesNav());
+        check("hiding it removes the rail and remembers the choice", !scopesNav() && get(interfaceStore).taskNavigatorCollapsed === true && toggle().getAttribute("aria-label") === "Show task scopes");
+        toggle().click(); await wait(() => scopesNav());
+        check("Show opens the navigator as a floating overlay over the board", scopesNav().classList.contains("gp-glass") && scopesNav().classList.contains("is-overlay") && toggle().getAttribute("aria-expanded") === "true");
+        press(document.activeElement ?? document.body, "Escape"); await wait(() => !scopesNav());
+        check("Escape closes the overlay and returns focus to the toggle", !scopesNav() && (await settled(() => document.activeElement === toggle())));
+        toggle().click(); await wait(() => scopesNav());
+        document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await wait(() => !scopesNav());
+        check("a pointer press outside the overlay closes it", !scopesNav());
+        toggle().click(); await wait(() => scopesNav());
+        button("Dock the task scopes beside the board", scopesNav()).click(); await wait(() => scopesNav() && !scopesNav().classList.contains("is-overlay"));
+        check("Dock puts the navigator back beside the board and forgets the collapse", !scopesNav().classList.contains("gp-glass") && get(interfaceStore).taskNavigatorCollapsed === false);
+
+        step = "narrow board";
+        appBox.style.width = "700px"; await wait(() => !scopesNav());
+        const board = root.querySelector('[data-testid="task-board"]');
+        check("a board too narrow for a rail and three columns hides the rail", !scopesNav() && toggle()?.getAttribute("aria-label") === "Show task scopes" && board.getBoundingClientRect().width <= 700);
+        toggle().click(); await wait(() => scopesNav());
+        const overlayRows = [...scopesNav().querySelectorAll(".nav-scope")];
+        check("the overlay starts under the toolbar, so the toggle stays reachable",
+          scopesNav().getBoundingClientRect().top >= root.querySelector(".board-main header").getBoundingClientRect().bottom - 1
+          && !button("Dock the task scopes beside the board", scopesNav()));
+        overlayRows.find(row => row.textContent.trim().startsWith("Fresh space")).click();
+        await wait(() => !scopesNav());
+        check("choosing a scope in the overlay closes it and returns focus to the toggle", !scopesNav() && (await settled(() => document.activeElement === toggle())));
+        toggle().click(); await wait(() => scopesNav());
+        button("All", scopesNav()).click(); await wait(() => !scopesNav());
+        appBox.style.width = ""; await wait(() => scopesNav());
+        check("widening the window docks the rail again", Boolean(scopesNav()) && !scopesNav().classList.contains("is-overlay"));
+      } catch (error) { check(`the navigator rail checks ran to the end (${error.message} at ${step})`, false); }
+      finally { appBox.style.width = ""; interfaceStore.setTaskNavigatorCollapsed(false); await settle(200); }
 
       try {
         step = "sheet controls";

@@ -228,6 +228,12 @@ export interface InterfacePrefs {
   /** Whether the scope navigator lists archived workspaces. */
   taskShowArchivedWorkspaces: boolean;
   /**
+   * Whether the Tasks scope navigator is tucked away. A collapsed navigator
+   * is opened from the board toolbar as an overlay, so the choice gives the
+   * board its full width without removing the scopes.
+   */
+  taskNavigatorCollapsed: boolean;
+  /**
    * What Return does in the board's quick-add line.
    *
    * `"assist"` saves the typed line exactly as `"manual"` does and then asks
@@ -394,6 +400,7 @@ const DEFAULTS: InterfacePrefs = {
   taskOrder: "priority",
   taskBoards: {},
   taskShowArchivedWorkspaces: true,
+  taskNavigatorCollapsed: false,
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
@@ -549,6 +556,7 @@ function readPrefs(): InterfacePrefs {
         parsed.taskShowArchivedWorkspaces,
         DEFAULTS.taskShowArchivedWorkspaces,
       ),
+      taskNavigatorCollapsed: bool(parsed.taskNavigatorCollapsed, DEFAULTS.taskNavigatorCollapsed),
       // Anything unrecognizable falls back to manual. A stored value this
       // build cannot read must not be the one that spends a model call.
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
@@ -792,6 +800,7 @@ function createInterfaceStore() {
         taskCardFields: [...view.cardFields],
       }),
     setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
+    setTaskNavigatorCollapsed: (collapsed: boolean) => patch({ taskNavigatorCollapsed: collapsed }),
     setTaskQuickAddAssist: (assist: boolean) => patch({ taskQuickAddAssist: assist }),
     /**
      * Remembers the last handoff a reader chose.
@@ -816,6 +825,7 @@ function createInterfaceStore() {
         taskSwimlane: DEFAULTS.taskSwimlane,
         taskOrder: DEFAULTS.taskOrder,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
+        taskNavigatorCollapsed: DEFAULTS.taskNavigatorCollapsed,
         taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),
       }),
