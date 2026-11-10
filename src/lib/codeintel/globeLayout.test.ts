@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  MAX_PITCH, clampPitch, layoutOnSphere, projectOrthographic, rotationToFace,
+  MAX_PITCH, clampPitch, layoutOnSphere, lerpRotation, projectOrthographic, rotateByDrag, rotationToFace,
   type GlobeModelInput, type SpherePoint,
 } from "./globeLayout";
 
@@ -190,5 +190,39 @@ describe("rotationToFace", () => {
     const { pitch } = rotationToFace({ x: 0, y: 1, z: 0 });
     expect(pitch).toBe(MAX_PITCH);
     expect(rotationToFace({ x: 0, y: -1, z: 0 }).pitch).toBe(-MAX_PITCH);
+  });
+});
+
+describe("rotateByDrag", () => {
+  const view = { zoom: 1, cx: 0, cy: 0, radius: 100 };
+
+  it("carries the front surface with the pointer: right moves it right, down moves it down", () => {
+    const front: SpherePoint = { x: 0, y: 0, z: 1 };
+    const right = rotateByDrag({ yaw: 0, pitch: 0 }, 30, 0, 100);
+    const [moved] = projectOrthographic([front], { ...right, ...view });
+    expect(moved.x).toBeGreaterThan(0);
+    expect(moved.y).toBeCloseTo(0, 9);
+    const down = rotateByDrag({ yaw: 0, pitch: 0 }, 0, 30, 100);
+    const [tipped] = projectOrthographic([front], { ...down, ...view });
+    expect(tipped.y).toBeGreaterThan(0);
+    expect(tipped.x).toBeCloseTo(0, 9);
+  });
+
+  it("clamps pitch and tolerates a zero radius", () => {
+    expect(rotateByDrag({ yaw: 0, pitch: 0 }, 0, 1e9, 100).pitch).toBe(MAX_PITCH);
+    expect(rotateByDrag({ yaw: 1, pitch: 0.5 }, 10, 10, 0)).toEqual({ yaw: 1, pitch: 0.5 });
+  });
+});
+
+describe("lerpRotation", () => {
+  it("takes the short way round in yaw and reaches both ends exactly", () => {
+    const from = { yaw: 3, pitch: 0 }, to = { yaw: -3, pitch: 0.4 };
+    expect(lerpRotation(from, to, 0)).toEqual(from);
+    const mid = lerpRotation(from, to, 0.5);
+    expect(Math.cos(mid.yaw)).toBeCloseTo(-1, 1); // through ±π, not through 0
+    expect(mid.pitch).toBeCloseTo(0.2, 9);
+    const end = lerpRotation(from, to, 1);
+    expect(Math.sin(end.yaw)).toBeCloseTo(Math.sin(to.yaw), 9);
+    expect(end.pitch).toBeCloseTo(0.4, 9);
   });
 });

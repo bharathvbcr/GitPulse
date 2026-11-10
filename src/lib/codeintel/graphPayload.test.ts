@@ -152,11 +152,60 @@ describe("community labels", () => {
     expect(groups(nodes)[0].label).toBe("app/Editor");
   });
 
-  it("disambiguates repeated inferred labels using stable community IDs", () => {
+  it("separates groups that share a directory by their most connected member, never an opaque #N", () => {
     const nodes = [file("app/Editor/A.swift", "community-7"), file("app/Editor/B.swift", "community-9")];
     const labels = groups(nodes).map(g => [g.name, g.label]);
-    expect(labels).toEqual([["community-7", "app/Editor · #7"], ["community-9", "app/Editor · #9"]]);
+    expect(labels).toEqual([["community-7", "app/Editor · A.swift"], ["community-9", "app/Editor · B.swift"]]);
     expect(groups([...nodes].reverse()).map(g => [g.name, g.label])).toEqual(labels);
+    expect(labels.flat().join(" ")).not.toMatch(/#\d/);
+  });
+
+  it("widens colliding captions with path segments", () => {
+    const nodes = [file("a/x/src/one.rs", "community-1"), file("b/x/src/two.rs", "community-2")];
+    expect(groups(nodes).map(g => g.label).sort()).toEqual(["a/x/src", "b/x/src"]);
+  });
+});
+
+describe("display labels", () => {
+  const labelsOf = (payload: object) => Object.fromEntries(buildCodeGraphModel(payload).nodes.map(n => [n.id, n.label]));
+
+  it("keeps the bare name when it is already unique", () => {
+    expect(labelsOf({ nodes: [{ id: "a/x.ts", name: "x.ts", path: "a/x.ts", kind: "file" }, { id: "a/y.ts", name: "y.ts", path: "a/y.ts", kind: "file" }], links: [] }))
+      .toEqual({ "a/x.ts": "x.ts", "a/y.ts": "y.ts" });
+  });
+
+  it("shows the shortest unique path suffix for repeated file names, leaving ids and names alone", () => {
+    const model = buildCodeGraphModel({ nodes: [
+      { id: "src/a/mod.rs", name: "mod.rs", path: "src/a/mod.rs", kind: "file" },
+      { id: "src/b/mod.rs", name: "mod.rs", path: "src/b/mod.rs", kind: "file" },
+      { id: "lib/b/mod.rs", name: "mod.rs", path: "lib/b/mod.rs", kind: "file" },
+    ], links: [] });
+    expect(Object.fromEntries(model.nodes.map(n => [n.id, n.label]))).toEqual({
+      "src/a/mod.rs": "a/mod.rs", "src/b/mod.rs": "src/b/mod.rs", "lib/b/mod.rs": "lib/b/mod.rs",
+    });
+    expect(model.nodes.every(n => n.name === "mod.rs")).toBe(true);
+  });
+
+  it("tells subsystems apart by area when their basenames collide", () => {
+    expect(labelsOf({ nodes: [
+      { id: "src-tauri/src", name: "src", area: "src-tauri/src", kind: "subsystem" },
+      { id: "src-tauri/framework/muda/src", name: "src", area: "src-tauri/framework/muda/src", kind: "subsystem" },
+    ], links: [] })).toEqual({ "src-tauri/src": "src-tauri/src", "src-tauri/framework/muda/src": "muda/src" });
+  });
+
+  it("qualifies repeated symbol names with their file and never compares across kinds", () => {
+    expect(labelsOf({ nodes: [
+      { id: "a.rs::new", name: "new", path: "a.rs", kind: "function" },
+      { id: "b.rs::new", name: "new", path: "b.rs", kind: "function" },
+      { id: "new", name: "new", kind: "file", path: "new" },
+    ], links: [] })).toEqual({ "a.rs::new": "a.rs/new", "b.rs::new": "b.rs/new", "new": "new" });
+  });
+
+  it("falls back to the name for nodes no suffix can separate", () => {
+    expect(labelsOf({ nodes: [
+      { id: "a.rs::new#1", name: "new", path: "a.rs", kind: "function" },
+      { id: "a.rs::new#2", name: "new", path: "a.rs", kind: "function" },
+    ], links: [] })).toEqual({ "a.rs::new#1": "new", "a.rs::new#2": "new" });
   });
 });
 

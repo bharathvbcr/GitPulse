@@ -233,3 +233,31 @@ export function rotationToFace(point: SpherePoint): { yaw: number; pitch: number
   const yaw = horizontal < 1e-12 ? 0 : Math.atan2(-point.x, point.z);
   return { yaw, pitch: clampPitch(Math.atan2(point.y, horizontal)) };
 }
+
+/**
+ * Drag rotation: the surface follows the pointer. Dragging right turns the
+ * front face right (yaw grows), dragging down tips it down (pitch grows).
+ * `radius` is the on-screen sphere radius, so one radius of drag is one radian.
+ */
+export function rotateByDrag(
+  rotation: { yaw: number; pitch: number },
+  dx: number,
+  dy: number,
+  radius: number,
+): { yaw: number; pitch: number } {
+  const per = radius > 0 ? 1 / radius : 0;
+  return { yaw: rotation.yaw + dx * per, pitch: clampPitch(rotation.pitch + dy * per) };
+}
+
+/** Interpolate between two rotations, taking the short way round in yaw. */
+export function lerpRotation(
+  from: { yaw: number; pitch: number },
+  to: { yaw: number; pitch: number },
+  t: number,
+): { yaw: number; pitch: number } {
+  const turn = Math.PI * 2;
+  let delta = (to.yaw - from.yaw) % turn;
+  if (delta > Math.PI) delta -= turn;
+  else if (delta < -Math.PI) delta += turn;
+  return { yaw: from.yaw + delta * t, pitch: from.pitch + (to.pitch - from.pitch) * t };
+}
