@@ -531,6 +531,8 @@ fn main() {
                     ns,
                     counters: Default::default(),
                     metrics: Default::default(),
+                    // No metrics, so no ranges beside them.
+                    metric_ranges: Default::default(),
                 });
             }
         }
