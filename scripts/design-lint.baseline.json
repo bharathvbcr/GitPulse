@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "commit": "d30c37c62e7d712b4d1fbc82098720a59fa7acac",
+  "commit": "fe63013fb1c5c9114fb553bfa5579a12fa0dfdf2",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 1580,
+      "total": 1578,
       "files": {
         "src/App.svelte": 7,
         "src/lib/components/AgentCommitMenu.svelte": 12,
@@ -76,7 +76,6 @@
         "src/lib/components/RepoTabBar.svelte": 26,
         "src/lib/components/RungFilterControl.svelte": 2,
         "src/lib/components/SessionAlertSettings.svelte": 6,
-        "src/lib/components/SettingToggle.svelte": 2,
         "src/lib/components/SettingsModal.svelte": 72,
         "src/lib/components/ShortcutsModal.svelte": 3,
         "src/lib/components/Sidebar.svelte": 18,
