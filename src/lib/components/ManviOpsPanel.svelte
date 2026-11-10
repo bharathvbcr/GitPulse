@@ -7,7 +7,7 @@
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { describeFailure } from "../ui/copy/describeFailure";
-  import Toggle from "./Toggle.svelte";
+  import Checkbox from "./Checkbox.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { reportPanelError } from "../diagnostics/report";
   import {
@@ -857,7 +857,7 @@
           <div class="max-h-52 space-y-1 overflow-auto">
             {#each cleanup.candidates as branch, i (`${branch.name}#${i}`)}
               <div class="gp-row">
-                <Toggle checked={isSelected(branch.name)} ariaLabel="Select {branch.name}" onchange={() => toggleSelected(branch.name)} />
+                <Checkbox checked={isSelected(branch.name)} ariaLabel="Select {branch.name}" onchange={() => toggleSelected(branch.name)} />
                 <span class="min-w-0 flex-1">
                   <span class="font-mono">{branch.name}</span>
                   <span class="ml-2 font-mono text-textMuted" title={branch.tip_commit_id}>{branch.tip_commit_id.slice(0, 7)}</span>
@@ -925,7 +925,7 @@
             <div class="max-h-40 space-y-1 overflow-auto">
               {#each tagPlan.candidates as tag, i (`${tag.name}#${i}`)}
                 <div class="gp-row">
-                  <Toggle checked={selectedTags.includes(tag.name)} ariaLabel="Select {tag.name}" onchange={() => toggleTag(tag.name)} />
+                  <Checkbox checked={selectedTags.includes(tag.name)} ariaLabel="Select {tag.name}" onchange={() => toggleTag(tag.name)} />
                   <span class="min-w-0 flex-1 truncate"><span class="font-mono">{tag.name}</span><span class="ml-2 text-textMuted">{tag.summary}</span></span>
                 </div>
               {:else}
@@ -1158,7 +1158,7 @@
           <input class="gp-field w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
           <input class="gp-field w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
           <div class="rounded-lg bg-surfaceHover p-2">
-            <Toggle checked={releaseConfirmed} onchange={(next) => (releaseConfirmed = next)} label="I confirm the working tree is ready." description="GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags." />
+            <Checkbox checked={releaseConfirmed} onchange={(next) => (releaseConfirmed = next)} label="I confirm the working tree is ready." description="GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags." />
           </div>
           <button class="gp-btn w-full justify-center" data-variant="primary" onclick={publishRelease} disabled={!releaseConfirmed || !releaseTag.trim() || busy !== null}>
             {#if busy === "release"}<LoaderCircle size={14} class="animate-spin" />{:else}<Rocket size={14} />{/if} Push release tag

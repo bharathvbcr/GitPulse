@@ -9,7 +9,7 @@
   import { PROVIDER_LABELS } from "../workbench/taskHandoff";
   import { describeFailure, type FailureCopy } from "../ui/copy/describeFailure";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
-  import Toggle from "./Toggle.svelte";
+  import Checkbox from "./Checkbox.svelte";
 
   let { repoPath, report, exclusions = [], scanFailed = false, focus, selectedScope = $bindable(false), onRescan, scanning = false }: {
     repoPath: string | null;
@@ -141,7 +141,7 @@
     </button>
     {#if focus}
       <span class="gp-chip min-w-0" data-tone="neutral" title="Scope the prompt to {focus.file.path}">
-        <Toggle id={focusId} ariaLabel="Focus on {focus.file.path}" checked={selectedScope} onchange={(next) => { selectedScope = next; }} />
+        <Checkbox id={focusId} ariaLabel="Focus on {focus.file.path}" checked={selectedScope} onchange={(next) => { selectedScope = next; }} />
         <label for={focusId} class="min-w-0 cursor-pointer truncate hover:text-textPrimary">Focus on {focus.file.path}</label>
       </span>
     {/if}

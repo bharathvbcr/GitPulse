@@ -91,6 +91,60 @@ export async function checkPrimitives() {
     await tick();
     check("a disabled Toggle is disabled and asks for nothing", () => disabledSwitch.disabled && state().disabledChanges === "0" && disabledSwitch.getAttribute("aria-checked") === "false");
 
+    // ---- Checkbox ------------------------------------------------------
+    const boxes = '[data-testid="checkboxes"]';
+    const cbState = () => q('[data-testid="checkbox-state"]').dataset;
+    const box = (name: string) => q<HTMLInputElement>(`${boxes} input[aria-label="${name}"]`);
+    const bareBox = box("Bare box");
+    check("the Checkbox is a native checkbox input wearing gp-check, named by its aria-label, and starts unticked", () =>
+      bareBox.tagName === "INPUT" && bareBox.type === "checkbox" && bareBox.classList.contains("gp-check")
+      && bareBox.getAttribute("aria-label") === "Bare box" && !bareBox.checked);
+    check("the Checkbox is drawn, not the browser's: appearance none, a 16px square on the xs radius", () => {
+      const style = getComputedStyle(bareBox);
+      return style.appearance === "none" && bareBox.getBoundingClientRect().width === 16 && bareBox.getBoundingClientRect().height === 16
+        && style.borderTopLeftRadius === "4px";
+    });
+    bareBox.focus();
+    check("the Checkbox takes keyboard focus and does not swallow Space", () => active() === bareBox && bareBox.tabIndex >= 0 && !key(bareBox, { key: " " }).defaultPrevented);
+    bareBox.click();
+    await tick();
+    check("a click ticks the Checkbox and checked follows", () => bareBox.checked && cbState().ticked === "true" && cbState().tickChanges === "1");
+    bareBox.click();
+    await tick();
+    check("a second click unticks it", () => !bareBox.checked && cbState().ticked === "false" && cbState().tickChanges === "2");
+    const labelledBox = box("Labelled box");
+    const labelRow = labelledBox.closest("label");
+    check("a labelled Checkbox sits inside one <label>, with the description linked", () =>
+      !!labelRow && labelRow.htmlFor === labelledBox.id
+      && document.getElementById(labelledBox.getAttribute("aria-describedby") ?? "")?.textContent?.trim() === "Says what ticking commits to.");
+    q<HTMLElement>("span.font-medium", labelRow ?? document).click();
+    await tick();
+    check("clicking a Checkbox's visible label ticks it", () => labelledBox.checked && cbState().confirmed === "true");
+    const mixedBox = box("Mixed box");
+    check("indeterminate is reflected on the input and drawn as an accent-filled bar", () =>
+      mixedBox.indeterminate && mixedBox.matches(":indeterminate") && !mixedBox.checked
+      && getComputedStyle(mixedBox).backgroundColor !== "rgba(0, 0, 0, 0)" && getComputedStyle(mixedBox, "::before").opacity === "1");
+    mixedBox.click();
+    await tick();
+    check("pressing an indeterminate Checkbox clears it through the parent", () => !mixedBox.indeterminate && cbState().mixed === "false");
+    const refusing = box("Refusing box");
+    refusing.click();
+    await tick();
+    check("a parent that refuses the change keeps the old state: the box is put back", () => !refusing.checked);
+    const disabledBox = box("Disabled box");
+    disabledBox.click();
+    await tick();
+    check("a disabled Checkbox is disabled, dimmed to .4 and ignores clicks", () =>
+      disabledBox.disabled && !disabledBox.checked && cbState().disabledTicks === "0" && getComputedStyle(disabledBox).opacity === "0.4");
+    check("an unticked Checkbox is transparent with no glyph", () =>
+      !bareBox.checked && getComputedStyle(bareBox).backgroundColor === "rgba(0, 0, 0, 0)" && getComputedStyle(bareBox, "::before").opacity === "0");
+    bareBox.click();
+    await tick();
+    // The fill fades in over --gp-dur-instant; read it once that has finished.
+    await idle();
+    check("a ticked Checkbox fills with the accent and shows its glyph", () =>
+      bareBox.checked && getComputedStyle(bareBox).backgroundColor !== "rgba(0, 0, 0, 0)" && getComputedStyle(bareBox, "::before").opacity === "1");
+
     // ---- Slider --------------------------------------------------------
     const range = q<HTMLInputElement>('[data-testid="slider"] input[type="range"]');
     check("the Slider is a native range input labelled by its visible label", () =>
