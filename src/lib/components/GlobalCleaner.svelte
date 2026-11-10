@@ -97,58 +97,58 @@
 
 <section aria-label="Global build cleaner" class="space-y-4 text-xs max-w-5xl">
   <div class="flex flex-wrap justify-between gap-3">
-    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain projects beneath your chosen roots, including repositories that are closed in GitPulse. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
-    <button class="gp-btn" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
+    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain repositories beneath your chosen roots, including repositories that are closed in GitPulse. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
+    <button class="gp-btn" data-size="sm" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
   </div>
-  {#if error}<p role="alert" class="rounded border border-rose-400/30 p-3 text-rose-300">{error}</p>{/if}
-  {#if refreshError}<p role="alert" class="rounded border border-rose-400/30 p-3 text-rose-300">{refreshError}</p>{/if}
+  {#if error}<p role="alert" class="gp-notice" data-tone="danger">{error}</p>{/if}
+  {#if refreshError}<p role="alert" class="gp-notice" data-tone="danger">{refreshError}</p>{/if}
   {#if notice}<p role="status" class="text-textSecondary">{notice}</p>{/if}
   {#if draft && cleaner}
-    {#if cleaner.background_error}<p role="alert" class="text-amber-300">Background setup failed; schedule disabled. {cleaner.background_error}</p>{/if}
+    {#if cleaner.background_error}<p role="alert" class="gp-notice" data-tone="warn">Couldn't set up background runs, so the schedule is off. {cleaner.background_error}</p>{/if}
     <fieldset disabled={busy} class="space-y-4 border-0 p-0 m-0 min-w-0">
-    {#if !cleaner.supported}<p class="text-amber-300">Cleanup is unavailable on this platform: removal relies on Unix descriptor-relative deletion that has no Windows implementation, so nothing is deleted here. Inventory and policy guidance remain available.</p>{/if}
+    {#if !cleaner.supported}<p class="gp-notice" data-tone="warn">Cleanup is unavailable on this platform: removal relies on Unix descriptor-relative deletion that has no Windows implementation, so nothing is deleted here. Inventory and policy guidance remain available.</p>{/if}
     <div class="grid gap-3 md:grid-cols-2">
-      <label class="space-y-1">Project roots · one absolute directory per line<textarea aria-label="Project roots" class="block w-full rounded border border-border bg-surface p-2 font-mono" rows="3" bind:value={rootsText} oninput={edited} disabled={busy}></textarea></label>
-      <label class="space-y-1">Excluded directories · one absolute directory per line<textarea aria-label="Excluded directories" class="block w-full rounded border border-border bg-surface p-2 font-mono" rows="3" bind:value={exclusionsText} oninput={edited} disabled={busy}></textarea></label>
+      <label class="space-y-1">Repository roots · one absolute directory per line<textarea aria-label="Repository roots" class="gp-field-multi block w-full font-mono" rows="3" bind:value={rootsText} oninput={edited} disabled={busy}></textarea></label>
+      <label class="space-y-1">Excluded directories · one absolute directory per line<textarea aria-label="Excluded directories" class="gp-field-multi block w-full font-mono" rows="3" bind:value={exclusionsText} oninput={edited} disabled={busy}></textarea></label>
     </div>
-    <button class="gp-btn" onclick={addRoot} disabled={busy}><FolderPlus size={12} />Add project root</button>
+    <button class="gp-btn" data-size="sm" onclick={addRoot} disabled={busy}><FolderPlus size={12} />Add repository root</button>
     <div class="flex flex-wrap gap-4">
-      <label>Sweeps keep output modified within <select aria-label="Global retention" class="ml-1 rounded border border-border bg-surface p-1" bind:value={draft.retention_days} onchange={edited}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
-      <label>Per-run byte budget <select aria-label="Cleanup byte budget" class="ml-1 rounded border border-border bg-surface p-1" bind:value={draft.max_run_bytes} onchange={edited}><option value={1073741824}>1 GiB</option><option value={10737418240}>10 GiB</option><option value={53687091200}>50 GiB</option><option value={107374182400}>100 GiB</option></select></label>
-      <label>Maximum directories <input aria-label="Maximum cleanup directories" class="ml-1 w-16 rounded border border-border bg-surface p-1" type="number" min="1" max="100" bind:value={draft.max_targets} oninput={edited} /></label>
+      <label>Sweeps keep output modified within <select aria-label="Global retention" class="gp-select ml-1" bind:value={draft.retention_days} onchange={edited}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
+      <label>Per-run byte budget <select aria-label="Cleanup byte budget" class="gp-select ml-1" bind:value={draft.max_run_bytes} onchange={edited}><option value={1073741824}>1 GiB</option><option value={10737418240}>10 GiB</option><option value={53687091200}>50 GiB</option><option value={107374182400}>100 GiB</option></select></label>
+      <label>Maximum directories <input aria-label="Maximum cleanup directories" class="gp-field ml-1 w-16" type="number" min="1" max="100" bind:value={draft.max_targets} oninput={edited} /></label>
     </div>
-    <div class="rounded-xl border border-border p-3 space-y-2">
-      <label class="flex items-center gap-2"><input type="checkbox" aria-label="Enable scheduled cleanup" bind:checked={draft.enabled} onchange={edited} disabled={!cleaner.supported} /><Clock size={13} />Automatically remove eligible output on schedule</label>
-      <label>Repeat every <select aria-label="Cleanup interval" class="mx-1 rounded border border-border bg-surface p-1" bind:value={draft.interval_hours} onchange={() => { if (draft) draft.next_run_at = 0; edited(); }}><option value={24}>day</option><option value={168}>week</option><option value={720}>30 days</option></select></label>
-      <label class="flex items-center gap-2"><input type="checkbox" aria-label="Run cleanup when GitPulse is closed" bind:checked={draft.run_when_closed} onchange={edited} disabled={!cleaner.background_supported} />Also run when GitPulse is closed</label>
+    <div class="gp-card p-3 space-y-2">
+      <label class="flex items-center gap-2"><input type="checkbox" class="gp-check" aria-label="Enable scheduled cleanup" bind:checked={draft.enabled} onchange={edited} disabled={!cleaner.supported} /><Clock size={13} />Automatically remove eligible output on schedule</label>
+      <label>Repeat every <select aria-label="Cleanup interval" class="gp-select mx-1" bind:value={draft.interval_hours} onchange={() => { if (draft) draft.next_run_at = 0; edited(); }}><option value={24}>day</option><option value={168}>week</option><option value={720}>30 days</option></select></label>
+      <label class="flex items-center gap-2"><input type="checkbox" class="gp-check" aria-label="Run cleanup when GitPulse is closed" bind:checked={draft.run_when_closed} onchange={edited} disabled={!cleaner.background_supported} />Also run when GitPulse is closed</label>
       <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
       <p class="text-textMuted">Next scheduled run: {cleaner.config.enabled ? new Date(cleaner.config.next_run_at * 1000).toLocaleString() : "Off"}</p>
     </div>
-    <p class="text-textMuted">Only ignored output with recognized producer evidence is eligible. Dirty repositories, active tasks, recent files, symlinks, environments, dependencies and persistent state are preserved. Shared package caches and non-Git projects are excluded from scheduled sweeps.</p>
+    <p class="text-textMuted">Only ignored output with recognized producer evidence is eligible. Dirty repositories, active tasks, recent files, symlinks, environments, dependencies and persistent state are preserved. Shared package caches and folders that are not Git repositories are excluded from scheduled sweeps.</p>
     </fieldset>
     <div class="flex flex-wrap gap-2">
-      <button class="gp-btn-primary" onclick={save} disabled={!dirty || busy}>{busy ? "Working…" : "Save cleanup policy"}</button>
+      <button class="gp-btn" data-variant="primary" onclick={save} disabled={!dirty || busy}>{busy ? "Working…" : "Save cleanup policy"}</button>
       <button class="gp-btn" onclick={inspect} disabled={dirty || busy || inspecting || cleaner.running || !cleaner.config.roots.length}><RefreshCw size={12} />{inspecting ? "Inspecting roots…" : "Inspect saved roots"}</button>
       {#if cleaner.running || inspecting}<button class="gp-btn" onclick={stop}><X size={12} />Stop {inspecting ? "inspection" : "cleanup"}</button>{/if}
-      {#if dirty}<button class="gp-btn" onclick={reloadSaved} disabled={busy}>Discard changes and reload</button><span class="self-center text-amber-300">Unsaved policy · inspect and run after saving</span>{/if}
+      {#if dirty}<button class="gp-btn" onclick={reloadSaved} disabled={busy}>Discard changes</button><span class="self-center text-warn">Unsaved policy · inspect and run after saving</span>{/if}
     </div>
     {#if inventory}
-      <div class="space-y-2 rounded-xl border border-border p-3">
+      <div class="gp-card space-y-2 p-3">
         <strong>{inventory.repositories} repositories · {inventory.candidates.length} output candidates · {inventory.visited_entries.toLocaleString()} entries inspected</strong>
-        {#if coverage}<p class="text-amber-300">{coverage}</p>{/if}
-        {#each inventory.issues as issue}<p class="text-amber-300 break-all">{issue}</p>{/each}
-        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 border-b border-border/40 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted">{row.provider}</p></div><span class="shrink-0">{humanBytes(row.bytes)}</span></div>{/each}</div>
+        {#if coverage}<p class="gp-notice" data-tone="warn">{coverage}</p>{/if}
+        {#each inventory.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}
+        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted">{row.provider}</p></div><span class="shrink-0">{humanBytes(row.bytes)}</span></div>{/each}</div>
         <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
-        <button class="gp-btn-primary" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
+        <button class="gp-btn" data-variant="danger" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
       </div>
     {/if}
     {#if cleaner.history.length}
       <details open><summary class="font-semibold cursor-pointer">Recent cleanup runs ({cleaner.history.length})</summary>
-        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="rounded border border-border p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {run.items.length} targets reported</p>{#each run.issues as issue}<p class="text-amber-300 break-all">{issue}</p>{/each}{#each run.items as item}<div class="border-t border-border/40 pt-1"><p class="font-mono break-all">{item.repo_path}/{item.path} · {item.status}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
+        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {run.items.length} targets reported</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {item.status}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
       </details>
     {/if}
     <details><summary class="cursor-pointer">DevCouncil agent hygiene rules</summary><p class="mt-2 whitespace-pre-wrap text-textMuted">{cleaner.agent_rules}</p></details>
   {:else if refreshError}
-    <div class="flex items-center gap-3"><p class="text-textMuted">Could not read the cleanup policy.</p><button class="gp-btn" onclick={refresh}><RefreshCw size={12} />Retry</button></div>
+    <div class="flex items-center gap-3"><p class="text-textMuted">Couldn't read the cleanup policy.</p><button class="gp-btn" data-size="sm" onclick={refresh}><RefreshCw size={12} />Try again</button></div>
   {:else}<p class="text-textMuted">Loading saved cleanup policy…</p>{/if}
 </section>

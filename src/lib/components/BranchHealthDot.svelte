@@ -14,10 +14,10 @@
   const health = $derived(branchHealth(branch, now));
 
   const TONE: Record<BranchHealthLevel, string> = {
-    healthy: "bg-emerald-500/70",
-    info: "bg-sky-500/70",
-    warn: "bg-amber-500",
-    attention: "bg-rose-500",
+    healthy: "bg-ok/70",
+    info: "bg-info/70",
+    warn: "bg-warn",
+    attention: "bg-danger",
   };
 </script>
 

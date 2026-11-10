@@ -62,15 +62,15 @@ describe("deadbranch frontend helpers", () => {
   it("assigns appropriate severity badges", () => {
     const fresh = severityBadge("fresh");
     expect(fresh.label).toBe("Fresh");
-    expect(fresh.textClass).toContain("text-emerald");
+    expect(fresh.textClass).toContain("text-ok");
 
     const moderate = severityBadge("moderate");
     expect(moderate.label).toBe("Moderate");
-    expect(moderate.textClass).toContain("text-amber");
+    expect(moderate.textClass).toContain("text-warn");
 
     const stale = severityBadge("stale");
     expect(stale.label).toBe("Stale");
-    expect(stale.textClass).toContain("text-rose");
+    expect(stale.textClass).toContain("text-danger");
   });
 
   it("formats backup timestamps into human readable string", () => {

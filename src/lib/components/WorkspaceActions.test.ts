@@ -83,7 +83,7 @@ describe("the work-in-progress roll-up panel", () => {
     // The panel grows with the sweep report, so a full-width Close at the
     // bottom was the first thing to scroll out of reach.
     expect(source).toContain('aria-label="Close workspace status"');
-    expect(source).toContain("border-rose-500/30 bg-rose-500/10");
+    expect(source).toMatch(/class="gp-icon-btn shrink-0"\s+data-size="sm"\s+data-tone="danger"\s+onclick=\{\(\) => \(detailsOpen = false\)\}/);
     expect(source).toContain('title="Close (Esc)"');
     // Replaced, not accumulated: the old bottom button is gone.
     expect(source).not.toContain('class="gp-btn mt-2 py-1! px-2! text-[11px]! w-full"');

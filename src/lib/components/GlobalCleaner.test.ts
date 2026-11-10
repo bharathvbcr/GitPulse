@@ -36,15 +36,15 @@ describe("GlobalCleaner status read failures", () => {
     expect(source).toContain('{#if refreshError}<p role="alert"');
   });
 
-  it("offers Retry instead of Loading forever when the first read failed", () => {
+  it("offers Try again instead of Loading forever when the first read failed", () => {
     const at = source.indexOf("{:else if refreshError}");
     expect(at).toBeGreaterThan(-1);
     const loading = source.indexOf("Loading saved cleanup policy…");
     expect(loading).toBeGreaterThan(at);
     const failed = source.slice(at, loading);
-    expect(failed).toContain("Could not read the cleanup policy.");
+    expect(failed).toContain("Couldn't read the cleanup policy.");
     expect(failed).toContain("onclick={refresh}");
-    expect(failed).toContain("Retry");
+    expect(failed).toContain("Try again");
   });
 
   it("formats every rejection with formatError, never String(e)", () => {

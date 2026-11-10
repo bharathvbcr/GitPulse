@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
-  import { explainError, getRepository } from "../workbench/client";
+  import { getRepository } from "../workbench/client";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { priorityLabel } from "../workbench/taskOrganize";
   import { beginWave, currentWave, resumeActiveWave } from "../workbench/waveHost";
   import { DEFAULT_WAVES, DEFAULT_WAVE_SIZE, MAX_WAVES, MAX_WAVE_SIZE, clampWaveSize, clampWaves, type MemberPhase, type WaveRecord, type WaveRunner } from "../workbench/waveLaunch";
@@ -33,16 +34,22 @@
   let stopPoll: (() => void) | null = null;
   let disposed = false;
 
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
   const running = $derived(record?.state === "running");
   /** The wave on screen belongs to another repository than the board being looked at. */
   const foreign = $derived(record !== null && record.repositoryId !== repositoryId);
   const nameOf = (id: string | null) => (id ? names[id] ?? id : "no repository");
   const LABELS: Record<MemberPhase, string> = {
-    launching: "Launching", running: "Agent working", verifying: "Verifying", ready: "Verified, waiting to merge",
+    launching: "Starting", running: "Agent working", verifying: "Verifying", ready: "Verified, waiting to merge",
     merging: "Merging", verifying_merge: "Verifying the merge", merged: "Merged", held: "Held for review", stopped: "Stopped",
   };
   const STATES: Record<WaveRecord["state"], string> = {
-    running: "Running", done: "Finished", cancelled: "Stopped", halted: "Halted after a failed re-verify", failed: "Stopped: its state could not be kept", refused: "Refused to launch from a partial ranking",
+    running: "Running", done: "Finished", cancelled: "Stopped", halted: "Halted after a failed re-verify", failed: "Stopped: its state could not be kept", refused: "Refused to start from a partial ranking",
   };
 
   function watch(next: WaveRunner) {
@@ -76,7 +83,7 @@
       if (disposed) return;
       partial = !found.complete;
       if (found.runner) watch(found.runner);
-    } catch (cause) { if (!disposed) error = `A wave left running could not be resumed: ${explainError(cause)}`; }
+    } catch (cause) { if (!disposed) error = failure("resume", "a wave left running", cause); }
   });
   onDestroy(() => { disposed = true; stopPoll?.(); });
 
@@ -84,7 +91,7 @@
     if (!repositoryId || busy || running) return;
     busy = true; error = "";
     try { watch(await beginWave({ repositoryId, n: clampWaveSize(size), waves: clampWaves(waves), acceptUnchecked, ...(maxPriority === "all" ? {} : { maxPriority }) })); }
-    catch (cause) { if (!disposed) error = explainError(cause); }
+    catch (cause) { if (!disposed) error = failure("start", "the wave", cause); }
     finally { if (!disposed) busy = false; }
   }
   async function stop() {
@@ -95,12 +102,12 @@
     const watching = runner;
     const stopFollow = createAdaptiveTimer(() => { if (!disposed && runner === watching) record = watching.record(); }, 250);
     try { await settling; if (!disposed && runner) record = runner.record(); }
-    catch (cause) { if (!disposed) error = explainError(cause); }
+    catch (cause) { if (!disposed) error = failure("stop", "the wave", cause); }
     finally { stopFollow(); if (!disposed) { busy = false; stopping = false; } }
   }
 </script>
 
-<section class="wave" data-testid="wave-panel" aria-label="Run the board in waves">
+<section class="wave gp-card" data-testid="wave-panel" aria-label="Run the board in waves">
   <div class="head">
     <h2>Run in waves <span class="repo" data-testid="wave-repo">{repositoryId ? `in ${nameOf(repositoryId)}` : "(choose a repository)"}</span></h2>
     <label>Tasks per wave
@@ -113,9 +120,9 @@
       <input type="checkbox" bind:checked={acceptUnchecked} disabled={running || busy} data-testid="wave-accept-unchecked" /> Allow unchecked ranking
     </label>
     {#if running}
-      <button type="button" class="gp-btn" onclick={() => void stop()} disabled={busy} data-testid="wave-stop">Stop</button>
+      <button type="button" class="gp-btn" data-size="sm" onclick={() => void stop()} disabled={busy} data-testid="wave-stop">Stop</button>
     {:else}
-      <button type="button" class="gp-btn-primary" onclick={() => void start()} disabled={busy || !repositoryId} title={repositoryId ? "Launch the top suggested tasks, verify, merge the passing ones, then the next." : "Choose a repository board: a wave launches in one repository."} data-testid="wave-start">{busy ? "Starting…" : "Start"}</button>
+      <button type="button" class="gp-btn" data-variant="primary" data-size="sm" onclick={() => void start()} disabled={busy || !repositoryId} title={repositoryId ? "Run the top suggested tasks, verify, merge the passing ones, then the next." : "Choose a repository board: a wave runs in one repository."} data-testid="wave-start">{busy ? "Starting…" : "Start"}</button>
     {/if}
   </div>
   <p class="note" data-testid="wave-priority">Asks for {maxPriority === "all" ? "tasks of any priority" : `tasks at priority ${priorityLabel(maxPriority)} or higher`}, as Suggest next does.</p>
@@ -139,9 +146,9 @@
 </section>
 
 <style>
-  .wave{margin:8px 14px 0;padding:10px 12px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px}
+  .wave{margin:8px 14px 0;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
   .head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  h2{font-size:12px;font-weight:650;margin:0;flex:1}
+  h2{font-size:12px;font-weight:600;margin:0;flex:1}
   label{font-size:11px;display:flex;align-items:center;gap:6px}
   input{width:52px}
   input[type="checkbox"]{width:auto}
@@ -149,8 +156,8 @@
   .note{font-size:11px;margin:0;color:rgb(var(--c-text-muted))}
   .members{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
   .members li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:12px}
-  .title{font-weight:550;overflow-wrap:anywhere}
+  .title{font-weight:500;overflow-wrap:anywhere}
   .phase{font-size:10px;padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent)}
-  li[data-phase="held"] .phase{background:rgb(209 90 100 / .16);color:#d15a64}
+  li[data-phase="held"] .phase{background:rgb(var(--c-danger) / .16);color:rgb(var(--c-danger))}
   .detail{font-size:11px;color:rgb(var(--c-text-muted));overflow-wrap:anywhere}
 </style>

@@ -10,7 +10,8 @@
    * looked makes gh refuse instead of merging what was never shown.
    */
   import { invoke } from "../../ipc/invoke";
-  import { formatError } from "../../ui/formatError";
+  import { describeFailure } from "../../ui/copy/describeFailure";
+  import Skeleton from "../Skeleton.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { verdictLabel } from "../../stores/harnessStore";
   import {
@@ -62,6 +63,12 @@
   let deleteBranch = $state(false);
   let inflight: AsyncGuard | null = null;
 
+  /** "Couldn't <verb> <object>. <Reason>" for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
   $effect(() => {
     onBusyChange?.(busy);
     return () => onBusyChange?.(false);
@@ -76,7 +83,7 @@
       const next = await invoke<PullRequestDetail>("cmd_github_pr_view", { repoPath, number });
       if (guard.isLive()) detail = next;
     } catch (error) {
-      if (guard.isLive()) loadError = formatError(error);
+      if (guard.isLive()) loadError = failure("load", `#${number}`, error);
     }
   }
 
@@ -101,7 +108,9 @@
       // effect's teardown then cancels this read, so it is not wasted work.
       await load();
     } catch (error) {
-      actionError = formatError(error);
+      actionError = action.kind === "merge"
+        ? failure("merge", `#${number}`, error)
+        : failure("submit", "the review", error);
     } finally {
       busy = false;
     }
@@ -115,7 +124,7 @@
       const result = await checkoutPullRequestInPlace(repoPath, number);
       onCheckedOut(withVerdict(result.output || `Checked out pull request #${number} in place.`, result.policy));
     } catch (error) {
-      actionError = formatError(error);
+      actionError = failure("check out", `#${number}`, error);
     } finally {
       busy = false;
     }
@@ -129,7 +138,7 @@
       const result = await openPullRequestWorktree(repoPath, number);
       (onWorktreeOpened ?? onChanged)(withVerdict(describePrWorktree(result.output), result.policy));
     } catch (error) {
-      actionError = formatError(error);
+      actionError = failure("open", `#${number} in a worktree`, error);
     } finally {
       busy = false;
     }
@@ -148,28 +157,28 @@
   }
 </script>
 
-<div data-pr-detail={number} class="mt-2 p-3 rounded-xl border border-border/60 bg-background/60 text-xs space-y-3">
+<div data-pr-detail={number} class="mt-2 p-3 rounded-xl border border-edge bg-background/60 text-xs space-y-3">
   {#if loadError}
-    <div class="flex flex-wrap items-center gap-2 text-rose-400" role="alert">
-      <span>Could not load #{number}: {loadError}</span>
-      <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => void load()}>Retry</button>
+    <div class="gp-notice" data-tone="danger" role="alert">
+      <span class="min-w-0 flex-1">{loadError}</span>
+      <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => void load()}>Try again</button>
     </div>
   {:else if !detail}
-    <div class="text-textMuted">Loading #{number}…</div>
+    <Skeleton variant="text" count={2} />
   {:else}
-    <div class="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-textMuted font-mono">
+    <div class="flex flex-wrap gap-x-3 gap-y-1 text-meta text-textMuted font-mono">
       <span>by {detail.author || "unknown"}</span>
       <span>{detail.head_ref} → {detail.base_ref} @ {shortHash(detail.head_oid)}</span>
-      <span><span class="text-emerald-500">+{detail.additions}</span> <span class="text-rose-400">−{detail.deletions}</span> in {detail.changed_files} files</span>
+      <span><span class="text-ok">+{detail.additions}</span> <span class="text-danger">−{detail.deletions}</span> in {detail.changed_files} files</span>
       <span>CI {detail.ci_status}</span>
       <span>{detail.mergeable.toLowerCase()} · {detail.merge_state.toLowerCase()}</span>
       {#if detail.review_decision}<span>{detail.review_decision.toLowerCase().replace("_", " ")}</span>{/if}
-      {#if !open}<span class="gp-pill">{detail.state.toLowerCase()}</span>{/if}
+      {#if !open}<span class="gp-chip" data-tone="neutral">{detail.state.toLowerCase()}</span>{/if}
     </div>
     {#if detail.body.trim()}
       <div class="max-h-48 overflow-auto whitespace-pre-wrap text-textPrimary/90 font-sans leading-relaxed">{detail.body}</div>
       {#if detail.body_truncated}
-        <div class="text-[11px] text-amber-600 dark:text-amber-400">The description is longer than shown here; open it on GitHub for the rest.</div>
+        <div class="text-meta text-warn">The description is longer than shown here; open it on GitHub for the rest.</div>
       {/if}
     {:else}
       <div class="text-textMuted italic">No description.</div>
@@ -178,13 +187,15 @@
     <div class="flex flex-wrap gap-1.5">
       <button
         type="button"
-        class="gp-btn py-1! px-2.5! text-[11px]!"
+        class="gp-btn"
+        data-size="sm"
         disabled={busy || locked}
         onclick={() => void openInWorktree()}
       >Open in new worktree</button>
       <button
         type="button"
-        class="gp-btn py-1! px-2.5! text-[11px]!"
+        class="gp-btn"
+        data-size="sm"
         disabled={busy || locked}
         onclick={() => void checkoutInPlace()}
       >Checkout in place</button>
@@ -200,27 +211,29 @@
           disabled={busy || locked}
         ></textarea>
         <div class="flex flex-wrap gap-1.5">
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked} onclick={() => review("approve")}>Approve…</button>
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("comment")}>Comment…</button>
-          <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("request_changes")}>Request changes…</button>
+          <button type="button" class="gp-btn" data-size="sm" disabled={busy || locked} onclick={() => review("approve")}>Approve…</button>
+          <button type="button" class="gp-btn" data-size="sm" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("comment")}>Comment…</button>
+          <button type="button" class="gp-btn" data-size="sm" disabled={busy || locked || !reviewBody.trim()} onclick={() => review("request_changes")}>Request changes…</button>
         </div>
       </div>
-      <div class="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">
-        <label class="flex items-center gap-1.5 text-[11px] text-textMuted">
+      <div class="flex flex-wrap items-center gap-2 pt-3">
+        <label class="flex items-center gap-1.5 text-meta text-textMuted">
           Merge as
-          <select class="gp-field py-0.5! text-[11px]!" bind:value={mergeMethod} disabled={busy || locked} aria-label="Merge method for #{number}">
+          <select class="gp-select" bind:value={mergeMethod} disabled={busy || locked} aria-label="Merge method for #{number}">
             <option value="squash">squash</option>
             <option value="merge">merge commit</option>
             <option value="rebase">rebase</option>
           </select>
         </label>
-        <label class="flex items-center gap-1.5 text-[11px] text-textMuted">
-          <input type="checkbox" bind:checked={deleteBranch} disabled={busy || locked} />
+        <label class="flex items-center gap-1.5 text-meta text-textMuted">
+          <input type="checkbox" class="gp-check" bind:checked={deleteBranch} disabled={busy || locked} />
           delete branch
         </label>
         <button
           type="button"
-          class="gp-btn py-1! px-2.5! text-[11px]! text-rose-300"
+          class="gp-btn"
+          data-variant="danger"
+          data-size="sm"
           disabled={busy || locked || detail.is_draft}
           title={detail.is_draft ? "A draft cannot be merged" : `Merge, pinned to ${shortHash(detail.head_oid)}`}
           onclick={merge}
@@ -228,5 +241,5 @@
       </div>
     {/if}
   {/if}
-  {#if actionError}<div class="text-rose-400" role="alert">{actionError}</div>{/if}
+  {#if actionError}<div class="gp-notice" data-tone="danger" role="alert">{actionError}</div>{/if}
 </div>

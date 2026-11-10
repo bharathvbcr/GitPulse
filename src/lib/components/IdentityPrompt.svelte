@@ -74,9 +74,9 @@
   }
 </script>
 
-<form class="rounded-lg border border-border/60 bg-background p-2.5 space-y-2 text-[11px]" onsubmit={(event) => { event.preventDefault(); void save(); }}>
+<form class="rounded-lg border border-edge bg-background p-2.5 space-y-2 text-meta" onsubmit={(event) => { event.preventDefault(); void save(); }}>
   <p class="flex items-center gap-1.5 font-medium text-textPrimary"><UserRound size={12} /> Who should commits be recorded as?</p>
-  <p class="text-[10px] text-textMuted">Git needs a name and an email for every commit. Nothing was committed yet.</p>
+  <p class="text-micro text-textMuted">Git needs a name and an email for every commit. Nothing was committed yet.</p>
   <label class="block"><span class="sr-only">Name</span>
     <input class="gp-field w-full" placeholder="Your name" autocomplete="name" bind:this={nameEl} bind:value={name} disabled={saving} />
   </label>
@@ -88,8 +88,8 @@
     <label class="inline-flex items-center gap-1.5"><input type="radio" name="identity-scope" value="global" bind:group={scope} />Every repository (global)</label>
     <label class="inline-flex items-center gap-1.5"><input type="radio" name="identity-scope" value="repo" bind:group={scope} />This repository only</label>
   </fieldset>
-  {#if error}<p role="alert" class="text-rose-400 whitespace-pre-wrap">{error}</p>
-  {:else if problem && (name || email)}<p class="text-[10px] text-amber-400">{problem}</p>{/if}
+  {#if error}<p role="alert" class="text-danger whitespace-pre-wrap">{error}</p>
+  {:else if problem && (name || email)}<p class="text-micro text-warn">{problem}</p>{/if}
   <div class="flex justify-end gap-2">
     <button type="button" class="gp-btn" disabled={saving} onclick={onDismiss}>Not now</button>
     <button type="submit" class="gp-btn-primary" disabled={saving || !!problem}>{saving ? "Saving…" : "Save and commit"}</button>

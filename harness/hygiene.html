@@ -163,8 +163,8 @@
     check("unsupported background registration cannot be enabled", root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').disabled);
     check("global inspections require saved roots",button("Inspect saved roots").disabled);
     check("global scheduling explains its app lifetime",root.textContent.includes("while GitPulse is open"));
-    button("Add project root").click();await settle();
-    check("folder picker adds a root",root.querySelector('[aria-label="Project roots"]').value==="/fixture/code");
+    button("Add repository root").click();await settle();
+    check("folder picker adds a root",root.querySelector('[aria-label="Repository roots"]').value==="/fixture/code");
     const exclusions=root.querySelector('[aria-label="Excluded directories"]');exclusions.value="/fixture/code/important";exclusions.dispatchEvent(new Event("input",{bubbles:true}));
     root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
     check("edited policy cannot be inspected before saving",button("Inspect saved roots").disabled);
@@ -200,10 +200,10 @@
     check("portable agent guidance is visible",root.textContent.includes("Agents must not enable or widen"));
     root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();button("Save cleanup policy").click();await settle();take("cmd_cleaner_save").reject("Settings changed in another window; reload before saving");await settle();
     check("stale policy save does not erase the draft",root.textContent.includes("another window")&&!button("Save cleanup policy").disabled);
-    button("Discard changes and reload").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),config:{...globalState.config,revision:2}});await settle();
+    button("Discard changes").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),config:{...globalState.config,revision:2}});await settle();
     check("stale draft can reload the saved revision",button("Save cleanup policy").disabled&&root.textContent.includes("Unsaved edits were discarded"));
     button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,background_error:"launchd unavailable",config:{...globalState.config,enabled:false,run_when_closed:false,revision:3}});await settle();
-    check("background registration failures disable the schedule visibly",root.textContent.includes("schedule disabled")&&root.textContent.includes("launchd unavailable"));
+    check("background registration failures disable the schedule visibly",root.textContent.includes("the schedule is off")&&root.textContent.includes("launchd unavailable"));
     root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').click();root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
     button("Save cleanup policy").click();await settle();const closedSave=take("cmd_cleaner_save");
     check("closed-app scheduling requires explicit saved consent",closedSave.args.config.run_when_closed===true&&closedSave.args.config.enabled===true);

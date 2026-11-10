@@ -60,7 +60,7 @@ const STATUS_LABELS: Record<string, string> = {
 const CONCLUSION_LABELS: Record<string, string> = {
   success: "Passed",
   failure: "Failed",
-  cancelled: "Cancelled",
+  cancelled: "Canceled",
   timed_out: "Timed out",
   startup_failure: "Startup failed",
   neutral: "Neutral",
@@ -91,18 +91,17 @@ export function runStateLabel(run: Pick<WorkflowRunInfo, "status" | "conclusion"
 }
 
 /**
- * Colour for a run's state, with both shades on every verdict.
+ * Colour for a run's state, as a status role on every verdict.
  *
- * A bare `-400` is tuned for the dark theme and sits near 2:1 against the
- * light theme's near-white card — on exactly the labels a reader opened the
- * panel to check. Kept identical to `rolloutStateClass` so a failed deploy and
- * a failed run are the same red.
+ * `text-ok`, `text-danger` and `text-warn` are defined per theme, so the label
+ * keeps its contrast against the light theme's near-white card as well as the
+ * dark one — on exactly the labels a reader opened the panel to check.
  */
 export function runStateClass(run: Pick<WorkflowRunInfo, "outcome">): string {
   const phase = runPhase(run);
-  if (phase === "settled_ok") return "text-green-700 dark:text-green-400";
-  if (phase === "settled_bad") return "text-red-700 dark:text-red-400";
-  if (phase === "in_flight") return "text-amber-700 dark:text-amber-400";
+  if (phase === "settled_ok") return "text-ok";
+  if (phase === "settled_bad") return "text-danger";
+  if (phase === "in_flight") return "text-warn";
   return "text-textMuted";
 }
 

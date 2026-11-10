@@ -74,17 +74,19 @@
 </script>
 
 {#if trustExtendable}
-  <div class="flex items-start gap-1.5 rounded-2xl bg-amber-500/10 px-2 py-1.5">
-    <AlertTriangle size={11} class="shrink-0 mt-px text-amber-600 dark:text-amber-400" />
+  <div class="gp-notice" data-tone="warn">
+    <AlertTriangle size={11} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
     <div class="min-w-0 flex-1">
-      <p class="text-[10px] leading-snug text-amber-700 dark:text-amber-300">
+      <p class="text-meta leading-snug">
         This repository was approved before GitPulse covered worktrees, so only its main
         checkout can be read. The others are left out of comparisons and collision checks.
       </p>
       <button
         type="button"
         onclick={extendTrust}
-        class="mt-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300 hover:bg-amber-500/15"
+        class="gp-btn mt-1"
+        data-variant="ghost"
+        data-size="sm"
       >Extend trust to every worktree</button>
     </div>
   </div>

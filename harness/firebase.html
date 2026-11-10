@@ -345,6 +345,25 @@
       check("an unchecked listing never claims the backend never deployed",
         () => !text().includes("This backend has never deployed"));
       check("an unchecked listing shows the reason", () => text().includes("not installed"));
+      {
+        // The unchecked notice's Rescan is the panel's own rollout listing, not a new
+        // fetch path: one click is exactly one more cmd_firebase_rollouts.
+        const rescan = [...root().querySelectorAll("button")].find(b => b.textContent.trim() === "Rescan");
+        check("an unchecked listing offers Rescan", () => Boolean(rescan));
+        const before = invoked.filter(c => c.cmd === "cmd_firebase_rollouts").length;
+        rolloutsReply = { policy: null, output: listing() };
+        rescan?.click();
+        await settle();
+        check("Rescan lists the rollouts exactly once through the existing listing",
+          () => invoked.filter(c => c.cmd === "cmd_firebase_rollouts").length === before + 1);
+        check("a Rescan that answers replaces the unchecked notice",
+          () => !text().includes("did not run"));
+        rolloutsReply = { policy: null, output: {
+          ...listing({ rollouts: [] }), available: false, checked: false,
+          error: "Firebase CLI is not installed or not on PATH",
+        } };
+        await runListing();
+      }
 
       rolloutsThrows = "gate refused: scope.unplanned";
       await runListing();

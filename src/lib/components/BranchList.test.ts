@@ -204,8 +204,8 @@ describe("BranchList two-line branch rows", () => {
     // only ever touches content that has already overflowed: the author's
     // ellipsis ends before it and stays crisp, a clipped number still fades.
     expect(line2).toContain("overflow-hidden pr-2.5");
-    expect(source).toContain("mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent)");
-    expect(source).toContain("-webkit-mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent)");
+    expect(source).toContain("mask-image: linear-gradient(to right, black calc(100% - 10px), transparent)");
+    expect(source).toContain("-webkit-mask-image: linear-gradient(to right, black calc(100% - 10px), transparent)");
   });
 
   it("reserves the hover actions' width on line one only, so line two gets the full row", () => {
@@ -228,7 +228,7 @@ describe("BranchList two-line branch rows", () => {
     expect(source).toContain("{@render branchIdentity(branch, leaf, false, false)}");
     expect(source).toContain("{@render branchIdentity(branch, leaf, true, true)}");
     expect(source).toContain("showStale && isStaleBranch(branch.last_commit_timestamp)");
-    expect(source).toContain("stale ? 'text-amber-500/90' : 'text-textMuted/80'");
+    expect(source).toContain("stale ? 'text-warn' : 'text-textMuted'");
   });
 
   it("keeps the separator with the author, which is what clipping removes", () => {

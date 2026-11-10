@@ -195,10 +195,10 @@ if(params.has("check")) {
     check("a stale branch shows its real age, not a chip",
       /mo|y/.test(staleAge.textContent) && !staleRow.textContent.includes("stale"));
     check("the stale age is tinted, and says so where it is read out",
-      staleAge.className.includes("amber") && staleAge.title.endsWith("stale"));
+      staleAge.className.includes("text-warn") && staleAge.title.endsWith("stale"));
     const freshAge = [...lines(navRow)[1].querySelectorAll("span")]
       .find(el => el.title.startsWith("Last commit"));
-    check("a fresh branch's age is not tinted",!freshAge.className.includes("amber"));
+    check("a fresh branch's age is not tinted",!freshAge.className.includes("text-warn"));
 
     // --- two-line worktree rows -----------------------------------------
     // Same defect, same sidebar, same fix — so the same harness. The

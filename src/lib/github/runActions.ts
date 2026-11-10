@@ -66,17 +66,17 @@ export function ciLocalVerdict(report: {
 /**
  * Tailwind class for a local-CI step status pill; unknown stays muted.
  *
- * Both shades, always. A single `-400` is tuned for the dark theme and sits
- * at roughly 2:1 against the light theme's near-white surface — legible
- * enough to look deliberate, not legible enough to read, on exactly the
- * labels a reader is here to check.
+ * Status roles, not palette shades: `text-ok` and `text-danger` are defined
+ * per theme, so the label keeps its contrast on the light theme's near-white
+ * surface as well as the dark one, on exactly the labels a reader is here to
+ * check.
  */
 export function ciStepClass(status: string): string {
   switch (status) {
     case "passed":
-      return "text-green-700 dark:text-green-400";
+      return "text-ok";
     case "failed":
-      return "text-red-700 dark:text-red-400";
+      return "text-danger";
     default:
       return "text-textMuted";
   }

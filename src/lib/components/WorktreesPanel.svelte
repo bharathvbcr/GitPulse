@@ -671,7 +671,7 @@
 </script>
 
 <div>
-  <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
+  <div class="gp-label flex items-center justify-between px-2 mb-1">
     <span class="flex items-center gap-1.5">
       <FolderGit2 size={11} />
       <span>Worktrees ({worktrees.length})</span>
@@ -698,7 +698,7 @@
 
   {#if showAddForm}
     <form
-      class="mx-1 mb-1 p-2.5 rounded-xl border border-border/70 bg-background space-y-1.5 shadow-card"
+      class="gp-card mx-1 mb-1 p-2.5 space-y-1.5"
       onsubmit={(e) => {
         e.preventDefault();
         void create();
@@ -708,54 +708,54 @@
         bind:value={newPath}
         placeholder="/absolute/path for the worktree"
         required
-        class="w-full bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
+        class="gp-field w-full font-mono"
       />
       <div class="flex gap-1.5">
         <input
           bind:value={newBranch}
           placeholder="new branch (optional)"
-          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
+          class="gp-field flex-1 min-w-0 font-mono"
         />
         <input
           bind:value={startPoint}
           placeholder="start point"
-          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
+          class="gp-field flex-1 min-w-0 font-mono"
         />
       </div>
       <input
         bind:value={sparsePathsInput}
         placeholder="sparse paths, comma-separated (optional, e.g. src/auth)"
         aria-label="Sparse checkout paths"
-        class="w-full bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
+        class="gp-field w-full font-mono"
       />
-      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
-        <input type="checkbox" bind:checked={cowCaches} class="rounded border-border text-accent focus:ring-accent" />
+      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
+        <input type="checkbox" bind:checked={cowCaches} class="gp-check" />
         <span>Share build caches (reflink / clonefile)</span>
       </label>
-      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
-        <input type="checkbox" bind:checked={seedDevmap} class="rounded border-border text-accent focus:ring-accent" />
+      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
+        <input type="checkbox" bind:checked={seedDevmap} class="gp-check" />
         <span>Seed DevMap index (copy-on-write clone, then built here)</span>
       </label>
       <label
-        class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none"
-        title="Only GitPulse reads the pointer; the devmap that agents run does not, and builds a full index beside it."
+        class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none"
+        title="Only GitPulse reads the pointer; the DevMap CLI that agents run does not, and builds a full index beside it."
       >
-        <input type="checkbox" bind:checked={zeroCopyDevmap} class="rounded border-border text-accent focus:ring-accent" />
+        <input type="checkbox" bind:checked={zeroCopyDevmap} class="gp-check" />
         <span>Zero-copy DevMap pointer instead (GitPulse only)</span>
       </label>
-      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
         <input
           type="checkbox"
           bind:checked={runHooks}
           onchange={readHooksPreview}
-          class="rounded border-border text-accent focus:ring-accent"
+          class="gp-check"
         />
         <span>Run repository hooks (.gitpulse/hooks)</span>
       </label>
       {#if runHooks}
-        <div class="rounded border border-border/80 p-1.5 text-[9px] text-textMuted" data-testid="worktree-hooks-consent">
+        <div class="rounded-xl bg-surface p-1.5 text-micro text-textMuted" data-testid="worktree-hooks-consent">
           {#if hooksError}
-            <p class="text-rose-400">{hooksError}</p>
+            <p class="text-danger">{hooksError}</p>
           {:else if hooksBusy && !hooksPreview}
             <p>Reading the hooks file…</p>
           {:else if !hooksPreview}
@@ -769,7 +769,7 @@
               <p class="mt-1">Approved. Editing the file asks again.</p>
             {:else}
               <p class="mt-1">Not approved: nothing runs until you approve exactly this text.</p>
-              <button type="button" class="gp-btn-primary px-2! py-0.5! text-[10px]! mt-1" disabled={hooksBusy} onclick={approveHooks}>
+              <button type="button" class="gp-btn mt-1" data-variant="primary" data-size="sm" disabled={hooksBusy} onclick={approveHooks}>
                 Approve these hooks
               </button>
             {/if}
@@ -777,8 +777,8 @@
         </div>
       {/if}
       <div class="flex items-center justify-between">
-        <span class="text-[9px] text-textMuted">No branch name creates a detached checkout.</span>
-        <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary px-2! py-0.5! text-[10px]!">
+        <span class="text-micro text-textMuted">No branch name creates a detached checkout.</span>
+        <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn" data-variant="primary" data-size="sm">
           {isCreating ? "Adding…" : "Add"}
         </button>
       </div>
@@ -786,18 +786,19 @@
   {/if}
 
   {#if error}
-    <div class="text-[10px] text-rose-400 px-2 py-1" title={error}>{error}</div>
+    <div class="gp-notice mx-1 mb-1" data-tone="danger" title={error}>{error}</div>
   {/if}
 
   {#if isLoading && worktrees.length === 0}
-    <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">Loading…</div>
+    <div class="text-meta text-textMuted/60 px-2 py-1 italic">Loading…</div>
   {:else}
     {#if onlyMain && !showAddForm}
-      <div class="mx-1 mb-1 px-2 py-1.5 rounded-xl border border-dashed border-border/70 text-[10px] text-textMuted" data-testid="worktrees-empty">
+      <div class="mx-1 mb-1 px-2 py-1.5 rounded-xl bg-surface/50 text-micro text-textMuted" data-testid="worktrees-empty">
         <p>No linked worktrees yet. A worktree checks out another branch in its own folder, so you can work on two things without stashing.</p>
         <button
           type="button"
-          class="mt-1 inline-flex items-center gap-1 text-accent hover:underline"
+          class="gp-btn mt-1"
+          data-size="sm"
           onclick={() => (showAddForm = true)}
         >
           <Plus size={10} /> Create worktree
@@ -830,7 +831,7 @@
             onclick={() => open(wt)}
             title="{wt.path}\n{wt.branch ?? 'detached'} · {wt.dirty_files === null ? (wt.scan_note ?? 'not scanned') : wt.dirty_files + ' change(s)'}{wt.dirty_files !== null && wt.scan_note ? '\n' + wt.scan_note : ''}"
           >
-            <span class="truncate text-[11px] font-medium text-textPrimary">{wt.name}</span>
+            <span class="truncate text-meta font-medium text-textPrimary">{wt.name}</span>
             <!-- Glyphs only, never text: the two marks small enough to share
                  line one without taking back what the name just gained. -->
             <span class="ml-auto flex items-center gap-1 shrink-0">
@@ -838,7 +839,7 @@
                 <Lock size={10} class="text-textMuted" />
               {/if}
               {#if wt.is_prunable}
-                <AlertTriangle size={10} class="text-amber-400" />
+                <AlertTriangle size={10} class="text-warn" />
               {/if}
             </span>
           </button>
@@ -865,7 +866,7 @@
                 disabled={mergingPath === wt.path}
                 title={mergingPath === wt.path ? "Merging…" : "Merge into the default branch and remove this worktree"}
                 aria-label="Merge {wt.name} into the default branch and remove it"
-                class="p-0.5 rounded-full {mergingPath === wt.path ? 'opacity-50 cursor-not-allowed' : mergeConfirmPath === wt.path ? 'text-amber-400' : 'hover:bg-surfaceHover hover:text-accent'}"
+                class="p-0.5 rounded-full {mergingPath === wt.path ? 'opacity-50 cursor-not-allowed' : mergeConfirmPath === wt.path ? 'text-warn' : 'hover:bg-surfaceHover hover:text-accent'}"
               >
                 <GitMerge size={11} class={mergingPath === wt.path ? "animate-spin" : ""} />
               </button>
@@ -893,7 +894,7 @@
                 onclick={() => void remove(wt)}
                 title={removeArmTitle(wt)}
                 aria-label={removeArmTitle(wt)}
-                class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
+                class="p-0.5 rounded-full {removingPath === wt.path ? 'text-danger' : 'hover:text-danger'}"
               >
                 <Trash2 size={11} />
               </button>
@@ -923,7 +924,7 @@
          <div class="flex items-center gap-1 min-w-0 leading-none">
           <span
             class="flex-1 min-w-0 flex items-center gap-1 overflow-hidden"
-            style="mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent);"
+            style="mask-image: linear-gradient(to right, rgb(var(--c-text)) calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, rgb(var(--c-text)) calc(100% - 14px), transparent);"
           >
             {#if isAgentWorktree(wt.path)}
               {@const kind = agentKind(wt.path)}
@@ -934,23 +935,27 @@
                      what its agent is doing, and the way back to it. -->
                 <button
                   type="button"
-                  class="shrink-0 min-w-0 max-w-[60%] truncate text-[9px] rounded-full bg-accent/10 px-1 text-accent hover:bg-accent/20"
+                  class="gp-chip shrink-0 min-w-0 max-w-[60%] cursor-pointer hover:bg-accent/20"
+                  data-tone="accent"
+                  data-kind="count"
                   data-testid="worktree-task"
                   title="Open the task this worktree's agent is working on: {lane.task_title} ({runStateLabel(lane.state)})"
                   onclick={() => void showLaneTask(lane)}
                 >{lane.task_title || "Task"} · {runStateLabel(lane.state)}</button>
               {:else}
                 <span
-                  class="shrink-0 text-[9px] rounded-full bg-accent/10 px-1 text-accent"
+                  class="gp-chip shrink-0"
+                  data-tone="accent"
+                  data-kind="count"
                   title="{isGitPulseLane(kind) ? 'GitPulse task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{isGitPulseLane(kind) ? ' — no agent is running in it' : ''}{slug ? `: ${slug}` : ''}"
                 >{agentKindLabel(kind)}</span>
               {/if}
             {/if}
             {#if wt.is_bare}
-              <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>
+              <span class="gp-chip shrink-0" data-tone="neutral" data-kind="count">bare</span>
             {/if}
             <span
-              class="truncate text-[10px] font-mono text-textMuted"
+              class="truncate text-micro font-mono text-textMuted"
             >{wt.branch ?? (wt.is_detached ? wt.head.slice(0, 7) : "")}</span>
           </span>
           {#if removingPath === wt.path}
@@ -968,7 +973,7 @@
               row's edge. `harness/branches.html` measures that, because line
               two must not be what finally breaks it.
             -->
-            <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
+            <span class="shrink-0 text-micro font-semibold text-danger whitespace-nowrap">
               {typeof wt.dirty_files === "number" && wt.dirty_files > 0
               ? `Discard ${wt.dirty_files} changed files?`
               : wt.dirty_files === null
@@ -976,7 +981,7 @@
                 : "Remove?"}
             </span>
           {:else if (wt.dirty_files ?? 0) > 0}
-            <button type="button" class="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400 hover:bg-amber-500/10"
+            <button type="button" class="shrink-0 rounded-full px-1.5 py-0.5 text-micro text-warn hover:bg-warn/15"
               title="Preview {wt.dirty_files} uncommitted changes in {wt.path}"
               onclick={() => void repoStore.previewUncommitted(wt.path)}>{wt.dirty_files} changed</button>
           {/if}
@@ -990,12 +995,14 @@
                   type="button"
                   onclick={() => void openRoute(wt, route.url)}
                   title="Open {route.url} in browser ({route.is_portless ? 'Portless: ' + route.hostname : 'Localhost'})"
-                  class="shrink-0 inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-px text-[9px] font-mono text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25 transition-colors"
+                  class="gp-chip shrink-0 cursor-pointer font-mono hover:bg-ok/25"
+                  data-tone="ok"
+                  data-kind="count"
                 >
                   <Globe size={9} />
                   <span>:{route.port}</span>
                   {#if route.is_portless}
-                    <span class="text-[8px] opacity-75">portless</span>
+                    <span class="text-micro opacity-75">portless</span>
                   {/if}
                 </button>
               {/each}
@@ -1004,36 +1011,36 @@
 
           <!-- High-density status board metrics: HEAD± uncommitted diff & base↕ divergence -->
           {#if wt.diff_stat || wt.main_divergence}
-            <div class="flex items-center gap-2 text-[9px] font-mono text-textMuted pt-0.5 min-w-0">
+            <div class="flex items-center gap-2 text-micro font-mono text-textMuted pt-0.5 min-w-0">
               {#if wt.diff_stat && (wt.diff_stat.insertions > 0 || wt.diff_stat.deletions > 0)}
                 <span title="HEAD± uncommitted changes: +{wt.diff_stat.insertions} -{wt.diff_stat.deletions} ({wt.diff_stat.files_changed} files)">
-                  HEAD± <span class="text-emerald-500 font-semibold">+{wt.diff_stat.insertions}</span> <span class="text-rose-400 font-semibold">-{wt.diff_stat.deletions}</span>
+                  HEAD± <span class="text-ok font-semibold">+{wt.diff_stat.insertions}</span> <span class="text-danger font-semibold">-{wt.diff_stat.deletions}</span>
                 </span>
               {/if}
               {#if wt.main_divergence && (wt.main_divergence.ahead > 0 || wt.main_divergence.behind > 0)}
                 <span title="divergence from the default branch: {wt.main_divergence.ahead} ahead, {wt.main_divergence.behind} behind">
-                  base↕ <span class="text-accent font-semibold">↑{wt.main_divergence.ahead}</span> <span class="text-amber-400 font-semibold">↓{wt.main_divergence.behind}</span>
+                  base↕ <span class="text-accent font-semibold">↑{wt.main_divergence.ahead}</span> <span class="text-warn font-semibold">↓{wt.main_divergence.behind}</span>
                 </span>
               {/if}
             </div>
           {/if}
 
           {#if mergeConfirmPath === wt.path}
-            <div class="text-[9px] font-semibold text-amber-400 pt-0.5" role="status">
+            <div class="text-micro font-semibold text-warn pt-0.5" role="status">
               Merge {wt.branch ?? wt.name} into the default branch and remove this worktree? Press merge again to confirm.
             </div>
-            <label class="flex items-center gap-1 pt-0.5 text-[9px] text-textMuted" title={MERGE_MODES.find((mode) => mode.mode === "squash")?.detail}>
-              <input type="checkbox" bind:checked={mergeSquash} onchange={() => holdMergeConfirm(wt.path)} />
+            <label class="flex items-center gap-1 pt-0.5 text-micro text-textMuted" title={MERGE_MODES.find((mode) => mode.mode === "squash")?.detail}>
+              <input type="checkbox" class="gp-check" bind:checked={mergeSquash} onchange={() => holdMergeConfirm(wt.path)} />
               Squash into one commit
             </label>
           {/if}
 
           {#if aiSummaries[wt.path]}
-            <div class="text-[9px] font-mono text-textMuted bg-surface/80 rounded px-1.5 py-0.5 mt-0.5 truncate" title={aiSummaries[wt.path]}>
+            <div class="text-micro font-mono text-textMuted bg-surface/80 rounded px-1.5 py-0.5 mt-0.5 truncate" title={aiSummaries[wt.path]}>
               ⚡ {aiSummaries[wt.path]}
             </div>
           {:else if loadingSummaries[wt.path]}
-            <div class="text-[9px] text-textMuted/60 italic mt-0.5">Summarizing diff…</div>
+            <div class="text-micro text-textMuted/60 italic mt-0.5">Summarizing diff…</div>
           {/if}
 
           <!--
@@ -1049,16 +1056,16 @@
             <div class="flex items-center gap-1 pl-1 pb-0.5 min-w-0">
               {#if bindingErrors[wt.path]}
                 <!-- Not bound and not unbound: the binding could not be read. -->
-                <span class="text-[9px] text-amber-400 truncate" title={bindingErrors[wt.path]}>task state unavailable</span>
+                <span class="text-micro text-warn truncate" title={bindingErrors[wt.path]}>task state unavailable</span>
               {:else if bound}
                 <span
-                  class="shrink-0 text-[9px] font-mono rounded-full bg-accent/15 text-accent border border-accent/30 px-1.5"
+                  class="gp-chip shrink-0 font-mono" data-tone="accent" data-kind="count"
                   title="Mutations in this worktree are judged against {bound}'s planned files"
                 >{bound}</span>
                 {#if scopes[bound]}
                   {@const sc = scopes[bound]}
                   <span
-                    class="shrink-0 text-[9px] text-textMuted"
+                    class="shrink-0 text-micro text-textMuted"
                     title="Planned: {sc.planned_files.join(', ') || 'nothing'}{sc.agent_appended_files
                       .length
                       ? `\nAgent-appended: ${sc.agent_appended_files.join(', ')}`
@@ -1071,7 +1078,7 @@
                 {/if}
                 {#if lease}
                   <span
-                    class="shrink-0 text-[9px] text-textMuted truncate"
+                    class="shrink-0 text-micro text-textMuted truncate"
                     title="Leased by {lease.owner}{lease.agent ? ` (${lease.agent})` : ''}{lease.expires_at
                       ? `, expires ${lease.expires_at}`
                       : ', no expiry'}"
@@ -1083,16 +1090,18 @@
                     currently holds it, and a task can be bound here while
                     nobody holds it.
                   -->
-                  <span class="shrink-0 text-[9px] text-textMuted">not leased</span>
+                  <span class="shrink-0 text-micro text-textMuted">not leased</span>
                 {/if}
                 <button
                   onclick={() => void unbindTask(wt)}
                   title="Clear this worktree's task binding"
-                  class="ml-auto shrink-0 text-[9px] text-textMuted hover:text-accent opacity-0 group-hover:opacity-100"
+                  class="gp-btn ml-auto shrink-0 opacity-0 group-hover:opacity-100"
+                  data-variant="ghost"
+                  data-size="sm"
                 >unbind</button>
               {:else if taskView.leases.length > 0}
                 <select
-                  class="text-[9px] bg-transparent text-textMuted border border-border/60 rounded-full px-1 py-px hover:text-accent focus:outline-hidden focus:border-accent/60"
+                  class="gp-select"
                   aria-label="Bind {wt.name} to a task"
                   onchange={(e) => {
                     const id = (e.currentTarget as HTMLSelectElement).value;
@@ -1113,7 +1122,7 @@
               The store reports its own error; a read that threw has no store
               answer at all, which is the same "we do not know".
             -->
-            <div class="pl-1 pb-0.5 text-[9px] text-amber-400 truncate" title={taskView?.error ?? taskStateError ?? ""}>
+            <div class="pl-1 pb-0.5 text-micro text-warn truncate" title={taskView?.error ?? taskStateError ?? ""}>
               task state unavailable
             </div>
           {/if}

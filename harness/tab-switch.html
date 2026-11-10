@@ -399,7 +399,7 @@
             text(sidebar()).includes("beta.md") && !text(sidebar()).includes("alpha"));
           check("branches: filter text is cleared", () => branchFilter().value === "");
           check("branches: the Local chip is no longer selected, All is", () =>
-            chip("All").className.includes("bg-accent/15") && !chip("Local").className.includes("bg-accent/15"));
+            chip("All").getAttribute("aria-pressed") === "true" && chip("Local").getAttribute("aria-pressed") === "false");
           check("branches: the half-typed new branch and its form are gone", () => !createInput());
           check("branches: the context menu opened on alpha's branch is gone", () => !contextMenu());
           check("branches: lists beta's branches and none of alpha's", () =>

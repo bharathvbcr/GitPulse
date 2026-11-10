@@ -54,7 +54,8 @@
       <button
         type="button"
         onclick={() => repoStore.setViewSection("work", "resolve")}
-        class="ml-auto shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors"
+        class="gp-chip ml-auto shrink-0 cursor-pointer"
+        data-tone="danger"
         title="{conflictedCount} file{conflictedCount === 1 ? '' : 's'} still carry conflict markers"
       >
         {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}

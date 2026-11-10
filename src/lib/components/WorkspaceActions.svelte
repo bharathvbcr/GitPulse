@@ -154,7 +154,8 @@
   <div class="flex items-center gap-1">
     <button
       type="button"
-      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5"
+      class="gp-btn"
+      data-size="sm"
       disabled={running !== null}
       onclick={() => void run("fetch")}
       title="Fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
@@ -176,7 +177,8 @@
     {#if running && cancelToken}
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn"
+        data-size="sm"
         onclick={() => {
           if (cancelToken) cancelToken.aborted = true;
         }}
@@ -189,19 +191,20 @@
     <button
       type="button"
       data-workspace-wip-trigger
-      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5 {wip.allClear
-        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? 'border-accent/50! bg-surfaceHover! text-textPrimary!' : ''}`
-        : `border-amber-500/50! bg-amber-500/20! text-amber-700 hover:bg-amber-500/30! hover:border-amber-500/70! dark:text-amber-300 dark:bg-amber-500/25! dark:hover:bg-amber-500/35! ${detailsOpen ? 'border-amber-500/70! bg-amber-500/30! dark:bg-amber-500/40! ring-1 ring-amber-500/40' : ''}`}"
+      class="gp-btn {wip.allClear
+        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? 'bg-surfaceHover! text-textPrimary!' : ''}`
+        : `bg-warn/15! text-warn hover:bg-warn/25! ${detailsOpen ? 'bg-warn/25!' : ''}`}"
+      data-size="sm"
       onclick={() => (detailsOpen = !detailsOpen)}
       title={describeWorkspace(wip)}
       aria-haspopup="dialog"
       aria-expanded={detailsOpen}
     >
       {#if wip.allClear}
-        <CircleCheck size={11} class="text-emerald-600 dark:text-emerald-400" />
+        <CircleCheck size={11} class="text-ok" />
         <span>All clean</span>
       {:else}
-        <AlertTriangle size={11} class="shrink-0 text-amber-600 dark:text-amber-400" />
+        <AlertTriangle size={11} class="shrink-0 text-warn" />
         <span>{wip.repos.length} with work</span>
       {/if}
     </button>
@@ -211,7 +214,7 @@
         use:portal
         use:popover={dismissal}
         data-workspace-wip
-        class="fixed right-3 top-20 w-80 gp-pop shadow-float rounded-xl p-3 text-[11px] bg-surface/95 border border-border/80"
+        class="fixed right-3 top-20 w-80 gp-pop shadow-float rounded-xl p-3 text-meta bg-surface/95 border border-edge"
         style="z-index: {LAYERS.MENU}"
         role="dialog"
         aria-label="Workspace status"
@@ -223,7 +226,9 @@
                run long enough to scroll it out of reach. -->
           <button
             type="button"
-            class="shrink-0 inline-flex h-5 w-5 items-center justify-center rounded-full border border-rose-500/30 bg-rose-500/10 text-rose-700 transition-colors hover:bg-rose-500/20 dark:text-rose-300"
+            class="gp-icon-btn shrink-0"
+            data-size="sm"
+            data-tone="danger"
             onclick={() => (detailsOpen = false)}
             title="Close (Esc)"
             aria-label="Close workspace status"
@@ -242,7 +247,7 @@
                      them is a notification, not a control. -->
                 <button
                   type="button"
-                  class="w-full rounded-lg border border-border/50 px-2 py-1.5 text-left transition-colors hover:border-accent/60 hover:bg-surfaceHover"
+                  class="w-full rounded-lg border border-edgeSoft px-2 py-1.5 text-left transition-colors hover:border-edgeStrong hover:bg-surfaceHover"
                   onclick={() => reveal(repo.path)}
                   title="Open {repo.label} — {describeDestination(to.tab, to.section)}"
                 >
@@ -252,7 +257,7 @@
                   </p>
                 </button>
                 {#if repo.severity !== "uncommitted" && repo.reasons.some(reason => reason.kind === "uncommitted")}
-                  <button type="button" class="mt-1 text-amber-600 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {repo.label}"
+                  <button type="button" class="mt-1 text-warn hover:underline" title="Preview uncommitted files in {repo.label}"
                     onclick={() => { void repoStore.previewUncommitted(repo.path); detailsOpen = false; }}>Preview uncommitted changes</button>
                 {/if}
               </li>
@@ -276,9 +281,8 @@
                   title="Open {result.label} — {describeDestination(to.tab, to.section)}"
                 >
                   <span
-                    class="mt-0.5 shrink-0 rounded-full px-1.5 text-[10px] {result.status === 'failed'
-                      ? 'bg-red-500/15 text-red-600 dark:text-red-400'
-                      : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}"
+                    class="gp-chip mt-0.5 shrink-0"
+                    data-tone={result.status === 'failed' ? 'danger' : 'warn'}
                   >
                     {result.status}
                   </span>
