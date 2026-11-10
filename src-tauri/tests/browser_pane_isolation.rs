@@ -33,11 +33,11 @@
 //! 9. **Reload.** A main-page reload closes every pane, through GitPulse's own
 //!    `desktop::handle_page_load`.
 //! 10. **The real commands.** `cmd_browser_*`, registered as `lib.rs` does,
-//!    are called from the main page through Tauri's IPC under GitPulse's own
-//!    capability grants, with a `tab-N` id: open, move, hide, navigate and
-//!    reload work; a remote URL, an unknown step, a bad id, impossible bounds
-//!    and an unknown session are refused with the reason; the page events
-//!    arrive through the event plugin; close is idempotent.
+//!     are called from the main page through Tauri's IPC under GitPulse's own
+//!     capability grants, with a `tab-N` id: open, move, hide, navigate and
+//!     reload work; a remote URL, an unknown step, a bad id, impossible bounds
+//!     and an unknown session are refused with the reason; the page events
+//!     arrive through the event plugin; close is idempotent.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
