@@ -68,7 +68,7 @@ fn spawned(farm: &Farm, marks: &[usize]) -> (usize, usize) {
 }
 
 fn ask(farm: &Farm, memo: &CollisionMemo) -> AppFacets {
-    serve_with(&farm.repo, &Vec::new(), memo, APP_TTL, APP_BUDGET)
+    serve_with(&farm.repo, &Vec::new(), memo, APP_TTL, APP_BUDGET, APP_BUDGET)
 }
 
 #[test]
@@ -148,10 +148,12 @@ fn a_facet_the_app_could_not_read_is_absent_with_its_reason_and_refuses_the_snap
     );
 }
 
-/// Two live sessions in the main checkout, which has uncommitted work, and
-/// nothing contended: the shape of this repository on a busy day.
-fn busy_main(farm: &Farm) -> live_sessions::Observation {
-    std::fs::write(Path::new(&farm.repo).join("scratch.txt"), "wip").expect("dirty main");
+/// Two live sessions in the main checkout, dirty or clean, and nothing
+/// contended: the shape of this repository on a busy day when `dirty`.
+fn busy_main(farm: &Farm, dirty: bool) -> live_sessions::Observation {
+    if dirty {
+        std::fs::write(Path::new(&farm.repo).join("scratch.txt"), "wip").expect("dirty main");
+    }
     let session = |pid: u32| crate::insights::LiveSession {
         kind: "claude".into(),
         pid,
@@ -173,71 +175,144 @@ fn busy_main(farm: &Farm) -> live_sessions::Observation {
     }]
 }
 
-#[test]
-fn a_busy_main_checkout_is_not_a_positive_collision_to_read_again() {
-    let farm = farm(2, false);
-    let observation = busy_main(&farm);
-    let memo = CollisionMemo::new(MEMO_TTL);
-    let first = serve_with(&farm.repo, &observation, &memo, APP_TTL, APP_BUDGET);
-    let risk = first.collisions.as_ref().expect("scanned");
-    assert_eq!(risk.overlapping_files, 0, "nothing is contended: {risk:?}");
-    assert!(
-        risk.shared_worktree_files >= 1,
-        "the shape is two sessions in a dirty main checkout: {risk:?}"
-    );
-
-    let mark = marks(&farm);
-    let again = serve_with(&farm.repo, &observation, &memo, APP_TTL, APP_BUDGET);
-    let (listings, statuses) = spawned(&farm, &mark);
-    eprintln!("handler git children on a busy main checkout, second ask: worktree list {listings}, status {statuses}");
-    assert_eq!(
-        (listings, statuses),
-        (0, 0),
-        "a checkout that only holds two sessions was read again"
-    );
-    assert!(again.age_ms <= APP_TTL.as_millis() as u64 + 500);
+fn ask_observed(
+    farm: &Farm,
+    observation: &live_sessions::Observation,
+    memo: &CollisionMemo,
+) -> AppFacets {
+    serve_with(&farm.repo, observation, memo, APP_TTL, APP_BUDGET, APP_BUDGET)
 }
 
-/// The age an answer can have is the promise: a read or a listing older than
-/// the TTL is read again, one inside it is not.
+/// A shared checkout that the kept read shows dirty is a positive: read again
+/// on the ask, not served from memory. This repository is always this shape.
+#[test]
+fn a_dirty_shared_checkout_is_read_again_on_every_ask() {
+    let farm = farm(2, false);
+    let observation = busy_main(&farm, true);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let first = ask_observed(&farm, &observation, &memo);
+    let risk = first.collisions.as_ref().expect("scanned");
+    assert_eq!(risk.overlapping_files, 0, "nothing is contended: {risk:?}");
+    assert!(risk.shared_worktree_files >= 1, "{risk:?}");
+
+    let mark = marks(&farm);
+    ask_observed(&farm, &observation, &memo);
+    let (listings, statuses) = spawned(&farm, &mark);
+    eprintln!("handler git children, dirty busy main checkout, second ask: worktree list {listings}, status {statuses}");
+    assert_eq!(listings, 0);
+    assert_eq!(statuses, 1, "the dirty shared checkout, and nothing else");
+}
+
+/// A shared checkout whose kept read is clean is not a positive: it costs no
+/// git child on the second ask.
+#[test]
+fn a_clean_shared_checkout_is_not_read_again() {
+    let farm = farm(2, false);
+    let observation = busy_main(&farm, false);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let first = ask_observed(&farm, &observation, &memo);
+    let risk = first.collisions.as_ref().expect("scanned");
+    assert_eq!(risk.shared_worktree_files, 0, "{risk:?}");
+
+    let mark = marks(&farm);
+    ask_observed(&farm, &observation, &memo);
+    let (listings, statuses) = spawned(&farm, &mark);
+    eprintln!("handler git children, clean busy main checkout, second ask: worktree list {listings}, status {statuses}");
+    assert_eq!((listings, statuses), (0, 0));
+}
+
+/// A positive that cannot be read again within the bound comes back not
+/// scanned: never served from the read it was found in, and never read late.
+#[test]
+fn a_dirty_shared_checkout_whose_reread_misses_the_bound_is_not_scanned() {
+    let farm = farm(2, false);
+    let observation = busy_main(&farm, true);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    ask_observed(&farm, &observation, &memo);
+
+    let missed = serve_with(
+        &farm.repo,
+        &observation,
+        &memo,
+        APP_TTL,
+        APP_BUDGET,
+        Duration::ZERO,
+    );
+    let risk = missed.collisions.as_ref().expect("the facet is still there");
+    assert!(risk.unscanned_worktrees >= 1, "{risk:?}");
+    assert!(
+        risk.shared_worktrees
+            .iter()
+            .all(|shared| shared.files.is_empty()),
+        "a positive was served from the kept read: {risk:?}"
+    );
+    let main = missed
+        .worktrees
+        .as_ref()
+        .expect("worktrees")
+        .items
+        .iter()
+        .find(|item| item.is_main)
+        .expect("main row");
+    assert_eq!(main.dirty_files, None, "the kept dirty count was served");
+    assert!(missed.deadline_expired);
+    assert!(
+        snapshot_from_app(&farm.repo, Instant::now(), missed)
+            .unwrap_err()
+            .contains("partial"),
+        "the asker would have believed it"
+    );
+}
+
+/// The age an answer can have is the promise, driven through the `ttl`
+/// argument and not the wall clock: a promise of nothing re-reads everything,
+/// a promise of an hour re-reads nothing.
 #[test]
 fn a_read_older_than_the_promised_age_is_read_again_and_a_younger_one_is_not() {
     let farm = farm(2, false);
-    let ttl = Duration::from_millis(1500);
     let memo = CollisionMemo::new(MEMO_TTL);
-    let serve = || serve_with(&farm.repo, &Vec::new(), &memo, ttl, APP_BUDGET);
-    serve();
+    let serve = |ttl: Duration| {
+        serve_with(&farm.repo, &Vec::new(), &memo, ttl, APP_BUDGET, APP_BUDGET)
+    };
+    serve(Duration::from_secs(3600));
 
     let mark = marks(&farm);
-    let young = serve();
+    let young = serve(Duration::from_secs(3600));
     assert_eq!(spawned(&farm, &mark), (0, 0), "a young read was read again");
-    assert!(young.age_ms < ttl.as_millis() as u64 + 500, "{}", young.age_ms);
+    assert!(young.age_ms < 3_600_000, "{}", young.age_ms);
 
-    std::thread::sleep(ttl + Duration::from_millis(300));
     let mark = marks(&farm);
-    let old = serve();
+    let old = serve(Duration::ZERO);
     let (listings, statuses) = spawned(&farm, &mark);
     assert!(
         listings >= 1 && statuses >= 3,
         "an old answer was served from memory: {listings} listings, {statuses} statuses"
     );
-    assert!(old.age_ms < ttl.as_millis() as u64, "{}", old.age_ms);
+    assert!(old.age_ms < 1_000, "{}", old.age_ms);
 }
 
 /// A hung read cannot hold the handler: past its wait every facet is
 /// answered not scanned, and the number of abandoned readings is bounded.
+/// The readings end when the test releases them, not after a sleep.
 #[test]
 fn a_read_that_cannot_finish_in_time_is_abandoned_and_every_facet_is_not_scanned() {
-    // Its own count: the app's is shared with every test that asks it.
+    use std::sync::atomic::AtomicBool;
+    // Its own counts: the app's is shared with every test that asks it.
     static MINE: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
     let reading = || {
-        std::thread::sleep(Duration::from_millis(900));
+        while !RELEASED.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         unscanned("/r".into(), "stand-in")
     };
-    let started = Instant::now();
-    let gave_up = serve_bounded_in(&MINE, "/r".into(), Duration::from_millis(100), reading)
+    let wait = crate::test_support::coverage_relaxed(Duration::from_millis(100));
+    let gave_up = serve_bounded_in(&MINE, "/r".into(), wait, reading)
         .expect("an abandoned read is still an answer");
-    assert!(started.elapsed() < Duration::from_millis(700), "waited for the read");
+    assert!(
+        !RELEASED.load(Ordering::Acquire),
+        "the handler waited for the read"
+    );
     assert!(gave_up.worktrees.is_none() && gave_up.collisions.is_none());
     assert!(gave_up.deadline_expired);
     assert_eq!(gave_up.not_scanned.len(), 4);
@@ -245,19 +320,21 @@ fn a_read_that_cannot_finish_in_time_is_abandoned_and_every_facet_is_not_scanned
 
     // Past the bound, new asks are refused until the abandoned readings end.
     for _ in 1..MAX_ABANDONED {
-        serve_bounded_in(&MINE, "/r".into(), Duration::from_millis(50), reading).expect("answered");
+        serve_bounded_in(&MINE, "/r".into(), wait, reading).expect("answered");
     }
-    let refused = serve_bounded_in(&MINE, "/r".into(), Duration::from_millis(50), reading);
+    let refused = serve_bounded_in(&MINE, "/r".into(), wait, reading);
     assert!(refused.unwrap_err().contains("still running"));
+    RELEASED.store(true, Ordering::Release);
     let ended = Instant::now();
     while MINE.load(Ordering::Acquire) > 0 {
         assert!(
-            ended.elapsed() < Duration::from_secs(10),
+            ended.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "abandoned reads never ended"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
     }
-    let after = serve_bounded_in(&MINE, "/r".into(), Duration::from_secs(2), || {
+    let patient = crate::test_support::coverage_relaxed(Duration::from_secs(2));
+    let after = serve_bounded_in(&MINE, "/r".into(), patient, || {
         unscanned("/r".into(), "ok")
     });
     assert!(after.is_ok());

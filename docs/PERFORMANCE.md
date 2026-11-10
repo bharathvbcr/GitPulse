@@ -882,9 +882,11 @@ first, for every request** (`validate_repo`), because a listing served from
 memory skips the listing's own check, and every read is of the canonical path it
 returned. **A positive is read again**: every worktree a positive collision
 names as a party (a file dirty in two worktrees) is re-read with a clock that
-began now before the facets are derived. A worktree that merely holds two live
-sessions is not re-read (a busy checkout always has several, which re-read it on
-nearly every ask); its dirty files are served at the stated age. A facet the app
+began now before the facets are derived, and so is a worktree that holds two or
+more live sessions whose kept read shows it dirty. A shared worktree whose kept
+read is clean is not a positive and is not re-read. A positive that cannot be
+re-read inside `APP_BUDGET` is reported not scanned (the facets are derived
+under the re-read's own bound), never served from the kept read. A facet the app
 could not read is `None` with a reason, and the asker also refuses an answer
 with `deadline_expired`, or with any unscanned or failed worktree, or a
 worktree with no dirty count (the app's budget is shorter than the asker's own
@@ -935,10 +937,13 @@ audit's sample): the asker's git children per `gitpulse_insights` call were
 `status` 0, other 0 (1) with a fake app replaying the app's answer
 (`hooks::tests::a_fresh_app_answer_replaces_the_askers_own_scan`; the one left is
 the ledger's address resolution in the asker). The *handler's* git children for
-a second ask of a busy main checkout (two live sessions in a dirty main
-checkout, nothing contended) were `worktree list` 0, `status` 1 before the
-positive rule stopped counting shared checkouts, and 0 and 0 after
-(`insights::app_facets::tests::a_busy_main_checkout_is_not_a_positive_collision_to_read_again`).
+a second ask, for the two shapes of a busy main checkout (two live sessions,
+two sibling worktrees, nothing contended), were: **clean** main checkout
+`worktree list` 0, `status` 0
+(`insights::app_facets::tests::a_clean_shared_checkout_is_not_read_again`);
+**dirty** main checkout `worktree list` 0, `status` 1, the main checkout itself
+(`a_dirty_shared_checkout_is_read_again_on_every_ask`). This repository is
+always the second shape, so its ask costs one status child, not zero.
 The live re-sample needs the app, `gitpulse-mcp` and `gitpulse-hook` rebuilt
 and reinstalled.
 

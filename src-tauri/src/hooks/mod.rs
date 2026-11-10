@@ -6163,19 +6163,19 @@ done
         // Slow: the app answers after the asker's deadline.
         let app = app_for(&farm.repo, false);
         let late = canned.clone();
+        // Both the deadline and how late the app is scale together, so a loaded
+        // host cannot make the app on time or the asker slow.
+        let deadline = crate::test_support::coverage_relaxed(Duration::from_millis(300));
+        let lateness = deadline * 8;
         app._owner.attach_insights(std::sync::Arc::new(move |_| {
-            std::thread::sleep(Duration::from_millis(2500));
+            std::thread::sleep(lateness);
             Ok(late.clone())
         }));
         let started = std::time::Instant::now();
-        let slow = insights_from_app_in(
-            app._profile.path().to_path_buf(),
-            &farm.repo,
-            Duration::from_millis(300),
-        );
+        let slow = insights_from_app_in(app._profile.path().to_path_buf(), &farm.repo, deadline);
         assert!(slow.is_err(), "a late answer was believed");
         assert!(
-            started.elapsed() < Duration::from_millis(2400),
+            started.elapsed() < deadline * 6,
             "the asker waited for the slow app"
         );
 
@@ -6383,13 +6383,14 @@ done
         let app = app_for(&farm.repo, false);
         let asked = Arc::new(AtomicUsize::new(0));
         let counter = asked.clone();
+        let slow = crate::test_support::coverage_relaxed(Duration::from_millis(300));
+        let lateness = slow * 5;
         app._owner.attach_insights(Arc::new(move |_| {
             counter.fetch_add(1, Ordering::AcqRel);
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(lateness);
             Err("too late".into())
         }));
         let dir = app._profile.path().to_path_buf();
-        let slow = Duration::from_millis(300);
         let first = std::time::Instant::now();
         assert!(insights_from_app_in(dir.clone(), &farm.repo, slow).is_err());
         let paid = first.elapsed();

@@ -106,7 +106,8 @@ pub fn serve(repo: &str) -> Result<AppFacets, String> {
         .to_string_lossy()
         .into_owned();
     let reading = canonical.clone();
-    serve_bounded(canonical, HANDLER_DEADLINE, move || {
+    let budget = scaled(APP_BUDGET);
+    serve_bounded(canonical, scaled(HANDLER_DEADLINE), move || {
         // The class the asker's own scan runs in (`gitpulse-mcp` is a
         // background process), so agents' reads do not compete with the UI's.
         with_admission(Admission::Background, || {
@@ -115,10 +116,25 @@ pub fn serve(repo: &str) -> Result<AppFacets, String> {
                 &live_sessions::observe(),
                 shared(),
                 APP_TTL,
-                APP_BUDGET,
+                budget,
+                budget,
             )
         })
     })
+}
+
+/// `bound` as production uses it. Under test a literal sub-second bound that a
+/// cold read of several worktrees must beat fails on a loaded host (a read of
+/// seven worktrees took longer than 1.6 s at load 49), so tests scale it the
+/// way the rest of the suite scales wall-clock limits.
+#[cfg(not(test))]
+fn scaled(bound: Duration) -> Duration {
+    bound
+}
+
+#[cfg(test)]
+fn scaled(bound: Duration) -> Duration {
+    crate::test_support::coverage_relaxed(bound)
 }
 
 const RUNNING: u8 = 0;
@@ -218,6 +234,7 @@ fn serve_with(
     memo: &CollisionMemo,
     ttl: Duration,
     budget: Duration,
+    refresh_budget: Duration,
 ) -> AppFacets {
     let asked = Instant::now();
     // A clock that began `ttl` ago: the status cell then hands over reads that
@@ -255,10 +272,20 @@ fn serve_with(
     let parties = positive_parties(&derived.collisions);
     if !parties.is_empty() {
         if let Ok(list) = &mut read.listed {
-            refresh(list, &parties, &ScanDeadline::after(Instant::now(), budget));
+            let begun = Instant::now();
+            let allowed = refresh_budget.min(clock.remaining());
+            refresh(list, &parties, &ScanDeadline::after(begun, allowed));
+            // The derive that follows may not read past the re-read's own
+            // bound: a positive that could not be read again in time is
+            // reported unread, never read late and never served from the kept
+            // read the re-read replaced.
+            let bound = ScanDeadline::after(
+                clock.started(),
+                begun.saturating_duration_since(clock.started()) + allowed,
+            );
             derived = derive_facets(
                 repo,
-                &clock,
+                &bound,
                 MAX_SNAPSHOT_WORKTREES,
                 observation,
                 &read.listed,
@@ -332,16 +359,23 @@ fn any_unreadable(listed: &Result<Vec<WorktreeInfo>, CommandError>) -> bool {
     })
 }
 
-/// The paths of every worktree a positive collision names as a party: a file
-/// dirty in two worktrees. A worktree that merely holds two live sessions
-/// (`shared_worktrees`) is not a positive of this kind, and a busy checkout
-/// always has several, so naming it here re-read it on nearly every ask. Its
-/// dirty files are served at the age the reply states.
+/// The paths of every worktree a positive names as a party: a file dirty in
+/// two worktrees, or a worktree two or more live sessions share whose kept read
+/// shows it dirty. A shared worktree whose kept read is clean is not a
+/// positive and is not read again (a busy checkout always has several
+/// sessions, so naming it regardless re-read it on every ask for nothing).
 fn positive_parties(collisions: &CollisionRisk) -> Vec<String> {
     let mut parties: Vec<String> = collisions
         .items
         .iter()
         .flat_map(|item| item.worktrees.iter().map(|party| party.path.clone()))
+        .chain(
+            collisions
+                .shared_worktrees
+                .iter()
+                .filter(|shared| shared.scanned && !shared.files.is_empty())
+                .map(|shared| shared.path.clone()),
+        )
         .collect();
     parties.sort_unstable();
     parties.dedup();
