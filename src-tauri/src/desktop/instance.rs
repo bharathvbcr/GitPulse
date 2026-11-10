@@ -489,6 +489,13 @@ fn write_frame(stream: &mut UnixStream, value: &impl Serialize) -> Result<(), St
         .map_err(|error| format!("write: {error}"))
 }
 
+/// Whether an owner's refusal says it is busy (every slot it gives this kind of
+/// request is taken) rather than unable: a busy owner is alive and answering,
+/// so an asker falls back for this call and asks again on the next.
+pub fn is_busy_refusal(reason: &str) -> bool {
+    reason.ends_with(" is busy")
+}
+
 /// Only this user's processes may hand the owner work. The profile directory
 /// is already private to the user; this holds if it is not. A peer whose uid
 /// could not be read is refused.
