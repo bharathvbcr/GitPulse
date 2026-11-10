@@ -429,7 +429,9 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         }
         // Answered on its own connection by the gate attached to the mailbox;
         // it never reaches the sink, and there is nothing here for the window.
-        instance::Request::GateCommand { .. } | instance::Request::CollisionScan { .. } => {}
+        instance::Request::GateCommand { .. }
+        | instance::Request::CollisionScan { .. }
+        | instance::Request::InsightsRead { .. } => {}
         instance::Request::Notification { id, snooze } => {
             if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
                 log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");

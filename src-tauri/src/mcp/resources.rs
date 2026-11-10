@@ -424,8 +424,30 @@ pub fn ledger_query_page(
 /// The insights snapshot as MCP reports it: the in-process snapshot, which the
 /// hooks consume as it is. Its `ledger` facet is already the honest status
 /// (never `recording`, `dropped` scoped, with freshness).
+///
+/// The running app is asked first, over the mailbox the edit hooks use: every
+/// agent session has its own MCP process, and each used to scan every worktree
+/// for itself. An answer from the app carries `served_by: {source: "app",
+/// age_ms}`; whatever keeps the app from answering (absent, slow, too old,
+/// busy, an older build, a facet it could not read) leaves this process to scan
+/// for itself, which is the document the tool has always returned.
 pub fn insights_document(repo: &str) -> Value {
-    json!(crate::insights::snapshot(repo))
+    match crate::hooks::insights_from_app(repo) {
+        Ok((snapshot, age_ms)) => {
+            let mut document = json!(snapshot);
+            if let Some(object) = document.as_object_mut() {
+                object.insert(
+                    "served_by".to_string(),
+                    json!({ "source": "app", "age_ms": age_ms }),
+                );
+            }
+            document
+        }
+        Err(why) => {
+            log::debug!(target: "mcp", "insights: scanning here, the app did not: {why}");
+            json!(crate::insights::snapshot(repo))
+        }
+    }
 }
 
 /// The composed repository status document.

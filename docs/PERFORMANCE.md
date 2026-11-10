@@ -846,6 +846,76 @@ on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
 
+## 2026-11-09: `gitpulse_insights` asks the app first (perf1109-mcp-asks-app)
+
+Every agent session has its own `gitpulse-mcp`, and each keeps its own
+`ref_cache` and `status_cell` statics, so N sessions asking `gitpulse_insights`
+scan the same worktrees N times (the audit sampled about 26 MCP processes, three
+scanning one repository within 7 s, and one call at 625-667 ms).
+
+**Shape.** `Request::InsightsRead { id, repo }` on the same mailbox, answered on
+its own connection by the sink `launch::establish` attaches
+(`hooks::serve_insights`, which calls `insights::app_facets::serve`). The reply
+is `AppFacets`: `worktrees`, `agents`, `changes`, `collisions` (each
+`Option`), `age_ms`, `deadline_expired` and `not_scanned` (`facet` and
+`reason` for every `None`). `agents` is the agent-session count attributed over
+the same listing, which the asker cannot attribute from the capped worktree
+rows. `resources::insights_document` (`gitpulse_insights` and the
+`gitpulse://insights` resource) asks through `hooks::insights_from_app` with
+the collision-guard's rules (`COLLISION_APP_DEADLINE` 2 s, answers older than
+`COLLISION_MAX_AGE_MS` refused, a reply that read no worktree refused) and
+reads the ledger and code graph itself. An answer from the app adds
+`served_by: {source: "app", age_ms}` to the document; a fallback adds nothing.
+
+**Where the answer comes from.** The same status cell and listing memo as the
+collision scan: the app reads with a clock that began `TTL` (5 s) ago, so a
+worktree status read that began within `TTL` is accepted and nothing older, and
+the listing is the memo's (`CollisionMemo::listing`). **Trust is checked first,
+for every request** (`validate_repo`), because a listing served from memory
+skips the listing's own check. **A positive is read again**: every worktree the
+collision facet names as a party (a file dirty in two worktrees, or a worktree
+two live sessions share) is re-read with a clock that began now before the
+facets are derived. A facet the app could not read is `None` with a reason; the
+asker answers none of the snapshot from a partial reply and scans for itself.
+`age_ms` is the oldest of the listing's age and the shared cell's age for each
+worktree (inferred from `status_age`, not stamped per read).
+
+**Bounds.** At most `MAX_INSIGHTS_HANDLERS` (4) reads at once, drawn from the
+`MAX_GATE_HANDLERS` slots, so the MCP processes cannot fill the slots the edit
+hooks use; one past is answered "busy". The app's status reads stop starting
+`APP_BUDGET` (2 s) after the ask. A reply that would not fit `MAX_FRAME` is
+refused at once ("the answer is N bytes") instead of being written. The request
+carries an id and an absolute path of at most 1024 bytes.
+
+**Version skew.** `PROTOCOL` is not bumped. An older app does not parse the new
+`kind`, refuses the frame (its log line is a warning per ask), and the MCP scans
+for itself. An older MCP never asks. An app without the sink attached refuses
+with "the insights read is not attached".
+
+**Measured:** a count inside one test process, not the installed binaries
+(`hooks::tests::a_fresh_app_answer_replaces_the_askers_own_scan`): see the lane
+report for the numbers. The live re-sample needs the app, `gitpulse-mcp` and
+`gitpulse-hook` rebuilt and reinstalled.
+
+**Security impact.** Read-only; no write path, no new socket, mode or
+permission. A caller can now ask for the `worktrees`, `changes` and `collisions`
+facets of a repository GitPulse is trusted in. It could already read them by
+running `git` there itself (and `gitpulse-mcp` does exactly that), and the
+paths and counts are what `gitpulse_insights` already returns. Trust, the
+same-uid peer check, the 0700 directory and the 0600 socket are the mailbox's
+and `validate_repo`'s, unchanged; `resolve_worktree_family` is not on this path
+and nothing here memoises it.
+
+**Why a hook process scanned while the app was up (still unproven for the
+sampled pid).** One path never asks: `run_session_brief` calls
+`insights::snapshot` directly, so every SessionStart hook runs a full worktree
+scan whatever the app is doing. The other ways collision-guard itself scans are
+all logged at debug level (`collision guard: scanning here, the app did not:
+why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
+verdicts), the mailbox's 24-connection admission (a connection past it is closed
+without a greeting), an answer older than 10 s, a reply that read no worktree,
+and the 2 s deadline under load.
+
 ## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
 
 The audit's perf cards need a number to be measured against. Before this there

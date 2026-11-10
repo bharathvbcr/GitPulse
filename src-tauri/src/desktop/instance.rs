@@ -71,6 +71,10 @@ const MAX_HANDLERS: usize = 8;
 /// burst of agent hooks can never use up the handlers a relaunch needs. One
 /// past this is answered "busy" and its hook judges the command itself.
 const MAX_GATE_HANDLERS: usize = 16;
+/// Insights reads in flight at once: a share of [`MAX_GATE_HANDLERS`], not on
+/// top of it. A snapshot's reads are heavier than a verdict or one file's
+/// collision scan, and every agent session has an MCP process that may ask.
+const MAX_INSIGHTS_HANDLERS: usize = 4;
 /// Requests held for an owner whose window is not up yet.
 const MAX_QUEUED: usize = 32;
 /// How long the owner gives one connection end to end. Longer than the
@@ -120,6 +124,18 @@ pub enum Request {
         /// The edited file, relative to `repo`.
         path: String,
     },
+    /// A `gitpulse-mcp` process asking for the git facets of
+    /// `gitpulse_insights` (`worktrees`, `changes`, `collisions`) of `repo`,
+    /// read-only. Answered on the connection like [`Request::CollisionScan`],
+    /// by the sink [`Primary::attach_insights`] put there. An owner that
+    /// predates this request refuses the unknown `kind` and the asker scans
+    /// for itself; the protocol version is deliberately not bumped for it.
+    InsightsRead {
+        /// Echoed in the answer, as for [`Request::GateCommand`].
+        id: String,
+        /// The repository to read (absolute). The owner re-checks trust in it.
+        repo: String,
+    },
 }
 
 impl Request {
@@ -127,7 +143,9 @@ impl Request {
     /// own connection.
     fn answered_id(&self) -> Option<&str> {
         match self {
-            Request::GateCommand { id, .. } | Request::CollisionScan { id, .. } => Some(id),
+            Request::GateCommand { id, .. }
+            | Request::CollisionScan { id, .. }
+            | Request::InsightsRead { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -193,6 +211,19 @@ impl Request {
                     || Path::new(path).is_absolute()
                 {
                     return Err("scan path must be relative to its repository".into());
+                }
+                Ok(())
+            }
+            Request::InsightsRead { id, repo } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("insights request id is empty, too long or not printable".into());
+                }
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("insights repository must be an absolute path".into());
                 }
                 Ok(())
             }
@@ -570,6 +601,19 @@ impl Secondary {
         self.answered(request, within)
     }
 
+    /// Asks the owner for the git facets of a repository: the owner's reply to
+    /// [`Request::InsightsRead`], on the same terms as [`Secondary::gate`].
+    pub fn insights(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::InsightsRead { .. }) {
+            return Err("not an insights request".into());
+        }
+        self.answered(request, within)
+    }
+
     fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
         let id = request
             .answered_id()
@@ -627,6 +671,9 @@ pub type GateSink = Arc<dyn Fn(&str, &str) -> Result<serde_json::Value, String> 
 /// Scans for a hook: `(repo, path)` to the collision scan's JSON.
 pub type ScanSink = GateSink;
 
+/// Reads for an MCP process: `repo` to the insights facets' JSON.
+pub type InsightsSink = Arc<dyn Fn(&str) -> Result<serde_json::Value, String> + Send + Sync>;
+
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
 #[derive(Default)]
@@ -641,6 +688,9 @@ struct Shared {
     gating: AtomicUsize,
     gate: Mutex<Option<GateSink>>,
     collision: Mutex<Option<ScanSink>>,
+    insights: Mutex<Option<InsightsSink>>,
+    /// Insights reads in flight, a share of `gating` of their own.
+    reading: AtomicUsize,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -659,6 +709,8 @@ impl Shared {
             gating: AtomicUsize::new(0),
             gate: Mutex::new(None),
             collision: Mutex::new(None),
+            insights: Mutex::new(None),
+            reading: AtomicUsize::new(0),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -772,6 +824,17 @@ impl Primary {
         *self
             .shared
             .collision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where MCP processes' insights reads are answered from now on. Until
+    /// this is called a [`Request::InsightsRead`] is refused, and its asker
+    /// scans the worktrees itself.
+    pub fn attach_insights(&self, sink: InsightsSink) {
+        *self
+            .shared
+            .insights
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1102,6 +1165,9 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if let Request::CollisionScan { id, repo, path } = &request {
         return answer_scan(stream, shared, id, repo, path).map_err(Ended::Refused);
     }
+    if let Request::InsightsRead { id, repo } = &request {
+        return answer_insights(stream, shared, id, repo).map_err(Ended::Refused);
+    }
     let verdict = admit(shared, request);
     let ack = match &verdict {
         Ok(_) => Ack::accepted(),
@@ -1128,13 +1194,9 @@ fn answer_gate(
     cwd: &str,
     command: &str,
 ) -> Result<(), String> {
-    answer_asked(
-        stream,
-        shared,
-        id,
-        (&shared.gate, "the gate"),
-        (cwd, command),
-    )
+    answer_asked(stream, shared, id, "the gate", || {
+        attached(&shared.gate, "the gate")?(cwd, command)
+    })
 }
 
 /// Answers a hook's [`Request::CollisionScan`] on its connection, on the same
@@ -1148,34 +1210,58 @@ fn answer_scan(
     repo: &str,
     path: &str,
 ) -> Result<(), String> {
-    answer_asked(
-        stream,
-        shared,
-        id,
-        (&shared.collision, "the collision scan"),
-        (repo, path),
-    )
+    answer_asked(stream, shared, id, "the collision scan", || {
+        attached(&shared.collision, "the collision scan")?(repo, path)
+    })
 }
 
+/// Answers an MCP process's [`Request::InsightsRead`] on its connection, on
+/// the same terms as [`answer_scan`], plus a share of its own: at most
+/// [`MAX_INSIGHTS_HANDLERS`] reads at once, so the many MCP processes of many
+/// agent sessions cannot fill the [`MAX_GATE_HANDLERS`] slots the edit hooks
+/// need. One past it is answered "busy" and its asker reads for itself.
+fn answer_insights(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    repo: &str,
+) -> Result<(), String> {
+    let reading = ReadSlot::take(shared);
+    answer_asked(stream, shared, id, "the insights read", || {
+        if reading.is_none() {
+            return Err("the insights read is busy".to_string());
+        }
+        attached(&shared.insights, "the insights read")?(repo)
+    })
+}
+
+/// The sink in `slot`, cloned out so its lock is not held while the answer is
+/// worked out.
+fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> {
+    slot.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .ok_or_else(|| format!("{name} is not attached"))
+}
+
+/// Runs `call` for a request answered on its own connection, and writes its
+/// reply, or its error as a refusal. A reply that would not fit one frame is a
+/// refusal too: the asker reads it at once and reads for itself, instead of
+/// waiting out its deadline on a frame it cannot take.
 fn answer_asked(
     stream: &mut UnixStream,
     shared: &Shared,
     id: &str,
-    (which, name): (&Mutex<Option<GateSink>>, &str),
-    (first, second): (&str, &str),
+    name: &str,
+    call: impl FnOnce() -> Result<serde_json::Value, String>,
 ) -> Result<(), String> {
     let slot = GateSlot::take(shared);
-    // Cloned out so the lock is not held while the answer is worked out.
-    let sink = which.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let outcome = if shared.closing.load(Ordering::Acquire) {
         Err("GitPulse is quitting".to_string())
     } else if slot.is_none() {
         Err(format!("{name} is busy"))
     } else {
-        match sink {
-            Some(sink) => sink(first, second),
-            None => Err(format!("{name} is not attached")),
-        }
+        call()
     };
     let ack = match outcome {
         Ok(reply) => Ack {
@@ -1186,7 +1272,34 @@ fn answer_asked(
         },
         Err(reason) => Ack::refused(reason),
     };
+    let encoded = serde_json::to_vec(&ack).map_err(|error| error.to_string())?;
+    if encoded.len() >= MAX_FRAME {
+        return write_frame(
+            stream,
+            &Ack::refused(format!("{name}: the answer is {} bytes", encoded.len())),
+        );
+    }
     write_frame(stream, &ack)
+}
+
+/// One of the [`MAX_INSIGHTS_HANDLERS`] insights reads in flight, released on
+/// drop.
+struct ReadSlot<'a>(&'a Shared);
+
+impl<'a> ReadSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.reading.fetch_add(1, Ordering::AcqRel) >= MAX_INSIGHTS_HANDLERS {
+            shared.reading.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for ReadSlot<'_> {
+    fn drop(&mut self) {
+        self.0.reading.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One of the [`MAX_GATE_HANDLERS`] verdicts in flight, released on drop.

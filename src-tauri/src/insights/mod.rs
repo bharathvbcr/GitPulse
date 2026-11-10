@@ -6,6 +6,7 @@
 //! nothing. Nothing here updates a git ref, index, or worktree file. File
 //! claims are a sidecar under the common git directory; see [`claims`].
 
+mod app_facets;
 pub mod claims;
 mod collision_memo;
 mod entity_collision;
@@ -21,6 +22,9 @@ pub mod merge_conflicts;
 mod merge_conflicts_bench_tests;
 
 pub use crate::engine::worktree::ScanDeadline;
+pub use app_facets::{
+    serve as serve_facets, snapshot_from_app, AppFacets, NotScanned, APP_BUDGET as APP_FACETS_BUDGET,
+};
 pub use collision_memo::{
     collision_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
 };
@@ -1066,16 +1070,66 @@ fn snapshot_observed(
     let started = Instant::now();
     // One clock for the whole pass, handed to every stage that can run long.
     let clock = worktree::ScanDeadline::after(started, deadline);
+    let read = read_git_facets(repo_path, &clock, max_worktrees, observation);
+    complete_snapshot(repo_path, started, read)
+}
+
+/// The git half of a snapshot: the three facets that cost `git` children
+/// (`worktrees`, `changes`, `collisions`) and the agent counts attributed over
+/// the same listing.
+struct GitFacets {
+    worktrees: WorktreeFacet,
+    agents: AgentSummary,
+    changes: ChangesFacet,
+    collisions: CollisionRisk,
+    deadline_expired: bool,
+}
+
+/// Reads [`GitFacets`] against `clock`. A status any stage reads is accepted
+/// from the shared cell when it began at or after `clock.started()`, so a clock
+/// started in the past accepts older reads (the app's remembered answer, see
+/// `app_facets`) and one started now accepts only a read that is in flight.
+fn read_git_facets(
+    repo_path: &str,
+    clock: &worktree::ScanDeadline,
+    max_worktrees: usize,
+    observation: &live_sessions::Observation,
+) -> GitFacets {
+    let read = read_listing(repo_path, clock, None);
+    let derived = derive_facets(
+        repo_path,
+        clock,
+        max_worktrees,
+        observation,
+        &read.listed,
+        read.deadline_expired,
+    );
+    GitFacets {
+        worktrees: derived.worktrees,
+        agents: derived.agents,
+        changes: read.changes,
+        collisions: derived.collisions,
+        deadline_expired: derived.deadline_expired,
+    }
+}
+
+/// The reads a snapshot makes before it derives anything: the listing, the main
+/// checkout's status and every worktree's status.
+struct ListingRead {
+    listed: Result<Vec<WorktreeInfo>, CommandError>,
+    changes: ChangesFacet,
+    deadline_expired: bool,
+}
+
+fn read_listing(
+    repo_path: &str,
+    clock: &worktree::ScanDeadline,
+    listing: Option<Result<Vec<WorktreeInfo>, CommandError>>,
+) -> ListingRead {
     // The listing alone: one process. The per-worktree status read is made
     // below, once, for the worktree rows and the collision scan together.
-    let mut listed = worktree::list_worktrees_lite(repo_path);
+    let mut listed = listing.unwrap_or_else(|| worktree::list_worktrees_lite(repo_path));
     let mut deadline_expired = false;
-    // Attributed over the whole listing, not the capped summaries: a session
-    // in the 65th worktree is still a session in this repository.
-    let live = match &listed {
-        Ok(list) => live_in(observation, list),
-        Err(error) => live_sessions::unattributed(error.message()),
-    };
 
     // The main checkout is read here, for the changes facet, and its row below
     // takes this same read: a pass reads each worktree once.
@@ -1094,12 +1148,42 @@ fn snapshot_observed(
     // the same clock as everything else; a worktree it did not reach stays
     // unknown in both facets rather than reading as clean in either.
     if let Ok(list) = &mut listed {
-        if worktree::read_dirty(list, &clock) > 0 {
+        if worktree::read_dirty(list, clock) > 0 {
             deadline_expired = true;
         }
     }
+    ListingRead {
+        listed,
+        changes,
+        deadline_expired,
+    }
+}
 
-    let (worktrees, agents) = match &listed {
+struct Derived {
+    worktrees: WorktreeFacet,
+    agents: AgentSummary,
+    collisions: CollisionRisk,
+    deadline_expired: bool,
+}
+
+/// The worktree rows, agent counts and collision scan out of a listing whose
+/// statuses were read ([`worktree::read_dirty`]).
+fn derive_facets(
+    repo_path: &str,
+    clock: &worktree::ScanDeadline,
+    max_worktrees: usize,
+    observation: &live_sessions::Observation,
+    listed: &Result<Vec<WorktreeInfo>, CommandError>,
+    mut deadline_expired: bool,
+) -> Derived {
+    // Attributed over the whole listing, not the capped summaries: a session
+    // in the 65th worktree is still a session in this repository.
+    let live = match listed {
+        Ok(list) => live_in(observation, list),
+        Err(error) => live_sessions::unattributed(error.message()),
+    };
+
+    let (worktrees, agents) = match listed {
         Ok(list) => {
             let truncated = list.len() > max_worktrees;
             let items: Vec<WorktreeSummary> = list
@@ -1119,7 +1203,7 @@ fn snapshot_observed(
                 })
                 .collect();
             let mut facet = worktree_facet(list.len() as u32, truncated, items);
-            fill_head_divergence(repo_path, &mut facet.items, &clock);
+            fill_head_divergence(repo_path, &mut facet.items, clock);
             // The same `truncated` the facet carries: these counts are rolled
             // from `facet.items`, which is the capped list, so a repository
             // past the cap must not report its floor as an exact count.
@@ -1132,7 +1216,7 @@ fn snapshot_observed(
         ),
     };
 
-    let mut collisions = match &listed {
+    let mut collisions = match listed {
         Ok(list) => {
             if clock.expired() {
                 deadline_expired = true;
@@ -1141,7 +1225,7 @@ fn snapshot_observed(
             // already read and counts every worktree it has none for as
             // unscanned, with `ok: false` and the reason — never
             // `overlapping_files: 0` for a scan that did not look.
-            collision_from_list(list, &live, Some(&clock))
+            collision_from_list(list, &live, Some(clock))
         }
         Err(error) => empty_collisions(error.message().to_string()),
     };
@@ -1150,7 +1234,24 @@ fn snapshot_observed(
     if listed.is_ok() {
         attach_file_claims(&mut collisions, repo_path, None);
     }
+    Derived {
+        worktrees,
+        agents,
+        collisions,
+        deadline_expired,
+    }
+}
 
+/// The snapshot around `read`: the main worktree's branch and the two local
+/// stores (ledger, code graph), which start no `git` child.
+fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> InsightsSnapshot {
+    let GitFacets {
+        worktrees,
+        agents,
+        changes,
+        collisions,
+        deadline_expired,
+    } = read;
     let main_worktree = worktrees.items.iter().find(|w| w.is_main);
     let branch = main_worktree.and_then(|w| w.branch.clone());
     // A null branch means the main worktree is on none — detached, or bare —

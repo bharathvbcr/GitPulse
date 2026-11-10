@@ -1567,6 +1567,201 @@ fn an_owner_that_predates_scans_refuses_the_request_instead_of_answering_it() {
     );
 }
 
+fn insights_request(id: &str) -> Request {
+    Request::InsightsRead {
+        id: id.into(),
+        repo: "/repo".into(),
+    }
+}
+
+#[test]
+fn an_insights_request_is_bounded_before_anything_acts_on_it() {
+    assert_eq!(insights_request("i-1").validate(), Ok(()));
+    let with = |id: &str, repo: &str| Request::InsightsRead {
+        id: id.into(),
+        repo: repo.into(),
+    };
+    let refused = [
+        with("", "/repo"),
+        with("i\n1", "/repo"),
+        with(&"i".repeat(MAX_NATIVE_ID + 1), "/repo"),
+        with("i", "repo"),
+        with("i", ""),
+        with("i", "/re\0po"),
+        with("i", &format!("/{}", "r".repeat(MAX_PATH_BYTES))),
+    ];
+    for request in refused {
+        assert!(request.validate().is_err(), "{request:?}");
+    }
+}
+
+#[test]
+fn an_insights_request_is_refused_until_its_own_sink_is_attached() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    // Neither a gate nor a collision scan is an insights read.
+    owner.attach_gate(Arc::new(|_, _| Ok(serde_json::json!({"gate": true}))));
+    owner.attach_collision(Arc::new(|_, _| Ok(serde_json::json!({"scan": true}))));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&insights_request("i-1"), Duration::from_secs(5));
+    assert_eq!(
+        refused,
+        Err("the insights read is not attached".to_string())
+    );
+
+    // And an insights sink answers neither of them.
+    let other = profile();
+    let owner_two = primary(other.path());
+    owner_two.attach_insights(Arc::new(|_| Ok(serde_json::json!({"insights": true}))));
+    let socket = Paths::in_dir(&other.path().canonicalize().unwrap()).socket;
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .collisions(&scan_request("s-1"), Duration::from_secs(5));
+    assert_eq!(
+        refused,
+        Err("the collision scan is not attached".to_string())
+    );
+    drop((owner, owner_two));
+}
+
+#[test]
+fn an_insights_answer_carries_the_sinks_reply_and_the_requests_id() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    owner.attach_insights(Arc::new(|repo| Ok(serde_json::json!({"repo": repo}))));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let reply = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&insights_request("i-7"), Duration::from_secs(5))
+        .expect("answered");
+    assert_eq!(reply, serde_json::json!({"repo": "/repo"}));
+
+    // A sink that errors is a refusal, never a reply; the asker reads itself.
+    owner.attach_insights(Arc::new(|_| Err("no read".into())));
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&insights_request("i-8"), Duration::from_secs(5));
+    assert_eq!(refused, Err("no read".to_string()));
+
+    let mismatched = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&scan_request("s-9"), Duration::from_secs(5));
+    assert_eq!(mismatched, Err("not an insights request".to_string()));
+}
+
+#[test]
+fn an_owner_that_predates_insights_reads_refuses_the_request_instead_of_answering_it() {
+    // What an older app sees: a `kind` it does not know. Today's owner without
+    // an insights sink behaves the same from the asker's side, and a frame with
+    // an unknown kind is refused whole.
+    let dir = profile();
+    let owner = primary(dir.path());
+    let received = recorder(&owner);
+    let (mut stream, mut reader) = raw(dir.path());
+    let ack = ack_of(
+        &mut stream,
+        &mut reader,
+        b"{\"v\":1,\"request\":{\"kind\":\"insights_read_next\",\"id\":\"x\",\"repo\":\"/r\"}}\n",
+    );
+    assert!(!ack.accepted && ack.reason.is_some() && ack.reply.is_none());
+    assert!(
+        received.try_recv().is_err(),
+        "a refused frame reached the app"
+    );
+}
+
+#[test]
+fn an_insights_answer_too_big_for_one_frame_is_refused_at_once() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    owner.attach_insights(Arc::new(|_| {
+        Ok(serde_json::json!({"blob": "x".repeat(MAX_FRAME)}))
+    }));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let started = Instant::now();
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&insights_request("i-big"), Duration::from_secs(5))
+        .expect_err("an oversized answer was delivered");
+    assert!(refused.contains("the answer is"), "{refused}");
+    assert!(
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+        "the asker waited out its deadline"
+    );
+}
+
+#[test]
+fn insights_reads_are_bounded_and_never_starve_the_edit_hooks() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_insights(Arc::new(move |_| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({"ok": true}))
+        }));
+    }
+    owner.attach_collision(Arc::new(|_, _| Ok(serde_json::json!({"scan": true}))));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let held: Vec<_> = (0..MAX_INSIGHTS_HANDLERS)
+        .map(|n| {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                Secondary::connect(&socket)
+                    .ok()
+                    .expect("reach the owner")
+                    .insights(&insights_request(&format!("i-{n}")), Duration::from_secs(30))
+            })
+        })
+        .collect();
+    let started = Instant::now();
+    while entered.load(Ordering::Acquire) < MAX_INSIGHTS_HANDLERS {
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+            "reads never filled"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // One past the cap is told it is busy, at once.
+    let over = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .insights(&insights_request("i-over"), Duration::from_secs(5));
+    assert_eq!(over, Err("the insights read is busy".to_string()));
+    // While every insights slot is held a hook's collision scan is still taken.
+    let scan = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .collisions(&scan_request("s-1"), Duration::from_secs(5));
+    assert_eq!(scan, Ok(serde_json::json!({"scan": true})));
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in held {
+        assert!(worker.join().unwrap().is_ok());
+    }
+}
+
 #[test]
 fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
     let dir = profile();

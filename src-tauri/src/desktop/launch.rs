@@ -104,6 +104,11 @@ pub fn establish() -> Launch {
                 primary.attach_collision(std::sync::Arc::new(|repo, path| {
                     crate::hooks::serve_collision(repo, path)
                 }));
+                // The git facets of `gitpulse_insights`, which every agent
+                // session's MCP process would otherwise scan for itself.
+                primary.attach_insights(std::sync::Arc::new(|repo| {
+                    crate::hooks::serve_insights(repo)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch

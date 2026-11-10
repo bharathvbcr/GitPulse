@@ -1927,6 +1927,79 @@ pub fn serve_collision(repo: &str, path: &str) -> Result<Value, String> {
     serde_json::to_value(answer).map_err(|error| error.to_string())
 }
 
+/// The app's half of the MCP's `gitpulse_insights`: the git facets of `repo`
+/// from the app's memory ([`insights::serve_facets`], which re-checks trust in
+/// `repo` first). A facet the app could not read is absent from the reply with
+/// its reason, never an empty one.
+pub fn serve_insights(repo: &str) -> Result<Value, String> {
+    let facets = insights::serve_facets(repo)?;
+    serde_json::to_value(facets).map_err(|error| error.to_string())
+}
+
+/// `gitpulse_insights` for the MCP: the running app's snapshot when it answers
+/// in time and young enough (and its age in milliseconds), otherwise an error
+/// saying why not, and the caller scans for itself. The app supplies the
+/// `worktrees`, `changes` and `collisions` facets and the agent counts; the
+/// ledger and the code graph are read here, and neither starts a `git` child.
+#[cfg(target_os = "macos")]
+pub fn insights_from_app(repo: &str) -> Result<(insights::InsightsSnapshot, u64), String> {
+    insights_from_app_in(
+        scan_profile(repo).ok_or("no profile directory to find the app in")?,
+        repo,
+        COLLISION_APP_DEADLINE,
+    )
+}
+
+/// There is no mailbox off macOS; the caller scans for itself.
+#[cfg(not(target_os = "macos"))]
+pub fn insights_from_app(_repo: &str) -> Result<(insights::InsightsSnapshot, u64), String> {
+    Err("only the macOS app answers an insights read".into())
+}
+
+/// [`insights_from_app`] against the app that owns profile directory `dir`,
+/// given `deadline` to answer. The same rules as [`scanned_by_app_in`]: the
+/// wait is detached at the deadline, an answer older than
+/// [`COLLISION_MAX_AGE_MS`] is not believed, and a reply that read nothing is
+/// not a scan.
+#[cfg(target_os = "macos")]
+fn insights_from_app_in(
+    dir: PathBuf,
+    repo: &str,
+    deadline: Duration,
+) -> Result<(insights::InsightsSnapshot, u64), String> {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let started = std::time::Instant::now();
+    let request = Request::InsightsRead {
+        id: mailbox_id("insights"),
+        repo: repo.to_string(),
+    };
+    let answer = within_budget(deadline + Duration::from_millis(100), move || {
+        reach_owner(&dir, deadline)
+            .ok_or_else(|| "no GitPulse is answering".to_string())?
+            .insights(&request, deadline)
+    })
+    .ok_or("the app missed its deadline")??;
+    let facets: insights::AppFacets = serde_json::from_value(answer)
+        .map_err(|error| format!("the answer is malformed: {error}"))?;
+    if facets.age_ms > COLLISION_MAX_AGE_MS {
+        return Err(format!(
+            "the app's answer is {} ms old; {COLLISION_MAX_AGE_MS} is the most believed",
+            facets.age_ms
+        ));
+    }
+    if facets
+        .collisions
+        .as_ref()
+        .is_some_and(|risk| risk.scanned_worktrees == 0)
+    {
+        return Err("the app's answer read no worktree".into());
+    }
+    let age = facets.age_ms;
+    let snapshot = insights::snapshot_from_app(repo, started, facets)?;
+    Ok((snapshot, age))
+}
+
 /// The collision scan for an edit of `target` in `root`: the app's, from its
 /// memory, when it answers in time; otherwise this process reads every worktree
 /// itself, as it always did. Either way the result is a full scan with its
@@ -5907,6 +5980,178 @@ done
         // The fallback says what it could not do instead of staying silent.
         let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
         assert!(!output.is_silent(), "an unscanned edit read as a clean one");
+    }
+
+    /// `gitpulse_insights` asked of a fake app that replays `reply`, the way
+    /// the MCP asks the real one.
+    #[cfg(target_os = "macos")]
+    fn insights_replayed(
+        farm: &Farm,
+        reply: Value,
+        deadline: Duration,
+    ) -> Result<(InsightsSnapshot, u64), String> {
+        let app = app_for(&farm.repo, false);
+        app._owner
+            .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
+        insights_from_app_in(app._profile.path().to_path_buf(), &farm.repo, deadline)
+    }
+
+    /// Case 1 of the card: the app is present and fresh. The asker starts no
+    /// git child for the three git facets, where its own scan starts one per
+    /// worktree; this is a count inside one test process with a fake app that
+    /// replays an answer the real serving code made, not a measurement of the
+    /// installed binaries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fresh_app_answer_replaces_the_askers_own_scan() {
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let app = app_for(&farm.repo, false);
+        let reply = canned.clone();
+        app._owner
+            .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
+
+        let marks = spawn_marks(&farm.dirs);
+        let (asked, age_ms) = insights_from_app_in(
+            app._profile.path().to_path_buf(),
+            &farm.repo,
+            unhurried(),
+        )
+        .expect("a fresh answer is believed");
+        let with_app = spawn_cost(&farm.dirs, &marks);
+
+        let marks = spawn_marks(&farm.dirs);
+        let own = insights::snapshot(&farm.repo);
+        let alone = spawn_cost(&farm.dirs, &marks);
+
+        eprintln!("git children per gitpulse_insights call, with a fake app attached: {with_app:?}; alone: {alone:?}");
+        // The one `worktree list` left is the ledger's own address resolution,
+        // which the asker still makes (`complete_snapshot`); no status read, and
+        // nothing else, is started for the three git facets.
+        assert_eq!((with_app.status, with_app.other), (0, 0), "{with_app:?}");
+        assert!(with_app.worktree_list <= 1, "{with_app:?}");
+        assert!(
+            alone.status > SIBLINGS && alone.worktree_list >= 1,
+            "the baseline scan did not scan: {alone:?}"
+        );
+        assert!(age_ms <= COLLISION_MAX_AGE_MS, "{age_ms}");
+        assert_eq!(asked.worktrees.count, own.worktrees.count);
+        assert_eq!(
+            asked.collisions.scanned_worktrees,
+            own.collisions.scanned_worktrees
+        );
+        assert!(asked.worktrees.ok && asked.changes.ok && asked.collisions.ok);
+    }
+
+    /// Cases 2 to 4 of the card, and the ways an answer is not believed: no
+    /// app, a slow app, an answer too old, an app that read nothing, a facet it
+    /// could not read, and a peer that is not the app. Each is an error the MCP
+    /// scans past; none is a snapshot.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_app_that_is_absent_slow_stale_or_partial_leaves_the_asker_to_scan() {
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+
+        // Absent: nobody owns the profile.
+        let empty = tempfile::Builder::new()
+            .prefix("cg")
+            .tempdir_in("/tmp")
+            .expect("profile dir");
+        let absent =
+            insights_from_app_in(empty.path().to_path_buf(), &farm.repo, unhurried()).unwrap_err();
+        assert!(absent.contains("no GitPulse is answering"), "{absent}");
+
+        // Slow: the app answers after the asker's deadline.
+        let app = app_for(&farm.repo, false);
+        let late = canned.clone();
+        app._owner.attach_insights(std::sync::Arc::new(move |_| {
+            std::thread::sleep(Duration::from_millis(2500));
+            Ok(late.clone())
+        }));
+        let started = std::time::Instant::now();
+        let slow = insights_from_app_in(
+            app._profile.path().to_path_buf(),
+            &farm.repo,
+            Duration::from_millis(300),
+        );
+        assert!(slow.is_err(), "a late answer was believed");
+        assert!(
+            started.elapsed() < Duration::from_millis(2400),
+            "the asker waited for the slow app"
+        );
+
+        // Too old, blind, partial, malformed: tampering with an honest answer.
+        let tampered = |edit: fn(&mut Value)| {
+            let mut reply = canned.clone();
+            edit(&mut reply);
+            insights_replayed(&farm, reply, unhurried())
+        };
+        assert!(tampered(|_| {}).is_ok(), "an honest answer is believed");
+        let old = tampered(|r| r["age_ms"] = json!(COLLISION_MAX_AGE_MS + 1)).unwrap_err();
+        assert!(old.contains("ms old"), "{old}");
+        let blind = tampered(|r| r["collisions"]["scanned_worktrees"] = json!(0)).unwrap_err();
+        assert!(blind.contains("read no worktree"), "{blind}");
+        let partial = tampered(|r| {
+            r["changes"] = Value::Null;
+            r["not_scanned"] = json!([{"facet": "changes", "reason": "status failed"}]);
+        })
+        .unwrap_err();
+        assert!(partial.contains("changes (status failed)"), "{partial}");
+        let malformed = tampered(|r| *r = json!({"age_ms": "soon"})).unwrap_err();
+        assert!(malformed.contains("malformed"), "{malformed}");
+    }
+
+    /// The MCP's document: from the app, with its age, when the app answers;
+    /// otherwise the MCP's own scan, with nothing to say it was the app's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mcp_document_is_the_apps_with_its_age_or_its_own_scan() {
+        use crate::mcp::resources::insights_document;
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+
+        // No app registered for this repository: the MCP scans for itself.
+        let alone = insights_document(&farm.repo);
+        assert!(alone.get("served_by").is_none(), "{alone}");
+        assert_eq!(alone["worktrees"]["ok"], json!(true));
+
+        // An app that answers.
+        let app = app_for(&farm.repo, false);
+        let reply = canned.clone();
+        app._owner
+            .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
+        let marks = spawn_marks(&farm.dirs);
+        let served = insights_document(&farm.repo);
+        let cost = spawn_cost(&farm.dirs, &marks);
+        assert_eq!(served["served_by"]["source"], json!("app"), "{served}");
+        assert!(served["served_by"]["age_ms"].is_u64());
+        assert_eq!((cost.status, cost.other), (0, 0), "{cost:?}");
+        assert!(cost.worktree_list <= 1, "{cost:?}");
+        assert_eq!(served["worktrees"]["count"], alone["worktrees"]["count"]);
+
+        // An app that refuses (or predates the request): the MCP's own scan,
+        // whole, and not an empty document.
+        app._owner
+            .attach_insights(std::sync::Arc::new(|_| Err("no read".into())));
+        let refused = insights_document(&farm.repo);
+        assert!(refused.get("served_by").is_none(), "{refused}");
+        assert_eq!(refused["worktrees"]["ok"], json!(true));
+        assert_eq!(refused["worktrees"]["count"], alone["worktrees"]["count"]);
+    }
+
+    /// The app reads only what the asker could read: an untrusted repository
+    /// and a directory that is no repository are errors, not empty facets.
+    #[cfg(unix)]
+    #[test]
+    fn the_app_does_not_answer_insights_for_a_repository_it_is_not_trusted_in() {
+        let farm = farm(false);
+        assert!(serve_insights(&farm.repo).is_ok());
+        crate::repository_trust::revoke(&farm.repo).expect("revoke trust");
+        let refused = serve_insights(&farm.repo);
+        assert!(refused.is_err(), "an untrusted repository was read: {refused:?}");
+        let elsewhere = tempfile::tempdir().expect("not a repository");
+        assert!(serve_insights(&elsewhere.path().to_string_lossy()).is_err());
     }
 
     /// The Edit/Write hook used to check collisions only, so a task-bound
