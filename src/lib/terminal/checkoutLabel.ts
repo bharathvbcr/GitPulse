@@ -50,11 +50,21 @@ function layoutRoot(path: string): string | null {
   return at > 0 ? normalizeRepoPath(normalized.slice(0, at)) : null;
 }
 
-export function describeCheckout(
+interface ResolvedCheckout {
+  label: CheckoutLabel;
+  /**
+   * Identity of the repository this checkout belongs to. When no repository
+   * is known, the checkout's own identity, so two directories that happen to
+   * share a name stay apart.
+   */
+  groupKey: string;
+}
+
+function resolveCheckout(
   path: string,
   tabs: readonly CheckoutTab[],
   options: PathIdentityOptions,
-): CheckoutLabel {
+): ResolvedCheckout {
   const identity = (candidate: string) => identityKey(candidate, options);
   const key = identity(path);
   const tab = key ? tabs.find((candidate) => identity(candidate.path) === key) : undefined;
@@ -64,7 +74,72 @@ export function describeCheckout(
   const repository = root ? familyName(root) : label;
   // The primary checkout is the repository itself; naming it twice is noise.
   const checkout = named.primary || named.name === repository ? null : named.name;
-  return { repository, checkout, primary: named.primary, worktreeAgent: named.agent };
+  return {
+    label: { repository, checkout, primary: named.primary, worktreeAgent: named.agent },
+    groupKey: (root ? identity(root) : key) || repository,
+  };
+}
+
+export function describeCheckout(
+  path: string,
+  tabs: readonly CheckoutTab[],
+  options: PathIdentityOptions,
+): CheckoutLabel {
+  return resolveCheckout(path, tabs, options).label;
+}
+
+/** One repository's sessions in the cross-repository Sessions list. */
+export interface SessionListGroup<T> {
+  /** Repository identity. Stable across spelling and across its checkouts. */
+  key: string;
+  repository: string;
+  /** This panel's checkout belongs to the repository. */
+  here: boolean;
+  sessions: T[];
+}
+
+/**
+ * Group a session list by repository.
+ *
+ * The flat list repeated the repository on every row and left the checkout
+ * path to a tooltip. Rows keep the order they arrived in. The panel's own
+ * repository comes first; the rest follow by name, and a shared name does
+ * not merge two repositories.
+ */
+export function groupSessionsByRepository<T extends { repoPath: string; checkout?: string }>(
+  sessions: readonly T[],
+  panelPath: string | null,
+  tabs: readonly CheckoutTab[],
+  options: PathIdentityOptions,
+): SessionListGroup<T>[] {
+  if (!Array.isArray(sessions)) return [];
+  const panelKey = panelPath ? resolveCheckout(panelPath, tabs, options).groupKey : "";
+  const order: string[] = [];
+  const groups = new Map<string, SessionListGroup<T>>();
+  for (const session of sessions) {
+    if (!session || typeof session.repoPath !== "string" || session.repoPath.length === 0) continue;
+    const resolved = resolveCheckout(session.checkout || session.repoPath, tabs, options);
+    let group = groups.get(resolved.groupKey);
+    if (!group) {
+      group = {
+        key: resolved.groupKey,
+        repository: resolved.label.repository,
+        here: panelKey !== "" && panelKey === resolved.groupKey,
+        sessions: [],
+      };
+      groups.set(resolved.groupKey, group);
+      order.push(resolved.groupKey);
+    }
+    group.sessions.push(session);
+  }
+  return order
+    .map((key) => groups.get(key)!)
+    .sort((a, b) => {
+      if (a.here !== b.here) return a.here ? -1 : 1;
+      const name = a.repository.localeCompare(b.repository, undefined, { sensitivity: "base" });
+      if (name !== 0) return name;
+      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    });
 }
 
 /** The pieces of one row in the terminal's Sessions list. */

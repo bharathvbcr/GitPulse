@@ -23,7 +23,7 @@ GitPulse has 4 application views with 18 specialized sections. Each view keeps r
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
-| **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
+| **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
 
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 18 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 17 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -53,7 +53,7 @@ flowchart TD
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
-        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
+        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
     end
 
     subgraph NotViews["Not views — available under every view"]
@@ -477,15 +477,19 @@ rather than presenting a floor as a total.
 - **Code map status & dead symbols**: When a DevMap store is present (the vendored reader is schema 29), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **Pinned Advisory Columns**: Table columns for security advisories and vulnerability details are pinned to fixed widths to prevent layout jitter across scans.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
-- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
+- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, the working-tree secrets scan, and repository health signals into a single explicit verdict with one canonical owner per repeated decision. Secrets reads as unknown until a complete scan has been shown, and any finding is critical.
+- **Coding-agent tasks**: The agent bar above the page sends *Fix dependencies*, *Improve coverage*, *Fix secrets* or *Optimize storage* to Claude Code, Codex or another configured CLI in GitPulse's terminal, or copies the prompt. *Fix dependencies* attaches the report on screen and *Fix secrets* attaches the secrets scan on screen (rule, path, line and location — never a value); the Secrets section's **Fix with agent** selects that task and opens its prompt for review before anything launches.
+- **Previewed lists**: Every list on the page — vulnerabilities, Dependabot and code scanning alerts, secret findings, issues, outdated packages, manifests and dead-code candidates — opens on its first eight rows with a **Show all N** control beneath it. Section headings still state the scan's own count and any cap; the control speaks only for rows it can reveal.
 
-### 4.4 Secrets
+### 4.4 Secrets (a section of Health)
+
+Secrets was its own Insights section until it folded into Health, which gave it the shared verdict and agent bar. A session that had Secrets open restores onto Health.
 
 - **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
 - **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
 - **Located Findings**: Rows are sorted with the actionable ones first, so a token in committed source does not sit among build output. Location chips (tracked, untracked, ignored, `.git` metadata, nested repository) filter the list, rows that hold the same value are marked, and each row can be revealed in the file manager.
 - **Stated Scope and Age**: The panel says what a scan covers — the working tree only, the file-size limit, symlinks, and inline ignores — and the header shows the scan's age. A result older than five minutes refreshes when the section is reopened.
-- **One Scan at a Time**: Opening the section runs one scan, and a newer scan cancels an older one, so switching repositories never queues scanners. Every location of a repeated value is listed rather than deduplicated away.
+- **One Scan at a Time**: Opening Health runs one secrets scan beside the dependency scan, and a newer scan cancels an older one, so switching repositories never queues scanners. The section is drawn whether the dependency scan is loading, failed or done; moving between those states joins the scan already running instead of starting another. Every location of a repeated value is listed rather than deduplicated away.
 - **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
 - **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that Kingfisher itself marked partial (an unreadable file) reports explicitly as unverified / not clean, never as an all-clear.
 
@@ -724,7 +728,7 @@ stop per checkout.
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
-Reflog / Suspects, Insights' Pulse / Coverage / Health / Secrets / Storage — are switched by that
+Reflog / Suspects, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
 section directly, including all five Work sections.

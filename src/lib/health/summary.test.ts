@@ -13,6 +13,30 @@ import type {
   DepsHealthReport,
 } from "./types";
 import type { CodeintelStatus } from "../codeintel/types";
+import type { SecretsReport } from "../secrets/types";
+
+/** A complete Kingfisher scan that found nothing: the only clear secrets input. */
+function cleanSecrets(overrides: Partial<SecretsReport> = {}): SecretsReport {
+  return {
+    ok: true,
+    error: null,
+    diagnostic: null,
+    kingfisher_present: true,
+    kingfisher_version: "2.7.0",
+    kingfisher_version_rejected: false,
+    nested_repos_scanned: true,
+    completeness: "complete",
+    findings: [],
+    findings_total: 0,
+    findings_unreadable: 0,
+    findings_truncated: false,
+    git_status_known: true,
+    max_file_size_mb: 256,
+    scanned_at_ms: 1_000_000,
+    duration_ms: 10,
+    ...overrides,
+  };
+}
 
 function report(overrides: Partial<DepsHealthReport> = {}): DepsHealthReport {
   return {
@@ -82,6 +106,7 @@ function cleanInput(overrides: Partial<HealthSummaryInput> = {}): HealthSummaryI
       truncated: false,
       walkIncomplete: null,
     },
+    secrets: cleanSecrets(),
     ...overrides,
   };
 }
@@ -117,6 +142,11 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     ["the dead-code query did not run", { deadCode: { available: false, reason: "budget", total: 0, shown: 0, truncated: false, walkIncomplete: null } }],
     ["the dead-code walk was incomplete", { deadCode: { available: true, reason: null, total: 0, shown: 0, truncated: false, walkIncomplete: "3 unresolved sites" } }],
     ["the dead-code query stopped at its budget", { deadCode: { available: true, reason: null, total: 0, shown: 0, truncated: true, walkIncomplete: null } }],
+    ["the working tree was never scanned for secrets", { secrets: null }],
+    ["the secrets scan was partial", { secrets: cleanSecrets({ completeness: "partial" }) }],
+    ["the secrets scan did not report its completeness", { secrets: cleanSecrets({ completeness: "unverified" }) }],
+    ["the secrets scanner was unavailable", { secrets: cleanSecrets({ ok: false, error: "kingfisher not found", kingfisher_present: false }) }],
+    ["the secrets scan lost rows it could not read", { secrets: cleanSecrets({ findings_unreadable: 2 }) }],
   ])("refuses an all-clear when %s", (_why, override) => {
     const summary = summarizeHealth(cleanInput(override));
     expect(summary.clearClaimable).toBe(false);
@@ -124,6 +154,19 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     expect(summary.caveats.length).toBeGreaterThan(0);
     // Every caveat names a reason; none is an empty string standing in for one.
     for (const caveat of summary.caveats) expect(caveat.trim().length).toBeGreaterThan(0);
+  });
+
+  it("ranks any secret finding critical and states a floor as a floor", () => {
+    const found = facet(
+      cleanInput({ secrets: cleanSecrets({ findings: [{ rule_id: "betterleaks.github-pat", rule_name: "github-pat", path: "src/app.env", line: 3, confidence: "high", location: "tracked", secret_group: 1 }], findings_total: 3, findings_truncated: true }) }),
+      "secrets",
+    );
+    expect(found.tone).toBe("critical");
+    expect(found.value).toBe("3+ found");
+    expect(found.caveat).toContain("Kingfisher omitted findings past its own report cap");
+    const unscanned = facet(cleanInput({ secrets: null }), "secrets");
+    expect(unscanned).toMatchObject({ tone: "unknown", value: "not scanned" });
+    expect(facet(cleanInput(), "secrets")).toMatchObject({ tone: "clear", value: "none" });
   });
 
   it("never invents a cause it was not given", () => {

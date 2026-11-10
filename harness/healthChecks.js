@@ -24,7 +24,7 @@ import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/for
 const REPO = "/fixture/GitPulse";
 
 export async function runHealthChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, remount, detach, attach, setMode, setGithub } = ctx;
+  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setMode, setGithub } = ctx;
 
   const copied = [];
   const setClipboard = writeText => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
@@ -48,11 +48,16 @@ export async function runHealthChecks(ctx) {
   });
   const done = result => ({ command: "", gated: true, policy: null, timed_out: false, truncated: false, truncation_reason: null, duration_ms: 5, exit_code: 0, stdout_tail: "", stderr_tail: "", ...result });
   const reset = () => {
-    Object.assign(knobs, { scanDelay: 0, deps: null, dead: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH" });
+    Object.assign(knobs, { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH" });
     runs.length = 0;
     aiCalls.length = 0;
   };
-  const noScans = () => ipcLog.filter(entry => ["cmd_scan_coverage", "cmd_scan_secrets", "cmd_storage_scan"].includes(entry.cmd)).length === 0;
+  const noScans = () => ipcLog.filter(entry => ["cmd_scan_coverage", "cmd_storage_scan"].includes(entry.cmd)).length === 0;
+  const secretsScans = path => ipcLog.filter(entry => entry.cmd === "cmd_scan_secrets" && entry.args.repoPath === path).length;
+  const finding = i => ({
+    rule_id: "betterleaks.github-pat", rule_name: "github-pat", path: `src/secret-${i}.env`, line: i + 1,
+    confidence: "high", location: "tracked", secret_group: i + 1,
+  });
   const runButton = () => agentBar().querySelector('button[aria-label^="Run "]');
 
   try {
@@ -338,7 +343,45 @@ export async function runHealthChecks(ctx) {
       has(section("vulnerabilities"), `Local audit incomplete (${coverageGap(failing())}); no all-clear is available.`) && coverageGap(failing()).includes("failed: npm audit"));
     knobs.deps = null;
     await rescan("findings");
-    check("Health never scans coverage, secrets or storage itself", noScans);
+    check("Health never scans coverage or storage itself", noScans);
+
+    // ---- Secrets: a section of Health, with Health's agent bar -------------------
+    check("Health scans secrets once per repository, never again on a local rescan or a remount", () =>
+      secretsScans(REPO) === 1 && secretsScans("/fixture/Other") === 1);
+    check("a clean secrets scan reads as clear in the summary", () =>
+      has(section("summary"), "Secrets none") && has(section("secrets"), "No secrets reported"));
+    knobs.secrets = () => {
+      const findings = Array.from({ length: 12 }, (_, i) => finding(i));
+      return { ...secretsReport(findings) };
+    };
+    button("Rescan secrets").click();
+    await until(() => !button("Rescan secrets").disabled && section("secrets").querySelectorAll("tbody tr").length > 0);
+    await wait();
+    check("secret findings raise the Health verdict and name the facet", () =>
+      has(section("summary"), "Secrets 12 found"));
+    check("secret findings open on the first 8 rows", () =>
+      section("secrets").querySelectorAll("tbody tr").length === 8 && has(section("secrets"), "Show all 12 findings"));
+    section("secrets").querySelector("[data-health-preview-toggle]").click(); await tick();
+    check("Show all reveals every finding", () => section("secrets").querySelectorAll("tbody tr").length === 12);
+    button("Fix with agent").click(); await wait();
+    check("Fix with agent selects the secrets task and opens its prompt for review", () =>
+      agentBar().querySelector('select[aria-label="Health agent task"]').value === "secrets"
+        && agentBar().querySelector("textarea").value.includes("SECRETS SCAN")
+        && has(agentBar(), "Attaches the secrets scan shown below")
+        && document.activeElement === runButton());
+    check("Fix with agent launches nothing on its own", () => get(terminalLaunchRequests) === null);
+    runButton().click(); await tick();
+    check("Run sends the secrets scan on screen, by rule, path and line", () => {
+      const request = get(terminalLaunchRequests);
+      return !!request && request.repoPath === REPO
+        && request.prompt.includes("- [Tracked] src/secret-11.env:12 — github-pat (betterleaks.github-pat), high confidence")
+        && request.prompt.includes("Never print, echo, log, paste or commit a secret value");
+    });
+    terminalLaunchRequests.take(REPO).complete(); await wait();
+    knobs.secrets = null;
+    button("Rescan secrets").click();
+    await until(() => !button("Rescan secrets").disabled);
+    await wait();
   } finally {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     reset();

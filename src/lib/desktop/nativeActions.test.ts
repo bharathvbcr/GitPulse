@@ -75,9 +75,10 @@ describe("dispatchNativeMenu", () => {
       }
     }
     // Written out so a registry that collapsed to nothing could not make the
-    // comparison below pass against an equally empty call list. 16 since
-    // Code's Search and Blame became toggles inside Explorer.
-    expect(expected).toHaveLength(16);
+    // comparison below pass against an equally empty call list. 15 since
+    // Secrets folded into Insights → Health and Code's Search and Blame
+    // became toggles inside Explorer.
+    expect(expected).toHaveLength(15);
     expect(h.calls).toEqual(expected);
   });
 
