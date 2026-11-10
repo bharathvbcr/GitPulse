@@ -69,6 +69,19 @@ describe("DiffViewer source contracts", () => {
     expect(source).toContain("if (whitespaceView || !lineSelectable(index)) return;");
   });
 
+  it("words a failed read through describeFailure and offers Try again, not a spinner or a raw message", () => {
+    // A read that failed is "couldn't determine" (the unknown tone), never a
+    // blank pane or a pass. The headline is the shared template; the backend's
+    // text is only the detail.
+    expect(source).toContain('describeFailure({ verb: "read", object: "this diff" }, diffError)');
+    expect(source).toContain('data-tone="unknown" role="alert"');
+    expect(source).not.toContain("Could not read this diff");
+    expect(source).not.toContain("animate-spin");
+    expect(source.split(">Try again</button>").length - 1).toBe(2); // the diff read and the file list
+    // The commit-history entry from d27e808e stays on the toolbar.
+    expect(source).toContain("data-diff-history-toggle");
+  });
+
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "DiffViewer.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);

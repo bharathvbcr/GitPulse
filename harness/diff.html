@@ -167,29 +167,29 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("a changed line is drawn as the removed and the added text",()=>text().includes("old two")&&text().includes("new two"));
  // --- staging -------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
- check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Unstage Hunk").length===0);
- hunkButtons("Stage Hunk")[1].click();await until(()=>stagingCalls.length===1,"hunk stage");
+ check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Unstage hunk").length===0);
+ hunkButtons("Stage hunk")[1].click();await until(()=>stagingCalls.length===1,"hunk stage");
  check("Stage Hunk marks exactly that hunk's changed lines as the ones to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old forty,new forty");
  stagingCalls.length=0;
  await wait(400);
  await until(()=>lineBoxes().length>0,"line boxes");
  lineBoxes()[0].click();await tick();await wait();
- check("selecting a line shows the selection bar with only Stage Selected",()=>text().includes("1 line selected")&&buttons("Stage Selected").length===1&&buttons("Unstage Selected").length===0);
- buttons("Stage Selected")[0].click();await until(()=>stagingCalls.length===1,"selection stage");
+ check("selecting a line shows the selection bar with only Stage Selected",()=>text().includes("1 line selected")&&buttons("Stage selected").length===1&&buttons("Unstage selected").length===0);
+ buttons("Stage selected")[0].click();await until(()=>stagingCalls.length===1,"selection stage");
  check("Stage Selected marks only the selected line as the one to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old two");
  stagingCalls.length=0;
  await open({text:twoHunks(),truncated:false},{staged:true});
- check("a staged file offers Unstage Hunk and never Stage Hunk",()=>hunkButtons("Unstage Hunk").length===2&&hunkButtons("Stage Hunk").length===0);
+ check("a staged file offers Unstage Hunk and never Stage Hunk",()=>hunkButtons("Unstage hunk").length===2&&hunkButtons("Stage hunk").length===0);
  lineBoxes()[0].click();await tick();await wait();
- check("and its selection bar offers Unstage Selected only",()=>buttons("Unstage Selected").length===1&&buttons("Stage Selected").length===0);
+ check("and its selection bar offers Unstage Selected only",()=>buttons("Unstage selected").length===1&&buttons("Stage selected").length===0);
  // --- truncation ----------------------------------------------------------
  await open({text:twoHunks(),truncated:true,truncation_reason:"the fixture byte cap"});
  check("a backend-truncated diff says why, in the backend's words, and that staging is off",()=>text().includes("the fixture byte cap")&&/Staging is disabled/i.test(text()));
- check("and every Stage Hunk is disabled",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled));
- hunkButtons("Stage Hunk")[0].click();await wait(120);
+ check("and every Stage Hunk is disabled",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>b.disabled));
+ hunkButtons("Stage hunk")[0].click();await wait(120);
  check("a click on a disabled Stage Hunk stages nothing",()=>stagingCalls.length===0);
  lineBoxes()[0].click();await tick();await wait();
- check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage Selected").length===1&&buttons("Stage Selected")[0].disabled);
+ check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage selected").length===1&&buttons("Stage selected")[0].disabled);
  await open({text:twoHunks(),truncated:true});
  check("a truncation with no stated cause still discloses the prefix",()=>text().includes("is incomplete"));
  // --- copy patch ------------------------------------------------------------
@@ -216,20 +216,20 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  await open({text:twoHunks(),truncated:false});
  await until(()=>lineBoxes().length>0,"line boxes");
  lineBoxes()[0].click();await tick();await wait();
- check("with whitespace shown, a line can be selected and staged as before",()=>text().includes("1 line selected")&&!buttons("Stage Selected")[0].disabled);
+ check("with whitespace shown, a line can be selected and staged as before",()=>text().includes("1 line selected")&&!buttons("Stage selected")[0].disabled);
  wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===true,"whitespace on");await wait(400);
  check("turning Ignore whitespace on drops a selection made from the other view",()=>!text().includes("line selected"));
  const wsReason="Turn off Ignore whitespace to stage — this view hides whitespace-only changes";
- check("with it on, every Stage Hunk is disabled and says why",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled&&b.title===wsReason));
+ check("with it on, every Stage Hunk is disabled and says why",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>b.disabled&&b.title===wsReason));
  stagingCalls.length=0;
- hunkButtons("Stage Hunk")[0].click();await wait(150);
+ hunkButtons("Stage hunk")[0].click();await wait(150);
  check("a click on it stages nothing",()=>stagingCalls.length===0);
  check("and the line checkboxes are disabled with the same reason",()=>lineBoxes().length>0&&lineBoxes().every(b=>b.disabled&&b.title===wsReason));
  lineBoxes()[0].click();await tick();await wait();
- check("clicking one selects nothing, so no bar offers Stage Selected",()=>!text().includes("line selected")&&buttons("Stage Selected").length===0);
- check("Stage File is not touched by it",()=>buttons("Stage File").length===1&&!buttons("Stage File")[0].disabled);
+ check("clicking one selects nothing, so no bar offers Stage Selected",()=>!text().includes("line selected")&&buttons("Stage selected").length===0);
+ check("Stage File is not touched by it",()=>buttons("Stage file").length===1&&!buttons("Stage file")[0].disabled);
  wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===false,"whitespace off");await wait(400);
- check("turning it off gives hunk staging back",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>!b.disabled&&b.title===""));
+ check("turning it off gives hunk staging back",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>!b.disabled&&b.title===""));
  lineBoxes()[0].click();await tick();await wait();
  check("and line selection",()=>text().includes("1 line selected"));
  // --- find ----------------------------------------------------------------
@@ -254,7 +254,7 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("Enter in the find box steps to the next match",()=>stepped.defaultPrevented&&/2 of 2/.test(text()));
  fire(findBox(),{key:"Enter",shiftKey:true});await tick();await wait();
  check("and Shift+Enter in it steps back",()=>/1 of 2/.test(text()));
- const onHunk=fire(hunkButtons("Stage Hunk")[0],{key:"Enter"});await tick();await wait();
+ const onHunk=fire(hunkButtons("Stage hunk")[0],{key:"Enter"});await tick();await wait();
  check("Enter on a focused Stage Hunk button with find open is the button's, not a search step",()=>!onHunk.defaultPrevented&&/1 of 2/.test(text()));
  const onClose=fire(preview.querySelector('button[aria-label="Close find"]'),{key:"Enter"});
  check("and so is Enter on Close find",()=>!onClose.defaultPrevented);
@@ -263,7 +263,7 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("Enter on a control outside the pane, such as a dialog's confirm button, is left alone",()=>!enterOutside.defaultPrevented&&/1 of 2/.test(text()));
  const escOutside=fire(outside,{key:"Escape"});await tick();await wait();
  check("Escape aimed at something outside the pane does not close find",()=>!escOutside.defaultPrevented&&Boolean(findBox()));
- const answered=hunkButtons("Stage Hunk")[0];
+ const answered=hunkButtons("Stage hunk")[0];
  const claim=event=>{if(event.key==="Escape")event.preventDefault();};
  answered.addEventListener("keydown",claim);
  fire(answered,{key:"Escape"});await tick();await wait();answered.removeEventListener("keydown",claim);
@@ -468,18 +468,18 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  blobs["bad.png"]={failNew:"blob unreadable",failOld:"blob unreadable"};
  blobCalls.length=0;
  await repoStore.selectFileDiff("bad.png",false);await wait(500);
- check("an image neither side of which can be read says so and why, instead of 'Nothing to compare'",()=>text().includes("Could not read this image")&&text().includes("blob unreadable")&&!text().includes("No image"));
+ check("an image neither side of which can be read says so and why, instead of 'Nothing to compare'",()=>text().includes("Couldn't read this image")&&text().includes("blob unreadable")&&!text().includes("No image"));
  blobs["bad.png"]={base64:"RklYRUQ=",mime:"image/png"};
  blobCalls.length=0;
- buttons("Retry")[0].click();await wait(500);
- check("Retry reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Could not read this image"));
+ buttons("Try again")[0].click();await wait(500);
+ check("Try again reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Couldn't read this image"));
  // --- opening at the configured defaults -----------------------------------
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffWordWrap(true);interfaceStore.setDiffSyntaxHighlight(false);
  await open({text:twoHunks(),truncated:false});
- check("a pane opened under the saved preferences starts split, wrapped and uncoloured",()=>button("Split").getAttribute("aria-pressed")==="true"&&wrapToggle().getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ check("a pane opened under the saved preferences starts split, wrapped and uncoloured",()=>button("Split").getAttribute("aria-pressed")==="true"&&wrapToggle().getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax coloring"]').getAttribute("aria-pressed")==="false");
  button("Unified").click();await tick();await wait(100);
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffSyntaxHighlight(true);await tick();await wait(150);
- check("a preference changed under an open pane does not take the reader's toolbar choice away",()=>button("Unified").getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ check("a preference changed under an open pane does not take the reader's toolbar choice away",()=>button("Unified").getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax coloring"]').getAttribute("aria-pressed")==="false");
  interfaceStore.setDiffLayout("unified");interfaceStore.setDiffWordWrap(false);interfaceStore.setDiffSyntaxHighlight(true);
  await open({text:twoHunks(),truncated:false});
  // --- names ---------------------------------------------------------------

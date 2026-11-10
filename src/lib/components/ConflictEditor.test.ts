@@ -293,8 +293,8 @@ describe("ConflictEditor custom draft lifecycle", () => {
     expect(openingTagContaining("select", "bind:value={selectedFile}"))
       .toContain("disabled={isSaving}");
     for (const label of [
-      "Accept All Current (Ours)",
-      "Accept All Incoming (Theirs)",
+      "Accept all current (ours)",
+      "Accept all incoming (theirs)",
     ]) {
       expect(openingTagContaining("button", label), label).toContain("disabled={isSaving}");
     }

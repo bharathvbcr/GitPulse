@@ -98,9 +98,10 @@ if(params.has("check")) {
 window.addEventListener("error",event=>crashes.push(event.message));
 window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
 const settle = async () => {await tick();await new Promise(resolve=>{const channel=new MessageChannel();channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};channel.port2.postMessage(null);});await tick();};
-const waitFor = async test => {for(let i=0;i<100;i++){await settle();if(test())return;}throw Error("Timed out waiting for UI");};
+const waitFor = async test => {for(let i=0;i<100;i++){await settle();if(test())return;await new Promise(resolve=>setTimeout(resolve,10));}throw Error("Timed out waiting for UI");};
 const button = name => [...document.querySelectorAll("button")].find(b=>b.textContent.trim()===name||b.getAttribute("aria-label")===name);
 const click = async name => {const b=button(name);if(!b)throw Error(`Missing button: ${name}`);if(b.disabled)throw Error(`Disabled button: ${name}`);b.focus();b.click();await settle();};
+const dismiss = async name => {await click(name);for(let i=0;i<100&&document.querySelector('[role="dialog"]');i++)await new Promise(resolve=>setTimeout(resolve,20));await settle();};
 const search = async text => {const input=document.querySelector("#merge-branch-search");input.value=text;input.dispatchEvent(new Event("input",{bubbles:true}));await settle();};
 const check = (name,pass) => results.push({name,pass:Boolean(pass)});
 const dialog = () => document.querySelector('[role="dialog"]');
@@ -344,7 +345,7 @@ if(params.has("check")) {
     await click("Fast-forward merge…");
     check("context menu opens review without merging",merges.length===0&&dialog());
     check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[name="merge-mode"]:checked')?.value==="ff-only");
-    await click("Cancel");
+    await dismiss("Cancel");
     // A menu action closes the menu first, and the branch it acts on is a
     // `{@const}` derived from that menu. Read after the close, it re-derives
     // from a null menu and throws inside the click: nothing is pushed, and
@@ -509,7 +510,7 @@ if(params.has("check")) {
     await click("Select local branch feature/branch-selection");
     current="release/0.0.9";await repoStore.refresh();await settle();
     check("changed destination requires review",button("Merge branch").disabled&&dialog().textContent.includes("checked-out branch changed"));
-    await click("Cancel");current="main";await repoStore.refresh();await settle();
+    await dismiss("Cancel");current="main";await repoStore.refresh();await settle();
     await click("Merge branches");await click("Select local branch feature/branch-selection");
     let finish;pendingMerge=resolve=>finish=resolve;
     await click("Merge branch");await waitFor(()=>finish);
@@ -524,27 +525,27 @@ if(params.has("check")) {
     operation={kind:"Merge",current_step:null,total_steps:null,head_ref:"main",incoming_ref:"topic",conflicted_paths:["conflict.txt"],conflicted_total:1,available:["abort"]};
     await click("Merge branch");await waitFor(()=>button("Resolve conflicts"));
     check("conflicts prevent a second merge",button("Merge branch").disabled);
-    await click("Resolve conflicts");
+    await dismiss("Resolve conflicts");
     check("conflict recovery opens Work Resolve",!dialog()&&get(repoStore).activeTab==="work"&&get(repoStore).viewSections.work==="resolve");
     operation=null;failMerge=false;await repoStore.refresh();await settle();
     await click("Merge branches");await click("Select local branch feature/branch-selection");
     await repoStore.openRepo("/fixture/other");await settle();
     check("repository switching invalidates review",button("Merge branch").disabled&&dialog().textContent.includes("repository changed"));
-    await click("Cancel");
+    await dismiss("Cancel");
     probeFailed=true;await repoStore.refresh();await settle();await click("Merge branches");
     check("unavailable operation check is not idle",dialog().textContent.includes("Could not check for an operation"));
-    await click("Cancel");probeFailed=false;current=null;await repoStore.refresh();await settle();await click("Merge branches");
+    await dismiss("Cancel");probeFailed=false;current=null;await repoStore.refresh();await settle();await click("Merge branches");
     check("detached HEAD explains the required action",dialog().textContent.includes("Check out a local branch")&&button("Merge branch").disabled);
-    await click("Cancel");current="main";branches=[branch("main")];await repoStore.refresh();await settle();await click("Merge branches");
+    await dismiss("Cancel");current="main";branches=[branch("main")];await repoStore.refresh();await settle();await click("Merge branches");
     check("no eligible branches has an honest empty state",dialog().textContent.includes("No other branches are available")&&button("Merge branch").disabled);
-    await click("Cancel");branches=[branch("main"),...Array.from({length:105},(_,i)=>branch(`topic/${String(i).padStart(3,"0")}`))];await repoStore.refresh();await settle();await click("Merge branches");
+    await dismiss("Cancel");branches=[branch("main"),...Array.from({length:105},(_,i)=>branch(`topic/${String(i).padStart(3,"0")}`))];await repoStore.refresh();await settle();await click("Merge branches");
     check("large list states shown and total counts",dialog().textContent.includes("Showing 100 of 105")&&document.querySelectorAll("[data-merge-choice]").length===100);
     await search("topic/104");check("search reaches beyond the displayed cap",button("Select local branch topic/104"));
     await click("Select local branch topic/104");await click("Clear merge search");
     check("selection beyond the cap remains explicit",dialog().textContent.includes("outside these results"));
     await click("Show selected");
     check("show selected reaches a branch beyond the cap",button("Select local branch topic/104").getAttribute("aria-checked")==="true"&&document.activeElement===button("Select local branch topic/104"));
-    await click("Cancel");
+    await dismiss("Cancel");
     check("dismissal restores the merge opener",document.activeElement===button("Merge branches"));
     check("no uncaught runtime errors",crashes.length===0);
     check("all IPC calls have explicit fixtures",unexpected.length===0);

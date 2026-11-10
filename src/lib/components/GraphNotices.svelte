@@ -50,14 +50,14 @@
 
 {#if notices.length > 0}
   <div
-    class="shrink-0 border-b border-border gp-section-edge bg-surface/60 px-3 py-1 text-[11px] text-textMuted"
+    class="shrink-0 bg-surface px-3 py-1 text-meta text-textMuted"
     data-testid="graph-notices"
   >
     <div class="flex items-center gap-1.5">
       <EyeOff size={11} class="shrink-0 opacity-70" />
       {#if many}
         <button
-          class="shrink-0 opacity-70 hover:opacity-100"
+          class="gp-icon-btn shrink-0" data-size="sm"
           aria-expanded={expanded}
           aria-label={expanded ? "Collapse notices" : "Expand notices"}
           onclick={() => (expanded = !expanded)}
@@ -76,7 +76,7 @@
         <span class="shrink-0 opacity-80">{summary.overflow}</span>
       {/if}
       <button
-        class="shrink-0 underline decoration-dotted underline-offset-2 hover:text-textPrimary"
+        class="gp-btn shrink-0" data-variant="ghost" data-size="sm"
         onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:settings"))}
       >
         Settings

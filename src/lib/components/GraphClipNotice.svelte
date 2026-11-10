@@ -15,7 +15,7 @@
   <p
     role="status"
     data-testid="graph-clip-notice"
-    class="shrink-0 border-t border-border/40 bg-surface/80 px-2 py-1 text-[10px] leading-snug text-textMuted"
+    class="shrink-0 bg-surface px-2 py-1 text-micro leading-snug text-textMuted"
   >
     {notice}
   </p>

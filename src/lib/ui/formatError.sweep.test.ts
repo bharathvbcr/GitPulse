@@ -44,6 +44,9 @@ const FORMATTER_SEAM = [
   { marker: "formatError(", importNeedle: "ui/formatError" },
   { marker: "reportPanelError(", importNeedle: "diagnostics/report" },
   { marker: "formatDiagnosticFailure(", importNeedle: "diagnostics/diagnostics" },
+  // `describeFailure` builds its "Couldn't <verb> <object>." headline around
+  // formatError's reason, so it is the same formatter with the house template.
+  { marker: "describeFailure(", importNeedle: "copy/describeFailure" },
 ] as const;
 
 function routesThroughFormatter(source: string): boolean {

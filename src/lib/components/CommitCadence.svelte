@@ -42,7 +42,7 @@
   >
     {#each summary.buckets as bucket, index (bucket.day)}
       <span
-        class="w-[2px] rounded-t-[1px] {bucket.count > 0 ? 'bg-accent' : 'bg-border/70'}"
+        class="w-[2px] rounded-t-xs {bucket.count > 0 ? 'bg-accent' : 'bg-edgeSoft'}"
         style="height: {Math.max(1, Math.round(heights[index] * 12))}px"
       ></span>
     {/each}

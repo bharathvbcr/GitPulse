@@ -104,13 +104,14 @@ describe("CommitDetails single current commit", () => {
   });
 
   it("never renders a zero file count for details that are not loaded", () => {
-    expect(source).toContain('Changed Files ({details ? filesSummary.count : "--"})');
-    expect(source).not.toContain("Changed Files ({filesSummary.count})");
+    expect(source).toContain('Changed files ({details ? filesSummary.count : "--"})');
+    expect(source).not.toContain("Changed files ({filesSummary.count})");
   });
 
-  it("tells a failed details read apart from an empty commit and offers Retry", () => {
+  it("tells a failed details read apart from an empty commit and offers Try again", () => {
     expect(source).toContain('{#if detailsStatus === "error"}');
-    expect(source).toContain("Could not load commit details: {detailsError}");
+    expect(source).toContain("Couldn't load commit details. {detailsError}");
+    expect(source).toContain("Try again</button>");
     expect(source).toContain("onclick={retryDetails}");
     expect(source).toContain("graphStore.selectCommit(selectedCommit)");
   });
@@ -129,7 +130,7 @@ describe("CommitDetails single current commit", () => {
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(preview).toContain("Reading the diff…");
-    expect(preview).toContain("Could not read this diff: {diffError}");
+    expect(preview).toContain("Couldn't read this diff. {diffError}");
     expect(preview).toContain("No changes in this commit");
     expect(preview).toContain("No changes in this file");
     // "No commit selected" is reserved for having no commit at all.
