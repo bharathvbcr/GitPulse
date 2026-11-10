@@ -2,7 +2,7 @@ import { tick } from "svelte";
 import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
 
 /** Real client-runtime regression: a same-size/same-generation payload must repaint. */
-export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => void): Promise<string> {
+export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => void, setFocus: (id: string | null) => void = () => {}): Promise<string> {
   const payload: GraphVizPayload = {
     level: "file", generation_id: 7,
     nodes: [
@@ -60,10 +60,16 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
     if (!element) throw new Error(`Missing control: ${selector}`);
     element.click(); await settle();
   };
+  // The four checkboxes and the language list live in the Filters popover,
+  // which is not in the DOM until it opens (and a scope change closes it).
+  const openFilters = async () => {
+    if (!document.querySelector('.map-filters')) await click('[data-testid="map-filters-toggle"]');
+    if (!document.querySelector('.map-filters input[type="checkbox"]')) throw new Error("Filters popover did not open");
+  };
   setLoad({available:true,kind:"code_graph",path:"/fixture/far",payload:{nodes:[{id:"far",name:"Far away",kind:"file",x:10000,y:10000}],links:[]}});
   await settle();
   for (let i=0;i<10;i++) canvas.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
-  await settle(); await click('.fit-button');
+  await settle(); await click('[data-testid="map-fit"]');
   const bounds = canvas.getBoundingClientRect();
   canvas.dispatchEvent(new MouseEvent('click',{clientX:bounds.left+bounds.width/2,clientY:bounds.top+bounds.height/2,bubbles:true}));
   await settle();
@@ -79,19 +85,21 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
     {source:"root",target:"dependency",kind:"calls"}, {source:"caller",target:"root",kind:"calls"},
   ]}};
   setLoad(explorer); await settle();
-  await click('.map-languages button:nth-child(3)'); // Swift, after Rust's larger count.
+  await openFilters();
+  await click('[data-map-language="swift"]'); // Swift, after Rust's larger count.
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "2 of 36 match filters") throw new Error("Language filter lost Swift nodes");
   await click('.map-filters input[type="checkbox"]');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 36 match filters") throw new Error("Test and language filters do not compose");
   setLoad({...explorer,payload:{...explorer.payload!,generation_id:8}}); await settle();
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 36 match filters") throw new Error("Refresh lost filters");
-  await click('.map-filters button');
+  await click('[data-testid="map-clear-filters"]');
+  await openFilters();
   await click('.map-filters label:nth-child(2) input');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "35 of 36 match filters") throw new Error("Generated path filter failed");
   await click('.map-filters label:nth-child(3) input');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 36 match filters") throw new Error("Connected-only filter retained isolated nodes");
-  await click('.map-filters button');
-  await click('.map-actions > button');
+  await click('[data-testid="map-clear-filters"]');
+  await click('[data-testid="map-nodes-toggle"]');
   await click('button[aria-label="Next nodes"]');
   if (!document.querySelector('.result-heading')?.textContent?.includes("31–36 shown")) throw new Error("Node browser cannot reach later pages");
   const currentSearch = document.querySelector<HTMLInputElement>('input[aria-label="Find a file or symbol"]');
@@ -117,20 +125,23 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
     {id:"doc",name:"Doc",path:"guide.mdx",documentation:true},
   ],links:[{source:"code",target:"note"}]}};
   setLoad(notes); await settle();
+  await openFilters();
   await click('input[aria-label="Hide notes & Markdown"]');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 3 match filters") throw new Error("Notes filter did not hide documentation");
-  await click('.map-actions > button');
+  await click('[data-testid="map-nodes-toggle"]');
   if (document.querySelector('.map-results')?.textContent?.includes("README.md")) throw new Error("Hidden Markdown remained in node browser");
   await click('.map-results button');
   if (document.querySelector('.neighbor-list')?.textContent?.includes("Note")) throw new Error("Hidden note remained in connections");
   setLoad({...notes,payload:{...notes.payload!,nodes:notes.payload!.nodes.map(n=>({...n,documentation:true}))}}); await settle();
   if (document.querySelector('.map-neighbors')) throw new Error("Refresh retained a newly hidden selection");
   if (!document.querySelector('.map-empty')?.textContent?.includes("No nodes match")) throw new Error("All-documentation filter left an unexplained blank canvas");
-  await click('.map-filters button');
+  await click('[data-testid="map-clear-filters"]');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 3 match filters") throw new Error("Clear filters did not restore documents");
+  await openFilters();
   await click('input[aria-label="Hide notes & Markdown"]');
   setLoad({...notes,path:"/fixture/notes-other"}); await settle();
-  if (document.querySelector<HTMLInputElement>('input[aria-label="Hide notes & Markdown"]')?.checked) throw new Error("Repository switch retained notes filter");
+  await openFilters();
+  if (document.querySelector<HTMLInputElement>('input[aria-label="Hide notes & Markdown"]')?.checked !== false) throw new Error("Repository switch retained notes filter");
   setLoad({available: true, kind: "code_graph", payload: JSON.parse('{"nodes":[null,{"id":"a","name":12,"language":{}},{"id":"b","name":"B"},{"id":"bad"},{"id":"bad"}],"links":[null,{"source":"a","target":"b"},{"source":"bad","target":"b"}]}')});
   await settle();
   if (!document.querySelector('[data-testid="code-graph-nodes-label"]')?.textContent?.includes("2 of 5")) {
@@ -160,7 +171,47 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
   canvas.dispatchEvent(new MouseEvent('click',{clientX:fitBounds.left+fitBounds.width/2,clientY:fitBounds.top+fitBounds.height/2,bubbles:true}));
   await settle();
   if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("First fit")) throw new Error("First payload after a scope change was not fitted");
-  return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
+  // Duplicate names: repeated file names read as their shortest unique path suffix.
+  setLoad({available:true,kind:"code_graph",path:"/fixture/dupes",payload:{level:"file",nodes:[
+    {id:"src/a/mod.rs",name:"mod.rs",kind:"file",path:"src/a/mod.rs",x:100,y:100},
+    {id:"src/b/mod.rs",name:"mod.rs",kind:"file",path:"src/b/mod.rs",x:200,y:100},
+    {id:"unique.rs",name:"unique.rs",kind:"file",path:"unique.rs",x:300,y:100},
+  ],links:[]}});
+  await settle();
+  await click('[data-testid="map-nodes-toggle"]');
+  const browser = document.querySelector('.map-results')?.textContent ?? "";
+  if (!browser.includes("a/mod.rs") || !browser.includes("b/mod.rs") || !browser.includes("unique.rs")) throw new Error(`Repeated names were not told apart: ${browser}`);
+  await click('[data-testid="map-nodes-toggle"]');
+  // Globe: only the file and symbol graphs offer it; it is opt-in and flat by default.
+  const globeNodes = Array.from({length:60},(_,i) => ({id:`pkg-${i % 6}/file-${i}.ts`,name:`file-${i}.ts`,kind:"file",path:`pkg-${i % 6}/file-${i}.ts`,community:`pkg-${i % 6}`,degree:i % 5}));
+  const globeLinks = globeNodes.slice(1).map(n => ({source:globeNodes[0].id,target:n.id,kind:"imports"}));
+  const layout = () => document.querySelector('[data-testid="map-layout"]');
+  setLoad({available:true,kind:"code_graph",path:"/fixture/globe",payload:{nodes:globeNodes,links:globeLinks}});
+  await settle();
+  if (layout()) throw new Error("Globe toggle offered for a graph with no file/symbol level");
+  setLoad({available:true,kind:"code_graph",path:"/fixture/globe",payload:{level:"file",nodes:globeNodes,links:globeLinks}});
+  await settle();
+  if (!layout()) throw new Error("Globe toggle missing on the file graph");
+  const toggle = (name: string) => [...document.querySelectorAll<HTMLButtonElement>('[data-testid="map-layout"] button')].find(b => b.textContent?.trim() === name);
+  if (toggle("Flat")?.getAttribute("aria-pressed") !== "true") throw new Error("Globe is not opt-in: the default is not Flat");
+  const flatPixels = canvas.toDataURL();
+  toggle("Globe")?.click(); await settle();
+  if (toggle("Globe")?.getAttribute("aria-pressed") !== "true") throw new Error("Globe toggle did not engage");
+  if (!canvas.getAttribute("aria-label")?.includes("rotate")) throw new Error("Canvas label does not describe rotation in globe mode");
+  const globePixels = canvas.toDataURL();
+  if (globePixels === flatPixels) throw new Error("Globe did not repaint the canvas");
+  canvas.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true})); await settle();
+  if (canvas.toDataURL() === globePixels) throw new Error("Arrow keys did not rotate the globe");
+  // Focus request: selects the node and, on the globe, turns it to face front.
+  setFocus("pkg-3/file-3.ts"); await settle();
+  await new Promise<void>(resolve => setTimeout(resolve, 450)); await settle();
+  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("file-3.ts")) throw new Error("focusNodeId did not select the node on the globe");
+  toggle("Flat")?.click(); await settle();
+  setFocus(null); await settle();
+  setFocus("pkg-4/file-4.ts"); await settle();
+  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("file-4.ts")) throw new Error("focusNodeId did not select the node in the flat view");
+  setFocus(null); await settle();
+  return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, repeated-name labels, globe toggle and rotation, focus requests, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
 }
 
 /** Measure mounted Svelte + canvas work, including actual frame completion. */
@@ -194,7 +245,7 @@ export async function stressDevmap(setLoad: (load: GraphVizLoad) => void): Promi
         const worst = samples[samples.length-1];
         results.push(`${shape} ${width}px: load ${Math.round(loadMs)}ms, frame max ${Math.round(worst)}ms`);
         if (loadMs > 4000 || worst > 500) throw new Error(`Stress responsiveness exceeded its budget: ${results.join("; ")}`);
-        if (map.querySelectorAll('.community-chip').length > 41) throw new Error(`Unbounded community controls: ${map.querySelectorAll('.community-chip').length}; ${results.join("; ")}`);
+        if (map.querySelectorAll('[data-map-group]').length > 41) throw new Error(`Unbounded community controls: ${map.querySelectorAll('[data-map-group]').length}; ${results.join("; ")}`);
       }
     }
   } finally { map.style.width = originalWidth; }

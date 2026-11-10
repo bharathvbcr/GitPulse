@@ -7,6 +7,7 @@ import {
 import { buildCodeGraphModel } from "../../../codeintel/graphPayload";
 import type { GraphVizPayload } from "../../../codeintel/types";
 import { getLanguageIconColor } from "../../../language/languageLogos";
+import type { ProjectedPoint } from "../../../codeintel/globeLayout";
 
 function recordingCtx() {
   const calls: string[] = [];
@@ -177,5 +178,56 @@ describe("CodeGraphRenderer", () => {
 
     const miss = hitTestCodeGraph(model, 10, 10, 0, 0, 1);
     expect(miss).toBeNull();
+  });
+});
+
+describe("CodeGraphRenderer globe mode", () => {
+  const model = buildCodeGraphModel({ nodes: [
+    { id: "near", name: "near", kind: "file", path: "a/near.ts", community: "g", degree: 4 },
+    { id: "limb", name: "limb", kind: "file", path: "a/limb.ts", community: "g", degree: 3 },
+    { id: "far", name: "far", kind: "file", path: "a/far.ts", community: "g", degree: 2 },
+  ], links: [{ source: "near", target: "far", kind: "imports" }, { source: "near", target: "limb", kind: "imports" }] });
+  const at = (x: number, y: number, depth: number): ProjectedPoint => ({ x, y, depth, front: depth > 0 });
+  const frame = { projection: [at(100, 100, 0.9), at(300, 100, 0.1), at(200, 200, -0.8)], cx: 200, cy: 150, radius: 140 };
+  const base = { model, widthCss: 400, heightCss: 300, panX: 999, panY: 999, scale: 9, selectedId: null, hoveredId: null, theme: DEFAULT_CODE_GRAPH_THEME, globe: frame };
+
+  it("never hits a back-hemisphere node or a link into it, and ignores pan and scale", () => {
+    expect(hitTestCodeGraph(model, 200, 200, 0, 0, 1, null, frame)).toBeNull();
+    expect(hitTestCodeGraph(model, 150, 150, 0, 0, 1, null, frame)).toBeNull();
+    expect(hitTestCodeGraph(model, 100, 100, 0, 0, 1, null, frame)?.id).toBe("near");
+    expect(hitTestCodeGraph(model, 100, 100, 500, -300, 7, null, frame)?.id).toBe("near");
+    expect(hitTestCodeGraph(model, 200, 100, 0, 0, 1, null, frame)?.kind).toBe("link");
+  });
+
+  it("paints the limb, draws the far hemisphere first and dimmer, and skips edges into it", () => {
+    const { ctx, calls } = recordingCtx();
+    const alphas: number[] = [];
+    vi.spyOn(ctx, "fill").mockImplementation(() => { alphas.push(ctx.globalAlpha); });
+    paintCodeGraph(ctx, { ...base, showLabels: false });
+    expect(calls.filter(c => c === "arc")).toHaveLength(4); // limb + three nodes
+    expect(alphas[0]).toBeCloseTo(0.18); // far, painted first
+    expect(alphas.slice(1)).toEqual([1, 1]);
+    expect(calls.filter(c => c === "lineTo")).toHaveLength(1); // near-limb link; near-far hidden
+  });
+
+  it("never labels back-face or limb-hugging nodes", () => {
+    const { ctx } = recordingCtx();
+    const labels = vi.spyOn(ctx, "fillText");
+    paintCodeGraph(ctx, { ...base, hoveredId: null });
+    const text = labels.mock.calls.map(([t]) => t);
+    expect(text).toContain("near");
+    expect(text).not.toContain("far");
+    expect(text).not.toContain("limb");
+  });
+
+  it("labels flat nodes with their disambiguated display label", () => {
+    const flat = buildCodeGraphModel({ nodes: [
+      { id: "a/mod.rs", name: "mod.rs", kind: "file", path: "a/mod.rs", x: 50, y: 50 },
+      { id: "b/mod.rs", name: "mod.rs", kind: "file", path: "b/mod.rs", x: 150, y: 50 },
+    ], links: [] });
+    const { ctx } = recordingCtx();
+    const labels = vi.spyOn(ctx, "fillText");
+    paintCodeGraph(ctx, { model: flat, widthCss: 400, heightCss: 300, panX: 0, panY: 0, scale: 1, selectedId: null, hoveredId: null, theme: DEFAULT_CODE_GRAPH_THEME });
+    expect(labels.mock.calls.map(([t]) => t).sort()).toEqual(["a/mod.rs", "b/mod.rs"]);
   });
 });

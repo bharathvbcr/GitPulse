@@ -17,6 +17,7 @@
   };
   let load: GraphVizLoad | null = $state({ available: true, kind: "code_graph", payload: fixture });
   let opened = $state("");
+  let focusId = $state<string | null>(null);
   let show = $state(true);
   let verdict = $state("");
   let checking = $state(false);
@@ -28,7 +29,7 @@
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
     try {
-      const result = await (stress ? stressDevmap : runDevmapChecks)(next => load = next);
+      const result = await (stress ? stressDevmap : (setLoad: (next: GraphVizLoad | null) => void) => runDevmapChecks(setLoad, id => focusId = id))(next => load = next);
       for (let i=0;i<3;i++) await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
       if (errors.length) throw new Error(`Browser runtime errors: ${errors.join("; ")}`);
       verdict = result;
@@ -40,6 +41,19 @@
       checking = false;
     }
   }
+  // `?check=1` (the measurement runner) runs both suites and reports the verdict.
+  async function reportChecks() {
+    const results: Array<{ name: string; pass: boolean }> = [];
+    const errors: string[] = [];
+    for (const [name, stress] of [["runtime checks", false], ["stress checks", true]] as const) {
+      await runChecks(stress);
+      results.push({ name, pass: verdict.startsWith("PASS") });
+      if (!verdict.startsWith("PASS")) errors.push(`${name}: ${verdict}`);
+    }
+    document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify([verdict]) })));
+    const report = new URLSearchParams(location.search).get("report");
+    if (report) await fetch(report, { method: "POST", body: document.documentElement.outerHTML });
+  }
   onMount(async () => {
     themeStore.setTheme(new URLSearchParams(location.search).get("theme") === "light" ? "light" : "dark");
     if (new URLSearchParams(location.search).has("real")) {
@@ -47,6 +61,7 @@
       if (!response.ok) throw new Error(`Preview fixture: ${response.status}`);
       load = {available: true, kind: "code_graph", payload: await response.json()};
     }
+    if (new URLSearchParams(location.search).has("check")) await reportChecks();
   });
 </script>
 <div style="display:flex;gap:8px;align-items:center;padding:24px 20px 8px;background:#10151f;color:#9baac0;font:11px system-ui">
@@ -59,4 +74,4 @@
   <button onclick={() => show = !show}>Toggle mount</button>
   <span data-testid="opened-file">{opened}</span>
 </div>
-{#if show}<CodeGraphCanvas {load} onOpenNode={(path) => opened = path} />{/if}
+{#if show}<CodeGraphCanvas {load} focusNodeId={focusId} onOpenNode={(path) => opened = path} />{/if}

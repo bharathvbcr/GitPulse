@@ -83,3 +83,51 @@ describe("buildCodeGraphModel layout space", () => {
     expect(graph.buildCodeGraphModel(payload).nodes.map((n) => [n.x, n.y])).toEqual(fixed.nodes.map((n) => [n.x, n.y]));
   });
 });
+
+describe("CodeGraphCanvas globe, focus and design-rule pins", () => {
+  it("offers the globe only on the file and symbol levels, flat by default, and keeps the choice for the session", () => {
+    expect(source).toContain('/^(?:file|symbol)s?$/.test(model.level ?? "")');
+    expect(source).toContain("let globeChoice = false;");
+    expect(source).toContain("let globeOn = $state(globeChoice);");
+    expect(source).toContain("const globeActive = $derived(globeOn && globeAvailable);");
+    // The sphere layout runs only while the globe is showing.
+    expect(source).toMatch(/unitPoints = \$derived\.by\(\(\) => globeActive \? layoutOnSphere\(model\) : \[\]\)/);
+  });
+
+  it("rotates on drag and arrow keys, faces the focused node, and jumps under reduced motion", () => {
+    expect(source).toContain("rotateByDrag(");
+    expect(source).toContain("rotationToFace(point)");
+    expect(source).toContain("prefersReducedMotion()");
+    expect(source).toContain("cancelAnimationFrame");
+    expect(source).toContain("Drag to rotate");
+    expect(source).toMatch(/Code map, globe view\. Drag to rotate/);
+    // The flat view's selection re-anchor is skipped on the globe.
+    expect(source).toContain("oldNode && newNode && !globeActive");
+  });
+
+  it("takes focusNodeId, applies it once per id after the scope effect, and reveals a filtered-out node", () => {
+    expect(source).toContain("focusNodeId?: string | null;");
+    const scopeEffect = source.indexOf("const nextScope = scopeKey");
+    const focusEffect = source.indexOf("const wanted = focusNodeId");
+    expect(scopeEffect).toBeGreaterThan(0);
+    expect(focusEffect).toBeGreaterThan(scopeEffect);
+    expect(source).toContain("appliedFocusId === wanted");
+    expect(source).toContain("if (!visibleIds.has(wanted)) clearFilters();");
+  });
+
+  it("carries no colour literals, uppercase tracking labels or off-scale weights", () => {
+    expect(source).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(source).not.toMatch(/text-transform:\s*uppercase|letter-spacing|font-weight:\s*(?:550|650)/);
+    expect(source).not.toContain("DEPENDENCY MAP");
+    expect(source).not.toContain("Code graph canvas");
+    expect(source).not.toContain("Loading graph");
+    expect(source).toContain("<Skeleton");
+    expect(source).not.toMatch(/\.(?:map-button|community-chip|language-swatch|fit-button|map-search)\b/);
+  });
+
+  it("shows path context for repeated names without changing ids", () => {
+    expect(source).toContain("node.label");
+    expect(source).toContain("nodePathText(row.node)");
+    expect(source).toContain("focusNode(row.node.id)");
+  });
+});

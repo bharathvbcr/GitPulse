@@ -9,6 +9,7 @@ import type { GraphVizCounts, GraphVizLink, GraphVizNode } from "./types";
 import { DOC_GRAPH_EXTENT } from "../docs/docGraphPayload";
 import { getLanguageDisplayName, resolveLanguageIconKey, type LanguageIconKey } from "../language/languageLogos";
 import { nodeFilePath } from "./nodeLabel";
+import { disambiguateSuffixes, splitSegments } from "./labelDisambiguation";
 import { asRecord } from "../record";
 
 /**
@@ -40,6 +41,12 @@ export function graphLanguageLegend(nodes: GraphVizNode[]): Array<{ key: Languag
 }
 
 export interface LaidOutNode extends GraphVizNode {
+  /**
+   * What the canvas shows: the shortest path suffix that is unique among the
+   * model's nodes of the same kind. Display only: search, ids and open-in-editor
+   * keep using `id`, `name` and `path`.
+   */
+  label: string;
   x: number;
   y: number;
   radius: number;
@@ -193,7 +200,7 @@ export function layoutNodes(
   const result = nodes.map((node): LaidOutNode => {
     const degree = Math.max(1, asFinite(node.degree, asFinite(node.val, 1)));
     const laidOut = {
-      ...node, x: 0, y: 0,
+      ...node, label: node.name || node.id, x: 0, y: 0,
       radius: Math.min(9, 4 + Math.sqrt(degree)),
       colorIndex: colors.get(nodeCommunity(node)) ?? 0,
     };
@@ -299,22 +306,91 @@ export function isGraphTestPath(path: string): boolean {
     /(?:^test[_.-]|[._-](?:tests?|specs?)$|(?:Tests?|Specs?)$)/.test(stem);
 }
 
-function communityLabel(name: string, nodes: LaidOutNode[]): string {
-  if (name !== "_" && !/^community[-_]\d+$/.test(name)) return name;
+/** The directory a node lives in, or its whole area for a subsystem. */
+function nodePathSegments(node: GraphVizNode): string[] {
+  const path = node.path?.trim() || node.area?.trim() || nodeFilePath(node.id) || node.id;
+  const segments = splitSegments(path);
+  const name = node.name || node.id;
+  // A symbol lives inside its file: `a/b.rs` + `new` reads `b.rs/new`.
+  if (segments.length === 0 || segments[segments.length - 1] !== name) segments.push(name);
+  return segments;
+}
+
+/**
+ * Give every node the shortest path suffix that is unique among nodes of its
+ * kind (`src/mod.rs` vs `framework/muda/src`). Computed once over the whole
+ * model, so a label that is unique here is unique in any filtered subset.
+ * Nodes that no suffix can separate (same path, same name) keep their name.
+ */
+function assignNodeLabels(nodes: LaidOutNode[]): void {
+  const byKind = new Map<string, LaidOutNode[]>();
+  for (const node of nodes) {
+    const bucket = byKind.get(node.kind ?? "") ?? [];
+    bucket.push(node);
+    byKind.set(node.kind ?? "", bucket);
+  }
+  for (const group of byKind.values()) {
+    const byId = new Map(group.map(node => [node.id, node]));
+    const segments = new Map(group.map(node => [node.id, nodePathSegments(node)]));
+    const labels = disambiguateSuffixes(
+      group.map(node => node.id),
+      id => segments.get(id) ?? [],
+      id => byId.get(id)?.name || id,
+    );
+    for (const node of group) node.label = labels.get(node.id) ?? (node.name || node.id);
+  }
+}
+
+interface CommunityCaption {
+  label: string;
+  /** Dominant source directory, whole; empty when the caption is not path-derived. */
+  directory: string;
+}
+
+function communityLabel(name: string, nodes: LaidOutNode[]): CommunityCaption {
+  if (name !== "_" && !/^community[-_]\d+$/.test(name)) return { label: name, directory: "" };
   // Test suites often outnumber the source files in a community. Prefer its
   // source area for the caption, without excluding tests from the graph.
   // Each file gets one vote even in a graph with many symbols per file.
   const paths = [...new Set(nodes.map(node => (node.path || "").replace(/\\/g, "/")).filter(Boolean))];
   const sourcePaths = paths.filter(path => !isGraphTestPath(path));
   const directories = new Map<string, number>();
+  const whole = new Map<string, string>();
   for (const path of sourcePaths.length ? sourcePaths : paths) {
     const parts = path.split("/");
     parts.pop();
     const directory = parts.slice(-2).join("/");
-    if (directory) directories.set(directory, (directories.get(directory) ?? 0) + 1);
+    if (directory) {
+      directories.set(directory, (directories.get(directory) ?? 0) + 1);
+      if (!whole.has(directory)) whole.set(directory, parts.join("/"));
+    }
   }
-  return [...directories].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0]
-    ?? (name === "_" ? "Ungrouped" : name.replace(/^community[-_]/, "Group "));
+  const top = [...directories].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+  if (top) return { label: top, directory: whole.get(top) ?? top };
+  return { label: name === "_" ? "Ungrouped" : name.replace(/^community[-_]/, "Group "), directory: "" };
+}
+
+/**
+ * Chips whose captions collide are widened with path segments until they
+ * differ. Two groups that share the same dominant directory cannot be told
+ * apart by path, so the next discriminator is their most connected member.
+ */
+function disambiguateCommunities(communities: GraphCommunity[], directories: ReadonlyMap<string, string>, hubs: ReadonlyMap<string, string>): void {
+  const counts = new Map<string, number>();
+  for (const group of communities) counts.set(group.label, (counts.get(group.label) ?? 0) + 1);
+  const colliding = communities.filter(group => (counts.get(group.label) ?? 0) > 1 && group.label !== group.name);
+  if (!colliding.length) return;
+  const byName = new Map(colliding.map(group => [group.name, group]));
+  const widened = disambiguateSuffixes(
+    colliding.map(group => group.name),
+    name => splitSegments(directories.get(name) ?? ""),
+    name => byName.get(name)?.label ?? name,
+  );
+  for (const group of colliding) {
+    const label = widened.get(group.name);
+    if (label && directories.get(group.name)) group.label = label;
+    else if (hubs.get(group.name)) group.label += ` · ${hubs.get(group.name)}`;
+  }
 }
 
 /**
@@ -421,6 +497,9 @@ export function buildCodeGraphModel(
     members.push(node);
     grouped.set(name, members);
   }
+  assignNodeLabels(nodes);
+  const directories = new Map<string, string>();
+  const hubs = new Map<string, string>();
   const communities: GraphCommunity[] = [...grouped].map(([name, members]) => {
     const minX = Math.min(...members.map(n => n.x - n.radius));
     const maxX = Math.max(...members.map(n => n.x + n.radius));
@@ -432,21 +511,19 @@ export function buildCodeGraphModel(
       const raw = nodesRaw[indexById.get(n.id) ?? -1];
       return Number.isFinite(raw?.x) && Number.isFinite(raw?.y);
     });
+    const caption = communityLabel(name, members);
+    directories.set(name, caption.directory);
+    const hub = members.reduce((best, n) => (n.degree ?? 0) > (best.degree ?? 0) || ((n.degree ?? 0) === (best.degree ?? 0) && n.id < best.id) ? n : best);
+    hubs.set(name, hub.label);
     return {
-      name, label: communityLabel(name, members), shown: members.length,
+      name, label: caption.label, shown: members.length,
       count: Math.max(members.length, count(communityCounts?.[name])),
       colorIndex: members[0].colorIndex,
       bounds: hasCoordinates ? null : { x, y, radius },
     };
   }).sort((a, b) => b.shown - a.shown || a.name.localeCompare(b.name));
 
-  const labelCounts = new Map<string, number>();
-  for (const group of communities) labelCounts.set(group.label, (labelCounts.get(group.label) ?? 0) + 1);
-  for (const group of communities) {
-    if ((labelCounts.get(group.label) ?? 0) > 1 && group.label !== group.name) {
-      group.label += ` · ${group.name.replace(/^community[-_]/, "#")}`;
-    }
-  }
+  disambiguateCommunities(communities, directories, hubs);
 
   const gen = typeof data.generation_id === "number" && Number.isFinite(data.generation_id) ? data.generation_id : textValue(data.generation_id);
   return {

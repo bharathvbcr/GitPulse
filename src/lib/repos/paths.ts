@@ -1,3 +1,5 @@
+import { disambiguateSuffixes } from "../codeintel/labelDisambiguation";
+
 export interface PathIdentityOptions {
   caseInsensitive: boolean;
 }
@@ -102,61 +104,10 @@ export function displayName(path: string): string {
 }
 
 /**
- * Last `depth` segments joined with "/", capped at the whole path. Depth 1 is
- * the bare display name; every deepening step prepends one more segment.
+ * Repository labels: the leaf, widened with parent segments only where two
+ * paths share a leaf. The algorithm lives in codeintel (one owner, shared with
+ * the code-graph model); this supplies the path-identity rules.
  */
-function suffixLabel(path: string, depth: number): string {
-  const parts = pathSegments(path);
-  const width = Math.min(Math.max(depth, 1), parts.length);
-  return parts.slice(parts.length - width).join("/");
-}
-
 export function disambiguateLabels(paths: string[]): Map<string, string> {
-  const labels = new Map<string, string>();
-  const groups = new Map<string, string[]>();
-  for (const path of paths) {
-    const name = displayName(path);
-    const bucket = groups.get(name) ?? [];
-    bucket.push(path);
-    groups.set(name, bucket);
-  }
-  for (const [name, group] of groups) {
-    if (group.length === 1) {
-      labels.set(group[0], name);
-      continue;
-    }
-    // Widening collision resolution: `parent/name` still collides when two
-    // repos share both leaf and parent (`/a/x/y` vs `/b/x/y`), so keep
-    // prepending segments — grandparent, then great-grandparent — until every
-    // member's label is unique within the group. Input order decides who
-    // claims a label first; identical normalized paths share a label by
-    // construction and fall back to the caller's displayName.
-    const claimed = new Set<string>();
-    let pending = [...group];
-    for (let depth = 2; pending.length > 0; depth += 1) {
-      const byLabel = new Map<string, string[]>();
-      for (const path of pending) {
-        const label = suffixLabel(path, depth);
-        const bucket = byLabel.get(label) ?? [];
-        bucket.push(path);
-        byLabel.set(label, bucket);
-      }
-      const nextPending: string[] = [];
-      for (const [label, members] of byLabel) {
-        if (members.length === 1 && !claimed.has(label)) {
-          labels.set(members[0], label);
-          claimed.add(label);
-        } else {
-          nextPending.push(...members);
-        }
-      }
-      pending = nextPending;
-      if (pending.length > 0 && pending.every((path) => pathSegments(path).length <= depth)) {
-        // Every remaining path has run out of segments: they normalize to the
-        // same string, so no deepening can separate them.
-        break;
-      }
-    }
-  }
-  return labels;
+  return disambiguateSuffixes(paths, pathSegments, displayName);
 }
