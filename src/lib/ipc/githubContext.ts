@@ -74,18 +74,7 @@ export function invalidateGitHubContext(repoPath?: string): void {
   else entries.delete(repoPath);
 }
 
-/**
- * `invoke`, except `cmd_github_context` goes through the shared read. Every
- * other command is passed through untouched.
- */
-export const invokeSharingGitHubContext: typeof invoke = <T>(
-  command: string,
-  args?: Parameters<typeof invoke>[1],
-  options?: Parameters<typeof invoke>[2],
-): Promise<T> => {
-  const repoPath = typeof args === "object" && args !== null && "repoPath" in args ? args.repoPath : undefined;
-  if (command === "cmd_github_context" && typeof repoPath === "string") {
-    return sharedGitHubContext(repoPath, () => invoke<T>(command, args, options));
-  }
-  return invoke<T>(command, args, options);
-};
+/** The GitHub context for a repository, through the shared read. Read-only. */
+export function readGitHubContext<T>(repoPath: string, options: { force?: boolean } = {}): Promise<T> {
+  return sharedGitHubContext(repoPath, () => invoke<T>("cmd_github_context", { repoPath }), options);
+}

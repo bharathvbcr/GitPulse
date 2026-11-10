@@ -2,7 +2,7 @@ import { withDeadline } from "../async/deadline";
 import { WORK_DEADLINE_MESSAGE, workTimeout } from "./request";
 import { validateWorkResponse } from "./contracts";
 import { invoke } from "../ipc/invoke";
-import { invokeSharingGitHubContext } from "../ipc/githubContext";
+import { readGitHubContext } from "../ipc/githubContext";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
@@ -83,11 +83,15 @@ export async function loadWork(
 ): Promise<WorkProjection> {
   // The real IPC shares one GitHub read with the other panels; an injected
   // `invoke` is a test's private seam and is called as given.
-  const nativeCall = deps.invoke ?? invokeSharingGitHubContext;
+  const nativeCall = deps.invoke ?? invoke;
+  const sharesGitHub = deps.invoke === undefined;
   const deadline = Date.now() + workTimeout(deps.timeoutMs);
   const call: typeof invoke = async <T>(command: string, args?: Parameters<typeof invoke>[1], options?: Parameters<typeof invoke>[2]): Promise<T> => {
     if (deps.signal?.aborted) throw new Error("Overview refresh superseded");
-    const result = await withDeadline(() => nativeCall<T>(command, args, options), deadline - Date.now(), { signal: deps.signal, message: WORK_DEADLINE_MESSAGE });
+    const read = sharesGitHub && command === "cmd_github_context"
+      ? () => readGitHubContext<T>(repoPath)
+      : () => nativeCall<T>(command, args, options);
+    const result = await withDeadline(read, deadline - Date.now(), { signal: deps.signal, message: WORK_DEADLINE_MESSAGE });
     validateWorkResponse(command, result);
     return result;
   };
