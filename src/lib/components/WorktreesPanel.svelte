@@ -26,6 +26,7 @@
     RefreshCw,
   } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
+  import BranchNameSuggestion from "./BranchNameSuggestion.svelte";
   import { agentKind, agentKindLabel, agentSessionSlug, isAgentWorktree, isGitPulseLane } from "../work/agentWorktree";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { trustExtended } from "../repos/trustExtension";
@@ -722,6 +723,7 @@
           class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
       </div>
+      <BranchNameSuggestion onUse={(name) => (newBranch = name)} />
       <input
         bind:value={sparsePathsInput}
         placeholder="sparse paths, comma-separated (optional, e.g. src/auth)"
