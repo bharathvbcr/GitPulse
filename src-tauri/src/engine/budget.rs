@@ -40,11 +40,15 @@
 /// cap, so nothing renderable is lost to it.
 pub const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
-/// `git blame --line-porcelain` output for one file.
+/// `git blame --porcelain` output for one file.
 ///
-/// Porcelain emits ~10 metadata lines per source line, so this is deliberately
-/// larger than the file-content budget for the same file: 16 MiB of porcelain
-/// is roughly a 40k-line file, past which the blame gutter is not usable.
+/// Porcelain states a commit's ~10 metadata lines once and costs a header line
+/// (`<oid> <orig> <final>`, about 50 bytes) plus the line's own text for every
+/// source line, so this is deliberately larger than the file-content budget
+/// for the same file. A file whose blame outgrows it is refused by name
+/// (`Blame unavailable: exceeded ...`), never returned as a prefix. The
+/// largest file that fits depends on its line length and on how many distinct
+/// commits touched it; see the blame ceiling tests in `git_reader`.
 pub const MAX_BLAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// One working-tree or blob file loaded into the viewer.

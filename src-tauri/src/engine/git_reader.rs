@@ -1439,13 +1439,15 @@ impl GitReader {
         // "weird?.txt" with no such literal file fails outright), and it
         // rejects pathspec magic entirely ("fatal: no such path
         // ':(literal)...' in HEAD"), so prefixing would break every call.
-        // `--line-porcelain` emits ~10 metadata lines per source line, so a
-        // large file's blame is an order of magnitude bigger than the file
-        // itself. This Vec-only API cannot label a prefix as incomplete, so
-        // hitting the cap must fail visibly instead of returning partial data.
+        // `--porcelain` states a commit's ~10 metadata lines once and then
+        // costs one header line per source line, so a file's blame is a small
+        // multiple of the file itself (`--line-porcelain` repeated the metadata
+        // for every line). This Vec-only API cannot label a prefix as
+        // incomplete, so hitting the cap must fail visibly instead of
+        // returning partial data.
         let result = git_text_capped(
             &repo,
-            &["blame", "--line-porcelain", "--", file_path],
+            &["blame", "--porcelain", "--", file_path],
             budget::MAX_BLAME_BYTES,
         );
         let (stdout, incomplete) = match result {
@@ -1487,7 +1489,7 @@ impl GitReader {
         if let Some(reason) = incomplete {
             return Err(format!("Blame unavailable: {}", reason.describe()).into());
         }
-        Ok(parse_blame_porcelain(&stdout))
+        parse_blame_porcelain(&stdout, false)
     }
 
     /// Lists every path the file explorer may show: tracked files plus
@@ -2718,14 +2720,14 @@ impl GitReader {
                 break;
             }
 
-            let mut args = vec!["blame", "--line-porcelain", "-w"];
+            let mut args = vec!["blame", "--porcelain", "-w"];
             args.extend(mailmap_flag("blame"));
             args.extend([head, "--", file_path.as_str()]);
 
-            let stdout = match git_text_capped(repo, &args, blame_cap) {
+            let (stdout, cut) = match git_text_capped(repo, &args, blame_cap) {
                 Ok((out, incomplete)) => {
                     blame_cut_short |= incomplete.is_some();
-                    out
+                    (out, incomplete.is_some())
                 }
                 Err(_) => {
                     blame_failed = true;
@@ -2733,7 +2735,12 @@ impl GitReader {
                 }
             };
 
-            let lines = parse_blame_porcelain(&stdout);
+            // A prefix is kept as a lower bound (flagged above); anything else
+            // the parser refuses is a failed blame, never a partial one.
+            let Ok(lines) = parse_blame_porcelain(&stdout, cut) else {
+                blame_failed = true;
+                continue;
+            };
             if lines.is_empty() {
                 continue;
             }
@@ -6074,13 +6081,13 @@ fn blame_at_revision(
     // path, not a pathspec, and rejects `:(literal)` magic.
     let (stdout, incomplete) = git_text_capped(
         repo,
-        &["blame", "--line-porcelain", oid, "--", file_path],
+        &["blame", "--porcelain", oid, "--", file_path],
         budget::MAX_BLAME_BYTES,
     )?;
     if let Some(reason) = incomplete {
         return Err(format!("Blame unavailable: {}", reason.describe()).into());
     }
-    Ok(parse_blame_porcelain(&stdout))
+    parse_blame_porcelain(&stdout, false)
 }
 
 /// A new file has content but no committed author. Preserve every line while
@@ -6139,7 +6146,7 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, Co
     Ok(lines)
 }
 
-/// Returns the commit oid when `line` opens a `--line-porcelain` header.
+/// Returns the commit oid when `line` opens a `--porcelain` header.
 ///
 /// Oid length depends on the repository hash (SHA-1: 40, SHA-256: 64), so any
 /// 32–64 character hex token qualifies; once a first header pins the expected
@@ -6157,54 +6164,170 @@ fn blame_header_oid(line: &str, expected_len: Option<usize>) -> Option<&str> {
     }
 }
 
-/// Parses `git blame --line-porcelain` output. See [`blame_header_oid`] for
-/// how the commit oid is recognised across hash algorithms.
-fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
-    let mut blame_lines = Vec::new();
-    let mut current_sha = String::new();
-    let mut current_author = String::new();
-    let mut current_email = String::new();
-    let mut current_time: i64 = 0;
-    let mut line_no = 0usize;
-    let mut oid_len: Option<usize> = None;
-    // `previous` is emitted only when the commit has a parent to blame
-    // through, so it is reset at every header: `--line-porcelain` repeats the
-    // whole block per line, and a stale value would point a root commit's
-    // line at an unrelated parent.
-    let mut current_previous: Option<(String, String)> = None;
+/// What `git blame --porcelain` states once per commit, at its first group.
+#[derive(Default)]
+struct BlameCommit {
+    author: Option<String>,
+    email: Option<String>,
+    time: Option<i64>,
+    /// `previous` as the commit's first `filename` block gave it.
+    previous: Option<(String, String)>,
+    /// A `filename` line has been seen for this commit.
+    pathed: bool,
+}
 
-    for line in stdout.lines() {
+/// The group a header opened: `left` more content lines are owed to it.
+struct BlameGroup {
+    oid: String,
+    left: usize,
+    /// `previous` for every line of the group: the commit's own, or the one
+    /// the group's `filename` block restated (a commit that touched more than
+    /// one path restates `previous` and `filename` per group).
+    previous: Option<(String, String)>,
+}
+
+fn malformed_blame(why: &str) -> CommandError {
+    format!("Blame unavailable: git printed a blame this reader cannot trust ({why})").into()
+}
+
+/// Parses `git blame --porcelain` output. See [`blame_header_oid`] for how the
+/// commit oid is recognised across hash algorithms.
+///
+/// `--porcelain` states a commit's author fields once, at its first group, and
+/// later groups of the same commit carry only `<oid> <orig> <final> [<count>]`,
+/// so the commit's fields are remembered. A header's `<count>` opens a group
+/// of exactly that many content lines; a header without one continues it.
+///
+/// Fails closed, never returns a partial blame as complete: a content line
+/// before any header, a group continued by a different commit or left open, a
+/// line number that skips, a commit used before its author was stated, a
+/// header with no content line, and output that stops mid-line are all errors.
+///
+/// `cut_short` is for output the caller already knows was cut at a cap or a
+/// deadline: the unfinished tail is dropped and the complete lines before it
+/// are returned (the caller marks its own result as a lower bound).
+fn parse_blame_porcelain(stdout: &str, cut_short: bool) -> Result<Vec<BlameLine>, CommandError> {
+    let text = if cut_short {
+        stdout.rfind('\n').map_or("", |end| &stdout[..=end])
+    } else if stdout.is_empty() || stdout.ends_with('\n') {
+        stdout
+    } else {
+        return Err(malformed_blame("the output stops inside a line"));
+    };
+    let mut commits: HashMap<String, BlameCommit> = HashMap::new();
+    let mut blame_lines: Vec<BlameLine> = Vec::new();
+    let mut group: Option<BlameGroup> = None;
+    let mut awaiting_content = false;
+    let mut block_previous: Option<(String, String)> = None;
+    let mut oid_len: Option<usize> = None;
+
+    for line in text.lines() {
         if let Some(content) = line.strip_prefix('\t') {
-            line_no += 1;
-            let (previous_commit, previous_path) = match &current_previous {
+            if !awaiting_content {
+                return Err(malformed_blame("a content line has no header"));
+            }
+            awaiting_content = false;
+            let open = group
+                .as_mut()
+                .ok_or_else(|| malformed_blame("a content line has no group"))?;
+            let commit = &commits[&open.oid];
+            let (Some(author), Some(email), Some(time)) =
+                (&commit.author, &commit.email, commit.time)
+            else {
+                return Err(malformed_blame(
+                    "a commit is used before its author is stated",
+                ));
+            };
+            let (previous_commit, previous_path) = match &open.previous {
                 Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
                 None => (None, None),
             };
             blame_lines.push(BlameLine {
-                line_no,
-                commit_id: current_sha.clone(),
-                author_name: current_author.clone(),
-                author_email: current_email.clone(),
-                timestamp: current_time,
+                line_no: blame_lines.len() + 1,
+                commit_id: open.oid.clone(),
+                author_name: author.clone(),
+                author_email: email.clone(),
+                timestamp: time,
                 content: content.to_string(),
                 previous_commit,
                 previous_path,
             });
-        } else if let Some(author) = line.strip_prefix("author ") {
-            current_author = author.to_string();
-        } else if let Some(mail) = line.strip_prefix("author-mail ") {
-            current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
-        } else if let Some(time) = line.strip_prefix("author-time ") {
-            current_time = time.parse().unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("previous ") {
-            current_previous = parse_blame_previous(rest, oid_len);
+            open.left -= 1;
         } else if let Some(oid) = blame_header_oid(line, oid_len) {
+            if awaiting_content {
+                return Err(malformed_blame("a header follows a header with no line"));
+            }
+            let number = |field: Option<&str>| field.and_then(|f| f.parse::<usize>().ok());
+            let mut fields = line.split_whitespace().skip(1);
+            let (Some(_original), Some(final_line)) =
+                (number(fields.next()), number(fields.next()))
+            else {
+                return Err(malformed_blame("a header has no line numbers"));
+            };
+            let count = fields.next();
+            if fields.next().is_some() || count.is_some_and(|c| number(Some(c)).is_none()) {
+                return Err(malformed_blame("a header has extra fields"));
+            }
+            if final_line != blame_lines.len() + 1 {
+                return Err(malformed_blame("a line number is skipped or repeated"));
+            }
             oid_len = Some(oid.len());
-            current_sha = oid.to_string();
-            current_previous = None;
+            match number(count) {
+                Some(0) => return Err(malformed_blame("a group of no lines")),
+                Some(lines) => {
+                    if group.as_ref().is_some_and(|open| open.left > 0) {
+                        return Err(malformed_blame("a group ends before its last line"));
+                    }
+                    let commit = commits.entry(oid.to_string()).or_default();
+                    group = Some(BlameGroup {
+                        oid: oid.to_string(),
+                        left: lines,
+                        previous: commit.previous.clone(),
+                    });
+                    block_previous = None;
+                }
+                None => {
+                    if !group
+                        .as_ref()
+                        .is_some_and(|open| open.left > 0 && open.oid == oid)
+                    {
+                        return Err(malformed_blame("a line belongs to no open group"));
+                    }
+                }
+            }
+            awaiting_content = true;
+        } else {
+            if !awaiting_content {
+                return Err(malformed_blame("commit fields appear outside a header"));
+            }
+            let Some(open) = group.as_mut() else {
+                return Err(malformed_blame("commit fields have no group"));
+            };
+            let commit = commits.entry(open.oid.clone()).or_default();
+            if let Some(author) = line.strip_prefix("author ") {
+                commit.author = Some(author.to_string());
+            } else if let Some(mail) = line.strip_prefix("author-mail ") {
+                commit.email = Some(mail.trim_matches(|c| c == '<' || c == '>').to_string());
+            } else if let Some(time) = line.strip_prefix("author-time ") {
+                commit.time = Some(time.parse().unwrap_or(0));
+            } else if let Some(rest) = line.strip_prefix("previous ") {
+                block_previous = parse_blame_previous(rest, oid_len);
+            } else if line.starts_with("filename ") {
+                // `previous` precedes `filename` in a block, and a block that
+                // names a path restates it for this group even when absent.
+                if !commit.pathed {
+                    commit.pathed = true;
+                    commit.previous = block_previous.clone();
+                }
+                open.previous = block_previous.take();
+            }
+            // committer*, summary, boundary, ignored, unblamable: not carried.
         }
     }
-    blame_lines
+    if !cut_short && (awaiting_content || group.is_some_and(|open| open.left > 0)) {
+        return Err(malformed_blame("the output ends inside a group"));
+    }
+    Ok(blame_lines)
 }
 
 /// Parses the `<oid> <path>` tail of a porcelain `previous` line. The oid must
@@ -10742,9 +10865,10 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .is_none());
     }
 
-    fn blame_block(oid: &str, content: &str) -> String {
+    /// One complete group of one line, the way `--line-porcelain` states it.
+    fn blame_block(oid: &str, line: usize, content: &str) -> String {
         format!(
-            "{oid} 1 1 1\n\
+            "{oid} {line} {line} 1\n\
              author T\n\
              author-mail <t@example.com>\n\
              author-time 1700000000\n\
@@ -10764,11 +10888,15 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     #[test]
     fn test_blame_porcelain_accepts_sha256_oid_length() {
         let oid64 = "b".repeat(64);
-        let lines = parse_blame_porcelain(&format!(
-            "{}{}",
-            blame_block(&oid64, "alpha"),
-            blame_block(&oid64, "beta")
-        ));
+        let lines = parse_blame_porcelain(
+            &format!(
+                "{}{}",
+                blame_block(&oid64, 1, "alpha"),
+                blame_block(&oid64, 2, "beta")
+            ),
+            false,
+        )
+        .unwrap();
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|l| l.commit_id.len() == 64));
         assert_eq!(lines[0].line_no, 1);
@@ -10776,22 +10904,26 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(lines[0].author_email, "t@example.com");
 
         let oid40 = "a".repeat(40);
-        let lines = parse_blame_porcelain(&blame_block(&oid40, "gamma"));
+        let lines = parse_blame_porcelain(&blame_block(&oid40, 1, "gamma"), false).unwrap();
         assert_eq!(lines[0].commit_id.len(), 40);
     }
 
-    /// `previous` belongs to the header it follows. `--line-porcelain`
-    /// repeats every block, so a root commit's line after a non-root one must
-    /// not inherit the earlier line's parent.
+    /// `previous` belongs to the block it sits in. A block that restates the
+    /// commit's `filename` without a `previous` (a root commit's path) must not
+    /// inherit an earlier group's parent.
     #[test]
     fn test_blame_porcelain_previous_is_per_header_and_unquoted() {
         let a = "a".repeat(40);
         let p = "1".repeat(40);
-        let with_previous = blame_block(&a, "child").replace(
+        let with_previous = blame_block(&a, 1, "child").replace(
             "filename f.txt",
             &format!("previous {p} \"dir/sp\\303\\251c \\\"x\\\".txt\"\nfilename f.txt"),
         );
-        let lines = parse_blame_porcelain(&format!("{with_previous}{}", blame_block(&a, "root")));
+        let lines = parse_blame_porcelain(
+            &format!("{with_previous}{}", blame_block(&a, 2, "root")),
+            false,
+        )
+        .unwrap();
         assert_eq!(lines[0].previous_commit.as_deref(), Some(p.as_str()));
         assert_eq!(
             lines[0].previous_path.as_deref(),
@@ -10801,11 +10933,14 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(lines[1].previous_path, None);
 
         // A wrong-length oid or a malformed quoted name never becomes a target.
-        let bad = blame_block(&a, "x").replace(
+        let bad = blame_block(&a, 1, "x").replace(
             "filename f.txt",
             &format!("previous {} f.txt\nfilename f.txt", "1".repeat(64)),
         );
-        assert_eq!(parse_blame_porcelain(&bad)[0].previous_commit, None);
+        assert_eq!(
+            parse_blame_porcelain(&bad, false).unwrap()[0].previous_commit,
+            None
+        );
         assert_eq!(unquote_c_style("\"bad\\q\""), None);
         assert_eq!(unquote_c_style("\"trailing\\\""), None);
         assert_eq!(
@@ -10817,19 +10952,425 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     #[test]
     fn test_blame_porcelain_pins_oid_length_after_first_header() {
         let oid64 = "b".repeat(64);
-        let mut stream = blame_block(&oid64, "real");
+        let mut stream = blame_block(&oid64, 1, "real");
         // A 40-char token arriving after the length was pinned to 64 must not
-        // hijack blame attribution for later lines.
-        stream.push_str(&format!("{} 9 9 1\n", "c".repeat(40)));
+        // hijack blame attribution for later lines: it is not a header, so
+        // the line after it has none, and the stream is refused whole rather
+        // than attributed to the commit before it (the old parser's answer).
+        stream.push_str(&format!("{} 2 2 1\n", "c".repeat(40)));
         stream.push_str("\thijack probe\n");
-        let lines = parse_blame_porcelain(&stream);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[1].commit_id.len(),
-            64,
+        assert!(
+            parse_blame_porcelain(&stream, false).is_err(),
             "pinned length must reject mismatched oids"
         );
-        assert_eq!(lines[1].content, "hijack probe");
+    }
+
+    /// The `--line-porcelain` parser this module shipped before blame moved to
+    /// `--porcelain`, kept only as the oracle the parity tests compare against.
+    fn oracle_line_porcelain(stdout: &str) -> Vec<BlameLine> {
+        let mut blame_lines = Vec::new();
+        let mut current_sha = String::new();
+        let mut current_author = String::new();
+        let mut current_email = String::new();
+        let mut current_time: i64 = 0;
+        let mut line_no = 0usize;
+        let mut oid_len: Option<usize> = None;
+        let mut current_previous: Option<(String, String)> = None;
+        for line in stdout.lines() {
+            if let Some(content) = line.strip_prefix('\t') {
+                line_no += 1;
+                let (previous_commit, previous_path) = match &current_previous {
+                    Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
+                    None => (None, None),
+                };
+                blame_lines.push(BlameLine {
+                    line_no,
+                    commit_id: current_sha.clone(),
+                    author_name: current_author.clone(),
+                    author_email: current_email.clone(),
+                    timestamp: current_time,
+                    content: content.to_string(),
+                    previous_commit,
+                    previous_path,
+                });
+            } else if let Some(author) = line.strip_prefix("author ") {
+                current_author = author.to_string();
+            } else if let Some(mail) = line.strip_prefix("author-mail ") {
+                current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
+            } else if let Some(time) = line.strip_prefix("author-time ") {
+                current_time = time.parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("previous ") {
+                current_previous = parse_blame_previous(rest, oid_len);
+            } else if let Some(oid) = blame_header_oid(line, oid_len) {
+                oid_len = Some(oid.len());
+                current_sha = oid.to_string();
+                current_previous = None;
+            }
+        }
+        blame_lines
+    }
+
+    /// The IPC JSON of `lines`. Git stamps an uncommitted line with the moment
+    /// it ran, which differs between two runs, so that one value is zeroed.
+    fn blame_json(lines: &[BlameLine]) -> String {
+        let steady: Vec<BlameLine> = lines
+            .iter()
+            .cloned()
+            .map(|mut line| {
+                if line.commit_id.bytes().all(|b| b == b'0') {
+                    line.timestamp = 0;
+                }
+                line
+            })
+            .collect();
+        serde_json::to_string(&steady).unwrap()
+    }
+
+    /// `git blame <args>` read both ways: the oracle over `--line-porcelain`
+    /// and the shipped parser over `--porcelain`.
+    fn blame_both_ways(repo: &Path, args: &[&str]) -> (Vec<BlameLine>, Vec<BlameLine>) {
+        let run = |format: &str| {
+            let mut argv = vec!["blame", format];
+            argv.extend_from_slice(args);
+            git_text_capped(repo, &argv, 32 * 1024 * 1024).unwrap().0
+        };
+        let old = oracle_line_porcelain(&run("--line-porcelain"));
+        let new = parse_blame_porcelain(&run("--porcelain"), false).unwrap();
+        (old, new)
+    }
+
+    /// Commits `message` as `name <email>`; `name` is raw bytes so an author
+    /// that is not UTF-8 can be recorded.
+    #[cfg(unix)]
+    fn commit_as(dir: &Path, name: &[u8], email: &str, message: &str) {
+        use std::os::unix::ffi::OsStrExt;
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
+            .args(["commit", "-q", "-m", message])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", std::ffi::OsStr::from_bytes(name))
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", "Committer")
+            .env("GIT_COMMITTER_EMAIL", "c@example.com")
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Every shape a blame has to attribute: three authors editing one file,
+    /// a rename edited in place (the file's lines come from two paths), the
+    /// root commit's boundary lines, CRLF text, a last line with no newline,
+    /// an empty file, an author that is not UTF-8, and uncommitted lines.
+    #[cfg(unix)]
+    fn blame_parity_repo() -> tempfile::TempDir {
+        // No seed commit: Ann's commit is the root, so its lines are boundary.
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let root = dir.path();
+        let write = |name: &str, text: &[u8]| std::fs::write(root.join(name), text).unwrap();
+        let story = |tag: &str| -> Vec<u8> {
+            (1..=6)
+                .map(|n| format!("{tag} line {n}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        write("story.txt", &story("a"));
+        // Long enough for git to see the rename (it needs similar content).
+        let old: String = (1..=20).map(|n| format!("original line {n}\n")).collect();
+        write("old.txt", old.as_bytes());
+        write("crlf.txt", b"one\r\ntwo\r\nthree\r\n");
+        write("nonl.txt", b"first\nlast without newline");
+        write("empty.txt", b"");
+        write("dirty.txt", b"d1\nd2\nd3\n");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Ann", "ann@example.com", "one");
+
+        let edit = |name: &str, from: &str, to: &str| {
+            let text = std::fs::read_to_string(root.join(name)).unwrap();
+            std::fs::write(root.join(name), text.replacen(from, to, 1)).unwrap();
+        };
+        edit("story.txt", "a line 2", "b line 2");
+        edit("story.txt", "a line 5", "b line 5");
+        git_in(root, &["mv", "old.txt", "moved.txt"]);
+        edit("moved.txt", "original line 7\n", "line 7 by bob\n");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Bob", "bob@example.com", "two");
+
+        edit("story.txt", "a line 4", "c line 4");
+        let mut story_text = std::fs::read_to_string(root.join("story.txt")).unwrap();
+        story_text.push_str("c line 7\nc line 8\n");
+        std::fs::write(root.join("story.txt"), story_text).unwrap();
+        edit("dirty.txt", "d2", "d2 by cy");
+        edit("crlf.txt", "two", "two edited");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Cy", "cy@example.com", "three");
+
+        write("latin.txt", b"l1\nl2\n");
+        git_in(root, &["add", "latin.txt"]);
+        commit_as(root, b"Ren\xe9 Latin", "rene@example.com", "four");
+
+        // Uncommitted: an edit in the middle and a new last line.
+        edit("dirty.txt", "d1", "d1 uncommitted");
+        let mut dirty = std::fs::read_to_string(root.join("dirty.txt")).unwrap();
+        dirty.push_str("d4 uncommitted\n");
+        std::fs::write(root.join("dirty.txt"), dirty).unwrap();
+        dir
+    }
+
+    /// The parser that reads `--porcelain` gives, line for line and byte for
+    /// byte of the IPC JSON, what the `--line-porcelain` parser gave on the
+    /// same repository, in the working tree and at a revision, and the shipped
+    /// `get_file_blame` answers the same. No call site passes `-M` or `-C`.
+    #[cfg(unix)]
+    #[test]
+    fn porcelain_blame_equals_line_porcelain_blame_on_every_shape() {
+        let dir = blame_parity_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let mut compared = 0;
+        let mut zero_oid_lines = 0;
+        let mut restated_paths = 0;
+        for file in [
+            "story.txt",
+            "moved.txt",
+            "crlf.txt",
+            "nonl.txt",
+            "empty.txt",
+            "dirty.txt",
+            "latin.txt",
+        ] {
+            for revision in [None, Some("HEAD"), Some("HEAD~1")] {
+                if file == "dirty.txt" && revision.is_none() {
+                    // Uncommitted lines only exist in the working tree.
+                } else if revision.is_some() && file == "latin.txt" && revision == Some("HEAD~1") {
+                    continue; // the file does not exist there
+                }
+                let mut args: Vec<&str> = Vec::new();
+                if let Some(revision) = revision {
+                    args.push(revision);
+                }
+                args.extend(["--", file]);
+                let (old, new) = blame_both_ways(&repo, &args);
+                assert_eq!(
+                    blame_json(&old),
+                    blame_json(&new),
+                    "{file} at {revision:?}: --porcelain differs from --line-porcelain"
+                );
+                let shipped = GitReader::get_file_blame(path, file, revision).unwrap();
+                assert_eq!(
+                    blame_json(&shipped),
+                    blame_json(&old),
+                    "{file} {revision:?}"
+                );
+                zero_oid_lines += new
+                    .iter()
+                    .filter(|l| l.commit_id.starts_with("0000"))
+                    .count();
+                restated_paths += new.iter().filter(|l| l.previous_path.is_some()).count();
+                compared += new.len();
+            }
+        }
+        // The comparison was not vacuous.
+        let raw = git_text_capped(&repo, &["blame", "--porcelain", "--", "story.txt"], 1 << 20)
+            .unwrap()
+            .0;
+        assert!(
+            raw.contains("\nboundary\n"),
+            "root-commit lines are boundary"
+        );
+        assert!(compared > 60, "{compared} lines compared");
+        assert!(zero_oid_lines >= 2, "uncommitted lines were compared");
+        assert!(restated_paths >= 1, "a `previous` header was compared");
+        // The renamed file's lines come from two paths: git names the older
+        // one in a `filename` line of its own.
+        let moved = git_text_capped(&repo, &["blame", "--porcelain", "--", "moved.txt"], 1 << 20)
+            .unwrap()
+            .0;
+        assert!(
+            moved.contains("\nfilename old.txt\n") && moved.contains("\nfilename moved.txt\n"),
+            "the filename changes inside one file's blame: {moved}"
+        );
+        let story = GitReader::get_file_blame(path, "story.txt", None).unwrap();
+        let authors: HashSet<&str> = story.iter().map(|l| l.author_name.as_str()).collect();
+        assert_eq!(authors, HashSet::from(["Ann", "Bob", "Cy"]));
+        let latin = GitReader::get_file_blame(path, "latin.txt", None).unwrap();
+        // Git re-encodes the byte on its way out, so this names the author
+        // whole; the lossy decode of a truly invalid name is the same call
+        // for both parsers (they read the same `&str`).
+        assert!(latin[0].author_name.starts_with("Ren"), "{:?}", latin[0]);
+        let crlf = GitReader::get_file_blame(path, "crlf.txt", None).unwrap();
+        assert_eq!(crlf[0].content, "one", "CRLF is stripped as it always was");
+        let nonl = GitReader::get_file_blame(path, "nonl.txt", None).unwrap();
+        assert_eq!(nonl[1].content, "last without newline");
+        assert!(GitReader::get_file_blame(path, "empty.txt", None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Output cut at ANY byte is an error or a prefix made of whole lines that
+    /// equal the full parse's: never a short line, never a line attributed to
+    /// another commit. With `cut_short` (the caller knows the output was cut)
+    /// it is always the complete lines before the cut.
+    #[cfg(unix)]
+    #[test]
+    fn a_blame_cut_at_any_byte_fails_closed_or_is_a_whole_prefix() {
+        let dir = blame_parity_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let full_text =
+            git_text_capped(&repo, &["blame", "--porcelain", "--", "story.txt"], 1 << 20)
+                .unwrap()
+                .0;
+        assert!(full_text.is_ascii());
+        let full = parse_blame_porcelain(&full_text, false).unwrap();
+        assert_eq!(full.len(), 8);
+        let groups = full_text
+            .lines()
+            .filter(|l| blame_header_oid(l, None).is_some() && l.split_whitespace().count() == 4)
+            .count();
+        let mut whole_prefixes = 0;
+        for cut in 0..full_text.len() {
+            let prefix = &full_text[..cut];
+            match parse_blame_porcelain(prefix, false) {
+                Ok(lines) => {
+                    whole_prefixes += 1;
+                    assert_eq!(
+                        blame_json(&lines),
+                        blame_json(&full[..lines.len()]),
+                        "cut {cut} returned a different blame"
+                    );
+                }
+                Err(error) => assert!(
+                    error.message().contains("Blame unavailable"),
+                    "{}",
+                    error.message()
+                ),
+            }
+            let lines = parse_blame_porcelain(prefix, true).unwrap();
+            assert_eq!(
+                blame_json(&lines),
+                blame_json(&full[..lines.len()]),
+                "cut_short {cut}"
+            );
+        }
+        // Only the cuts that land exactly between groups read as a smaller,
+        // whole blame (the caller's cap flag is what tells that apart).
+        assert!(
+            whole_prefixes <= groups,
+            "{whole_prefixes} prefixes parsed, {groups} groups"
+        );
+        assert!(parse_blame_porcelain(&full_text[..full_text.len() - 1], false).is_err());
+    }
+
+    #[test]
+    fn a_blame_that_names_a_commit_it_never_described_is_refused() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let described = blame_block(&a, 1, "x");
+        let refused = |text: String, why: &str| {
+            let error = parse_blame_porcelain(&text, false)
+                .expect_err(why)
+                .message()
+                .to_string();
+            assert!(error.contains("Blame unavailable"), "{why}: {error}");
+        };
+        // A header and its line, but no author block ever.
+        refused(format!("{a} 1 1 1\n\tx\n"), "never described");
+        // A continuation line for a commit that is not the open group.
+        refused(
+            format!("{described}{b} 2 2\n\ty\n"),
+            "a bare header for an unknown commit",
+        );
+        // A bare header after a group that is already full.
+        refused(
+            format!("{described}{a} 2 2\n\ty\n"),
+            "a bare header with no open group",
+        );
+        // A new group for a commit whose fields were never stated.
+        refused(
+            format!("{described}{b} 2 2 1\n\ty\n"),
+            "a second commit with no fields",
+        );
+        refused("\tstray\n".to_string(), "content with no header");
+        refused("author T\n".to_string(), "fields with no header");
+        refused(
+            format!("{described}{a} 3 3 1\nauthor T\n\tz\n"),
+            "a skipped line number",
+        );
+        refused(
+            format!("{a} 1 1 2\nauthor T\n{a} 2 2 1\n\tx\n"),
+            "a header where the first line should be",
+        );
+        refused(
+            blame_block(&a, 1, "x").replacen("1 1 1", "1 1 2", 1),
+            "a group of two that stops at one",
+        );
+        refused(format!("{a} 1 1 0\n"), "a group of no lines");
+        refused(format!("{a} one 1 1\n"), "a header with no numbers");
+        refused(
+            described.trim_end_matches('\n').to_string(),
+            "output that stops inside a line",
+        );
+        // The same cut is a lower bound when the caller knows it was cut.
+        assert!(
+            parse_blame_porcelain(described.trim_end_matches('\n'), true)
+                .unwrap()
+                .is_empty()
+        );
+        // ...but a cut never excuses a line that is wrong, only one missing.
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 2\nauthor T\n\tx\n"), true).is_err());
+        let short_group = blame_block(&a, 1, "x").replacen("1 1 1", "1 1 2", 1);
+        assert_eq!(parse_blame_porcelain(&short_group, true).unwrap().len(), 1);
+    }
+
+    /// A repository holding one commit that adds `lines` lines of 100 bytes
+    /// (101 with the newline) to `big.txt`.
+    fn one_commit_big_file(lines: usize) -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        let body: String = (0..lines)
+            .map(|n| format!("{n:06} {}\n", "x".repeat(93)))
+            .collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        git_in(dir.path(), &["add", "big.txt"]);
+        git_in(dir.path(), &["commit", "-q", "-m", "big"]);
+        dir
+    }
+
+    /// `--line-porcelain` repeated a commit's metadata for EVERY line, so a
+    /// one-commit file of 100,000 lines (10 MB of text) outgrew the 16 MiB cap
+    /// and was refused ("exceeded 16 MB"). `--porcelain` states a commit's
+    /// metadata once, so the same file is its text plus one header per line
+    /// and blames whole.
+    #[test]
+    fn blame_past_the_old_line_porcelain_ceiling_is_complete() {
+        let dir = one_commit_big_file(100_000);
+        let path = dir.path().to_str().unwrap();
+        let lines = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
+            .expect("a 100,000-line one-commit file is under the cap");
+        assert_eq!(lines.len(), 100_000);
+        assert_eq!(lines[0].line_no, 1);
+        assert_eq!(lines[99_999].line_no, 100_000);
+        assert!(lines[99_999].content.starts_with("099999 "));
+        assert!(lines.iter().all(|l| l.commit_id == lines[0].commit_id));
+    }
+
+    /// The cap itself still holds: a file whose porcelain exceeds
+    /// [`budget::MAX_BLAME_BYTES`] is refused for its size by name, never
+    /// returned as an empty or partial blame.
+    #[test]
+    fn blame_over_the_porcelain_cap_is_refused_for_size_never_partial() {
+        let dir = one_commit_big_file(120_000);
+        let path = dir.path().to_str().unwrap();
+        let error = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
+            .expect_err("a blame over the cap must not be returned");
+        let message = error.message();
+        assert!(
+            message.contains("Blame unavailable") && message.contains("exceeded"),
+            "the refusal must name the size limit: {message}"
+        );
     }
 
     #[test]
