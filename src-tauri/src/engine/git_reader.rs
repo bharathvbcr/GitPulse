@@ -6348,7 +6348,21 @@ enum NumstatReach {
 /// ride on the command line (`git diff` takes no `--pathspec-from-file`), whose
 /// limit is smallest on Windows (about 32 KiB for the whole line). Past either
 /// bound the whole tree is read, which is slower but cannot be wrong.
-const MAX_NUMSTAT_PATHSPECS: usize = 512;
+///
+/// The count is where limiting stops paying in wall time, measured on
+/// 2026-11-10 by the `repo_read` bench (`numstat_paired`, rows
+/// `get_status <N> dirty`): 50k tracked files in 500 directories, 24-line files,
+/// n=21 counterbalanced pairs per count, host load 9-15 on 18 cores, null check
+/// passed (the 2000-dirty arms run the same code and agreed). Limited minus
+/// whole, median wall: 1 dirty -29 ms, 50 -23, 100 -10 (smaller in 17/21
+/// rounds, min 139 vs 154), 200 +16 (5/21, min 194 vs 172), 300 +31 (2/21), 500
+/// +57 (1/21). The same-code null pair at 2000 reads +16 (7/21), so +16 is the
+/// noise floor and 200 is not distinguishable from it; the rule took the largest
+/// count whose median AND min are not worse than whole-tree, erring low: 100.
+/// Child CPU is lower at every count up to 500 (about -47% at 1, -41% at 100,
+/// -24% at 500), so the cap is set by wall time. Unmeasured: path depth and
+/// length (the byte bound below caps total argument size regardless).
+const MAX_NUMSTAT_PATHSPECS: usize = 100;
 const MAX_NUMSTAT_PATHSPEC_BYTES: usize = 16 * 1024;
 
 /// The literal pathspecs for the paths of `rows` (both sides of a rename or
@@ -13841,6 +13855,45 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             spawned[0]
         );
         assert!(limited.contains("additions: 2"), "churn was counted");
+    }
+
+    /// The form switches exactly at the cap, counted on the numstat child's
+    /// argv: `MAX_NUMSTAT_PATHSPECS` changed files are read through a pathspec
+    /// list, one more reads the whole tree, and the rows are the whole-tree
+    /// read's either way. No timing: which form ran is read off the command.
+    #[test]
+    fn status_numstat_switches_form_exactly_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        for n in 0..=MAX_NUMSTAT_PATHSPECS {
+            std::fs::write(root.join(format!("f{n:03}.txt")), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let change = |count: usize| {
+            for n in 0..count {
+                std::fs::write(root.join(format!("f{n:03}.txt")), "a\nb\n").unwrap();
+            }
+        };
+        change(MAX_NUMSTAT_PATHSPECS);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        let argv = &spawned[0];
+        let at = argv.iter().position(|arg| arg == "--").expect("at the cap");
+        assert_eq!(
+            argv.len() - at - 1,
+            MAX_NUMSTAT_PATHSPECS,
+            "one spec per file"
+        );
+        change(MAX_NUMSTAT_PATHSPECS + 1);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "one past the cap reads the whole tree: {:?}",
+            spawned[0]
+        );
     }
 
     /// A path that is not valid UTF-8 reaches the report with replacement
