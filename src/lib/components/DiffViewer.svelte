@@ -67,7 +67,7 @@
     type RailEntry,
   } from "../diff/fileRail";
   import { createCommitPicker, type CommitFilesRead } from "../diff/commitPick";
-  import { commitLabel, compareLabel, type RailTab } from "../diff/historyRail";
+  import { commitLabel, compareLabel, toggleHistoryView, type RailTab } from "../diff/historyRail";
   import { createCommitHover } from "../diff/commitHover";
   import { shortHash } from "../format";
   import type { CommitBody, CompareFiles, CommitNote } from "../diff/compareTypes";
@@ -90,6 +90,7 @@
     ChevronUp,
     Copy,
     FileCode,
+    GitBranch,
     Loader2,
     Palette,
     PanelLeftOpen,
@@ -1106,12 +1107,7 @@
     if (event.code === "KeyH" && !event.shiftKey) {
       if (typing) return;
       event.preventDefault();
-      if (!railOpen || railTab !== "history") {
-        railOpen = true;
-        railTab = "history";
-      } else {
-        railTab = "files";
-      }
+      toggleHistory();
       return;
     }
     if (event.key === "PageDown" || event.key === "PageUp") {
@@ -1143,6 +1139,31 @@
     openFile: (commitId, path) => void repoStore.selectCommitFileDiff(commitId, path),
     openCommit: (commitId) => void repoStore.selectCommitDiff(commitId),
   });
+
+  /** ⌥H and the toolbar's History button: one rule, {@link toggleHistoryView}. */
+  function toggleHistory(): void {
+    ({ open: railOpen, tab: railTab } = toggleHistoryView({ open: railOpen, tab: railTab }));
+  }
+
+  /** The empty diff's way into History: always lands on it, never toggles away. */
+  function showHistory(): void {
+    railOpen = true;
+    railTab = "history";
+  }
+
+  /** Whether the History tab is what the rail is showing right now. */
+  const historyShowing = $derived(railOpen && hasRail && railTab === "history");
+
+  /**
+   * A diff with nothing in it is where a reader is most likely to be looking
+   * for a commit to open, so it offers the graph rather than only describing
+   * where else to go. Not offered when History is already beside it.
+   */
+  const emptyAction = $derived(
+    historyRows.length > 0 && !historyShowing
+      ? { label: "Browse commit history", icon: GitBranch, onClick: showHistory }
+      : undefined,
+  );
 
   /**
    * A commit picked in the History tab. The Files tab comes forward with it:
@@ -1712,9 +1733,11 @@
   </div>
 
   <!-- Controls: how the diff is read. Separated from identity so neither row
-       has to shed labels at a narrow width. -->
+       has to shed labels at a narrow width. Wraps for the identity row's
+       reason: at a 420px pane the controls measured 694px wide and the
+       layout toggles ran off an edge no scrollbar reaches. -->
   <div
-    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/30 px-3 py-1 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/60 gp-section-edge bg-surface/30 px-3 py-1 font-sans"
   >
     {#if !railOpen && hasRail}
       <button
@@ -1725,6 +1748,26 @@
       >
         <PanelLeftOpen size={13} />
         Files
+      </button>
+    {/if}
+
+    <!-- The commit graph's way in from the toolbar. The rail's own History
+         tab is only reachable while the rail is open, and ⌥H is invisible
+         until someone tells you about it; this is on screen either way. -->
+    {#if historyRows.length > 0}
+      <button
+        type="button"
+        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] {historyShowing
+          ? 'border-accent/60 bg-accent/10 text-accent'
+          : 'text-textMuted'}"
+        aria-pressed={historyShowing}
+        onclick={toggleHistory}
+        aria-label="Commit history"
+        title="{historyShowing ? 'Back to the file list' : 'Commit history — pick or compare commits'} ({shortcutTextLabel('⌥H', $hostPlatform.os)})"
+        data-diff-history-toggle
+      >
+        <GitBranch size={13} />
+        <span class="hidden sm:inline">History</span>
       </button>
     {/if}
 
@@ -1762,7 +1805,7 @@
       </button>
     </div>
 
-    <div class="ml-auto flex items-center gap-2">
+    <div class="ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
       <button
         type="button"
         class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
@@ -2072,7 +2115,7 @@
           />
         {:else if showEmpty}
           <div class="flex flex-1 items-center justify-center">
-            <EmptyState icon={FileCode} title={emptyCopy.title} hint={emptyCopy.hint} />
+            <EmptyState icon={FileCode} title={emptyCopy.title} hint={emptyCopy.hint} action={emptyAction} />
           </div>
         {:else if viewMode === "unified"}
           <VirtualList

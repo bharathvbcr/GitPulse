@@ -13,7 +13,8 @@
  * compares two commits (older..newer, whichever was picked first) and lists
  * the comparison's own files, hovers a card with the message body, the git
  * note and provenance, pages older history in, answers ⌥H and the keyboard,
- * and that a range selection no longer borrows the working tree's files.
+ * is reachable from the toolbar (rail collapsed or not) and from an empty
+ * diff, and that a range selection no longer borrows the working tree's files.
  * Nothing here executes git.
  */
 import "../src/app.css";
@@ -44,6 +45,8 @@ const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_cod
 const files=[status("worktree-only.ts")];
 const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
 let graphFail=false;
+/** The working-tree file whose diff reads empty, for the empty-state checks. */
+let emptyDiffPath=null;
 const fixtures={
  cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
  cmd_get_head_id:()=>hex(0),
@@ -62,7 +65,7 @@ const fixtures={
   const count=a.maxCommits>5000?TOTAL:FIRST_PAGE;
   return {rows:graphRows(count),head_id:hex(0),refs:[{name:"main",kind:"local",commit_id:hex(0),is_head:true},{name:"feature",kind:"local",commit_id:hex(1),is_head:false}],has_more:count<TOTAL,mainline_id:hex(0),mainline_name:"main"};
  },
- cmd_get_file_diff:a=>{calls.push({cmd:"cmd_get_file_diff",args:a});return {text:patch(a.filePath,"worktree change"),truncated:false};},
+ cmd_get_file_diff:a=>{calls.push({cmd:"cmd_get_file_diff",args:a});return {text:a.filePath===emptyDiffPath?"":patch(a.filePath,"worktree change"),truncated:false};},
  cmd_get_commit_diff:a=>{calls.push({cmd:"cmd_get_commit_diff",args:a});return {text:patch("one.ts",`commit ${a.commitId.slice(0,4)}`),truncated:false};},
  cmd_get_commit_file_diff:a=>{calls.push({cmd:"cmd_get_commit_file_diff",args:a});return {text:patch(a.filePath,`commit file ${a.commitId.slice(0,4)}`),truncated:false};},
  cmd_get_commit_files:a=>{calls.push({cmd:"cmd_get_commit_files",args:a});return [{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}];},
@@ -106,6 +109,8 @@ const tab=(name)=>[...(rail()?.querySelectorAll('[role="tab"]')??[])].find(b=>b.
 const list=()=>preview.querySelector('[role="listbox"][aria-label^="Commit history"]');
 const row=(i)=>preview.querySelector(`[data-commit-id="${hex(i)}"]`);
 const card=()=>document.querySelector("[data-diff-history-card]");
+const historyButton=()=>preview.querySelector("[data-diff-history-toggle]");
+const emptyAction=()=>[...preview.querySelectorAll("button")].find(b=>b.textContent.trim()==="Browse commit history");
 const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
 const altH=()=>window.dispatchEvent(new KeyboardEvent("keydown",{key:"˙",code:"KeyH",altKey:true,bubbles:true,cancelable:true}));
 const key=(el,k,extra={})=>el.dispatchEvent(new KeyboardEvent("keydown",{key:k,bubbles:true,cancelable:true,...extra}));
@@ -133,6 +138,18 @@ const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbl
  check("uncommitted work stays reachable from History",()=>[...rail().querySelectorAll("button")].some(b=>b.textContent.includes("Uncommitted changes")&&b.getAttribute("aria-current")==="true"));
  altH();await tick();
  check("⌥H again goes back to Files",()=>tab("Files").getAttribute("aria-selected")==="true");
+
+ // --- the toolbar's History button ---------------------------------------------
+ check("the toolbar offers History while the rail is on Files",()=>historyButton()?.getAttribute("aria-pressed")==="false");
+ historyButton().click();await until(()=>list(),"history from toolbar");
+ check("the toolbar button opens History and says so",()=>tab("History").getAttribute("aria-selected")==="true"&&historyButton().getAttribute("aria-pressed")==="true");
+ historyButton().click();await tick();
+ check("pressing it again returns to Files",()=>tab("Files").getAttribute("aria-selected")==="true"&&historyButton().getAttribute("aria-pressed")==="false");
+ rail().querySelector('[aria-label="Hide the file list"]').click();await until(()=>!rail(),"rail collapsed");
+ check("History stays reachable with the rail collapsed",()=>historyButton()?.getAttribute("aria-pressed")==="false");
+ historyButton().click();await until(()=>list(),"history from collapsed rail");
+ check("from a collapsed rail it opens the rail straight onto History",()=>rail()&&tab("History").getAttribute("aria-selected")==="true");
+
  tab("History").click();await until(()=>list(),"history by click");
 
  // --- hover card ------------------------------------------------------------
@@ -210,6 +227,25 @@ const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbl
  await until(()=>get(repoStore).selectionKind==="range"&&!get(repoStore).selectedDiffPending,"range");
  tab("Files").click();await tick();
  check("a range selection does not offer the working tree's files",()=>!text().includes("worktree-only.ts"));
+
+ // --- an empty diff offers the graph --------------------------------------------
+ emptyDiffPath="worktree-only.ts";
+ await repoStore.selectFileDiff("worktree-only.ts",false);
+ await until(()=>!get(repoStore).selectedDiffPending&&emptyAction(),"empty diff");
+ check("an empty diff offers to browse the commit history",()=>tab("Files").getAttribute("aria-selected")==="true"&&emptyAction());
+ emptyAction().click();await until(()=>list(),"history from empty diff");
+ check("the empty diff's action opens History and then steps aside",()=>tab("History").getAttribute("aria-selected")==="true"&&!emptyAction());
+ emptyDiffPath=null;
+
+ // --- a narrow pane -------------------------------------------------------------
+ preview.style.width="420px";await wait(150);
+ const controls=historyButton().parentElement;
+ // The row's controls wrap to a second line rather than running off an edge
+ // no scrollbar reaches; measured at 694px of content in this 420px pane before.
+ const inside=(el)=>{const r=el.getBoundingClientRect(),b=controls.getBoundingClientRect();return r.left>=b.left-1&&r.right<=b.right+1;};
+ check("at a narrow pane every diff control stays inside the row",()=>controls.scrollWidth<=controls.clientWidth+1&&[...controls.querySelectorAll("button,label")].every(inside));
+ check("History is still reachable at a narrow pane",()=>inside(historyButton()));
+ preview.style.width="1000px";await wait(60);
 
  check("No unexpected commands",()=>unexpected.length===0);
  check("No runtime errors",()=>crashes.length===0);
