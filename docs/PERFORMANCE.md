@@ -1209,9 +1209,9 @@ the last ref write).
 So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
 fixture) and the lane solve is tens of milliseconds, so on the payload side the
 cost of a reload that changed nothing is bytes and decode rather than the
-solve; what the token answer saves in practice, against what its probes cost,
-is not established by these rows. A real repository's subjects and lane width
-move the byte counts.
+solve; the `graph_window` rows alone do not say what the token answer saves
+against what its probes cost, which is what the `graph_hit_path` table above
+measures. A real repository's subjects and lane width move the byte counts.
 
 `watcher` (N = 60): `record_event_signal` over 10,000 events: min 15.14 ms, p50
 18.21 ms, p95 20.17 ms; 549k events/s at p50-ish (metric); 7,000 admitted, 3,000
