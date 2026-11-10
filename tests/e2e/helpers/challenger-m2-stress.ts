@@ -284,7 +284,9 @@ async function main() {
   console.log("==================================================================");
 }
 
-main().catch((err) => {
+// The stores it builds keep their poll timers alive; without this the script
+// printed its verdict and then never exited.
+main().then(() => process.exit(0), (err) => {
   console.error("Fatal stress test failure:", err);
   process.exit(1);
 });
