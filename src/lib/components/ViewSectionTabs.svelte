@@ -122,7 +122,7 @@
         data-section={section.id}
         data-tip-guide={guideKey}
         onclick={() => repoStore.setViewSection(view, section.id)}
-        class="gp-seg-btn gp-section-tab relative inline-flex h-[26px] items-center gap-1 text-meta! py-0! {isActive ? 'px-2!' : 'px-1.5!'}"
+        class="gp-seg-btn gp-section-tab relative inline-flex h-[26px] items-center gap-1 text-meta! py-0! {isActive ? 'px-2!' : 'px-1.5! @min-[1100px]:px-2!'}"
       >
         {#if macos && isActive}
           <span
@@ -135,7 +135,10 @@
         <!-- `relative`: on the Mac the selection pill is absolutely placed and
              would otherwise paint over a static icon. -->
         <Icon size={13} aria-hidden="true" class="relative shrink-0" />
-        {#if isActive}<span>{section.label}</span>{/if}
+        <!-- The active label always shows. The others show from 1100px (the
+             view bar's container width, HEADER_SPEC section 4) and are icons
+             below it, where the aria-label keeps their names. -->
+        <span class={isActive ? "" : "hidden @min-[1100px]:inline"} data-section-label>{section.label}</span>
         {#if flag}
           <!-- A <b>, not a <span>: the Mac liquid tabs make every span in a
                tab position:relative, which would pull the badge into the row. -->

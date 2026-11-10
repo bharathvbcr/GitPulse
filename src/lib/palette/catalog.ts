@@ -99,7 +99,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
   ];
   return [
     { id: "open_repo", label: "Open Repository…", description: "Choose a local Git repository", category: "Repositories", icon: FolderOpen, shortcut: "⌘T", closeBefore: true, action: () => repoStore.pickAndOpenRepo() },
-    { id: "clone_repo", label: "Clone Repository…", description: "Clone a remote repository to a local folder", category: "Repositories", icon: Download, closeBefore: true, disabledReason: host.onClone ? undefined : "Cloning is unavailable in this window.", action: () => host.onClone?.() },
+    { id: "clone_repo", label: "Clone repository…", description: "Clone a remote repository to a local folder", category: "Repositories", icon: Download, closeBefore: true, disabledReason: host.onClone ? undefined : "Cloning is unavailable in this window.", action: () => host.onClone?.() },
     { id: "tasks", label: "Open Tasks — global and workspace Kanban boards", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setGlobalSurface("tasks") },
     { id: "fleet", label: "Open Fleet — every repository at a glance", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setFleetOpen(true) },
     { id: "agents", label: "Open Agents — sessions, worktrees, and what needs you", category: "Workspace", icon: Bot, shortcut: "⌘⇧A", action: () => interfaceStore.setAgentsOpen(true) },

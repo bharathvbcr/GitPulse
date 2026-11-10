@@ -25,7 +25,6 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "acceptFirstMouse": true,
-        "tabbingIdentifier": "com.gitpulse.desktop",
         "trafficLightPosition": {
           "x": 16,
           "y": 14

@@ -26,7 +26,10 @@ describe("onboarding integration and native permission purposes", () => {
     expect(app).toContain('settingsOpen={isSettingsModalOpen}');
     expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="repository"');
     expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
-    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="tasks"');
+    // The Tasks tab is a surfaceTab snippet now, so it names its tour stop as
+    // data (`tour: "tasks"`, rendered as data-tour) rather than as a literal.
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('tour: "tasks"');
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain("data-tour={spec.tour}");
   });
 
   it("keeps the title bar clear of the walkthrough pill and replays from Settings", () => {

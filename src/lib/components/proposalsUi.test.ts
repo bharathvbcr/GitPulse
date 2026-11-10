@@ -121,7 +121,7 @@ describe("glass that floats over content is blurred", () => {
   // Every user is listed: a new one must be placed in one of the two groups.
   const FLOAT_TIER = ["TaskMergeDialog.svelte", "QuickEnhanceSheet.svelte", "TaskHandoffSheet.svelte", "TaskActionDialog.svelte", "NativeNotificationBridge.svelte"];
   const IN_FLOW = [
-    "App.svelte", "StatusPopover.svelte", "TaskBoard.svelte", "StatusBar.svelte", "AttentionInbox.svelte", "RepoTabBar.svelte",
+    "App.svelte", "StatusPopover.svelte", "TaskBoard.svelte", "StatusBar.svelte", "AttentionInbox.svelte", "RepoTabBar.svelte", "ViewBar.svelte",
     "TaskEditor.svelte", "TaskArchive.svelte", "Sidebar.svelte", "WorkspaceEditor.svelte",
   ];
   // Every `.svelte` file under src/ that names gp-glass, as a root-relative

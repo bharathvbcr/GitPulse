@@ -110,7 +110,9 @@ describe("ViewSectionTabs", () => {
     expect(viewTabBar).toContain("<ViewSectionTabs");
     expect(sectionBar).not.toContain("class:gp-liquid-tabs");
     expect(sectionBar).toContain("gp-liquid-selection");
-    expect(sectionBar).toContain("<span>{section.label}</span>");
+    // The label is always rendered; below 1100px an inactive tab hides it
+    // (the icon and the destination guide stand in) and the active one keeps it.
+    expect(sectionBar).toContain("data-section-label>{section.label}</span>");
   });
 
   it("ships a destination guide instead of a label-only title", () => {

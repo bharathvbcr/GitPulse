@@ -22,7 +22,7 @@ describe("StatusBar", () => {
 
   it("renders status bar role and shortcut indicators", () => {
     const body = bar();
-    expect(body).toContain('role="status"');
+    expect(body).toContain('role="contentinfo"');
     expect(body).toContain('aria-label="Repository Status Bar"');
     expect(body).toContain("Palette");
     expect(body).toContain("Shortcuts");
@@ -42,7 +42,7 @@ describe("StatusBar", () => {
 
   it("renders nothing at all when hidden and the repository is quiet", () => {
     interfaceStore.setStatusBarMode("hidden");
-    expect(bar()).not.toContain('role="status"');
+    expect(bar()).not.toContain('role="contentinfo"');
   });
 
   it("uses the same liquid-blur chrome as the title bar, not a covering slab", () => {

@@ -174,6 +174,9 @@
         "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
         "cmd_workbench_request", "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
         "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
+        // The header checks open the Fleet surface (row 2 inert under it), which
+        // asks for its snapshot; the answer is not what they look at.
+        "cmd_fleet_snapshot",
       ]);
       // The code-graph service is not installed in this fixture, which is what
       // a refused call means to its callers.
@@ -333,6 +336,30 @@
             text(worktreesPanel()).includes("alpha-wt-one") && langTrigger());
           const firstContent = panelContent();
           hardCheck("the view panel has content to compare", () => !!firstContent);
+
+          // `?shot=<words>` is for taking screenshots of the header, not a
+          // check: it puts the real app in the named state and stops, so a
+          // headless browser can capture it. Words: `light`, `fleet`,
+          // `agents`, `tasks`, `fullscreen` (stamps `html[data-fullscreen]`, as
+          // windowState.ts does on macOS). Combine with `?fill` for a viewport-
+          // sized window.
+          const shot = params.get("shot");
+          if (shot !== null) {
+            const words = shot.split(/[\s,+]+/);
+            // The first-run walkthrough and the fixture's task-storage toast
+            // are not part of the header: put both away for the picture.
+            (await import("../src/lib/tools/productTour.ts")).productTour.closeForSession();
+            (await import("../src/lib/stores/toastStore.ts")).toastStore.clear();
+            if (words.includes("light")) document.documentElement.classList.replace("dark", "light");
+            if (words.includes("fullscreen")) document.documentElement.setAttribute("data-fullscreen", "");
+            for (const surface of ["fleet", "agents", "tasks"]) {
+              if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
+            }
+            await settle();
+            $("#result").textContent = `shot ready: ${shot}`;
+            document.documentElement.dataset.gpShot = "ready";
+            return;
+          }
 
           // ---- 1. mount counts: the shell survives A -> B -> A -> B -------------
           const applePerSwitch = [];
@@ -558,6 +585,63 @@
             landed?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
             await settle();
             check("switcher: ArrowUp from a section returns to its view", () => document.activeElement === viewButton("history"));
+          }
+
+          // ---- the two header rows (HEADER_SPEC sections 2, 3, 4, 7) ----------
+          // Row 1 (header) is the title bar: surfaces and repositories in one
+          // Workspace tablist. Row 2 (nav "Views") is the view bar. They never
+          // merge, the Terminal pill lives in row 2, and a global surface
+          // leaves row 2 mounted at the same height with its controls inert.
+          {
+            const row1 = $("header");
+            const row2 = $('nav[aria-label="Views"]');
+            const workspace = $$('[role="tablist"][aria-label="Workspace"]');
+            check("header: exactly one Workspace tablist, in row 1, holding the surfaces and the repository tabs", () =>
+              workspace.length === 1 && row1.contains(workspace[0]) && !row2.contains(workspace[0]) &&
+              $$('[data-surface-tab]', workspace[0]).length === 3 && $$('[role="tab"][data-tab-id]', workspace[0]).length >= 2);
+            check("header: the Views landmark holds the switcher, the Terminal pill and Refresh, and row 1 holds none of them", () =>
+              !!row2 && row2.contains($("[data-view-group]")) && !!$('[data-testid="terminal-pill"]', row2) &&
+              !!$('[data-testid="viewbar-refresh"]', row2) && !$("[data-view-group]", row1) && !$('[data-testid="terminal-pill"]', row1));
+            check("header: the Terminal pill left the status bar", () => !$('[data-testid="terminal-pill"]', statusBar()));
+            check("header: the rows never merge, row 1 above row 2", () =>
+              row1.getBoundingClientRect().bottom <= row2.getBoundingClientRect().top + 0.5 &&
+              row1.getBoundingClientRect().height >= 40 && row2.getBoundingClientRect().height >= 32);
+            check("header: nothing changes shape at 1280, the label tier: Open is a pill and the section labels show", () =>
+              /^Open$/.test(text($('[data-testid="open-repo-tab"]'))) &&
+              $$('[data-section-label]', row2).every((el) => getComputedStyle(el).display !== "none"));
+            const row2Box = row2.getBoundingClientRect();
+            const controls = () => $("[data-viewbar-controls]", row2);
+            check("header: on the repository surface row 2's controls are live", () => !controls().inert);
+            interfaceStore.setGlobalSurface("fleet");
+            await settle();
+            const underBox = row2.getBoundingClientRect();
+            check("header: under Fleet row 2 stays mounted at the same height, its controls inert and hidden, the surface named", () =>
+              row2.isConnected && Math.abs(underBox.height - row2Box.height) < 0.5 && Math.abs(underBox.top - row2Box.top) < 0.5 &&
+              controls().inert === true && getComputedStyle(controls()).visibility === "hidden" &&
+              text($('[data-viewbar-surface="fleet"]', row2)) === "Fleet");
+            check("header: the Workspace tablist has one selected tab, Fleet, and Fleet is the one roving stop", () => {
+              const tabs = $$('[role="tab"]', workspace[0]);
+              return tabs.filter((el) => el.getAttribute("aria-selected") === "true").map((el) => el.dataset.surfaceTab).join() === "fleet" &&
+                tabs.filter((el) => el.tabIndex === 0).length === 1 && $('[data-surface-tab="fleet"]').tabIndex === 0;
+            });
+            interfaceStore.setGlobalSurface("repository");
+            await settle();
+            // The surface name fades out (70ms) rather than vanishing.
+            for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+            check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
+              !controls().inert && !$("[data-viewbar-surface]", row2));
+            // Full screen is stamped on <html>; the inset collapses with it.
+            const inset = $(".gp-traffic-inset");
+            if (inset) {
+              const windowed = inset.getBoundingClientRect().width;
+              document.documentElement.setAttribute("data-fullscreen", "");
+              await settle();
+              const full = inset.getBoundingClientRect().width;
+              document.documentElement.removeAttribute("data-fullscreen");
+              await settle();
+              check("header: html[data-fullscreen] collapses the 76px traffic-light inset to a 12px gutter and back", () =>
+                Math.round(windowed) === 76 && Math.round(full) === 12 && Math.round(inset.getBoundingClientRect().width) === 76);
+            }
           }
 
           check("every IPC call had a fixture", () => unexpected.length === 0);

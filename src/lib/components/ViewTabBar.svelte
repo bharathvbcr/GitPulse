@@ -220,7 +220,9 @@
   });
 </script>
 
-<nav class="relative shrink-0" aria-label="Views" data-tour="views">
+<!-- The `nav "Views"` landmark is the view bar that hosts this switcher
+     (ViewBar.svelte): the switcher is one part of it, beside the pills. -->
+<div class="relative shrink-0" data-tour="views">
   <div class="sr-only">
     {#each navItems as item (item.id)}
       {@const guide = destinationGuide(tipGuideKey(item.id))}
@@ -297,14 +299,9 @@
           />
         {/if}
       </div>
-      {#if item.id === "history" && $repoStore.statuses.length > 0}
-        <button type="button" class="px-1.5 py-0.5 rounded-full text-micro font-mono bg-warn/20 text-warn font-semibold hover:bg-warn/30"
-          title="Preview uncommitted files and modifications" aria-label="Preview {$repoStore.statuses.length} uncommitted changes"
-          onclick={() => void repoStore.previewUncommitted()}>{$repoStore.statuses.length}</button>
-      {/if}
     {/each}
   </div>
-</nav>
+</div>
 
 {#if flyoutView && flyoutAnchor}
   {@const view = flyoutView}

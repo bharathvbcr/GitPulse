@@ -23,16 +23,25 @@
     type OverflowAxis,
     type OverflowHint,
   } from "../dom/overflowHint";
+  import { fade } from "svelte/transition";
   import { prefersReducedMotion } from "../motion/easing";
+  import { backdropFade, backdropFadeOut } from "../ui/transitions";
 
   let {
     target,
     axis = "y",
     hint,
+    diffuse = false,
   }: {
     target: HTMLElement | undefined;
     axis?: OverflowAxis;
     hint?: OverflowHint;
+    /**
+     * Opt in to the header-style edge: a progressive blur over the opacity
+     * mask on each edge that hides content, and chevrons that show only
+     * while the pointer is over the scroller's parent. Off for everyone else.
+     */
+    diffuse?: boolean;
   } = $props();
 
   let measured: OverflowHint = $state(EMPTY_OVERFLOW_HINT);
@@ -86,6 +95,23 @@
     if (el) setOverflowFade(el, overflowFadeToken(axis, resolved));
   });
 
+  // The overlay ignores the pointer, so hover is read off the `relative`
+  // parent that holds both the scroller and the chevrons: leaving the
+  // scroller for a chevron must not hide it.
+  $effect(() => {
+    const host = diffuse ? target?.parentElement : null;
+    if (!host) return;
+    const enter = () => host.setAttribute("data-gp-hover", "");
+    const leave = () => host.removeAttribute("data-gp-hover");
+    host.addEventListener("pointerenter", enter);
+    host.addEventListener("pointerleave", leave);
+    return () => {
+      host.removeEventListener("pointerenter", enter);
+      host.removeEventListener("pointerleave", leave);
+      leave();
+    };
+  });
+
   function nudge(toward: "start" | "end") {
     if (!target) return;
     scrollOverflowBy(target, axis, toward, {
@@ -95,6 +121,12 @@
 </script>
 
 {#if target && resolved.canScroll}
+  {#if diffuse && resolved.showStart}
+    {@render diffuseEdge("start")}
+  {/if}
+  {#if diffuse && resolved.showEnd}
+    {@render diffuseEdge("end")}
+  {/if}
   {#if resolved.showStart && !yielded.start}
     {@render cue("start")}
   {/if}
@@ -102,6 +134,24 @@
     {@render cue("end")}
   {/if}
 {/if}
+
+{#snippet diffuseEdge(toward: "start" | "end")}
+  {@const edge = axis === "x" ? (toward === "start" ? "left" : "right") : (toward === "start" ? "top" : "bottom")}
+  <div class="gp-scroll-diffuse" data-edge={edge} aria-hidden="true">
+    <div
+      class="gp-scroll-diffuse-strip"
+      data-strength="light"
+      in:fade={backdropFade()}
+      out:fade={backdropFadeOut()}
+    ></div>
+    <div
+      class="gp-scroll-diffuse-strip"
+      data-strength="heavy"
+      in:fade={backdropFade()}
+      out:fade={backdropFadeOut()}
+    ></div>
+  </div>
+{/snippet}
 
 {#snippet cue(toward: "start" | "end")}
   {@const horizontal = axis === "x"}
@@ -120,6 +170,7 @@
       type="button"
       tabindex="-1"
       class="gp-scroll-cue-btn"
+      data-hover-only={diffuse ? "" : undefined}
       aria-label={label}
       title={label}
       onpointerdown={(e) => {
