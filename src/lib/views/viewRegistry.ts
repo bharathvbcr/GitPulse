@@ -206,7 +206,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
       // repository like the advisories beside it, and alone it had no way to
       // hand its findings to a coding agent; inside Health it shares the
       // verdict and the agent bar. A restored "secrets" lands here
-      // (`RETIRED_SECTIONS` in repos/persist.ts).
+      // (`RETIRED_SECTIONS` below).
       {
         id: "health",
         label: "Health",
@@ -313,9 +313,24 @@ export function resolveSection(id: ViewTab, candidate: unknown): string | null {
  * build, that still names it must land where the content went, not on the
  * view's first section. Resolve is the case that matters: a conflicts chip
  * that opened Overview would hide the conflicts it was pointing at.
+ *
+ * This is the one retirement map: [`resolveSection`] reads it, so restored
+ * sessions (`sanitizeViewSections` in repos/persist.ts) and live callers land
+ * in the same place. Native menu destinations naming a retired section still
+ * do not navigate (`nativeActions.ts` matches live sections only), so a stale
+ * native menu id cannot open a surprise pane.
  */
 export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
+  // Resolve became the top of Policy: agents finish most parked merges.
   work: { resolve: "policy" },
+  // Secrets became a section of Health: one verdict, one agent bar.
+  insights: { secrets: "health" },
+  // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
+  // the file a saved session was searching or blaming is still the selection.
+  code: { search: "explorer", blame: "explorer" },
+  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
+  // itself is restored from the same retired id by `restoredHistoryList`.
+  history: { reflog: "graph" },
 };
 
 /** Where a retired section's content now lives, or null when it is not retired. */

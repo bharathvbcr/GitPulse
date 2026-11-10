@@ -11,7 +11,7 @@ import {
   RETIRED_SECTIONS,
   sectionsFor,
 } from "./viewRegistry";
-import { RETIRED_VIEWS, isViewTab, type ViewTab } from "../repos/persist";
+import { RETIRED_VIEWS, isViewTab, sanitizeViewSections, type ViewTab } from "../repos/persist";
 import { WIP_DESTINATIONS, WIP_REASON_KINDS } from "../repos/wipSummary";
 
 describe("view sections", () => {
@@ -95,6 +95,18 @@ describe("view sections", () => {
     expect(retiredSectionFor("work", "__proto__")).toBeNull();
   });
 
+  it("keeps every fold in the one retirement map, for restores and callers alike", () => {
+    // Secrets, Search, Blame and Reflog folded away before Resolve did. A
+    // second map beside this one answered only restored sessions, so a caller
+    // naming Secrets opened Pulse rather than Health.
+    expect(resolveSection("insights", "secrets")).toBe("health");
+    expect(resolveSection("code", "search")).toBe("explorer");
+    expect(resolveSection("code", "blame")).toBe("explorer");
+    expect(resolveSection("history", "reflog")).toBe("graph");
+    expect(sanitizeViewSections({ insights: "secrets", work: "resolve" })).toEqual({
+      insights: "health",
+      work: "policy",
+    });
   });
 
   it("keeps a remembered section", () => {

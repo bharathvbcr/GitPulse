@@ -196,35 +196,6 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   blame: { tab: "code", section: "explorer" },
 };
 
-/**
- * Sections this build no longer registers, by view, and the section of the
- * same view that shows their content now.
- *
- * A remembered section the registry does not offer falls back to the view's
- * first section, which for a section that merged into a sibling lands the
- * reader on an unrelated pane and reads as the content having been deleted.
- *
- * Only restored sessions read this. Menu and palette destinations naming a
- * retired section still do not navigate (`nativeActions.ts`), so a stale
- * native menu id cannot open a surprise pane.
- */
-export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
-  // Secrets became a section of Health: one verdict, one agent bar.
-  insights: { secrets: "health" },
-  // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
-  // the file a saved session was searching or blaming is still the selection.
-  code: { search: "explorer", blame: "explorer" },
-  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
-  // itself is restored from the same retired id by `restoredHistoryList`.
-  history: { reflog: "graph" },
-};
-
-/** Where a remembered section of `view` lives now; unchanged when not retired. */
-export function retiredSectionFor(view: ViewTab, section: string): string {
-  const moved = RETIRED_SECTIONS[view];
-  return moved && Object.hasOwn(moved, section) ? moved[section] : section;
-}
-
 /** The retirement record for a persisted id, or null when it is not retired. */
 export function retiredViewFor(value: unknown): RetiredView | null {
   if (typeof value !== "string") return null;
@@ -252,9 +223,10 @@ export function migrateViewTab(value: unknown): ViewTab {
  * restoring "History" without "on the Diff" is the retirement reading as a
  * deletion.
  *
- * Every id is narrowed by the registry: a section renamed or dropped since
- * the blob was written falls back to the view's default rather than selecting
- * a pane that no longer exists.
+ * Every id is narrowed by the registry: a section folded into a sibling lands
+ * where its content went (`RETIRED_SECTIONS` in views/viewRegistry.ts), and one
+ * renamed or dropped since the blob was written falls back to the view's
+ * default rather than selecting a pane that no longer exists.
  */
 export function sanitizeViewSections(
   raw: unknown,
@@ -264,7 +236,7 @@ export function sanitizeViewSections(
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [view, section] of Object.entries(raw as Record<string, unknown>)) {
       if (!isViewTab(view) || typeof section !== "string") continue;
-      const resolved = resolveSection(view, retiredSectionFor(view, section));
+      const resolved = resolveSection(view, section);
       if (resolved) out[view] = resolved;
     }
   }
