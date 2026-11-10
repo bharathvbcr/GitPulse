@@ -1,5 +1,6 @@
 <script lang="ts">
   import Toggle from "../src/lib/components/Toggle.svelte";
+  import Checkbox from "../src/lib/components/Checkbox.svelte";
   import Slider from "../src/lib/components/Slider.svelte";
   import Dialog from "../src/lib/components/Dialog.svelte";
 
@@ -13,6 +14,12 @@
   let changes = $state(0);
   let labelled = $state(false);
   let disabledChanges = $state(0);
+  let ticked = $state(false);
+  let tickChanges = $state(0);
+  let confirmed = $state(false);
+  let mixed = $state(true);
+  let refused = $state(false);
+  let disabledTicks = $state(0);
   let level = $state(20);
   let inputs = $state(0);
   let md = $state(false);
@@ -27,6 +34,14 @@
     <Toggle label="Labelled switch" checked={labelled} onchange={(next) => (labelled = next)} />
     <Toggle ariaLabel="Disabled switch" disabled onchange={() => (disabledChanges += 1)} />
   </div>
+  <div data-testid="checkboxes" class="flex flex-col gap-2">
+    <Checkbox ariaLabel="Bare box" checked={ticked} onchange={(next) => { ticked = next; tickChanges += 1; }} />
+    <Checkbox label="Labelled box" description="Says what ticking commits to." checked={confirmed} onchange={(next) => (confirmed = next)} />
+    <Checkbox ariaLabel="Mixed box" indeterminate={mixed} checked={false} onchange={() => (mixed = false)} />
+    <Checkbox ariaLabel="Refusing box" checked={refused} onchange={() => {}} />
+    <Checkbox ariaLabel="Disabled box" disabled onchange={() => (disabledTicks += 1)} />
+  </div>
+  <div data-testid="checkbox-state" data-ticked={ticked} data-tick-changes={tickChanges} data-confirmed={confirmed} data-mixed={mixed} data-disabled-ticks={disabledTicks}></div>
   <div data-testid="slider">
     <Slider label="Level" min={0} max={100} step={5} bind:value={level} format={(n) => `${n}%`} oninput={() => (inputs += 1)} />
   </div>

@@ -604,6 +604,64 @@
   @apply border-amber-500/30 bg-amber-500/[0.05];
 }
 
+@utility gp-check {
+  /* The one checkbox (design language section 9): a native
+     `<input type="checkbox" class="gp-check">` drawn as a rounded square, so the
+     role, Space, form semantics and `indeterminate` all stay the browser's.
+     It picks items from a list or confirms a statement; a setting that takes
+     effect at once is a switch (Toggle), not this.
+       unchecked      transparent box, edge in `--c-text-faint`. `--gp-edge` is
+                      a hairline tuned for separators (about 1.3:1) and would
+                      leave the box invisible, so the edge uses the faint text
+                      role, which holds 4.5:1 on every surface in both themes;
+       checked        accent fill, `--c-on-accent` glyph;
+       indeterminate  accent fill, a bar in place of the tick;
+       focus          the global `input:focus-visible` ring;
+       disabled       dimmed to the .4 every control uses.
+     Only colors animate, at `--gp-dur-instant`; the glyph appears with the
+     fill and has no transition of its own. */
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1.5px solid rgb(var(--c-text-faint));
+  border-radius: var(--gp-r-xs);
+  background-color: transparent;
+  cursor: pointer;
+  transition-property: background-color, border-color;
+  transition-duration: var(--gp-dur-instant);
+  transition-timing-function: var(--gp-ease-effect);
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-color: rgb(var(--c-on-accent));
+    clip-path: polygon(20% 52%, 30% 42%, 43% 56%, 72% 24%, 82% 34%, 43% 76%);
+    opacity: 0;
+  }
+  &:hover:not(:disabled) {
+    border-color: rgb(var(--c-text-muted));
+  }
+  &:checked,
+  &:indeterminate {
+    background-color: rgb(var(--c-accent));
+    border-color: rgb(var(--c-accent));
+    &::before {
+      opacity: 1;
+    }
+  }
+  &:indeterminate::before {
+    clip-path: polygon(22% 42%, 78% 42%, 78% 58%, 22% 58%);
+  }
+  &:disabled {
+    @apply cursor-not-allowed opacity-40;
+  }
+}
+
 @utility gp-seg-btn {
   @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
   &:hover {
@@ -2064,7 +2122,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
     animation: none !important;
   }
 
-  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
     transition: none !important;
   }
 
@@ -2077,7 +2135,7 @@ html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, 
   animation: none !important;
 }
 
-html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
   transition: none !important;
 }
 
