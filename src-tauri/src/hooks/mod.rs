@@ -1956,11 +1956,80 @@ pub fn insights_from_app(_repo: &str) -> Result<(insights::InsightsSnapshot, u64
     Err("only the macOS app answers an insights read".into())
 }
 
+/// The oldest insights answer an asker believes, in milliseconds: twice the age
+/// the app promises ([`insights::APP_FACETS_TTL`]), tighter than the collision
+/// scan's because a negative here is what an agent about to edit acts on.
+#[cfg(target_os = "macos")]
+const INSIGHTS_MAX_AGE_MS: u64 = 2 * insights::APP_FACETS_TTL.as_millis() as u64;
+
+/// Apps that did not answer, and until when to leave them alone.
+///
+/// A wedged or slow app would otherwise cost every call of every MCP process
+/// the full ask deadline before the fallback, and a deferral retry would pay it
+/// twice. After an ask that failed in transport (a missed deadline, a refusal,
+/// nobody answering) the same app is not asked again for [`INTERVAL`]. The entry
+/// names the app by its socket's identity, so a new app instance, which binds a
+/// new socket, is asked at once.
+#[cfg(target_os = "macos")]
+mod ask_backoff {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use crate::desktop::instance::Paths;
+
+    pub(super) const INTERVAL: Duration = Duration::from_secs(30);
+    const MAX_ENTRIES: usize = 8;
+
+    type Identity = (u64, u64);
+    static DOWN: Mutex<Vec<(PathBuf, Identity, Instant)>> = Mutex::new(Vec::new());
+
+    /// The profile directory and the identity of the socket in it.
+    fn identity(dir: &Path) -> Option<(PathBuf, Identity)> {
+        let dir = dir.canonicalize().ok()?;
+        let meta = std::fs::symlink_metadata(Paths::in_dir(&dir).socket).ok()?;
+        Some((dir, (meta.dev(), meta.ino())))
+    }
+
+    /// How long the app now at `dir` is to be left alone, if it is the one that
+    /// failed.
+    pub(super) fn holding(dir: &Path, now: Instant) -> Option<Duration> {
+        let (dir, id) = identity(dir)?;
+        let mut down = DOWN.lock().unwrap_or_else(PoisonError::into_inner);
+        down.retain(|(_, _, until)| *until > now);
+        down.iter()
+            .find(|(held, held_id, _)| *held == dir && *held_id == id)
+            .map(|(_, _, until)| *until - now)
+    }
+
+    pub(super) fn note_failure(dir: &Path, now: Instant) {
+        let Some((dir, id)) = identity(dir) else {
+            return;
+        };
+        let mut down = DOWN.lock().unwrap_or_else(PoisonError::into_inner);
+        down.retain(|(held, _, _)| *held != dir);
+        if down.len() >= MAX_ENTRIES {
+            down.remove(0);
+        }
+        down.push((dir, id, now + INTERVAL));
+    }
+
+    pub(super) fn clear(dir: &Path) {
+        if let Ok(dir) = dir.canonicalize() {
+            DOWN.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(held, _, _)| *held != dir);
+        }
+    }
+}
+
 /// [`insights_from_app`] against the app that owns profile directory `dir`,
 /// given `deadline` to answer. The same rules as [`scanned_by_app_in`]: the
 /// wait is detached at the deadline, an answer older than
-/// [`COLLISION_MAX_AGE_MS`] is not believed, and a reply that read nothing is
-/// not a scan.
+/// [`INSIGHTS_MAX_AGE_MS`] is not believed, and a reply that read nothing, is
+/// about another repository, or is partial is not a scan. An app that failed in
+/// transport is not asked again for [`ask_backoff::INTERVAL`].
 #[cfg(target_os = "macos")]
 fn insights_from_app_in(
     dir: PathBuf,
@@ -1970,21 +2039,50 @@ fn insights_from_app_in(
     use crate::desktop::instance::{reach_owner, Request};
 
     let started = std::time::Instant::now();
+    if let Some(left) = ask_backoff::holding(&dir, started) {
+        return Err(format!(
+            "not asking: the app did not answer last time ({} s of quiet left)",
+            left.as_secs()
+        ));
+    }
     let request = Request::InsightsRead {
         id: mailbox_id("insights"),
         repo: repo.to_string(),
     };
+    let asked_dir = dir.clone();
     let answer = within_budget(deadline + Duration::from_millis(100), move || {
-        reach_owner(&dir, deadline)
+        reach_owner(&asked_dir, deadline)
             .ok_or_else(|| "no GitPulse is answering".to_string())?
             .insights(&request, deadline)
-    })
-    .ok_or("the app missed its deadline")??;
+    });
+    let answer = match answer {
+        Some(Ok(answer)) => {
+            ask_backoff::clear(&dir);
+            answer
+        }
+        Some(Err(why)) => {
+            ask_backoff::note_failure(&dir, started);
+            return Err(why);
+        }
+        None => {
+            ask_backoff::note_failure(&dir, started);
+            return Err("the app missed its deadline".into());
+        }
+    };
     let facets: insights::AppFacets = serde_json::from_value(answer)
         .map_err(|error| format!("the answer is malformed: {error}"))?;
-    if facets.age_ms > COLLISION_MAX_AGE_MS {
+    let asked_about = std::fs::canonicalize(repo)
+        .map_err(|error| format!("cannot resolve {repo}: {error}"))?;
+    if Path::new(&facets.repo) != asked_about {
         return Err(format!(
-            "the app's answer is {} ms old; {COLLISION_MAX_AGE_MS} is the most believed",
+            "the app answered about {}, not {}",
+            facets.repo,
+            asked_about.display()
+        ));
+    }
+    if facets.age_ms > INSIGHTS_MAX_AGE_MS {
+        return Err(format!(
+            "the app's answer is {} ms old; {INSIGHTS_MAX_AGE_MS} is the most believed",
             facets.age_ms
         ));
     }
@@ -6034,7 +6132,7 @@ done
             alone.status > SIBLINGS && alone.worktree_list >= 1,
             "the baseline scan did not scan: {alone:?}"
         );
-        assert!(age_ms <= COLLISION_MAX_AGE_MS, "{age_ms}");
+        assert!(age_ms <= INSIGHTS_MAX_AGE_MS, "{age_ms}");
         assert_eq!(asked.worktrees.count, own.worktrees.count);
         assert_eq!(
             asked.collisions.scanned_worktrees,
@@ -6088,8 +6186,13 @@ done
             insights_replayed(&farm, reply, unhurried())
         };
         assert!(tampered(|_| {}).is_ok(), "an honest answer is believed");
-        let old = tampered(|r| r["age_ms"] = json!(COLLISION_MAX_AGE_MS + 1)).unwrap_err();
+        let old = tampered(|r| r["age_ms"] = json!(INSIGHTS_MAX_AGE_MS + 1)).unwrap_err();
         assert!(old.contains("ms old"), "{old}");
+        // The bound is inclusive: the oldest believed answer is believed.
+        assert!(
+            tampered(|r| r["age_ms"] = json!(INSIGHTS_MAX_AGE_MS)).is_ok(),
+            "an answer at the bound was refused"
+        );
         let blind = tampered(|r| r["collisions"]["scanned_worktrees"] = json!(0)).unwrap_err();
         assert!(blind.contains("read no worktree"), "{blind}");
         let partial = tampered(|r| {
@@ -6138,6 +6241,167 @@ done
         assert!(refused.get("served_by").is_none(), "{refused}");
         assert_eq!(refused["worktrees"]["ok"], json!(true));
         assert_eq!(refused["worktrees"]["count"], alone["worktrees"]["count"]);
+    }
+
+    /// An answer with worktrees unread, failed or cut off is worse than the
+    /// asker's own scan (longer deadline), so it is not believed: the document
+    /// is the asker's own and says nothing of the app.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_partial_app_answer_leaves_the_document_to_the_askers_own_scan() {
+        use crate::mcp::resources::insights_document;
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let partials: [fn(&mut Value); 4] = [
+            |r| r["deadline_expired"] = json!(true),
+            |r| r["collisions"]["unscanned_worktrees"] = json!(2),
+            |r| r["collisions"]["failed_worktrees"] = json!(1),
+            |r| r["worktrees"]["dirty_unknown"] = json!(1),
+        ];
+        for partial in partials {
+            let mut reply = canned.clone();
+            partial(&mut reply);
+            let refused = insights_replayed(&farm, reply.clone(), unhurried()).unwrap_err();
+            assert!(refused.contains("partial"), "{refused}");
+
+            let app = app_for(&farm.repo, false);
+            app._owner
+                .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
+            let document = insights_document(&farm.repo);
+            assert!(document.get("served_by").is_none(), "{document}");
+            assert_eq!(document["worktrees"]["ok"], json!(true));
+        }
+    }
+
+    /// A reply about another repository is a refusal, whatever else it says.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_answer_about_another_repository_is_refused() {
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let canonical = std::fs::canonicalize(&farm.repo)
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(canned["repo"], json!(canonical), "the reply names its repository");
+        let mut other = canned.clone();
+        other["repo"] = json!("/somewhere/else");
+        let refused = insights_replayed(&farm, other, unhurried()).unwrap_err();
+        assert!(refused.contains("not"), "{refused}");
+        assert!(refused.contains("/somewhere/else"), "{refused}");
+        // Asked through a link, the answer still names the real repository.
+        let linked = tempfile::tempdir().expect("link dir");
+        let link = linked.path().join("alias");
+        std::os::unix::fs::symlink(&farm.repo, &link).expect("symlink");
+        let through = serve_insights(&link.to_string_lossy()).expect("the app reads");
+        assert_eq!(through["repo"], json!(canonical));
+    }
+
+    /// An app that did not answer is left alone for an interval, and not asked
+    /// twice in one tool call; a new instance of the app is asked at once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_app_that_did_not_answer_is_not_asked_again_until_it_is_a_new_app() {
+        use crate::desktop::instance::{claim, Claim};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let farm = farm(false);
+        let canned = serve_insights(&farm.repo).expect("the app reads");
+        let profile = tempfile::Builder::new()
+            .prefix("cg")
+            .tempdir_in("/tmp")
+            .expect("profile dir");
+        let socket = profile
+            .path()
+            .canonicalize()
+            .expect("canonical profile")
+            .join("instance.sock");
+
+        // An app from before insights reads: it greets, then refuses the frame.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let old_app = {
+            let (connections, stop) = (connections.clone(), stop.clone());
+            std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                while !stop.load(Ordering::Acquire) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    connections.fetch_add(1, Ordering::AcqRel);
+                    stream.set_nonblocking(false).expect("blocking");
+                    let _ = writeln!(stream, "{{\"v\":1,\"pid\":{}}}", std::process::id());
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(stream.try_clone().expect("clone"))
+                        .read_line(&mut line);
+                    let _ = writeln!(
+                        stream,
+                        "{{\"accepted\":false,\"reason\":\"malformed request: unknown variant\"}}"
+                    );
+                }
+            })
+        };
+
+        let ask = || insights_from_app_in(profile.path().to_path_buf(), &farm.repo, unhurried());
+        let first = ask().unwrap_err();
+        assert!(first.contains("malformed request"), "{first}");
+        let second = ask().unwrap_err();
+        assert!(second.contains("not asking"), "{second}");
+        assert_eq!(
+            connections.load(Ordering::Acquire),
+            1,
+            "an app that cannot answer was asked again"
+        );
+        // The quiet is an interval, not forever.
+        let later = std::time::Instant::now() + ask_backoff::INTERVAL + Duration::from_secs(1);
+        assert!(ask_backoff::holding(profile.path(), later).is_none());
+
+        // A new instance binds a new socket, and is asked at once.
+        stop.store(true, Ordering::Release);
+        old_app.join().expect("the stand-in app ends");
+        std::fs::remove_file(&socket).expect("old socket");
+        let Claim::Primary(owner) = claim(profile.path(), Duration::from_millis(200)) else {
+            panic!("expected to own the profile");
+        };
+        owner.attach_insights(Arc::new(move |_| Ok(canned.clone())));
+        let (_, age) = ask().expect("a new app instance is asked and believed");
+        assert!(age <= INSIGHTS_MAX_AGE_MS);
+    }
+
+    /// Two reads in one tool call (a deferral retry) pay a slow app's deadline
+    /// once, not twice.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slow_app_costs_one_deadline_across_a_tool_calls_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let farm = farm(false);
+        let app = app_for(&farm.repo, false);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        app._owner.attach_insights(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(1500));
+            Err("too late".into())
+        }));
+        let dir = app._profile.path().to_path_buf();
+        let slow = Duration::from_millis(300);
+        let first = std::time::Instant::now();
+        assert!(insights_from_app_in(dir.clone(), &farm.repo, slow).is_err());
+        let paid = first.elapsed();
+        let second = std::time::Instant::now();
+        let again = insights_from_app_in(dir, &farm.repo, slow).unwrap_err();
+        assert!(again.contains("not asking"), "{again}");
+        assert!(
+            second.elapsed() < paid / 2 + Duration::from_millis(50),
+            "the second read paid the deadline again: {:?} after {paid:?}",
+            second.elapsed()
+        );
+        assert_eq!(asked.load(Ordering::Acquire), 1);
     }
 
     /// The app reads only what the asker could read: an untrusted repository

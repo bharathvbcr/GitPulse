@@ -1304,7 +1304,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean. When the GitPulse app is running its worktrees, changes, collisions and agent counts may come from the app's shared reads instead of a scan made at call time; such a document carries served_by {source: \"app\", age_ms}, and age_ms is how old the oldest read is (never more than a few seconds): a collision reported absent may be up to that old, and a collision reported present was read again for this call. No served_by means this call scanned for itself.",
             RepoArgs::properties(),
             &RepoArgs::required(),
             json!({
@@ -1316,7 +1316,15 @@ fn build_tools() -> Vec<Value> {
                     "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
                     "ledger": ledger_facet_output(),
-                    "codeintel": { "type": "object" }
+                    "codeintel": { "type": "object" },
+                    "served_by": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string", "enum": ["app"] },
+                            "age_ms": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["source", "age_ms"]
+                    }
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
             }),

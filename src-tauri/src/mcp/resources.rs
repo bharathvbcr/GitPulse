@@ -433,21 +433,28 @@ pub fn ledger_query_page(
 /// for itself, which is the document the tool has always returned.
 pub fn insights_document(repo: &str) -> Value {
     match crate::hooks::insights_from_app(repo) {
-        Ok((snapshot, age_ms)) => {
-            let mut document = json!(snapshot);
-            if let Some(object) = document.as_object_mut() {
-                object.insert(
-                    "served_by".to_string(),
-                    json!({ "source": "app", "age_ms": age_ms }),
-                );
-            }
-            document
-        }
+        Ok((snapshot, age_ms)) => served_document(&snapshot, age_ms),
         Err(why) => {
             log::debug!(target: "mcp", "insights: scanning here, the app did not: {why}");
             json!(crate::insights::snapshot(repo))
         }
     }
+}
+
+/// The insights document of a snapshot the app supplied: the snapshot, plus
+/// `served_by: {source: "app", age_ms}`, which the tool's output schema
+/// declares. `age_ms` is the age of the oldest read the git facets stand on, so
+/// a reader can tell this document from a scan made at call time: a collision
+/// reported absent may be up to that old.
+pub(crate) fn served_document(snapshot: &crate::insights::InsightsSnapshot, age_ms: u64) -> Value {
+    let mut document = json!(snapshot);
+    if let Some(object) = document.as_object_mut() {
+        object.insert(
+            "served_by".to_string(),
+            json!({ "source": "app", "age_ms": age_ms }),
+        );
+    }
+    document
 }
 
 /// The composed repository status document.

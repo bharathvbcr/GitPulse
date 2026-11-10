@@ -114,6 +114,42 @@ fn adv_every_surface_validates_against_its_declared_output_schema() {
     }
 }
 
+/// A document the app served carries `served_by`, and the tool's output schema
+/// declares it, so a reader can tell it from a scan made at call time and a
+/// malformed one is a violation.
+#[test]
+fn adv_a_served_insights_document_meets_the_schema_that_declares_served_by() {
+    let (_dir, repo) = trusted_repo();
+    let document = resources::served_document(&crate::insights::snapshot(&repo), 1234);
+    let schema = schema_of("gitpulse_insights");
+    assert_eq!(
+        schema["properties"]["served_by"]["properties"]["source"]["enum"],
+        json!(["app"]),
+        "served_by is not declared in the output schema"
+    );
+    let violations: Vec<String> = validate::validate(&document, &schema)
+        .iter()
+        .map(validate::Violation::render)
+        .collect();
+    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(document["served_by"], json!({"source": "app", "age_ms": 1234}));
+
+    let mut wrong = document.clone();
+    wrong["served_by"]["source"] = json!("cloud");
+    assert!(
+        !validate::validate(&wrong, &schema).is_empty(),
+        "an undeclared source passed"
+    );
+    let described = tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "gitpulse_insights")
+        .expect("tool")["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(described.contains("served_by") && described.contains("age_ms"), "{described}");
+}
+
 #[test]
 fn adv_new_fields_are_declared_in_the_manifest_tool_schemas() {
     let manifest = resources::read("gitpulse://server/manifest").expect("manifest");
