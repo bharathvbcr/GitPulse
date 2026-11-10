@@ -369,7 +369,7 @@ state, output and pending questions by run id.
   so that socket is *unverified*.
 - *Seams that already accept a process's request.* The single-instance mailbox
   (`desktop/instance.rs`, `Request`, about line 88: `Open`, `Reveal`,
-  `Notification`, `GateCommand`, `CollisionScan`), the hook bridge
+  `Notification`, `GateCommand`, `CollisionScan`, `InsightsRead`), the hook bridge
   (`alerts/bridge.rs`) and `gitpulse-ptyd`. All bind through
   `local_socket::bind_private` (directory `0700`, socket `0600`, peer uid read
   on every connection, and a platform that cannot report it is not bound). The

@@ -846,6 +846,166 @@ on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
 
+## 2026-11-09: `gitpulse_insights` asks the app first (perf1109-mcp-asks-app)
+
+Every agent session has its own `gitpulse-mcp`, and each keeps its own
+`ref_cache` and `status_cell` statics, so N sessions asking `gitpulse_insights`
+scan the same worktrees N times (the audit sampled about 26 MCP processes, three
+scanning one repository within 7 s, and one call at 625-667 ms).
+
+**Shape.** `Request::InsightsRead { id, repo }` on the same mailbox, answered on
+its own connection by the sink `launch::establish` attaches
+(`hooks::serve_insights`, which calls `insights::app_facets::serve`). The reply
+is `AppFacets`: `repo` (the canonical path the app read), `worktrees`,
+`agents`, `changes`, `collisions` (each `Option`), `age_ms`, `deadline_expired`
+and `not_scanned` (`facet` and `reason` for every `None`). `agents` is the
+agent-session count attributed over the same listing, which the asker cannot
+attribute from the capped worktree rows. `resources::insights_document`
+(`gitpulse_insights` and the `gitpulse://insights` resource) asks through
+`hooks::insights_from_app` (`COLLISION_APP_DEADLINE` 2 s) and reads the ledger
+and code graph itself. An answer from the app adds `served_by: {source: "app",
+age_ms}` to the document, declared in the tool's output schema and described in
+its description; a fallback adds nothing.
+
+**Where the answer comes from.** The same status cell and listing memo as the
+collision scan, with a shorter promise. The app reads with a clock that began
+`APP_TTL` (2 s) ago, so a worktree status read that began within 2 s is
+accepted and nothing older, and a memoised listing older than 2 s is listed
+again (`CollisionMemo::listing`). **Why 2 s and not the collision scan's 5 s:**
+a *negative* ("nothing overlaps") is the answer an agent about to edit acts on,
+and the asker's own scan is fresh at the call. 2 s lets asks that arrive within
+it share the reads already made, but at most four are served at once
+(`MAX_INSIGHTS_HANDLERS`); with 26 sessions asking together, the rest scan for
+themselves for that call, so the saving is the reads and listing the served
+asks share, not 26 into 1. The edit hook, which is the gate and checks again at
+edit time, keeps its own 5 s. The
+asker refuses an answer older than `INSIGHTS_MAX_AGE_MS` (4 s, twice the
+promise, so a clock hiccup does not discard a good answer). **Trust is checked
+first, for every request** (`validate_repo`), because a listing served from
+memory skips the listing's own check, and every read is of the canonical path it
+returned. **A positive is read again**: every worktree a positive collision
+names as a party (a file dirty in two worktrees) is re-read with a clock that
+began now before the facets are derived, and so is a worktree that holds two or
+more live sessions whose kept read shows it dirty. A shared worktree whose kept
+read is clean is not a positive and is not re-read. A positive that cannot be
+re-read inside `APP_BUDGET` is reported not scanned (the facets are derived
+under the re-read's own bound), never served from the kept read. A facet the app
+could not read is `None` with a reason, and the asker also refuses an answer
+with `deadline_expired`, or with any unscanned or failed worktree, or a
+worktree with no dirty count (the app's budget is shorter than the asker's own
+scan's), and one about another repository: it scans for itself.
+
+**What `age_ms` is.** The age, at the moment the facets were derived, of the
+oldest read the answer stands on: the worktree listing, the status behind
+`changes`, and the status of every worktree that was read. Each is stamped
+*before* it is read, from the cache's report of the kept read's age (a newer
+read handed over only makes the stamp older, never younger), or with the ask's
+own instant when the cache would not hand its read over; a worktree read again
+because it is a positive is stamped with the instant its re-read began. The
+stamps are taken once and the age is computed from them, so a concurrent asker
+refreshing the cache afterwards cannot lower it, and one re-read worktree does
+not make the answer look fresh. When the checkout `changes` describes is itself
+a positive, `changes` is taken again from the re-read, so its row and the facet
+are one moment (and if that re-read missed its bound `changes` is not scanned).
+The asker refuses `age_ms` above `INSIGHTS_MAX_AGE_MS` (4 s).
+
+**Limits, stated plainly.** A shared checkout that was clean at its kept read
+and has been dirtied since goes unseen for at most about 2 s, where `main`
+scanned on every ask. "One status child" for a dirty shared checkout is per
+ask, not per coalesced window. The child counts below are n=1, in one test
+process, on a synthetic farm, taken at the load recorded with them.
+
+**Bounds.** At most `MAX_INSIGHTS_HANDLERS` (4) reads at once, drawn from the
+`MAX_GATE_HANDLERS` slots, so the MCP processes cannot fill the slots the edit
+hooks use; one past is answered "busy". The handler does its git work in
+`Admission::Background`, the class the asker's own scan has (`gitpulse-mcp` is a
+background process), so agents' reads do not compete with the UI. The app's
+status reads stop starting `APP_BUDGET` (1.2 s) after the ask, and the handler
+waits `HANDLER_DEADLINE` (1.6 s, under the asker's 2 s) for its own reading and
+then answers every facet "not scanned" and frees its slot; the reading is
+abandoned, not cancelled (git has no handle to cancel), so at most
+`MAX_ABANDONED` (4) abandoned readings may be running before new asks are
+refused. A reply that would not fit `MAX_FRAME` is refused at once ("the answer
+is N bytes") instead of being written. The request carries an id and an
+absolute path of at most 1024 bytes.
+
+**Asker backoff.** After an ask that failed in transport (a missed deadline, a
+refusal, nobody answering) the same app is not asked again for 30 s
+(`ask_backoff`), so a wedged app costs each MCP process one deadline, not one
+per call, and a deferral retry never pays it twice. Three answers in a row that
+could not be used (partial, too old, another repository, malformed) start the
+same 30 s, and the first usable answer resets the count: one partial answer is
+ordinary on a loaded host and two can be chance, but an app that cannot serve a
+repository (more worktrees than its budget reads) would otherwise cost every
+call the app's time and then its own scan. The reason is kept and shown in
+"not asking: <reason>". **A "busy" refusal is neither**: the app is alive and
+answering, so that call scans for itself and the next call asks again. The
+refusal is immediate (no deadline paid), askers retry on their own calls'
+schedules rather than a shared timer, and the four slots bound the app's load
+however many ask, so there is nothing to synchronise into a herd. The app is
+named by its socket's identity, so a new instance is asked at once.
+
+**Version skew.** `PROTOCOL` is not bumped, and should not be: the greeting is
+strictly parsed, so a bump would make a new app refuse every installed old hook
+and relaunch. An older app does not parse the new `kind`, refuses the frame
+(its own log line is a warning per connection, so one per backoff interval per
+MCP process), and the MCP scans for itself; the MCP's fallback logs at debug
+level. An older MCP never asks. An app without the sink attached refuses with
+"the insights read is not attached".
+
+**Profile directory.** The asker, like the collision-guard hook, asks only the
+app that owns `tool_config::default_config_dir()` (derived from `$HOME`), which
+is the directory the app claims at launch (`launch::establish`). Both use the
+one resolver, so they agree with the app; a process with another `$HOME`, or an
+app run under another profile, is never asked and scans for itself.
+
+**Measured** (counts inside one test process with the real serving code, not
+the installed binaries; 7 sibling worktrees dirty, a repository shaped like the
+audit's sample): the asker's git children per `gitpulse_insights` call were
+`worktree list` 1, `status` 7, other 5 (13) alone and `worktree list` 1,
+`status` 0, other 0 (1) with a fake app replaying the app's answer
+(`hooks::tests::a_fresh_app_answer_replaces_the_askers_own_scan`; the one left is
+the ledger's address resolution in the asker). The *handler's* git children for
+a second ask, for the two shapes of a busy main checkout (two live sessions,
+two sibling worktrees, nothing contended), were: **clean** main checkout
+`worktree list` 0, `status` 0
+(`insights::app_facets::tests::a_clean_shared_checkout_is_not_read_again`);
+**dirty** main checkout `worktree list` 0, `status` 1, the main checkout itself
+(`a_dirty_shared_checkout_is_read_again_on_every_ask`). This repository is
+always the second shape, so its ask costs one status child, not zero.
+Re-run on 2026-11-10 with the final tree, n=1 each, in one test process on a
+synthetic farm, load average 16.8 (1 min) before and 22.6 after the run: asker
+alone 13 children, asker with a fake app 1, handler second ask 0 (clean shared
+checkout) and 1 (dirty shared checkout), the same as above.
+The live re-sample needs the app, `gitpulse-mcp` and `gitpulse-hook` rebuilt
+and reinstalled.
+
+**Security impact.** Read-only; no write path, no new socket, mode or
+permission. A caller can now ask for the `worktrees`, `changes` and `collisions`
+facets of a repository GitPulse is trusted in. It could already read them by
+running `git` there itself (and `gitpulse-mcp` does exactly that), and the
+paths and counts are what `gitpulse_insights` already returns. Trust, the
+same-uid peer check, the 0700 directory and the 0600 socket are the mailbox's
+and `validate_repo`'s, unchanged; `resolve_worktree_family` is not on this path
+and nothing here memoises it. Two changes tighten it: the app reads the
+canonical path validation returned, not the string the peer sent, and echoes it
+in the reply, and the asker refuses a reply about any other repository. The
+app's git work runs in the background admission class, so a peer cannot use the
+request to take UI-priority git slots, and a handler that cannot finish in
+1.6 s answers "not scanned" and frees its slot (the readings it abandons are
+capped at four).
+
+**Why a hook process scanned while the app was up (still unproven for the
+sampled pid).** One path never asks: `run_session_brief` calls
+`insights::snapshot` directly, so every SessionStart hook runs a full worktree
+scan whatever the app is doing. The other ways collision-guard itself scans are
+all logged at debug level (`collision guard: scanning here, the app did not:
+why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
+verdicts), the mailbox's 24-connection admission (a connection past it is closed
+without a greeting), an answer older than 10 s, a reply that read no worktree,
+the 2 s deadline under load, the app quitting mid-ask ("GitPulse is quitting"),
+and an owner on an incompatible protocol version (`reach_owner` returns none).
+
 ## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
 
 The audit's perf cards need a number to be measured against. Before this there

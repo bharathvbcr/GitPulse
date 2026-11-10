@@ -444,7 +444,9 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         }
         // Answered on its own connection by the gate attached to the mailbox;
         // it never reaches the sink, and there is nothing here for the window.
-        instance::Request::GateCommand { .. } | instance::Request::CollisionScan { .. } => {}
+        instance::Request::GateCommand { .. }
+        | instance::Request::CollisionScan { .. }
+        | instance::Request::InsightsRead { .. } => {}
         // An agent's `gitpulse_browser_open`. The window opens the repository
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.
