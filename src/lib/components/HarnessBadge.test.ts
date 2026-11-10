@@ -74,7 +74,7 @@ describe("HarnessBadge reachability", () => {
     expect(source.match(/disabled=\{!reachable\}/g)).toHaveLength(
       chipTargets.length,
     );
-    expect(source).toContain("Open a repository to reach the MANVI view.");
+    expect(source).toContain("Open a repository to reach the Manvi view.");
     // Hover styling is gated on the same condition, so a dead chip does not
     // light up under the pointer.
     expect(source).not.toMatch(/[^:]hover:/);
@@ -93,14 +93,14 @@ describe("HarnessBadge rendering", () => {
 
   it("renders the harness and model chips with distinct tooltips", () => {
     const { body } = render(HarnessBadge);
-    expect(body).toContain("MANVI");
+    expect(body).toContain("Manvi");
     const titles = [...body.matchAll(/title="([^"]*)"/g)].map(
       (match) => match[1],
     );
     expect(titles.length).toBeGreaterThanOrEqual(2);
     expect(new Set(titles).size).toBe(titles.length);
     // Only navigation needs an open repository; the model preference is global.
-    expect(titles[0]).toContain("Open a repository to reach the MANVI view.");
+    expect(titles[0]).toContain("Open a repository to reach the Manvi view.");
     expect(titles[1]).toContain("Choose a local model.");
     expect(titles[1]).not.toContain("Open a repository");
     expect(body).toContain("disabled");
@@ -125,8 +125,8 @@ describe("HarnessBadge model options", () => {
 
   it("offers retry after an error without presenting the stale result as ready", () => {
     const body = renderState({ ai: ready, error: "Request timed out" });
-    expect(body).toContain('aria-label="Retry model discovery"');
-    expect(body).toContain("Model check failed. Request timed out");
+    expect(body).toContain('aria-label="Try local model discovery again"');
+    expect(body).toContain("Couldn't check local models. Request timed out");
     expect(body).not.toContain("Automatically using chat");
     expect(body).not.toMatch(/\sbg-accent\/10[\s"]/);
   });

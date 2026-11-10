@@ -19,7 +19,8 @@
    *   instead of showing an empty, reassuring list.
    */
   import { AlertTriangle, Check, RefreshCw } from "@lucide/svelte";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Skeleton from "./Skeleton.svelte";
   import { getDevcouncilSuite } from "../codeintel/client";
   import {
     healthSummary,
@@ -50,7 +51,8 @@
       loadError = null;
     } catch (error) {
       report = null;
-      loadError = formatError(error);
+      const copy = describeFailure({ verb: "check", object: "the DevCouncil components" }, error);
+      loadError = copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
     } finally {
       loading = false;
     }
@@ -72,27 +74,27 @@
 
 <div class="space-y-2" data-testid="devcouncil-suite">
   <div class="flex items-center justify-between gap-2">
-    <h4 class="text-textPrimary text-[11px] font-medium">DevCouncil components</h4>
+    <h4 class="text-textPrimary text-meta font-medium">DevCouncil components</h4>
     <button
       type="button"
-      class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+      class="gp-btn" data-size="sm"
       disabled={loading}
       onclick={() => void refresh()}
     >
       <RefreshCw size={10} class={loading ? "animate-spin" : undefined} />
-      Re-check
+      Rescan
     </button>
   </div>
 
   {#if loadError}
-    <p class="text-amber-600 dark:text-amber-400 text-[10px]">{loadError}</p>
+    <div class="gp-notice" data-tone="unknown" role="status">{loadError}</div>
   {:else if !report}
-    <p class="text-textMuted text-[10px]">Probing installed components…</p>
+    <Skeleton variant="text" count={3} />
   {:else}
     <p
-      class="text-[10px] leading-snug {report.suite.complete
+      class="text-micro leading-snug {report.suite.complete
         ? 'text-textMuted'
-        : 'text-amber-600 dark:text-amber-400'}"
+        : 'text-warn'}"
       data-testid="suite-missing-summary"
     >
       {missingSummary(report.suite.components)}
@@ -100,36 +102,36 @@
 
     <ul class="space-y-1.5">
       {#each report.suite.components as component (component.id)}
-        <li class="rounded-xl border border-border/70 bg-background/60 p-2 space-y-0.5">
+        <li class="rounded-xl bg-background/60 p-2 space-y-0.5">
           <div class="flex items-start gap-2">
             <span class="mt-0.5 shrink-0">
               {#if component.installed}
-                <Check size={11} class="text-emerald-600 dark:text-emerald-400" />
+                <Check size={11} class="text-ok" />
               {:else if component.need === "optional"}
-                <span class="text-textMuted text-[11px] leading-none">—</span>
+                <span class="text-textMuted text-meta leading-none">—</span>
               {:else}
-                <AlertTriangle size={11} class="text-amber-600 dark:text-amber-400" />
+                <AlertTriangle size={11} class="text-warn" />
               {/if}
             </span>
             <div class="min-w-0 flex-1">
               <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                <span class="text-textPrimary text-[11px] font-mono font-medium"
+                <span class="text-textPrimary text-meta font-mono font-medium"
                   >{component.id}</span
                 >
-                <span class="text-textMuted text-[10px]">{needLabel(component.need)}</span>
+                <span class="text-textMuted text-micro">{needLabel(component.need)}</span>
               </div>
-              <p class="text-textMuted text-[10px] leading-snug">{component.purpose}</p>
+              <p class="text-textMuted text-micro leading-snug">{component.purpose}</p>
               {#if component.installed}
-                <p class="text-textMuted text-[10px] font-mono break-all leading-snug opacity-80">
+                <p class="text-textMuted text-micro font-mono break-all leading-snug opacity-80">
                   {versionText(component.version)}
                 </p>
                 {#if component.path}
-                  <p class="text-textMuted text-[10px] font-mono break-all leading-snug opacity-60">
+                  <p class="text-textMuted text-micro font-mono break-all leading-snug opacity-60">
                     {component.path}
                   </p>
                 {/if}
               {:else if component.reason}
-                <p class="text-[10px] leading-snug {component.need === 'optional' ? 'text-textMuted' : 'text-amber-600 dark:text-amber-400'}">
+                <p class="text-micro leading-snug {component.need === 'optional' ? 'text-textMuted' : 'text-warn'}">
                   {component.reason}
                 </p>
               {/if}
@@ -140,29 +142,29 @@
     </ul>
 
     <div class="space-y-0.5">
-      <h5 class="text-textPrimary text-[10px] font-medium">Install presets</h5>
+      <h5 class="gp-label">Install presets</h5>
       {#each report.suite.presets as preset (preset.id)}
-        <p class="text-textMuted text-[10px] leading-snug">
+        <p class="text-textMuted text-micro leading-snug">
           <span class="font-mono">{preset.id}</span>: {presetSummary(preset)}
         </p>
       {/each}
     </div>
 
     <div class="space-y-0.5">
-      <h5 class="text-textPrimary text-[10px] font-medium">Installation health</h5>
+      <h5 class="gp-label">Installation health</h5>
       {#if health?.kind === "unchecked"}
-        <p class="text-textMuted text-[10px] leading-snug" data-testid="doctor-unchecked">
-          Not checked — {health.reason}
-        </p>
+        <div class="gp-notice" data-tone="unknown" role="status" data-testid="doctor-unchecked">
+          Couldn't check installation health. {health.reason}
+        </div>
       {:else if health?.kind === "clean"}
-        <p class="text-textMuted text-[10px] leading-snug">
-          <span class="font-mono">devmap doctor</span> found nothing to report.
+        <p class="text-textMuted text-micro leading-snug">
+          The installation check found nothing to report.
         </p>
       {:else if health}
         <ul class="space-y-1">
           {#each health.warnings as warning, i (`${i}:${warning.slice(0, 40)}`)}
             <li
-              class="text-amber-600 dark:text-amber-400 text-[10px] leading-snug break-words"
+              class="text-warn text-micro leading-snug break-words"
             >
               {warning}
             </li>

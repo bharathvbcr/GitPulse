@@ -6,7 +6,9 @@
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Toggle from "./Toggle.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { reportPanelError } from "../diagnostics/report";
   import {
     AlertTriangle,
@@ -66,17 +68,27 @@
 
   const ISSUE_REFRESH_MS = 60_000;
 
-  /** One MANVI surface, two panes: guarded operations, and harness/AI controls. */
+  /** "Couldn't <verb> <object>. <Reason>." for a notice. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
+  /** One Manvi surface, two panes: guarded operations, and harness/AI controls. */
   let pane = $state<ManviPane>("ops");
   let permissionMode = $derived(harnessPermissionMode($harnessStore.harness));
   let permissionLabel = $derived(
     permissionMode === "connected"
       ? "policy connected"
       : permissionMode === "unguarded"
-        ? "MANVI not installed"
+        ? "Manvi not installed"
         : permissionMode === "blocked"
           ? "mutations blocked"
           : "checking policy",
+  );
+  /** Not probed yet is unknown, never a neutral that reads as "fine". */
+  let permissionTone = $derived(
+    permissionMode === "connected" ? "ok" : permissionMode === "unguarded" ? "warn" : permissionMode === "blocked" ? "danger" : "unknown",
   );
 
   let subtitle = $derived(MANVI_PANES[pane].summary);
@@ -212,9 +224,9 @@
       if (opts.background) {
         // A background poll must not clobber action feedback ("Issue
         // reported…"); its failures get their own quieter slot.
-        pollError = formatError(error);
+        pollError = failure("refresh", "GitHub issues", error);
       } else {
-        notice = formatError(error);
+        notice = failure("load", "GitHub issues", error);
       }
     } finally {
       if (opts.background) backgroundRefreshing = false;
@@ -233,7 +245,7 @@
       cleanup = next;
       selectedBranches = next.candidates.map((candidate) => candidate.name);
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = formatError(error);
+      if ($repoStore.currentPath === repo) notice = failure("scan", "branches", error);
     } finally {
       settleBusy();
     }
@@ -252,7 +264,7 @@
       // purpose, so deleting one is a choice the user makes per row.
       selectedTags = [];
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = formatError(error);
+      if ($repoStore.currentPath === repo) notice = failure("scan", "tags", error);
     } finally {
       settleBusy();
     }
@@ -272,7 +284,7 @@
     if (!repo || !target) return;
     const names = [...selectedTags];
     const confirmed = await askConfirm({
-      title: "Delete tags",
+      title: `Delete ${names.length} tag${names.length === 1 ? "" : "s"}?`,
       message: `Delete ${names.length} tag${names.length === 1 ? "" : "s"} whose commits are already in ${tagPlan?.compared_to ?? "the base"}?\n\n${names.join("\n")}`,
       confirmLabel: "Delete",
     });
@@ -285,7 +297,7 @@
       for (const name of names) {
         const outcome = await repoStore.deleteTag(name, target);
         if (outcome.ok) deleted += 1;
-        else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+        else failures.push(`${name}: ${outcome.error ?? "no reason reported"}`);
         // The repository changed: every remaining tag would be refused too.
         if (outcome.refused) break;
       }
@@ -310,7 +322,7 @@
     if (selected.length === 0) return;
     const names = selected.map((c) => c.name);
     const confirmed = await askConfirm({
-      title: "Delete merged branches",
+      title: `Delete ${names.length} merged branch${names.length === 1 ? "" : "es"}?`,
       message: `Delete ${names.length} merged local branch${names.length === 1 ? "" : "es"}?\n\n${names.join("\n")}`,
       confirmLabel: "Delete",
     });
@@ -406,7 +418,7 @@
       const next = await invoke<CommitReviewReport>("cmd_review_outgoing_commits", { repoPath: repo });
       if ($repoStore.currentPath === repo) review = next;
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = formatError(error);
+      if ($repoStore.currentPath === repo) notice = failure("review", "outgoing commits", error);
     } finally {
       settleBusy();
     }
@@ -419,12 +431,12 @@
       const outcome = kind === "pull" ? await repoStore.pull() : await repoStore.push();
       notice = outcome.ok
         ? `${kind === "pull" ? "Pull" : "Push"} completed${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`
-        : outcome.error ?? `${kind} failed`;
+        : outcome.error ?? `Couldn't ${kind} the branch.`;
     } catch (error) {
       // runMutating resolves invoke failures itself; this keeps an unexpected
       // throw (verdict rendering, store internals) visible in the panel
       // instead of console-only, matching scanBranches/reportIssue.
-      notice = formatError(error);
+      notice = failure(kind, "the branch", error);
     } finally {
       settleBusy();
     }
@@ -439,7 +451,7 @@
       const labels = issueLabels.split(",").map((label) => label.trim()).filter(Boolean);
       const outcome = await repoStore.reportIssue(title, issueBody, labels);
       if (!outcome.ok) {
-        notice = outcome.error ?? "Issue report failed.";
+        notice = outcome.error ?? "Couldn't report the issue.";
         return;
       }
       notice = `Issue reported${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`;
@@ -452,7 +464,7 @@
       }
       await loadIssues();
     } catch (error) {
-      notice = formatError(error);
+      notice = failure("report", "the issue", error);
     } finally {
       settleBusy();
     }
@@ -468,14 +480,14 @@
         releaseMessage.trim() || `Release ${releaseTag.trim()}`,
       );
       if (!outcome.ok) {
-        notice = outcome.error ?? "Release publish failed.";
+        notice = outcome.error ?? "Couldn't publish the release.";
         return;
       }
       notice = `Pushed ${outcome.output?.tag ?? releaseTag} to ${outcome.output?.remote ?? "the remote"}; the release workflow can now build the app.`;
       releaseConfirmed = false;
       await loadIssues();
     } catch (error) {
-      notice = formatError(error);
+      notice = failure("publish", "the release", error);
     } finally {
       settleBusy();
     }
@@ -505,7 +517,7 @@
       const repo = $repoStore.currentPath;
       if (repo) await loadRepoTasks(repo);
     },
-    onError: (cause) => { repoTasksError = formatError(cause); },
+    onError: (cause) => { repoTasksError = failure("read", "the task list", cause); },
   });
   function scheduleRefreshRepoTasks() { repoTaskLoader.schedule(); }
 
@@ -529,7 +541,7 @@
       // would re-create every task that already exists.
       if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
         repoTasks = null;
-        repoTasksError = formatError(err);
+        repoTasksError = failure("read", "the task list", err);
       }
     }
   }
@@ -556,7 +568,7 @@
       }
     } catch (err) {
       if ($repoStore.currentPath === repoPath) {
-        notice = formatError(err);
+        notice = failure("create", "the task", err);
       }
     } finally {
       taskAddingNumber = null;
@@ -579,7 +591,7 @@
 
     const count = unimportedIssues.length;
     const confirmed = await askConfirm({
-      title: "Add all issues to tasks",
+      title: "Add all issues to tasks?",
       message: `Create ${count} task${count === 1 ? "" : "s"} from open GitHub issues for coding agents to work on?`,
       confirmLabel: "Add tasks",
     });
@@ -598,12 +610,12 @@
           notice = `Added ${result.created.length} task${result.created.length === 1 ? "" : "s"} to Tasks board for agent handoff.`;
         }
         if (result.errors.length > 0) {
-          notice = `Added ${result.created.length} tasks; ${result.errors.length} failed: ${result.errors[0].error}`;
+          notice = `Added ${result.created.length} tasks. Couldn't add ${result.errors.length}. ${result.errors[0].error}`;
         }
       }
     } catch (err) {
       if ($repoStore.currentPath === repoPath) {
-        notice = formatError(err);
+        notice = failure("add", "issues to tasks", err);
       }
     } finally {
       batchAdding = false;
@@ -771,30 +783,30 @@
       <div>
         <div class="flex items-center gap-2">
           <ShieldCheck size={19} class="text-accent" />
-          <h2 class="text-base font-semibold">MANVI</h2>
-          <span class="gp-pill">{permissionLabel}</span>
+          <h2 class="text-base font-semibold">Manvi</h2>
+          <span class="gp-chip" data-tone={permissionTone} data-kind="label">{permissionLabel}</span>
         </div>
         <p class="mt-1 text-textMuted">{subtitle}</p>
       </div>
       <div class="flex items-center gap-2 shrink-0">
         {#if pane === "ops"}
-          <button class="gp-btn" onclick={() => { void scanBranches(); void reviewCommits(); void loadIssues(); }} disabled={busy !== null}>
+          <button class="gp-btn" data-size="sm" onclick={() => { void scanBranches(); void reviewCommits(); void loadIssues(); }} disabled={busy !== null}>
             <RefreshCw size={13} class={busy ? "animate-spin" : ""} /> Refresh all
           </button>
         {/if}
-        <div class="gp-segmented" role="group" aria-label="MANVI view">
+        <div class="gp-segmented" role="group" aria-label="Manvi view">
           {#each MANVI_PANE_LIST as entry (entry.id)}
-            <button type="button" aria-pressed={pane === entry.id} data-active={pane === entry.id ? "true" : "false"} class="gp-seg-btn text-[11px]! py-1!" onclick={() => (pane = entry.id)}>{entry.label}</button>
+            <button type="button" aria-pressed={pane === entry.id} data-active={pane === entry.id ? "true" : "false"} class="gp-seg-btn text-meta!" onclick={() => (pane = entry.id)}>{entry.label}</button>
           {/each}
         </div>
       </div>
     </div>
 
     {#if notice}
-      <div class="flex items-center justify-between rounded-xl border border-border bg-surface px-3 py-2 text-textSecondary">
-        <span>{notice}</span>
+      <div class="gp-notice" data-tone="info" role="status">
+        <span class="min-w-0 flex-1">{notice}</span>
         {#if notice.includes("Tasks board")}
-          <button type="button" class="gp-btn text-xs py-0.5 px-2 ml-2 shrink-0" onclick={openTasksView}>
+          <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={openTasksView}>
             Open Tasks
           </button>
         {/if}
@@ -802,28 +814,26 @@
     {/if}
 
     {#if pollError}
-      <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-300">
-        Background refresh failed: {pollError}
-      </div>
+      <div class="gp-notice" data-tone="warn" role="status">{pollError}</div>
     {/if}
 
     {#if pane === "harness"}
       <ManviHarnessPane />
     {:else}
     <section class="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={() => sync("pull")} disabled={busy !== null}>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:bg-surfaceHover disabled:opacity-40" onclick={() => sync("pull")} disabled={busy !== null}>
         <ArrowDownToLine size={20} class="text-accent" />
-        <span><strong class="block">Quick pull</strong><span class="text-textMuted">Update the working branch through MANVI.</span></span>
+        <span><strong class="block">Quick pull</strong><span class="text-textMuted">Update the working branch through Manvi.</span></span>
       </button>
-      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={() => sync("push")} disabled={busy !== null}>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:bg-surfaceHover disabled:opacity-40" onclick={() => sync("push")} disabled={busy !== null}>
         <ArrowUpFromLine size={20} class="text-accent" />
         <span><strong class="block">Quick push</strong><span class="text-textMuted">Publish the current branch safely.</span></span>
       </button>
-      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={scanBranches} disabled={busy !== null}>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:bg-surfaceHover disabled:opacity-40" onclick={scanBranches} disabled={busy !== null}>
         <GitBranch size={20} class="text-accent" />
         <span><strong class="block">Scan branches</strong><span class="text-textMuted">Find merged local branches only.</span></span>
       </button>
-      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={reviewCommits} disabled={busy !== null}>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:bg-surfaceHover disabled:opacity-40" onclick={reviewCommits} disabled={busy !== null}>
         <ScanSearch size={20} class="text-accent" />
         <span><strong class="block">Review messages</strong><span class="text-textMuted">Audit commits that are about to ship.</span></span>
       </button>
@@ -836,38 +846,38 @@
             <h3 class="font-semibold">Branch cleanup</h3>
             <p class="text-textMuted">Dry-run first; current, default, worktree, and unmerged branches stay protected.</p>
           </div>
-          {#if cleanup}<span class="gp-pill">{cleanup.candidates.length} eligible / {cleanup.total_local_branches} local</span>{/if}
+          {#if cleanup}<span class="gp-chip" data-tone="neutral" data-kind="label">{cleanup.candidates.length} eligible / {cleanup.total_local_branches} local</span>{/if}
         </div>
         {#if busy === "branches" || busy === "clean"}
-          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Inspecting Git refs…</div>
+          <div class="py-3" aria-label="Inspecting Git refs"><Skeleton variant="text" count={3} /></div>
         {:else if cleanup}
           {#if !cleanupInvariant}
-            <div class="mb-2 flex items-center gap-2 text-rose-400"><AlertTriangle size={14} /> Cleanup coverage is inconsistent; deletion is disabled.</div>
+            <div class="gp-notice mb-2" data-tone="danger" role="alert"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Cleanup coverage is inconsistent; deletion is disabled.</div>
           {/if}
           <div class="max-h-52 space-y-1 overflow-auto">
             {#each cleanup.candidates as branch, i (`${branch.name}#${i}`)}
-              <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
-                <input type="checkbox" checked={isSelected(branch.name)} onchange={() => toggleSelected(branch.name)} />
+              <div class="gp-row">
+                <Toggle checked={isSelected(branch.name)} ariaLabel="Select {branch.name}" onchange={() => toggleSelected(branch.name)} />
                 <span class="min-w-0 flex-1">
                   <span class="font-mono">{branch.name}</span>
                   <span class="ml-2 font-mono text-textMuted" title={branch.tip_commit_id}>{branch.tip_commit_id.slice(0, 7)}</span>
                   <span class="ml-2 truncate text-textMuted">{branch.last_summary}</span>
                 </span>
-                {#if branch.upstream_gone}<span class="gp-pill">upstream gone</span>{/if}
-              </label>
+                {#if branch.upstream_gone}<span class="gp-chip" data-tone="warn" data-kind="label">upstream gone</span>{/if}
+              </div>
             {:else}
-              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No merged local branches need cleanup.</div>
+              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-ok" /> No merged local branches need cleanup.</div>
             {/each}
           </div>
           <div class="gp-separator" aria-hidden="true"></div>
           <div class="mt-3 flex items-center justify-between pt-3 text-textMuted">
             <span>{cleanup.protected_branches} protected · {cleanup.unmerged_branches} unmerged</span>
             {#if cleanup.unchecked_branches > 0}
-              <span class="text-amber-300" title={cleanup.unchecked_reason ?? ""}>
+              <span class="text-warn" title={cleanup.unchecked_reason ?? ""}>
                 {cleanup.unchecked_branches} not checked for squash merges{cleanup.unchecked_reason ? `: ${cleanup.unchecked_reason}` : ""}
               </span>
             {/if}
-            <button class="gp-btn" onclick={cleanBranches} disabled={!cleanupInvariant || selectedBranches.length === 0 || busy !== null}>
+            <button class="gp-btn" data-variant="danger" data-size="sm" onclick={cleanBranches} disabled={!cleanupInvariant || selectedBranches.length === 0 || busy !== null}>
               <Trash2 size={13} /> Delete {selectedBranches.length} selected
             </button>
           </div>
@@ -882,48 +892,48 @@
             <h3 class="font-semibold">Tag retention</h3>
             <p class="text-textMuted">A commit held by a tag alone is on no branch, so branch cleanup counts it nowhere.</p>
           </div>
-          {#if tagPlan}<span class="gp-pill">{tagPlan.retained_count} holding work / {tagPlan.total_tags} tags</span>{/if}
+          {#if tagPlan}<span class="gp-chip" data-tone="neutral" data-kind="label">{tagPlan.retained_count} holding work / {tagPlan.total_tags} tags</span>{/if}
         </div>
         {#if busy === "tags" || busy === "tag-clean"}
-          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Measuring tags against the base…</div>
+          <div class="py-3" aria-label="Measuring tags against the base"><Skeleton variant="text" count={3} /></div>
         {:else if tagPlan}
           {#if !tagInvariant}
-            <div class="mb-2 flex items-center gap-2 text-rose-400"><AlertTriangle size={14} /> Tag coverage is inconsistent; deletion is disabled.</div>
+            <div class="gp-notice mb-2" data-tone="danger" role="alert"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Tag coverage is inconsistent; deletion is disabled.</div>
           {/if}
           {#if tagPlan.truncated}
-            <div class="mb-2 text-amber-400">The tag listing was capped, so these counts describe a sample of this repository's tags, not all of them.</div>
+            <div class="gp-notice mb-2" data-tone="warn" role="status">The tag listing was capped, so these counts describe a sample of this repository's tags, not all of them.</div>
           {/if}
           {#if tagPlan.total_tags === 0}
-            <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> This repository has no tags.</div>
+            <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-ok" /> This repository has no tags.</div>
           {:else}
             {#if tagPlan.retained_count > 0}
               <p class="mb-1 text-textSecondary">Holding work {tagPlan.compared_to ?? "the base"} does not have — kept, not deletable.</p>
               <div class="max-h-40 space-y-1 overflow-auto">
                 {#each tagPlan.retained as tag, i (`${tag.name}#${i}`)}
                   <div class="flex items-center gap-2 rounded-lg px-2 py-1.5">
-                    <Tag size={13} class="shrink-0 text-amber-400" />
+                    <Tag size={13} class="shrink-0 text-warn" />
                     <span class="min-w-0 flex-1 truncate font-mono">{tag.name}</span>
-                    <span class="gp-pill" title="{tag.commits_ahead_of_base} commits not in {tagPlan.compared_to ?? 'the base'}">+{tag.commits_ahead_of_base}</span>
+                    <span class="gp-chip" data-tone="warn" data-kind="count" title="{tag.commits_ahead_of_base} commits not in {tagPlan.compared_to ?? 'the base'}">+{tag.commits_ahead_of_base}</span>
                   </div>
                 {/each}
               </div>
               {#if tagPlan.retained.length < tagPlan.retained_count}
-                <div class="mt-1 text-amber-400">Showing {tagPlan.retained.length} of {tagPlan.retained_count} tags holding work.</div>
+                <div class="mt-1 text-warn">Showing {tagPlan.retained.length} of {tagPlan.retained_count} tags holding work.</div>
               {/if}
             {/if}
             <p class="mt-3 mb-1 text-textSecondary">Every commit already in {tagPlan.compared_to ?? "the base"} — safe to delete.</p>
             <div class="max-h-40 space-y-1 overflow-auto">
               {#each tagPlan.candidates as tag, i (`${tag.name}#${i}`)}
-                <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
-                  <input type="checkbox" checked={selectedTags.includes(tag.name)} onchange={() => toggleTag(tag.name)} />
+                <div class="gp-row">
+                  <Toggle checked={selectedTags.includes(tag.name)} ariaLabel="Select {tag.name}" onchange={() => toggleTag(tag.name)} />
                   <span class="min-w-0 flex-1 truncate"><span class="font-mono">{tag.name}</span><span class="ml-2 text-textMuted">{tag.summary}</span></span>
-                </label>
+                </div>
               {:else}
-                <div class="flex items-center gap-2 py-4 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No tags are redundant with {tagPlan.compared_to ?? "the base"}.</div>
+                <div class="flex items-center gap-2 py-4 text-textMuted"><CheckCircle2 size={15} class="text-ok" /> No tags are redundant with {tagPlan.compared_to ?? "the base"}.</div>
               {/each}
             </div>
             {#if tagPlan.candidates.length < tagPlan.deletable_count}
-              <div class="mt-1 text-amber-400">Showing {tagPlan.candidates.length} of {tagPlan.deletable_count} deletable tags.</div>
+              <div class="mt-1 text-warn">Showing {tagPlan.candidates.length} of {tagPlan.deletable_count} deletable tags.</div>
             {/if}
           {/if}
           <div class="gp-separator" aria-hidden="true"></div>
@@ -938,7 +948,7 @@
                 no base to compare against
               {/if}
             </span>
-            <button class="gp-btn" onclick={cleanTags} disabled={!tagInvariant || selectedTags.length === 0 || busy !== null}>
+            <button class="gp-btn" data-variant="danger" data-size="sm" onclick={cleanTags} disabled={!tagInvariant || selectedTags.length === 0 || busy !== null}>
               <Trash2 size={13} /> Delete {selectedTags.length} selected
             </button>
           </div>
@@ -950,20 +960,20 @@
       <section class="gp-card p-4">
         <div class="mb-3 flex items-center justify-between">
           <div><h3 class="font-semibold">Outgoing commit review</h3><p class="text-textMuted">Conventional format, duplicate subjects, issue links, and length.</p></div>
-          {#if review}<span class="gp-pill">{review.findings.length} findings</span>{/if}
+          {#if review}<span class="gp-chip" data-tone={review.findings.length === 0 ? "ok" : "warn"} data-kind="label">{review.findings.length} findings</span>{/if}
         </div>
         {#if busy === "review"}
-          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Reviewing commit headers…</div>
+          <div class="py-3" aria-label="Reviewing commit headers"><Skeleton variant="text" count={3} /></div>
         {:else if review}
           <p class="mb-2 text-textSecondary">{summarizeCommitReview(review)} <span class="font-mono text-textMuted">{review.range}</span></p>
           <div class="max-h-56 space-y-1 overflow-auto">
             {#each review.findings as finding, i (`${finding.commit_id}:${finding.code}#${i}`)}
-              <div class="rounded-lg border border-border px-2.5 py-2">
-                <div class="flex items-center gap-2"><span class="font-mono text-accent">{finding.short_id}</span><span class={finding.severity === "error" ? "text-rose-400" : finding.severity === "warning" ? "text-amber-400" : "text-textMuted"}>{finding.code}</span></div>
+              <div class="rounded-lg bg-surface/50 px-2.5 py-2">
+                <div class="flex items-center gap-2"><span class="font-mono text-accent">{finding.short_id}</span><span class={finding.severity === "error" ? "text-danger" : finding.severity === "warning" ? "text-warn" : "text-textMuted"}>{finding.code}</span></div>
                 <div class="mt-0.5 truncate">{finding.subject}</div><div class="text-textMuted">{finding.detail}</div>
               </div>
             {:else}
-              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No commit-message findings.</div>
+              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-ok" /> No commit-message findings.</div>
             {/each}
           </div>
         {:else}
@@ -978,18 +988,18 @@
             {#if importPaused}
               <button
                 type="button"
-                class="gp-btn text-xs py-1 px-2.5"
+                class="gp-btn" data-size="sm"
                 onclick={() => loadRepoTasks()}
-                title={repoTasksError ?? "Reading the existing task list"}
+                title={repoTasksError ?? "Reading the existing task list again"}
               >
                 <RefreshCw size={12} />
-                <span>Retry task list</span>
+                <span>Try again</span>
               </button>
             {/if}
             {#if unimportedCount > 0}
               <button
                 type="button"
-                class="gp-btn text-xs py-1 px-2.5"
+                class="gp-btn" data-size="sm"
                 onclick={addAllIssuesToTasks}
                 disabled={batchAdding || busy !== null}
                 title="Add all unimported open issues into tasks for agent handoff"
@@ -1003,50 +1013,51 @@
                 {/if}
               </button>
             {/if}
-            <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
+            <button class="gp-icon-btn" data-size="sm" aria-label="Refresh issues" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
           </div>
         </div>
         {#if importPaused && repoTasksError}
-          <div class="mb-2 flex items-center gap-2 text-amber-400" role="status"><AlertTriangle size={14} /> Task import paused: could not read the existing task list ({repoTasksError}), so issues are not checked against it.</div>
+          <div class="gp-notice mb-2" data-tone="unknown" role="status"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Task import paused. Couldn't read the existing task list ({repoTasksError}), so issues are not checked against it.</div>
         {/if}
         {#if github?.error}
-          <div class="text-amber-400">{github.error}</div>
+          <div class="gp-notice" data-tone="unknown" role="status">{github.error}</div>
         {:else if github?.issues_error}
-          <div class="flex items-center gap-2 text-amber-400"><AlertTriangle size={14} /> Issue monitor unavailable: {github.issues_error}</div>
+          <div class="gp-notice" data-tone="unknown" role="status"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Couldn't check the issue monitor. {github.issues_error}</div>
         {:else}
           <div class="max-h-56 space-y-1.5 overflow-auto">
             {#each github?.issues ?? [] as issue (issue.number)}
               {@const inTask = findTaskForIssue(repoTasks, issue.number)}
-              <div class="flex items-center justify-between gap-2 rounded-lg border border-border/50 bg-surface/50 px-2.5 py-2 hover:bg-surfaceHover transition-colors">
+              <div class="gp-row justify-between bg-surface/50">
                 <div class="flex items-center gap-2 min-w-0 flex-1">
                   <Bug size={13} class="text-accent shrink-0" />
                   <button
                     type="button"
-                    class="font-mono text-textMuted hover:text-accent hover:underline text-left text-xs shrink-0 cursor-pointer"
+                    class="gp-btn shrink-0 font-mono" data-variant="ghost" data-size="sm"
                     onclick={() => openExternal(issue.url)}
                     title={`Open issue #${issue.number} on GitHub`}
                   >
                     #{issue.number}
                   </button>
                   <span class="min-w-0 flex-1 truncate text-xs font-medium" title={issue.title}>{issue.title}</span>
-                  {#if issue.labels[0]}<span class="gp-pill text-[10px] shrink-0">{issue.labels[0]}</span>{/if}
+                  {#if issue.labels[0]}<span class="gp-chip shrink-0" data-tone="neutral" data-kind="label">{issue.labels[0]}</span>{/if}
                 </div>
 
                 <div class="flex items-center gap-1.5 shrink-0">
                   {#if inTask}
                     <button
                       type="button"
-                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-accent/10 text-accent hover:bg-accent/20 border border-accent/30 transition-colors cursor-pointer"
+                      class="gp-chip cursor-pointer gap-1"
+                      data-tone="accent"
                       onclick={openTasksView}
                       title={`Issue #${issue.number} is in tasks. Click to view on Tasks board.`}
                     >
-                      <CheckCircle2 size={11} class="text-emerald-400" />
+                      <CheckCircle2 size={11} class="text-ok" />
                       <span>In tasks</span>
                     </button>
                   {:else}
                     <button
                       type="button"
-                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-surface hover:bg-surfaceHover border border-border text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 cursor-pointer"
+                      class="gp-btn" data-size="sm"
                       onclick={() => addIssueToTask(issue)}
                       disabled={taskAddingNumber === issue.number || batchAdding || busy !== null || repoTasks === null}
                       title={`Create task from issue #${issue.number} for agents to work on`}
@@ -1062,7 +1073,9 @@
                   {/if}
                   <button
                     type="button"
-                    class="gp-icon-btn p-1 text-textMuted hover:text-textPrimary cursor-pointer"
+                    class="gp-icon-btn"
+                    data-size="sm"
+                    aria-label={`Open issue #${issue.number} on GitHub`}
                     title={`Open issue #${issue.number} on GitHub`}
                     onclick={() => openExternal(issue.url)}
                   >
@@ -1074,32 +1087,32 @@
               <div class="py-3 text-textMuted">No open issues found.</div>
             {/each}
           </div>
-          {#if github?.issues_truncated}<div class="mt-1 text-amber-400">Showing 50 issues; more open issues exist. This is not complete coverage.</div>{/if}
+          {#if github?.issues_truncated}<div class="mt-1 text-warn">Showing 50 issues. More open issues exist, so this is not complete coverage.</div>{/if}
         {/if}
         <div class="gp-separator" aria-hidden="true"></div>
         <div class="mt-3 space-y-2 pt-3">
-          <input class="gp-input w-full" maxlength="256" placeholder="Issue title" bind:value={issueTitle} />
-          <textarea class="gp-input min-h-20 w-full resize-y" maxlength="65536" placeholder="What happened, what you expected, and how to reproduce it" bind:value={issueBody}></textarea>
-          <div class="flex gap-2"><input class="gp-input min-w-0 flex-1" placeholder="labels, comma-separated" bind:value={issueLabels} /><button class="gp-btn" onclick={reportIssue} disabled={!issueTitle.trim() || busy !== null}><Bug size={13} /> Report issue</button></div>
+          <input class="gp-field w-full" maxlength="256" placeholder="Issue title" bind:value={issueTitle} />
+          <textarea class="gp-field gp-field-multi min-h-20 w-full" maxlength="65536" placeholder="What happened, what you expected, and how to reproduce it" bind:value={issueBody}></textarea>
+          <div class="flex gap-2"><input class="gp-field min-w-0 flex-1" placeholder="labels, comma-separated" bind:value={issueLabels} /><button class="gp-btn" onclick={reportIssue} disabled={!issueTitle.trim() || busy !== null}><Bug size={13} /> Report issue</button></div>
         </div>
       </section>
 
       <section class="gp-card p-4">
         <div class="mb-3 flex items-center justify-between">
           <div>
-            <h3 class="font-semibold">Release monitor & publication</h3>
+            <h3 class="font-semibold">Release monitor and publication</h3>
             <p class="text-textMuted">Monitors published releases and pushes annotated SemVer tags.</p>
           </div>
           {#if (github?.releases?.length ?? 0) > 0}
-            <span class="gp-pill">{github?.releases?.length ?? 0} releases</span>
+            <span class="gp-chip" data-tone="neutral" data-kind="label">{github?.releases?.length ?? 0} releases</span>
           {/if}
         </div>
 
         {#if github?.error}
-          <div class="mb-3 text-amber-400">{github.error}</div>
+          <div class="gp-notice mb-3" data-tone="unknown" role="status">{github.error}</div>
         {:else if github?.releases_error}
-          <div class="mb-3 flex items-center gap-2 text-amber-400">
-            <AlertTriangle size={14} /> Release monitor unavailable: {github.releases_error}
+          <div class="gp-notice mb-3" data-tone="unknown" role="status">
+            <AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Couldn't check the release monitor. {github.releases_error}
           </div>
         {:else if (github?.releases?.length ?? 0) > 0}
           <div class="mb-3 max-h-44 space-y-1 overflow-auto">
@@ -1115,17 +1128,17 @@
                     <span class="text-textMuted truncate max-w-xs">{release.name}</span>
                   {/if}
                   {#if release.is_latest}
-                    <span class="gp-pill bg-emerald-500/10! text-emerald-400! border-emerald-500/30!">latest</span>
+                    <span class="gp-chip" data-tone="ok" data-kind="label">latest</span>
                   {/if}
                   {#if release.is_prerelease}
-                    <span class="gp-pill bg-amber-500/10! text-amber-400! border-amber-500/30!">pre-release</span>
+                    <span class="gp-chip" data-tone="warn" data-kind="label">pre-release</span>
                   {/if}
                   {#if release.is_draft}
-                    <span class="gp-pill">draft</span>
+                    <span class="gp-chip" data-tone="neutral" data-kind="label">draft</span>
                   {/if}
                 </div>
                 {#if release.published_at || release.created_at}
-                  <span class="text-textMuted text-[11px] shrink-0 font-mono">
+                  <span class="text-textMuted text-meta shrink-0 font-mono">
                     {formatReleaseDate(release.published_at || release.created_at)}
                   </span>
                 {/if}
@@ -1133,7 +1146,7 @@
             {/each}
           </div>
           {#if github?.releases_truncated}
-            <div class="mb-3 text-amber-400 text-[11px]">Showing 50 releases; more releases exist. This is not complete coverage.</div>
+            <div class="mb-3 text-warn text-meta">Showing 50 releases; more releases exist. This is not complete coverage.</div>
           {/if}
         {:else if github}
           <div class="mb-3 py-2 text-textMuted">No releases found on GitHub.</div>
@@ -1141,17 +1154,19 @@
 
         <div class="gp-separator" aria-hidden="true"></div>
         <div class="space-y-2 pt-3">
-          <div class="text-xs font-semibold text-textPrimary">Publish new release tag</div>
-          <input class="gp-input w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
-          <input class="gp-input w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
-          <label class="flex items-start gap-2 rounded-lg bg-surfaceHover p-2 text-textSecondary"><input class="mt-0.5" type="checkbox" bind:checked={releaseConfirmed} /><span>I confirm the working tree is ready. GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags.</span></label>
-          <button class="gp-btn-primary w-full justify-center" onclick={publishRelease} disabled={!releaseConfirmed || !releaseTag.trim() || busy !== null}>
+          <div class="text-xs font-semibold text-textPrimary">Publish a new release tag</div>
+          <input class="gp-field w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
+          <input class="gp-field w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
+          <div class="rounded-lg bg-surfaceHover p-2">
+            <Toggle checked={releaseConfirmed} onchange={(next) => (releaseConfirmed = next)} label="I confirm the working tree is ready." description="GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags." />
+          </div>
+          <button class="gp-btn w-full justify-center" data-variant="primary" onclick={publishRelease} disabled={!releaseConfirmed || !releaseTag.trim() || busy !== null}>
             {#if busy === "release"}<LoaderCircle size={14} class="animate-spin" />{:else}<Rocket size={14} />{/if} Push release tag
           </button>
         </div>
         {#if (github?.workflow_runs?.length ?? 0) > 0}
           <div class="gp-separator" aria-hidden="true"></div>
-          <div class="mt-3 pt-3"><div class="mb-1 text-textMuted">Recent release/workflow activity</div>{#each github?.workflow_runs.slice(0, 3) ?? [] as run (run.id)}<button class="flex w-full items-center justify-between rounded px-1 py-1 text-left hover:bg-surfaceHover" onclick={() => openExternal(run.url)}><span class="truncate">{run.title || run.name}</span><span class="gp-pill">{runState(run)}</span></button>{/each}</div>
+          <div class="mt-3 pt-3"><div class="mb-1 text-textMuted">Recent release/workflow activity</div>{#each github?.workflow_runs.slice(0, 3) ?? [] as run (run.id)}<button class="flex w-full items-center justify-between rounded px-1 py-1 text-left hover:bg-surfaceHover" onclick={() => openExternal(run.url)}><span class="truncate">{run.title || run.name}</span><span class="gp-chip" data-tone="neutral" data-kind="label">{runState(run)}</span></button>{/each}</div>
         {/if}
       </section>
     </div>

@@ -134,8 +134,8 @@ describe("AgentInbox", () => {
   it("renders the inbox root element with data-testid", () => {
     const html = render(AgentInbox, { props: { initialThreads: [] } }).body;
     expect(html).toContain('data-testid="agent-inbox"');
-    expect(html).toContain("Agent Inbox");
-    expect(html).toContain('placeholder="Search threads..."');
+    expect(html).toContain("Agent inbox");
+    expect(html).toContain('placeholder="Search threads…"');
   });
 
   it("displays empty state when no threads are present", () => {
@@ -164,7 +164,7 @@ describe("AgentInbox", () => {
   it("renders structured decide ask widget with option choices and recommendation", () => {
     const html = render(AgentInbox, { props: { initialThreads: mockThreads } }).body;
     expect(html).toContain('data-testid="structured-ask-box"');
-    expect(html).toContain("Structured Decision Request");
+    expect(html).toContain("Structured decision request");
     expect(html).toContain("Should we use SQLite or JSON Lines for agent coordination bus?");
     expect(html).toContain("SQLite");
     expect(html).toContain("JSON Lines");
@@ -176,7 +176,7 @@ describe("AgentInbox", () => {
     const html = render(AgentInbox, { props: { initialThreads: mockThreads } }).body;
     expect(html).toContain("open");
     expect(html).toContain("answered");
-    expect(html).toContain("Withdraw Ask");
+    expect(html).toContain("Withdraw ask");
     expect(html).toContain('data-testid="new-ask-btn"');
     expect(html).toContain('data-testid="decompose-task-btn"');
   });
@@ -227,7 +227,7 @@ describe("AgentInbox", () => {
       },
     }).body;
     expect(html).toContain('data-testid="active-lanes-strip"');
-    expect(html).toContain("Active Lanes (1):");
+    expect(html).toContain("Active worktrees (1):");
     expect(html).toContain("agy-worker-1");
     expect(html).toContain("feat/graft-bridge");
     expect(html).toContain("Select IPC transport from Graft Bridge");
@@ -331,12 +331,12 @@ describe("AgentInbox", () => {
     const withHandler = render(AgentInbox, {
       props: { initialThreads: taskLinked, onopenTask: async () => {} },
     }).body;
-    expect(withHandler).toContain("Open Task");
+    expect(withHandler).toContain("Open task");
 
     const withoutHandler = render(AgentInbox, {
       props: { initialThreads: taskLinked },
     }).body;
-    expect(withoutHandler).not.toContain("Open Task");
+    expect(withoutHandler).not.toContain("Open task");
   });
 
   it("renders Vespin-inspired thread selection checkboxes, select-visible action, and Kick Off Agent bar", () => {
@@ -354,13 +354,13 @@ describe("AgentInbox", () => {
     expect(html).toContain('data-testid="batch-resolve-btn"');
     expect(html).toContain('data-testid="kickoff-agent-bar"');
     expect(html).toContain('data-testid="kickoff-agent-btn"');
-    expect(html).toContain("Kick Off Agent");
+    expect(html).toContain("Kick off agent");
     expect(html).toContain("Claude");
     expect(html).toContain("Antigravity");
     expect(html).toContain("Codex");
   });
 
-  it("renders Phone · Graft Mobile badge and 1-click Launch Session / Apply Subtasks buttons for mobile threads", () => {
+  it("renders Phone · Graft Mobile badge and 1-click Run session / Apply subtasks buttons for mobile threads", () => {
     const mobileKickoffThread: AgentInboxThread = {
       thread_key: "kickoff-claude-1",
       title: "Run Claude Managed Session",
@@ -417,7 +417,7 @@ describe("AgentInbox", () => {
     expect(kickoffHtml).toContain("Phone · Graft Mobile");
     expect(kickoffHtml).toContain('data-testid="mobile-origin-badge"');
     expect(kickoffHtml).toContain('data-testid="mobile-launch-session-btn"');
-    expect(kickoffHtml).toContain("Launch Session");
+    expect(kickoffHtml).toContain("Run session");
 
     const mobileBreakdownThread: AgentInboxThread = {
       ...mobileKickoffThread,
@@ -454,7 +454,7 @@ describe("AgentInbox", () => {
     }).body;
     expect(breakdownHtml).toContain("Phone · Graft Mobile");
     expect(breakdownHtml).toContain('data-testid="mobile-apply-subtasks-btn"');
-    expect(breakdownHtml).toContain("Apply Subtasks");
+    expect(breakdownHtml).toContain("Apply subtasks");
 
     const agentThreadWithMobileReply: AgentInboxThread = {
       ...mockThreads[0],

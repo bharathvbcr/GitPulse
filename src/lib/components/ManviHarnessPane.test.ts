@@ -75,7 +75,7 @@ describe("ManviHarnessPane capability truth", () => {
     expect(source).toContain("grant.scope.rules");
     expect(source).toContain("grant.scope.paths");
     expect(source).toContain("grant.scope.once");
-    expect(source).toContain("Current MANVI CLI has no grant-revocation command");
+    expect(source).toContain("Current Manvi CLI has no grant-revocation command");
     expect(source).toContain("{grants.path}");
     expect(source).not.toContain(["manvi", "grants", "revoke"].join(" "));
     expect(source).not.toContain('"any policy rule"');
@@ -84,9 +84,9 @@ describe("ManviHarnessPane capability truth", () => {
 
   it("renders grant IPC failures instead of hiding the authority section", () => {
     expect(source).toContain("let grantsLoadError = $state<string | null>(null);");
-    expect(source).toContain("grantsLoadError = redactDiagnosticText(formatError(error));");
+    expect(source).toContain('grantsLoadError = failure("refresh", "grant history", redactDiagnosticText(formatError(error)));');
     expect(source).toContain("{#if grantsLoadError}");
-    expect(source).toContain("Grant history could not be refreshed");
+    expect(source).toContain("The last verified snapshot remains below.");
   });
 
   it("refreshes grants and expiry labels while the pane remains open", () => {
@@ -187,7 +187,7 @@ describe("ManviHarnessPane capability truth", () => {
       }),
     ).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "Latest MANVI status request failed", tone: "error" }),
+        expect.objectContaining({ label: "Couldn't check Manvi status", tone: "error" }),
         expect.objectContaining({ label: "Activity history recording", tone: "ready" }),
         expect.objectContaining({ label: "Catch-up complete", tone: "ready" }),
       ]),

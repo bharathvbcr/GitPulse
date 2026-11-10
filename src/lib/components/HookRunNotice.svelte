@@ -6,9 +6,9 @@
    * at 90 s, so the user is the one who decides when a slow hook has run long
    * enough (the backend still stops it at its own, much later, deadline).
    */
-  import { Loader2, Square } from "@lucide/svelte";
+  import { Square } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
 
   let { afterMs = 4000 }: { afterMs?: number } = $props();
 
@@ -27,7 +27,8 @@
       const stopped = await repoStore.cancelHooks();
       note = stopped > 0 ? "Stopping…" : "Nothing is running a hook right now.";
     } catch (error) {
-      note = formatError(error);
+      const failure = describeFailure({ verb: "stop", object: "the hook" }, error);
+      note = failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
     } finally {
       stopping = false;
     }
@@ -35,12 +36,11 @@
 </script>
 
 {#if shown}
-  <div role="status" class="flex items-center gap-2 text-[10px] text-textMuted">
-    <Loader2 size={11} class="animate-spin shrink-0" />
-    <span class="flex-1 min-w-0">Still running. A repository hook (pre-commit, commit-msg, …) may be what is taking the time.</span>
-    <button type="button" class="gp-btn px-2! py-0.5! text-[10px] shrink-0" disabled={stopping} onclick={() => void stop()}>
+  <div role="status" class="flex items-center gap-2 text-meta text-textMuted">
+    <span class="min-w-0 flex-1">Still running. A repository hook (pre-commit, commit-msg, …) may be what is taking the time.</span>
+    <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={stopping} onclick={() => void stop()}>
       <Square size={10} /> Stop
     </button>
   </div>
-  {#if note}<p class="text-[10px] text-textMuted">{note}</p>{/if}
+  {#if note}<p class="text-meta text-textMuted">{note}</p>{/if}
 {/if}

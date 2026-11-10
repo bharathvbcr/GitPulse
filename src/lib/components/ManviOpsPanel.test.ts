@@ -82,9 +82,9 @@ describe("ManviOpsPanel rendering", () => {
     expect(body).toContain("Build tag plan");
   });
 
-  it("renders the MANVI header with both panes", () => {
+  it("renders the Manvi header with both panes", () => {
     const { body } = render(ManviOpsPanel);
-    expect(body).toContain("MANVI");
+    expect(body).toContain("Manvi");
     expect(body).toContain("Ops");
     expect(body).toContain("Harness");
   });

@@ -88,7 +88,7 @@ async function clickPreview(name,selector,repo=root,staged=true){
  check(`${name}: actual modifications`,preview.textContent.includes(`${repo} ${staged?"staged":"unstaged"} modification`)&&!preview.textContent.includes("old commit content"));
 }
 /*
- * Ask Agent to Commit. The panel used to be an `absolute` child of its trigger,
+ * Ask agent to commit. The panel used to be an `absolute` child of its trigger,
  * so the sidebar scroller, the 48px collapsed rail and this page's own 260px
  * `overflow:auto` surface all cut it off. Visibility is judged by hit-testing
  * the panel's corners (`elementFromPoint` ignores clipped paint), not by its
@@ -119,7 +119,7 @@ function coversTrigger(panel,trigger){
 async function frames(n=2){for(let i=0;i<n;i++)await step();await tick();}
 /** Idempotent: the section remembers being open across a close and reopen. */
 async function expandDetails(panel){
- const toggle=[...panel.querySelectorAll("button")].find(b=>b.textContent.includes("CLI & Developer SDK"));
+ const toggle=[...panel.querySelectorAll("button")].find(b=>b.textContent.includes("CLI & developer SDK"));
  if(toggle.getAttribute("aria-expanded")!=="true")toggle.click();
  await until(()=>panel.querySelector("pre"),"agent commit details");await frames(3);
 }
@@ -136,7 +136,7 @@ async function closeAgentMenu(entry){
 }
 async function placementChecks(site,{rail=null}={}){
  const entries=agentTriggers();
- check(`${site}: Ask Agent triggers are mounted`,entries.length>0);
+ check(`${site}: Ask agent triggers are mounted`,entries.length>0);
  check(`${site}: every mount carries its own instance id`,new Set(entries.map(e=>e.uid)).size===entries.length);
  for(const entry of entries){
   entry.trigger.scrollIntoView({block:"center",inline:"nearest"});await frames();
@@ -184,7 +184,7 @@ async function agentCommitMenuChecks(){
  files=[...files,status("extra.ts",false,"??")];await repoStore.refresh();await frames(3);
  check("a status refresh keeps the user's scope choice",!!agentPanel(first.uid)&&scopeButton("All changes")?.getAttribute("aria-pressed")==="true"&&scopeButton("All changes").textContent.includes("(4)"));
  await expandDetails(panel);
- [...panel.querySelectorAll("button")].find(b=>b.textContent.trim()==="CLI Command").click();await frames();
+ [...panel.querySelectorAll("button")].find(b=>b.textContent.trim()==="CLI command").click();await frames();
  const cli=panel.querySelector("pre").textContent;
  check("the copy-paste command single-quotes the repository and prompt",cli.startsWith(`cd '${root}' && agy --prompt-interactive '`)&&cli.endsWith("'")&&!cli.includes(`cd "${root}"`));
  await closeAgentMenu(first);

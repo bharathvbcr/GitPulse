@@ -11,7 +11,7 @@
     requestManviFocus,
     type ManviFocusId,
   } from "../ui/manviFocus";
-  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, ChevronDown, RefreshCw, CircleAlert } from "@lucide/svelte";
+  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert } from "@lucide/svelte";
 
   const instanceId = $props.id();
 
@@ -30,10 +30,10 @@
     repoStore.setActiveTab("work", "policy");
   }
 
-  // MANVI is a repository view: with no repository open there is no session to
+  // Manvi is a repository view: with no repository open there is no session to
   // switch tabs on, so navigation chips remain disabled until a repo is open.
   let reachable = $derived(Boolean($repoStore.currentPath));
-  let unreachableHint = "Open a repository to reach the MANVI view.";
+  let unreachableHint = "Open a repository to reach the Manvi view.";
 
   let harness = $derived($harnessStore.harness);
   let ai = $derived($harnessStore.ai);
@@ -52,7 +52,7 @@
     $harnessStore.isProbing
       ? preferred ? `Checking ${preferred.model}…` : "Refreshing local models…"
       : $harnessStore.error
-        ? `Model check failed. ${$harnessStore.error} Use Retry to check again.`
+        ? `Couldn't check local models. ${$harnessStore.error} Refresh to try again.`
         : modelReady && ai?.selected
           ? `${preferred ? "Using" : "Automatically using"} ${ai.selected.model}.`
           : preferred
@@ -63,7 +63,7 @@
   );
   let refreshLabel = $derived($harnessStore.isProbing
     ? "Refreshing local models"
-    : $harnessStore.error ? "Retry model discovery" : "Refresh local models");
+    : $harnessStore.error ? "Try local model discovery again" : "Refresh local models");
   let automaticDetail = $derived(preferred ? "" : $harnessStore.isProbing
     ? " · checking…"
     : $harnessStore.error ? " · retry needed"
@@ -71,6 +71,16 @@
     : ai ? " · no models" : " · not checked");
   let verdict = $derived($harnessStore.lastVerdict);
   let permissionMode = $derived(harnessPermissionMode(harness));
+  /** Not probed yet is unknown, never a neutral that reads as "fine". */
+  let harnessTone = $derived(
+    permissionMode === "connected" ? "ok"
+      : permissionMode === "blocked" ? "danger"
+        : permissionMode === "unguarded" ? "warn"
+          : "unknown",
+  );
+  let modelTone = $derived(
+    $harnessStore.error && !$harnessStore.isProbing ? "text-danger" : modelReady ? "text-accent" : "text-textMuted",
+  );
 
   let harnessTitle = $derived(
     `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\n${reachable ? manviFocusHint("harness") : unreachableHint}`,
@@ -105,29 +115,17 @@
 </script>
 
 <div class="flex items-center gap-1.5">
-  <!-- One pill, two segments: the harness and the local model are separate
-       facts with separate states, so each segment keeps its own tint inside
-       the shared outline rather than the pill taking one colour for both.
-       The harness segment's three states stay distinct on purpose: connected,
-       unavailable, and "a rule fired on the last action" never collapse into
-       one another. -->
-  <div
-    role="group"
-    aria-label="MANVI and local model"
-    class="flex max-w-[300px] items-stretch overflow-hidden rounded-full border border-border/80 text-[11px] shadow-xs"
-  >
+  <!-- The harness and the local model are separate facts with separate states,
+       so each keeps its own tone. The harness chip's states stay distinct on
+       purpose: connected, unavailable, "a rule fired on the last action" and
+       "not probed yet" never collapse into one another. -->
+  <div role="group" aria-label="Manvi and local model" class="flex min-w-0 items-center gap-1.5">
     <button
       onclick={() => openManvi("harness")}
       disabled={!reachable}
       title={harnessTitle}
-      class="flex shrink-0 items-center gap-1.5 px-2.5 py-1 transition-colors disabled:cursor-default focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent
-        {permissionMode === 'connected'
-          ? 'bg-emerald-500/10 text-emerald-400 enabled:hover:bg-emerald-500/20'
-          : permissionMode === 'blocked'
-            ? 'bg-rose-500/10 text-rose-400 enabled:hover:bg-rose-500/20'
-            : permissionMode === 'unguarded'
-              ? 'bg-amber-500/10 text-amber-400 enabled:hover:bg-amber-500/20'
-              : 'bg-surfaceHover text-textMuted enabled:hover:text-textPrimary'}"
+      class="gp-chip shrink-0 gap-1.5 enabled:cursor-pointer disabled:cursor-default"
+      data-tone={harnessTone}
     >
       {#if permissionMode === "connected"}
         <ShieldCheck size={12} />
@@ -136,63 +134,54 @@
       {:else}
         <ShieldAlert size={12} />
       {/if}
-      <span class="font-medium">MANVI</span>
+      <span class="font-medium">Manvi</span>
     </button>
 
     <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
-    <div
-      class="flex min-w-0 max-w-[180px] items-center border-l border-border/60 transition-colors
-        {$harnessStore.error && !$harnessStore.isProbing
-          ? 'bg-rose-500/10 text-rose-400'
-          : modelReady
-            ? 'bg-accent/10 text-accent'
-            : 'bg-surfaceHover text-textMuted'}"
-    >
-      <div class="relative min-w-0 flex-1">
-        <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden="true">
-          {#if modelAttention}
-            <CircleAlert size={12} />
-          {:else}
-            <Sparkles size={12} />
-          {/if}
-        </span>
-        <select
-          aria-label="Local model"
-          aria-describedby="{instanceId}-model-status"
-          aria-busy={$harnessStore.isProbing}
-          title={modelTitle}
-          value={preferredKey}
-          onchange={(event) => pickModel(event.currentTarget.value)}
-          class="w-full cursor-pointer appearance-none truncate bg-transparent py-1 pl-7 pr-5 text-[11px] transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
-        >
-          <option value="">Automatic{automaticDetail}</option>
-          {#if preferred && !preferredListed}
-            <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
-          {/if}
-          {#each endpoints as endpoint}
-            <optgroup label={endpoint.base_url}>
-              {#each endpoint.models as model}
-                <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
-              {/each}
-            </optgroup>
-          {/each}
-          {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
-            <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
-          {/if}
-        </select>
-        <ChevronDown size={11} class="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" aria-hidden="true" />
-      </div>
-      <button
-        type="button"
-        aria-label={refreshLabel}
-        title={refreshLabel}
-        disabled={$harnessStore.isProbing}
-        onclick={() => { if (!$harnessStore.isProbing) void harnessStore.refreshAi(); }}
-        class="flex w-7 shrink-0 self-stretch items-center justify-center border-l border-current/15 transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent disabled:cursor-wait"
+    <div class="relative min-w-0 max-w-[180px] flex-1">
+      <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 {modelTone}" aria-hidden="true">
+        {#if modelAttention}
+          <CircleAlert size={12} />
+        {:else}
+          <Sparkles size={12} />
+        {/if}
+      </span>
+      <select
+        aria-label="Local model"
+        aria-describedby="{instanceId}-model-status"
+        aria-busy={$harnessStore.isProbing}
+        title={modelTitle}
+        value={preferredKey}
+        onchange={(event) => pickModel(event.currentTarget.value)}
+        class="gp-select w-full pl-7"
       >
-        <RefreshCw size={11} class={$harnessStore.isProbing ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
-      </button>
+        <option value="">Automatic{automaticDetail}</option>
+        {#if preferred && !preferredListed}
+          <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
+        {/if}
+        {#each endpoints as endpoint}
+          <optgroup label={endpoint.base_url}>
+            {#each endpoint.models as model}
+              <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
+            {/each}
+          </optgroup>
+        {/each}
+        {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
+          <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
+        {/if}
+      </select>
     </div>
+    <button
+      type="button"
+      class="gp-icon-btn shrink-0"
+      data-size="sm"
+      aria-label={refreshLabel}
+      title={refreshLabel}
+      disabled={$harnessStore.isProbing}
+      onclick={() => { if (!$harnessStore.isProbing) void harnessStore.refreshAi(); }}
+    >
+      <RefreshCw size={11} class={$harnessStore.isProbing ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
+    </button>
   </div>
   <span id="{instanceId}-model-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{modelStatus}</span>
 
@@ -201,12 +190,8 @@
       onclick={() => openManvi("activity")}
       disabled={!reachable}
       title={verdictTitle}
-      class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 shadow-xs disabled:cursor-default
-        {verdict.status === 'blocked'
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-400'
-          : verdict.status === 'unchecked'
-            ? 'border-amber-500/30 bg-amber-500/10 text-amber-400'
-            : 'border-border/80 bg-surfaceHover text-textMuted'}"
+      class="gp-chip shrink-0 gap-1.5 enabled:cursor-pointer disabled:cursor-default"
+      data-tone={verdict.status === "blocked" ? "danger" : verdict.status === "unchecked" ? "unknown" : "neutral"}
     >
       <ShieldQuestion size={12} />
       <span class="truncate max-w-[150px]">{verdictLabel(verdict)}</span>

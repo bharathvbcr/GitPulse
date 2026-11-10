@@ -31,7 +31,9 @@
   import { attemptNotices, taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
-  import { explainError, getTaskRun } from "../workbench/client";
+  import { getTaskRun } from "../workbench/client";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import EmptyState from "./EmptyState.svelte";
   import { openTaskForRun, requestTaskOpen } from "../workbench/taskOpen";
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentDirectories } from "../agents/cwd";
@@ -58,6 +60,12 @@
     type AgentRow,
     type AgentTreeEntry,
   } from "../agents/plane";
+
+  /** "Couldn't <verb> <object>. <Reason>." for a toast or an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
 
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const board = createBoardAgents();
@@ -133,9 +141,9 @@
   const notes = $derived<GapNote[]>([
     ...plane.gaps,
     ...($registeredStatus.error
-      ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${$registeredStatus.error}` }]
+      ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: `Couldn't read the registered repositories, so a run's repository is not named. ${$registeredStatus.error}` }]
       : !$registeredStatus.complete
-        ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some attempts may not name their repository." }]
+        ? [{ kind: "partial" as const, repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some runs may not name their repository." }]
         : []),
   ]);
   // The same failure in every repository is one line naming them all, not
@@ -189,7 +197,7 @@
       const run = await runOf(row.taskRunId);
       if ((await showTaskTerminal(run)) === "queued") toastStore.info(queuedTerminalNote(run.cwd));
     } catch (cause) {
-      toastStore.error(`The terminal could not be shown: ${explainError(cause)}`);
+      toastStore.error(failure("show", "the terminal", cause));
     }
   }
 
@@ -198,7 +206,7 @@
     try {
       await openTaskForRun(row.taskRunId);
     } catch (cause) {
-      toastStore.error(`This attempt's task could not be opened: ${explainError(cause)}`);
+      toastStore.error(failure("open", "this run's task", cause));
     }
   }
 
@@ -206,7 +214,7 @@
     try {
       requestTaskOpen(taskId);
     } catch (cause) {
-      toastStore.error(`This ask's task could not be opened: ${explainError(cause)}`);
+      toastStore.error(failure("open", "this ask's task", cause));
     }
   }
 
@@ -330,7 +338,7 @@
       <Bot size={16} class="text-accent shrink-0" />
       <div class="min-w-0">
         <h1 class="gp-surface-title">Agents</h1>
-        <p class="text-[11px] text-textMuted truncate" data-testid="agents-headline" title={headline}>{headline}</p>
+        <p class="text-meta text-textMuted truncate" data-testid="agents-headline" title={headline}>{headline}</p>
       </div>
     </div>
     <div class="flex items-center gap-1.5 shrink-0">
@@ -358,10 +366,9 @@
           <span>Inbox</span>
         </button>
       </div>
-      <span class="mx-0.5 h-4 w-px bg-border" aria-hidden="true"></span>
         <button
           type="button"
-          class="gp-btn py-1! px-2! text-[11px]!"
+          class="gp-btn" data-size="sm"
           onclick={refresh}
           disabled={scanning}
         >
@@ -369,7 +376,7 @@
           <span>Refresh</span>
         </button>
         {#if scanning}
-          <button type="button" class="gp-btn py-1! px-2! text-[11px]!" onclick={() => agentPlaneStore.cancel()}>
+          <button type="button" class="gp-btn" data-size="sm" onclick={() => agentPlaneStore.cancel()}>
             Cancel
           </button>
         {/if}
@@ -391,14 +398,12 @@
   {#if activeView === "plane"}
     <div class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2" data-testid="agents-toolbar">
       {#if scopeLabel}
-        <span
-          class="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 pl-2 pr-0.5 py-0.5 text-[11px] text-textPrimary"
-          data-testid="agents-scope"
-        >
+        <span class="gp-chip" data-tone="accent" data-kind="removable" data-testid="agents-scope">
           <span>Only {scopeLabel}</span>
           <button
             type="button"
-            class="gp-icon-btn h-4! w-4!"
+            class="gp-icon-btn"
+            data-size="sm"
             aria-label="Show every repository"
             title="Show every repository"
             onclick={() => setAgentsRepositoryScope(null)}
@@ -409,12 +414,12 @@
       {/if}
       <!-- One filter at a time, so a segmented switch, not toggles. -->
       <div class="flex items-center gap-1.5" role="group" aria-label="Show">
-        <span class="text-[10px] font-semibold uppercase tracking-wider text-textMuted">Show</span>
+        <span class="gp-label">Show</span>
         <div class="gp-segmented" class:gp-liquid-tabs={macos}>
           {#each FILTERS as item (item.id)}
             <button
               type="button"
-              class="gp-seg-btn py-0.5! px-2.5! text-[11px]!"
+              class="gp-seg-btn text-meta!"
               data-active={filter === item.id}
               aria-pressed={filter === item.id}
               data-testid="agents-filter-{item.id}"
@@ -426,11 +431,11 @@
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Columns">
-        <span class="text-[10px] font-semibold uppercase tracking-wider text-textMuted">Columns</span>
+        <span class="gp-label">Columns</span>
         {#each AGENT_COLUMNS as column (column.key)}
           <button
             type="button"
-            class="gp-btn py-0.5! px-2! text-[11px]!"
+            class="gp-btn" data-size="sm"
             aria-pressed={columnVisible(column.key)}
             onclick={() => interfaceStore.toggleAgentsColumn(column.key)}
           >
@@ -438,7 +443,7 @@
           </button>
         {/each}
         {#if hidden.size > 0}
-          <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" onclick={() => interfaceStore.showAllAgentsColumns()}>
+          <button type="button" class="gp-btn" data-size="sm" onclick={() => interfaceStore.showAllAgentsColumns()}>
             Show columns
           </button>
         {/if}
@@ -466,30 +471,31 @@
       <!-- One card, above the table so a hidden column never hides it. A
            failure every repository shares is one line naming them all. -->
       <section
-        class="gp-notice gp-notice-warn shrink-0 px-0! py-0!"
+        class="gp-notice mx-3! mt-2! shrink-0 flex-col! gap-0! p-0!"
+        data-tone="unknown"
         data-testid="agents-gaps"
         aria-label="What the plane could not read"
       >
         <div class="flex items-center gap-2 px-3 pt-2 pb-1">
-          <CircleAlert size={13} class="shrink-0 text-amber-500" />
-          <span class="text-[11px] font-semibold text-textPrimary">
+          <CircleAlert size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
+          <span class="text-meta font-semibold text-textPrimary">
             {notesBlock ? "Not everything could be read" : "Some of this is partial"}
           </span>
-          <span class="text-[11px] text-textMuted">{plural(notes.length, "note", "notes")}</span>
+          <span class="text-meta text-textMuted">{plural(notes.length, "note", "notes")}</span>
           <button
             type="button"
-            class="gp-btn ml-auto py-0.5! px-2! text-[11px]!"
+            class="gp-btn ml-auto" data-size="sm"
             onclick={refresh}
             disabled={scanning}
             data-testid="agents-gaps-retry"
           >
             <RefreshCw size={11} class={scanning ? "animate-spin" : ""} />
-            <span>{scanning ? "Reading…" : "Retry"}</span>
+            <span>{scanning ? "Reading…" : "Try again"}</span>
           </button>
         </div>
         <ul class="flex flex-col gap-1.5 px-3 pb-2.5 pl-[33px] max-h-56 overflow-y-auto">
           {#each noteGroups as group (group.key)}
-            <li class="text-[11px] text-textSecondary min-w-0" role="status" data-gap-kind={group.kind}>
+            <li class="text-meta text-textSecondary min-w-0" role="status" data-gap-kind={group.kind}>
               <span class="font-medium text-textPrimary">{gapGroupTitle(group)}.</span> {group.reason}
               {#if group.labels.length > 1}
                 <!-- Every name, wrapped: the card scrolls, so none is dropped. -->
@@ -503,19 +509,19 @@
 
   <div class="flex-1 min-h-0 min-w-0 overflow-auto">
     {#if visible.length === 0}
-      <p class="px-4 py-8 text-[12px] text-textMuted max-w-xl" data-testid="agents-empty">
+      <div class="px-4 py-6 max-w-xl" data-testid="agents-empty">
         {#if scopeLabel && plane.rows.length > 0 && scoped.length === 0}
-          No agent checkouts, terminals or task attempts in {scopeLabel}. Other repositories have {plural(plane.rows.length, "row", "rows")}; clear the scope to see them.
+          <EmptyState compact icon={Bot} title="No agent work in {scopeLabel}" hint="No agent checkouts, terminals or task runs here. Other repositories have {plural(plane.rows.length, "row", "rows")}; clear the scope to see them." />
         {:else if plane.rows.length > 0}
-          Nothing matches this filter. The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid.
+          <EmptyState compact icon={Bot} title="Nothing matches this filter" hint="The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid." />
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
-          Sessions could not be read. The notes above are the reason, not an empty workspace.
+          <div class="gp-notice" data-tone="unknown" role="status">Sessions could not be read. The notes above are the reason, not an empty workspace.</div>
         {:else if plane.gaps.length > 0 || scanning}
-          Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.
+          <div class="gp-notice" data-tone="unknown" role="status">Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.</div>
         {:else}
-          No agent checkouts, terminals or task attempts in the open repositories. A checkout appears when its path is an agent worktree. A terminal appears when this window started it.
+          <EmptyState compact icon={Bot} title="No agent work yet" hint="No agent checkouts, terminals or task runs in the open repositories. A checkout appears when its path is an agent worktree. A terminal appears when this window started it." />
         {/if}
-      </p>
+      </div>
     {:else}
       <!-- A table whose rows nest is a treegrid (ARIA authoring practices); the
            rows carry their level and open state, and the arrow keys move through
@@ -525,12 +531,12 @@
       <table
         bind:this={treegrid}
         role="treegrid"
-        aria-label="Agent checkouts, terminals, task attempts and the child sessions under them"
-        class="w-full text-left border-collapse {compact ? 'text-[11px]' : 'text-[12px]'}"
+        aria-label="Agent checkouts, terminals, task runs and the child sessions under them"
+        class="w-full text-left border-collapse {compact ? 'text-meta' : 'text-xs'}"
       >
-        <caption class="sr-only">Agent checkouts, terminals and task attempts across open repositories</caption>
+        <caption class="sr-only">Agent checkouts, terminals and task runs across open repositories</caption>
         <thead class="sticky top-0 bg-background text-textMuted">
-          <tr class="border-b border-border">
+          <tr>
             <th scope="col" class="px-4 py-2 font-medium">Agent</th>
             {#if columnVisible("checkout")}<th scope="col" class="px-3 py-2 font-medium">Checkout</th>{/if}
             {#if columnVisible("presence")}<th scope="col" class="px-3 py-2 font-medium">Presence</th>{/if}
@@ -544,7 +550,7 @@
             {@const row = entry.row}
             {@const under = rollupSummary(row)}
             <tr
-              class="border-b border-border/60 hover:bg-surfaceHover/60 focus-visible:outline-2 focus-visible:outline-accent"
+              class="hover:bg-surfaceHover/60 focus-visible:outline-2 focus-visible:outline-accent"
               data-testid="agents-row"
               data-row-id={row.id}
               data-level={entry.level}
@@ -583,7 +589,7 @@
                   {#if row.liveKey || row.taskRunId}
                     <button
                       type="button"
-                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      class="gp-btn" data-size="sm"
                       aria-label="Show terminal for {row.session}"
                       onclick={() => showTerminal(row)}
                     >
@@ -594,7 +600,7 @@
                   {#if row.taskRunId}
                     <button
                       type="button"
-                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      class="gp-btn" data-size="sm"
                       aria-label="Open task for {row.session}"
                       onclick={() => openTask(row)}
                     >
@@ -605,7 +611,7 @@
                   {#if row.checkoutPath}
                     <button
                       type="button"
-                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      class="gp-btn" data-size="sm"
                       aria-label="Open checkout {row.checkout} for {row.session}"
                       title={row.checkoutPath}
                       onclick={() => openCheckout(row)}
