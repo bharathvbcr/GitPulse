@@ -197,4 +197,17 @@ describe("WorkView", () => {
     expect(source).toContain("Current worktree");
     expect(source).toContain("{row.worktrees[0].worktree.path}");
   });
+
+  it("sits flush with the section pane above the heading and below the last block", () => {
+    // Block-axis padding on the scroller is a band of the pane's background
+    // between the section tabs and the heading, and again under the last
+    // block. Inline padding stays so the bands still inset from the sides.
+    const ruleStart = source.indexOf(".work-overview {");
+    const rule = source.slice(ruleStart, source.indexOf("}", ruleStart));
+    expect(rule).toContain("padding-block: 0");
+    expect(rule).not.toMatch(/(^|\n)\s*padding\s*:/);
+    const markupStart = source.indexOf('class="work-overview');
+    const markup = source.slice(markupStart, source.indexOf(">", markupStart));
+    expect(markup).not.toMatch(/\b(?:p|py|pt|pb)-\d/);
+  });
 });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore, verdictDetail, verdictLabel } from "../stores/harnessStore";
   import {
     harnessPermissionMode,
@@ -64,11 +65,32 @@
   let refreshLabel = $derived($harnessStore.isProbing
     ? "Refreshing local models"
     : $harnessStore.error ? "Retry model discovery" : "Refresh local models");
-  let automaticDetail = $derived(preferred ? "" : $harnessStore.isProbing
-    ? " · checking…"
-    : $harnessStore.error ? " · retry needed"
-    : modelReady && ai?.selected ? ` · ${ai.selected.model}`
-    : ai ? " · no models" : " · not checked");
+  /**
+   * Closed title-bar label. A failed model check reads "Failed"; the icon
+   * button beside it is the retry. The failure sentence stays on the tooltip.
+   */
+  let closedFace = $derived(
+    $harnessStore.isProbing
+      ? "Checking…"
+      : $harnessStore.error
+        ? "Failed"
+        : preferred
+          ? preferred.model
+          : modelReady && ai?.selected
+            ? `Automatic · ${ai.selected.model}`
+            : ai
+              ? "No models"
+              : "Not checked",
+  );
+  /** The Automatic choice. When it is selected, its label is the closed face. */
+  let automaticOption = $derived(preferred ? "Automatic" : closedFace);
+  let discoveryNote = $derived(
+    endpoints.some((endpoint) => endpoint.models.length > 0)
+      ? ""
+      : $harnessStore.isProbing
+        ? "Looking for local models…"
+        : "No local models available",
+  );
   let verdict = $derived($harnessStore.lastVerdict);
   let permissionMode = $derived(harnessPermissionMode(harness));
 
@@ -77,7 +99,9 @@
   );
 
   let modelTitle = $derived(
-    `${modelStatus}${preferred ? `\n${preferred.model} at ${preferred.base_url}`
+    `${modelStatus}${
+      discoveryNote && !modelStatus.includes(discoveryNote) ? `\n${discoveryNote}` : ""
+    }${preferred ? `\n${preferred.model} at ${preferred.base_url}`
       : modelReady && ai?.selected ? `\n${ai.selected.base_url}` : ""}${
       modelReady ? `\n${ai?.model_info?.describe ?? "context window not probed"}` : ""
     }\nChoose a local model.`,
@@ -104,7 +128,8 @@
   }
 </script>
 
-<div class="flex items-center gap-1.5">
+{#if $interfaceStore.showHarnessBadges}
+<div class="flex items-center gap-1.5" data-testid="manvi-titlebar-status">
   <!-- One pill, two segments: the harness and the local model are separate
        facts with separate states, so each segment keeps its own tint inside
        the shared outline rather than the pill taking one colour for both.
@@ -114,7 +139,7 @@
   <div
     role="group"
     aria-label="MANVI and local model"
-    class="flex max-w-[300px] items-stretch overflow-hidden rounded-full border border-border/80 text-[11px] shadow-xs"
+    class="flex w-max max-w-[300px] items-stretch overflow-hidden rounded-full border border-border/80 text-[11px] shadow-xs"
   >
     <button
       onclick={() => openManvi("harness")}
@@ -141,14 +166,17 @@
 
     <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
     <div
-      class="flex min-w-0 max-w-[180px] items-center border-l border-border/60 transition-colors
+      class="flex min-w-0 items-center border-l border-border/60 transition-colors
         {$harnessStore.error && !$harnessStore.isProbing
           ? 'bg-rose-500/10 text-rose-400'
           : modelReady
             ? 'bg-accent/10 text-accent'
             : 'bg-surfaceHover text-textMuted'}"
     >
-      <div class="relative min-w-0 flex-1">
+      <!-- The select stays for the model list. Its closed width follows the
+           short face, not the longest option, and a long model name ellipsizes
+           at 160px. The failure sentence is the tooltip. -->
+      <div class="relative min-w-0 max-w-[160px] focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-accent">
         <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden="true">
           {#if modelAttention}
             <CircleAlert size={12} />
@@ -156,6 +184,7 @@
             <Sparkles size={12} />
           {/if}
         </span>
+        <span aria-hidden="true" data-manvi-face={closedFace} class="block truncate py-1 pl-7 pr-5">{closedFace}</span>
         <select
           aria-label="Local model"
           aria-describedby="{instanceId}-model-status"
@@ -163,22 +192,19 @@
           title={modelTitle}
           value={preferredKey}
           onchange={(event) => pickModel(event.currentTarget.value)}
-          class="w-full cursor-pointer appearance-none truncate bg-transparent py-1 pl-7 pr-5 text-[11px] transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+          class="absolute inset-0 h-full w-full cursor-pointer opacity-0"
         >
-          <option value="">Automatic{automaticDetail}</option>
+          <option value="">{automaticOption}</option>
           {#if preferred && !preferredListed}
             <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
           {/if}
-          {#each endpoints as endpoint}
+          {#each endpoints as endpoint (endpoint.base_url)}
             <optgroup label={endpoint.base_url}>
-              {#each endpoint.models as model}
+              {#each endpoint.models as model (model)}
                 <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
               {/each}
             </optgroup>
           {/each}
-          {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
-            <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
-          {/if}
         </select>
         <ChevronDown size={11} class="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" aria-hidden="true" />
       </div>
@@ -213,3 +239,4 @@
     </button>
   {/if}
 </div>
+{/if}

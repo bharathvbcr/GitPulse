@@ -128,7 +128,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="switch"');
     expect(body).toContain('aria-label="Show the language mix in the status bar"');
-    expect(body).toContain('aria-label="Show MANVI status badges"');
+    expect(body).toContain('aria-label="Show MANVI status in the title bar"');
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
@@ -187,7 +187,8 @@ describe("SettingsModal layout options", () => {
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
     expect(layout).toContain('aria-label="Show the language mix in the status bar"');
-    expect(layout).toContain('aria-label="Show MANVI status badges"');
+    expect(layout).toContain('aria-label="Show MANVI status in the title bar"');
+    expect(prose(layout)).toContain("Harness and local-model status in the title bar.");
   });
 
   it("says a hidden status bar still comes back for anything that needs attention", () => {
