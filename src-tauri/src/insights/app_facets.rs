@@ -35,10 +35,12 @@ use serde::{Deserialize, Serialize};
 
 use super::collision_memo::{memo_key, shared, CollisionMemo};
 use super::{
-    complete_snapshot, derive_facets, live_sessions, read_listing, AgentSummary, ChangesFacet,
-    CollisionRisk, GitFacets, InsightsSnapshot, WorktreeFacet, MAX_SNAPSHOT_WORKTREES,
+    changes_from_status, complete_snapshot, derive_facets, empty_changes, live_sessions,
+    read_listing, AgentSummary, ChangesFacet, CollisionRisk, GitFacets, InsightsSnapshot,
+    WorktreeFacet, MAX_SNAPSHOT_WORKTREES,
 };
 use crate::engine::git_cli::{with_admission, Admission};
+use crate::engine::git_reader::GitReader;
 use crate::engine::worktree::{self, ScanDeadline, StatusRead, WorktreeInfo};
 use crate::ipc_error::CommandError;
 
@@ -239,16 +241,23 @@ fn serve_with(
     let asked = Instant::now();
     // A clock that began `ttl` ago: the status cell then hands over reads that
     // began within `ttl`, and nothing older. It ends `budget` after the ask.
-    let clock = ScanDeadline::after(asked.checked_sub(ttl).unwrap_or(asked), ttl + budget);
+    let floor = asked.checked_sub(ttl).unwrap_or(asked);
+    let clock = ScanDeadline::after(floor, ttl + budget);
     let key = memo_key(repo);
     let (mut listing, mut list_age) = memo.listing(&key, repo);
+    let mut listed_at = Instant::now();
     // The memo keeps a listing longer than an asker is promised. One older than
     // `ttl` is read again, so a worktree made or removed in the last few
     // seconds is not missing from a negative answer.
     if list_age > ttl {
         memo.forget_listing(&key);
         (listing, list_age) = memo.listing(&key, repo);
+        listed_at = Instant::now();
     }
+    // Each read's start is stamped before it is made (see [`Stamps`]), so the
+    // age reported is the age of what this answer used, not of what the cache
+    // happens to hold when the answer is sent.
+    let mut stamps = Stamps::capture(&listing, repo, asked, floor);
     let mut read = read_listing(repo, &clock, Some(listing));
     // A failure beside a listing served from memory may be the listing being
     // out of date (a worktree removed in the last few seconds). One listing
@@ -257,8 +266,11 @@ fn serve_with(
         memo.forget_listing(&key);
         let (listing, age) = memo.listing(&key, repo);
         list_age = age;
+        listed_at = Instant::now();
+        stamps = Stamps::capture(&listing, repo, asked, floor);
         read = read_listing(repo, &clock, Some(listing));
     }
+    let list_began = listed_at.checked_sub(list_age).unwrap_or(floor);
     let mut derived = derive_facets(
         repo,
         &clock,
@@ -272,20 +284,32 @@ fn serve_with(
     let parties = positive_parties(&derived.collisions);
     if !parties.is_empty() {
         if let Ok(list) = &mut read.listed {
-            let begun = Instant::now();
-            let allowed = refresh_budget.min(clock.remaining());
-            refresh(list, &parties, &ScanDeadline::after(begun, allowed));
-            // The derive that follows may not read past the re-read's own
-            // bound: a positive that could not be read again in time is
-            // reported unread, never read late and never served from the kept
-            // read the re-read replaced.
-            let bound = ScanDeadline::after(
-                clock.started(),
-                begun.saturating_duration_since(clock.started()) + allowed,
-            );
+            let reread = Reread::new(Instant::now(), refresh_budget.min(clock.remaining()));
+            refresh(list, &parties, &reread.reading());
+            stamps.reread(&parties, reread.begun);
+            // The checkout `changes` describes was read before the re-read.
+            // When it is one of the positives its count is taken from the
+            // re-read, so the row's dirty count and `changes` are one moment;
+            // when the re-read did not complete, `changes` is not scanned,
+            // never the kept read.
+            if parties.iter().any(|party| super::same_path(party, repo)) {
+                let reread_ok = list.iter().any(|info| {
+                    super::same_path(&info.path, repo)
+                        && matches!(info.status_read, StatusRead::Read { .. })
+                });
+                read.changes = if reread_ok {
+                    match GitReader::get_status_since(repo, reread.begun) {
+                        Ok(files) => changes_from_status(&files, false),
+                        Err(error) => empty_changes(error.into_message()),
+                    }
+                } else {
+                    empty_changes("the re-read of this checkout did not finish in time")
+                };
+                stamps.changes = reread.begun;
+            }
             derived = derive_facets(
                 repo,
-                &bound,
+                &reread.deriving(&clock),
                 MAX_SNAPSHOT_WORKTREES,
                 observation,
                 &read.listed,
@@ -294,14 +318,10 @@ fn serve_with(
         }
     }
 
-    let mut age = list_age;
-    if let Ok(list) = &read.listed {
-        for info in list {
-            if let Some(read_age) = worktree::status_age(Path::new(&info.path)) {
-                age = age.max(read_age);
-            }
-        }
-    }
+    // Taken here, with the facets just derived, from the stamps of the reads
+    // they stand on: nothing a concurrent asker does to the cache afterwards
+    // can lower it.
+    let age = stamps.oldest(Instant::now(), list_began, &read.listed);
 
     let mut not_scanned = Vec::new();
     let mut gap = |facet: &str, reason: &str| {
@@ -349,6 +369,157 @@ fn serve_with(
         collisions,
         deadline_expired: derived.deadline_expired,
         not_scanned,
+    }
+}
+
+/// How old the status read kept for `dir` is, as the cache reports it.
+#[cfg(not(test))]
+fn kept_age(dir: &Path) -> Option<Duration> {
+    worktree::status_age(dir)
+}
+
+/// [`kept_age`] with the test seam: a test installs a probe to say how old the
+/// reads are, so an age can be driven without waiting for it.
+#[cfg(test)]
+fn kept_age(dir: &Path) -> Option<Duration> {
+    test_ages::probe(dir).unwrap_or_else(|| worktree::status_age(dir))
+}
+
+#[cfg(test)]
+mod test_ages {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::time::Duration;
+
+    type Probe = Box<dyn Fn(&Path) -> Option<Duration>>;
+
+    thread_local! {
+        static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    }
+
+    /// The installed probe's answer, if one is installed on this thread.
+    pub(super) fn probe(dir: &Path) -> Option<Option<Duration>> {
+        PROBE.with(|probe| probe.borrow().as_ref().map(|answer| answer(dir)))
+    }
+
+    /// Runs `body` with `answer` as the cache's report of every read's age.
+    pub(super) fn with_ages<T>(
+        answer: impl Fn(&Path) -> Option<Duration> + 'static,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        PROBE.with(|probe| *probe.borrow_mut() = Some(Box::new(answer)));
+        let result = body();
+        PROBE.with(|probe| *probe.borrow_mut() = None);
+        result
+    }
+}
+
+/// When each read this answer stands on began.
+///
+/// `status_age` says what the shared cache holds *now*, which is wrong as the
+/// age of an answer on both sides: a concurrent asker refreshing it lowers it,
+/// and a re-read of one checkout says nothing of the others. So each
+/// ingredient is stamped before it is read: a kept read that the clock will
+/// accept began `age` before the stamp (a newer one may be handed over, which
+/// only makes the stamp conservative), and one it will not accept is read for
+/// this ask, which begins no earlier than the ask. Re-read ingredients are
+/// restamped with the instant their re-read began.
+struct Stamps {
+    changes: Instant,
+    worktrees: Vec<(String, Instant)>,
+}
+
+impl Stamps {
+    fn capture(
+        listed: &Result<Vec<WorktreeInfo>, CommandError>,
+        repo: &str,
+        asked: Instant,
+        floor: Instant,
+    ) -> Self {
+        let stamped = Instant::now();
+        let began = |path: &str| match kept_age(Path::new(path)) {
+            // Accepted by a clock that began at `floor`.
+            Some(age) if stamped.checked_sub(age).is_some_and(|began| began >= floor) => {
+                stamped.checked_sub(age).unwrap_or(floor)
+            }
+            _ => asked,
+        };
+        Self {
+            changes: began(repo),
+            worktrees: listed
+                .as_ref()
+                .map(|list| {
+                    list.iter()
+                        .filter(|info| !info.is_bare)
+                        .map(|info| (info.path.clone(), began(&info.path)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The worktrees in `named` were read again, beginning at `begun`.
+    fn reread(&mut self, named: &[String], begun: Instant) {
+        for (path, began) in &mut self.worktrees {
+            if named.contains(path) {
+                *began = begun;
+            }
+        }
+    }
+
+    /// The age at `now` of the oldest read the facets stand on: the listing,
+    /// the `changes` read, and every worktree status that was read.
+    fn oldest(
+        &self,
+        now: Instant,
+        list_began: Instant,
+        listed: &Result<Vec<WorktreeInfo>, CommandError>,
+    ) -> Duration {
+        let mut began = list_began.min(self.changes);
+        if let Ok(list) = listed {
+            for info in list {
+                if !matches!(info.status_read, StatusRead::Read { .. }) {
+                    continue;
+                }
+                if let Some((_, at)) = self.worktrees.iter().find(|(path, _)| *path == info.path) {
+                    began = began.min(*at);
+                }
+            }
+        }
+        now.saturating_duration_since(began)
+    }
+}
+
+/// The one end both the re-read of a positive and the derive that follows it
+/// answer to. The derive may not read past the re-read's own bound (a positive
+/// that could not be read again in time is reported unread, never read late
+/// and never served from the kept read the re-read replaced), so the two
+/// deadlines are built from this single instant and cannot be given different
+/// ends.
+struct Reread {
+    begun: Instant,
+    end: Instant,
+}
+
+impl Reread {
+    fn new(begun: Instant, allowed: Duration) -> Self {
+        Self {
+            begun,
+            end: begun.checked_add(allowed).unwrap_or(begun),
+        }
+    }
+
+    /// The deadline the re-read runs under.
+    fn reading(&self) -> ScanDeadline {
+        ScanDeadline::after(self.begun, self.end.saturating_duration_since(self.begun))
+    }
+
+    /// The deadline the derive runs under: the pass's own start, this end.
+    fn deriving(&self, clock: &ScanDeadline) -> ScanDeadline {
+        ScanDeadline::after(
+            clock.started(),
+            self.end.saturating_duration_since(clock.started()),
+        )
     }
 }
 

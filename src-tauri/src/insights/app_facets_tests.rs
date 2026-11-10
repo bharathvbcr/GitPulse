@@ -255,11 +255,14 @@ fn a_dirty_shared_checkout_whose_reread_misses_the_bound_is_not_scanned() {
         .find(|item| item.is_main)
         .expect("main row");
     assert_eq!(main.dirty_files, None, "the kept dirty count was served");
-    assert!(missed.deadline_expired);
     assert!(
-        snapshot_from_app(&farm.repo, Instant::now(), missed)
-            .unwrap_err()
-            .contains("partial"),
+        missed.changes.is_none(),
+        "the kept `changes` of a checkout whose re-read missed the bound was served"
+    );
+    assert!(missed.deadline_expired);
+    // Not a snapshot either way: `changes` is not scanned, and the rest is partial.
+    assert!(
+        snapshot_from_app(&farm.repo, Instant::now(), missed).is_err(),
         "the asker would have believed it"
     );
 }
@@ -276,19 +279,117 @@ fn a_read_older_than_the_promised_age_is_read_again_and_a_younger_one_is_not() {
     };
     serve(Duration::from_secs(3600));
 
+    // The kept reads are 50 ms old as far as the stamps are told: a young
+    // answer is handed over and says so, within a tight range of that age.
+    let known = Duration::from_millis(400);
     let mark = marks(&farm);
-    let young = serve(Duration::from_secs(3600));
+    let young = test_ages::with_ages(move |_| Some(known), || serve(Duration::from_secs(3600)));
     assert_eq!(spawned(&farm, &mark), (0, 0), "a young read was read again");
-    assert!(young.age_ms < 3_600_000, "{}", young.age_ms);
+    assert_age_near(young.age_ms, known);
 
+    // A promise of nothing refuses every kept read; the answer is as old as
+    // the ask itself, whatever the cache says its reads' ages are.
     let mark = marks(&farm);
-    let old = serve(Duration::ZERO);
+    let old = test_ages::with_ages(move |_| Some(known), || serve(Duration::ZERO));
     let (listings, statuses) = spawned(&farm, &mark);
     assert!(
         listings >= 1 && statuses >= 3,
         "an old answer was served from memory: {listings} listings, {statuses} statuses"
     );
-    assert!(old.age_ms < 1_000, "{}", old.age_ms);
+    assert!(
+        old.age_ms < slack().as_millis() as u64,
+        "{} ms for an answer read for this ask",
+        old.age_ms
+    );
+}
+
+/// How far above its ingredient's age an answer's age may be: the time between
+/// the stamp and the reply, scaled for a loaded host.
+fn slack() -> Duration {
+    crate::test_support::coverage_relaxed(Duration::from_millis(1000))
+}
+
+/// `age_ms` is at least `known` (the oldest ingredient's own age) and no more
+/// than `slack()` above it.
+fn assert_age_near(age_ms: u64, known: Duration) {
+    let known_ms = known.as_millis() as u64;
+    assert!(age_ms >= known_ms, "{age_ms} ms understates a {known_ms} ms read");
+    assert!(
+        age_ms <= known_ms + slack().as_millis() as u64,
+        "{age_ms} ms overstates a {known_ms} ms read"
+    );
+}
+
+/// The age is the oldest read the answer stands on. The checkout that
+/// `changes` describes is 1.5 s old as the stamps are told, while the
+/// worktrees in a collision are read again just now: the answer is not
+/// "fresh" for having re-read some.
+#[test]
+fn the_age_is_the_oldest_read_used_even_when_other_worktrees_were_just_read() {
+    let farm = farm(3, true);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    ask(&farm, &memo);
+    let main = farm.repo.clone();
+    let known = Duration::from_millis(1500);
+    let answer = test_ages::with_ages(
+        move |dir| Some(if dir == Path::new(&main) { known } else { Duration::from_millis(100) }),
+        || serve_with(&farm.repo, &Vec::new(), &memo, Duration::from_secs(3600), APP_BUDGET, APP_BUDGET),
+    );
+    let risk = answer.collisions.as_ref().expect("scanned");
+    assert!(risk.overlapping_files >= 1, "the siblings are in a collision: {risk:?}");
+    assert_age_near(answer.age_ms, known);
+}
+
+/// A concurrent asker refreshing the cache between the derive and the reply
+/// cannot lower the age: the cache is asked once, before the reads, and never
+/// again. (The probe answers 1.5 s the first time a path is asked and nothing
+/// after: an age taken from the cache afterwards would be 0.)
+#[test]
+fn a_refresh_of_the_cache_after_the_reads_does_not_lower_the_age() {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    let farm = farm(2, false);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    ask(&farm, &memo);
+    let asked_once = RefCell::new(HashSet::new());
+    let known = Duration::from_millis(1500);
+    let answer = test_ages::with_ages(
+        move |dir| {
+            let first = asked_once.borrow_mut().insert(dir.to_path_buf());
+            Some(if first { known } else { Duration::ZERO })
+        },
+        || serve_with(&farm.repo, &Vec::new(), &memo, Duration::from_secs(3600), APP_BUDGET, APP_BUDGET),
+    );
+    assert_age_near(answer.age_ms, known);
+}
+
+/// The checkout `changes` describes is read again when it is a positive, so its
+/// row and the facet are one moment (before, `changes` kept the older read).
+#[test]
+fn a_reread_main_checkout_and_the_changes_facet_agree() {
+    let farm = farm(2, false);
+    let observation = busy_main(&farm, true);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let first = ask_observed(&farm, &observation, &memo);
+    assert_eq!(first.changes.as_ref().expect("changes").files, 1);
+
+    std::fs::write(Path::new(&farm.repo).join("scratch2.txt"), "more wip").expect("dirty again");
+    let second = ask_observed(&farm, &observation, &memo);
+    let main = second
+        .worktrees
+        .as_ref()
+        .expect("worktrees")
+        .items
+        .iter()
+        .find(|item| item.is_main)
+        .expect("main row");
+    let changes = second.changes.as_ref().expect("changes");
+    assert_eq!(main.dirty_files, Some(2), "the re-read saw the new file");
+    assert_eq!(
+        main.dirty_files,
+        Some(changes.files),
+        "the row and `changes` describe different moments"
+    );
 }
 
 /// A hung read cannot hold the handler: past its wait every facet is
