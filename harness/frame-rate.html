@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en" class="macos dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Frame-rate measurement</title>
+    <style>
+      body { margin: 0; padding: 12px; background: rgb(11 14 23); color: #ccc; }
+      /* The stage is opaque: html.macos makes the body transparent for the
+         window material, and a backdrop blur over nothing measures nothing. */
+      #stage { position: relative; display: flex; width: 1100px; height: 640px; overflow: hidden; background: rgb(var(--c-bg)); }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px 0; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <pre id="result">Measuring…</pre>
+    <script type="module">
+      // Measurement page, not a product surface: it ignores prefers-reduced-motion
+      // on purpose (see harness/FrameRate.ts). `?theme=light` selects light;
+      // `?ms=<n>` changes the 3000 ms phase length for manual runs.
+      import "../src/app.css";
+      import { createChecks } from "./checks.ts";
+      import { PHASES, runFrameRate } from "./FrameRate.ts";
+
+      const params = new URLSearchParams(location.search);
+      if (params.get("theme") === "light") document.documentElement.classList.replace("dark", "light");
+      const durationMs = Math.min(10000, Math.max(500, Number(params.get("ms") ?? 3000) || 3000));
+      const errors = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const { results, check, stopped } = createChecks();
+      const fixed = (value, digits = 2) => (Number.isFinite(value) ? value.toFixed(digits) : String(value));
+      let run = null;
+      let verdict = "";
+
+      const table = () => {
+        if (!run) return `${verdict}\n`;
+        const head = "phase      status                 focus      frames  median   p95      p99      max      Hz med/mean long";
+        const lines = run.phases.map((p) => [
+          p.phase.padEnd(10), p.status.padEnd(22), p.focus.padEnd(10), String(p.frames).padEnd(7),
+          `${fixed(p.medianMs)}ms`.padEnd(8), `${fixed(p.p95Ms)}ms`.padEnd(8), `${fixed(p.p99Ms)}ms`.padEnd(8),
+          `${fixed(p.maxMs)}ms`.padEnd(8), `${fixed(p.hz, 1)}/${fixed(p.meanHz, 1)}`.padEnd(11), String(p.longFrames),
+        ].join(" ") + (p.note ? `\n  ! ${p.note}` : ""));
+        const env = run.environment;
+        return [head, ...lines, "",
+          `float backdrop-filter: ${env.floatBlur}`, `html.macos: ${env.macosClass}  dpr: ${env.devicePixelRatio}  screen: ${env.screen}  reduced-motion preference: ${env.reducedMotionPreference}`,
+          env.userAgent, "", verdict].join("\n");
+      };
+      const show = () => { document.getElementById("result").textContent = table(); };
+
+      (async () => {
+        try {
+          run = await runFrameRate(document.getElementById("stage"), durationMs);
+          // A phase that could not measure is a failed check; a phase that
+          // measured a low rate is a pass that reports the low rate. Each
+          // row asserts one number exists and is usable, so a run that never
+          // sampled cannot pass by having no rows to fail.
+          check("html.macos is set, so the material tokens and the float blur rule apply", () => run.environment.macosClass);
+          for (const phase of PHASES) {
+            const p = run.phases.find((candidate) => candidate.phase === phase);
+            const usable = (name, value) => check(`${phase}: ${name} (${p.status}${p.note ? `: ${p.note}` : ""}; focus ${p.focus})`, () => p.status === "ok" && Number.isFinite(value));
+            usable(`rAF delivered ${p.frames} usable intervals`, p.frames);
+            usable(`median ${fixed(p.medianMs)} ms`, p.medianMs);
+            usable(`p95 ${fixed(p.p95Ms)} ms`, p.p95Ms);
+            usable(`p99 ${fixed(p.p99Ms)} ms`, p.p99Ms);
+            usable(`effective ${fixed(p.hz, 1)} Hz`, p.hz);
+            usable(`${p.longFrames} long frames (> 1.5x median)`, p.longFrames);
+          }
+          check("the float surface computed a backdrop blur during the blur phase", () => /blur\(/.test(run.environment.floatBlur));
+          check("no unhandled runtime errors", () => errors.length === 0);
+          verdict = "All phases measured. Low rates are reported above, never failed.";
+        } catch (error) {
+          verdict = stopped(error);
+        }
+        show();
+
+        // The runner prints `diagnostics` on a green run and the full verdict on
+        // a failed one, so the numbers travel either way.
+        const diagnostics = JSON.stringify({ phases: run?.phases ?? [], environment: run?.environment ?? null, durationMs });
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>

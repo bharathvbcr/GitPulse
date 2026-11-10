@@ -1,0 +1,7 @@
+export function enter() {
+  return { duration: 180, y: 4 };
+}
+
+export function exit(media: unknown) {
+  return motionDuration(200, media);
+}

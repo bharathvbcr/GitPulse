@@ -1,0 +1,5 @@
+// duration: 180 in a comment
+export function enter(media: unknown) {
+  return { duration: motionDuration(MOTION.base, media), y: 4 };
+}
+export const label = "duration-500 is a string a human reads";
