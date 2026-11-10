@@ -3200,7 +3200,7 @@ fn parse_conversion_attrs(raw: &[u8]) -> Result<HashMap<String, ConversionAttrs>
             .into());
     }
     let mut seen: HashMap<String, [Option<String>; 6]> = HashMap::new();
-    for triple in fields.chunks_exact(3) {
+    for triple in fields.as_chunks::<3>().0 {
         let (Ok(path), Ok(attr), Ok(value)) = (
             std::str::from_utf8(triple[0]),
             std::str::from_utf8(triple[1]),
@@ -3315,10 +3315,15 @@ fn clones_that_are_not_their_blob(
     target: &Path,
     cloned: &[(String, String)],
 ) -> Result<Vec<String>, CommandError> {
-    let (hashable, unnameable): (Vec<&(String, String)>, Vec<&(String, String)>) = cloned
-        .iter()
-        .partition(|(rel, _)| named_exactly_by_stdin_paths(rel));
-    let mut wrong: Vec<String> = unnameable.iter().map(|(rel, _)| rel.clone()).collect();
+    let mut hashable = Vec::with_capacity(cloned.len());
+    let mut wrong: Vec<String> = Vec::new();
+    for clone in cloned {
+        if named_exactly_by_stdin_paths(&clone.0) {
+            hashable.push(clone);
+        } else {
+            wrong.push(clone.0.clone());
+        }
+    }
     if hashable.is_empty() {
         return Ok(wrong);
     }
