@@ -14,8 +14,8 @@ const CONVERTED = [
   "components/TaskArchive.svelte",
   "components/TaskManviAssist.svelte",
   "components/files/LivePulseDashboard.svelte",
-  "components/ManviOpsPanel.svelte",
-  "components/ManviHarnessPane.svelte",
+  // Grants refresh while the Policy activity disclosure is open.
+  "components/PolicyActivity.svelte",
   // The delivery poll's timeline ticker fires every second while a run is in
   // flight, and its `live` state outlives the window being hidden.
   "components/GitHubPanel.svelte",
@@ -28,7 +28,7 @@ describe("background UI timers follow the load cadence", () => {
   it.each(CONVERTED)("%s schedules through createAdaptiveTimer", (path) => {
     const source = readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
     expect(source).toContain("createAdaptiveTimer");
-    // A bare `window.setInterval` is the shape this replaced. (ManviHarnessPane
+    // A bare `window.setInterval` is the shape this replaced. (PolicyActivity
     // keeps a `setInterval` *seam* whose real implementation is the timer.)
     expect(source).not.toMatch(/window\.setInterval\(/);
     expect(source).not.toMatch(/[^.\w]setInterval\(\(\) =>/);

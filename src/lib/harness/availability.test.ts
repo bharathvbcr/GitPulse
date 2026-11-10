@@ -55,8 +55,8 @@ describe("harness permission availability", () => {
   it("routes every MANVI status surface through the same permission truth", () => {
     const components = [
       "../components/HarnessBadge.svelte",
-      "../components/ManviHarnessPane.svelte",
-      "../components/ManviOpsPanel.svelte",
+      "../components/ManviConnection.svelte",
+      "../components/PolicyActivity.svelte",
     ].map((path) => readFileSync(new URL(path, import.meta.url), "utf8"));
 
     for (const source of components) {

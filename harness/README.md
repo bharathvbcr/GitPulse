@@ -376,7 +376,7 @@ never reaches the final assignment — that is how the StoragePanel defect
 presented).
 
 - `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `FleetView` |
-  `TerminalPanel` | `ManviOpsPanel` | `StatusBar` | `LoopCanary` | `FileTreePanel`
+  `TerminalPanel` | `GitHubPanel` | `StatusBar` | `LoopCanary` | `FileTreePanel`
 - `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs` | `treebuilds`
 - `treebuilds` counts how many times the Code view's file tree is built
   (`fileTreeBuildCount()`, read at `buildFileTree`) per file click, per unrelated

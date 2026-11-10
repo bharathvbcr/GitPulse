@@ -32,7 +32,7 @@ Four **views**, each a header tab. Sections inside a view are lenses on the same
 ```mermaid
 flowchart LR
     subgraph Views["The four views"]
-        Work["Work — Overview · Resolve · Remote · Policy · Tasks"]
+        Work["Work — Overview · Remote · Tasks"]
         Code["Code — Explorer · Blame · Search · Map"]
         History["History — Graph (commits / HEAD moves) · Diff · Suspects"]
         Insights["Insights — Pulse · Coverage · Health · Secrets · Storage"]

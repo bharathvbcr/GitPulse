@@ -2,7 +2,7 @@
 
 GitPulse has **four views**. Each holds sections (lenses) on one subject. Tasks, Fleet and the terminal dock are workspace surfaces outside those four views.
 
-**Product stack.** DevCouncil is components and modules. Manvi wraps them. Work → Policy and Tasks go through Manvi; Code → Map uses DevCouncil's `devmap` module.
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. Work → Overview's cleanup and policy activity, Remote's issue import and release publishing, and Tasks go through Manvi; Code → Map uses DevCouncil's `devmap` module.
 
 ![Files view: explorer, syntax-highlighted viewer, and uncommitted status](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-files.png)
 
@@ -14,10 +14,8 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 
 | Section | Purpose |
 | --- | --- |
-| **Overview** | One row per place work is happening: linked worktrees, PRs, runs, policy verdicts. Blocked operations sort first. Agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Branch stack hierarchy is embedded directly in Overview as a collapsible card, with zero-round-trip churn carry-forward across matching commit tips. Supports DevMap-guided `--cone` sparse checkouts, `<512 B` zero-copy DevMap base pointers (`base_store_ref.json`), worktree copy-on-write cache sync (APFS clonefile / Linux FICLONE) paired with the `gitpulse-rustc` shared build cache, 3-layer parallel agent collision radar, named localhost routes via portless, and `.gitpulse/hooks.toml` lifecycle hooks. |
-| **Resolve** | 3-way conflict editor: ours / theirs / base, marker jump, accept current / incoming / both. |
-| **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
-| **Policy** | Manvi wrap of DevCouncil modules: gate status, dead-branch cleanup (with tip backups in the ledger, squash merge detection, and authorized delete commands), outgoing commit review, release preflight. |
+| **Overview** | One row per place work is happening: linked worktrees, PRs, runs, policy verdicts. Blocked operations sort first. Agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. While a merge, rebase, cherry-pick or revert is parked, the 3-way conflict editor (ours / theirs / base, marker jump, accept current / incoming / both) leads Overview. Branch stack hierarchy, branch and tag cleanup (dead-branch cleanup with tip backups in the ledger, squash merge detection, and authorized delete commands) and policy activity (grants and recorded verdicts) are collapsible cards, with zero-round-trip churn carry-forward across matching commit tips. Supports DevMap-guided `--cone` sparse checkouts, `<512 B` zero-copy DevMap base pointers (`base_store_ref.json`), worktree copy-on-write cache sync (APFS clonefile / Linux FICLONE) paired with the `gitpulse-rustc` shared build cache, 3-layer parallel agent collision radar, named localhost routes via portless, and `.gitpulse/hooks.toml` lifecycle hooks. |
+| **Remote** | Outgoing commits checked before you push; PRs and issues (report an issue, add issues to tasks) in the wide column; workflows, runs, and releases (push a release tag after preflight) in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
 | **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, column "Load all" (pages up to 2,000 cards with persistent reload depth), named hidden repository notices, batched verification sweeps (`latest_many`), Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.

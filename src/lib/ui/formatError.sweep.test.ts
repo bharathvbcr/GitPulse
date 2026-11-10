@@ -15,8 +15,13 @@ const SWEPT_FILES = [
   "../stores/graphStore.ts",
   "../stores/harnessStore.ts",
   "../components/WorktreesPanel.svelte",
-  "../components/ManviOpsPanel.svelte",
-  "../components/ManviHarnessPane.svelte",
+  "../components/LocalModelServers.svelte",
+  "../components/BranchNameSuggestion.svelte",
+  "../components/PolicyActivity.svelte",
+  "../components/BranchTagCleanup.svelte",
+  "../components/OutgoingCommitReview.svelte",
+  "../components/IssueTaskActions.svelte",
+  "../components/ReleasePublish.svelte",
   "../components/ConflictEditor.svelte",
   "../components/CodeStackViewer.svelte",
   "../components/CoverageViewer.svelte",
@@ -44,6 +49,9 @@ const FORMATTER_SEAM = [
   { marker: "formatError(", importNeedle: "ui/formatError" },
   { marker: "reportPanelError(", importNeedle: "diagnostics/report" },
   { marker: "formatDiagnosticFailure(", importNeedle: "diagnostics/diagnostics" },
+  // User-facing failure copy: the reason is `formatError(err)`, flattened
+  // and capped (ui/copy/describeFailure.ts), so it is the same seam.
+  { marker: "describeFailure(", importNeedle: "ui/copy/describeFailure" },
 ] as const;
 
 function routesThroughFormatter(source: string): boolean {

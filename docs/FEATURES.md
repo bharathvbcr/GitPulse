@@ -8,7 +8,7 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Find a workflow
 
-- [Work: Overview, Remote, Policy, and Tasks](#1-work-work)
+- [Work: Overview, Remote, and Tasks](#1-work-work)
 - [Tasks and saved workspaces](TASKS_AND_WORKSPACES.md)
 - [Code](#2-code-code), [History](#3-history-history), and [Insights](#4-insights-insights)
 - [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
@@ -16,11 +16,11 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 13 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 12 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
-| **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Policy · Tasks |
+| **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Tasks |
 | **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 13 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 12 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -50,7 +50,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
-        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Policy · Tasks"]
+        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph (commits or HEAD moves) · Diff · Suspects — three lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
@@ -67,9 +67,12 @@ flowchart TD
 
 ## 1. Work (`work`)
 
-Everything in flight, and the actions that unblock it. Five sections cover
-worktree activity, conflict resolution, GitHub, policy and the repository's
-shared task board (with branch stack hierarchy embedded directly in Overview).
+Everything in flight, and the actions that unblock it. Three sections cover
+worktree activity (with the conflict editor, branch chains, cleanup and the
+policy journal folded into Overview), GitHub and the outgoing commits
+(Remote), and the repository's shared task board. Resolve and Policy were
+sections once; their content now lives with the subject it acts on — see
+[1.3](#13-policy-manvi-across-work-and-settings).
 
 ### 1.1 Overview
 
@@ -196,17 +199,37 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 - **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
 - **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
 
-### 1.3 Policy (Manvi wrap)
+### 1.3 Policy (Manvi), across Work and Settings
 
-- **Conflicts Lead While a Merge Is Stopped**: Resolve was its own section; agents finish most parked merges, so it is now the top of Policy. While files are conflicted, a merge, rebase, cherry-pick or revert is parked, or the operation could not be read, the conflict editor takes the pane at full height and Manvi follows below in one scroller. Drafts kept from an earlier operation get a one-line row with **Review drafts** instead of the whole pane. Every way that used to open Resolve (the conflicts chip, status bar, tray, merge dialog, blocked Overview rows, a saved selection) opens Policy.
+Resolve and Policy were Work sections. Resolve was an empty state nearly every
+visit — agents finish most parked merges — and Policy was a page named after
+the engine underneath rather than a subject, showing GitHub issues and
+releases beside Remote's lists of the same objects. Each piece now lives with
+the subject it acts on, and a saved `resolve` or `policy` selection, a native
+menu build or an old deep link lands on Overview.
+
+**On Overview**
+- **Conflicts Lead While a Merge Is Stopped**: While files are conflicted, a merge, rebase, cherry-pick or revert is parked, or the operation could not be read, the conflict editor leads Overview at full height and the joined rows follow in one scroller; nothing about it shows otherwise. The rows are one instance outside the editor's branch, so a merge an agent parks or finishes while you read does not rebuild them under you. Drafts kept from an earlier operation get a one-line row with **Review drafts** instead of the whole page. Every way that used to open Resolve (the conflicts chip, status bar, tray and its `3` key, merge dialog, blocked rows, the palette's **Resolve conflicts**) lands here and scrolls to the editor.
   - **3-Way Conflict Editor**: Clear visual distinction between *ours*, *theirs*, and *base* revisions.
   - **One-Click Resolution**: Quick actions to accept current, incoming, or combined changes.
   - **Marker Navigation**: Jump directly between unresolved conflict markers across changed files.
-- **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
+- **Branch and Tag Cleanup** (collapsed): Manvi's conservative cleanup plan for merged local branches and redundant tags, scanned on request. It is always listed, never hidden when empty, because the scan is manual and a hidden card would read as clean without having checked; a count appears only after a scan has run. **Stale branches…** opens the dead-branch cleanup: it scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`), writes a restorable tip backup first and records it in the ledger, authorizes each `git branch -d/-D` and `git push --delete` before execution (a refusal aborts the batch before any branch is removed), and its Restore action puts backed-up tips back.
+- **Policy Activity** (collapsed): Grants and the agent journal — the verdicts Manvi's command and file write gates recorded, with ledger adoption when the history reports an error. Shown unless Manvi is positively not installed with nothing recorded; a check that could not run keeps it visible. Grants refresh only while it is open. Each row's verdict chips show the same verdicts per piece of work.
+
+**On Remote**
+- **Outgoing Commits**: Conventional format, duplicate subjects, issue links and length, checked before you push. A local check, so it works without `gh`; shown while the branch is ahead, and when the ahead count is unknown (no upstream) it says so rather than hiding.
+- **Issues to Tasks**: Remote's one issue list gains **Report issue…**, **Add to tasks** per issue, **Add all to tasks** (only the missing ones), and a pause for the import. Its once-a-minute refresh is one quiet read beside the panel's own.
+- **Release Publisher**: **Push release tag…** on Releases, with preflight (clean worktree, synchronized branch) and a confirmation before the SemVer tag is pushed.
+
+**In Settings → Agents**
+- **Manvi Policy** and **Capability Boundary**: connection status, posture and what the gate can and cannot see, beside the external CLI installer.
+- **Local Model Servers**: scan, pick, and the Claude model Manvi uses.
+- **Branch naming** for the work in progress moved beside the new-branch field of the **Worktrees** panel.
+
+**Underneath**
 - **macOS Background Band Pre-Exec Hook**: Background Git and CLI processes enter Darwin's background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`), ensuring background tasks and their child trees inherit background priority permanently without race conditions.
-- **Dead-Branch Cleanup**: Scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`). Cleaning writes a restorable tip backup first and records it in the ledger. Each `git branch -d/-D` and `git push --delete` command is authorized before execution; a refusal aborts the batch before any branch is removed. The Restore action puts backed-up tips back.
-- **Commit Review**: Analyzes outgoing commits before pushing, reporting reviewed vs total counts.
-- **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
+
+The header's Manvi chip opens **Settings → Agents → Manvi policy**, its verdict chip opens **Overview → Policy activity**, and Storage's merged-branch count opens **Overview → Branch and tag cleanup** — each names its destination in its tooltip. Quick pull and Quick push were dropped: they called the same pull and push the sidebar, palette and branch menu offer.
 
 ---
 
@@ -363,7 +386,7 @@ the commit you had just selected.
 - **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
 - **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter in History's section bar, which filters all three sections from one walk. From any other view it switches to History first; in Code, ⌘F still searches the open file — in both sections, because Blame's lines are that same file's lines.
 - **Filters That Keep The Graph Connected**: Every filter term — `author:`, `sha:`, `type:` or a `fix:`-style prefix, free text, and `path:` — is applied by the backend before lanes are solved. A commit the filter drops hands its lineage to its children, the way `git log --parents -- path` rewrites parents, so the survivors stay connected to their nearest kept ancestors, a survivor with no kept ancestors becomes a root of the filtered view, and the straight main-branch rail stays straight, anchored on the first surviving commit of the default branch's chain. A fading stub therefore always means one thing: the parent is past the loaded window, and the tooltip says so.
-- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in Work → Policy, with the conflict editor first, if a conflict results.
+- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in Work → Overview, with the conflict editor first, if a conflict results.
 
 ### 3.2 Diff
 

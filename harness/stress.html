@@ -449,7 +449,8 @@
       // hand-rolled one answered `plugin:event|listen` with null and installed
       // no `__TAURI_EVENT_PLUGIN_INTERNALS__`, so no `listen()` ever registered
       // and every unlisten on teardown threw reading `unregisterListener` --
-      // ManviOpsPanel's chaos remount reported that TypeError as a crash.
+      // ManviOpsPanel's chaos remount reported that TypeError as a crash (its
+      // listeners and issue poll now live in GitHubPanel, which took its place).
       const { mockIPCWithEvents } = await import("./tauriMocks.ts");
       mockIPCWithEvents(async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null));
 
@@ -482,7 +483,7 @@
         CoverageViewer: () => import("../src/lib/components/CoverageViewer.svelte"),
         FleetView: () => import("../src/lib/components/FleetView.svelte"),
         TerminalPanel: () => import("../src/lib/components/TerminalPanel.svelte"),
-        ManviOpsPanel: () => import("../src/lib/components/ManviOpsPanel.svelte"),
+        GitHubPanel: () => import("../src/lib/components/GitHubPanel.svelte"),
         StatusBar: () => import("../src/lib/components/StatusBar.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
         FileTreePanel: () => import("../src/lib/components/files/FileTreePanel.svelte"),
