@@ -1020,22 +1020,58 @@ impl GitReader {
         // window of n rows needs ceil((n - 1) / chunk) chunks, so chunk + 1
         // rows is one walk, and the chunks stay aligned (and kept) as before.
         let wire = chunk.saturating_add(1);
+        // One stamp for the whole window: every chunk is kept under the refs
+        // as they were before the first walk started, as a lone walk is.
+        let stamp = ref_cache::stamp(&repo, history_namespaces(revision, scope));
+        let stash = std::cell::RefCell::new(HashMap::new());
         let mut commits = if count <= wire {
-            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+            let run = ChunkRun {
+                stamp: stamp.as_ref(),
+                stash: &stash,
+                chunk,
+                last_start: skipped,
+            };
+            Self::history_chunk(
+                &repo,
+                skipped,
+                count,
+                revision,
+                spec.as_deref(),
+                scope,
+                &run,
+            )?
         } else {
             // A long window is read as aligned chunks, each kept on its own.
             // One 100k-commit answer exceeded the cache's per-entry cap and
             // was never kept, so every "load more" walked and parsed the whole
             // window again; chunks stay under the cap, and growing the window
-            // reads only the chunks it has not seen. (Git still skips past
-            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            // reads only the chunks it has not seen. A cold read is ONE walk:
+            // its output is cut into the chunks the window still needs
+            // ([`slice_history_walk`]) and each is kept under the key a walk
+            // of that chunk alone would have had, instead of one `--skip`
+            // walk per chunk, each of which re-walks every commit before it.
             let end = skipped.saturating_add(count);
-            let mut start = skipped - skipped % chunk;
+            let first = skipped - skipped % chunk;
+            let run = ChunkRun {
+                stamp: stamp.as_ref(),
+                stash: &stash,
+                chunk,
+                // The loop below reads chunks while `start + 1 < end`.
+                last_start: first + ((end - 2 - first) / chunk) * chunk,
+            };
+            let mut start = first;
             let mut taken_to = skipped;
             let mut commits = Vec::with_capacity(count);
             while start.saturating_add(1) < end {
-                let rows =
-                    Self::history_chunk(&repo, start, wire, revision, spec.as_deref(), scope)?;
+                let rows = Self::history_chunk(
+                    &repo,
+                    start,
+                    wire,
+                    revision,
+                    spec.as_deref(),
+                    scope,
+                    &run,
+                )?;
                 let ended = rows.len() < wire;
                 let to = end.min(start + rows.len());
                 if to > taken_to {
@@ -1062,58 +1098,41 @@ impl GitReader {
         revision: Option<&str>,
         spec: Option<&str>,
         scope: RefScope,
+        run: &ChunkRun<'_>,
     ) -> Result<Vec<RawCommitNode>, CommandError> {
-        let count_arg = format!("-n{count}");
-        let skip_arg = format!("--skip={skip}");
-        let mut args: Vec<&str> = Vec::new();
-        if spec.is_some() {
-            // Path bytes reach us raw rather than octal-escaped, matching the
-            // pathspec we hand back to git.
-            args.extend_from_slice(&["-c", "core.quotepath=off"]);
-        }
-        args.extend_from_slice(&["log", count_arg.as_str(), skip_arg.as_str(), "--topo-order"]);
-        if spec.is_some() {
-            // Parent rewriting only. `--parents` prepends parent oids to the
-            // DEFAULT log line; with a custom `--format` it adds no fields, so
-            // the record layout below is untouched.
-            args.push("--parents");
-        }
-        // Subjects may legally contain any byte except NUL, so the RECORD
-        // terminator is %x00 — a hostile subject can no longer split the
-        // stream into bogus records. Fields use %x01, which a subject,
-        // author name or email may legally contain too: the risky
-        // variable-length fields therefore sit at the END of the record
-        // and parsing works from the RIGHT (see [`parse_history_record`]),
-        // so such a byte can only truncate the one field it landed in —
-        // never shift id, parents or timestamp.
-        args.push("--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00");
-        if let Some(rev) = revision {
-            validate_ref_name(rev)?;
-            args.push(rev);
-        } else {
-            // NOT `--all`. `--all` walks every namespace under `refs/` —
-            // including agent turn checkpoints, prefetch mirrors and CI pull
-            // refs — while only heads/remotes/tags are ever labelled, so
-            // those namespaces opened lanes nothing could name. One owner
-            // decides the set for both sides; see crate::graph::ref_scope.
-            args.extend_from_slice(crate::graph::history_rev_args(scope));
-        }
-        if let Some(spec) = spec {
-            args.push("--");
-            args.push(spec);
-        }
+        let argv = history_log_args(skip, count, revision, spec, scope)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         // The graph, the history list and the AI context ask for the same
         // page at once after a change; queued identical walks share a child.
         // The walk is a function of the refs it starts from and of objects,
         // which never change, so a refresh caused by a working-tree edit is
-        // answered without a walk. A named revision or `--all` may start
-        // anywhere in the ref store, every worktree's HEAD included.
-        let namespaces: &[&str] = if revision.is_some() || scope == RefScope::All {
-            &[ref_cache::ALL_REFS]
-        } else {
-            &crate::graph::ref_scope::NAMED_REF_PATTERNS
-        };
-        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
+        // answered without a walk.
+        let stdout = ref_cache::through_stamped(repo, &args, run.stamp, || {
+            if let Some(text) = run.stash.borrow_mut().remove(&skip) {
+                return Ok((text, true));
+            }
+            if run.last_start > skip {
+                // Chunks follow this one in the window, and none is held:
+                // one walk from here to the window's last chunk answers all.
+                let wire = run.chunk.saturating_add(1);
+                let rows = run.last_start + wire - skip;
+                let long = history_log_args(skip, rows, revision, spec, scope)?;
+                let long: Vec<&str> = long.iter().map(String::as_str).collect();
+                let (text, cut) =
+                    git_cli::git_text_capped_shared(repo, &long, git_cli::MAX_OUTPUT_BYTES)?;
+                let mut pieces =
+                    slice_history_walk(&text, skip, run.chunk, wire, run.last_start, cut.is_none())
+                        .into_iter();
+                // A walk cut at the output cap or a deadline may not even
+                // cover this chunk; then it is read on its own, as before.
+                if let Some((start, first)) = pieces.next() {
+                    debug_assert_eq!(start, skip);
+                    run.stash.borrow_mut().extend(pieces);
+                    return Ok((first, true));
+                }
+            }
+            git_cli::git_text_shared(repo, &args).map(|text| (text, true))
+        })?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -5372,6 +5391,127 @@ impl FirstParentPass {
         }
         FirstParentChain::Unfinished
     }
+}
+
+/// What the chunks of one history window share while it is read.
+struct ChunkRun<'a> {
+    /// The ref stamp read once before the window's first walk.
+    stamp: Option<&'a ref_cache::Stamp>,
+    /// Chunks a single walk already produced for the ones after it, by start.
+    stash: &'a std::cell::RefCell<HashMap<usize, String>>,
+    chunk: usize,
+    /// Start of the window's last chunk. A chunk at this start has nothing
+    /// after it to read ahead for.
+    last_start: usize,
+}
+
+/// The refs a history walk starts from, as a ref listing is stamped: a named
+/// revision or `--all` may start anywhere in the ref store, every worktree's
+/// HEAD included.
+fn history_namespaces(revision: Option<&str>, scope: RefScope) -> &'static [&'static str] {
+    if revision.is_some() || scope == RefScope::All {
+        &[ref_cache::ALL_REFS]
+    } else {
+        &crate::graph::ref_scope::NAMED_REF_PATTERNS
+    }
+}
+
+/// The `git log` argv for `count` rows after `skip`.
+fn history_log_args(
+    skip: usize,
+    count: usize,
+    revision: Option<&str>,
+    spec: Option<&str>,
+    scope: RefScope,
+) -> Result<Vec<String>, CommandError> {
+    let mut args: Vec<String> = Vec::new();
+    if spec.is_some() {
+        // Path bytes reach us raw rather than octal-escaped, matching the
+        // pathspec we hand back to git.
+        args.extend(["-c", "core.quotepath=off"].map(String::from));
+    }
+    args.extend([
+        "log".to_string(),
+        format!("-n{count}"),
+        format!("--skip={skip}"),
+        "--topo-order".to_string(),
+    ]);
+    if spec.is_some() {
+        // Parent rewriting only. `--parents` prepends parent oids to the
+        // DEFAULT log line; with a custom `--format` it adds no fields, so
+        // the record layout below is untouched.
+        args.push("--parents".to_string());
+    }
+    // Subjects may legally contain any byte except NUL, so the RECORD
+    // terminator is %x00 — a hostile subject can no longer split the
+    // stream into bogus records. Fields use %x01, which a subject,
+    // author name or email may legally contain too: the risky
+    // variable-length fields therefore sit at the END of the record
+    // and parsing works from the RIGHT (see [`parse_history_record`]),
+    // so such a byte can only truncate the one field it landed in —
+    // never shift id, parents or timestamp.
+    args.push("--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00".to_string());
+    if let Some(rev) = revision {
+        validate_ref_name(rev)?;
+        args.push(rev.to_string());
+    } else {
+        // NOT `--all`. `--all` walks every namespace under `refs/` —
+        // including agent turn checkpoints, prefetch mirrors and CI pull
+        // refs — while only heads/remotes/tags are ever labelled, so
+        // those namespaces opened lanes nothing could name. One owner
+        // decides the set for both sides; see crate::graph::ref_scope.
+        args.extend(
+            crate::graph::history_rev_args(scope)
+                .iter()
+                .map(|arg| (*arg).to_string()),
+        );
+    }
+    if let Some(spec) = spec {
+        args.push("--".to_string());
+        args.push(spec.to_string());
+    }
+    Ok(args)
+}
+
+/// Cuts the stdout of one `git log --skip=from` walk into the stdout that a
+/// walk of each aligned chunk alone would have printed: for the chunk starting
+/// at `from + j * chunk`, its `wire` records beginning at record `j * chunk`.
+/// Chunks run from `from` to `last_start`. Records end in NUL.
+///
+/// `complete` says the walk ran to its end. A cut walk only yields the chunks
+/// it covers whole, so a chunk is never short because the output was.
+fn slice_history_walk(
+    text: &str,
+    from: usize,
+    chunk: usize,
+    wire: usize,
+    last_start: usize,
+    complete: bool,
+) -> Vec<(usize, String)> {
+    let ends: Vec<usize> = text.match_indices('\0').map(|(at, _)| at + 1).collect();
+    let records = ends.len();
+    let mut pieces = Vec::new();
+    let mut start = from;
+    while start <= last_start {
+        let first = start - from;
+        let after = first.saturating_add(wire);
+        if !complete && records < after {
+            break;
+        }
+        if first >= records && !pieces.is_empty() {
+            // History ended: the loop that reads the chunks stops before it.
+            break;
+        }
+        let piece = if first >= records {
+            ""
+        } else {
+            let begin = if first == 0 { 0 } else { ends[first - 1] };
+            text[begin..ends[after.min(records) - 1]].trim_start_matches('\n')
+        };
+        pieces.push((start, piece.to_string()));
+        start += chunk;
+    }
+    pieces
 }
 
 /// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
@@ -13742,6 +13882,251 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         })
         .unwrap();
         assert_eq!(ids(&mid), ids(&whole[9..22]));
+    }
+
+    /// A cold window of several chunks is ONE `git log`, not one `--skip` walk
+    /// per chunk (each of which re-walks every commit before its skip), and
+    /// every chunk it filled is kept, so reading the same window again spawns
+    /// nothing. Every row equals a single unchunked walk's.
+    #[test]
+    fn a_cold_multi_chunk_window_is_one_log_and_fills_every_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_argvs = |since: usize| -> Vec<Vec<String>> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .cloned()
+                .collect()
+        };
+        let spawned = || git_cli::spawn_log::spawns_in(&repo).len();
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 45);
+
+        // Cold: 45 rows over chunks of 10 are five chunks (starts 0..=40).
+        let (cold, warm, grown, walks_cold, walks_warm, walks_grown) =
+            with_history_chunk(10, || {
+                eager_unhurried(|| {
+                    let before = spawned();
+                    let cold = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_cold = log_argvs(before);
+                    let before = spawned();
+                    let warm = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_warm = log_argvs(before);
+                    // A named revision is a different question: cold again.
+                    let before = spawned();
+                    let grown = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        Some("main"),
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_grown = log_argvs(before);
+                    (cold, warm, grown, walks_cold, walks_warm, walks_grown)
+                })
+            });
+        assert_eq!(
+            ids(&cold),
+            ids(&whole),
+            "the cold window differs from one walk"
+        );
+        assert_eq!(ids(&warm), ids(&whole));
+        assert_eq!(ids(&grown), ids(&whole));
+        assert_eq!(
+            walks_cold.len(),
+            1,
+            "a cold window of five chunks must be one log, got {walks_cold:?}"
+        );
+        assert_eq!(
+            walks_warm.len(),
+            0,
+            "kept chunks are not read again: {walks_warm:?}"
+        );
+        // A different revision is a different question: its own single walk.
+        assert_eq!(walks_grown.len(), 1, "{walks_grown:?}");
+    }
+
+    /// A window that grows past kept chunks walks once from the first chunk it
+    /// does not hold, however many chunks that leaves.
+    #[test]
+    fn growing_over_several_missing_chunks_is_one_log_from_the_first_missing() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let (rows, argvs) = with_history_chunk(10, || {
+            eager_unhurried(|| {
+                // Starts 0, 10, 20 are held after this.
+                GitReader::read_commit_history_paged(path, 0, 22, None, None, RefScope::Named)
+                    .unwrap();
+                let mid = git_cli::spawn_log::spawns_in(&repo).len();
+                let rows =
+                    GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+                        .unwrap();
+                let argvs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[mid..]
+                    .iter()
+                    .filter(|argv| argv.iter().any(|a| a == "log"))
+                    .cloned()
+                    .collect();
+                (rows, argvs)
+            })
+        });
+        assert!(git_cli::spawn_log::spawns_in(&repo).len() > before);
+        assert_eq!(rows.len(), 45);
+        assert_eq!(argvs.len(), 1, "starts 30 and 40 are one walk: {argvs:?}");
+        assert!(
+            argvs[0].iter().any(|a| a == "--skip=30"),
+            "the walk starts at the first missing chunk: {argvs:?}"
+        );
+    }
+
+    /// The cut of one long walk into chunks is exactly what a walk of each
+    /// chunk alone prints, for a path-limited walk (whose parents are
+    /// rewritten) as for the whole history, and a walk cut short yields only
+    /// the chunks it covers whole.
+    #[test]
+    fn a_one_walk_window_equals_chunked_walks_for_a_path_limited_history() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..14 {
+            if n % 2 == 0 {
+                std::fs::write(dir.path().join("a.txt"), format!("{n}\n")).unwrap();
+                git_in(dir.path(), &["add", "a.txt"]);
+                git_in(dir.path(), &["commit", "-q", "-m", &format!("a{n}")]);
+            } else {
+                git_in(
+                    dir.path(),
+                    &["commit", "--allow-empty", "-m", &format!("e{n}")],
+                );
+            }
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let rows = |chunk: usize| {
+            with_history_chunk(chunk, || {
+                eager_unhurried(|| {
+                    GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        8,
+                        None,
+                        Some("a.txt"),
+                        RefScope::Named,
+                    )
+                })
+            })
+            .unwrap()
+        };
+        let whole = rows(usize::MAX);
+        assert_eq!(whole.len(), 7, "seven commits touch a.txt");
+        for chunk in [1, 2, 3] {
+            let got = rows(chunk);
+            assert_eq!(got.len(), whole.len(), "chunk {chunk}");
+            for (a, b) in got.iter().zip(&whole) {
+                assert_eq!(
+                    (&a.id, &a.parent_ids),
+                    (&b.id, &b.parent_ids),
+                    "chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slicing_a_walk_gives_each_chunk_the_rows_its_own_walk_would() {
+        let walk = |rows: std::ops::Range<usize>| -> String {
+            rows.map(|n| format!("r{n}\0"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Chunks of 4 rows (+1 overlap = 5 on the wire) from skip 8, 13 rows.
+        let text = walk(0..13);
+        let pieces = slice_history_walk(&text, 8, 4, 5, 16, true);
+        let starts: Vec<usize> = pieces.iter().map(|(s, _)| *s).collect();
+        assert_eq!(starts, vec![8, 12, 16]);
+        assert_eq!(pieces[0].1, walk(0..5));
+        assert_eq!(pieces[1].1, walk(4..9));
+        assert_eq!(pieces[2].1, walk(8..13));
+        // A walk cut after 9 whole rows covers chunk 8 (rows 0..5) and 12
+        // (rows 4..9) and nothing more; the half row after them is dropped.
+        let cut = format!("{}\nhalf", walk(0..9));
+        let pieces = slice_history_walk(&cut, 8, 4, 5, 16, false);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].1, walk(4..9));
+        // A cut that does not cover the first chunk yields nothing.
+        assert!(slice_history_walk(&walk(0..3), 8, 4, 5, 16, false).is_empty());
+        // History that ends inside the window: later chunks are not invented.
+        let pieces = slice_history_walk(&walk(0..6), 8, 4, 5, 16, true);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].1, walk(4..6));
+        // A window past the end of history is one empty chunk.
+        assert_eq!(
+            slice_history_walk("", 8, 4, 5, 16, true),
+            vec![(8, String::new())]
+        );
+    }
+
+    /// One page that fits a chunk (and its probe row) is one process in total:
+    /// the `git log` and nothing else, root commit and all.
+    #[test]
+    fn one_history_page_spawns_exactly_one_process() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..9 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let rows = eager_unhurried(|| {
+            GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 10, "the page reaches the root commit");
+        let spawned: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..].to_vec();
+        assert_eq!(spawned.len(), 1, "one page, one process: {spawned:?}");
+        assert!(spawned[0].iter().any(|a| a == "log"), "{spawned:?}");
     }
 
     /// Every (chunk size, history length, skip, count) over a small repository
