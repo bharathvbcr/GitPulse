@@ -321,11 +321,12 @@ describe("annotated but unregistered commands", () => {
     // cmd_tuning_apply_cancel), and 304 with the Agent Inbox commands
     // (cmd_inbox_read, cmd_inbox_post, cmd_worktree_send_message,
     // cmd_inbox_withdraw, cmd_inbox_decompose_task), and 305 with
-    // cmd_github_open_pr_worktree;
+    // cmd_github_open_pr_worktree, and 306 with cmd_cancel_read (a read whose
+    // callers have all gone is stopped);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(305);
+    expect(found.size).toBe(306);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

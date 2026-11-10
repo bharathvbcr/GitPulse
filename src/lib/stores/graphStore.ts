@@ -13,7 +13,12 @@ import { isRefScope, type RefScope } from "../graph/refScope";
 import { interfaceStore } from "./interfaceStore";
 import type { CommitSignatureCheck } from "../pulse/types";
 
-export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+export type InvokeFn = <T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+  /** Only `signal` is honoured: aborting it is this caller leaving (see `ipc/invoke.ts`). */
+  options?: { signal?: AbortSignal },
+) => Promise<T>;
 
 export interface CommitFileChange {
   path: string;
@@ -478,6 +483,12 @@ export function createGraphStore(
    */
   const generations = new Map<string, number>();
   /**
+   * The graph load now in flight per repository. A newer load aborts it once
+   * its own read is issued, which tells the backend the older walk has no
+   * caller left (unless the newer load joined it).
+   */
+  const loads = new Map<string, AbortController>();
+  /**
    * The warning set last written to diagnostics, per repository.
    *
    * Assembly warnings are STATE, not events: a repository with refs outside
@@ -717,6 +728,8 @@ export function createGraphStore(
       // store-wide sources above.
       generations.delete(path);
       selections.delete(path);
+      loads.get(path)?.abort();
+      loads.delete(path);
       warnedSignatures.delete(path);
       if (visiblePath === path) {
         visiblePath = null;
@@ -759,14 +772,30 @@ export function createGraphStore(
           visiblePath: repoPath,
         }));
       }
+      const controller = new AbortController();
+      const olderLoad = loads.get(repoPath);
+      loads.set(repoPath, controller);
       try {
-        const payload = await invokeFn<CommitGraphPayload>("cmd_get_commit_graph", {
-          repoPath,
-          maxCommits: max,
-          query: query || null,
-          revision: revision || null,
-          refScope,
-        });
+        let pending: Promise<CommitGraphPayload>;
+        try {
+          pending = invokeFn<CommitGraphPayload>(
+            "cmd_get_commit_graph",
+            {
+              repoPath,
+              maxCommits: max,
+              query: query || null,
+              revision: revision || null,
+              refScope,
+            },
+            { signal: controller.signal },
+          );
+        } finally {
+          // After the newer read is issued, never before: a newer load of the
+          // same request joins the older read, and the older one is stopped
+          // only when nobody else waits for it.
+          olderLoad?.abort();
+        }
+        const payload = await pending;
         if (!isCurrent(repoPath, token)) return;
 
         // Assembly warnings ride along with an otherwise-good payload: each
