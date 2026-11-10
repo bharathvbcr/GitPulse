@@ -942,7 +942,7 @@
         {#if brokenSection === "loading"}
           <p class="text-meta text-textMuted">Loading…</p>
         {:else if brokenSection === "error"}
-          <p class="text-meta text-danger" role="alert" data-testid="docs-broken-error">Could not check links. {boundStrip(brokenError)}</p>
+          <p class="text-meta text-danger" role="alert" data-testid="docs-broken-error">Couldn't check links. {boundStrip(brokenError)}</p>
           <button type="button" class="gp-btn text-meta px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Try again</button>
         {:else if brokenSection === "empty"}
           <p class="text-meta text-textMuted">None found in the indexed vault.</p>

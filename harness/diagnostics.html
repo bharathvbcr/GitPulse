@@ -308,7 +308,7 @@
     const okRefresh=fixture.cmd_docs_refresh;
     fixture.cmd_docs_refresh=()=>{throw new Error("vault refresh boom");};
     await click("Docs");
-    check("a failed vault refresh says the links could not be checked",target.textContent.includes("Could not check links.")&&!target.textContent.includes("None found in the indexed vault."));
+    check("a failed vault refresh says the links could not be checked",target.textContent.includes("Couldn't check links.")&&!target.textContent.includes("None found in the indexed vault."));
     fixture.cmd_docs_refresh=okRefresh;
     await click("Symbols");take("graph").resolve({available:false,reason:"symbols",kind:"code_graph",payload:null});await settle();
     await click("Files");const oldGraph=take("graph");

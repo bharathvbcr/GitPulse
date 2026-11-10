@@ -147,7 +147,7 @@ describe("RepoMapPanel template honesty", () => {
     expect(source).toContain("brokenLinksSection(");
     expect(source).toContain("brokenError = reportMapFailure(");
     expect(source).toContain('data-testid="docs-broken-error"');
-    expect(template).toContain("Could not check links. {boundStrip(brokenError)}");
+    expect(template).toContain("Couldn't check links. {boundStrip(brokenError)}");
     const empty = template.indexOf('{:else if brokenSection === "empty"}');
     const noneFound = template.indexOf("None found in the indexed vault.");
     expect(empty).toBeGreaterThan(-1);
