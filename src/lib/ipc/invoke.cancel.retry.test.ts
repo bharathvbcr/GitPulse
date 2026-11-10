@@ -10,7 +10,7 @@ import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./s
  * attaches to has already been told to stop.
  */
 
-const CANCELLATION = { kind: "unclassified", message: "git read cancelled: its caller is gone" };
+const CANCELLATION = { kind: "read_cancelled", message: "git read cancelled: its caller is gone" };
 const DEFERRED = { kind: "deferred_under_load", message: "git log deferred under load after 1s" };
 
 function backend() {

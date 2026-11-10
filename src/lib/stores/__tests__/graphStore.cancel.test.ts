@@ -12,7 +12,7 @@ function backend(onAbort: "abort" | "cancellation" = "abort") {
       reads.push({ query: args?.query, signal: options?.signal, answer: () => resolve(EMPTY) });
       // What the backend's answer to a cancelled read looks like, when it
       // reaches a caller before that caller's own abort does.
-      const refusal = onAbort === "cancellation" ? { kind: "unclassified", message: "git read cancelled: its caller is gone" } : new DOMException("aborted", "AbortError");
+      const refusal = onAbort === "cancellation" ? { kind: "read_cancelled", message: "git read cancelled: its caller is gone" } : new DOMException("aborted", "AbortError");
       options?.signal?.addEventListener("abort", () => reject(refusal), { once: true });
     })) as unknown as InvokeFn;
   return { reads, store: createGraphStore({ invoke }) };

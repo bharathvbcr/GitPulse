@@ -22,6 +22,7 @@ export const IPC_ERROR_KINDS = [
   "ledger_not_initialised",
   "ledger_failed",
   "ai_endpoint_unconfirmed",
+  "read_cancelled",
 ] as const;
 
 export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];
@@ -212,22 +213,35 @@ function newRequestId(): string {
 }
 
 /**
- * The callers still waiting on one backend call, and what it takes to stop it.
+ * The callers still waiting on one backend request, and what it takes to stop it.
  *
- * A Set so every place that already joins callers by adding their `Interest`
- * (the shared-read join, the retry join) registers them here without change.
- * The backend call is stopped when the last interested caller has left, and
- * never before: a caller that joined a running call keeps it alive.
+ * This is the one object that stands for "a request and the callers waiting on
+ * it". A caller attaches to a request only through {@link attach} (the shared-read
+ * join) or {@link mergeInto} (a call that turns out to be waiting on another
+ * request), and both refuse a request that has been told to stop: its answer
+ * will be the cancellation, which a caller still waiting must never receive.
+ *
+ * Two sets can come to stand for one request: a call opens its own set before it
+ * learns that an identical call is already waiting to retry, and rides that one.
+ * Rather than copy callers across and leave the first set standing (a later
+ * caller joining it would then be judged by callers of a request it is not on),
+ * the set is merged into the one that owns the request. A merged set keeps
+ * working as a handle to its owner: every `attach`, `cancelled` and
+ * `stopIfAbandoned` on it acts on the owner, so no reference to it can reach a
+ * request other than the one actually sent.
+ *
+ * The backend request is stopped when the last interested caller has left, and
+ * never before: a caller that joined a running request keeps it alive.
  */
 class Waiters extends Set<Interest> {
-  /** The id the backend call was sent under; null for a command that cannot be stopped. */
+  /** The id the backend request was sent under; null for a command that cannot be stopped. */
   readonly id: string | null;
-  /** Whether the call has been put on the wire under `id`. */
+  /** Whether the request has been put on the wire under `id`. */
   sent = false;
-  /** Whether the call has answered or failed. */
+  /** Whether the request has answered or failed. */
   settled = false;
-  /** Whether a cancel has been sent: a caller arriving now must not join this call. */
-  cancelled = false;
+  private stopped = false;
+  private into: Waiters | null = null;
   private readonly stop: (id: string) => void;
 
   constructor(id: string | null, stop: (id: string) => void) {
@@ -236,7 +250,24 @@ class Waiters extends Set<Interest> {
     this.stop = stop;
   }
 
+  /** The set that owns the request this one stands for. */
+  private owner(): Waiters {
+    let at: Waiters = this;
+    while (at.into) at = at.into;
+    return at;
+  }
+
+  /** Whether a cancel has been sent for the request: a caller arriving now must not join it. */
+  get cancelled(): boolean {
+    return this.owner().stopped;
+  }
+
   override add(interest: Interest): this {
+    const owner = this.owner();
+    if (owner !== this) {
+      owner.add(interest);
+      return this;
+    }
     super.add(interest);
     let owners = waitersOf.get(interest);
     if (!owners) waitersOf.set(interest, (owners = new Set()));
@@ -244,36 +275,44 @@ class Waiters extends Set<Interest> {
     return this;
   }
 
-  /** `rest` as it goes on the wire: with the id, when this call has one. */
+  /** Attaches a caller to the request unless it has been told to stop; whether it did. */
+  attach(interest: Interest): boolean {
+    const owner = this.owner();
+    if (owner.stopped) return false;
+    owner.add(interest);
+    return true;
+  }
+
+  /**
+   * Makes this set a handle to `target`'s request, moving its callers there.
+   * Refused (false, nothing moved) when `target`'s request has been told to stop.
+   */
+  mergeInto(target: Waiters): boolean {
+    const to = target.owner();
+    const from = this.owner();
+    if (to === from) return true;
+    if (to.stopped) return false;
+    for (const interest of from) to.add(interest);
+    from.into = to;
+    return true;
+  }
+
+  /** `rest` as it goes on the wire: with the id, when this request has one. */
   arm(rest: Rest): Rest {
     if (this.id === null) return rest;
     this.sent = true;
     return [{ ...(rest[0] as Record<string, unknown>), requestId: this.id }];
   }
 
-  /** Sends the cancel when the call is on the wire and no caller is left waiting. */
+  /** Sends the cancel when the request is on the wire and no caller is left waiting. */
   stopIfAbandoned(): void {
-    if (this.id === null || !this.sent || this.settled || this.cancelled) return;
+    const owner = this.owner();
+    if (owner !== this) return owner.stopIfAbandoned();
+    if (this.id === null || !this.sent || this.settled || this.stopped) return;
     for (const interest of this) if (interest()) return;
-    this.cancelled = true;
+    this.stopped = true;
     this.stop(this.id);
   }
-}
-
-/**
- * Whether a caller may attach to the call `interests` belongs to. A call that
- * has been told to stop will answer with the cancellation, and a caller that
- * has not aborted must never be handed that: it starts a read of its own.
- *
- * Every place a second caller attaches to a running or waiting call asks this,
- * so the rule holds in one place for all of them: the shared-read join and the
- * two joins onto a call waiting to retry. The alternative, a fresh id for each
- * retry attempt, was not taken: a cancel names one call, and a call whose id
- * changes under it would leave a cancel racing the attempt it was meant for.
- * Refusing the join keeps one call, one id, and a cancel that is final.
- */
-function joinable(interests: Set<Interest>): boolean {
-  return !(interests instanceof Waiters && interests.cancelled);
 }
 
 const waitersOf = new WeakMap<Interest, Set<Waiters>>();
@@ -382,9 +421,9 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
    * sent only while one of them is, so a caller that has aborted or run out of
    * time never causes another command to be sent on its account.
    */
-  const retrying = new Map<string, { chain: Promise<unknown>; interests: Set<Interest> }>();
+  const retrying = new Map<string, { chain: Promise<unknown>; interests: Waiters }>();
   /** Allowlisted reads in flight, by command and canonical arguments; see `sharedReads.ts`. */
-  const sharing = new Map<string, { promise: Promise<unknown>; generation: number; interests: Set<Interest> }>();
+  const sharing = new Map<string, { promise: Promise<unknown>; generation: number; interests: Waiters }>();
 
   /**
    * One call to `raw`, always as a promise. Tauri's own `invoke` returns one;
@@ -400,7 +439,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     }
   }
 
-  async function retry<T>(cmd: string, rest: Rest, first: unknown, interests: Set<Interest>): Promise<T> {
+  async function retry<T>(cmd: string, rest: Rest, first: unknown, interests: Waiters): Promise<T> {
     let last = first;
     for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES; attempt += 1) {
       await sleep(jitteredRetryDelayMs(attempt, random));
@@ -447,10 +486,10 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
           // command, a watcher event) makes the running read a pre-change
           // answer, which a caller asking now must not be handed.
           //
-          // Not one that has been told to stop: its answer will be the
-          // cancellation, which a caller still waiting must not receive.
-          if (live && live.generation === readGeneration && joinable(live.interests)) {
-            live.interests.add(interest);
+          // Not one that has been told to stop (`attach` refuses it): its
+          // answer will be the cancellation, which a caller still waiting must
+          // not receive.
+          if (live && live.generation === readGeneration && live.interests.attach(interest)) {
             return live.promise as Promise<T>;
           }
           const interests = openWaiters(cmd, rest, interest);
@@ -492,7 +531,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     return new Waiters(id, stop).add(interest);
   }
 
-  function dispatchOne<T>(cmd: string, rest: Rest, interests: Set<Interest>): Promise<T> {
+  function dispatchOne<T>(cmd: string, rest: Rest, interests: Waiters): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
     // So is a byte buffer; both are known without serializing anything.
@@ -508,15 +547,11 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       key = lazyRetryKey(cmd, rest[0]);
       if (key === null) return call<T>(cmd, rest);
       const pending = retrying.get(key);
-      if (pending && joinable(pending.interests)) {
-        for (const interest of interests) pending.interests.add(interest);
-        return pending.chain as Promise<T>;
-      }
+      if (pending && interests.mergeInto(pending.interests)) return pending.chain as Promise<T>;
     }
     // The key above is of the arguments as the caller gave them; the id, when
     // the call has one, is added only to what goes on the wire.
-    const waiters = interests instanceof Waiters ? interests : null;
-    const wire = waiters ? waiters.arm(rest) : rest;
+    const wire = interests.arm(rest);
     const result = call<T>(cmd, wire).catch((error: unknown) => {
       if (!isDeferred(error)) throw error;
       if (key === undefined) key = lazyRetryKey(cmd, rest[0]);
@@ -525,22 +560,17 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       if (key === null) throw error;
       const settledKey = key;
       const joined = retrying.get(settledKey);
-      if (joined && joinable(joined.interests)) {
-        for (const interest of interests) joined.interests.add(interest);
-        return joined.chain as Promise<T>;
-      }
+      if (joined && interests.mergeInto(joined.interests)) return joined.chain as Promise<T>;
       const chain = retry<T>(cmd, wire, error, interests).finally(() => {
         if (retrying.get(settledKey)?.chain === chain) retrying.delete(settledKey);
       });
       retrying.set(settledKey, { chain, interests });
       return chain;
     });
-    if (waiters) {
-      const done = () => {
-        waiters.settled = true;
-      };
-      result.then(done, done);
-    }
+    const done = () => {
+      interests.settled = true;
+    };
+    result.then(done, done);
     return result;
   }
 

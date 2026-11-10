@@ -24,7 +24,7 @@ function harness(options_: { onAbort?: "abort" | "cancellation" } = {}) {
         reads.push(read);
         // What the backend's answer to a cancelled read looks like, when it
         // reaches a caller before that caller's own abort does.
-        const refusal = options_.onAbort === "cancellation" ? { kind: "unclassified", message: "git read cancelled: its caller is gone" } : new DOMException("aborted", "AbortError");
+        const refusal = options_.onAbort === "cancellation" ? { kind: "read_cancelled", message: "git read cancelled: its caller is gone" } : new DOMException("aborted", "AbortError");
         options?.signal?.addEventListener("abort", () => reject(refusal), { once: true });
       })) as never,
     activeSession: () => session,
