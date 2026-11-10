@@ -33,12 +33,12 @@
 </script>
 
 <div
-  class="shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs"
+  class="shrink-0 bg-warn/15 px-3 py-2 text-xs"
   role="alert"
   data-testid="editor-conflict"
 >
   <div class="flex flex-wrap items-center gap-2">
-    <span class="font-semibold text-amber-300">{unbased ? "Version unknown" : "Changed on disk"}</span>
+    <span class="font-semibold text-warn">{unbased ? "Version unknown" : "Changed on disk"}</span>
     <span class="min-w-0 flex-1 text-textMuted wrap-break-word">
       {#if unbased}
         {path} has no recorded disk version, so a save cannot tell whether it changed.
@@ -47,11 +47,27 @@
       {/if}
       Your draft is kept and nothing was written.
     </span>
-    <button type="button" class="gp-btn" disabled={busy} onclick={onReload}>Reload</button>
-    <button type="button" class="gp-btn" disabled={busy} aria-pressed={comparing} onclick={() => (comparing = !comparing)}>
+    <button
+      type="button"
+      class="gp-btn"
+      data-size="sm"
+      title="Read the file from disk again and discard your draft"
+      disabled={busy}
+      onclick={onReload}>Refresh</button
+    >
+    <button
+      type="button"
+      class="gp-btn"
+      data-size="sm"
+      disabled={busy}
+      aria-pressed={comparing}
+      onclick={() => (comparing = !comparing)}
+    >
       Compare
     </button>
-    <button type="button" class="gp-btn-danger" disabled={busy} onclick={onOverwrite}>Overwrite</button>
+    <button type="button" class="gp-btn" data-variant="danger" data-size="sm" disabled={busy} onclick={onOverwrite}>
+      Overwrite
+    </button>
   </div>
   {#if overwriteNote}
     <p class="mt-1 text-textMuted" data-testid="editor-conflict-overwrite-note">{overwriteNote}</p>
@@ -60,11 +76,11 @@
     <div class="mt-2 grid grid-cols-2 gap-2 max-sm:grid-cols-1" data-testid="editor-conflict-compare">
       {#each [true, false] as onDisk (onDisk)}
         <div class="min-w-0">
-          <div class="mb-1 text-[10px] font-semibold uppercase tracking-wide text-textMuted">
+          <div class="gp-label mb-1">
             {onDisk ? "On disk" : "Your draft"}
           </div>
           <div
-            class="max-h-64 overflow-auto rounded border border-border/60 bg-black/20 p-2 font-mono text-[11px] leading-5 whitespace-pre select-text"
+            class="max-h-64 overflow-auto rounded border border-edgeSoft bg-black/20 p-2 font-mono text-meta leading-5 whitespace-pre select-text"
             tabindex="0"
             role="textbox"
             aria-readonly="true"
@@ -73,7 +89,7 @@
           >
             {#if rows}
               {#each rows as row, index (index)}
-                <div>{#each onDisk ? row.ours : row.theirs as part, partIndex (partIndex)}<span class={part.kind !== "Equal" ? "bg-amber-500/25 rounded-sm" : ""}>{part.text}</span>{/each}</div>
+                <div>{#each onDisk ? row.ours : row.theirs as part, partIndex (partIndex)}<span class={part.kind !== "Equal" ? "bg-warn/25 rounded-sm" : ""}>{part.text}</span>{/each}</div>
               {/each}
             {:else}
               {onDisk ? diskText : draft}
@@ -83,7 +99,7 @@
       {/each}
     </div>
     {#if !rows}
-      <p class="mt-1 text-[10px] text-textMuted">Complete plain text. Word highlighting is limited to smaller files.</p>
+      <p class="mt-1 text-micro text-textMuted">Complete plain text. Word highlighting is limited to smaller files.</p>
     {/if}
   {/if}
 </div>

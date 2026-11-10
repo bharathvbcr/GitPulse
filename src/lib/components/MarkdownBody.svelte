@@ -10,7 +10,7 @@
 
   let {
     source = "",
-    class: className = "text-[11px] text-textMuted select-text",
+    class: className = "text-meta text-textMuted select-text",
   }: {
     source?: string | null;
     class?: string;
@@ -41,10 +41,10 @@
 </script>
 
 {#if error}
-  <div class="text-[11px] text-textMuted whitespace-pre-wrap">{source}</div>
-  <div class="text-[10px] text-rose-400" role="status">Could not render this as Markdown: {error}</div>
+  <div class="text-meta text-textMuted whitespace-pre-wrap">{source}</div>
+  <div class="text-micro text-danger" role="status">Couldn't render this as Markdown. {error}</div>
 {:else if bodyHtml}
   <MarkdownContent html={bodyHtml} class="gp-markdown-compact {className}" />
 {:else if source}
-  <div class="text-[11px] text-textMuted whitespace-pre-wrap">{source}</div>
+  <div class="text-meta text-textMuted whitespace-pre-wrap">{source}</div>
 {/if}

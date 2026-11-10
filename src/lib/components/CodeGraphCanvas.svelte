@@ -383,7 +383,7 @@
 <div class="code-map bg-background flex flex-col min-h-0 flex-1" class:narrow={width <= 760}>
   <div class="map-toolbar">
     <div class="map-heading">
-      <span class="map-eyebrow">DEPENDENCY MAP</span>
+      <span class="gp-label">Dependency map</span>
       <div class="map-counts" role="status" data-testid="code-graph-legend">
         {#if loading}
           <span>Loading graph…</span>
@@ -403,8 +403,8 @@
           onkeydown={(e) => { if (e.key === "Enter" && matches[0]) focusNode(matches[0].id); }} />
         {#if query}<button type="button" aria-label="Clear search" onclick={() => query = ""}>×</button>{/if}
       </label>
-      <button type="button" class="map-button" aria-pressed={showNodeList} onclick={() => showNodeList = !showNodeList}>Nodes</button>
-      <button type="button" class="map-button" aria-pressed={showLabels} onclick={() => showLabels = !showLabels}>Labels</button>
+      <button type="button" class="gp-btn" data-size="sm" aria-pressed={showNodeList} onclick={() => showNodeList = !showNodeList}>Nodes</button>
+      <button type="button" class="gp-btn" data-size="sm" aria-pressed={showLabels} onclick={() => showLabels = !showLabels}>Labels</button>
     </div>
   </div>
   {#if legend.honesty || legend.coverageLabel}
@@ -418,9 +418,9 @@
   {#if model.communities.length > 0}
     <div class="map-group-row">
     <div class="map-communities" aria-label="Communities">
-      <button type="button" class="community-chip" class:chosen={!activeCommunity} aria-pressed={!activeCommunity} onclick={() => { activeCommunity = null; filtersChanged(); }}>All groups</button>
+      <button type="button" class="community-chip gp-chip" data-tone={!activeCommunity ? "accent" : undefined} aria-pressed={!activeCommunity} onclick={() => { activeCommunity = null; filtersChanged(); }}>All groups</button>
       {#each model.communities.slice(currentCommunityPage * 40, (currentCommunityPage + 1) * 40) as community (community.name)}
-        <button type="button" class="community-chip" class:chosen={activeCommunity === community.name}
+        <button type="button" class="community-chip gp-chip" data-tone={activeCommunity === community.name ? "accent" : undefined}
           aria-pressed={activeCommunity === community.name}
           title={`${community.name} · ${community.shown} shown of ${community.count}`}
           onclick={() => { activeCommunity = activeCommunity === community.name ? null : community.name; filtersChanged(); }}>
@@ -464,7 +464,7 @@
       onpointerdown={onPointerDown} onpointermove={onPointerMove} onpointerup={onPointerUp}
       onpointercancel={onPointerUp} onpointerleave={() => { if (!dragging) hoveredId = null; }}
       onclick={onClick} ondblclick={onDblClick} onwheel={onWheel} onkeydown={onKeyDown}
-      tabindex="0" aria-label="Code graph canvas. Drag to pan, scroll to zoom. Arrow keys pan; plus and minus zoom; Enter opens selection; Escape clears."
+      tabindex="0" aria-label="Code map canvas. Drag to pan, scroll to zoom. Arrow keys pan; plus and minus zoom; Enter opens selection; Escape clears."
     ></canvas>
 
     {#if query.trim() || showNodeList}
@@ -523,7 +523,7 @@
       <button type="button" aria-label="Zoom out" onclick={() => zoomAt(1 / 1.2)} disabled={scale <= 0.000001}>−</button>
       <span>{scale < 0.01 ? "<1" : Math.round(scale * 100)}%</span>
       <button type="button" aria-label="Zoom in" onclick={() => zoomAt(1.2)} disabled={scale >= 5}>+</button>
-      <button type="button" class="fit-button" onclick={resetView} title="Fit filtered nodes into the view (0)">Fit view</button>
+      <button type="button" class="fit-button gp-btn" data-size="sm" onclick={resetView} title="Fit filtered nodes into the view (0)">Fit view</button>
     </div>
     <div class="map-help">Drag to explore <span>·</span> Scroll to zoom <span>·</span> Select to trace connections</div>
   </div>
@@ -539,9 +539,9 @@
       {#if selectedNode}<span class="connection-count">{connections.length} loaded connections</span>{/if}
       {#if inspectedNode.flags?.length}<span class="inspector-kind">{inspectedNode.flags.map(f => f.flag).join(" · ")}</span>{/if}
       {#if onOpenNode && openPath}
-        <button type="button" class="map-button" onclick={() => { if (inspectedNode && openPath) onOpenNode?.(openPath, inspectedNode.id); }}>Open file ↗</button>
+        <button type="button" class="gp-btn" data-size="sm" onclick={() => { if (inspectedNode && openPath) onOpenNode?.(openPath, inspectedNode.id); }}>Open file ↗</button>
       {/if}
-      {#if selectedNode}<button type="button" class="map-button" aria-label="Clear selection" onclick={() => selectedId = null}>×</button>{/if}
+      {#if selectedNode}<button type="button" class="gp-btn" data-size="sm" aria-label="Clear selection" onclick={() => selectedId = null}>×</button>{/if}
     {:else}
       <span class="inspector-placeholder">Select a node to inspect its file and connections.</span>
       <span class="inspector-key">Node size reflects connectivity</span>
@@ -556,68 +556,65 @@
     --map-muted: rgb(var(--c-text-muted));
     --map-hover: rgb(var(--c-surface-hover) / 0.55); }
   .map-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 12px; }
-  .map-eyebrow { font-size: 10px; font-weight: 650; letter-spacing: .13em; color: var(--map-muted); }
-  .map-counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; font-size: 11px; }
+  .map-counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; font-size: var(--text-meta); }
   .map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
   .map-search { display: flex; align-items: center; gap: 8px; background: var(--map-panel); border: 1px solid var(--map-border); border-radius: 8px; padding: 7px 10px; color: var(--map-muted); }
-  .map-search input { width: 190px; min-width: 0; background: transparent; outline: none; font-size: 11px; color: inherit; }
+  .map-search input { width: 190px; min-width: 0; background: transparent; outline: none; font-size: var(--text-meta); color: inherit; }
   button { cursor: pointer; }
   button:disabled { opacity: .35; cursor: default; }
-  button:focus-visible, canvas:focus-visible, .map-search:focus-within { outline: 2px solid #79a7ed; outline-offset: 2px; }
-  .map-button { border: 1px solid var(--map-border); border-radius: 7px; padding: 6px 10px; font-size: 11px; white-space: nowrap; background: var(--map-panel); }
-  .map-button:hover, .map-button[aria-pressed=true] { background: var(--map-hover); color: #79a7ed; }
-  .map-honesty { margin: 0; padding: 0 20px 10px; color: light-dark(#936016, #c99756); font-size: 11px; }
+  button:focus-visible, canvas:focus-visible, .map-search:focus-within { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
+  .map-actions .gp-btn[aria-pressed=true] { background: var(--map-hover); color: rgb(var(--c-accent)); }
+  .map-honesty { margin: 0; padding: 0 20px 10px; color: rgb(var(--c-warn)); font-size: var(--text-meta); }
   .map-group-row { display: flex; min-width: 0; }
-  .group-pages { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 12px 12px 0; font-size: 10px; color: var(--map-muted); }
+  .group-pages { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 12px 12px 0; font-size: var(--text-micro); color: var(--map-muted); }
   .group-pages button { padding: 5px; }
   .map-communities { display: flex; flex: 1; min-width: 0; gap: 5px; overflow-x: auto; padding: 0 20px 12px; scrollbar-width: thin; }
-  .community-chip { display: inline-flex; align-items: center; gap: 6px; flex: none; padding: 5px 9px; border-radius: 6px; border: 1px solid transparent; color: var(--map-muted); font-size: 10px; }
-  .community-chip:hover, .community-chip.chosen { background: var(--map-hover); border-color: var(--map-border); color: inherit; }
-  .community-chip > span:first-child { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .map-languages { display: flex; flex: none; gap: 14px; overflow-x: auto; padding: 0 20px 12px; font-size: 10px; color: var(--map-muted); scrollbar-width: thin; }
+  .map-communities .gp-chip { flex: none; cursor: pointer; }
+  .map-communities .gp-chip > span:first-child { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .map-languages { display: flex; flex: none; gap: 14px; overflow-x: auto; padding: 0 20px 12px; font-size: var(--text-micro); color: var(--map-muted); scrollbar-width: thin; }
   .language-heading { font-weight: 600; white-space: nowrap; }
   .language-swatch[aria-pressed=true] { color: inherit; box-shadow: 0 1px currentColor; }
   .language-swatch { display: inline-flex; align-items: center; gap: 6px; flex: none; }
   .community-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; }
   .chip-count { opacity: .55; font-variant-numeric: tabular-nums; }
-  .map-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 0 20px 10px; font-size: 10px; color: var(--map-muted); }
+  .map-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 0 20px 10px; font-size: var(--text-micro); color: var(--map-muted); }
   .map-filters label { display: inline-flex; align-items: center; gap: 5px; }
-  .map-filters input { accent-color: #79a7ed; }
+  .map-filters input { accent-color: rgb(var(--c-accent)); }
   .map-filters button { color: inherit; text-decoration: underline; }
-  .map-neighbors { position: absolute; right: 16px; top: 8px; width: 304px; max-height: calc(100% - 76px); overflow: auto; padding: 10px; border: 1px solid var(--map-border); border-radius: 10px; background: var(--map-panel); box-shadow: 0 8px 30px #00000025; }
+  .map-neighbors { position: absolute; right: 16px; top: 8px; width: 304px; max-height: calc(100% - 76px); overflow: auto; padding: 10px; border: 1px solid var(--map-border); border-radius: 10px; background: var(--map-panel); box-shadow: var(--shadow-pop); }
   .neighbor-heading, .trace-controls, .map-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .neighbor-heading { font-size: 11px; margin-bottom: 9px; }
+  .neighbor-heading { font-size: var(--text-meta); margin-bottom: 9px; }
   .neighbor-heading button { width: 24px; height: 24px; }
-  .trace-controls select { min-width: 0; padding: 5px; border-radius: 5px; background: var(--map-panel); color: inherit; border: 1px solid var(--map-border); font-size: 11px; }
-  .trace-summary, .neighbor-list p { margin: 8px 0; font-size: 10px; line-height: 1.5; color: var(--map-muted); }
+  .trace-controls select { min-width: 0; padding: 5px; border-radius: 5px; background: var(--map-panel); color: inherit; border: 1px solid var(--map-border); font-size: var(--text-meta); }
+  .trace-summary, .neighbor-list p { margin: 8px 0; font-size: var(--text-micro); line-height: 1.5; color: var(--map-muted); }
   .neighbor-list button { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 8px 4px; border-radius: 6px; }
   .neighbor-list button:hover { background: var(--map-hover); }
-  .map-pagination { padding: 5px; font-size: 10px; color: var(--map-muted); }
+  .map-pagination { padding: 5px; font-size: var(--text-micro); color: var(--map-muted); }
   .map-results .map-pagination button, .map-pagination button { width: auto; padding: 5px; }
-  .map-stage { overflow: hidden; background-image: radial-gradient(circle, #8b9db314 .65px, transparent .65px); background-size: 22px 22px; }
-  .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: 9px; background: var(--map-panel); box-shadow: 0 4px 18px #00000015; }
-  .map-zoom button { width: 28px; height: 28px; border-radius: 5px; font-size: 17px; }
+  .map-stage { overflow: hidden; background-image: radial-gradient(circle, rgb(var(--c-text-muted) / 0.08) .65px, transparent .65px); background-size: 22px 22px; }
+  .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: 9px; background: var(--map-panel); box-shadow: var(--shadow-card); }
+  .map-zoom button { width: 28px; height: 28px; border-radius: 5px; font-size: 1.125rem; }
   .map-zoom button:hover { background: var(--map-hover); }
-  .map-zoom span { width: 42px; text-align: center; font-size: 10px; color: var(--map-muted); font-variant-numeric: tabular-nums; }
-  .map-zoom .fit-button { width: auto; padding: 0 10px; margin-left: 4px; font-size: 11px; }
-  .map-help { position: absolute; bottom: 25px; left: 20px; font-size: 10px; color: var(--map-muted); pointer-events: none; }
+  .map-zoom span { width: 42px; text-align: center; font-size: var(--text-micro); color: var(--map-muted); font-variant-numeric: tabular-nums; }
+  .map-zoom .gp-btn { width: auto; padding: 0 10px; margin-left: 4px; font-size: var(--text-meta); }
+  .map-help { position: absolute; bottom: 25px; left: 20px; font-size: var(--text-micro); color: var(--map-muted); pointer-events: none; }
   .map-help span { padding: 0 6px; opacity: .4; }
-  .map-results { position: absolute; top: 8px; left: 16px; width: min(310px, calc(100% - 32px)); max-height: 60%; overflow-y: auto; padding: 6px; border-radius: 10px; border: 1px solid var(--map-border); background: var(--map-panel); box-shadow: 0 10px 40px #00000025; }
-  .result-heading, .map-results p { padding: 7px; font-size: 10px; color: var(--map-muted); }
+  .map-results { position: absolute; top: 8px; left: 16px; width: min(310px, calc(100% - 32px)); max-height: 60%; overflow-y: auto; padding: 6px; border-radius: 10px; border: 1px solid var(--map-border); background: var(--map-panel); box-shadow: var(--shadow-float); }
+  .result-heading, .map-results p { padding: 7px; font-size: var(--text-micro); color: var(--map-muted); }
   .map-results button { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px; border-radius: 6px; }
   .map-results button:hover, .map-results button.chosen { background: var(--map-hover); }
   .result-copy { display: flex; flex-direction: column; gap: 3px; overflow: hidden; }
-  .result-copy strong { font-size: 11px; font-weight: 500; }
+  .result-copy strong { font-size: var(--text-meta); font-weight: 500; }
   .result-copy strong, .inspector-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .result-copy small { font-size: 10px; color: var(--map-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 12px; color: var(--map-muted); pointer-events: none; }
-  .map-inspector { min-height: 55px; padding: 10px 20px; display: flex; align-items: center; gap: 12px; border-top: 1px solid var(--map-border); font-size: 11px; }
+  .result-copy small { font-size: var(--text-micro); color: var(--map-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 0.75rem; color: var(--map-muted); pointer-events: none; }
+  .map-inspector { min-height: 55px; padding: 10px 20px; display: flex; align-items: center; gap: 12px; border-top: 1px solid var(--map-border); font-size: var(--text-meta); }
   .inspector-copy { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
-  .inspector-copy strong { font-weight: 550; }
-  .inspector-copy span { color: var(--map-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .inspector-kind, .connection-count { color: var(--map-muted); font-size: 10px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inspector-copy strong { font-weight: 500; }
+  .inspector-copy span { color: var(--map-muted); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inspector-kind, .connection-count { color: var(--map-muted); font-size: var(--text-micro); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .inspector-placeholder { flex: 1; color: var(--map-muted); }
-  .inspector-key { color: var(--map-muted); font-size: 10px; opacity: .7; }
+  .inspector-key { color: var(--map-muted); font-size: var(--text-micro); opacity: .7; }
   .narrow .map-neighbors { left: 16px; width: auto; max-height: 38%; }
   .narrow .map-inspector { flex-wrap: wrap; }
   .narrow .map-help, .narrow .inspector-key { display: none; }

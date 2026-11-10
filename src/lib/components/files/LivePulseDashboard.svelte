@@ -123,9 +123,9 @@
     // The repository this file belongs to, held across the confirm.
     const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
-      title: "Discard Changes",
+      title: "Discard changes",
       message: `Discard all uncommitted changes to ${path}? This cannot be undone.`,
-      confirmLabel: "Discard Changes",
+      confirmLabel: "Discard changes",
     });
     if (!confirmed) return;
     const outcome = await repoStore.discardChanges(path, target);
@@ -211,28 +211,30 @@
   });
 </script>
 
-<div class="flex flex-col h-full bg-surface/40 font-sans text-xs min-h-0 border-l border-border/70 select-none overflow-y-auto gp-scroll">
+<div class="flex flex-col h-full bg-surface/40 font-sans text-xs min-h-0 select-none overflow-y-auto gp-scroll">
   <!-- Top Live Pulse Header -->
-  <div class="flex items-center justify-between px-3 py-2.5 border-b border-border/60 gp-section-edge bg-surface/80 shrink-0">
+  <div class="flex items-center justify-between px-3 py-2.5 gp-section-edge bg-surface/80 shrink-0">
     <div class="flex items-center gap-2">
       {#if isDirty}
         <span class="relative flex h-2.5 w-2.5">
-          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-          <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500"></span>
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-warn opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-warn"></span>
         </span>
       {:else}
-        <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+        <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-ok"></span>
       {/if}
-      <span class="text-[11px] font-bold uppercase tracking-wider text-textPrimary">Live Pulse</span>
-      <span class="text-[10px] text-textMuted font-mono">({formatAge(lastRefreshed, nowMs)})</span>
+      <span class="text-meta font-semibold text-textPrimary">Live pulse</span>
+      <span class="text-micro text-textMuted font-mono">({formatAge(lastRefreshed, nowMs)})</span>
     </div>
 
     <div class="flex items-center gap-1">
       <button
         type="button"
         onclick={handleRefresh}
-        title="Sync Status"
-        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+        title="Refresh status"
+        aria-label="Refresh status"
+        class="gp-icon-btn"
+        data-size="sm"
       >
         <RefreshCw size={12} class={isRefreshing || $repoStore.isLoading ? "animate-spin" : ""} />
       </button>
@@ -242,35 +244,35 @@
   <div class="p-3 space-y-4">
     <!-- Uncommitted Churn Metrics Grid -->
     <div>
-      <div class="flex items-center justify-between text-[11px] font-semibold text-textMuted mb-2 uppercase tracking-wide">
+      <div class="flex items-center justify-between gp-label mb-2">
         <div class="flex items-center gap-1.5">
           <Activity size={12} class="text-accent" />
-          <span>Uncommitted Status</span>
+          <span>Uncommitted status</span>
         </div>
         {#if totalAdditions > 0 || totalDeletions > 0}
-          <div class="flex items-center gap-1.5 font-mono text-[10px]">
-            <span class="text-emerald-400 font-bold">+{totalAdditions}</span>
-            <span class="text-rose-400 font-bold">-{totalDeletions}</span>
+          <div class="flex items-center gap-1.5 font-mono text-micro">
+            <span class="text-ok font-semibold">+{totalAdditions}</span>
+            <span class="text-danger font-semibold">-{totalDeletions}</span>
           </div>
         {/if}
       </div>
 
       <div class="grid grid-cols-2 gap-2">
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
-          <span class="text-[10px] text-textMuted">Staged</span>
-          <span class="text-base font-bold text-emerald-400 tabular-nums">{stagedFiles.length}</span>
+        <div class="p-2.5 rounded-xl border border-edgeSoft bg-surface/60 shadow-xs flex flex-col">
+          <span class="text-micro text-textMuted">Staged</span>
+          <span class="text-base font-semibold text-ok tabular-nums">{stagedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
-          <span class="text-[10px] text-textMuted">Modified</span>
-          <span class="text-base font-bold text-amber-400 tabular-nums">{unstagedFiles.length}</span>
+        <div class="p-2.5 rounded-xl border border-edgeSoft bg-surface/60 shadow-xs flex flex-col">
+          <span class="text-micro text-textMuted">Modified</span>
+          <span class="text-base font-semibold text-warn tabular-nums">{unstagedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
-          <span class="text-[10px] text-textMuted">Untracked</span>
-          <span class="text-base font-bold text-cyan-400 tabular-nums">{untrackedFiles.length}</span>
+        <div class="p-2.5 rounded-xl border border-edgeSoft bg-surface/60 shadow-xs flex flex-col">
+          <span class="text-micro text-textMuted">Untracked</span>
+          <span class="text-base font-semibold text-info tabular-nums">{untrackedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
-          <span class="text-[10px] text-textMuted">Conflicted</span>
-          <span class="text-base font-bold {conflictedFiles.length > 0 ? 'text-rose-400' : 'text-textMuted'} tabular-nums">{conflictedFiles.length}</span>
+        <div class="p-2.5 rounded-xl border border-edgeSoft bg-surface/60 shadow-xs flex flex-col">
+          <span class="text-micro text-textMuted">Conflicted</span>
+          <span class="text-base font-semibold {conflictedFiles.length > 0 ? 'text-danger' : 'text-textMuted'} tabular-nums">{conflictedFiles.length}</span>
         </div>
       </div>
 
@@ -280,25 +282,25 @@
             <button
               type="button"
               onclick={stageAll}
-              class="gp-btn flex-1 py-1! text-[11px]! justify-center text-emerald-300 font-semibold"
+              class="gp-btn flex-1 justify-center text-ok" data-size="sm"
             >
               <Check size={11} />
-              <span>Stage All</span>
+              <span>Stage all</span>
             </button>
           {/if}
           {#if stagedFiles.length > 0}
             <button
               type="button"
               onclick={unstageAll}
-              class="gp-btn flex-1 py-1! text-[11px]! justify-center text-amber-300 font-semibold"
+              class="gp-btn flex-1 justify-center text-warn" data-size="sm"
             >
               <Undo2 size={11} />
-              <span>Unstage All</span>
+              <span>Unstage all</span>
             </button>
             <button
               type="button"
               onclick={() => void promptQuickCommit()}
-              class="gp-btn-primary flex-1 py-1! text-[11px]! justify-center"
+              class="gp-btn flex-1 justify-center" data-variant="primary" data-size="sm"
             >
               <GitCommit size={11} />
               <span>Commit</span>
@@ -310,18 +312,18 @@
 
     <!-- Live Uncommitted Modifications Stream -->
     <div>
-      <div class="flex items-center justify-between text-[11px] font-semibold text-textMuted mb-2 uppercase tracking-wide">
+      <div class="flex items-center justify-between gp-label mb-2">
         <div class="flex items-center gap-1.5">
-          <Flame size={12} class="text-amber-400" />
-          <span>Active Changes ({statuses.length})</span>
+          <Flame size={12} class="text-warn" />
+          <span>Active changes ({statuses.length})</span>
         </div>
       </div>
 
       {#if statuses.length === 0}
-        <div class="p-4 rounded-xl border border-border/60 bg-surface/30 text-center text-textMuted text-xs flex flex-col items-center gap-1.5">
-          <CheckCircle2 size={16} class="text-emerald-400" />
-          <span class="font-medium text-textPrimary">Working Tree Clean</span>
-          <span class="text-[10px] text-textMuted">No pending or uncommitted modifications</span>
+        <div class="p-4 rounded-xl border border-edgeSoft bg-surface/30 text-center text-textMuted text-xs flex flex-col items-center gap-1.5">
+          <CheckCircle2 size={16} class="text-ok" />
+          <span class="font-medium text-textPrimary">Working tree clean</span>
+          <span class="text-micro text-textMuted">No pending or uncommitted modifications</span>
         </div>
       {:else}
         <div class="space-y-1.5 pr-0.5">
@@ -329,9 +331,9 @@
             {@const isSelected = selectedFile === s.path}
             {@const kind = classifyFileChange(s)}
             <div
-              class="p-2 rounded-xl border transition-all flex items-center justify-between gap-2 {isSelected
-                ? 'border-accent/60 bg-accent/10 shadow-xs'
-                : 'border-border/60 bg-surface/50 hover:border-border'}"
+              class="p-2 rounded-xl border transition-colors flex items-center justify-between gap-2 {isSelected
+                ? 'border-accent bg-accent/10 shadow-xs'
+                : 'border-edgeSoft bg-surface/50 hover:border-border'}"
             >
               <button
                 type="button"
@@ -340,18 +342,18 @@
               >
                 <div class="flex items-center gap-1.5 min-w-0">
                   <LanguageLogo filePath={s.path} size={12} class="shrink-0" />
-                  <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(kind)}">{statusBadgeLabel(kind)}</span>
+                  <span class="px-1 py-0.2 text-micro font-semibold rounded {statusBadgeClass(kind)}">{statusBadgeLabel(kind)}</span>
                   <span class="min-w-0 text-xs font-medium text-textPrimary truncate">{formatPathParts(s.path).name}</span>
                 </div>
-                <div class="text-[10px] text-textMuted font-mono truncate max-w-[180px] pl-4">
+                <div class="text-micro text-textMuted font-mono truncate max-w-[180px] pl-4">
                   {s.path}
                 </div>
               </button>
 
               <div class="flex items-center gap-1 shrink-0">
                 {#if s.additions > 0 || s.deletions > 0}
-                  <span class="text-[9px] font-mono text-emerald-400">+{s.additions}</span>
-                  <span class="text-[9px] font-mono text-rose-400">-{s.deletions}</span>
+                  <span class="text-micro font-mono text-ok">+{s.additions}</span>
+                  <span class="text-micro font-mono text-danger">-{s.deletions}</span>
                 {/if}
 
                 {#if s.is_staged}
@@ -359,7 +361,9 @@
                     type="button"
                     onclick={() => unstageFile(s.path)}
                     title="Unstage"
-                    class="p-1 rounded hover:bg-surface text-textMuted hover:text-amber-300"
+                    aria-label="Unstage"
+                    class="gp-icon-btn hover:text-warn"
+                    data-size="sm"
                   >
                     <Undo2 size={12} />
                   </button>
@@ -368,7 +372,9 @@
                     type="button"
                     onclick={() => stageFile(s.path)}
                     title="Stage"
-                    class="p-1 rounded hover:bg-surface text-textMuted hover:text-emerald-300"
+                    aria-label="Stage"
+                    class="gp-icon-btn hover:text-ok"
+                    data-size="sm"
                   >
                     <Check size={12} />
                   </button>
@@ -376,7 +382,9 @@
                     type="button"
                     onclick={() => discardFile(s.path)}
                     title="Discard changes"
-                    class="p-1 rounded hover:bg-surface text-textMuted hover:text-rose-400"
+                    aria-label="Discard changes"
+                    class="gp-icon-btn hover:text-danger"
+                    data-size="sm"
                   >
                     <Undo2 size={12} />
                   </button>
@@ -390,15 +398,15 @@
 
     <!-- Active File Inspector -->
     {#if selectedFile}
-      <div class="pt-2 border-t border-border/60">
-        <div class="flex items-center justify-between text-[11px] font-semibold text-textMuted mb-2 uppercase tracking-wide">
+      <div class="pt-3">
+        <div class="flex items-center justify-between gp-label mb-2">
           <div class="flex items-center gap-1.5">
-            <FileText size={12} class="text-purple-400" />
-            <span>File Inspector</span>
+            <FileText size={12} class="text-accent" />
+            <span>File inspector</span>
           </div>
           {#if detectedLang}
             <span
-              class="px-1.5 py-0.5 text-[9px] font-mono font-bold rounded flex items-center gap-1"
+              class="px-1.5 py-0.5 text-micro font-mono font-semibold rounded flex items-center gap-1"
               style="background-color: {detectedLang.color_hex}25; color: {detectedLang.color_hex};"
             >
               <LanguageLogo language={detectedLang.name} size={11} class="shrink-0" />
@@ -407,42 +415,42 @@
           {/if}
         </div>
 
-        <div class="p-3 rounded-xl border border-border/70 bg-surface/50 space-y-2.5">
+        <div class="p-3 rounded-xl border border-edgeSoft bg-surface/50 space-y-2.5">
           <div class="flex items-center justify-between">
-            <span class="text-[10px] text-textMuted font-mono truncate max-w-[200px]" title={selectedFile}>{selectedFile}</span>
+            <span class="text-micro text-textMuted font-mono truncate max-w-[200px]" title={selectedFile}>{selectedFile}</span>
             {#if activeFileStatus}
               {@const kind = classifyFileChange(activeFileStatus)}
-              <span class="px-1.5 py-0.5 text-[9px] font-bold rounded {kind === 'conflict'
-                ? 'bg-rose-500/20 text-rose-300'
+              <span class="px-1.5 py-0.5 text-micro font-semibold rounded {kind === 'conflict'
+                ? 'bg-danger/15 text-danger'
                 : kind === 'staged'
-                  ? 'bg-emerald-500/20 text-emerald-300'
+                  ? 'bg-ok/15 text-ok'
                   : kind === 'untracked'
-                    ? 'bg-cyan-500/20 text-cyan-300'
-                    : 'bg-amber-500/20 text-amber-300'}">
-                {kind === "conflict" ? "CONFLICT" : kind === "staged" ? "STAGED" : kind === "untracked" ? "UNTRACKED" : "MODIFIED"}
+                    ? 'bg-info/15 text-info'
+                    : 'bg-warn/15 text-warn'}">
+                {kind === "conflict" ? "Conflict" : kind === "staged" ? "Staged" : kind === "untracked" ? "Untracked" : "Modified"}
               </span>
             {:else}
-              <span class="px-1.5 py-0.5 text-[9px] font-bold rounded bg-emerald-500/15 text-emerald-400">
+              <span class="px-1.5 py-0.5 text-micro font-semibold rounded bg-ok/15 text-ok">
                 Clean (HEAD)
               </span>
             {/if}
           </div>
 
-          <div class="flex items-center gap-2 pt-1 border-t border-border/50">
+          <div class="flex items-center gap-2 pt-2">
             <button
               type="button"
               onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('history', 'diff'); }}
-              class="gp-btn flex-1 py-1! text-[10px]! justify-center"
+              class="gp-btn flex-1 justify-center" data-size="sm"
             >
-              <Layers size={11} class="text-cyan-400" />
+              <Layers size={11} class="text-info" />
               <span>Diff</span>
             </button>
             <button
               type="button"
               onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('code', 'blame'); }}
-              class="gp-btn flex-1 py-1! text-[10px]! justify-center"
+              class="gp-btn flex-1 justify-center" data-size="sm"
             >
-              <GitCommit size={11} class="text-purple-400" />
+              <GitCommit size={11} class="text-accent" />
               <span>Blame</span>
             </button>
           </div>
@@ -450,15 +458,15 @@
 
         <!-- Recent Commits Touching This File -->
         <div class="mt-3">
-          <div class="flex items-center gap-1.5 text-[11px] font-semibold text-textMuted mb-2 uppercase tracking-wide">
+          <div class="flex items-center gap-1.5 gp-label mb-2">
             <Clock size={12} />
-            <span>Recent File History</span>
+            <span>Recent file history</span>
           </div>
 
           {#if isLoadingCommits}
-            <div class="p-3 text-center text-textMuted text-xs">Loading file history...</div>
+            <div class="p-3 text-center text-textMuted text-xs">Loading file history…</div>
           {:else if recentCommits.length === 0}
-            <div class="p-3 rounded-xl border border-border/60 bg-surface/30 text-center text-textMuted text-[11px]">
+            <div class="p-3 rounded-xl border border-edgeSoft bg-surface/30 text-center text-textMuted text-meta">
               No prior commits recorded for this path
             </div>
           {:else}
@@ -467,17 +475,17 @@
                 <button
                   type="button"
                   onclick={() => repoStore.inspectCommitInHistory(c.id)}
-                  class="w-full text-left p-2 rounded-lg border border-border/60 bg-surface/40 hover:bg-surface/70 transition-colors"
+                  class="w-full text-left p-2 rounded-lg border border-edgeSoft bg-surface/40 hover:bg-surface/70 transition-colors"
                   title="Inspect {c.id.slice(0, 7)} on the graph"
                 >
-                  <div class="flex items-center justify-between text-[10px]">
+                  <div class="flex items-center justify-between text-micro">
                     <span class="font-mono text-accent font-semibold">{c.id.slice(0, 7)}</span>
                     <span class="text-textMuted font-mono">{formatAge(c.date, nowMs)}</span>
                   </div>
                   <div class="text-xs text-textPrimary font-medium truncate mt-0.5" title={c.message}>
                     {c.message}
                   </div>
-                  <div class="text-[10px] text-textMuted truncate mt-0.5">
+                  <div class="text-micro text-textMuted truncate mt-0.5">
                     by {c.author}
                   </div>
                 </button>

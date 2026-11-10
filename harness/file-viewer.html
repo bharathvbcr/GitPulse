@@ -9,7 +9,7 @@
  *
  * A draft carries the disk version it was made from and every save sends it.
  * When the host refuses with `changed_on_disk` the draft must survive, the
- * banner must offer Reload, Compare and Overwrite, and Overwrite must save over
+ * banner must offer Refresh, Compare and Overwrite, and Overwrite must save over
  * exactly the version the refusal reported. The fixture host here plays the
  * agent that rewrites the file while the editor is open. Nothing executes git.
  */
@@ -111,13 +111,13 @@ const type = async value => { const area = textarea(); area.value = value; area.
   blobFails = true;
   statuses = [status(file, "M")];
   await repoStore.refresh(root);
-  await until(() => host.textContent.includes("Failed to read file"), "the failed reload is shown");
+  await until(() => host.textContent.includes("Couldn't read this file"), "the failed reload is shown");
   check("a reload that cannot read the file shows the failure instead of the stale text", () => host.textContent.includes("unreadable by fixture") && !lnSpan());
   blobFails = false;
   statuses = [status(file, "MM")];
   await repoStore.refresh(root);
   await until(() => lnSpan(), "the file is readable again");
-  check("and the next good reload clears the failure", () => !host.textContent.includes("Failed to read file"));
+  check("and the next good reload clears the failure", () => !host.textContent.includes("Couldn't read this file"));
   statuses = [status(file, "M")];
   await repoStore.refresh(root);
   await wait(300);
@@ -133,7 +133,7 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(banner, "the changed-on-disk banner");
   check("the save carried the version the draft was made from", () => saves.length === 1 && saves[0].expectedBase === "8:aaaa" && saves[0].content === "one\ntwo\nmine\n");
   check("the refusal left the agent's edit on disk", () => disk.text === "agent one\nagent two\n");
-  check("the banner names the file and offers Reload, Compare and Overwrite", () => banner().textContent.includes(file) && ["Reload", "Compare", "Overwrite"].every(label => [...banner().querySelectorAll("button")].some(el => el.textContent.trim() === label)));
+  check("the banner names the file and offers Reload, Compare and Overwrite", () => banner().textContent.includes(file) && ["Refresh", "Compare", "Overwrite"].every(label => [...banner().querySelectorAll("button")].some(el => el.textContent.trim() === label)));
   check("the draft is kept, still in the editor", () => textarea()?.value === "one\ntwo\nmine\n");
   check("the tab still reads as having unsaved changes", () => /Unsaved/.test(host.textContent));
 
@@ -160,15 +160,15 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(banner, "the banner again");
   check("the next save carried the base the last save returned", () => saves[2].expectedBase === "0:saved");
   const readsBefore = blobReads.length;
-  [...banner().querySelectorAll("button")].find(el => el.textContent.trim() === "Reload").click();
+  [...banner().querySelectorAll("button")].find(el => el.textContent.trim() === "Refresh").click();
   await until(() => get(promptState), "the discard confirmation");
-  check("Reload asks before discarding the draft", () => get(promptState).options.mode === "confirm");
+  check("Refresh asks before discarding the draft", () => get(promptState).options.mode === "confirm");
   check("and the confirmation names the file whose draft goes", () => get(promptState).options.message.includes(file));
   completePrompt(true);
-  await until(() => banner() === null, "the banner goes after Reload");
+  await until(() => banner() === null, "the banner goes after Refresh");
   await until(() => blobReads.length > readsBefore, "the file is read again");
-  check("Reload shows what is on disk and leaves no draft", () => banner() === null && saves.length === 3 && host.textContent.includes("agent again"));
-  check("Reload wrote nothing", () => saves.length === 3);
+  check("Refresh shows what is on disk and leaves no draft", () => banner() === null && saves.length === 3 && host.textContent.includes("agent again"));
+  check("Refresh wrote nothing", () => saves.length === 3);
 
   check("after Reload the editor is closed on the disk version", () => Boolean(button("Edit")) && !textarea());
 

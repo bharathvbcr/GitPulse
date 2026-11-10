@@ -157,13 +157,13 @@ export function mergeListedAndStatusPaths(
 export function statusBadgeClass(kind: FileChangeKind): string {
   switch (kind) {
     case "conflict":
-      return "bg-rose-500/20 text-rose-300 border border-rose-500/40";
+      return "bg-danger/15 text-danger";
     case "staged":
-      return "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
+      return "bg-ok/15 text-ok";
     case "untracked":
-      return "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40";
+      return "bg-info/15 text-info";
     case "unstaged":
-      return "bg-amber-500/20 text-amber-300 border border-amber-500/40";
+      return "bg-warn/15 text-warn";
     default:
       return "";
   }
@@ -176,13 +176,13 @@ export function statusBadgeLabel(kind: FileChangeKind, full = false): string {
   if (full) {
     switch (kind) {
       case "conflict":
-        return "CONFLICT";
+        return "Conflict";
       case "staged":
-        return "STAGED";
+        return "Staged";
       case "untracked":
-        return "UNTRACKED";
+        return "Untracked";
       case "unstaged":
-        return "MODIFIED";
+        return "Modified";
       default:
         return "";
     }

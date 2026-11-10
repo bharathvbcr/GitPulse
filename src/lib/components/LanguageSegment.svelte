@@ -176,11 +176,11 @@
       {/each}
     </span>
     <span class="font-medium">{mix.dominant.language}</span>
-    <span class="tabular-nums text-[10px] text-textMuted/70">{mix.dominant.percentage}%</span>
+    <span class="tabular-nums text-micro text-textMuted/70">{mix.dominant.percentage}%</span>
     {#if mix.partial}
       <!-- The capped-scan marker rides the compact form too. A floor that
            reads as a total is the one thing this segment must never do. -->
-      <span class="text-amber-600 dark:text-amber-400" title={mix.partialNotice ?? "Partial scan"}>⚠</span>
+      <span class="text-warn" title={mix.partialNotice ?? "Partial scan"}>⚠</span>
     {/if}
   </button>
 {:else if rawSnapshot?.value?.stats?.length}
@@ -197,7 +197,7 @@
     <span class="font-medium">Notes only</span>
   </button>
 {:else if mix.failed}
-  <span class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 shrink-0" title="The language scan failed; see Diagnostics">
+  <span class="inline-flex items-center gap-1 text-warn shrink-0" title="The language scan failed; see Diagnostics">
     <span>⚠</span><span>Languages</span>
   </span>
 {/if}
@@ -216,14 +216,15 @@
     <div
       role="radiogroup"
       aria-label="Code percentage calculation mode"
-      class="flex items-center p-0.5 mb-2.5 rounded-lg bg-surface border border-border/70 text-[11px]"
+      class="gp-segmented flex w-full mb-2.5 text-meta"
     >
       <button
         type="button"
         role="radio"
         aria-checked={$interfaceStore.codePercentageMode === "code-only"}
         onclick={() => interfaceStore.setCodePercentageMode("code-only")}
-        class="flex-1 py-1 px-2 rounded-md font-medium text-center transition-all {$interfaceStore.codePercentageMode === 'code-only' ? 'bg-surfaceActive text-textPrimary shadow-xs border border-border/40 font-semibold' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-seg-btn flex-1 font-medium text-center"
+        data-active={$interfaceStore.codePercentageMode === "code-only"}
         data-testid="mode-code-only"
         title="Only code files: Exclude Markdown, notes, and documentation from code percentage"
       >
@@ -234,7 +235,8 @@
         role="radio"
         aria-checked={$interfaceStore.codePercentageMode === "all"}
         onclick={() => interfaceStore.setCodePercentageMode("all")}
-        class="flex-1 py-1 px-2 rounded-md font-medium text-center transition-all {$interfaceStore.codePercentageMode === 'all' ? 'bg-surfaceActive text-textPrimary shadow-xs border border-border/40 font-semibold' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-seg-btn flex-1 font-medium text-center"
+        data-active={$interfaceStore.codePercentageMode === "all"}
         data-testid="mode-all-files"
         title="Include notes: Count markdowns and notes in percentage with explanatory note"
       >
@@ -256,21 +258,22 @@
     {#if mix.note}
       <div
         data-testid="language-mix-note"
-        class="mb-2 px-2 py-1.5 rounded-md bg-accent/10 border border-accent/25 text-[10px] text-textMuted flex items-center gap-1.5 leading-tight"
+        class="gp-notice mb-2! px-2 py-1.5 text-micro text-textMuted items-center gap-1.5 leading-tight"
+        data-tone="info"
       >
-        <span class="text-accent font-semibold shrink-0">ℹ</span>
+        <span class="font-semibold shrink-0" style="color: var(--gp-notice-ink)">ℹ</span>
         <span>{mix.note}</span>
       </div>
     {/if}
 
     {#if mix.partialNotice}
-      <p class="mb-2 text-[10px] text-amber-600 dark:text-amber-400 leading-snug">
+      <p class="mb-2 text-micro text-warn leading-snug">
         ⚠ {mix.partialNotice}
       </p>
     {/if}
 
     {#if mix.stats.length === 0}
-      <div class="py-4 text-center text-textMuted text-[11px]" data-testid="empty-code-files">
+      <div class="py-4 text-center text-textMuted text-meta" data-testid="empty-code-files">
         No code files detected (markdown &amp; notes excluded)
       </div>
     {:else}
@@ -285,7 +288,7 @@
           >
             <LanguageLogo language={lang.language} size={13} class="shrink-0" />
             <span class="text-textPrimary/90 font-medium truncate flex-1">{lang.language}</span>
-            <span class="text-textMuted tabular-nums text-[10px] shrink-0">{lang.percentage}%</span>
+            <span class="text-textMuted tabular-nums text-micro shrink-0">{lang.percentage}%</span>
           </button>
         {/each}
       </div>
@@ -296,7 +299,9 @@
       data-language-rescan
       onclick={rescan}
       disabled={refreshing}
-      class="flex items-center justify-center gap-1.5 w-full mt-2 pt-2 border-t border-border/50 text-textMuted hover:text-textPrimary transition-colors disabled:opacity-50"
+      class="gp-btn w-full justify-center mt-2"
+      data-variant="ghost"
+      data-size="sm"
       title="Rescan language percentages"
     >
       <RefreshCw size={11} class={refreshing ? "animate-spin" : ""} />
