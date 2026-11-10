@@ -59,7 +59,7 @@
          had as its own section, so resolving is unchanged; MANVI follows. -->
     <section aria-label="Conflicts" class="policy-conflicts shrink-0 flex flex-col">
       {#if !live}
-        <div class="flex items-center gap-2 px-4 py-1.5 text-[11px] text-textMuted border-b border-border/40">
+        <div class="flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted">
           <span>Retained conflict drafts</span>
           <button type="button" class="gp-btn ml-auto" onclick={() => (reviewingDrafts = false)}>
             Hide
@@ -70,7 +70,7 @@
     </section>
   {:else if retainedDrafts > 0}
     <div
-      class="shrink-0 flex items-center gap-2 px-4 py-1.5 text-[11px] text-textMuted border-b border-border/40"
+      class="shrink-0 flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted"
       data-testid="policy-retained-drafts"
     >
       <span>
@@ -82,8 +82,8 @@
     </div>
   {/if}
   <section
-    aria-label="MANVI"
-    class="flex flex-col {showEditor ? 'shrink-0 border-t border-border/40' : 'flex-1 min-h-0'}"
+    aria-label="Manvi"
+    class="flex flex-col {showEditor ? 'shrink-0 bg-surface/20' : 'flex-1 min-h-0'}"
   >
     <LazyView load={loadManvi} name="Manvi ops" />
   </section>
