@@ -522,7 +522,7 @@
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
       check("A lost managed launch response retains one provider session",report.managedSpawns===1);
-      button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
+      button("Start or recover managed run").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
       check("Managed retry reuses the original session",report.managedSpawns===1);
       check("Run history does not fetch full output or effective settings",report.detailReads===0);
       const current=[...runs.values()].find(run=>run.kind==="managed"), now=Math.floor(Date.now()/1000);

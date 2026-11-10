@@ -677,7 +677,7 @@
         <button class="gp-btn" data-size="sm" type="button" onclick={() => stopSession(run, session.record)} disabled={!free}>Stop conversation</button>
       {/each}
       {#if run.kind === "managed"}
-        {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" data-size="sm" type="button" onclick={() => resumeManaged(run)} disabled={!mayMutate}>Start or recover managed launch</button>{/if}
+        {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" data-size="sm" type="button" onclick={() => resumeManaged(run)} disabled={!mayMutate}>Start or recover managed run</button>{/if}
         {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" data-size="sm" type="button" onclick={() => stopManaged(run)} disabled={!free}>Stop managed run</button>{/if}
         <button class="gp-btn" data-size="sm" type="button" onclick={() => inspect(run)} disabled={!free}>View output and settings</button>{/if}
       {#if (run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" data-size="sm" type="button" onclick={() => resume(run)} disabled={!mayMutate} title={`Starts ${run.provider === "agy" ? "an Antigravity" : "a Claude Code"} tab in this run's checkout that continues its conversation, in the same permission mode. You stay on this task.`}>Resume conversation</button>{/if}
