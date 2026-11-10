@@ -432,14 +432,29 @@ fn main() {
             // the stamp settled: the reload after an ordinary commit. Each arm
             // has its own clone, read once (warm, and the token the client
             // would hold) and then moved; one 4 s wait settles all of them.
-            let mut prepared: Vec<(PathBuf, String, Option<String>)> = Vec::new();
-            for tag in ["m1a", "m1b", "m2a", "m2b"] {
-                let dir = temp.path().join(format!("{tag}-{round}"));
+            //
+            // The clone prepared first has the longer wait behind it, so which
+            // arm gets that clone alternates with the round, the same way the
+            // timed order does. A first run tied "arm b" to "prepared second"
+            // and its null pair read 1.9 ms apart in 16 of 21 rounds: invalid.
+            let tags = ["m1a", "m1b", "m2a", "m2b"];
+            let order: [usize; 4] = if round.is_multiple_of(2) {
+                [0, 1, 2, 3]
+            } else {
+                [1, 0, 3, 2]
+            };
+            let mut slots: Vec<Option<(PathBuf, String, Option<String>)>> = vec![None; 4];
+            for at in order {
+                let dir = temp.path().join(format!("{}-{round}", tags[at]));
                 let path = clone_repo(&source, &dir);
                 let token = call(&path, window, Arm::Old, None, true).0;
                 git(&dir, &["commit", "--allow-empty", "-q", "-m", "one more"]);
-                prepared.push((dir, path, token));
+                slots[at] = Some((dir, path, token));
             }
+            let prepared: Vec<(PathBuf, String, Option<String>)> = slots
+                .into_iter()
+                .map(|slot| slot.expect("every slot prepared"))
+                .collect();
             std::thread::sleep(Duration::from_secs(4));
             for (pair, at) in [(&mut moved, 0), (&mut moved_null, 2)] {
                 let (first, second) = (pair.first, pair.second);
