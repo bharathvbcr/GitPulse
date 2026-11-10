@@ -4390,7 +4390,8 @@ describe("Overview repository-open destinations", () => {
     await store.openRepo("/alias", options);
     expect(ready).toHaveBeenCalledWith("/real");
     expect(get(store).activeTab).toBe("work");
-    expect(get(store).viewSections.work).toBe("policy");
+    // Resolve retired into Overview, which leads with the conflict editor.
+    expect(get(store).viewSections.work).toBe("overview");
     for (const tab of get(store).openTabs) await store.closeTab(tab.id);
   });
 

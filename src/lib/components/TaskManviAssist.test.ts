@@ -13,7 +13,7 @@ describe("TaskManviAssist", () => {
   it("gates Ask on manviGate and uses the shared local model selection", () => {
     expect(source).toContain("!manviGate.ok");
     expect(source).toContain("effectiveSelection");
-    expect(source).toContain("requestManviFocus(\"model\")");
+    expect(source).toContain("openManviFocus(\"model\")");
     expect(source).toContain("Pick a local model in Local model servers");
     expect(source).toContain("enhancementConfiguration(liveSelection)");
     expect(source).not.toContain("bind:value={configuration.model}");

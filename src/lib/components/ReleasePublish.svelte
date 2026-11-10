@@ -35,6 +35,8 @@
   let releaseConfirmed = $state(false);
   /** Once the person types a tag, a later tag-list refresh must not replace it. */
   let tagEdited = $state(false);
+  /** Once the person types a message, the tag no longer rewrites it. */
+  let messageEdited = $state(false);
   let error = $state<string | null>(null);
 
   const repoTags = $derived($repoStore.tags);
@@ -51,7 +53,7 @@
     untrack(() => {
       if (!tagEdited) {
         releaseTag = next;
-        releaseMessage = `Release ${next}`;
+        if (!messageEdited) releaseMessage = `Release ${next}`;
       }
     });
   });
@@ -62,6 +64,7 @@
       open = false;
       releaseConfirmed = false;
       tagEdited = false;
+      messageEdited = false;
       error = null;
     });
   });
@@ -73,8 +76,9 @@
   function editTag(value: string) {
     releaseTag = value;
     tagEdited = true;
-    // A message still reading "Release <old tag>" follows the tag.
-    if (releaseMessage === "" || /^Release\s/.test(releaseMessage)) releaseMessage = `Release ${value.trim()}`;
+    // A message the person has not written follows the tag. Decided by the
+    // edit, not by matching the message text.
+    if (!messageEdited) releaseMessage = `Release ${value.trim()}`;
   }
 
   async function publishRelease() {
@@ -155,7 +159,7 @@
         value={releaseTag}
         oninput={(event) => editTag(event.currentTarget.value)}
       />
-      <input class="gp-field w-full" maxlength="4096" placeholder="Release message" aria-label="Release message" bind:value={releaseMessage} />
+      <input class="gp-field w-full" maxlength="4096" placeholder="Release message" aria-label="Release message" bind:value={releaseMessage} oninput={() => (messageEdited = true)} />
       <div class="rounded-lg bg-surfaceHover p-2">
         <Checkbox
           checked={releaseConfirmed}

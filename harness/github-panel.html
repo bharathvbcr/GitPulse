@@ -833,6 +833,14 @@
             text().includes("Pushed v3.0.1 to origin — ") && text().includes("the release workflow can now build the app"));
           check("the form closes and Remote re-reads GitHub", () =>
             !$('input[aria-label="Release tag"]', releases()) && count("cmd_github_context") > contextsBeforePush);
+          // A message the person wrote is theirs, even one that starts with
+          // "Release ": the tag rewrites only a message nobody has typed.
+          button("Push release tag…", releases()).click();
+          await settle();
+          await input($('input[aria-label="Release message"]', releases()), "Release notes: login hotfix");
+          await input($('input[aria-label="Release tag"]', releases()), "v3.0.2");
+          check("a typed release message survives a tag edit, even one starting with Release", () =>
+            $('input[aria-label="Release message"]', releases())?.value === "Release notes: login hotfix");
 
           check("no window.open anywhere", () => windowOpens.length === 0);
           check("every IPC call had a fixture", () => unexpected.length === 0);

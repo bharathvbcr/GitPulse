@@ -9,7 +9,6 @@
 import type { HarnessPermissionMode } from "./availability";
 import type { CatchUp } from "../ingest/types";
 import type { LedgerStatus } from "../ledger/types";
-import type { MutationTarget } from "../repos/storeTypes";
 import { redactDiagnosticText } from "../diagnostics/diagnostics";
 
 export type StatusTone = "ready" | "warning" | "error" | "neutral";
