@@ -9,7 +9,7 @@
 //! constantly, with the argv of the production readers in `engine/git_reader.rs`
 //! (the `log --topo-order` history page, the `--parents` path-limited log, the
 //! `for-each-ref %(ahead-behind:)` branch listing, `rev-list --count`, and
-//! `blame --line-porcelain`). They go through the gated `git_cli::git_text`
+//! `blame --porcelain`). They go through the gated `git_cli::git_text`
 //! seam but not the readers' caches, so every sample really walks.
 //!
 //! # Fixture
@@ -264,7 +264,7 @@ fn operations(size: usize, main_oid: &str) -> Vec<(&'static str, Vec<String>)> {
             "blame",
             vec![
                 "blame".into(),
-                "--line-porcelain".into(),
+                "--porcelain".into(),
                 "--".into(),
                 RARE_PATH.into(),
             ],
