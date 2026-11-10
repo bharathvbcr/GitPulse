@@ -180,6 +180,8 @@ impl RepoFileWatcher {
                 // The sender's lifetime follows every native callback owner.
                 // It is never sent to: disconnect is the shutdown receipt.
                 std::hint::black_box(&lifetime);
+                #[cfg(all(test, target_os = "macos"))]
+                callback_filter.count_callback();
                 if callback_filter.admit(&res) {
                     forward_event(&tx, &callback_overflow, res);
                 }

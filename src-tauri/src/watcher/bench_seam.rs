@@ -64,6 +64,7 @@ impl StormClassifier {
         let kept = prefixes.len();
         let rules = IgnoreRules {
             prefixes,
+            files: Default::default(),
             load_error: None,
             truncated,
         };

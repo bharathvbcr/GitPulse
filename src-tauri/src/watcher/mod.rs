@@ -355,6 +355,12 @@ const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 /// `ls-files` answer is a partial result: the prefixes that fit still apply,
 /// and [`IgnoreRules::load_error`] says the rest were not recorded.
 const MAX_IGNORE_PREFIXES: usize = 4096;
+/// How many ignored FILES (not directories) one watch will remember, and how
+/// many bytes of their names. Past either bound the rest are simply not
+/// recorded: an unrecorded ignored file is forwarded, which costs a refresh and
+/// is never wrong.
+const MAX_IGNORE_FILES: usize = 4096;
+const MAX_IGNORE_FILE_BYTES: usize = 256 * 1024;
 /// The watch thread must not sit on `git ls-files` for the full git timeout
 /// while filesystem events queue behind it.
 const IGNORE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -369,6 +375,13 @@ const IGNORE_RETRY: Duration = Duration::from_secs(30);
 pub(crate) struct IgnoreRules {
     /// Folded, `/`-separated directory prefixes (`scratch`, `pkg/generated`).
     prefixes: HashSet<String>,
+    /// Ignored files the listing printed one by one (a nested
+    /// `.claude/settings.local.json`, `lcov.info`, a `.DS_Store`), exactly as
+    /// printed and relative to the worktree root. A write to one of these is
+    /// not forwarded by the recursive watch's callback filter; see
+    /// [`filter::EventFilter::admit`]. Bounded by [`MAX_IGNORE_FILES`] and
+    /// [`MAX_IGNORE_FILE_BYTES`].
+    files: HashSet<String>,
     /// `None` only when the query finished and the prefix list was complete.
     load_error: Option<String>,
     /// True when the query finished and the list was cut at
@@ -386,6 +399,7 @@ impl IgnoreRules {
     fn builtin() -> Self {
         Self {
             prefixes: HashSet::new(),
+            files: HashSet::new(),
             load_error: None,
             truncated: false,
         }
@@ -409,6 +423,7 @@ impl IgnoreRules {
         ) {
             Ok(stdout) => {
                 let (prefixes, truncated) = parse_ignored_directories(&stdout);
+                let files = parse_ignored_files(&stdout);
                 if truncated {
                     let error = format!(
                         "ignore directory list truncated at {MAX_IGNORE_PREFIXES}; further ignored directories were not recorded"
@@ -416,12 +431,14 @@ impl IgnoreRules {
                     log::warn!(target: "watcher", "{}: {error}", repo.display());
                     Self {
                         prefixes,
+                        files,
                         load_error: Some(error),
                         truncated: true,
                     }
                 } else {
                     Self {
                         prefixes,
+                        files,
                         load_error: None,
                         truncated: false,
                     }
@@ -435,6 +452,7 @@ impl IgnoreRules {
                 );
                 Self {
                     prefixes: HashSet::new(),
+                    files: HashSet::new(),
                     load_error: Some(error.into_message()),
                     truncated: false,
                 }
@@ -464,6 +482,26 @@ fn parse_ignored_directories(stdout: &str) -> (HashSet<String>, bool) {
         prefixes.insert(folded);
     }
     (prefixes, truncated)
+}
+
+/// The ignored files the listing printed one by one (the entries that do not
+/// end in a separator), up to [`MAX_IGNORE_FILES`] and
+/// [`MAX_IGNORE_FILE_BYTES`] of names. Nothing past a bound is recorded.
+fn parse_ignored_files(stdout: &str) -> HashSet<String> {
+    let mut files = HashSet::new();
+    let mut bytes = 0usize;
+    for field in stdout.split('\0') {
+        if field.is_empty() || field.ends_with('/') || field.ends_with('\\') {
+            continue;
+        }
+        let name = field.trim_start_matches("./");
+        if files.len() >= MAX_IGNORE_FILES || bytes + name.len() > MAX_IGNORE_FILE_BYTES {
+            break;
+        }
+        bytes += name.len();
+        files.insert(name.to_string());
+    }
+    files
 }
 
 /// Directories that are build output by construction. Ordinary source names
@@ -532,16 +570,30 @@ fn rules_due(
 /// git command anyone runs. The list only decides which events are forwarded
 /// for an immediate refresh, never what status shows, so it may be a little
 /// stale. Reloads are coalesced to one per [`SCAN_COALESCE`].
-fn event_may_change_ignore_rules(event: &Event, internal_roots: &[PathBuf]) -> bool {
-    let rule_file = event.paths.iter().any(
-        |path| match path.file_name().and_then(|name| name.to_str()) {
-            Some(".gitignore") => true,
-            Some("exclude") => path.parent().is_some_and(|parent| parent.ends_with("info")),
-            _ => false,
-        },
-    );
+///
+/// The directory trigger exists only for the recursive watch (`recursive`):
+/// where the root watch is non-recursive (Linux, Windows) a new directory
+/// delivers nothing below it, so there is nothing for a stale list to hide and
+/// no reason to spend a `git ls-files` on it.
+fn event_may_change_ignore_rules(
+    event: &Event,
+    internal_roots: &[PathBuf],
+    recursive: bool,
+) -> bool {
+    let rule_file =
+        event.paths.iter().any(
+            |path| match path.file_name().and_then(|name| name.to_str()) {
+                Some(".gitignore") => true,
+                Some("exclude") => path.parent().is_some_and(|parent| parent.ends_with("info")),
+                _ => false,
+            },
+        );
     rule_file
-        || (matches!(event.kind, EventKind::Create(notify::event::CreateKind::Folder))
+        || (recursive
+            && matches!(
+                event.kind,
+                EventKind::Create(notify::event::CreateKind::Folder)
+            )
             && event
                 .paths
                 .iter()
@@ -1159,7 +1211,8 @@ where
                 let worktree = Path::new(&path);
                 // One canonicalize per batch — never per drained leftover.
                 let worktree_canonical = worktree.canonicalize().ok();
-                reload_wanted |= event_may_change_ignore_rules(&event, &internal_roots);
+                reload_wanted |=
+                    event_may_change_ignore_rules(&event, &internal_roots, filter.recursive());
                 let mut significant = record_event_signal(
                     &event,
                     &internal_roots,
@@ -1171,8 +1224,11 @@ where
                 for leftover in watcher.receiver.try_iter() {
                     significant |= match leftover {
                         Ok(event) => {
-                            reload_wanted |=
-                                event_may_change_ignore_rules(&event, &internal_roots);
+                            reload_wanted |= event_may_change_ignore_rules(
+                                &event,
+                                &internal_roots,
+                                filter.recursive(),
+                            );
                             record_event_signal(
                                 &event,
                                 &internal_roots,
@@ -5207,6 +5263,7 @@ mod tests {
         let now = Instant::now();
         let mut rules = IgnoreRules {
             prefixes: HashSet::new(),
+            files: HashSet::new(),
             load_error: None,
             truncated: false,
         };
@@ -5349,7 +5406,9 @@ mod tests {
         std::fs::write(out.join("seed.o"), "x").unwrap();
         std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
         // The rule file edit and the new directory are what reload the rules.
-        wait_for("the rules to be reloaded with `out/`", || filter.loads() >= 2);
+        wait_for("the rules to be reloaded with `out/`", || {
+            filter.loads() >= 2
+        });
         prime_watcher(&rx, &root, PRIME_DEADLINE);
         let (loads, examined) = (filter.loads(), filter.examined());
 
@@ -5392,15 +5451,205 @@ mod tests {
         let event = |kind: EventKind, path: &str| Event::new(kind).add_path(PathBuf::from(path));
         let modify = EventKind::Modify(notify::event::ModifyKind::Any);
         let folder = EventKind::Create(notify::event::CreateKind::Folder);
-        assert!(event_may_change_ignore_rules(&event(modify, "/repo/.gitignore"), &roots));
-        assert!(event_may_change_ignore_rules(&event(modify, "/repo/a/.gitignore"), &roots));
-        assert!(event_may_change_ignore_rules(&event(modify, "/repo/.git/info/exclude"), &roots));
-        assert!(event_may_change_ignore_rules(&event(folder, "/repo/dist"), &roots));
-        assert!(!event_may_change_ignore_rules(&event(folder, "/repo/.git/objects/ab"), &roots));
-        assert!(!event_may_change_ignore_rules(&event(modify, "/repo/.git/index"), &roots));
-        assert!(!event_may_change_ignore_rules(&event(modify, "/repo/.git/HEAD"), &roots));
-        assert!(!event_may_change_ignore_rules(&event(modify, "/repo/.git/config"), &roots));
-        assert!(!event_may_change_ignore_rules(&event(modify, "/repo/src/main.rs"), &roots));
+        for recursive in [true, false] {
+            let asks = |e: &Event| event_may_change_ignore_rules(e, &roots, recursive);
+            assert!(asks(&event(modify, "/repo/.gitignore")));
+            assert!(asks(&event(modify, "/repo/a/.gitignore")));
+            assert!(asks(&event(modify, "/repo/.git/info/exclude")));
+            assert!(!asks(&event(folder, "/repo/.git/objects/ab")));
+            assert!(!asks(&event(modify, "/repo/.git/index")));
+            assert!(!asks(&event(modify, "/repo/.git/HEAD")));
+            assert!(!asks(&event(modify, "/repo/.git/config")));
+            assert!(!asks(&event(modify, "/repo/src/main.rs")));
+        }
+        // A new directory asks only where the root watch is recursive: where
+        // it is not (Linux, Windows) nothing below it is delivered, so a stale
+        // list hides nothing and a `git ls-files` per directory would be new
+        // cost.
+        assert!(event_may_change_ignore_rules(
+            &event(folder, "/repo/dist"),
+            &roots,
+            true
+        ));
+        assert!(!event_may_change_ignore_rules(
+            &event(folder, "/repo/dist"),
+            &roots,
+            false
+        ));
+    }
+
+    // ---- Ignored files, listed one by one ---------------------------------
+
+    #[test]
+    fn the_listing_names_ignored_files_and_the_bound_stops_it() {
+        let listing =
+            "target/\0docs/lcov.info\0.DS_Store\0harness/.devmap-preview.json\0scratch/\0";
+        let files = parse_ignored_files(listing);
+        let mut names: Vec<&str> = files.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                ".DS_Store",
+                "docs/lcov.info",
+                "harness/.devmap-preview.json"
+            ]
+        );
+
+        let mut huge = String::new();
+        for i in 0..(MAX_IGNORE_FILES + 50) {
+            huge.push_str(&format!("d/f{i}.log\0"));
+        }
+        assert_eq!(parse_ignored_files(&huge).len(), MAX_IGNORE_FILES);
+        let long = format!("{}/x\0", "a".repeat(MAX_IGNORE_FILE_BYTES));
+        assert!(
+            parse_ignored_files(&long).is_empty(),
+            "past the byte bound: not recorded"
+        );
+    }
+
+    #[test]
+    fn a_real_listing_carries_the_ignored_files_and_not_the_tracked_ones() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "*.local.json\nlcov.info\n").unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/settings.local.json"), "x").unwrap();
+        std::fs::write(root.join("a/b/lcov.info"), "x").unwrap();
+        std::fs::write(root.join("a/b/tracked.json"), "x").unwrap();
+        git_in(root, &["add", ".gitignore", "a/b/tracked.json"]);
+        git_in(root, &["commit", "-m", "base"]);
+        let rules = IgnoreRules::load(root);
+        assert!(rules.load_error.is_none(), "{:?}", rules.load_error);
+        assert!(
+            rules.files.contains("a/b/settings.local.json"),
+            "{:?}",
+            rules.files
+        );
+        assert!(rules.files.contains("a/b/lcov.info"));
+        assert!(!rules.files.contains("a/b/tracked.json"));
+    }
+
+    /// User plus system CPU time of this process so far.
+    #[cfg(target_os = "macos")]
+    fn process_cpu() -> Duration {
+        // SAFETY: `getrusage` fills the zeroed struct it is handed.
+        let usage = unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+            usage
+        };
+        let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+        Duration::from_micros(micros(usage.ru_utime) + micros(usage.ru_stime))
+    }
+
+    /// What the recursive root watch costs the callback: 50,000 files created
+    /// in an ignored directory with (a) no watcher, (b) main's watcher (root
+    /// NON-recursive: the backend discards nested paths before our callback),
+    /// (c) stage 1's (root recursive, events filtered in the callback). Counts
+    /// the native callbacks we receive, the events forwarded to the queue, and
+    /// the process CPU time spent from the first write until the callbacks have
+    /// gone quiet. The writer's own CPU is arm (a); the difference is the
+    /// watcher's. Arms are interleaved over fresh repositories, n = 3. Run on a
+    /// quiet host: `cargo test --lib watcher::tests::measure_callback_cost --
+    /// --ignored --nocapture`. A run that starts or ends above load 30 is
+    /// printed as CONTAMINATED and is not a result.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "measurement; 50,000 file creations per arm on a quiet host"]
+    fn measure_callback_cost_of_ignored_churn_main_versus_stage_1() {
+        const FILES: u32 = 50_000;
+        const REPS: usize = 3;
+        let load = || {
+            let mut load = [0f64; 3];
+            // SAFETY: `getloadavg` writes at most `3` doubles into the array.
+            let got = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+            if got >= 1 {
+                load[0]
+            } else {
+                f64::NAN
+            }
+        };
+        let load_start = load();
+        // (callbacks, forwarded, cpu ms) per repetition, per arm.
+        let mut rows: [Vec<(u64, usize, u128)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for _ in 0..REPS {
+            for (arm, mode) in [
+                None,
+                Some(notify::RecursiveMode::NonRecursive),
+                Some(notify::RecursiveMode::Recursive),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let temp = TempDir::new().unwrap();
+                git_init(temp.path(), false);
+                let root = temp.path().canonicalize().unwrap();
+                let out = root.join("out");
+                for shard in 0..50 {
+                    std::fs::create_dir_all(out.join(format!("d{shard}"))).unwrap();
+                }
+                std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+                let watcher = mode.map(|mode| {
+                    let watcher = RepoFileWatcher::watch_repo_with(
+                        &root.join(".git"),
+                        Some(&root),
+                        None,
+                        mode,
+                    )
+                    .expect("watch");
+                    watcher
+                        .filter()
+                        .publish_rules(Arc::new(IgnoreRules::load(&root)));
+                    thread::sleep(Duration::from_millis(600));
+                    while watcher.receiver.try_recv().is_ok() {}
+                    watcher
+                });
+                let (calls_before, cpu_before) = (
+                    watcher.as_ref().map_or(0, |w| w.filter().callbacks()),
+                    process_cpu(),
+                );
+                for i in 0..FILES {
+                    std::fs::write(
+                        out.join(format!("d{}", i % 50)).join(format!("f{i}.o")),
+                        "x",
+                    )
+                    .unwrap();
+                }
+                // Quiet: the callback count has not moved for 2 s.
+                let mut last = u64::MAX;
+                let mut still_since = Instant::now();
+                while still_since.elapsed() < Duration::from_secs(2) {
+                    thread::sleep(Duration::from_millis(200));
+                    let now = watcher.as_ref().map_or(0, |w| w.filter().callbacks());
+                    if now != last {
+                        last = now;
+                        still_since = Instant::now();
+                    }
+                }
+                let cpu = process_cpu() - cpu_before;
+                let (callbacks, forwarded) = watcher.as_ref().map_or((0, 0), |w| {
+                    (
+                        w.filter().callbacks() - calls_before,
+                        w.receiver.try_iter().count(),
+                    )
+                });
+                rows[arm].push((callbacks, forwarded, cpu.as_millis()));
+            }
+        }
+        let load_end = load();
+        let contaminated = load_start > 30.0 || load_end > 30.0 || load_start.is_nan();
+        eprintln!(
+            "MEASURE {FILES} creations in an ignored directory, n={REPS}, (callbacks, forwarded, process cpu ms): \\
+             no-watcher={:?} main(non-recursive)={:?} stage1(recursive+filter)={:?}; \\
+             load 1m start={load_start:.1} end={load_end:.1} {}",
+            rows[0],
+            rows[1],
+            rows[2],
+            if contaminated { "CONTAMINATED (above 30): not a result" } else { "clean" }
+        );
+        assert!(rows[2].iter().all(|(_, forwarded, _)| *forwarded == 0));
     }
 
     #[cfg(target_os = "macos")]
