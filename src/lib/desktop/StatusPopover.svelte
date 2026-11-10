@@ -37,7 +37,7 @@
   const metrics = $derived([
     { label: "Changed", value: card?.changed, icon: FileDiff, action: "section:work:overview" },
     { label: "Staged", value: card?.staged, icon: Layers, action: "section:work:overview" },
-    { label: "Conflicts", value: card?.conflicts, icon: CircleAlert, action: "section:work:resolve" },
+    { label: "Conflicts", value: card?.conflicts, icon: CircleAlert, action: "section:work:policy" },
   ]);
   const shortcutIcon = $derived<Record<string, typeof History>>({
     "section:history:graph": History, "section:insights:pulse": HeartPulse, fleet: LayoutGrid, agents: Bot,

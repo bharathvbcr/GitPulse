@@ -75,10 +75,11 @@ describe("dispatchNativeMenu", () => {
       }
     }
     // Written out so a registry that collapsed to nothing could not make the
-    // comparison below pass against an equally empty call list. 14 since
+    // comparison below pass against an equally empty call list. 13 since
     // Secrets folded into Insights → Health, Code's Search and Blame became
-    // toggles inside Explorer, and Reflog folded into History › Graph.
-    expect(expected).toHaveLength(14);
+    // toggles inside Explorer, Reflog folded into History › Graph, and Work's
+    // Resolve folded into Policy.
+    expect(expected).toHaveLength(13);
     expect(h.calls).toEqual(expected);
   });
 

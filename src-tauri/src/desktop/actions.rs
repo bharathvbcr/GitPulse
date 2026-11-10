@@ -78,7 +78,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         title: "Work",
         entries: &[
             ("section:work:overview", "Overview"),
-            ("section:work:resolve", "Resolve"),
             ("section:work:remote", "Remote"),
             ("section:work:policy", "Policy"),
             ("section:work:tasks", "Tasks"),
@@ -334,10 +333,11 @@ mod tests {
         // when History gained Suspects, and again at 16 when Insights gained
         // Secrets, at 17 when Code gained Search, at 18 before Secrets folded
         // into Health (17) and Code's Search and Blame became toggles inside
-        // Explorer (15), and at 15 when Reflog folded into History › Graph
-        // (14); the parity contract is what proves the number is the right
-        // one rather than just the current one.
-        assert_eq!(entries.len(), 14);
+        // Explorer (15), at 15 when Reflog folded into History › Graph (14),
+        // and at 14 when Work's Resolve folded into Policy (13); the parity
+        // contract is what proves the number is the right one rather than just
+        // the current one.
+        assert_eq!(entries.len(), 13);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -432,6 +432,9 @@ mod tests {
         assert_eq!(NativeAction::parse("tab-manvi"), None);
         assert_eq!(NativeAction::parse("tab-stack"), None);
         assert_eq!(NativeAction::parse("tab-conflict"), None);
+        // Resolve then folded into Policy, which leads with the conflicts.
+        assert_eq!(NativeAction::parse("section:work:resolve"), None);
+        assert!(NativeAction::parse("section:work:policy").is_some());
         // Files and Blame became sections of Code.
         assert_eq!(NativeAction::parse("tab-files"), None);
         assert_eq!(NativeAction::parse("tab-blame"), None);

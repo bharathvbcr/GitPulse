@@ -236,7 +236,7 @@ impl MenuState {
                 self.tray_summary.id.as_str(),
                 actions::OPEN
                     | actions::REFRESH
-                    | "section:work:resolve"
+                    | "section:work:policy"
                     | "section:work:overview"
                     | "section:history:graph"
             )

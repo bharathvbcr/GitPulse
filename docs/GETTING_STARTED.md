@@ -43,7 +43,8 @@ Selective patch staging is available in the diff. Check the staged result before
 committing; a failed or partially completed operation needs its reported recovery
 step, not an assumption that everything succeeded.
 
-For a parked merge or rebase, open **Work → Resolve**. Review the conflict chunks
+For a parked merge or rebase, open **Work → Policy**, which leads with the conflict
+editor while one is parked. Review the conflict chunks
 and remaining operation state before continuing. See the [feature reference](FEATURES.md)
 for stash, worktree, stack, and recovery controls.
 

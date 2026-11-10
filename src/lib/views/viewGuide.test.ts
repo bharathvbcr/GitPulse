@@ -47,14 +47,16 @@ describe("destination guides", () => {
       view: "history",
       section: "diff",
     });
-    expect(tipGuideKey("work", "resolve")).toBe("work:resolve");
-    expect(tipGuideDescId("work:resolve")).toBe("gitpulse-view-guide-work-resolve");
+    expect(tipGuideKey("work", "policy")).toBe("work:policy");
+    expect(tipGuideDescId("work:policy")).toBe("gitpulse-view-guide-work-policy");
   });
 
   it("keeps Work's F10 and Code's digit chord on the view cards", () => {
     expect(destinationGuide("work")?.shortcut).toBe("F10");
     expect(destinationGuide("code")?.shortcut).toBe("⌘1");
     expect(destinationGuide("work:overview")?.shortcut).toBe("⌥1");
-    expect(destinationGuide("work:resolve")?.shortcut).toBe("⌥2");
+    expect(destinationGuide("work:remote")?.shortcut).toBe("⌥2");
+    // Resolve folded into Policy, so it has no card and no chord of its own.
+    expect(destinationGuide("work:resolve")).toBeNull();
   });
 });

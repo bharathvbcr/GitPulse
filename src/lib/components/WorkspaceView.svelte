@@ -8,6 +8,7 @@
   const view = "work" as const;
   import WorkView from "./WorkView.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
+  import PolicyPane from "./PolicyPane.svelte";
   const loadTasks = () => import("./RepositoryTasks.svelte");
 
   /**
@@ -51,7 +52,7 @@
     <ViewContextBar label="Conflicts">
       <button
         type="button"
-        onclick={() => repoStore.setViewSection("work", "resolve")}
+        onclick={() => repoStore.setViewSection("work", "policy")}
         class="ml-auto shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors"
         title="{conflictedCount} file{conflictedCount === 1 ? '' : 's'} still carry conflict markers"
       >
@@ -63,14 +64,12 @@
 
     {#if section === "tasks"}
       <LazyView load={loadTasks} name="repository tasks" props={{ active: section === "tasks" }} />
-    {:else if section === "resolve"}
-      <LazyView load={loadConflict} name="the conflict editor" />
     {:else if section === "remote"}
       <LazyView load={loadGitHub} name="GitHub" />
     {:else if section === "stack"}
       <LazyView load={loadStack} name="the code stack" />
     {:else if section === "policy"}
-      <LazyView load={loadManvi} name="Manvi ops" />
+      <PolicyPane {loadConflict} {loadManvi} />
     {:else}
       <WorkView />
     {/if}

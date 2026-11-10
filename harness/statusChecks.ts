@@ -293,7 +293,7 @@ export async function checkStatusPopover() {
       afterEscape.closed && afterEscape.action);
     await select(1, "conflicts");
     check("conflicts receive a specific headline and card", element("h1").textContent === "Conflicts need your attention" && button('[aria-label="2 conflicts"]').classList.contains("attention"));
-    await click(".primary"); check("the conflict action opens Resolve", action("section:work:resolve"));
+    await click(".primary"); check("the conflict action opens Policy, which leads with the conflicts", action("section:work:policy"));
     await select(1, "clean");
     check("clean state shows real zeros and disables all cards", metrics().every(m => m.disabled && m.querySelector("strong")?.textContent === "0"));
     await click(".primary"); check("clean state offers history", action("section:history:graph"));

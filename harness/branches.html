@@ -525,7 +525,7 @@ if(params.has("check")) {
     await click("Merge branch");await waitFor(()=>button("Resolve conflicts"));
     check("conflicts prevent a second merge",button("Merge branch").disabled);
     await click("Resolve conflicts");
-    check("conflict recovery opens Work Resolve",!dialog()&&get(repoStore).activeTab==="work"&&get(repoStore).viewSections.work==="resolve");
+    check("conflict recovery opens Work Policy",!dialog()&&get(repoStore).activeTab==="work"&&get(repoStore).viewSections.work==="policy");
     operation=null;failMerge=false;await repoStore.refresh();await settle();
     await click("Merge branches");await click("Select local branch feature/branch-selection");
     await repoStore.openRepo("/fixture/other");await settle();

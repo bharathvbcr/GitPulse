@@ -182,7 +182,7 @@
           await click("View history");
           check("history navigates to graph", get(repoStore).activeTab === "history" && get(repoStore).viewSections.history === "graph");
           await click("Rebase in progress");
-          check("parked operation opens the correct worktree in Resolve", get(repoStore).currentPath.includes("review-flow") && get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "resolve");
+          check("parked operation opens the correct worktree in Policy", get(repoStore).currentPath.includes("review-flow") && get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "policy");
           await repoStore.openRepo(root); await settle();
           repoStore.setActiveTab("code", "explorer");
           const resolve = fixtures.cmd_resolve_repo;
