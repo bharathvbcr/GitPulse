@@ -1762,6 +1762,109 @@ fn insights_reads_are_bounded_and_never_starve_the_edit_hooks() {
     }
 }
 
+/// Twice the 24 connections the mailbox admits, all asking for insights while
+/// four reads are held: every extra one is refused or dropped, none is served,
+/// and a relaunch and a hook's collision scan are still taken afterwards.
+#[test]
+fn a_burst_of_insights_asks_past_the_accept_cap_never_starves_a_relaunch_or_a_hook() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_insights(Arc::new(move |_| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({"ok": true}))
+        }));
+    }
+    owner.attach_collision(Arc::new(|_, _| Ok(serde_json::json!({"scan": true}))));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    owner.attach(move |request| sink.lock().unwrap().push(request));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let ask = |n: usize, within: Duration| {
+        let socket = socket.clone();
+        std::thread::spawn(move || {
+            Secondary::connect(&socket)
+                .ok()
+                .map(|owner| owner.insights(&insights_request(&format!("i-{n}")), within))
+        })
+    };
+    let held: Vec<_> = (0..MAX_INSIGHTS_HANDLERS)
+        .map(|n| ask(n, Duration::from_secs(30)))
+        .collect();
+    let started = Instant::now();
+    while entered.load(Ordering::Acquire) < MAX_INSIGHTS_HANDLERS {
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+            "reads never filled"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let burst: Vec<_> = (0..(MAX_HANDLERS + MAX_GATE_HANDLERS) * 2)
+        .map(|n| ask(100 + n, Duration::from_secs(5)))
+        .collect();
+    // A relaunch and a hook reach the owner while the burst is in flight,
+    // retrying as a real one does if the accept cap turns a connection away.
+    let patiently = |attempt: &dyn Fn() -> bool| {
+        let begun = Instant::now();
+        while !attempt() {
+            assert!(
+                begun.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "the owner never took it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    patiently(&|| {
+        Secondary::connect(&socket)
+            .ok()
+            .is_some_and(|owner| owner.forward(&Request::Reveal).is_ok())
+    });
+    patiently(&|| {
+        Secondary::connect(&socket).ok().is_some_and(|owner| {
+            owner.collisions(&scan_request("s-1"), Duration::from_secs(5))
+                == Ok(serde_json::json!({"scan": true}))
+        })
+    });
+    for asker in burst {
+        match asker.join().unwrap() {
+            // Turned away at the accept cap: no greeting at all.
+            None => {}
+            Some(answer) => assert!(
+                answer.is_err(),
+                "an ask past the insights cap was served: {answer:?}"
+            ),
+        }
+    }
+    assert_eq!(entered.load(Ordering::Acquire), MAX_INSIGHTS_HANDLERS);
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for asker in held {
+        assert!(asker.join().unwrap().is_some_and(|answer| answer.is_ok()));
+    }
+    let waited = Instant::now();
+    while !seen.lock().unwrap().contains(&Request::Reveal) {
+        assert!(
+            waited.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+            "the relaunch was acknowledged but never delivered"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
     let dir = profile();

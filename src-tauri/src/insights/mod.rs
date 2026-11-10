@@ -23,7 +23,7 @@ mod merge_conflicts_bench_tests;
 
 pub use crate::engine::worktree::ScanDeadline;
 pub use app_facets::{
-    serve as serve_facets, snapshot_from_app, AppFacets, NotScanned, APP_BUDGET as APP_FACETS_BUDGET,
+    serve as serve_facets, snapshot_from_app, AppFacets, NotScanned, APP_TTL as APP_FACETS_TTL,
 };
 pub use collision_memo::{
     collision_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,

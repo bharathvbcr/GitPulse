@@ -27,23 +27,46 @@
 //!   did not run, and the asker answers from its own scan instead.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::collision_memo::{memo_key, shared, CollisionMemo, TTL};
+use super::collision_memo::{memo_key, shared, CollisionMemo};
 use super::{
     complete_snapshot, derive_facets, live_sessions, read_listing, AgentSummary, ChangesFacet,
     CollisionRisk, GitFacets, InsightsSnapshot, WorktreeFacet, MAX_SNAPSHOT_WORKTREES,
 };
+use crate::engine::git_cli::{with_admission, Admission};
 use crate::engine::worktree::{self, ScanDeadline, StatusRead, WorktreeInfo};
 use crate::ipc_error::CommandError;
 
+/// How long a read or a listing may be, and still be handed to an asker.
+///
+/// Shorter than the collision scan's 5 s ([`super::collision_memo::TTL`]) on
+/// purpose. A *negative* here ("nothing overlaps") is the answer an agent about
+/// to edit acts on, and the asker's own scan would have been fresh at the call.
+/// 2 s is long enough that the many MCP processes of many sessions asking in the
+/// same moment share one set of reads, and short enough that the edit hook,
+/// which is the gate and checks again at edit time, is the only place a
+/// sibling's brand-new edit can go unseen for as long as 5 s. The reply says
+/// how old its oldest read is.
+pub const APP_TTL: Duration = Duration::from_secs(2);
+
 /// How long the app spends reading for one request, from the moment it was
 /// asked. Status reads that would start after it are not started, and the
-/// worktrees they would have covered are reported unread. It bounds the git
-/// work of one handler; the asker's own deadline bounds how long it waits.
-pub const APP_BUDGET: Duration = Duration::from_secs(2);
+/// worktrees they would have covered are reported unread.
+pub const APP_BUDGET: Duration = Duration::from_millis(1200);
+
+/// How long the handler waits for its own reading before it gives up and
+/// answers that nothing was scanned: under the asker's 2 s wait, so the answer
+/// arrives. The reading is abandoned, not cancelled (git has no handle to
+/// cancel), so [`MAX_ABANDONED`] bounds how many may still be running.
+pub const HANDLER_DEADLINE: Duration = Duration::from_millis(1600);
+
+/// Abandoned readings that may still be running before the app refuses new ones.
+const MAX_ABANDONED: usize = 4;
 
 /// A facet the app did not answer, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +78,9 @@ pub struct NotScanned {
 /// The app's answer to [`crate::desktop::instance::Request::InsightsRead`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppFacets {
+    /// The repository the answer is about, as the app resolved it (canonical).
+    /// The asker refuses a reply about another one.
+    pub repo: String,
     /// Age in milliseconds of the oldest read the answer was assembled from;
     /// 0 when everything was read for this request.
     pub age_ms: u64,
@@ -73,14 +99,117 @@ pub struct AppFacets {
 /// per-facet gaps are in the reply.
 pub fn serve(repo: &str) -> Result<AppFacets, String> {
     // Trust is decided here, before any memory is consulted, for every request.
-    crate::engine::validate_repo(repo).map_err(CommandError::into_message)?;
-    Ok(serve_with(
+    // Every read below is of the canonical path validation returned, never of
+    // the string the peer sent, so a link swapped in afterwards is not followed.
+    let canonical = crate::engine::validate_repo(repo)
+        .map_err(CommandError::into_message)?
+        .to_string_lossy()
+        .into_owned();
+    let reading = canonical.clone();
+    serve_bounded(canonical, HANDLER_DEADLINE, move || {
+        // The class the asker's own scan runs in (`gitpulse-mcp` is a
+        // background process), so agents' reads do not compete with the UI's.
+        with_admission(Admission::Background, || {
+            serve_with(
+                &reading,
+                &live_sessions::observe(),
+                shared(),
+                APP_TTL,
+                APP_BUDGET,
+            )
+        })
+    })
+}
+
+const RUNNING: u8 = 0;
+const DONE: u8 = 1;
+const ABANDONED_STATE: u8 = 2;
+
+/// Readings the handler gave up on that have not ended yet.
+static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+
+/// Runs `work` and waits `wait` for it. Past that the reading is abandoned
+/// (its thread ends when git does) and every facet is answered not scanned, so
+/// a hung `git` cannot hold the handler, and with it a mailbox slot, for git's
+/// own 90 s cap. At most [`MAX_ABANDONED`] abandoned readings may be running
+/// before new asks are refused.
+fn serve_bounded(
+    repo: String,
+    wait: Duration,
+    work: impl FnOnce() -> AppFacets + Send + 'static,
+) -> Result<AppFacets, String> {
+    serve_bounded_in(&ABANDONED, repo, wait, work)
+}
+
+/// [`serve_bounded`] counting its abandoned readings in `abandoned`.
+fn serve_bounded_in(
+    abandoned: &'static AtomicUsize,
+    repo: String,
+    wait: Duration,
+    work: impl FnOnce() -> AppFacets + Send + 'static,
+) -> Result<AppFacets, String> {
+    if abandoned.load(Ordering::Acquire) >= MAX_ABANDONED {
+        return Err(format!(
+            "{MAX_ABANDONED} earlier reads are still running"
+        ));
+    }
+    let state = Arc::new(AtomicU8::new(RUNNING));
+    let (send, receive) = mpsc::channel();
+    let worker_state = Arc::clone(&state);
+    std::thread::Builder::new()
+        .name("insights-read".into())
+        .spawn(move || {
+            let answer = work();
+            let _ = send.send(answer);
+            if worker_state
+                .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                abandoned.fetch_sub(1, Ordering::AcqRel);
+            }
+        })
+        .map_err(|error| format!("cannot start the read: {error}"))?;
+    match receive.recv_timeout(wait) {
+        Ok(answer) => Ok(answer),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("the read ended without an answer".into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            abandoned.fetch_add(1, Ordering::AcqRel);
+            if state
+                .compare_exchange(RUNNING, ABANDONED_STATE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(unscanned(
+                    repo,
+                    &format!("the read did not finish within {} ms", wait.as_millis()),
+                ));
+            }
+            // It finished between the timeout and the hand-over: take its answer.
+            abandoned.fetch_sub(1, Ordering::AcqRel);
+            receive
+                .try_recv()
+                .map_err(|_| "the read ended without an answer".to_string())
+        }
+    }
+}
+
+/// An answer that scanned nothing, with the reason for every facet.
+fn unscanned(repo: String, reason: &str) -> AppFacets {
+    AppFacets {
         repo,
-        &live_sessions::observe(),
-        shared(),
-        TTL,
-        APP_BUDGET,
-    ))
+        age_ms: 0,
+        worktrees: None,
+        agents: None,
+        changes: None,
+        collisions: None,
+        deadline_expired: true,
+        not_scanned: ["worktrees", "agents", "changes", "collisions"]
+            .into_iter()
+            .map(|facet| NotScanned {
+                facet: facet.to_string(),
+                reason: reason.to_string(),
+            })
+            .collect(),
+    }
 }
 
 fn serve_with(
@@ -95,7 +224,14 @@ fn serve_with(
     // began within `ttl`, and nothing older. It ends `budget` after the ask.
     let clock = ScanDeadline::after(asked.checked_sub(ttl).unwrap_or(asked), ttl + budget);
     let key = memo_key(repo);
-    let (listing, mut list_age) = memo.listing(&key, repo);
+    let (mut listing, mut list_age) = memo.listing(&key, repo);
+    // The memo keeps a listing longer than an asker is promised. One older than
+    // `ttl` is read again, so a worktree made or removed in the last few
+    // seconds is not missing from a negative answer.
+    if list_age > ttl {
+        memo.forget_listing(&key);
+        (listing, list_age) = memo.listing(&key, repo);
+    }
     let mut read = read_listing(repo, &clock, Some(listing));
     // A failure beside a listing served from memory may be the listing being
     // out of date (a worktree removed in the last few seconds). One listing
@@ -178,6 +314,7 @@ fn serve_with(
         None
     };
     AppFacets {
+        repo: repo.to_string(),
         age_ms: age.as_millis() as u64,
         worktrees,
         agents,
@@ -195,13 +332,16 @@ fn any_unreadable(listed: &Result<Vec<WorktreeInfo>, CommandError>) -> bool {
     })
 }
 
-/// The paths of every worktree the collision facet names as a party.
+/// The paths of every worktree a positive collision names as a party: a file
+/// dirty in two worktrees. A worktree that merely holds two live sessions
+/// (`shared_worktrees`) is not a positive of this kind, and a busy checkout
+/// always has several, so naming it here re-read it on nearly every ask. Its
+/// dirty files are served at the age the reply states.
 fn positive_parties(collisions: &CollisionRisk) -> Vec<String> {
     let mut parties: Vec<String> = collisions
         .items
         .iter()
         .flat_map(|item| item.worktrees.iter().map(|party| party.path.clone()))
-        .chain(collisions.shared_worktrees.iter().map(|w| w.path.clone()))
         .collect();
     parties.sort_unstable();
     parties.dedup();
@@ -244,17 +384,47 @@ pub fn snapshot_from_app(
         ..
     } = facets;
     match (worktrees, agents, changes, collisions) {
-        (Some(worktrees), Some(agents), Some(changes), Some(collisions)) => Ok(complete_snapshot(
-            repo_path,
-            started,
-            GitFacets {
-                worktrees,
-                agents,
-                changes,
-                collisions,
-                deadline_expired,
-            },
-        )),
+        (Some(worktrees), Some(agents), Some(changes), Some(collisions)) => {
+            // The asker's own scan has a longer deadline than the app's read,
+            // so an answer with worktrees unread, failed or cut off is worse
+            // than the scan it would replace.
+            let mut partial = Vec::new();
+            if deadline_expired {
+                partial.push("the read ran out of time".to_string());
+            }
+            if collisions.unscanned_worktrees > 0 {
+                partial.push(format!(
+                    "{} worktree(s) unscanned for collisions",
+                    collisions.unscanned_worktrees
+                ));
+            }
+            if collisions.failed_worktrees > 0 {
+                partial.push(format!(
+                    "{} worktree(s) failed to read",
+                    collisions.failed_worktrees
+                ));
+            }
+            if worktrees.dirty_unknown > 0 {
+                partial.push(format!(
+                    "{} worktree(s) with no dirty count",
+                    worktrees.dirty_unknown
+                ));
+            }
+            if !partial.is_empty() {
+                return Err(format!("the app's answer is partial: {}", partial.join(", ")));
+            }
+            Ok(complete_snapshot(
+                repo_path,
+                started,
+                GitFacets {
+                    worktrees,
+                    agents,
+                    changes,
+                    collisions,
+                    deadline_expired,
+                },
+            ))
+        }
         _ => Err(format!(
             "the app did not scan: {}",
             not_scanned
