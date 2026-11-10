@@ -196,7 +196,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "insights",
     label: "Insights",
     summary:
-      "On-demand measurements of this repository: activity, coverage, dependency health, secrets and disk. A scan that could not run is never shown as clean.",
+      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that could not run is never shown as clean.",
     paletteCommand: "Open Insights — activity, dependencies, coverage, secrets and disk",
     // Scans of one subject: this repository. They were separate header
     // entries, each empty until someone ran it. As sections they share one
@@ -216,19 +216,17 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
           "Line and file coverage from this project's own test commands. Truncation and failures are named, not dressed as 100%.",
         paletteCommand: "Open Coverage",
       },
+      // Secrets was a section of its own. It is a finding about this
+      // repository like the advisories beside it, and alone it had no way to
+      // hand its findings to a coding agent; inside Health it shares the
+      // verdict and the agent bar. A restored "secrets" lands here
+      // (`RETIRED_SECTIONS` in repos/persist.ts).
       {
         id: "health",
         label: "Health",
         summary:
-          "Local audits across ecosystems, Dependabot and code scanning alerts, and dead code from the code graph. A scanner that did not run is listed, not implied clean.",
-        paletteCommand: "Scan npm vulnerabilities and updates",
-      },
-      {
-        id: "secrets",
-        label: "Secrets",
-        summary:
-          "Working-tree secret scan via Kingfisher, located against Git: tracked, untracked, ignored. A partial or truncated scan is listed, never implied clean. No secret values are shown.",
-        paletteCommand: "Scan working tree for secrets",
+          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code graph. A scanner that did not run is listed, not implied clean. No secret values are shown.",
+        paletteCommand: "Scan dependencies and secrets",
       },
       {
         id: "storage",

@@ -94,7 +94,6 @@
   // fresh function each render and remount the view every update.
   const loadCoverageViewer = () => import("./lib/components/CoverageViewer.svelte");
   const loadHealthPanel = () => import("./lib/components/HealthPanel.svelte");
-  const loadSecretsPanel = () => import("./lib/components/SecretsPanel.svelte");
   const loadStoragePanel = () => import("./lib/components/StoragePanel.svelte");
   const loadTerminalPanel = () => import("./lib/components/TerminalPanel.svelte");
   const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
@@ -1249,7 +1248,6 @@
                   loadPulse={loadPulseView}
                   loadCoverage={loadCoverageViewer}
                   loadHealth={loadHealthPanel}
-                  loadSecrets={loadSecretsPanel}
                   loadStorage={loadStoragePanel}
                 />
               {/if}

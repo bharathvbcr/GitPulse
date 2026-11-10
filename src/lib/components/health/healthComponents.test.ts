@@ -75,6 +75,7 @@ describe("GithubAlertsSection — a failed fetch is not a missing CLI", () => {
       requestFailed: false,
       count: { shown, total: shown, atLeast: true },
       noun: "Dependabot alerts",
+      rowCount: shown,
       columns: [{ label: "Severity" }],
       row: (() => {}) as never,
     });

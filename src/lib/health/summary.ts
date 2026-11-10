@@ -37,6 +37,8 @@ import type {
   DepsHealthReport,
 } from "./types";
 import type { CodeintelStatus } from "../codeintel/types";
+import { verdict as secretsVerdict } from "../secrets/summary";
+import type { SecretsReport } from "../secrets/types";
 
 /**
  * How a facet reads, worst last.
@@ -112,6 +114,11 @@ export interface HealthSummaryInput {
   codeScanning: CodeScanningReport | null;
   codegraph: CodeintelStatus | null;
   deadCode: DeadCodeSummaryInput | null;
+  /**
+   * The working-tree secrets scan on screen. Null until one has been shown,
+   * which reads as "not scanned", never as no secrets.
+   */
+  secrets: SecretsReport | null;
 }
 
 /** Advisory severity, as a tone. Shares `normalizeSeverity` with the badges. */
@@ -259,6 +266,47 @@ function githubFacet(
   };
 }
 
+/**
+ * The secrets scan, read through the Secrets section's own verdict so the
+ * chip and the section cannot disagree. Only that verdict's `ok` — a scan
+ * that succeeded, read every input, lost no rows and found nothing — is
+ * clear; a partial, unverified or unavailable scan is unknown, and any
+ * finding is critical: a credential in the working tree is one commit from
+ * history, and rotating it is the fix.
+ */
+function secretsFacet(report: SecretsReport | null): HealthFacet {
+  const id = "secrets";
+  const label = "Secrets";
+  if (!report) {
+    return {
+      id,
+      label,
+      value: "not scanned",
+      tone: "unknown",
+      caveat: "The working tree has not been scanned for secrets yet.",
+    };
+  }
+  const shown = secretsVerdict(report);
+  if (shown.tone === "ok") return { id, label, value: "none", tone: "clear" };
+  if (report.findings_total > 0) {
+    const floor = report.findings_truncated || report.findings_unreadable > 0 || !report.ok;
+    return {
+      id,
+      label,
+      value: `${report.findings_total}${floor ? "+" : ""} found`,
+      tone: "critical",
+      caveat: `${shown.title}. ${shown.detail}`.trim(),
+    };
+  }
+  return {
+    id,
+    label,
+    value: report.ok ? "incomplete" : "unavailable",
+    tone: "unknown",
+    caveat: `${shown.title}. ${shown.detail}`.trim(),
+  };
+}
+
 function issuesFacet(report: DepsHealthReport): HealthFacet {
   const id = "issues";
   const label = "Issues";
@@ -375,12 +423,13 @@ const HEADLINE_PREFIX: Readonly<Record<HealthTone, string>> = Object.freeze({
  * reader cannot be told two different things about one scan.
  */
 export function summarizeHealth(input: HealthSummaryInput): HealthSummary {
-  const { report, dependabot, codeScanning, codegraph, deadCode } = input;
+  const { report, dependabot, codeScanning, codegraph, deadCode, secrets } = input;
 
   const facets: HealthFacet[] = [
     vulnerabilityFacet(report),
     githubFacet("dependabot", "Dependabot", dependabot),
     githubFacet("code-scanning", "Code scanning", codeScanning),
+    secretsFacet(secrets),
     issuesFacet(report),
     outdatedFacet(report),
     deadCodeFacet(codegraph, deadCode),

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable } from "./catalog";
-import { PALETTE_MODES } from "./model";
+import { PALETTE_MODES, rankItems } from "./model";
 import { interfaceStore } from "../stores/interfaceStore";
 import { themeStore } from "../stores/themeStore";
 import { completePrompt, cancelPrompt, promptState } from "../stores/modalStore";
@@ -39,6 +39,18 @@ describe("command catalog and context", () => {
         expect(navigate).toHaveBeenLastCalledWith(view.id, section.id);
       }
     }
+  });
+  it("still finds secrets after the Secrets section folded into Health", async () => {
+    // "Scan working tree for secrets" was the retired section's door. Typing
+    // "secrets" must still land on the pane that scans them, not on nothing.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.some(c => c.id === "insights:secrets")).toBe(false);
+    const sections = rankItems(commands, "secrets").filter(c => c.id.startsWith("insights:"));
+    expect(sections[0]?.id).toBe("insights:health");
+    expect(sections[0]?.label).toBe("Scan dependencies and secrets");
+    await sections[0]?.action();
+    expect(navigate).toHaveBeenLastCalledWith("insights", "health");
   });
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
