@@ -878,7 +878,7 @@
                 {#if proposal.edited_fields.includes(field)}<small>Original suggestion</small><pre>{proposal.original_proposed?.[field]}</pre>{/if}
                 <small>{proposal.edited_fields.includes(field) ? "Edited suggestion" : "Suggestion"}</small>
                 <pre class="suggestion">{proposal.proposed[field]}</pre>
-                {#if editing}<label>Revised {field}<textarea class="gp-field" bind:value={revisionDraft[field]} rows={field === "title" ? 2 : 5} maxlength={field === "title" ? 300 : 65536} disabled={acting || lockedFields.includes(field)}></textarea></label>{/if}
+                {#if editing}<label oninput={(event) => event.stopPropagation()} onchange={(event) => event.stopPropagation()}>Revised {field}<textarea class="gp-field" bind:value={revisionDraft[field]} rows={field === "title" ? 2 : 5} maxlength={field === "title" ? 300 : 65536} disabled={acting || lockedFields.includes(field)}></textarea></label>{/if}
               </div>
             {/each}
           {/if}

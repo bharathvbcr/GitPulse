@@ -390,7 +390,7 @@ describe("an open the repository store will refuse", () => {
     expect(outcome.kind === "failed" && outcome.reason).toMatch(/Too many open repositories \(max 24\)/);
     expect(get(taskTerminalRequests)).toEqual([]);
     expect(openRepo).not.toHaveBeenCalled();
-    await expect(showTaskTerminal(run("a", "/work/a"))).rejects.toThrow(/Could not open a: Too many open repositories/);
+    await expect(showTaskTerminal(run("a", "/work/a"))).rejects.toThrow(/Couldn't open a\. Too many open repositories/);
     findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
     expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toMatchObject({ outcome: "unavailable" });
   });
