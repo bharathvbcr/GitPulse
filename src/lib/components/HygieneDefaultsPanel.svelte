@@ -51,7 +51,7 @@
   </div>
 
   {#if unsaved}
-    <p role="alert" class="text-amber-300">
+    <p role="alert" class="text-warn">
       These defaults could not be saved; they apply only to this visit.
     </p>
   {/if}
@@ -77,7 +77,7 @@
     onchange={(next) => commit({ ...defaults, reviewSharedCaches: next })}
   />
 
-  <div class="rounded-xl border border-border/60 p-3 text-textMuted">
+  <div class="rounded-xl border border-edge p-3 text-textMuted">
     <p class="font-medium text-textSecondary">Which setting reaches which repository</p>
     <ul class="mt-1.5 list-disc space-y-1 pl-4">
       <li>
@@ -90,7 +90,7 @@
       </li>
       <li>
         <strong class="text-textSecondary">The scheduled cleaner below</strong> — every
-        repository under its project roots, including ones not open in GitPulse. It keeps its own
+        repository under its own roots, including ones not open in GitPulse. It keeps its own
         retention because the schedule runs without this window.
       </li>
     </ul>

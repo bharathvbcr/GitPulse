@@ -153,8 +153,8 @@
   });
 </script>
 
-<div class="space-y-2 text-[11px]" data-testid="session-alerts">
-  <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Agent session notifications</h4>
+<div class="space-y-2 text-meta" data-testid="session-alerts">
+  <h4 class="gp-label">Agent session notifications</h4>
   <p class="text-textMuted leading-snug">
     A native banner when an agent running in a terminal tab needs you or finishes. Suppressed while
     you are looking at that session.
@@ -191,7 +191,7 @@
           running. The GitPulse plugin's hooks use it to say <em>why</em> an agent stopped —
           permission, idle, finished — instead of only that it did. A report can raise a banner and
           nothing else.
-          {#if view.status.bridge_path}<br /><span class="font-mono text-[10px]">{view.status.bridge_path}</span>{/if}
+          {#if view.status.bridge_path}<br /><span class="font-mono text-micro">{view.status.bridge_path}</span>{/if}
         {:else}
           Needs a Unix socket, which this platform does not offer.
         {/if}
@@ -239,8 +239,8 @@
     </div>
 
     <div class="flex gap-2">
-      <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={save} disabled={busy}>Save</button>
-      <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Recheck</button>
+      <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={save} disabled={busy}>Save</button>
+      <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={load} disabled={busy}>Recheck</button>
     </div>
   {/if}
   {#if error}
@@ -251,6 +251,6 @@
     </p>
   {/if}
   {#if !draft && (error || $sessionAlertsLoadError)}
-    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Retry</button>
+    <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={load} disabled={busy}>Retry</button>
   {/if}
 </div>

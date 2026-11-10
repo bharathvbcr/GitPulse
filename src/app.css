@@ -49,6 +49,13 @@
   --text-micro--line-height: 1.3;
   --text-meta: 0.6875rem;
   --text-meta--line-height: 1.4;
+
+  /* Type (§6, §11). `--gp-font-ui` / `--gp-font-mono` are inline inputs written
+     by Settings -> Appearance (local family names, already followed by the
+     fallback stack). Unset, these are Tailwind's own default stacks, so a fresh
+     install renders exactly what it did before the setting existed. */
+  --font-sans: var(--gp-font-ui, ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");
+  --font-mono: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
 }
 
 /* Static: these are plain vocabulary, not utilities, so Tailwind must emit them
@@ -1158,6 +1165,18 @@
     --gp-pad: 12px;
     --gp-density: 1;
 
+    /* Settings -> Appearance inputs (ui/appearance/apply.ts writes these inline
+       on <html>). The values here are the shipped look, so unset and default
+       are the same thing; `initial` is the guaranteed-invalid value, which makes
+       the font hooks take their fallback stacks. Only inputs live here: the
+       `--mac-*` outputs computed from them stay in the macOS blocks, where the
+       Reduce Transparency rules can still redeclare them. */
+    --gp-material: 0;
+    --gp-float-blur: 34px;
+    --gp-radius-scale: 1;
+    --gp-font-ui: initial;
+    --gp-font-mono: initial;
+
     --ui-font-scale: 1;
     /* Columns a literal tab advances to. 8 is the CSS initial value, so the
      default renders exactly what it rendered before the setting existed;
@@ -1210,6 +1229,17 @@
     --gp-header-h: 36px;
     --gp-pad: 16px;
     --gp-density: 1.15;
+  }
+
+  /* Corner style (§5, §11). Stamped only when the scale is not 1, so the shipped
+     radii above stay the single declaration of the ladder. `full` (pills) and
+     `pane` (the window-concentric card) are not scaled. */
+  html[data-radius-scale] {
+    --gp-r-xs: calc(4px * var(--gp-radius-scale, 1));
+    --gp-r-sm: calc(8px * var(--gp-radius-scale, 1));
+    --gp-r-md: calc(12px * var(--gp-radius-scale, 1));
+    --gp-r-lg: calc(16px * var(--gp-radius-scale, 1));
+    --gp-r-xl: calc(20px * var(--gp-radius-scale, 1));
   }
 }
 
@@ -1382,7 +1412,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 html.macos,
 html.macos body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-family: var(--gp-font-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif);
 }
 
 html.macos ::-webkit-scrollbar {
@@ -1428,15 +1458,21 @@ html.macos {
      these alphas lift that ground to roughly 3:1 against --c-text-muted, which
      fails AA. Chroma at the same luminance reads as more glass, not less. */
 
-  --mac-glass-fill: rgb(var(--c-surface) / 0.4);
+  /* `--gp-material` is the Settings → Appearance "material intensity" input
+     (0 = the alphas below, 1 = opaque). Only the input is ever written inline;
+     these OUTPUTS stay declared here, so the Reduce Transparency blocks that
+     redeclare them as opaque colours keep winning over a user setting. */
+  --mac-glass-fill: rgb(var(--c-surface) / calc(0.4 + 0.6 * var(--gp-material, 0)));
   /* The workspace plate. Denser than the chrome because dense text sits
      directly on it, thinner than opaque so the field carries under it. */
-  --mac-plate-fill: rgb(var(--c-bg) / 0.46);
+  --mac-plate-fill: rgb(var(--c-bg) / calc(0.46 + 0.54 * var(--gp-material, 0)));
   --mac-glass-edge: rgb(255 255 255 / 0.14);
   --mac-glass-sheen: rgb(255 255 255 / 0.05);
   --mac-glass-shade: rgb(0 0 0 / 0.22);
   --mac-glass-tint: rgb(var(--c-accent) / 0.07);
-  --mac-glass-blur-float: 34px;
+  /* `--gp-float-blur` is the Settings input; 0 also stamps
+     `html[data-float-blur="off"]`, because `blur(0)` is not `none`. */
+  --mac-glass-blur-float: var(--gp-float-blur, 34px);
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
   /* An inset area inside a panel -- a diff preview, a code block, an
@@ -1467,8 +1503,8 @@ html.macos.light {
   --mac-hue-c: 168 136 252;
   --mac-hue-d: 240 122 186;
   --mac-hue-gain: 0.5;
-  --mac-glass-fill: rgb(255 255 255 / 0.58);
-  --mac-plate-fill: rgb(255 255 255 / 0.6);
+  --mac-glass-fill: rgb(255 255 255 / calc(0.58 + 0.42 * var(--gp-material, 0)));
+  --mac-plate-fill: rgb(255 255 255 / calc(0.6 + 0.4 * var(--gp-material, 0)));
   --mac-glass-edge: rgb(var(--c-border) / 0.24);
   --mac-glass-sheen: rgb(255 255 255 / 0.7);
   --mac-glass-shade: rgb(38 46 76 / 0.07);
@@ -1569,6 +1605,13 @@ html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
     -webkit-backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
     backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
   }
+
+  /* Float blur 0 in Settings -> Appearance. `none`, not `blur(0)`: a var inside
+     `blur()` cannot produce `none`, and `blur(0)` still makes a backdrop root. */
+  html.macos[data-float-blur="off"] :is(.gp-menu, [class~="shadow-float"], [class~="shadow-pop"]) {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
 }
 
 /* One blur per dialog, not two.
@@ -1607,12 +1650,12 @@ html.macos .gp-scrim {
  * Depth does the work that a single global alpha cannot.
  */
 html.macos {
-  --mac-fill-bg: rgb(var(--c-bg) / 0.42);
-  --mac-fill-surface: rgb(var(--c-surface) / 0.5);
+  --mac-fill-bg: rgb(var(--c-bg) / calc(0.42 + 0.58 * var(--gp-material, 0)));
+  --mac-fill-surface: rgb(var(--c-surface) / calc(0.5 + 0.5 * var(--gp-material, 0)));
   /* Hover and selection have to survive being translucent: they are a
      DIFFERENCE against whatever they sit on, and thinning both sides equally
      erases the difference. This one stays dense on purpose. */
-  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.78);
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / calc(0.78 + 0.22 * var(--gp-material, 0)));
 
   /*
    * The graph canvas, which is the one surface CSS cannot make translucent on
@@ -1630,9 +1673,9 @@ html.macos {
 }
 
 html.macos.light {
-  --mac-fill-bg: rgb(var(--c-bg) / 0.52);
-  --mac-fill-surface: rgb(var(--c-surface) / 0.6);
-  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.82);
+  --mac-fill-bg: rgb(var(--c-bg) / calc(0.52 + 0.48 * var(--gp-material, 0)));
+  --mac-fill-surface: rgb(var(--c-surface) / calc(0.6 + 0.4 * var(--gp-material, 0)));
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / calc(0.82 + 0.18 * var(--gp-material, 0)));
 }
 
 html.macos :where([class~="bg-background"], .gp-field, .gp-field-multi, .gp-select) {
@@ -2354,7 +2397,7 @@ html.light .gp-markdown {
   margin-bottom: 0;
 }
 .gp-markdown :is(code, pre, kbd, samp) {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
   font-size: 0.88em;
 }
 .gp-markdown :not(pre) > code {
@@ -2474,7 +2517,7 @@ html.light .gp-markdown {
   font-size: 0.9em;
 }
 .gp-markdown .math-source {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
   font-size: 0.9em;
   color: rgb(var(--c-text-muted));
 }
@@ -2583,7 +2626,7 @@ html.light .gp-markdown {
 }
 .gp-md-frontmatter dt {
   color: rgb(var(--c-text-muted));
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
 }
 .gp-md-frontmatter dd {
   margin: 0;

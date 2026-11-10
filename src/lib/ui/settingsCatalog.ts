@@ -10,7 +10,7 @@ import {
  * definition, and so the check is made once here instead of as a platform
  * conditional scattered through the modal's markup.
  */
-export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos";
+export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos" | "nativeMaterial";
 
 export interface SettingEntry {
   readonly id: string;
@@ -84,16 +84,76 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "dark light system appearance colour color scheme night mode",
   },
   {
+    id: "theme-file",
+    section: "appearance",
+    label: "Theme file",
+    keywords:
+      "theme import export file json custom share gitpulse-theme load save palette colors base contrast",
+  },
+  {
     id: "accent",
     section: "appearance",
-    label: "Accent colour",
-    keywords: "accent color highlight tint blue violet teal green amber rose brand",
+    label: "Accent color",
+    keywords: "accent colour color highlight tint blue violet teal green amber rose brand custom hex picker contrast",
   },
   {
     id: "ui-scale",
     section: "appearance",
-    label: "UI font scale",
-    keywords: "zoom size text bigger smaller scale font magnify",
+    label: "Text size",
+    keywords: "zoom size text bigger smaller scale font magnify ui font scale",
+  },
+  {
+    id: "font-ui",
+    section: "appearance",
+    label: "Interface font",
+    keywords: "font family typeface type text ui interface sans local installed system",
+  },
+  {
+    id: "font-mono",
+    section: "appearance",
+    label: "Code font",
+    keywords: "font family typeface monospace code mono terminal diff editor local installed ligatures",
+  },
+  {
+    id: "corner-style",
+    section: "appearance",
+    label: "Corner style",
+    keywords: "corners radius rounded sharp soft round shape squircle pill",
+  },
+  {
+    id: "material-intensity",
+    section: "appearance",
+    label: "Material intensity",
+    keywords: "glass material translucent transparency opacity opaque thickness liquid plate vibrancy see through",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "float-blur",
+    section: "appearance",
+    label: "Float blur",
+    keywords: "blur menus popovers dialogs backdrop glass frosted radius background blur performance",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "background-field",
+    section: "appearance",
+    label: "Background field",
+    keywords: "background field hue color glow gradient blobs wallpaper tint vivid subtle off rotate",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "transparency",
+    section: "appearance",
+    label: "Transparency",
+    keywords: "reduce transparency opaque translucent glass accessibility solid auto system",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "density",
+    section: "appearance",
+    label: "Density",
+    keywords:
+      "density compact comfortable spacious rows spacing padding branch spacing lanes height graph tight airy",
   },
   {
     id: "motion",
@@ -205,7 +265,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   {
     id: "harness-badges",
     section: "layout",
-    label: "MANVI status badges",
+    label: "Manvi status badges",
     keywords: "manvi harness local model chips toolbar agents",
   },
   {
@@ -213,12 +273,6 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "views",
     label: "Views in the header",
     keywords: "tabs nav navigation hide show work history files health insights fleet",
-  },
-  {
-    id: "branch-spacing",
-    section: "graph",
-    label: "Branch spacing",
-    keywords: "density compact spacious lanes rows height",
   },
   {
     id: "graph-width",

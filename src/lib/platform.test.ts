@@ -114,7 +114,16 @@ describe("host OS identity", () => {
       // Even on macOS: the webview cannot know whether the code compiled in.
       expect(fallback.dock_hiding).toBe(false);
       expect(fallback.browser_sessions).toBe(false);
+      expect(fallback.native_material).toBe(false);
     });
+  });
+
+  it.each([
+    ["no field (an older backend)", { os: "macos" }],
+    ["a truthy non-boolean", { os: "macos", native_material: "yes" }],
+    ["a numeric flag", { os: "macos", native_material: 1 }],
+  ])("reads native_material as false for %s", (_label, value) => {
+    expect(parseHostPlatform(value).native_material).toBe(false);
   });
 
   it("recognises exactly the four host names", () => {
@@ -126,15 +135,21 @@ describe("host OS identity", () => {
 
 describe("host platform envelope", () => {
   it("reads the backend's snake_case capability fields", () => {
-    expect(parseHostPlatform({ os: "windows", dock_hiding: false, browser_sessions: false })).toEqual({
+    expect(
+      parseHostPlatform({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false }),
+    ).toEqual({
       os: "windows",
       dock_hiding: false,
       browser_sessions: false,
+      native_material: false,
     });
-    expect(parseHostPlatform({ os: "macos", dock_hiding: true, browser_sessions: true })).toEqual({
+    expect(
+      parseHostPlatform({ os: "macos", dock_hiding: true, browser_sessions: true, native_material: true }),
+    ).toEqual({
       os: "macos",
       dock_hiding: true,
       browser_sessions: true,
+      native_material: true,
     });
   });
 

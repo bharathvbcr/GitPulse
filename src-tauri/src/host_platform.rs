@@ -30,6 +30,12 @@ pub struct HostPlatform {
     /// dock) are compiled in. See [`crate::browser::SUPPORTED`]: the native
     /// hosting exists only on macOS so far.
     pub browser_sessions: bool,
+    /// Whether the window is drawn on a native translucent material (macOS
+    /// `NSVisualEffectView`) that the `html.macos` glass tokens sit on. See
+    /// [`crate::desktop::NATIVE_MATERIAL`]. Windows and Linux paint an opaque
+    /// window, so material intensity, float blur, the background field and
+    /// the transparency preference would be dead knobs there.
+    pub native_material: bool,
 }
 
 impl HostPlatform {
@@ -38,6 +44,7 @@ impl HostPlatform {
             os: std::env::consts::OS,
             dock_hiding: crate::desktop::DOCK_HIDING,
             browser_sessions: crate::browser::SUPPORTED,
+            native_material: crate::desktop::NATIVE_MATERIAL,
         }
     }
 }
@@ -84,6 +91,16 @@ mod tests {
         );
     }
 
+    /// The material settings are offered exactly where the translucent window
+    /// material is compiled in.
+    #[test]
+    fn native_material_tracks_the_macos_window_material() {
+        assert_eq!(
+            HostPlatform::detect().native_material,
+            cfg!(target_os = "macos")
+        );
+    }
+
     /// The wire shape the frontend parses. Renaming a field silently turns the
     /// gate it feeds into `undefined`, which is falsy — a feature would vanish
     /// on every platform rather than fail loudly.
@@ -100,6 +117,10 @@ mod tests {
             object.contains_key("browser_sessions"),
             "missing browser_sessions: {json}"
         );
-        assert_eq!(object.len(), 3, "unexpected extra fields: {json}");
+        assert!(
+            object.contains_key("native_material"),
+            "missing native_material: {json}"
+        );
+        assert_eq!(object.len(), 4, "unexpected extra fields: {json}");
     }
 }

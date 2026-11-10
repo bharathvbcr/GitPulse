@@ -26,6 +26,18 @@ import {
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
 import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
+import {
+  APPEARANCE_DEFAULTS,
+  FLOAT_BLUR_MAX,
+  installAppearance,
+  sanitizeAppearance,
+  type AppearancePrefs,
+  type FieldLevel,
+} from "../ui/appearance/apply";
+import { densityFromLegacy, type Density } from "../ui/appearance/density";
+import type { GitPulseTheme } from "../ui/appearance/themeSchema";
+import { themeStore } from "./themeStore";
+import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
 import {
   DEFAULT_TAB_WIDTH,
@@ -68,7 +80,7 @@ import type { CodePercentageMode } from "../language/barStats";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
-export interface InterfacePrefs {
+export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Which accent tint the window wears. Applied as an inline `--c-accent`
    * override on `<html>`; see ui/accents.ts for why it is a per-theme pair
@@ -352,6 +364,7 @@ export interface InterfacePrefs {
 const STORAGE_KEY = "gitpulse_interface_prefs";
 
 const DEFAULTS: InterfacePrefs = {
+  ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
   reduceMotion: false,
   timestampStyle: "relative",
@@ -469,13 +482,30 @@ function columnKeys(value: unknown, fallback: string[]): string[] {
   return [...seen];
 }
 
+const LEGACY_DENSITY_KEY = "gitpulse_density_mode";
+
+function readLegacyDensity(): Density {
+  try {
+    return densityFromLegacy(window.localStorage.getItem(LEGACY_DENSITY_KEY));
+  } catch {
+    return densityFromLegacy(null);
+  }
+}
+
 function readPrefs(): InterfacePrefs {
   if (typeof window === "undefined" || !window.localStorage) return freshDefaults();
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return freshDefaults();
+    // No stored preferences yet: a reader who only ever changed the old
+    // density setting still has it under its own key.
+    if (!raw) return { ...freshDefaults(), density: readLegacyDensity() };
     const parsed = JSON.parse(raw) as Partial<InterfacePrefs> & { fleetOpen?: unknown };
     return {
+      ...sanitizeAppearance({
+        ...parsed,
+        // Before the density merge the preference lived under its own key.
+        density: parsed.density ?? readLegacyDensity(),
+      }),
       accent: isAccentId(parsed.accent) ? parsed.accent : DEFAULTS.accent,
       reduceMotion: bool(parsed.reduceMotion, DEFAULTS.reduceMotion),
       timestampStyle: isTimestampStyle(parsed.timestampStyle)
@@ -670,7 +700,24 @@ function createInterfaceStore() {
     subscribe,
     /** Saves a pending change now; the page-hide handler does the same. */
     flush: () => pendingSave.flush(),
-    setAccent: (accent: AccentId) => patch({ accent }),
+    setAccent: (accent: AccentId) => patch({ accent, customAccent: "" }),
+    /** A custom accent (`#rrggbb`); the contrast guard decides what it becomes. `""` returns to the preset. */
+    setCustomAccent: (hex: string) => patch({ customAccent: hex }),
+    setFontUi: (family: string) => patch({ fontUi: family }),
+    setFontMono: (family: string) => patch({ fontMono: family }),
+    setDensity: (density: Density) => patch({ density }),
+    setRadiusScale: (scale: number) => patch({ radiusScale: scale }),
+    setMaterialIntensity: (intensity: number) => patch({ materialIntensity: intensity }),
+    setFloatBlur: (px: number) => patch({ floatBlur: Math.round(Math.min(FLOAT_BLUR_MAX, Math.max(0, px))) }),
+    setFieldLevel: (level: FieldLevel) => patch({ fieldLevel: level }),
+    setFieldHue: (degrees: number) => patch({ fieldHue: degrees }),
+    setReduceTransparency: (reduce: boolean) => patch({ reduceTransparency: reduce }),
+    setCustomTheme: (theme: GitPulseTheme | null) => patch({ customTheme: theme }),
+    /** Applies several appearance fields at once (an imported theme), as one save. */
+    patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
+    /** Puts every Appearance preference back without touching the rest. */
+    resetAppearance: () =>
+      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),
     setBranchRowLayout: (layout: BranchRowLayout) => patch({ branchRowLayout: layout }),
@@ -852,3 +899,8 @@ function createInterfaceStore() {
 }
 
 export const interfaceStore = createInterfaceStore();
+
+// The document follows the preferences from here on, whichever window or test
+// harness imported the store first; there is one subscription and it lives as
+// long as the page. It is a no-op without a document.
+installAppearance({ prefs: interfaceStore, theme: themeStore, platform: hostPlatform });

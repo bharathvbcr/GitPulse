@@ -146,6 +146,18 @@ describe("host-gated settings", () => {
     expect(unsupported.has("apple-intelligence")).toBe(true);
   });
 
+  it("gates the glass material settings by capability, not by OS name", () => {
+    expect(REQUIREMENTS).toContain("nativeMaterial");
+    const unsupported = unsupportedSettingIds({ dockHiding: true, appleIntelligence: true, macos: true, nativeMaterial: false });
+    for (const id of ["material-intensity", "float-blur", "background-field", "transparency"]) {
+      expect(unsupported.has(id)).toBe(true);
+    }
+    // Everything else in Appearance is portable CSS and stays.
+    for (const id of ["theme", "accent", "density", "corner-style", "font-ui", "font-mono", "theme-file"]) {
+      expect(unsupported.has(id)).toBe(false);
+    }
+  });
+
   it("never gates a setting that works on every host", () => {
     const unsupported = unsupportedSettingIds(capabilities(false));
     // A portable setting caught by the gate would vanish from a host that can
@@ -157,7 +169,7 @@ describe("host-gated settings", () => {
 });
 
 describe("search on a host missing a capability", () => {
-  const WITHOUT_DOCK = unsupportedSettingIds({ dockHiding: false, appleIntelligence: true, macos: true });
+  const WITHOUT_DOCK = unsupportedSettingIds({ dockHiding: false, appleIntelligence: true, macos: true, nativeMaterial: true });
 
   it("omits the unsupported control from an unfiltered listing", () => {
     const listed = matchSettings("", WITHOUT_DOCK);
@@ -182,7 +194,7 @@ describe("search on a host missing a capability", () => {
   it("still finds the control on a host that supports it", () => {
     const result = matchSettings(
       "dock accessory",
-      unsupportedSettingIds({ dockHiding: true, appleIntelligence: true, macos: true }),
+      unsupportedSettingIds({ dockHiding: true, appleIntelligence: true, macos: true, nativeMaterial: true }),
     );
     expect(result.settings).toContain("hide-dock");
     expect(result.sections).toContain("layout");

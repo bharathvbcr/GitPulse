@@ -61,8 +61,8 @@
 </script>
 
 <section class="gp-card p-4 space-y-2">
-  <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Manvi's model</h3>
-  <div class="flex flex-wrap gap-3 text-[11px]">
+  <h3 class="gp-label">Manvi's model</h3>
+  <div class="flex flex-wrap gap-3 text-meta">
     <label class="inline-flex items-center gap-1">
       <input
         type="radio"
@@ -86,7 +86,7 @@
   </div>
 
   {#if choice}
-    <label class="flex items-center gap-2 text-[11px]">
+    <label class="flex items-center gap-2 text-meta">
       <span class="text-textMuted">Model</span>
       <select
         class="bg-background border border-border rounded px-1.5 py-0.5"
@@ -99,13 +99,13 @@
         {/each}
       </select>
     </label>
-    <p class="text-[11px] text-textMuted">
+    <p class="text-meta text-textMuted">
       Task suggestions and Manvi's own model calls are billed to this key. Claude Code agents Manvi
       launches keep their own login. Manvi keeps the key from every program it starts.
     </p>
   {/if}
 
-  <div class="space-y-1 text-[11px]">
+  <div class="space-y-1 text-meta">
     {#if keySaved === null}
       <span class="text-textMuted">Checking the Keychain…</span>
     {:else if keySaved}
@@ -120,7 +120,7 @@
         </button>
       </div>
     {:else if choice}
-      <span class="text-amber-400">No Claude API key saved: Manvi cannot run until you add one.</span>
+      <span class="text-warn">No Claude API key saved: Manvi cannot run until you add one.</span>
     {/if}
     <form
       class="flex items-center gap-2"
@@ -147,7 +147,7 @@
       </button>
     </form>
     {#if error}
-      <p class="text-red-400">{error}</p>
+      <p class="text-danger">{error}</p>
     {/if}
   </div>
 </section>
