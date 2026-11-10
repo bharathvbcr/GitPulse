@@ -168,11 +168,13 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // into one row each — the GitHub and MANVI views were rendering halves of
   // the same answer beside it, down to issuing the same `cmd_github_context`
   // call twice. Resolve is not a destination either: it is what a blocked
-  // row opens into, and Work already sorts blocked rows first.
+  // row opens into, and Work already sorts blocked rows first. It later
+  // folded into Policy, which leads with the conflict editor while a merge
+  // or rebase is parked.
   github: { tab: "work", section: "remote" },
   manvi: { tab: "work", section: "policy" },
   stack: { tab: "work" },
-  conflict: { tab: "work", section: "resolve" },
+  conflict: { tab: "work", section: "policy" },
   // Files and Blame are two readings of one file. Both keyed off
   // `selectedFilePath`, and Blame had grown its own explorer rail and its own
   // path box so a user would not have to walk back to Files for the file they

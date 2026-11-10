@@ -176,7 +176,7 @@
    *
    * This is what makes the screen a workspace rather than a report: the whole
    * point of showing that a worktree is stuck mid-rebase is being one click
-   * from the Resolve view that unsticks it. Rows with several worktrees open
+   * from the conflict editor in Policy that unsticks it. Rows with several worktrees open
    * the first — the one the row is keyed on in worktree mode.
    */
   async function openWorktree(row: WorkRow): Promise<void> {
@@ -190,7 +190,7 @@
     try {
       const opened = await repoStore.openRepo(path, {
         onReady: () => {
-          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) repoStore.setActiveTab("work", "resolve");
+          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) repoStore.setActiveTab("work", "policy");
           else reviewChanges();
         },
       });
@@ -351,8 +351,8 @@
         </div>
         <div class="flex flex-wrap items-center gap-2">
           {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
-            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "resolve")}>
-              <GitMerge size={13} /> Open Resolve
+            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "policy")}>
+              <GitMerge size={13} /> Resolve conflicts
             </button>
           {:else if here && here.staged + here.unstaged > 0}
             <button type="button" class="gp-btn-primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
@@ -420,8 +420,8 @@
             <button
               type="button"
               class="text-rose-600 dark:text-rose-400 hover:underline"
-              onclick={() => repoStore.setActiveTab("work", "resolve")}
-              title="Open Resolve"
+              onclick={() => repoStore.setActiveTab("work", "policy")}
+              title="Open the conflicts in Policy"
             >
               {here.conflicted} conflicted
             </button>
@@ -447,8 +447,8 @@
         <button
           type="button"
           class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
-          onclick={() => repoStore.setActiveTab("work", "resolve")}
-          title="Open Resolve to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
+          onclick={() => repoStore.setActiveTab("work", "policy")}
+          title="Open Policy to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
           <GitMerge size={12} class="mt-px shrink-0" />
           <span class="min-w-0">{headline($repoStore.operation.operation)}</span>

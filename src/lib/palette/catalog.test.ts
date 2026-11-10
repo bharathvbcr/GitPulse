@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable } from "./catalog";
-import { PALETTE_MODES } from "./model";
+import { PALETTE_MODES, rankItems } from "./model";
 import { interfaceStore } from "../stores/interfaceStore";
 import { themeStore } from "../stores/themeStore";
 import { completePrompt, cancelPrompt, promptState } from "../stores/modalStore";
@@ -40,6 +40,20 @@ describe("command catalog and context", () => {
       }
     }
   });
+  it("keeps a door to the conflicts now that Resolve lives in Policy", async () => {
+    // Resolve had its own command. Folding it into Policy must not leave a
+    // reader typing "resolve" or "conflicts" with nothing that lands there.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.some(command => command.id === "work:resolve")).toBe(false);
+    for (const query of ["resolve", "resolve conflicts", "conflicts", "policy"]) {
+      const top = rankItems(commands.filter(command => command.category === "Views"), query)[0];
+      expect(top?.id, query).toBe("work:policy");
+    }
+    await commands.find(command => command.id === "work:policy")?.action();
+    expect(navigate).toHaveBeenLastCalledWith("work", "policy");
+  });
+
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
     const commands = buildCommands(ready(), () => {});
@@ -73,7 +87,7 @@ describe("command catalog and context", () => {
     expect(repoUnavailable(snapshot({ currentPath: "/repo", isLoading: true }))).toContain("loading");
     expect(worktreeUnavailable({ ...ready(), isBare: true })).toContain("bare repository");
     expect(worktreeUnavailable({ ...ready(), operation: { operation: null, probeFailed: true } })).toContain("unavailable");
-    expect(worktreeUnavailable({ ...ready(), operation: { probeFailed: false, operation: { kind: "Merge", current_step: null, total_steps: null, head_ref: null, incoming_ref: null, conflicted_paths: [], conflicted_total: 0, available: [] } } })).toContain("Resolve");
+    expect(worktreeUnavailable({ ...ready(), operation: { probeFailed: false, operation: { kind: "Merge", current_step: null, total_steps: null, head_ref: null, incoming_ref: null, conflicted_paths: [], conflicted_total: 0, available: [] } } })).toContain("Work → Policy");
     expect(worktreeUnavailable({ ...ready(), statuses: [{ path: "a", status_code: "UU", is_staged: false, is_conflicted: true, additions: 0, deletions: 0 }] })).toContain("conflicted");
   });
   it("does not silently offer stash or commit operations on an empty tree", () => {

@@ -7,9 +7,11 @@ import {
   describeDestination,
   isSectionOnScreen,
   resolveSection,
+  retiredSectionFor,
+  RETIRED_SECTIONS,
   sectionsFor,
 } from "./viewRegistry";
-import { RETIRED_VIEWS, isViewTab } from "../repos/persist";
+import { RETIRED_VIEWS, isViewTab, type ViewTab } from "../repos/persist";
 import { WIP_DESTINATIONS, WIP_REASON_KINDS } from "../repos/wipSummary";
 
 describe("view sections", () => {
@@ -55,6 +57,26 @@ describe("view sections", () => {
     expect(resolveSection("history", 42)).toBe("graph");
     expect(resolveSection("history", null)).toBe("graph");
     expect(activeSectionFor("history", { history: "nonsense" })).toBe("graph");
+  });
+
+  it("lands a section folded into another where its content went, not on the default", () => {
+    // Resolve folded into Policy. A saved selection, a native menu build or a
+    // caller that still names it must open the conflicts, not Overview.
+    expect(sectionsFor("work").map((s) => s.id)).not.toContain("resolve");
+    expect(resolveSection("work", "resolve")).toBe("policy");
+    expect(activeSectionFor("work", { work: "resolve" })).toBe("policy");
+    // Scoped to its view: the same id elsewhere is just unknown.
+    expect(resolveSection("history", "resolve")).toBe("graph");
+    // Every alias points at a live section of its own view, and none shadows one.
+    for (const [view, aliases] of Object.entries(RETIRED_SECTIONS)) {
+      const ids = sectionsFor(view as ViewTab).map((s) => s.id);
+      for (const [retired, target] of Object.entries(aliases ?? {})) {
+        expect(ids, `${view}:${retired} is still a live section`).not.toContain(retired);
+        expect(ids, `${view}:${retired} retires to a missing section`).toContain(target);
+        expect(retiredSectionFor(view as ViewTab, retired)).toBe(target);
+      }
+    }
+    expect(retiredSectionFor("work", "__proto__")).toBeNull();
   });
 
   it("keeps a remembered section", () => {
@@ -136,7 +158,7 @@ describe("view sections", () => {
   it("names a destination the way the header and section bar spell it", () => {
     // The name travels into tooltips that promise where a click will land, so
     // it is read out of the registry rather than written at the call site.
-    expect(describeDestination("work", "resolve")).toBe("Work → Resolve");
+    expect(describeDestination("work", "policy")).toBe("Work → Policy");
     expect(describeDestination("history", "diff")).toBe("History → Diff");
     // No section, or one this build dropped: the view's own name, never an
     // arrow pointing at a pane that is not there.

@@ -22,6 +22,8 @@ import {themeStore} from "../src/lib/stores/themeStore";
 import {repoStore} from "../src/lib/stores/repoStore";
 import {conflictSessions} from "../src/lib/diff/conflictSession";
 import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
+import PolicyPane from "../src/lib/components/PolicyPane.svelte";
+import PolicyManviStub from "./PolicyManviStub.svelte";
 const params = new URLSearchParams(location.search);
 if(params.has("check"))conflictSessions.clear();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
@@ -106,6 +108,30 @@ let editor=mount(ConflictEditor,{target:root});
 await waitFor(()=>root.querySelectorAll("textarea").length===2);
 if(params.has("check")){
  try{
+  // Work → Policy with conflicts: the editor keeps the full pane height it had
+  // as its own section, and MANVI follows below it in one scroller. The host
+  // fills #app the way the view pane does, so the real height chain is tested.
+  await unmount(editor);
+  const host=document.createElement("div");host.style.cssText="flex:1;min-height:0;display:flex;flex-direction:column";root.replaceChildren(host);
+  const policy=mount(PolicyPane,{target:host,props:{loadConflict:()=>Promise.resolve({default:ConflictEditor}),loadManvi:()=>Promise.resolve({default:PolicyManviStub})}});
+  await waitFor(()=>host.querySelectorAll("textarea").length===2&&host.querySelector("[data-testid='manvi-stub']"));
+  const scroller=host.querySelector("[data-policy-layout='with-conflicts']"), page=host.querySelector(".resolve-page"), manvi=host.querySelector("[data-testid='manvi-stub']");
+  check("policy leads with the conflict editor at full pane height, MANVI below",scroller&&Math.abs(page.getBoundingClientRect().height-scroller.clientHeight)<=2&&manvi.getBoundingClientRect().top>=page.getBoundingClientRect().bottom-1);
+  scroller.scrollTop=scroller.scrollHeight;await settle();
+  check("policy scrolls as one pane down to MANVI",scroller.scrollTop>0&&manvi.getBoundingClientRect().top<host.getBoundingClientRect().bottom);
+  // The merge finishes under the reader (an agent's doing): the editor goes,
+  // the opened file's draft is kept as a row, and MANVI is the same node.
+  const parkedFiles=files, operation=fixture.cmd_repo_operation;
+  files=[];fixture.cmd_repo_operation=()=>null;await repoStore.refresh();
+  await waitFor(()=>!host.querySelector(".resolve-page"));
+  check("a finished merge leaves policy without remounting MANVI",host.querySelector("[data-testid='manvi-stub']")===manvi&&host.querySelector("[data-policy-layout='policy']"));
+  check("drafts kept from the finished merge get a row, not the pane",host.querySelector("[data-testid='policy-retained-drafts']")&&!host.querySelector("[data-policy-layout='with-conflicts']"));
+  [...host.querySelectorAll("button")].find(b=>b.textContent.trim()==="Review drafts").click();
+  await waitFor(()=>host.querySelector(".resolve-page"));
+  check("reviewing drafts opens the editor above the same MANVI",host.querySelector("[data-testid='manvi-stub']")===manvi&&host.querySelector(".recovery-panel"));
+  files=parkedFiles;fixture.cmd_repo_operation=operation;await repoStore.refresh();await settle();
+  await unmount(policy);root.replaceChildren();
+  editor=mount(ConflictEditor,{target:root});await waitFor(()=>root.querySelectorAll("textarea").length===2);
   check("initial choices are unresolved and save is disabled",button("Save & stage file").disabled);
   check("two conflicts are grouped and ancestor is available",root.querySelectorAll(".conflict-block").length===2&&root.textContent.includes("Common ancestor"));
   await click("Accept Ours");

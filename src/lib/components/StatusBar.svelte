@@ -176,7 +176,7 @@
     {#if operationMarker}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("work", "resolve")}
+        onclick={() => repoStore.setActiveTab("work", "policy")}
         class="inline-flex items-center gap-1 px-1.5 py-0.2 rounded border font-medium transition-colors {operationState.probeFailed
           ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
           : 'border-accent/50 bg-accent/10 text-accent hover:bg-accent/20'}"
@@ -243,7 +243,7 @@
     {#if conflictedCount > 0}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("work", "resolve")}
+        onclick={() => repoStore.setActiveTab("work", "policy")}
         class="inline-flex items-center gap-1 font-semibold text-rose-600 dark:text-rose-400 hover:brightness-110 transition-colors animate-pulse"
         title="{conflictedCount} unresolved conflict{conflictedCount === 1 ? '' : 's'}"
       >

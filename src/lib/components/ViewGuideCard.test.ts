@@ -36,7 +36,7 @@ describe("ViewGuideArt", () => {
     expect(art).toContain('view === "code"');
     expect(art).toContain('view === "history"');
     expect(art).toContain('view === "insights"');
-    expect(art).toContain('section === "resolve"');
+    expect(art).toContain('section === "policy"');
     expect(art).toContain('section === "blame"');
     expect(art).toContain('section === "map"');
     expect(art).toContain('section === "diff"');

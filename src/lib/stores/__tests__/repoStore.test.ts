@@ -4140,7 +4140,7 @@ describe("Overview repository-open destinations", () => {
     await store.openRepo("/alias", options);
     expect(ready).toHaveBeenCalledWith("/real");
     expect(get(store).activeTab).toBe("work");
-    expect(get(store).viewSections.work).toBe("resolve");
+    expect(get(store).viewSections.work).toBe("policy");
     for (const tab of get(store).openTabs) await store.closeTab(tab.id);
   });
 

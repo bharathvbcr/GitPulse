@@ -5,7 +5,7 @@ import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
 import { askText } from "../stores/modalStore";
 import { promptQuickCommit } from "../commit/quickCommit";
-import { VIEW_REGISTRY } from "../views/viewRegistry";
+import { VIEW_REGISTRY, describeDestination } from "../views/viewRegistry";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
 import { LAUNCHERS } from "../terminal/tabs";
@@ -22,7 +22,7 @@ export function repoUnavailable(state: RepoState): string | undefined {
 export function worktreeUnavailable(state: RepoState): string | undefined {
   return repoUnavailable(state) ?? (state.isBare ? "This bare repository has no working tree." :
     state.operation.probeFailed ? "Operation status is unavailable. Refresh the repository first." :
-    state.operation.operation ? "Finish the current Git operation in Work → Resolve first." :
+    state.operation.operation ? `Finish the current Git operation in ${describeDestination("work", "policy")} first.` :
     state.statuses.some(file => file.is_conflicted) ? "Resolve conflicted files first." : undefined);
 }
 

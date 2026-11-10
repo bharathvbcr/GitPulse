@@ -1055,7 +1055,7 @@
                     Unchecking a view removes it from the header only. It stays reachable from
                     the command palette ({shortcutTextLabel("⌘K", $hostPlatform.os)}) and the View menu, the view you are currently in
                     always shows, and Work reappears on its own while conflicts are
-                    unresolved — that is where Resolve lives.
+                    unresolved — its Policy section is where they are resolved.
                   </p>
 
                   <!-- One flat list: the header is four tabs, so grouping

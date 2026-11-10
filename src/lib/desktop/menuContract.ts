@@ -66,7 +66,7 @@ export const MENU_WATCH_STATUSES = ["unknown", "watching", "degraded"] as const;
 export const TRAY_SUMMARY_IDS = [
   "open",
   "refresh",
-  "section:work:resolve",
+  "section:work:policy",
   "section:work:overview",
   "section:history:graph",
 ] as const;

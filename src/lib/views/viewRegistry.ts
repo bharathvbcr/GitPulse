@@ -76,20 +76,17 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // a blocked row opens into, and Work already sorts blocked rows first.
     // Stack joined Overview as a collapsible card: branch chains are another
     // reading of "this repository's branches", the subject the Overview's
-    // standing row already opens.
+    // standing row already opens. Resolve then joined Policy: agents finish
+    // most parked merges, so a section that was an empty state nearly always
+    // earned no tab of its own. Policy is "may this merge?", and finishing a
+    // stopped merge is the same question's other half; the conflict editor
+    // leads Policy while there is anything for it to show.
     sections: [
       {
         id: "overview",
         label: "Overview",
         summary:
           "The joined list of this repository's worktrees, pull requests and runs. A blocked row is the one to open.",
-      },
-      {
-        id: "resolve",
-        label: "Resolve",
-        summary:
-          "Finish a parked merge or rebase. Conflicted files, chunk by chunk, without leaving Work.",
-        paletteCommand: "Open Resolve — finish a parked merge or rebase",
       },
       {
         id: "remote",
@@ -102,8 +99,8 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "policy",
         label: "Policy",
         summary:
-          "MANVI gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
-        paletteCommand: "Open MANVI — gates, verdicts and branch cleanup",
+          "What is allowed to merge, and finishing the merges that stopped. MANVI gates, verdicts and cleanup, with a parked merge or rebase's conflicts first.",
+        paletteCommand: "Open Policy — resolve conflicts, MANVI gates, verdicts and cleanup",
       },
       {
         id: "tasks",
@@ -261,7 +258,7 @@ export function sectionsFor(id: ViewTab): readonly ViewSection[] {
  * A destination's name, the way the header and section bar spell it.
  *
  * For UI elsewhere in the app that sends the reader to a pane and has to say
- * where they are about to land ("Work → Resolve"). Derived from the registry
+ * where they are about to land ("Work → Policy"). Derived from the registry
  * rather than written out at the call site, so renaming a section renames
  * every promise made about it. An unknown section id degrades to the view's
  * own name instead of inventing one.
@@ -313,10 +310,33 @@ export function isSectionOnScreen(
 export function resolveSection(id: ViewTab, candidate: unknown): string | null {
   const sections = sectionsFor(id);
   if (sections.length === 0) return null;
-  if (typeof candidate === "string" && sections.some((s) => s.id === candidate)) {
-    return candidate;
+  if (typeof candidate === "string") {
+    if (sections.some((s) => s.id === candidate)) return candidate;
+    const merged = retiredSectionFor(id, candidate);
+    if (merged) return merged;
   }
   return sections[0].id;
+}
+
+/**
+ * Sections folded into another section of the same view, by retired id.
+ *
+ * The default fallback is right for a section that simply went away, and
+ * wrong for one whose content moved: a saved selection, or a native menu
+ * build, that still names it must land where the content went, not on the
+ * view's first section. Resolve is the case that matters: a conflicts chip
+ * that opened Overview would hide the conflicts it was pointing at.
+ */
+export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
+  work: { resolve: "policy" },
+};
+
+/** Where a retired section's content now lives, or null when it is not retired. */
+export function retiredSectionFor(id: ViewTab, candidate: string): string | null {
+  const retired = RETIRED_SECTIONS[id];
+  if (!retired || !Object.hasOwn(retired, candidate)) return null;
+  const target = retired[candidate];
+  return sectionsFor(id).some((s) => s.id === target) ? target : null;
 }
 
 /** Native menu ids are `tab-<id>`; derived so a new view cannot be missed. */

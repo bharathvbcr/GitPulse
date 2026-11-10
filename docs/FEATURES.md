@@ -8,7 +8,7 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Find a workflow
 
-- [Work: Overview, Resolve, Remote, Policy, and Tasks](#1-work-work)
+- [Work: Overview, Remote, Policy, and Tasks](#1-work-work)
 - [Tasks and saved workspaces](TASKS_AND_WORKSPACES.md)
 - [Code](#2-code-code), [History](#3-history-history), and [Insights](#4-insights-insights)
 - [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
@@ -20,7 +20,7 @@ GitPulse has 4 application views with 18 specialized sections. Each view keeps r
 
 | View | What you do here | Sections |
 | --- | --- | --- |
-| **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
+| **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Policy · Tasks |
 | **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
@@ -50,7 +50,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
-        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
+        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Search · Map — file selection, text search and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
@@ -76,7 +76,7 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 - **One Row Per Place Work Is Happening**: Joins linked worktrees, open pull requests, workflow runs, policy verdicts and grants into one row each. Everything else in GitPulse shows one of these; this shows how they relate.
 - **Keyed On What Exists Here**: With a DevCouncil store, the unit is the task. Without one — the ordinary case for a repository driven by Claude Code or by hand — the unit is the **worktree**, because that is where a branch, its uncommitted changes, its parked operation and its pull request actually live. Keying on task regardless collapsed the whole repository into a single row labelled "Not bound to a task".
 - **Agent Worktrees Are Named As Such**: A worktree under `/.<agent>/worktrees/` (Claude Code, Cursor, Codex, and any other tool using that layout) is marked, because a stale agent session and a stale hand-made checkout want opposite remedies — resume or merge, versus prune. Detection reads the directory layout, never the branch name, so a human naming a branch `claude/…` is not mislabelled. Git's own `.git/worktrees/` metadata is never labelled an agent session.
-- **Blocked Worktrees Sort First**: A worktree parked mid-merge, rebase, cherry-pick or revert is the one thing on the screen that cannot progress without a person, so it outranks rows with more pull requests, and clicking it opens that worktree in the Resolve view.
+- **Blocked Worktrees Sort First**: A worktree parked mid-merge, rebase, cherry-pick or revert is the one thing on the screen that cannot progress without a person, so it outranks rows with more pull requests, and clicking it opens that worktree in Policy, which leads with the conflict editor.
 - **Uncommitted Is Counted, Unscanned Is Not Claimed**: A worktree past the scan cap shows nothing rather than `0`, which would report it as verified clean.
 - **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight. Remotes can be added, renamed, re-pointed, pruned, or removed; submodules can be initialized, URL-synced, or deinitialized (never force-discarded). A remote, tag, or submodule listing cut by a cap says so, instead of looking complete.
 - **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
@@ -98,13 +98,7 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 - **Tri-State Line-Level Entity Collision Detection**: Extends file-level collision checks with hunk-range and entity-range overlap detection (`insights/entity_collision.rs`: `ContendedLine`, `CollisionRisk` = *None* | *SameFileClean* | *OverlappingEntity*).
 - **Shortcut**: `F10`.
 
-### 1.2 Resolve
-
-- **3-Way Conflict Editor**: Clear visual distinction between *ours*, *theirs*, and *base* revisions.
-- **One-Click Resolution**: Quick actions to accept current, incoming, or combined changes.
-- **Marker Navigation**: Jump directly between unresolved conflict markers across changed files.
-
-### 1.3 Remote & Local CI
+### 1.2 Remote & Local CI
 
 - **Two Columns, Not One Ragged Grid**: Pull requests and issues take the wide column because they are what a reader acts on; workflows, the runs they produce, and releases sit together in a CI rail. The five listings used to share one grid whose rows are as tall as their tallest cell, so twenty pull requests left a screen of white space beside a three-line releases card — and Workflows sat a row away from its own runs.
 - **PR Management**: List repository PRs with one-click checkout, and a **New pull request** action that opens GitHub's compare form for the current branch onto the default branch.
@@ -202,8 +196,12 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 - **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
 - **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
 
-### 1.4 Policy (Manvi wrap)
+### 1.3 Policy (Manvi wrap)
 
+- **Conflicts Lead While a Merge Is Stopped**: Resolve was its own section; agents finish most parked merges, so it is now the top of Policy. While files are conflicted, a merge, rebase, cherry-pick or revert is parked, or the operation could not be read, the conflict editor takes the pane at full height and Manvi follows below in one scroller. Drafts kept from an earlier operation get a one-line row with **Review drafts** instead of the whole pane. Every way that used to open Resolve (the conflicts chip, status bar, tray, merge dialog, blocked Overview rows, a saved selection) opens Policy.
+  - **3-Way Conflict Editor**: Clear visual distinction between *ours*, *theirs*, and *base* revisions.
+  - **One-Click Resolution**: Quick actions to accept current, incoming, or combined changes.
+  - **Marker Navigation**: Jump directly between unresolved conflict markers across changed files.
 - **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
 - **macOS Background Band Pre-Exec Hook**: Background Git and CLI processes enter Darwin's background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`), ensuring background tasks and their child trees inherit background priority permanently without race conditions.
 - **Dead-Branch Cleanup**: Scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`). Cleaning writes a restorable tip backup first and records it in the ledger. Each `git branch -d/-D` and `git push --delete` command is authorized before execution; a refusal aborts the batch before any branch is removed. The Restore action puts backed-up tips back.
@@ -212,7 +210,7 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 
 ---
 
-### 1.5 Tasks
+### 1.4 Tasks
 
 Work → Tasks shows tasks linked to the active repository. The **Tasks** button
 beside Fleet opens global and saved-workspace scopes over the same records.
@@ -357,7 +355,7 @@ the commit you had just selected.
 - **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
 - **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter in History's section bar, which filters all three sections from one walk. From any other view it switches to History first; in Code, ⌘F still searches the open file — in both sections, because Blame's lines are that same file's lines.
 - **Filters That Keep The Graph Connected**: Every filter term — `author:`, `sha:`, `type:` or a `fix:`-style prefix, free text, and `path:` — is applied by the backend before lanes are solved. A commit the filter drops hands its lineage to its children, the way `git log --parents -- path` rewrites parents, so the survivors stay connected to their nearest kept ancestors, a survivor with no kept ancestors becomes a root of the filtered view, and the straight main-branch rail stays straight, anchored on the first surviving commit of the default branch's chain. A fading stub therefore always means one thing: the parent is past the loaded window, and the tooltip says so.
-- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in the Resolve view if a conflict results.
+- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in Work → Policy, with the conflict editor first, if a conflict results.
 
 ### 3.2 Diff
 

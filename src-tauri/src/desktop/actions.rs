@@ -78,7 +78,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         title: "Work",
         entries: &[
             ("section:work:overview", "Overview"),
-            ("section:work:resolve", "Resolve"),
             ("section:work:remote", "Remote"),
             ("section:work:policy", "Policy"),
             ("section:work:tasks", "Tasks"),
@@ -336,9 +335,10 @@ mod tests {
         // label by label. This assertion is the cheap smoke check beside it —
         // it went stale at 16 once when the section count dropped, again at 15
         // when History gained Suspects, and again at 16 when Insights gained
-        // Secrets, and at 17 when Code gained Search; the parity contract is what proves the number is the
+        // Secrets, and at 17 when Code gained Search, 18 then 17 again when Work's
+        // Resolve folded into Policy; the parity contract is what proves the number is the
         // right one rather than just the current one.
-        assert_eq!(entries.len(), 18);
+        assert_eq!(entries.len(), 17);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -425,6 +425,9 @@ mod tests {
         assert_eq!(NativeAction::parse("tab-manvi"), None);
         assert_eq!(NativeAction::parse("tab-stack"), None);
         assert_eq!(NativeAction::parse("tab-conflict"), None);
+        // Resolve then folded into Policy, which leads with the conflicts.
+        assert_eq!(NativeAction::parse("section:work:resolve"), None);
+        assert!(NativeAction::parse("section:work:policy").is_some());
         // Files and Blame became sections of Code.
         assert_eq!(NativeAction::parse("tab-files"), None);
         assert_eq!(NativeAction::parse("tab-blame"), None);
