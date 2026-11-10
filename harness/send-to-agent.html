@@ -140,7 +140,7 @@
       scenario = { ...scenario, route: "mailbox", previewFails: true };
       type(row, "Try once more");
       await wait(() => calls.previews.length === 1 && route(row).textContent.includes("Couldn't check"), "the failed preview");
-      check("A route that could not be asked for is not offered: Confirm stays off and the panel says Nothing can be sent", () => confirmBtn(row).disabled && route(row).textContent.includes("nothing can be sent"));
+      check("A route that could not be asked for is not offered: Confirm stays off and the panel says Nothing can be sent", () => confirmBtn(row).disabled && route(row).textContent.includes("Nothing can be sent"));
       scenario = { ...scenario, previewFails: false };
 
       // ---- the attempt changed between the preview and the send -----------------
