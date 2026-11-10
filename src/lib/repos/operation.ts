@@ -145,7 +145,7 @@ export function nextStep(op: RepoOperation): string {
   const n = op.conflicted_total;
   if (n > 0) {
     const files = n === 1 ? "1 file" : `${n} files`;
-    return `Resolve ${files} in ${describeDestination("work", "policy")}, stage the result, then continue.`;
+    return `Resolve ${files} in ${describeDestination("work", "overview")}, stage the result, then continue.`;
   }
   if (op.available.includes("continue")) {
     return "All conflicts are resolved — continue to finish the operation.";

@@ -13,8 +13,17 @@ import { SESSION_TYPES } from "../terminal/tabs";
 import { hostPlatform } from "../stores/platformStore";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
+import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
+import { openManviFocus } from "../ui/openManviFocus";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
+/** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
+const MANVI_PALETTE_LABELS: Readonly<Record<ManviFocusId, string>> = {
+  harness: "Open Manvi policy settings — connection and capability boundary",
+  model: "Open local model servers — the models Manvi and agents can use",
+  activity: "Open policy activity — Manvi verdicts, grants and the agent journal",
+  cleanup: "Open branch and tag cleanup — merged branches and tags safe to delete",
+};
 const dispatch = (event: string) => { window.dispatchEvent(new CustomEvent(event)); };
 
 export function repoUnavailable(state: RepoState): string | undefined {
@@ -24,7 +33,7 @@ export function repoUnavailable(state: RepoState): string | undefined {
 export function worktreeUnavailable(state: RepoState): string | undefined {
   return repoUnavailable(state) ?? (state.isBare ? "This bare repository has no working tree." :
     state.operation.probeFailed ? "Operation status is unavailable. Refresh the repository first." :
-    state.operation.operation ? `Finish the current Git operation in ${describeDestination("work", "policy")} first.` :
+    state.operation.operation ? `Finish the current Git operation in ${describeDestination("work", "overview")} first.` :
     state.statuses.some(file => file.is_conflicted) ? "Resolve conflicted files first." : undefined);
 }
 
@@ -80,6 +89,32 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         repoStore.setHistoryList("moves");
       },
     }] : []),
+    // Resolve and Policy were sections of Work, and the palette was one of
+    // their doors. Their content moved to the surfaces that own its subject,
+    // so the registry derives no command for them; these keep a reader who
+    // types "resolve", "conflicts", "policy" or "cleanup" landing on the card
+    // that answers it rather than on nothing.
+    ...(view.id === "work" ? [
+      {
+        id: "work:conflicts", label: "Resolve conflicts — finish a parked merge or rebase",
+        description: "Work → Overview · The conflict editor leads Overview while a merge, rebase or cherry-pick is parked.",
+        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work, disabledReason: unavailable,
+        action: () => {
+          interfaceStore.setGlobalSurface("repository");
+          repoStore.setActiveTab("work", "overview");
+        },
+      },
+      ...MANVI_FOCUS_LIST.map(target => ({
+        id: `manvi:${target.id}`, label: MANVI_PALETTE_LABELS[target.id],
+        description: `${target.destination.label} → ${target.label}`,
+        keywords: `Manvi Policy ${target.destination.label.replace("→", "")} ${target.label}`, category: "Views", icon: icons.work,
+        disabledReason: target.destination.kind === "view" ? unavailable : undefined,
+        action: () => {
+          if (target.destination.kind === "view") interfaceStore.setGlobalSurface("repository");
+          openManviFocus(target.id);
+        },
+      })),
+    ] : []),
   ]);
   // Search and Blame were sections of Code; they are toggles inside Explorer
   // now (`files/explorerLens.ts`), so the registry no longer generates their

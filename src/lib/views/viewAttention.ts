@@ -34,10 +34,11 @@ export function sectionAttention(
   section: string,
   context: AttentionContext,
 ): SectionAttention | null {
-  if (view !== "work" || section !== "policy") return null;
-  // Policy holds the conflict editor (Resolve folded into it), and the editor
-  // leads the pane while files carry markers, so the count outranks a blocked
-  // verdict: it is the thing the reader lands on.
+  if (view !== "work" || section !== "overview") return null;
+  // Overview holds the conflict editor (Resolve folded into it), and the
+  // editor leads the page while files carry markers, so the count outranks a
+  // blocked verdict: it is the thing the reader lands on. A blocked verdict
+  // also lives on Overview, on the row of the work it blocked.
   if (context.conflictedCount > 0) {
     const n = context.conflictedCount;
     return {
@@ -47,7 +48,7 @@ export function sectionAttention(
     };
   }
   if (context.verdictStatus === "blocked") {
-    return { tone: "rose", count: null, reason: "MANVI blocked the last action" };
+    return { tone: "rose", count: null, reason: "Manvi blocked the last action" };
   }
   return null;
 }

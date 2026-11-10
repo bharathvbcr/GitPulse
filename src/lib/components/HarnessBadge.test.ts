@@ -51,9 +51,11 @@ describe("HarnessBadge destinations", () => {
     }
   });
 
-  it("routes every chip through the focus request, never straight to the tab", () => {
-    expect(source.match(/setActiveTab\("work", "policy"\)/g)).toHaveLength(1);
-    expect(source).toContain("requestManviFocus(target);");
+  it("routes every chip through the focus catalog, never straight to a tab", () => {
+    // The catalog owns each destination (Settings for the connection, Overview
+    // for the policy journal); a hand-written setActiveTab here could drift.
+    expect(source).not.toContain("setActiveTab(");
+    expect(source).toContain("openManviFocus(target);");
   });
 
   it("tells each chip's tooltip where the click lands", () => {
@@ -67,14 +69,15 @@ describe("HarnessBadge destinations", () => {
 
 describe("HarnessBadge reachability", () => {
   it("does not offer a link to a view that cannot open", () => {
-    // MANVI is a repository view: with no repository open there is no session
-    // to switch tabs on, so the click did nothing at all. The chip keeps
-    // reporting status; it just stops claiming to be a link.
-    expect(source).toContain("let reachable = $derived(Boolean($repoStore.currentPath));");
-    expect(source.match(/disabled=\{!reachable\}/g)).toHaveLength(
-      chipTargets.length,
-    );
-    expect(source).toContain("Open a repository to reach the Manvi view.");
+    // Overview is a repository view: with no repository open there is no
+    // session to switch tabs on, so the verdict chip stops claiming to be a
+    // link. Settings opens without one, so the harness chip stays live.
+    expect(source).toContain("let hasRepo = $derived(Boolean($repoStore.currentPath));");
+    expect(source).toContain(`MANVI_FOCUS_TARGETS[target].destination.kind === "settings" || hasRepo`);
+    for (const target of chipTargets) {
+      expect(source).toContain(`disabled={!reachableFor("${target}")}`);
+    }
+    expect(source).toContain("Open a repository to see its policy activity.");
     // Hover styling is gated on the same condition, so a dead chip does not
     // light up under the pointer.
     expect(source).not.toMatch(/[^:]hover:/);
@@ -99,8 +102,9 @@ describe("HarnessBadge rendering", () => {
     );
     expect(titles.length).toBeGreaterThanOrEqual(2);
     expect(new Set(titles).size).toBe(titles.length);
-    // Only navigation needs an open repository; the model preference is global.
-    expect(titles[0]).toContain("Open a repository to reach the Manvi view.");
+    // The harness chip opens Settings, which needs no repository; the model
+    // preference is global too.
+    expect(titles[0]).toContain("Opens Settings → Agents → Manvi policy.");
     expect(titles[1]).toContain("Choose a local model.");
     expect(titles[1]).not.toContain("Open a repository");
     expect(body).toContain("disabled");

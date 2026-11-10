@@ -47,8 +47,8 @@ describe("destination guides", () => {
       view: "history",
       section: "diff",
     });
-    expect(tipGuideKey("work", "policy")).toBe("work:policy");
-    expect(tipGuideDescId("work:policy")).toBe("gitpulse-view-guide-work-policy");
+    expect(tipGuideKey("work", "remote")).toBe("work:remote");
+    expect(tipGuideDescId("work:remote")).toBe("gitpulse-view-guide-work-remote");
   });
 
   it("keeps Work's F10 and Code's digit chord on the view cards", () => {

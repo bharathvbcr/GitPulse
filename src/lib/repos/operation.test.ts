@@ -177,7 +177,7 @@ describe("nextStep", () => {
   it("counts the blocking files and points at the view that fixes them", () => {
     const text = nextStep(op({ conflicted_total: 3, available: ["abort"] }));
     expect(text).toContain("3 files");
-    expect(text).toContain("Work → Policy");
+    expect(text).toContain("Work → Overview");
   });
 
   it("uses the singular for one file", () => {
@@ -189,7 +189,7 @@ describe("nextStep", () => {
   it("switches to the forward instruction once conflicts clear", () => {
     const text = nextStep(op({ conflicted_total: 0, available: ["abort", "continue"] }));
     expect(text).toContain("continue");
-    expect(text).not.toContain("Work → Policy");
+    expect(text).not.toContain("Work → Overview");
   });
 
   it("does not invent an instruction when git wants something unmodelled", () => {

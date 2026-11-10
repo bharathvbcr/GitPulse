@@ -119,8 +119,9 @@ export interface WipDestination {
  * until it has somewhere to land.
  */
 export const WIP_DESTINATIONS: Readonly<Record<WipReasonKind, WipDestination>> = {
-  conflicts: { tab: "work", section: "policy" },
-  operation: { tab: "work", section: "policy" },
+  // The conflict editor leads Overview while a merge or rebase is parked.
+  conflicts: { tab: "work", section: "overview" },
+  operation: { tab: "work", section: "overview" },
   // The working-tree diff, matching the status bar's modified-file count.
   uncommitted: { tab: "history", section: "diff" },
   // Branch, upstream and the stash are all on Work's overview.

@@ -3,7 +3,8 @@
   import { commitGraphHint } from "../health/commitGraph";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
-  import { requestManviFocus } from "../ui/manviFocus";
+  import { manviFocusHint } from "../ui/manviFocus";
+  import { openManviFocus } from "../ui/openManviFocus";
   import {
     HardDrive,
     RefreshCw,
@@ -306,10 +307,9 @@
   }
 
   function openManviCleanup() {
-    // Names the section, not just the view: Manvi opens on its Ops pane and
-    // branch cleanup is one card among several down the page.
-    requestManviFocus("cleanup");
-    repoStore.setActiveTab("work", "policy");
+    // Names the card, not just the view: branch and tag cleanup is a
+    // collapsed disclosure on Overview, below the joined rows.
+    openManviFocus("cleanup");
   }
 
   $effect(() => {
@@ -773,9 +773,9 @@
             {/if}
             <span><span class="font-semibold text-danger">{report.branches.gone_upstream_count}</span> <span class="text-textMuted">upstream gone</span></span>
             {#if report.branches.merged_stale_count > 0}
-              <button type="button" onclick={openManviCleanup} class="gp-btn ml-auto" data-size="sm" title="Review the conservative cleanup plan in the Manvi view">
+              <button type="button" onclick={openManviCleanup} class="gp-btn ml-auto" data-size="sm" title={`Review the conservative cleanup plan. ${manviFocusHint("cleanup")}`}>
                 <Sparkles size={11} />
-                Clean up in Manvi
+                Clean up branches
               </button>
             {/if}
           </div>

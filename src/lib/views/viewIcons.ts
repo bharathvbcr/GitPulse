@@ -15,7 +15,6 @@ import {
   ListChecks,
   Network,
   Search,
-  ShieldCheck,
   TestTube,
 } from "@lucide/svelte";
 import type { ViewTab } from "../repos/persist";
@@ -43,7 +42,6 @@ export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, Vie
   work: {
     overview: LayoutDashboard,
     remote: Cloud,
-    policy: ShieldCheck,
     tasks: ListChecks,
   },
   code: {

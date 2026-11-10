@@ -78,9 +78,10 @@ describe("StoragePanel source contracts & async hygiene", () => {
     expect(source).toContain("committed");
   });
 
-  it("provides single-click navigation to MANVI for merged-branch cleanup", () => {
-    expect(source).toContain('repoStore.setActiveTab("work", "policy")');
-    expect(source).toContain("Clean up in Manvi");
+  it("provides single-click navigation to branch cleanup for merged branches", () => {
+    expect(source).toContain(`openManviFocus("cleanup")`);
+    expect(source).toContain(`manviFocusHint("cleanup")`);
+    expect(source).toContain("Clean up branches");
   });
 
   it("honestly flags truncated/budgeted scans instead of presenting as complete", () => {

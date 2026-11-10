@@ -250,11 +250,11 @@ describe("bulkSkipReason", () => {
 describe("wipDestination", () => {
   it("sends a conflicted or parked repository to the resolver", () => {
     // Both are the same situation from the reader's side — a repository that
-    // cannot move until someone finishes something — and Policy (which leads
+    // cannot move until someone finishes something — and Overview (which leads
     // with the conflict editor while one is parked) is the one
     // pane in the app that finishes it.
-    expect(wipDestination("conflicts")).toEqual({ tab: "work", section: "policy" });
-    expect(wipDestination("operation")).toEqual({ tab: "work", section: "policy" });
+    expect(wipDestination("conflicts")).toEqual({ tab: "work", section: "overview" });
+    expect(wipDestination("operation")).toEqual({ tab: "work", section: "overview" });
   });
 
   it("sends uncommitted work to the diff the status bar already opens", () => {
@@ -314,6 +314,6 @@ describe("wipDestination", () => {
     // And that ordering is over every kind the model has, not a subset.
     expect(new Set(everything.reasons.map((r) => r.kind))).toEqual(new Set(WIP_REASON_KINDS));
     expect(everything.severity).toBe("conflicts");
-    expect(wipDestination(everything.severity)).toEqual({ tab: "work", section: "policy" });
+    expect(wipDestination(everything.severity)).toEqual({ tab: "work", section: "overview" });
   });
 });

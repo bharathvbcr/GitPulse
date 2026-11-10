@@ -76,11 +76,18 @@ describe("view sections", () => {
   });
 
   it("lands a section folded into another where its content went, not on the default", () => {
-    // Resolve folded into Policy. A saved selection, a native menu build or a
-    // caller that still names it must open the conflicts, not Overview.
+    // Resolve folded into Policy, then both into Overview, which leads with
+    // the conflict editor. A saved selection, a native menu build or a caller
+    // that still names either must open Overview, never fail to resolve.
     expect(sectionsFor("work").map((s) => s.id)).not.toContain("resolve");
-    expect(resolveSection("work", "resolve")).toBe("policy");
-    expect(activeSectionFor("work", { work: "resolve" })).toBe("policy");
+    expect(sectionsFor("work").map((s) => s.id)).not.toContain("policy");
+    expect(resolveSection("work", "resolve")).toBe("overview");
+    expect(activeSectionFor("work", { work: "resolve" })).toBe("overview");
+    // Overview is also Work's default, so assert the alias itself, not only
+    // where the fallback happens to land: a retired id must be on the map.
+    expect(retiredSectionFor("work", "resolve")).toBe("overview");
+    expect(retiredSectionFor("work", "policy")).toBe("overview");
+    expect(activeSectionFor("work", { work: "policy" })).toBe("overview");
     // Scoped to its view: the same id elsewhere is just unknown.
     expect(resolveSection("history", "resolve")).toBe("graph");
     // Every alias points at a live section of its own view, and none shadows one.
@@ -105,7 +112,7 @@ describe("view sections", () => {
     expect(resolveSection("history", "reflog")).toBe("graph");
     expect(sanitizeViewSections({ insights: "secrets", work: "resolve" })).toEqual({
       insights: "health",
-      work: "policy",
+      work: "overview",
     });
   });
 
@@ -188,7 +195,7 @@ describe("view sections", () => {
   it("names a destination the way the header and section bar spell it", () => {
     // The name travels into tooltips that promise where a click will land, so
     // it is read out of the registry rather than written at the call site.
-    expect(describeDestination("work", "policy")).toBe("Work → Policy");
+    expect(describeDestination("work", "remote")).toBe("Work → Remote");
     expect(describeDestination("history", "diff")).toBe("History → Diff");
     // No section, or one this build dropped: the view's own name, never an
     // arrow pointing at a pane that is not there.

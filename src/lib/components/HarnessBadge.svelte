@@ -6,11 +6,8 @@
     harnessPermissionMode,
     harnessPermissionSummary,
   } from "../harness/availability";
-  import {
-    manviFocusHint,
-    requestManviFocus,
-    type ManviFocusId,
-  } from "../ui/manviFocus";
+  import { MANVI_FOCUS_TARGETS, manviFocusHint, type ManviFocusId } from "../ui/manviFocus";
+  import { openManviFocus } from "../ui/openManviFocus";
   import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert } from "@lucide/svelte";
 
   const instanceId = $props.id();
@@ -22,18 +19,22 @@
   });
 
   /**
-   * The harness and verdict chips open the section that owns their subject.
-   * Model selection is global and stays directly in the header.
+   * The harness and verdict chips open the card that owns their subject: the
+   * connection is configuration (Settings → Agents), a verdict is history of
+   * this repository (Work → Overview → Policy activity). Model selection is
+   * global and stays directly in the header.
    */
   function openManvi(target: ManviFocusId) {
-    requestManviFocus(target);
-    repoStore.setActiveTab("work", "policy");
+    openManviFocus(target);
   }
 
-  // Manvi is a repository view: with no repository open there is no session to
-  // switch tabs on, so navigation chips remain disabled until a repo is open.
-  let reachable = $derived(Boolean($repoStore.currentPath));
-  let unreachableHint = "Open a repository to reach the Manvi view.";
+  // Settings opens with or without a repository; Overview is a repository
+  // view, so a chip that lands there stays disabled until a repo is open.
+  let hasRepo = $derived(Boolean($repoStore.currentPath));
+  function reachableFor(target: ManviFocusId): boolean {
+    return MANVI_FOCUS_TARGETS[target].destination.kind === "settings" || hasRepo;
+  }
+  let unreachableHint = "Open a repository to see its policy activity.";
 
   let harness = $derived($harnessStore.harness);
   let ai = $derived($harnessStore.ai);
@@ -83,7 +84,7 @@
   );
 
   let harnessTitle = $derived(
-    `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\n${reachable ? manviFocusHint("harness") : unreachableHint}`,
+    `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\n${manviFocusHint("harness")}`,
   );
 
   let modelTitle = $derived(
@@ -95,7 +96,7 @@
 
   let verdictTitle = $derived(
     verdict
-      ? `${verdictDetail(verdict)}\n${reachable ? manviFocusHint("activity") : unreachableHint}`
+      ? `${verdictDetail(verdict)}\n${reachableFor("activity") ? manviFocusHint("activity") : unreachableHint}`
       : unreachableHint,
   );
 
@@ -122,7 +123,7 @@
   <div role="group" aria-label="Manvi and local model" class="flex min-w-0 items-center gap-1.5">
     <button
       onclick={() => openManvi("harness")}
-      disabled={!reachable}
+      disabled={!reachableFor("harness")}
       title={harnessTitle}
       class="gp-chip shrink-0 gap-1.5 enabled:cursor-pointer disabled:cursor-default"
       data-tone={harnessTone}
@@ -188,7 +189,7 @@
   {#if verdict}
     <button
       onclick={() => openManvi("activity")}
-      disabled={!reachable}
+      disabled={!reachableFor("activity")}
       title={verdictTitle}
       class="gp-chip shrink-0 gap-1.5 enabled:cursor-pointer disabled:cursor-default"
       data-tone={verdict.status === "blocked" ? "danger" : verdict.status === "unchecked" ? "unknown" : "neutral"}

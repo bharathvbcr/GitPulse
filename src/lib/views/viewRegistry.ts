@@ -67,40 +67,37 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "work",
     label: "Work",
     summary:
-      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Branch chains and blocked items sort first.",
+      "Everything in flight: worktrees, pull requests, CI runs and Manvi verdicts. Branch chains, blocked items and a parked merge sort first.",
     paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
     // Everything in flight, and the surfaces that act on it. GitHub and MANVI
     // were separate views rendering halves of the same answer Work already
     // joins — both issued `cmd_github_context`, four `gh` round trips each,
-    // to draw overlapping lists. Resolve was never a destination: it is what
-    // a blocked row opens into, and Work already sorts blocked rows first.
-    // Stack joined Overview as a collapsible card: branch chains are another
-    // reading of "this repository's branches", the subject the Overview's
-    // standing row already opens. Resolve then joined Policy: agents finish
-    // most parked merges, so a section that was an empty state nearly always
-    // earned no tab of its own. Policy is "may this merge?", and finishing a
-    // stopped merge is the same question's other half; the conflict editor
-    // leads Policy while there is anything for it to show.
+    // to draw overlapping lists. Stack joined Overview as a collapsible card:
+    // branch chains are another reading of "this repository's branches".
+    //
+    // Resolve and Policy then dissolved into the sections whose subject they
+    // act on. Resolve was never a destination: agents finish most parked
+    // merges, so the tab was an empty state nearly every visit, and what it
+    // shows is the state of this repository — the conflict editor now leads
+    // Overview while a merge or rebase is parked and is absent otherwise.
+    // Policy was a page named after the engine underneath rather than a
+    // subject: branch and tag cleanup and the policy journal are collapsed
+    // disclosures on Overview, issues, releases and outgoing commits joined
+    // Remote's lists of the same objects, and the Manvi connection and model
+    // servers are configuration, so they live in Settings → Agents.
     sections: [
       {
         id: "overview",
         label: "Overview",
         summary:
-          "The joined list of this repository's worktrees, pull requests and runs. A blocked row is the one to open.",
+          "The joined list of this repository's worktrees, pull requests and runs. A parked merge or rebase leads the page until it is finished.",
       },
       {
         id: "remote",
         label: "Remote",
         summary:
-          "Pull requests, issues, Actions runs and releases from GitHub for this repository.",
+          "Pull requests, issues, Actions runs and releases from GitHub, and the commits about to be pushed.",
         paletteCommand: "Open GitHub — pull requests, issues, runs and releases",
-      },
-      {
-        id: "policy",
-        label: "Policy",
-        summary:
-          "What is allowed to merge, and finishing the merges that stopped. MANVI gates, verdicts and cleanup, with a parked merge or rebase's conflicts first.",
-        paletteCommand: "Open Policy — resolve conflicts, MANVI gates, verdicts and cleanup",
       },
       {
         id: "tasks",
@@ -312,7 +309,8 @@ export function resolveSection(id: ViewTab, candidate: unknown): string | null {
  * wrong for one whose content moved: a saved selection, or a native menu
  * build, that still names it must land where the content went, not on the
  * view's first section. Resolve is the case that matters: a conflicts chip
- * that opened Overview would hide the conflicts it was pointing at.
+ * must land on the conflict editor, which now leads Overview while a merge
+ * or rebase is parked.
  *
  * This is the one retirement map: [`resolveSection`] reads it, so restored
  * sessions (`sanitizeViewSections` in repos/persist.ts) and live callers land
@@ -321,8 +319,11 @@ export function resolveSection(id: ViewTab, candidate: unknown): string | null {
  * native menu id cannot open a surprise pane.
  */
 export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
-  // Resolve became the top of Policy: agents finish most parked merges.
-  work: { resolve: "policy" },
+  // Resolve leads Overview while a merge or rebase is parked. Policy's cards
+  // moved to the surfaces that own their subject; the nearest whole page is
+  // Overview, where cleanup and the policy journal live. Both ids point at the
+  // destination directly, because this lookup does not chain.
+  work: { resolve: "overview", policy: "overview" },
   // Secrets became a section of Health: one verdict, one agent bar.
   insights: { secrets: "health" },
   // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):

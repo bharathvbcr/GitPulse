@@ -45,25 +45,6 @@
       <rect x="42" y={30 + row * 22} width={90 - row * 12} height="6" rx="3" fill="rgb(var(--c-text-muted))" fill-opacity="0.45" />
       <circle cx="228" cy={33 + row * 22} r="3.2" fill={row === 1 ? "rgb(var(--c-status-amber))" : "rgb(var(--c-status-emerald))"} fill-opacity="0.8" />
     {/each}
-  {:else if view === "work" && section === "stack"}
-    <rect x="28" y="28" width="160" height="20" rx="5" fill="rgb(var(--c-surface))" stroke="rgb(var(--c-accent))" stroke-opacity="0.45" />
-    <rect x="44" y="50" width="160" height="20" rx="5" fill="rgb(var(--c-surface))" />
-    <rect x="60" y="72" width="160" height="16" rx="5" fill="rgb(var(--c-surface))" fill-opacity="0.7" />
-    <rect x="36" y="34" width="70" height="8" rx="4" fill="rgb(var(--c-accent))" fill-opacity="0.35" />
-    <rect x="52" y="56" width="56" height="8" rx="4" fill="rgb(var(--c-text-muted))" fill-opacity="0.35" />
-    <path d="M196 38h18M214 38l-4-4M214 38l-4 4" fill="none" stroke="rgb(var(--c-accent))" stroke-width="1.4" />
-  {:else if view === "work" && section === "policy"}
-    {#each [0, 1, 2, 3] as row (row)}
-      <rect x="16" y={26 + row * 16} width="224" height="13" rx="4" fill="rgb(var(--c-surface))" />
-      <circle
-        cx="28"
-        cy={32.5 + row * 16}
-        r="4"
-        fill={row === 2 ? "rgb(var(--c-status-rose))" : "rgb(var(--c-status-emerald))"}
-        fill-opacity="0.75"
-      />
-      <rect x="40" y={29 + row * 16} width={100 - row * 10} height="6" rx="3" fill="rgb(var(--c-text-muted))" fill-opacity="0.4" />
-    {/each}
   {:else if view === "work"}
     {#each [0, 1, 2] as row (row)}
       <rect x="10" y={24 + row * 22} width="236" height="18" rx="6" fill="rgb(var(--c-surface))" />
