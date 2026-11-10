@@ -5618,7 +5618,8 @@ mod tests {
                 // Quiet: the callback count has not moved for 2 s.
                 let mut last = u64::MAX;
                 let mut still_since = Instant::now();
-                while still_since.elapsed() < Duration::from_secs(2) {
+                let quiet = Duration::from_secs(2);
+                while still_since.elapsed() < quiet {
                     thread::sleep(Duration::from_millis(200));
                     let now = watcher.as_ref().map_or(0, |w| w.filter().callbacks());
                     if now != last {
