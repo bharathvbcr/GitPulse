@@ -38,9 +38,7 @@
   } = $props();
 
   const section = $derived(activeSectionFor("work", $repoStore.viewSections));
-  const conflictedCount = $derived(
-    $repoStore.statuses.filter((s) => s.is_conflicted).length,
-  );
+  const conflictedCount = $derived($repoStore.conflictedCount);
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">

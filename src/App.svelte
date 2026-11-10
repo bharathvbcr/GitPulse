@@ -302,7 +302,7 @@
     }, DROP_HIDE_GRACE_MS);
   }
 
-  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+  let conflictedCount = $derived($repoStore.conflictedCount);
 
   /** Total occurrences across recorded errors, for the header badge. */
   let diagnosticErrorCount = $derived(
@@ -1332,7 +1332,7 @@
          than unmounted for the same reason the terminal is. -->
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
-        <LazyView load={loadFleetView} name="the Fleet dashboard" />
+        <LazyView load={loadFleetView} name="the Fleet dashboard" props={{ active: fleetOpen }} />
       </div>
     </svelte:boundary>
   {/if}

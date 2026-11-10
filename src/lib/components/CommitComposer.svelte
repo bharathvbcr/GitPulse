@@ -41,7 +41,7 @@
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
-  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+  let conflictedCount = $derived($repoStore.conflictedCount);
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let apple = $state<AppleIntelligenceStatus | null>(null);
   $effect(() => {

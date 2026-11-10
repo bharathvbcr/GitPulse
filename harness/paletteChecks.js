@@ -3,6 +3,7 @@ import { mount, tick } from "svelte";
 import { get } from "svelte/store";
 import { mockIPCWithEvents } from "./tauriMocks";
 import { repoStore } from "../src/lib/stores/repoStore";
+import { invalidateRepoListing } from "../src/lib/files/repoListing";
 import { themeStore } from "../src/lib/stores/themeStore";
 import CommandPalette from "../src/lib/components/CommandPalette.svelte";
 import { FRECENCY_KEY } from "../src/lib/palette/model";
@@ -85,6 +86,8 @@ if (params.has("check")) {
   await open(); await type("qckcmt"); check("fuzzy aliases find Quick Commit", Boolean(option("Quick Commit")));
   check("clean-tree Quick Commit explains why it cannot run", option("Quick Commit")?.textContent.includes("Nothing to commit"));
   files = Array.from({ length: 125 }, (_, i) => `src/file-${String(i).padStart(3,"0")}.ts`);
+  // The fixture changed the tree without a status or HEAD change, which the real backend never does.
+  invalidateRepoListing();
   await type("/"); await waitFor(() => option("file-000.ts"));
   check("large file lists render only the first page", root.querySelectorAll("[role=option]").length === 50 && root.textContent.includes("1–50 of 125 results"));
   await key("PageDown"); check("PageDown reaches the next page", root.textContent.includes("51–100 of 125 results") && Boolean(option("file-050.ts")));

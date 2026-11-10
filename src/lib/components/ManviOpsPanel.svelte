@@ -3,6 +3,7 @@
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "../ipc/invoke";
+  import { readGitHubContext } from "../ipc/githubContext";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -192,7 +193,7 @@
 
   async function loadIssues(
     repo: string = $repoStore.currentPath ?? "",
-    opts: { background?: boolean } = {},
+    opts: { background?: boolean; reuse?: boolean } = {},
   ) {
     if (!repo) return;
     if (busy !== null) {
@@ -210,7 +211,7 @@
       busy = "issues";
     }
     try {
-      const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
+      const next = await readGitHubContext<GitHubContext>(repo, { force: !opts.background && !opts.reuse });
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;
@@ -771,7 +772,7 @@
     releaseConfirmed = false;
     pendingIssueRepo = null; // a queued request for an older repo is obsolete
     if (repo) {
-      void loadIssues(repo);
+      void loadIssues(repo, { reuse: true });
       void loadRepoTasks(repo);
     }
   }

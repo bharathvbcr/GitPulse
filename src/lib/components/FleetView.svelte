@@ -48,6 +48,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
+  import { recomputeWhileActive } from "../runtime/recomputeWhileActive";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   let cleanerOpen = $state(false);
   /**
@@ -146,33 +147,56 @@
   let focusedIndex = $state(0);
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
 
-  const openFacts = $derived.by(() => {
-    // Touch the session fields the facts are derived from so this re-runs
-    // whenever any of them changes.
-    void $repoStore.openTabs;
-    void $repoStore.statuses;
-    void $repoStore.operation;
-    void $repoStore.stashEntries;
-    void $repoStore.watch;
-    return repoStore.repoFacts();
-  });
+  /**
+   * Whether the Fleet surface is the one on screen. The view stays mounted
+   * behind `class:hidden`, so without this every publish of any session
+   * recomputed every tab's facts for a grid nobody could see. While false the
+   * three inputs below hold their last value and read nothing from the stores;
+   * when it turns true they recompute, so the grid is current when shown.
+   */
+  let { active = true }: { active?: boolean } = $props();
 
-  const recents = $derived.by(() => {
-    const openPaths = openFacts.map((facts) => facts.path);
-    const paths = $repoStore.recentRepos.filter((path) => !isPathAmong(path, openPaths, pathOpts));
-    const labels = disambiguateLabels(paths);
-    return paths.map((path) => ({ path, label: labels.get(path) ?? displayName(path) }));
-  });
+  const openFacts = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () => {
+        // Touch the session fields the facts are derived from so this re-runs
+        // whenever any of them changes.
+        void $repoStore.openTabs;
+        void $repoStore.statuses;
+        void $repoStore.operation;
+        void $repoStore.stashEntries;
+        void $repoStore.watch;
+        return repoStore.repoFacts();
+      },
+    ),
+  );
 
-  const rows = $derived(
-    buildFleetRows({
-      open: openFacts,
-      recents,
-      snapshot: $fleetStore.snapshot,
-      snapshotError: $fleetStore.snapshotError,
-      scanFailures: $fleetStore.scanFailures,
-      now: Date.now(),
-    }),
+  const recents = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () => {
+        const openPaths = openFacts.map((facts) => facts.path);
+        const paths = $repoStore.recentRepos.filter((path) => !isPathAmong(path, openPaths, pathOpts));
+        const labels = disambiguateLabels(paths);
+        return paths.map((path) => ({ path, label: labels.get(path) ?? displayName(path) }));
+      },
+    ),
+  );
+
+  const rows = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () =>
+        buildFleetRows({
+          open: openFacts,
+          recents,
+          snapshot: $fleetStore.snapshot,
+          snapshotError: $fleetStore.snapshotError,
+          scanFailures: $fleetStore.scanFailures,
+          now: Date.now(),
+        }),
+    ),
   );
 
   // Filter, then search, then order. The severity sort delegates to the same

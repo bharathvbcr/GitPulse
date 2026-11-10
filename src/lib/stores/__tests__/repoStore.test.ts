@@ -3011,6 +3011,220 @@ describe("repoStore ignore-whitespace preference", () => {
   });
 });
 
+describe("repoStore openTabs identity", () => {
+  async function twoTabs() {
+    const { store } = makeStore();
+    await store.openRepo("/r/tabs-a");
+    await store.openRepo("/r/tabs-b");
+    return store;
+  }
+
+  it("keeps the array when a publish changed no tab entry", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    expect(before).toHaveLength(2);
+    // Replaces the active session without touching anything a tab row reads.
+    store.selectFilePath("README.md");
+    const after = get(store).openTabs;
+    expect(get(store).selectedFilePath).toBe("README.md");
+    expect(after).toBe(before);
+    expect(after[0]).toBe(before[0]);
+  });
+
+  it("returns a new array when a tab entry changes", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    await store.activateTab(before[0].id);
+    const after = get(store).openTabs;
+    expect(after).not.toBe(before);
+    expect(after.map((tab) => tab.isActive)).toEqual([true, false]);
+  });
+
+  it("returns a new array when tabs are reordered although every row is reused", async () => {
+    const store = await twoTabs();
+    const before = get(store).openTabs;
+    expect(store.moveTabBy(before[1].id, -1)).toBe(true);
+    const after = get(store).openTabs;
+    expect(after).not.toBe(before);
+    expect(after.map((tab) => tab.path)).toEqual(["/r/tabs-b", "/r/tabs-a"]);
+    expect(after[0]).toBe(before[1]);
+    expect(after[1]).toBe(before[0]);
+  });
+});
+
+describe("repoStore field stores", () => {
+  const file = (path: string, extra: Record<string, unknown> = {}) => ({
+    path, status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0, ...extra,
+  });
+
+  async function open(statuses: unknown[]) {
+    let current = statuses;
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => current as never }));
+    await store.openRepo("/r/fields");
+    return { store, set: (next: unknown[]) => { current = next; } };
+  }
+
+  function watch<T>(readable: { subscribe: (run: (value: T) => void) => () => void }) {
+    const seen: T[] = [];
+    const stop = readable.subscribe((value) => seen.push(value));
+    return { seen, stop };
+  }
+
+  it("statuses, branches and openTabs notify only when their array is replaced", async () => {
+    const { store, set } = await open([file("a.ts")]);
+    const statuses = watch(store.statuses);
+    const branches = watch(store.branches);
+    const tabs = watch(store.openTabs);
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length]).toEqual([1, 1, 1]);
+
+    store.selectFilePath("a.ts"); // a publish that touches none of the three
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length]).toEqual([1, 1, 1]);
+
+    set([file("a.ts"), file("b.ts")]);
+    await store.refresh("/r/fields", "status");
+    expect(statuses.seen).toHaveLength(2);
+    expect(statuses.seen[1]).toHaveLength(2);
+    expect(branches.seen).toHaveLength(1);
+    statuses.stop(); branches.stop(); tabs.stop();
+  });
+
+  it("with no repository open, a publish wakes no field-store subscriber", () => {
+    const { store } = makeStore();
+    const statuses = watch(store.statuses);
+    const branches = watch(store.branches);
+    const tabs = watch(store.openTabs);
+    const conflicts = watch(store.conflictedCount);
+    store.setError("first"); // the first projection replaces the constructor's placeholder arrays, once
+    const settled = [statuses.seen.length, branches.seen.length, tabs.seen.length, conflicts.seen.length];
+    store.setError("second");
+    store.setError(null);
+    store.setError("third");
+    expect([statuses.seen.length, branches.seen.length, tabs.seen.length, conflicts.seen.length]).toEqual(settled);
+    // The same shared empty array every time, and one nobody can push into.
+    expect(Object.isFrozen(get(store.statuses))).toBe(true);
+    expect(get(store.statuses)).toBe(get(store.branches));
+    statuses.stop(); branches.stop(); tabs.stop(); conflicts.stop();
+  });
+
+  it("counts conflicted and staged files once per statuses array", async () => {
+    const { store, set } = await open([file("a.ts", { is_conflicted: true }), file("b.ts", { is_staged: true }), file("c.ts", { is_staged: true })]);
+    expect(get(store.conflictedCount)).toBe(1);
+    expect(get(store.stagedCount)).toBe(2);
+    expect(get(store).conflictedCount).toBe(1);
+    const conflicts = watch(store.conflictedCount);
+    store.selectFilePath("b.ts");
+    expect(conflicts.seen).toEqual([1]);
+    set([file("a.ts")]);
+    await store.refresh("/r/fields", "status");
+    expect(conflicts.seen).toEqual([1, 0]);
+    expect(get(store.stagedCount)).toBe(0);
+    conflicts.stop();
+  });
+});
+
+describe("repoStore index and worktree mutations refresh the status facet only", () => {
+  const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
+  const unit = async () => undefined as never;
+  const mixed = [
+    { path: "a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 },
+    { path: "b.ts", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 },
+  ];
+  type Store = ReturnType<typeof makeStore>["store"];
+
+  async function afterMutation(mutate: (store: Store) => Promise<unknown>, extra: Partial<Record<string, InvokeFn>> = {}) {
+    let recording = false;
+    const calls: string[] = [];
+    const base = makeInvoke({
+      cmd_get_status: async () => mixed as never,
+      cmd_stage_file: unit,
+      cmd_unstage_file: unit,
+      cmd_change_index: unit,
+      cmd_stage_selective_patch: unit,
+      cmd_unstage_selective_patch: unit,
+      cmd_discard_changes: unit,
+      cmd_checkout_branch: unit,
+      ...extra,
+    });
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (recording) calls.push(cmd);
+      return base(cmd, args);
+    };
+    const { store, graph } = makeStore(invoke);
+    await store.openRepo("/r/status-only");
+    const loadedBefore = graph.loaded.length;
+    const revisionBefore = get(store.contentRevisions)["/r/status-only"];
+    recording = true;
+    await mutate(store);
+    return {
+      calls,
+      graphLoads: graph.loaded.length - loadedBefore,
+      revisionMoved: get(store.contentRevisions)["/r/status-only"] !== revisionBefore,
+    };
+  }
+
+  const merge = {
+    kind: "Merge", current_step: null, total_steps: null, head_ref: "main", incoming_ref: "feature",
+    conflicted_paths: ["a.ts"], conflicted_total: 1, available: ["abort"],
+  };
+
+  it("with no operation in progress, staging re-reads neither the operation, the branches nor the revision", async () => {
+    const { calls, revisionMoved } = await afterMutation((s) => s.stageFile("a.ts"));
+    expect(calls).not.toContain("cmd_repo_operation");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(revisionMoved).toBe(false);
+  });
+
+  it.each([
+    ["stageFile", (s: Store) => s.stageFile("a.ts")],
+    ["unstageFile", (s: Store) => s.unstageFile("b.ts")],
+    ["stage patch", (s: Store) => s.stageSelectivePatch(patch, true)],
+    ["stageAll", (s: Store) => s.stageAll()],
+    ["discard", (s: Store) => s.discardChanges("a.ts")],
+  ])("mid-merge, %s re-reads the operation and moves the review revision", async (_name, mutate) => {
+    const { calls, revisionMoved } = await afterMutation(mutate, { cmd_repo_operation: async () => merge as never });
+    expect(calls).toContain("cmd_repo_operation");
+    expect(revisionMoved).toBe(true);
+  });
+
+  it("an operation probe that failed is not taken for an idle repository", async () => {
+    const { calls } = await afterMutation((s) => s.stageFile("a.ts"), {
+      cmd_repo_operation: async () => { throw new Error("probe failed"); },
+    });
+    // The failed probe at open leaves `probeFailed`; the mutation re-asks.
+    expect(calls).toContain("cmd_repo_operation");
+  });
+
+  it.each([
+    ["stageFile", (s: Store) => s.stageFile("a.ts")],
+    ["unstageFile", (s: Store) => s.unstageFile("b.ts")],
+    ["stage patch", (s: Store) => s.stageSelectivePatch(patch, true)],
+    ["unstage patch", (s: Store) => s.stageSelectivePatch(patch, false)],
+    ["stageAll", (s: Store) => s.stageAll()],
+    ["unstageAll", (s: Store) => s.unstageAll()],
+    ["discard", (s: Store) => s.discardChanges("a.ts")],
+  ])("%s reloads statuses but neither branches nor the graph window", async (_name, mutate) => {
+    const { calls, graphLoads } = await afterMutation(mutate);
+    expect(calls).toContain("cmd_get_status");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(graphLoads).toBe(0);
+  });
+
+  it("a mutation that can move a ref still reloads branches and the graph window", async () => {
+    const { calls, graphLoads } = await afterMutation((s) => s.checkoutBranch("feature"));
+    expect(calls).toContain("cmd_list_branches");
+    expect(graphLoads).toBe(1);
+  });
+
+  it("a failed bulk index change recovers with the status facet only", async () => {
+    const { calls, graphLoads } = await afterMutation((s) => s.stageAll(), {
+      cmd_change_index: async () => { throw new Error("Index update stopped: index.lock"); },
+    });
+    expect(calls).toContain("cmd_get_status");
+    expect(calls).not.toContain("cmd_list_branches");
+    expect(graphLoads).toBe(0);
+  });
+});
+
 describe("repoStore post-mutation selection refetch", () => {
   const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
   const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
@@ -3227,27 +3441,32 @@ describe("repoStore background-refresh flicker hardening", () => {
 
   it("stageAll runs exactly one refresh cycle regardless of file count", async () => {
     let branchListings = 0;
+    let statusReads = 0;
     const invoke = makeInvoke({
       cmd_list_branches: async () => {
         branchListings += 1;
         return snapshotFor("/r/bulk").branches as never;
       },
-      cmd_get_status: async () =>
-        [1, 2, 3].map((n) => ({
+      cmd_get_status: async () => {
+        statusReads += 1;
+        return [1, 2, 3].map((n) => ({
           path: `f${n}.ts`,
           status_code: "M",
           is_staged: false,
           is_conflicted: false,
           additions: 1,
           deletions: 0,
-        })) as never,
+        })) as never;
+      },
     });
     const { store } = makeStore(invoke);
-    await store.openRepo("/r/bulk"); // hydration listing #1
+    await store.openRepo("/r/bulk"); // hydration: status read #1, branch listing #1
     await store.stageAll();
     // Pre-fix this was 1 + N (one full refresh per staged file): each cycle
-    // flipped the spinner and re-rendered the sidebar N times in a row.
-    expect(branchListings).toBe(2);
+    // flipped the spinner and re-rendered the sidebar N times in a row. Now
+    // one status refresh and no branch listing: the index cannot move a ref.
+    expect(statusReads).toBe(2);
+    expect(branchListings).toBe(1);
   });
 
   it("settles a no-change stats drain without extra publishes", async () => {

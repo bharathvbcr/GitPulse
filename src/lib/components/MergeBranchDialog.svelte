@@ -31,7 +31,7 @@
   let tabStop = $derived(visible.some(branch => mergeRef(branch) === selectedRef) ? selectedRef : visible[0] ? mergeRef(visible[0]) : "");
   let blocked = $derived(mergeBlockedReason($repoStore, request));
   let selectionMissing = $derived(selectedRef !== "" && !source);
-  let conflicted = $derived($repoStore.operation.operation?.conflicted_total || $repoStore.statuses.filter(s => s.is_conflicted).length);
+  let conflicted = $derived($repoStore.operation.operation?.conflicted_total || $repoStore.conflictedCount);
 
   // Child bindings settle after actions; focus only once the input is mounted.
   onMount(() => { searchInput?.focus(); });

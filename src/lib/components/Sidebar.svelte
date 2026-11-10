@@ -90,16 +90,21 @@
 
   /* --- Derived repo pulse --------------------------------------------------- */
 
-  let statuses = $derived($repoStore.statuses);
+  // Field stores: they notify when their value is replaced, not on every
+  // publish, so the file lists below are not rebuilt by a click elsewhere.
+  const statusesStore = repoStore.statuses;
+  const branchesStore = repoStore.branches;
+  const conflictedStore = repoStore.conflictedCount;
+  let statuses = $derived($statusesStore);
   let dirtyCount = $derived(statuses.length);
   let totalAdditions = $derived(statuses.reduce((n, s) => n + (s.additions || 0), 0));
   let totalDeletions = $derived(statuses.reduce((n, s) => n + (s.deletions || 0), 0));
-  let conflictedCount = $derived(statuses.filter((s) => s.is_conflicted).length);
+  let conflictedCount = $derived($conflictedStore);
 
   // The pulse strip speaks only for the checked-out branch; a remote ref or a
   // missing match must never surface someone else's counts.
   let currentBranchInfo = $derived(
-    $repoStore.branches.find((b) => b.is_current && !b.is_remote) ?? null,
+    $branchesStore.find((b) => b.is_current && !b.is_remote) ?? null,
   );
   let aheadCount = $derived(currentBranchInfo?.ahead_count ?? 0);
   let behindCount = $derived(currentBranchInfo?.behind_count ?? 0);
