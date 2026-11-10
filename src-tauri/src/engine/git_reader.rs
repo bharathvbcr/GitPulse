@@ -1298,6 +1298,7 @@ impl GitReader {
                     .iter()
                     .filter(|r| status_kind(r.index_status, r.work_status).work_changed),
                 reach,
+                cfg!(windows),
             );
             read_numstat(&repo, &["diff", "--numstat", "-z"], paths)?
         } else {
@@ -1309,6 +1310,7 @@ impl GitReader {
                     .iter()
                     .filter(|r| status_kind(r.index_status, r.work_status).staged),
                 reach,
+                cfg!(windows),
             );
             read_numstat(&repo, &["diff", "--cached", "--numstat", "-z"], paths)?
         } else {
@@ -6362,13 +6364,17 @@ const MAX_NUMSTAT_PATHSPEC_BYTES: usize = 16 * 1024;
 /// - a path is not valid UTF-8: it was decoded with replacement characters, and
 ///   a pathspec built from those names a file that does not exist, which would
 ///   read as zero churn;
-/// - a path is one [`listing_must_match_path_exactly`] names (`*?[` or `:`):
-///   Git for Windows glob-expands `*?[` after `:(literal)` and reads `X:rest`
-///   as a drive ("is outside repository"), which would fail the whole report.
-///   The predicate is the same on every platform so the decision is testable.
+/// - `windows` and a path is one [`listing_must_match_path_exactly`] names
+///   (`*?[` or `:`): Git for Windows glob-expands `*?[` after `:(literal)` and
+///   reads `X:rest` as a drive ("is outside repository"), which would fail the
+///   whole report. Git on macOS and Linux names those paths exactly (a
+///   SvelteKit `src/routes/[id]/+page.svelte` included), so there they keep
+///   the limited read. `windows` is a parameter, not a `cfg!`, so both
+///   answers are tested on any host; production passes `cfg!(windows)`.
 fn numstat_pathspecs<'a>(
     rows: impl Iterator<Item = &'a RawStatusRecord>,
     reach: NumstatReach,
+    windows: bool,
 ) -> Option<Vec<String>> {
     if reach == NumstatReach::WholeTree {
         return None;
@@ -6376,7 +6382,9 @@ fn numstat_pathspecs<'a>(
     let mut paths = std::collections::BTreeSet::new();
     for row in rows {
         for path in std::iter::once(&row.path).chain(row.old_path.as_ref()) {
-            if undecodable_path_warning(path).is_some() || listing_must_match_path_exactly(path) {
+            if undecodable_path_warning(path).is_some()
+                || (windows && listing_must_match_path_exactly(path))
+            {
                 return None;
             }
             paths.insert(path.as_str());
@@ -13574,6 +13582,12 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "both.txt",
             "conflict.txt",
             "dir/nested.txt",
+            // Names Git for Windows cannot take as a literal pathspec; here a
+            // `:(literal)` pathspec names them exactly (a glob would widen
+            // `glob*.txt` to its decoy), so the read stays limited.
+            "src/routes/[id]/+page.svelte",
+            "glob*.txt",
+            ":colon.txt",
         ];
         for name in tracked {
             std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
@@ -13623,6 +13637,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "glob_decoy.txt",
             "ünï.txt",
             "dir/nested.txt",
+            "src/routes/[id]/+page.svelte",
+            "glob*.txt",
+            ":colon.txt",
         ] {
             edit(name);
         }
@@ -13652,15 +13669,30 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
         assert_eq!(spawned.len(), 2, "one numstat each way: {spawned:?}");
         for argv in &spawned {
-            let at = argv.iter().position(|arg| arg == "--").expect("pathspec fence");
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("pathspec fence");
             assert!(
                 argv[at + 1..].iter().all(|spec| spec.starts_with(":(literal)")),
                 "every pathspec is literal: {argv:?}"
             );
         }
-        let worktree = spawned.iter().find(|a| !a.iter().any(|x| x == "--cached")).unwrap();
-        for wanted in [":(literal)-dash.txt", ":(literal)new\nline.txt"] {
-            assert!(worktree.iter().any(|spec| spec == wanted), "{wanted}: {worktree:?}");
+        let worktree = spawned
+            .iter()
+            .find(|a| !a.iter().any(|x| x == "--cached"))
+            .unwrap();
+        for wanted in [
+            ":(literal)-dash.txt",
+            ":(literal)new\nline.txt",
+            ":(literal)src/routes/[id]/+page.svelte",
+            ":(literal)glob*.txt",
+            ":(literal):colon.txt",
+        ] {
+            assert!(
+                worktree.iter().any(|spec| spec == wanted),
+                "{wanted}: {worktree:?}"
+            );
         }
         assert!(
             !worktree.iter().any(|spec| spec.contains("bystander")),
@@ -13675,21 +13707,30 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// Git for Windows reads `:(literal)X:rest` as a drive path ("is outside
     /// repository") and glob-expands `*?[` after `:(literal)`, so a status
     /// that names such a path cannot take the limited read there. The decision
-    /// is the same everywhere (it reuses [`listing_must_match_path_exactly`]),
-    /// so it is checked here on every platform; the Windows behaviour itself is
-    /// not exercised by this test.
+    /// is a function of (paths, is_windows), so both answers are checked here
+    /// on any host; the Windows behaviour of git itself is not exercised.
+    /// Elsewhere the same names keep the limited read: git there names them
+    /// exactly (see `status_numstat_is_limited_to_reported_paths_and_matches_the_whole_tree_read`).
     #[test]
-    fn numstat_pathspecs_are_withheld_for_paths_a_pathspec_cannot_name_exactly() {
+    fn numstat_pathspecs_are_withheld_on_windows_for_paths_a_pathspec_cannot_name_exactly() {
         let row = |path: &str| RawStatusRecord {
             index_status: ' ',
             work_status: 'M',
             path: path.to_string(),
             old_path: None,
         };
-        for hostile in ["glob*.txt", "q?.txt", "br[ac].txt", ":colon.txt", "C:rest.txt", "d/a:b"] {
+        for hostile in [
+            "glob*.txt",
+            "q?.txt",
+            "br[ac].txt",
+            ":colon.txt",
+            "C:rest.txt",
+            "d/a:b",
+            "src/routes/[id]/+page.svelte",
+        ] {
             let rows = [row("fine.txt"), row(hostile)];
             assert_eq!(
-                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, true),
                 None,
                 "{hostile}"
             );
@@ -13698,35 +13739,67 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 ..row("fine.txt")
             }];
             assert_eq!(
-                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths),
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths, true),
                 None,
                 "old side {hostile}"
             );
+            // Off Windows the same rows are limited, literal and complete.
+            assert_eq!(
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, false),
+                Some(vec![
+                    literal_pathspec("fine.txt"),
+                    literal_pathspec(hostile)
+                ])
+                .map(|mut specs| {
+                    specs.sort();
+                    specs
+                }),
+                "{hostile}"
+            );
+            assert_eq!(
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths, false)
+                    .map(|specs| specs.len()),
+                Some(2),
+                "old side {hostile}"
+            );
         }
-        assert!(numstat_pathspecs([row("fine.txt")].iter(), NumstatReach::ChangedPaths).is_some());
+        assert!(
+            numstat_pathspecs([row("fine.txt")].iter(), NumstatReach::ChangedPaths, true).is_some()
+        );
     }
 
-    /// The same names through a real status: the report still carries their
-    /// churn, read over the whole tree.
+    /// The same names through a real status: the report carries their churn
+    /// either way. On Windows the read is over the whole tree; everywhere else
+    /// it stays limited to the dirty paths, so a SvelteKit or Next.js route
+    /// (`src/routes/[id]/+page.svelte`) does not give the optimization away.
     #[test]
-    fn status_numstat_with_glob_and_drive_like_names_reads_the_whole_tree() {
+    fn status_numstat_with_glob_and_drive_like_names_reads_per_platform() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+        let names = [
+            "glob*.txt",
+            "glob_decoy.txt",
+            ":colon.txt",
+            "src/routes/[id]/+page.svelte",
+        ];
+        for name in names {
+            std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
             std::fs::write(root.join(name), "a\n").unwrap();
         }
         crate::test_support::git_in(&root, &["add", "."]);
         crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-        for name in ["glob*.txt", "glob_decoy.txt", ":colon.txt"] {
+        for name in names {
             std::fs::write(root.join(name), "a\nb\n").unwrap();
         }
         let (limited, whole, spawned) = status_both_ways(&root);
         assert_eq!(limited, whole);
         assert!(limited.contains("additions: 1"), "churn counted: {limited}");
-        assert!(
-            !spawned[0].iter().any(|arg| arg == "--"),
-            "whole-tree read: {:?}",
+        let fenced = spawned[0].iter().any(|arg| arg == "--");
+        assert_eq!(
+            fenced,
+            !cfg!(windows),
+            "limited off Windows, whole-tree on it: {:?}",
             spawned[0]
         );
     }
@@ -13748,10 +13821,14 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 .collect()
         };
         let limited = |rows: &[RawStatusRecord]| {
-            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths).map(|specs| specs.len())
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, cfg!(windows))
+                .map(|specs| specs.len())
         };
         let short = |count: usize| rows((0..count).map(|n| format!("f{n:04}")).collect());
-        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS)), Some(MAX_NUMSTAT_PATHSPECS));
+        assert_eq!(
+            limited(&short(MAX_NUMSTAT_PATHSPECS)),
+            Some(MAX_NUMSTAT_PATHSPECS)
+        );
         assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS + 1)), None);
         // 16 paths of 1024 bytes each are exactly the byte bound.
         let long = |count: usize, tail: usize| {
@@ -13839,7 +13916,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         };
         let rows = [row("new.txt", Some("old.txt")), row("b.txt", None)];
         assert_eq!(
-            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths),
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, cfg!(windows)),
             Some(vec![
                 ":(literal)b.txt".to_string(),
                 ":(literal)new.txt".to_string(),
@@ -13847,12 +13924,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             ]),
             "both sides of the rename, sorted and literal"
         );
-        assert_eq!(numstat_pathspecs(rows.iter(), NumstatReach::WholeTree), None);
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::WholeTree, cfg!(windows)),
+            None
+        );
         for odd in [
             [row("odd\u{FFFD}.txt", None)],
             [row("new.txt", Some("odd\u{FFFD}.txt"))],
         ] {
-            assert_eq!(numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths), None);
+            assert_eq!(
+                numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths, cfg!(windows)),
+                None
+            );
         }
     }
 
