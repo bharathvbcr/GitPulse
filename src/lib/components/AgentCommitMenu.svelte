@@ -88,8 +88,8 @@
   const repoPath = $derived($currentRepoPath);
   const statuses = $derived($repoStore.statuses);
   const dirtyCount = $derived(statuses.length);
-  const stagedCount = $derived(statuses.filter((s) => s.is_staged).length);
-  const conflictedCount = $derived(statuses.filter((s) => s.is_conflicted).length);
+  const stagedCount = $derived($repoStore.stagedCount);
+  const conflictedCount = $derived($repoStore.conflictedCount);
 
   /**
    * Scope is a choice only while some — not all — changes are staged. The

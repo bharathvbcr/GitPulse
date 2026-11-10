@@ -141,25 +141,52 @@ describe("file tree array identity", () => {
  */
 describe("array operations on $repoStore", () => {
   const LISTS = "statuses|branches|openTabs|tags|stashEntries|recentRepos";
-  const METHODS = "map|filter|flatMap|reduce|slice|sort|toSorted|concat|find|some|every|forEach";
+  // Anything that walks, searches, copies or re-shapes the array.
+  const METHODS =
+    "map|filter|flatMap|reduce|reduceRight|slice|splice|sort|toSorted|toReversed|toSpliced|reverse|concat|find|findIndex|findLast|findLastIndex|some|every|forEach|includes|indexOf|lastIndexOf|at|join|flat|with|entries|keys|values";
+  // `$repoStore.statuses` or `$repoStore["statuses"]`, optionally closed by `)` for `($repoStore.statuses).x`.
+  const LIST = `\\$repoStore\\s*(?:\\.\\s*(?:${LISTS})\\b|\\[\\s*["'](?:${LISTS})["']\\s*\\])`;
+  const SHAPES = [
+    // $repoStore.statuses.filter(...), ?.filter(...), ($repoStore.statuses).filter(...)
+    `${LIST}\\s*\\)?\\s*(?:\\?\\.|\\.)\\s*(?:${METHODS})\\s*\\(`,
+    // [...$repoStore.statuses]
+    `\\.\\.\\.\\s*${LIST}`,
+    // Array.from($repoStore.statuses), Array.from(($repoStore.statuses), ...)
+    `Array\\s*\\.\\s*from\\s*\\(\\s*\\(?\\s*${LIST}`,
+    // for (const f of $repoStore.statuses)
+    `\\bof\\s+\\(?\\s*${LIST}`,
+  ];
   const reads = (source: string): number =>
-    (source.match(new RegExp(`\\$repoStore\\s*\\.\\s*(?:${LISTS})\\s*(?:\\?\\.|\\.)\\s*(?:${METHODS})\\s*\\(`, "g")) ?? []).length +
-    (source.match(new RegExp(`\\.\\.\\.\\s*\\$repoStore\\.(?:${LISTS})\\b`, "g")) ?? []).length;
+    SHAPES.reduce((total, shape) => total + (source.match(new RegExp(shape, "g")) ?? []).length, 0);
 
-  it("counts a method call or spread on a list, and nothing else", () => {
+  it("counts every shape that walks or copies a list, and nothing else", () => {
     expect(reads("{#each $repoStore.statuses.filter(f) as s}")).toBe(1);
     expect(reads("const x = $derived([...$repoStore.branches, b]);")).toBe(1);
+    // The shapes the first version let through:
+    expect(reads("const i = $repoStore.branches.findIndex((b) => b.is_current);")).toBe(1);
+    expect(reads("const a = Array.from($repoStore.statuses);")).toBe(1);
+    expect(reads("const a = ($repoStore.tags).filter((t) => t.name);")).toBe(1);
+    expect(reads("const a = $repoStore?.statuses?.map(f);")).toBe(0); // `$repoStore?.` is not a shape the store has
+    expect(reads('const a = $repoStore["statuses"].map(f);')).toBe(1);
+    for (const method of ["includes", "indexOf", "lastIndexOf", "at", "join", "flat", "reduceRight", "findLast", "toSorted", "keys"]) {
+      expect(reads(`const a = $repoStore.stashEntries.${method}(x);`), method).toBe(1);
+    }
+    expect(reads("for (const f of $repoStore.statuses) use(f);")).toBe(1);
+    expect(reads("for (const f of ($repoStore.openTabs)) use(f);")).toBe(1);
+    // Not walks: a plain read, a length, another field, the field stores.
     expect(reads("const s = $derived($repoStore.statuses);")).toBe(0);
     expect(reads("{$repoStore.statuses.length} {$repoStore.currentPath}")).toBe(0);
     expect(reads("const n = $statuses.filter(f);")).toBe(0);
+    expect(reads("const n = $statusesStore.find(f);")).toBe(0);
+    expect(reads("const n = $repoStore.currentBranch.includes('x');")).toBe(0);
   });
 
   const KNOWN: Record<string, number> = {
-    "App.svelte": 2,
+    "App.svelte": 1,
     "lib/components/BlameViewer.svelte": 2,
     "lib/components/BranchList.svelte": 6,
     "lib/components/CommandPalette.svelte": 1,
-    "lib/components/CommitComposer.svelte": 2,
+    "lib/components/CommitComposer.svelte": 1,
     "lib/components/ConflictEditor.svelte": 2,
     "lib/components/DiffViewer.svelte": 1,
     "lib/components/FileViewer.svelte": 3,
@@ -173,7 +200,6 @@ describe("array operations on $repoStore", () => {
     "lib/components/TerminalDock.svelte": 2,
     "lib/components/WorkView.svelte": 1,
     "lib/components/WorkspaceActions.svelte": 1,
-    "lib/components/WorkspaceView.svelte": 1,
     "lib/components/WorktreesPanel.svelte": 3,
     "lib/components/files/FileTreePanel.svelte": 1,
     "lib/components/pulse/PulseView.svelte": 1,
@@ -186,6 +212,28 @@ describe("array operations on $repoStore", () => {
       if (count > 0) found[relative(SRC, file)] = count;
     }
     expect(found).toEqual(KNOWN);
+  });
+});
+
+/** The conflicted and staged counts are taken once per statuses array in the projection. */
+describe("counts come from the projection", () => {
+  const COMPONENTS = [
+    "App.svelte",
+    "lib/components/CommitComposer.svelte",
+    "lib/components/AgentCommitMenu.svelte",
+    "lib/components/WorkspaceView.svelte",
+  ];
+  const recount = /statuses\s*\.\s*filter\(\s*\(?\s*\w+\s*\)?\s*=>\s*\w+\.is_(?:conflicted|staged)\s*\)\s*\.\s*length/;
+
+  it.each(COMPONENTS)("%s does not recount statuses itself", (file) => {
+    expect(readFileSync(join(SRC, file), "utf8")).not.toMatch(recount);
+  });
+
+  it("every count the projection takes has a consumer", () => {
+    const consumers = (field: string) =>
+      svelteFiles(SRC).filter((file) => new RegExp(`\\$repoStore\\.${field}\\b|repoStore\\.${field}\\b`).test(readFileSync(file, "utf8")));
+    expect(consumers("conflictedCount").length).toBeGreaterThan(0);
+    expect(consumers("stagedCount").length).toBeGreaterThan(0);
   });
 });
 

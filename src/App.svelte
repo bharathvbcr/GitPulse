@@ -305,7 +305,7 @@
     }, DROP_HIDE_GRACE_MS);
   }
 
-  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+  let conflictedCount = $derived($repoStore.conflictedCount);
 
   /** Total occurrences across recorded errors, for the header badge. */
   let diagnosticErrorCount = $derived(
