@@ -12,7 +12,7 @@
    * Insights: what this repository is like, as opposed to what is happening
    * in it.
    *
-   * Pulse, Coverage, Health, Secrets and Storage are on-demand measurements
+   * Pulse, Coverage, Health (with its secrets scan) and Storage are on-demand measurements
    * that must say when they were capped rather than presenting a floor as a
    * total. Gathering them here is what lets that contract have one owner.
    *
@@ -25,13 +25,11 @@
     loadPulse,
     loadCoverage,
     loadHealth,
-    loadSecrets,
     loadStorage,
   }: {
     loadPulse: ViewLoader;
     loadCoverage: ViewLoader;
     loadHealth: ViewLoader;
-    loadSecrets: ViewLoader;
     loadStorage: ViewLoader;
   } = $props();
 
@@ -46,8 +44,6 @@
       <LazyView load={loadCoverage} name="Coverage" />
     {:else if section === "health"}
       <LazyView load={loadHealth} name="Health" />
-    {:else if section === "secrets"}
-      <LazyView load={loadSecrets} name="Secrets" />
     {:else if section === "storage"}
       <LazyView load={loadStorage} name="Storage" />
     {:else}

@@ -117,31 +117,20 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "code",
     label: "Code",
     summary:
-      "The working tree. Open a file in Explorer, inspect Blame, or navigate the code map.",
-    paletteCommand: "Open Code — the file explorer, editor, blame and map",
-    // Three readings of one repository. Explorer and Blame still share
-    // `selectedFilePath`; Map is the structural navigator over
+      "The working tree. Open, search and blame files in Explorer, or navigate the code map.",
+    paletteCommand: "Open Code — the file explorer, editor, search, blame and map",
+    // Two readings of one repository. Explorer is the file: its rail toggles
+    // between the tree and content search, and the open file between the
+    // editor and its blame (both were sections here once, and each sent the
+    // user back to Explorer for the file it had just named — see
+    // `files/explorerLens.ts`). Map is the structural navigator over
     // `.devcouncil/repo_map.json` plus docs search, doc graph, and workspace links.
     sections: [
       {
         id: "explorer",
         label: "Explorer",
         summary:
-          "Browse and edit files. The tree, editor tabs and the live pulse dashboard live here.",
-      },
-      {
-        id: "blame",
-        label: "Blame",
-        summary:
-          "Who last touched each line, and how old that code is. Keeps the file Explorer had open.",
-        paletteCommand: "Open Blame — line authorship and code age",
-      },
-      {
-        id: "search",
-        label: "Search",
-        summary:
-          "Search file contents across the working tree or a revision. A capped, cut or cancelled result says it is partial.",
-        paletteCommand: "Open Search — find text across the repository",
+          "Browse, search and edit files, and toggle the open file to its blame. The tree, content search, editor tabs and the live pulse dashboard live here.",
       },
       {
         id: "map",
@@ -196,7 +185,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "insights",
     label: "Insights",
     summary:
-      "On-demand measurements of this repository: activity, coverage, dependency health, secrets and disk. A scan that could not run is never shown as clean.",
+      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that could not run is never shown as clean.",
     paletteCommand: "Open Insights — activity, dependencies, coverage, secrets and disk",
     // Scans of one subject: this repository. They were separate header
     // entries, each empty until someone ran it. As sections they share one
@@ -216,19 +205,17 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
           "Line and file coverage from this project's own test commands. Truncation and failures are named, not dressed as 100%.",
         paletteCommand: "Open Coverage",
       },
+      // Secrets was a section of its own. It is a finding about this
+      // repository like the advisories beside it, and alone it had no way to
+      // hand its findings to a coding agent; inside Health it shares the
+      // verdict and the agent bar. A restored "secrets" lands here
+      // (`RETIRED_SECTIONS` in repos/persist.ts).
       {
         id: "health",
         label: "Health",
         summary:
-          "Local audits across ecosystems, Dependabot and code scanning alerts, and dead code from the code graph. A scanner that did not run is listed, not implied clean.",
-        paletteCommand: "Scan npm vulnerabilities and updates",
-      },
-      {
-        id: "secrets",
-        label: "Secrets",
-        summary:
-          "Working-tree secret scan via Kingfisher, located against Git: tracked, untracked, ignored. A partial or truncated scan is listed, never implied clean. No secret values are shown.",
-        paletteCommand: "Scan working tree for secrets",
+          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code graph. A scanner that did not run is listed, not implied clean. No secret values are shown.",
+        paletteCommand: "Scan dependencies and secrets",
       },
       {
         id: "storage",

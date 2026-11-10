@@ -25,6 +25,7 @@ import {
 } from "./report";
 import { formatSectionCount, isBounded } from "./counts";
 import { summarizeHealth } from "./summary";
+import type { SecretsReport } from "../secrets/types";
 import type {
   CodeScanningReport,
   DeadCodeReport,
@@ -458,6 +459,12 @@ describe("the verdict stays total and stays honest", () => {
     truncated: false,
     walkIncomplete: null,
   };
+  const cleanSecrets: SecretsReport = {
+    ok: true, error: null, diagnostic: null, kingfisher_present: true, kingfisher_version: "2.7.0",
+    kingfisher_version_rejected: false, nested_repos_scanned: true, completeness: "complete",
+    findings: [], findings_total: 0, findings_unreadable: 0, findings_truncated: false,
+    git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1,
+  };
 
   it("never throws on hostile strings in any text-bearing field", () => {
     for (const hostile of HOSTILE_STRINGS) {
@@ -481,11 +488,12 @@ describe("the verdict stays total and stays honest", () => {
         } as unknown as CodeScanningReport,
         codegraph: { ...graph, reason: hostile },
         deadCode: { ...liveDeadCode, reason: hostile, walkIncomplete: hostile },
+        secrets: { ...cleanSecrets, ok: false, error: hostile, diagnostic: hostile, findings_total: 1 },
       };
       const summary = summarizeHealth(input);
       expect(typeof summary.headline).toBe("string");
       expect(summary.headline.length).toBeGreaterThan(0);
-      expect(summary.facets).toHaveLength(6);
+      expect(summary.facets).toHaveLength(7);
       for (const caveat of summary.caveats) expect(typeof caveat).toBe("string");
       // An error *is* the error branch, so the feed can never read as clear.
       expect(summary.clearClaimable).toBe(false);
@@ -499,6 +507,7 @@ describe("the verdict stays total and stays honest", () => {
       codeScanning: null,
       codegraph: graph,
       deadCode: liveDeadCode,
+      secrets: cleanSecrets,
     };
     expect(summarizeHealth(input)).toEqual(summarizeHealth(input));
   });
@@ -538,6 +547,13 @@ describe("the verdict stays total and stays honest", () => {
       { ...liveDeadCode, walkIncomplete: "unresolved sites" },
       { ...liveDeadCode, total: 3, shown: 3 },
     ];
+    const secretScans: (SecretsReport | null)[] = [
+      cleanSecrets,
+      null,
+      { ...cleanSecrets, completeness: "partial" },
+      { ...cleanSecrets, ok: false, error: "kingfisher not found" },
+      { ...cleanSecrets, findings_total: 1 },
+    ];
 
     let sawClear = false;
     let sawUnclear = false;
@@ -546,12 +562,14 @@ describe("the verdict stays total and stays honest", () => {
         for (const codeScanning of feeds) {
           for (const codegraph of graphs) {
             for (const deadCode of deads) {
+              for (const secrets of secretScans) {
               const summary = summarizeHealth({
                 report,
                 dependabot: dependabot as unknown as DependabotReport | null,
                 codeScanning: codeScanning as unknown as CodeScanningReport | null,
                 codegraph,
                 deadCode,
+                secrets,
               });
               const everyFacetClear = summary.facets.every((f) => f.tone === "clear");
               expect(
@@ -566,6 +584,7 @@ describe("the verdict stays total and stays honest", () => {
               }
               if (summary.clearClaimable) sawClear = true;
               else sawUnclear = true;
+              }
             }
           }
         }
@@ -587,6 +606,7 @@ describe("the verdict stays total and stays honest", () => {
         codeScanning: null,
         codegraph: graph,
         deadCode: liveDeadCode,
+        secrets: cleanSecrets,
       });
       expect(typeof summary.headline).toBe("string");
       expect(summary.headline).not.toContain("undefined");
@@ -622,6 +642,7 @@ describe("the verdict stays total and stays honest", () => {
       codeScanning: null,
       codegraph: graph,
       deadCode: { ...liveDeadCode, total: 50_000, shown: 200, truncated: true },
+      secrets: { ...cleanSecrets, findings_total: 20_001, findings_truncated: true },
     });
     expectWithinBudget(
       performance.now() - started,

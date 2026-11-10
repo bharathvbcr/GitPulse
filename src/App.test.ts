@@ -58,7 +58,6 @@ const DEFERRED_VIEWS = [
   "GitHubPanel",
   "ManviOpsPanel",
   "ReflogViewer",
-  "BlameViewer",
   "ConflictEditor",
   "PulseView",
 ];

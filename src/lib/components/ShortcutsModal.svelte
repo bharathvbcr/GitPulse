@@ -89,6 +89,7 @@
         { keys: ["Esc"], description: "Close the find bar" },
         { keys: ["Alt", "↑ / ↓"], description: "Previous / next file in this change" },
         { keys: ["Alt", "PgUp / PgDn"], description: "Previous / next block of changes" },
+        { keys: ["Alt", "H"], description: "Commit history in the file rail, and back to the files" },
       ],
     },
     {

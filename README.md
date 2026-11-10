@@ -45,9 +45,9 @@ GitPulse has 4 application views with 18 specialized sections. Each view keeps r
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **Code** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
+| **Code** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
 | **History** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
-| **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
+| **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected
 file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (scaling to 1,000 repositories with 24 active watches),
@@ -127,7 +127,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 18 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end

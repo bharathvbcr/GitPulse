@@ -12,54 +12,34 @@
   /**
    * Code: the working tree, under whichever lens the question needs.
    *
-   * Explorer and Blame share `selectedFilePath`. Map is the structural
-   * navigator over the consumer repo map — subsystems, entry points, area
-   * tests — and does not need a file selected.
+   * Explorer is the file: its rail toggles between the tree and content
+   * search, and the open file between the editor and its blame — both used
+   * to be sections here. Map is the structural navigator over the consumer
+   * repo map — subsystems, entry points, area tests — and does not need a
+   * file selected.
    *
-   * Explorer is eager (the default section). Blame and Map stay lazy.
+   * Explorer is eager (the default section). Map stays lazy.
    */
 
   let {
-    /** Blame's loader, declared at module scope by App so it stays stable. */
-    loadBlame,
-    /** Map navigator loader — same stability rule as Blame. */
+    /** Map navigator loader, declared at module scope by App so it stays stable. */
     loadMap,
-    /** Content search loader — same stability rule as Blame. */
-    loadSearch,
   }: {
-    loadBlame: ViewLoader;
     loadMap: ViewLoader;
-    loadSearch: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("code", $repoStore.viewSections));
-  const selected = $derived($repoStore.selectedFilePath);
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewSectionBar view="code">
-    <!-- The subject Blame shares with Explorer. Map has its own subject
-         (subsystems), so the path chip stays Blame-only. -->
-    {#if selected && section === "blame"}
-      <span
-        class="ml-auto shrink-0 max-w-[40ch] truncate font-mono text-[11px] text-textMuted"
-        title={selected}
-      >
-        {selected}
-      </span>
-    {/if}
-  </ViewSectionBar>
+  <ViewSectionBar view="code" />
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane
          and replay the entrance fade, and FileViewer would lose its open tabs
          and unsaved drafts on every switch. -->
-    {#if section === "blame"}
-      <LazyView load={loadBlame} name="blame" />
-    {:else if section === "map"}
+    {#if section === "map"}
       <LazyView load={loadMap} name="Map" />
-    {:else if section === "search"}
-      <LazyView load={loadSearch} name="Search" />
     {:else}
       <FileViewer />
     {/if}

@@ -34,7 +34,7 @@
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
@@ -82,7 +82,9 @@
     updateKindClass,
   } from "../health/format";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
-  import { HEALTH_CONTENT_WIDTH, HEALTH_PROSE_WIDTH } from "../health/sections";
+  import { HEALTH_CONTENT_WIDTH, HEALTH_PREVIEW_ROWS, HEALTH_PROSE_WIDTH } from "../health/sections";
+  import { previewSlice } from "../ui/previewList";
+  import type { SecretsReport } from "../secrets/types";
   import { vulnerabilityEmptyMessage, type SectionCount } from "../health/counts";
   import { withoutTrailingPeriod } from "../format";
   import { keyedList } from "../ui/eachKeys";
@@ -93,6 +95,8 @@
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
   import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
+  import SecretsSection from "./health/SecretsSection.svelte";
+  import HealthPreviewToggle from "./health/HealthPreviewToggle.svelte";
   import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
@@ -154,6 +158,32 @@
    */
   let actionError = $state<string | null>(null);
   let filter = $state<"all" | "direct">("all");
+  /**
+   * The Secrets section's scan, mirrored here for the verdict and the agent
+   * prompt. The section owns the scan; Health only reads what it shows.
+   */
+  let secretsReport = $state<SecretsReport | null>(null);
+
+  /**
+   * Which long lists the reader expanded. Every list opens on its first
+   * HEALTH_PREVIEW_ROWS rows, and collapses again for the next repository.
+   * The heading counts are untouched: they state what the scan saw, and the
+   * toggle states what it can reveal.
+   */
+  const COLLAPSED_LISTS = {
+    vulnerabilities: false,
+    dependabot: false,
+    "code-scanning": false,
+    issues: false,
+    outdated: false,
+    packages: false,
+    "dead-code": false,
+  };
+  type PreviewedList = keyof typeof COLLAPSED_LISTS;
+  let expandedLists = $state({ ...COLLAPSED_LISTS });
+  function previewed<T>(list: PreviewedList, rows: readonly T[]): T[] {
+    return previewSlice(rows, expandedLists[list], HEALTH_PREVIEW_ROWS);
+  }
   let copied = $state(false);
   let fixing = $state(false);
   let plan = $state<AiGeneration | null>(null);
@@ -293,6 +323,7 @@
               walkIncomplete: deadSymbolsIncomplete,
             }
           : null,
+      secrets: secretsReport,
     });
   });
 
@@ -324,6 +355,7 @@
       "vulnerabilities",
       "dependabot",
       "code-scanning",
+      "secrets",
       "issues",
       "outdated",
       "packages",
@@ -758,14 +790,34 @@
   let agentLaunchController: AbortController | null = null;
 
   const agentActionLabel = $derived(HEALTH_AGENT_ACTIONS.find((action) => action.id === agentAction)?.label ?? "");
-  // Health attaches only the report it is already showing. Coverage, secrets
-  // and storage are scanned by their own pages; their prompts say nothing
-  // was attached instead of Health starting a second, uncancellable scan.
+  // Health attaches only what it is already showing: the dependency report
+  // and the secrets scan. Coverage and storage are scanned by their own
+  // pages; their prompts say nothing was attached instead of Health starting
+  // a second, uncancellable scan.
   const agentPrompt = $derived.by(() => {
     const repoPath = $repoStore.currentPath;
     if (!repoPath) return "";
-    return healthAgentPrompt(agentAction, repoPath, agentAction === "deps" ? renderedReport() : null);
+    return healthAgentPrompt(
+      agentAction,
+      repoPath,
+      agentAction === "deps" ? renderedReport() : null,
+      agentAction === "secrets" ? secretsReport : null,
+    );
   });
+
+  let agentRunButton = $state<HTMLButtonElement | null>(null);
+
+  /**
+   * The Secrets section's "Fix with agent". It selects the secrets task and
+   * opens the prompt in the agent bar rather than launching: the reader sees
+   * what will be sent and chooses the agent before anything starts.
+   */
+  async function sendSecretsToAgent() {
+    agentAction = "secrets";
+    agentPreviewOpen = true;
+    await tick();
+    agentRunButton?.focus();
+  }
 
   $effect(() => {
     void agentPrompt;
@@ -844,6 +896,7 @@
       untrack(() => {
         agentNotice = null;
         scanned.path = "";
+        secretsReport = null;
         report = null;
         reportPath = null;
         dependabot = null;
@@ -867,6 +920,7 @@
     cancelHealthAgentLaunch();
     untrack(() => {
       agentNotice = null;
+      expandedLists = { ...COLLAPSED_LISTS };
     });
     // Hydrate last-known data synchronously so a revisit renders instantly
     // (the placeholder below only fires when there is no cached report).
@@ -958,7 +1012,7 @@
     </div>
   {/snippet}
   {#snippet dependabotRows()}
-    {#each keyedList(dependabot?.alerts ?? [], (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
+    {#each keyedList(previewed("dependabot", dependabot?.alerts ?? []), (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
       <tr class="border-t border-border/40 align-top">
         <td class="px-3 py-1.5">
           <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(alert.severity)}">{alert.severity || "unranked"}</span>
@@ -994,7 +1048,7 @@
   {/snippet}
 
   {#snippet codeScanningRows()}
-    {#each keyedList(codeScanning?.alerts ?? [], (alert) => `${alert.number}:${alert.rule_id}:${alert.path}:${alert.start_line}`) as { item: alert, key } (key)}
+    {#each keyedList(previewed("code-scanning", codeScanning?.alerts ?? []), (alert) => `${alert.number}:${alert.rule_id}:${alert.path}:${alert.start_line}`) as { item: alert, key } (key)}
       <tr class="border-t border-border/40 align-top">
         <td class="px-3 py-1.5">
           <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(alert.severity)}">{alert.severity || "unranked"}</span>
@@ -1036,6 +1090,8 @@
       count={dependabotCount}
       tone={facetTone("dependabot")}
       noun="Dependabot alerts"
+      rowCount={dependabot?.alerts.length ?? 0}
+      bind:expanded={expandedLists.dependabot}
       columns={DEPENDABOT_COLUMNS}
       row={dependabotRows}
     />
@@ -1046,9 +1102,18 @@
       count={codeScanningCount}
       tone={facetTone("code-scanning")}
       noun="code scanning alerts"
+      rowCount={codeScanning?.alerts.length ?? 0}
+      bind:expanded={expandedLists["code-scanning"]}
       columns={CODE_SCANNING_COLUMNS}
       row={codeScanningRows}
     />
+  {/snippet}
+
+  <!-- Its own scan, independent of the dependency scan: rendered whether that
+       is loading, failed or loaded. A remount between those states joins the
+       Kingfisher scan already running rather than starting another. -->
+  {#snippet secretsSection()}
+    <SecretsSection bind:report={secretsReport} tone={facetTone("secrets")} onagent={sendSecretsToAgent} />
   {/snippet}
 
   <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between gap-3 shrink-0">
@@ -1160,6 +1225,7 @@
       <button
         type="button"
         class="gp-btn-primary py-1! px-2.5! text-[11px]!"
+        bind:this={agentRunButton}
         aria-label={`Run ${agentActionLabel} in ${PROVIDER_LABELS[agentLauncher]}`}
         title="Runs in GitPulse’s terminal with this repository as the working directory"
         disabled={!agentPrompt || agentLaunching}
@@ -1193,6 +1259,8 @@
           <p class="text-textMuted">
             {#if agentAction === "deps"}
               {report ? "Attaches the health report shown below." : "No health report is loaded yet; the prompt tells the agent to audit before changing anything."}
+            {:else if agentAction === "secrets"}
+              {secretsReport ? "Attaches the secrets scan shown below: rule, path, line and location, never a value." : "No secrets scan is loaded yet; the prompt tells the agent to scan before changing anything."}
             {:else}
               Health attaches no snapshot for this task; the prompt tells the agent to measure first.
             {/if}
@@ -1262,9 +1330,11 @@
           <Skeleton variant="text" count={4} height="2rem" />
         </div>
       </div>
+      {@render secretsSection()}
     {:else if errorMsg && !report}
       {@render scanFailureBanner()}
       {@render githubSections()}
+      {@render secretsSection()}
     {:else if report}
       {#if errorMsg}
         {@render scanFailureBanner()}
@@ -1462,7 +1532,7 @@
           </p>
         {:else}
           <HealthTable caption="Known vulnerabilities in this repository's dependencies" columns={VULNERABILITY_COLUMNS}>
-            {#each keyedList(visibleVulns, (vuln) => `${vuln.ecosystem}:${vuln.name}:${vuln.range}:${vuln.title}`) as { item: vuln, key } (key)}
+            {#each keyedList(previewed("vulnerabilities", visibleVulns), (vuln) => `${vuln.ecosystem}:${vuln.name}:${vuln.range}:${vuln.title}`) as { item: vuln, key } (key)}
               <tr class="border-t border-border/40 align-top">
                 <td class="px-3 py-1.5">
                   <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(vuln.severity)}">{vuln.severity}</span>
@@ -1488,17 +1558,23 @@
               </tr>
             {/each}
           </HealthTable>
+          <HealthPreviewToggle
+            total={visibleVulns.length}
+            noun="vulnerabilities"
+            bind:expanded={expandedLists.vulnerabilities}
+          />
         {/if}
       </HealthSection>
 
       {@render githubSections()}
+      {@render secretsSection()}
 
       <HealthSection id="issues" count={issuesCount} tone={facetTone("issues")}>
         {#if report.issues.length === 0}
           <p class="text-textMuted">No repository configuration issues were reported by this scan.</p>
         {:else}
           <div class="space-y-1.5 {HEALTH_PROSE_WIDTH}">
-            {#each keyedList(report.issues, (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
+            {#each keyedList(previewed("issues", report.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
               <div class="px-3 py-2 rounded-xl border {issueClass(issue.severity)}">
                 <div class="flex items-center gap-2 min-w-0">
                   <AlertTriangle size={12} class="shrink-0" aria-hidden="true" />
@@ -1514,6 +1590,7 @@
               </div>
             {/each}
           </div>
+          <HealthPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
         {/if}
       </HealthSection>
 
@@ -1524,7 +1601,7 @@
           </p>
         {:else}
           <HealthTable caption="npm packages behind their latest published release" columns={OUTDATED_COLUMNS}>
-            {#each keyedList(report.outdated, (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
+            {#each keyedList(previewed("outdated", report.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
               {@const kind = updateKind(pkg.current, pkg.latest)}
               <tr class="border-t border-border/40">
                 <td class="px-3 py-1.5 font-mono text-textPrimary">{pkg.name}</td>
@@ -1538,6 +1615,11 @@
               </tr>
             {/each}
           </HealthTable>
+          <HealthPreviewToggle
+            total={report.outdated.length}
+            noun="outdated packages"
+            bind:expanded={expandedLists.outdated}
+          />
         {/if}
       </HealthSection>
 
@@ -1560,7 +1642,7 @@
           <p class="text-textMuted">No package.json found. Other ecosystems are listed below when detected.</p>
         {:else}
           <div class="grid gap-2 md:grid-cols-2">
-            {#each keyedList(report.manifests, (pkg) => pkg.path) as { item: pkg, key } (key)}
+            {#each keyedList(previewed("packages", report.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
               <!-- Grid items default to `min-width: auto`, so a long manifest
                    path widens its column instead of wrapping inside it. -->
               <div class="p-3.5 rounded-2xl border border-border/70 bg-surface shadow-card min-w-0 [overflow-wrap:anywhere]">
@@ -1591,6 +1673,11 @@
               </div>
             {/each}
           </div>
+          <HealthPreviewToggle
+            total={report.manifests.length}
+            noun="package manifests"
+            bind:expanded={expandedLists.packages}
+          />
         {/if}
         {#if report.ecosystems.length > 0}
           <!-- One row per family, as a definition list rather than a prose run.
@@ -1686,7 +1773,7 @@
           </p>
         {:else if deadSymbolsAvailable && deadSymbols.length > 0}
           <HealthTable caption="Symbols the code graph found no reference to" columns={DEAD_CODE_COLUMNS}>
-            {#each keyedList(deadSymbols, (sym) => `${sym.file_path}:${sym.symbol_name}`) as { item: sym, key } (key)}
+            {#each keyedList(previewed("dead-code", deadSymbols), (sym) => `${sym.file_path}:${sym.symbol_name}`) as { item: sym, key } (key)}
               <tr class="border-t border-border/40">
                 <td class="px-3 py-1.5 font-mono text-textPrimary font-medium">{sym.symbol_name}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{sym.file_path}</td>
@@ -1705,6 +1792,11 @@
               </tr>
             {/each}
           </HealthTable>
+          <HealthPreviewToggle
+            total={deadSymbols.length}
+            noun="candidates"
+            bind:expanded={expandedLists["dead-code"]}
+          />
         {:else}
           <p class="text-[11px] text-textMuted">
             No dead-code result for this repository yet.

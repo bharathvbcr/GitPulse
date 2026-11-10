@@ -98,11 +98,11 @@ describe("persist workspace", () => {
     expect(loaded.tabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
     expect(loaded.tabs[0].pinned).toBe(true);
     expect(loaded.tabs[0].viewTab).toBe("work");
-    // "blame" was a view; it is a section of Code now, so the restored tab
-    // lands on Code *showing blame* rather than on Code's default pane —
-    // otherwise the retirement reads to the user as the content being gone.
+    // "blame" was a view, then a section of Code; it is a toggle on
+    // Explorer's open file now, so the restored tab lands on Code's Explorer
+    // — where the file it was blaming is still the selection.
     expect(loaded.tabs[1].viewTab).toBe("code");
-    expect(loaded.tabs[1].viewSections?.code).toBe("blame");
+    expect(loaded.tabs[1].viewSections?.code).toBe("explorer");
     expect(loaded.activePath).toBe("/r/a");
     expect(loaded.recents).toEqual(["/r/b", "/r/a"]);
   });

@@ -20,6 +20,23 @@ import type { GraphRenderConfig } from "../canvas/GraphRenderer";
 
 export type RailTab = "files" | "history";
 
+/** Whether the rail column is showing, and which of its tabs. */
+export interface RailView {
+  open: boolean;
+  tab: RailTab;
+}
+
+/**
+ * ⌥H and the toolbar's History button: History, from wherever the rail is —
+ * collapsed or on Files — and back to Files from History. One rule for both,
+ * so the key and the button never disagree about what "toggle" means.
+ */
+export function toggleHistoryView(view: RailView): RailView {
+  return view.open && view.tab === "history"
+    ? { open: true, tab: "files" }
+    : { open: true, tab: "history" };
+}
+
 /**
  * One history row. The canvas is painted on this pitch and every row is laid
  * out at it, so the two must agree exactly or nodes drift off their rows.

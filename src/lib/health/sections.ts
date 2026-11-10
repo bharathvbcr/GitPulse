@@ -52,6 +52,16 @@ export const HEALTH_CONTENT_WIDTH = "max-w-5xl";
 export const HEALTH_PROSE_WIDTH = "max-w-3xl";
 
 /**
+ * Rows a Health list shows before "Show all".
+ *
+ * One number for every list on the page, so sections line up and a reader
+ * learns the shape once. Long enough that a typical finding list needs no
+ * click; short enough that 200 outdated packages do not push the sections
+ * below them off the page.
+ */
+export const HEALTH_PREVIEW_ROWS = 8;
+
+/**
  * Rendered order, findings first.
  *
  * `plan` is the MANVI remediation plan. It sits above the findings because it
@@ -88,6 +98,16 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     label: "Code scanning",
     heading: "GitHub Code Scanning",
     summary: "Open GitHub code scanning alerts.",
+  },
+  {
+    // Secrets had a page of its own under Insights. It is a finding about
+    // this repository like the advisories around it, and as a page it had no
+    // way to hand its findings to a coding agent; here it shares Health's.
+    id: "secrets",
+    label: "Secrets",
+    heading: "Working-tree secrets",
+    summary:
+      "Secrets Kingfisher matched in the working tree, located against Git. No secret values are shown.",
   },
   {
     id: "issues",

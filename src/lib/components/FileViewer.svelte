@@ -27,6 +27,9 @@
   // Both registries must outlive a rendered FileViewer: App remounts this
   // component when switching views while an accepted write may still settle.
   const fileSaveQueue = editorFileSaveQueue;
+  // Module scope so LazyView sees one stable loader (see LazyView). Blame is
+  // the editor's other lens and stays out of the Code chunk until it is used.
+  const loadBlame = () => import("./BlameViewer.svelte");
   const viewerOwners = createLatestOwnerRegistry<{
     completeSave(path: string, savedContent: string, tabs: EditorTabState, savedBase: string | null): void;
   }>();
@@ -40,6 +43,7 @@
     PanelLeftClose,
     PanelLeftOpen,
     FileText,
+    Search,
     Copy,
     ExternalLink,
     ChevronRight,
@@ -60,7 +64,9 @@
   import type { SavedFile } from "../files/types";
   import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
-  import FileTreePanel from "./files/FileTreePanel.svelte";
+  import ExplorerRail from "./files/ExplorerRail.svelte";
+  import LazyView from "./LazyView.svelte";
+  import { explorerLens, showExplorerRail, toggleBlameLens } from "../files/explorerLens";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -510,12 +516,38 @@
    * repository's history. Selecting the path first is what makes the switch
    * land on the file the user is looking at rather than the last one.
    */
-  function inspectIn(lens: "diff" | "blame") {
+  function inspectInDiff() {
     if (!activeTabPath) return;
     repoStore.selectFilePath(activeTabPath);
-    if (lens === "diff") repoStore.setActiveTab("history", "diff");
-    else repoStore.setViewSection("code", "blame");
+    repoStore.setActiveTab("history", "diff");
   }
+
+  const searchRailUp = $derived(paneLayout.explorerVisible && $explorerLens.rail === "search");
+
+  /**
+   * Search lives in the Explorer column, so asking for it while that column
+   * is hidden shows the column on Search rather than flipping a mode nobody
+   * can see.
+   */
+  function toggleSearchRail() {
+    if (searchRailUp) {
+      showExplorerRail("files");
+      return;
+    }
+    showExplorerRail("search");
+    if (!paneLayout.explorerVisible) toggleSidePane("explorer");
+  }
+
+  // A request to search made from elsewhere (the command palette) must be
+  // able to see its own result: bring the column up for it. Visibility is
+  // tracked, not peeked: the request usually lands before this component has
+  // hydrated the repository's pane preferences, and hydration can hide the
+  // column again — this re-runs and shows it. The flag clears once the search
+  // box has taken focus, which needs the column on screen.
+  $effect(() => {
+    if (!$explorerLens.searchFocusPending || paneLayout.explorerVisible) return;
+    untrack(() => toggleSidePane("explorer"));
+  });
 
   /**
    * Ask the Explorer to show a directory. A nonce rather than the bare path,
@@ -744,6 +776,18 @@
       {/if}
     </button>
 
+    <button
+      type="button"
+      onclick={toggleSearchRail}
+      aria-label="Search file contents"
+      aria-pressed={searchRailUp}
+      title={searchRailUp ? "Back to the file tree" : "Search file contents across the repository"}
+      data-search-toggle
+      class="gp-icon-btn p-1.5! shrink-0 {searchRailUp ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+    >
+      <Search size={14} />
+    </button>
+
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
 
     {#if openTabs.length === 0}
@@ -929,7 +973,7 @@
 
         <button
           type="button"
-          onclick={() => inspectIn("diff")}
+          onclick={inspectInDiff}
           class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 text-cyan-400"
           title="View in Diff Tab"
         >
@@ -937,11 +981,17 @@
           <span>Diff</span>
         </button>
 
+        <!-- A toggle, not a destination: the open file reads as its blame
+             in place, and the tabs, tree and selection stay where they are. -->
         <button
           type="button"
-          onclick={() => inspectIn("blame")}
-          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 text-purple-400"
-          title="View Git Blame"
+          onclick={toggleBlameLens}
+          aria-pressed={$explorerLens.lens === "blame"}
+          data-blame-lens
+          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 {$explorerLens.lens === 'blame'
+            ? 'text-purple-300 bg-purple-500/15 border-purple-400/50!'
+            : 'text-purple-400'}"
+          title={$explorerLens.lens === "blame" ? "Back to the editor" : "Show Git blame for this file"}
         >
           <GitCommit size={11} />
           <span>Blame</span>
@@ -953,7 +1003,7 @@
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
     {#if paneLayout.explorerVisible}
       <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-72 shrink-0' : 'flex-1 min-w-0'}">
-        <FileTreePanel
+        <ExplorerRail
           selectedFile={activeTabPath}
           {revealRequest}
           onSelectFile={(path) => previewFile(path)}
@@ -970,7 +1020,11 @@
         role="tabpanel"
         class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative"
       >
-        {#if isLoadingFile && !blobIsCurrent}
+        {#if $explorerLens.lens === "blame" && activeTabPath}
+          <!-- Blame reads the same selection the tabs drive, so it follows
+               the active tab. It does not wait for the editor's read. -->
+          <LazyView load={loadBlame} name="Blame" />
+        {:else if isLoadingFile && !blobIsCurrent}
           <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
             <span>Loading file contents...</span>
           </div>
@@ -1006,7 +1060,9 @@
           <EmptyState
             icon={FileText}
             title="No file opened"
-            hint="Single-click previews a file; double-click pins it. Filter the tree with globs, /regex/, or ~fuzzy."
+            hint={$explorerLens.lens === "blame"
+              ? "Blame is on: the file you open shows its line authorship and code age."
+              : "Single-click previews a file; double-click pins it. Filter the tree with globs, /regex/, or ~fuzzy."}
           />
         {/if}
       </div>

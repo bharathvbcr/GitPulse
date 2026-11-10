@@ -411,7 +411,7 @@ flowchart TD
   still parses repository-supplied files with the user's account permissions.
 
 ### Secrets Scanner Privacy & Fail-Closed Reporting
-- Insights → Secrets integrates the Kingfisher scanner to discover exposed
+- Insights → Health integrates the Kingfisher secrets scanner to discover exposed
   API keys, access tokens, and credentials in repository files.
 - Kingfisher runs with `--redact` and `--no-validate`, a scrubbed environment
   (`PATH`, `HOME`, `NO_COLOR` only), and a fixed argv that never loads a

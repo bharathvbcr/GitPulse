@@ -75,6 +75,17 @@ describe("TerminalPanel session ownership", () => {
     // string, so the panel's own checkout spelled differently read as
     // elsewhere. Both now come from `sessionRow` (terminal/checkoutLabel.ts).
     expect(source).toContain("sessionRow(session, repoPath, checkouts, pathOpts)");
+    expect(source).toContain("groupSessionsByRepository(filteredSessions, repoPath, checkouts, pathOpts)");
+    expect(source).toContain('data-testid="session-path"');
+    expect(source).not.toContain("other checkout");
+    // Each session is a direct child of the list. A section around the
+    // repository made the group's first Go to the one a reader activated.
+    const list = source.slice(
+      source.indexOf('aria-label="Sessions across repositories"'),
+      source.indexOf("{#if waitingForCapacity"),
+    );
+    expect(list).not.toContain("<section");
+    expect(list).toContain('data-testid="session-group"');
     expect(source).not.toContain("session.repoPath.split(");
     expect(source).not.toMatch(/session\.repoPath\s*[!=]==\s*repoPath/);
     expect(source).toContain('data-testid="session-agent"');
@@ -129,6 +140,20 @@ describe("TerminalPanel rendering", () => {
     expect(body).toContain("Terminal");
     expect(body).toContain("Shell");
     expect(body).toContain("Console");
+  });
+
+  it("labels the session count as open sessions against the limit", () => {
+    const { body } = render(TerminalPanel);
+    const match = body.match(/data-testid="terminal-session-count"[^>]*>([\s\S]*?)<\/button>/);
+    expect(match).not.toBeNull();
+    const text = (match?.[1] ?? "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    // The old control was an unlabeled `0/32` icon button.
+    expect(text).toMatch(/^\d+ open \/ \d+ limit$/);
+    expect(text).not.toBe("0/32");
+    expect(source).toContain('data-testid="session-group"');
+    expect(source).toContain("sessionListNotice");
+    expect(source).not.toContain('aria-label="Terminal shortcuts"');
+    expect(source).not.toContain("{$terminalSessions.length}/{$terminalSessionLimit}");
   });
 });
 

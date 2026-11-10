@@ -20,7 +20,7 @@ const CONVERTED = [
   // flight, and its `live` state outlives the window being hidden.
   "components/GitHubPanel.svelte",
   "components/FirebasePanel.svelte",
-  "components/SecretsPanel.svelte",
+  "components/health/SecretsSection.svelte",
   "components/AgentsView.svelte",
 ] as const;
 
