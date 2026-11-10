@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeCheckout, sessionRow } from "./checkoutLabel";
+import { describeCheckout, groupSessionsByRepository, sessionRow } from "./checkoutLabel";
 
 const opts = { caseInsensitive: true };
 const TABS = [
@@ -42,6 +42,59 @@ describe("describeCheckout", () => {
 
   it("keeps case apart on a case-sensitive volume", () => {
     expect(describeCheckout("/WORK/APP", TABS, { caseInsensitive: false })).toMatchObject({ repository: "APP", primary: false });
+  });
+});
+
+describe("groupSessionsByRepository", () => {
+  const session = (repoPath: string, checkout?: string) => ({ repoPath, ...(checkout ? { checkout } : {}), label: "Claude" });
+
+  it("puts one repository's checkouts under one name and keeps their order", () => {
+    const groups = groupSessionsByRepository(
+      [
+        session("/work/app"),
+        session("/a/api"),
+        session("/work/app", "/work/app/.claude/worktrees/fix-importer-8540d4"),
+      ],
+      "/a/api",
+      TABS,
+      opts,
+    );
+    expect(groups.map((group) => group.repository)).toEqual(["api", "app"]);
+    expect(groups[0]).toMatchObject({ here: true, sessions: [session("/a/api")] });
+    expect(groups[1].here).toBe(false);
+    expect(groups[1].sessions.map((row) => row.repoPath)).toEqual(["/work/app", "/work/app"]);
+    expect(groups[1].sessions[1].checkout).toBe("/work/app/.claude/worktrees/fix-importer-8540d4");
+  });
+
+  it("does not merge two repositories that share a display name", () => {
+    const groups = groupSessionsByRepository(
+      [session("/a/api"), session("/b/api.git")],
+      null,
+      TABS,
+      opts,
+    );
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.repository)).toEqual(["api", "api"]);
+    expect(groups[0].key).not.toBe(groups[1].key);
+    expect(groups.every((group) => group.here === false)).toBe(true);
+  });
+
+  it("groups an agent worktree with no open tab by the repository in its path", () => {
+    const groups = groupSessionsByRepository(
+      [session("/work/svc/.gitpulse/worktrees/fix-1-a1b2c3d4"), session("/elsewhere/tool")],
+      "/work/svc",
+      [],
+      opts,
+    );
+    expect(groups.map((group) => ({ repository: group.repository, here: group.here }))).toEqual([
+      { repository: "svc", here: true },
+      { repository: "tool", here: false },
+    ]);
+  });
+
+  it("returns nothing for an empty list and skips a record with no repository", () => {
+    expect(groupSessionsByRepository([], "/work/app", TABS, opts)).toEqual([]);
+    expect(groupSessionsByRepository([{ repoPath: "" }], "/work/app", TABS, opts)).toEqual([]);
   });
 });
 

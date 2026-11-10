@@ -1,6 +1,7 @@
 import { formatCoverageAgentPrompt } from "../coverage/report";
 import { formatSecretsAgentPrompt } from "../secrets/agentPrompt";
 import { formatStorageAgentPrompt } from "../storage/agentPrompt";
+import type { SecretsReport } from "../secrets/types";
 import { AGENT_CONTEXT_CLIP_NOTE, boundAgentPrompt, safeBlock, safeText } from "../terminal/agentPromptText";
 
 export type HealthAgentAction = "deps" | "coverage" | "secrets" | "storage";
@@ -43,15 +44,21 @@ export function formatDependencyAgentPrompt(report: string | null, repoPath: str
 }
 
 /**
- * The prompt for one Health action. Only dependencies carry a snapshot —
- * the report already on screen. Coverage, secrets and storage are scanned by
- * their own pages, so their prompts state that nothing was attached.
+ * The prompt for one Health action. Dependencies and secrets carry a
+ * snapshot — the dependency report and the secrets scan already on screen,
+ * both Health's own. Coverage and storage are scanned by their own pages, so
+ * their prompts state that nothing was attached.
  */
-export function healthAgentPrompt(action: HealthAgentAction, repoPath: string, report: string | null): string {
+export function healthAgentPrompt(
+  action: HealthAgentAction,
+  repoPath: string,
+  report: string | null,
+  secrets: SecretsReport | null = null,
+): string {
   switch (action) {
     case "deps": return formatDependencyAgentPrompt(report, repoPath);
     case "coverage": return formatCoverageAgentPrompt(null, repoPath);
-    case "secrets": return formatSecretsAgentPrompt(repoPath);
+    case "secrets": return formatSecretsAgentPrompt(repoPath, secrets);
     case "storage": return formatStorageAgentPrompt(repoPath);
   }
 }

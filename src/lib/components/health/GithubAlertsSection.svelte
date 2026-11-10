@@ -1,6 +1,7 @@
 <script lang="ts">
   import HealthSection from "./HealthSection.svelte";
   import HealthTable from "./HealthTable.svelte";
+  import HealthPreviewToggle from "./HealthPreviewToggle.svelte";
   import { healthSection } from "../../health/sections";
   import type { SectionCount } from "../../health/counts";
   import type { HealthTone } from "../../health/summary";
@@ -57,6 +58,12 @@
     tone = null,
     /** Lowercase noun for prose: "Dependabot alerts", "code scanning alerts". */
     noun,
+    /**
+     * Rows the report holds. `row` renders only the first few until the
+     * reader expands the list; this is what "Show all" reveals.
+     */
+    rowCount,
+    expanded = $bindable(false),
     columns,
     row,
   }: {
@@ -66,6 +73,8 @@
     count: SectionCount;
     tone?: HealthTone | null;
     noun: string;
+    rowCount: number;
+    expanded?: boolean;
     columns: readonly { label: string; width?: string; hideLabel?: boolean }[];
     row: import("svelte").Snippet;
   } = $props();
@@ -132,5 +141,6 @@
     <HealthTable caption={`${spec?.heading ?? id}: ${noun}`} {columns}>
       {@render row()}
     </HealthTable>
+    <HealthPreviewToggle total={rowCount} {noun} bind:expanded />
   {/if}
 </HealthSection>

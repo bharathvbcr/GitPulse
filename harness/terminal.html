@@ -785,9 +785,7 @@
             const grid = visible("[data-terminal-session]")[0].getBoundingClientRect();
             return chrome.bottom <= grid.top + 1;
           };
-          button("Terminal shortcuts").click(); await wait();
-          check("shortcuts sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal keyboard shortcuts")));
-          button("Terminal shortcuts").click(); await wait();
+          check("the dock toolbar has no separate terminal shortcuts button", () => !label("Terminal shortcuts"));
           const beforeOptions = report.spawned;
           button("Terminal tab options").click(); await wait();
           check("tab options sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal tab name").closest("form")));
@@ -872,13 +870,13 @@
             await wait(40);
           }
           check("global session limit spans both repositories", () => report.spawned === SESSION_LIMIT && button("New Shell session").disabled);
-          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT}/${SESSION_LIMIT}`));
+          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
           // The limit is live: raising it in Settings frees a place at once
           // (a waiting task terminal opens off the same `canCreate`), and
           // lowering it again closes nothing.
           setTerminalSessionLimit(SESSION_LIMIT + 1); await wait();
           check("raising the limit frees a place at once",
-            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT}/${SESSION_LIMIT + 1}`));
+            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
           setTerminalSessionLimit(undefined); await wait();
           check("lowering it again closes nothing",
             () => button("New Shell session").disabled && report.spawned === SESSION_LIMIT && report.killed === 0);

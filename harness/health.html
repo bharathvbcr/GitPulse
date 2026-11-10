@@ -26,7 +26,15 @@
       let githubMode = "alerts";
       // Knobs for healthChecks.js; all null/zero outside its scenarios.
       const ipcLog = [], aiCalls = [], runs = [];
-      const knobs = { scanDelay: 0, deps: null, dead: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH" };
+      const knobs = { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH" };
+      // Health's secrets section scans on open. A complete, empty scan by
+      // default, so every other check reads a verdict secrets does not move.
+      const secretsReport = (findings = []) => ({
+        ok: true, error: null, diagnostic: null, kingfisher_present: true, kingfisher_version: "2.7.0",
+        kingfisher_version_rejected: false, nested_repos_scanned: true, completeness: "complete",
+        findings, findings_total: findings.length, findings_unreadable: 0, findings_truncated: false,
+        git_status_known: true, max_file_size_mb: 256, scanned_at_ms: Date.now(), duration_ms: 3,
+      });
       const delayed = answer => knobs.scanDelay ? new Promise(resolve => setTimeout(() => resolve(answer), knobs.scanDelay)) : answer;
 
       const bigCount = 400;
@@ -181,6 +189,7 @@
             return githubReport("code-scanning");
           case "cmd_codeintel_dead_symbols": return knobs.dead ? knobs.dead() : deadSymbols();
           case "cmd_codeintel_status": return codeintelStatus();
+          case "cmd_scan_secrets": return knobs.secrets ? knobs.secrets() : secretsReport();
           case "cmd_copy_text": return null;
           case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
           case "cmd_stash_list": return { entries: [], truncated: false };
@@ -448,6 +457,26 @@
           });
           check("a capped total is headlined, not the surviving rows", () =>
             has(section("vulnerabilities").querySelector("h3"), "showing"));
+          // The heading states the scan's count; the list itself opens short.
+          const previewRows = id => section(id).querySelectorAll("tbody tr").length;
+          const previewToggle = id => section(id).querySelector("[data-health-preview-toggle]");
+          for (const [id, label] of [["vulnerabilities", "Show all 400 vulnerabilities"], ["outdated", "Show all 400 outdated packages"], ["dead-code", "Show all 250 candidates"]]) {
+            check(`a long ${id} list opens on its first 8 rows, with "${label}" beneath it`, () =>
+              previewRows(id) === 8 && has(previewToggle(id), label) && previewToggle(id).getAttribute("aria-expanded") === "false");
+          }
+          check("the issue list opens on its first 8 issues, with Show all beneath it", () =>
+            section("issues").querySelectorAll(".rounded-xl.border:not([data-health-preview-toggle])").length === 8
+              && has(previewToggle("issues"), "Show all 60 issues"));
+          previewToggle("outdated").click();
+          await tick();
+          check("Show all reveals every row of that list, and only that list", () =>
+            previewRows("outdated") === 400 && previewToggle("outdated").getAttribute("aria-expanded") === "true"
+              && previewRows("vulnerabilities") === 8);
+          check("an expanded large list still does not scroll sideways", () =>
+            scroller().scrollWidth <= scroller().clientWidth + 1);
+          previewToggle("outdated").click();
+          await tick();
+          check("Show fewer collapses it again", () => previewRows("outdated") === 8);
           check("the header still does not clip under a large report", () =>
             header().scrollWidth <= header().clientWidth + 1);
           check("the agent bar still renders and does not clip under a large report", () =>
@@ -594,7 +623,7 @@
           const { runHealthChecks } = await import("./healthChecks.js");
           await runHealthChecks({
             check, root, section, has, flat, wait, until, button, scroller, header, agentBar, rescan,
-            ipcLog, aiCalls, runs, knobs, tick, healthReport, remount, detach, attach,
+            ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach,
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           check("no unhandled runtime errors", () => errors.length === 0);

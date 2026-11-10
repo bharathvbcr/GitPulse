@@ -417,14 +417,16 @@
 
           // --- claims the source-text tests used to make ------------------------
           setMode("mixed"); await until(() => rows().length > 0 && !!strip());
-          const explorerToggle = () => [...document.querySelectorAll("button")].find(node => /Explorer/.test(node.title));
-          const explorerOpen = () => !!document.querySelector('[role="tree"]');
-          check("the explorer is open beside the blame pane, with a toggle that names its state", () =>
-            explorerOpen() && /^Hide Explorer/.test(explorerToggle()?.title ?? ""));
-          explorerToggle().click(); await tick(); await wait();
-          check("the toggle hides the explorer and says Show", () => !explorerOpen() && /^Show Explorer/.test(explorerToggle()?.title ?? ""));
-          window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", metaKey: true, bubbles: true, cancelable: true })); await tick(); await wait();
-          check("Command-B brings it back", () => explorerOpen());
+          // Blame is Explorer's other lens on the open file now, drawn beside
+          // Explorer's own tree. A second tree here — and a second ⌘B handler
+          // fighting Explorer's for the same chord — is the duplicate the
+          // merge removed.
+          check("blame carries no file tree or explorer toggle of its own", () =>
+            !document.querySelector('[role="tree"]') &&
+            ![...document.querySelectorAll("button")].some(node => /Explorer/.test(node.title)));
+          const chord = new KeyboardEvent("keydown", { key: "b", metaKey: true, bubbles: true, cancelable: true });
+          window.dispatchEvent(chord); await tick(); await wait();
+          check("and Command-B is left to Explorer", () => !chord.defaultPrevented && !document.querySelector('[role="tree"]'));
 
           coverageRefused = true;
           setMode("fresh"); await until(() => rows().length === 20);

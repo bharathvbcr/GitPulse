@@ -188,10 +188,40 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // path box so a user would not have to walk back to Files for the file they
   // already had open — the same tell Diff gave. As sections of Code the
   // selection survives the switch, so the second set of pickers is what the
-  // merge removes.
+  // merge removes. Blame then folded further, into a toggle on Explorer's
+  // open file, so a restored "blame" lands on Explorer with that file open.
   files: { tab: "code", section: "explorer" },
-  blame: { tab: "code", section: "blame" },
+  blame: { tab: "code", section: "explorer" },
 };
+
+/**
+ * Sections this build no longer registers, by view, and the section of the
+ * same view that shows their content now.
+ *
+ * A remembered section the registry does not offer falls back to the view's
+ * first section, which for a section that merged into a sibling lands the
+ * reader on an unrelated pane and reads as the content having been deleted.
+ *
+ * Only restored sessions read this. Menu and palette destinations naming a
+ * retired section still do not navigate (`nativeActions.ts`), so a stale
+ * native menu id cannot open a surprise pane.
+ */
+export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
+  // Secrets became a section of Health: one verdict, one agent bar.
+  insights: { secrets: "health" },
+  // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
+  // the file a saved session was searching or blaming is still the selection.
+  code: { search: "explorer", blame: "explorer" },
+  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
+  // itself is restored from the same retired id by `restoredHistoryList`.
+  history: { reflog: "graph" },
+};
+
+/** Where a remembered section of `view` lives now; unchanged when not retired. */
+export function retiredSectionFor(view: ViewTab, section: string): string {
+  const moved = RETIRED_SECTIONS[view];
+  return moved && Object.hasOwn(moved, section) ? moved[section] : section;
+}
 
 /** The retirement record for a persisted id, or null when it is not retired. */
 export function retiredViewFor(value: unknown): RetiredView | null {
@@ -232,7 +262,7 @@ export function sanitizeViewSections(
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [view, section] of Object.entries(raw as Record<string, unknown>)) {
       if (!isViewTab(view) || typeof section !== "string") continue;
-      const resolved = resolveSection(view, section);
+      const resolved = resolveSection(view, retiredSectionFor(view, section));
       if (resolved) out[view] = resolved;
     }
   }

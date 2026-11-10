@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
-  import { platformChord, shortcutKeyLabel, shortcutTextLabel } from "../ui/platformCopy";
+  import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { closeWithConfirmation, terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
@@ -33,7 +33,6 @@
     ChevronDown,
     Maximize2,
     Minimize2,
-    Keyboard,
     Columns2,
     Settings2,
     ChevronLeft,
@@ -49,7 +48,8 @@
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
-  import { sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
+  import { groupSessionsByRepository, sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
+  import { sessionCountLabel, sessionIsLive, sessionListCommand, sessionListNotice, sessionStatusLabel } from "../terminal/sessionList";
   import { forgetEndedTail } from "../terminal/endedBuffer";
   import ScrollCue from "./ScrollCue.svelte";
   import {
@@ -211,6 +211,10 @@
   let sessionSearchInput = $state<HTMLInputElement | null>(null);
   let launcherSearchInput = $state<HTMLInputElement | null>(null);
   let launcherTriggerEl = $state<HTMLButtonElement | null>(null);
+  let sessionListTrigger = $state<HTMLButtonElement | null>(null);
+  let sessionListEl = $state<HTMLDivElement | null>(null);
+  /** Null until the reader moves: the focused row, or the first, starts selected. */
+  let sessionListHighlight = $state<number | null>(null);
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
   let unread = $state(new Set<string>());
@@ -223,7 +227,6 @@
   const capacityTitle = $derived(canCreate ? "New terminal session" : stripFull
     ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
     : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
-  let shortcutsOpen = $state(false);
   let focusTabStrip = false;
   const tabExtras = $derived.by(() => {
     const extras: Record<string, { status?: string; unread?: boolean }> = {};
@@ -234,12 +237,31 @@
   });
   const filteredTabs = $derived(filterTerminalTabs(tabState.tabs, sessionQuery, tabExtras));
   const filteredSessions = $derived(filterSessionRecords($terminalSessions, sessionListQuery));
+  const sessionGroups = $derived(groupSessionsByRepository(filteredSessions, repoPath, checkouts, pathOpts));
+  const sessionListFlat = $derived(sessionGroups.flatMap((group) => group.sessions));
+  const sessionListLive = $derived(
+    $terminalSessions.reduce((count, session) => count + (sessionIsLive(session.status) ? 1 : 0), 0),
+  );
+  const sessionListMessage = $derived(
+    sessionListNotice($terminalSessions.length, filteredSessions.length, sessionListLive),
+  );
+  const sessionListIndex = $derived.by(() => {
+    const rows = sessionListFlat;
+    if (rows.length === 0) return -1;
+    if (sessionListHighlight !== null && sessionListHighlight >= 0 && sessionListHighlight < rows.length) {
+      return sessionListHighlight;
+    }
+    const focused = rows.findIndex(
+      (session) => session.key === activeId && !!repoPath && sameRepo(repoPath, session.repoPath, pathOpts),
+    );
+    return focused >= 0 ? focused : 0;
+  });
   const filteredLaunchers = $derived(filterLaunchers(LAUNCHERS, launcherQuery));
   /**
    * Compact overlay, not an in-flow chrome row. A full-width `terminal-popover`
    * shoved the PTY down by the height of the type list. The other chrome
    * bars stay in the column because they are short toolbars; this one is a
-   * picker, so it uses the same portaled menu as HeaderRepoMenu.
+   * picker, so it uses the shared portaled popover (`ui/popover.ts`).
    */
   const launcherMenuDismissal = $derived({
     anchor: { kind: "element" as const, element: launcherTriggerEl, gap: 6 },
@@ -260,9 +282,54 @@
   function closeChrome() {
     tabOptions = false;
     sessionListOpen = false;
-    shortcutsOpen = false;
     sessionSearchOpen = false;
     launcherMenuOpen = false;
+  }
+
+  function toggleSessionList() {
+    const next = !sessionListOpen;
+    closeChrome();
+    sessionListOpen = next;
+    sessionListHighlight = null;
+    if (next) void tick().then(() => sessionListEl?.focus());
+  }
+
+  function dismissSessionList() {
+    sessionListOpen = false;
+    restoreFocusTo(sessionListTrigger);
+  }
+
+  function revealSessionRow(node: HTMLElement, active: boolean) {
+    if (active) node.scrollIntoView({ block: "nearest" });
+    return {
+      update(next: boolean) {
+        if (next) node.scrollIntoView({ block: "nearest" });
+      },
+    };
+  }
+
+  function onSessionListKey(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    const command = sessionListCommand(event.key);
+    if (command === "none") return;
+    if (command === "up" || command === "down") {
+      event.preventDefault();
+      if (sessionListFlat.length === 0) return;
+      const current = sessionListIndex < 0 ? 0 : sessionListIndex;
+      sessionListHighlight = stepSearchIndex(sessionListFlat.length, current, command === "down" ? 1 : -1);
+      return;
+    }
+    if (command === "escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      dismissSessionList();
+      return;
+    }
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest("[data-session-aux]")) return;
+    event.preventDefault();
+    const session = sessionListFlat[sessionListIndex];
+    if (session?.reveal) void goToSession(session);
   }
 
   function openSessionSearch() {
@@ -666,10 +733,12 @@
 
   function handlePanelKey(event: KeyboardEvent) {
     if (!visible || event.defaultPrevented) return;
-    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || shortcutsOpen || sessionSearchOpen || launcherMenuOpen)) {
+    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || sessionSearchOpen || launcherMenuOpen)) {
+      const sessionsWereOpen = sessionListOpen;
       closeChrome();
       event.preventDefault(); event.stopPropagation();
-      if (activeId) sessions[activeId]?.reveal();
+      if (sessionsWereOpen) restoreFocusTo(sessionListTrigger);
+      else if (activeId) sessions[activeId]?.reveal();
       return;
     }
     if (handleChord(event)) return;
@@ -981,8 +1050,17 @@
           <span>Clear</span>
         </button>
       {/if}
-      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { const next = !sessionListOpen; closeChrome(); sessionListOpen = next; }}>{$terminalSessions.length}/{$terminalSessionLimit}</button>
-      <button type="button" class="gp-icon-btn" aria-label="Terminal shortcuts" aria-expanded={shortcutsOpen} title="Terminal shortcuts" onclick={() => { const next = !shortcutsOpen; closeChrome(); shortcutsOpen = next; }}><Keyboard size={13} /></button>
+      <button
+        bind:this={sessionListTrigger}
+        type="button"
+        class="gp-icon-btn px-2! gap-1 text-[10px]! tabular-nums whitespace-nowrap"
+        aria-label="All terminal sessions"
+        aria-expanded={sessionListOpen}
+        aria-controls="terminal-session-list"
+        title="Sessions across repositories"
+        data-testid="terminal-session-count"
+        onclick={toggleSessionList}
+      >{sessionCountLabel($terminalSessions.length, $terminalSessionLimit)}</button>
       {#if onToggleExpanded}
         <button type="button" class="gp-icon-btn" aria-label={expanded ? "Restore terminal size" : "Expand terminal"} title={expanded ? "Restore terminal size" : "Expand terminal"} onclick={onToggleExpanded}>
           {#if expanded}<Minimize2 size={13} />{:else}<Maximize2 size={13} />{/if}
@@ -995,56 +1073,118 @@
   </div>
 
   {#if sessionListOpen}
-    <div class="terminal-popover px-3 py-2 overflow-auto border-b border-border/60 gp-section-edge bg-surface text-[11px]" aria-label="Sessions across repositories">
+    <div
+      bind:this={sessionListEl}
+      id="terminal-session-list"
+      class="terminal-popover terminal-session-list px-3 py-2 border-b border-border/60 gp-section-edge bg-surface text-[11px]"
+      role="listbox"
+      aria-label="Sessions across repositories"
+      aria-activedescendant={sessionListIndex >= 0 ? `terminal-session-option-${sessionListIndex}` : undefined}
+      tabindex="0"
+      onkeydown={onSessionListKey}
+    >
       <input
         type="search"
         aria-label="Search terminal sessions"
         placeholder="Search sessions"
         bind:value={sessionListQuery}
         maxlength="128"
+        oninput={() => (sessionListHighlight = null)}
         class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
       />
-      {#each filteredSessions as session (session.key)}
-        <!-- Repository and checkout, not the path's last segment: an agent
-             worktree's slug alone says nothing about which repository it is
-             in, and two repositories can share a name. Named by the rule the
-             tab strip's stacks use (`terminal/checkoutLabel.ts`). -->
-        {@const row = sessionRow(session, repoPath, checkouts, pathOpts)}
-        <div class="flex gap-2 items-center py-0.5" data-testid="session-row">
-          <span class="flex-1 min-w-0 flex items-center gap-1.5" title={session.checkout ?? session.repoPath}>
-            <span class="min-w-0 truncate">
-              <span class="font-medium" data-testid="session-repository">{row.repository}</span>{#if row.checkout}<span class="text-textMuted" aria-hidden="true"> / </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
-              <span class="text-textMuted"> · {session.title ? `${session.title} · ` : ""}{row.agent ? "" : `${session.label} · `}{session.status}{session.taskRunId ? " · task attempt" : session.continuesRunId ? " · resumed conversation" : ""}{row.here ? "" : " · other checkout"}</span>
-            </span>
-            {#if row.agent}<span class="shrink-0 rounded border border-accent/40 px-1 text-[10px] leading-4 text-accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
-          </span>
-          <!-- The list has always been able to NAME every shell across every
-               repository; until now the only thing it could do with one was
-               kill it. -->
-          <button
-            type="button"
-            class="gp-btn py-0!"
-            disabled={!session.reveal}
-            title={session.reveal
-              ? (row.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
-              : "This session's panel is not mounted, so it cannot be shown"}
-            onclick={() => void goToSession(session)}
-          >Go to</button>
-          {#if row.taskRunId}
-            <!-- A resumed conversation links back too: it continues an
-                 attempt, and that attempt's task is where it is listed. -->
-            <button
-              type="button"
-              class="gp-btn py-0!"
-              data-testid="session-open-task"
-              title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
-              onclick={() => void openListedTask(row.taskRunId)}
-            >Task</button>
-          {/if}
-          <button type="button" class="gp-btn py-0!" onclick={() => void closeListed(session)}>Close session</button>
-        </div>
-      {:else}
-        <span>{$terminalSessions.length ? "No sessions match." : "No active processes."}</span>
+      {#if sessionListMessage}
+        <p class="mb-1 text-textMuted" data-testid="session-list-notice">{sessionListMessage}</p>
+      {/if}
+      <!-- One header per repository, drawn on that group's first session so
+           every session stays a direct child of this list. A wrapper around
+           the group would make the group's first Go to the one a reader
+           activates. A flat row repeated the repository on every line, and
+           the checkout path only appeared as a tooltip over the empty middle.
+           Named by the same rule as the tab strip (`terminal/checkoutLabel.ts`);
+           two repositories that share a name stay separate groups. -->
+      {#each sessionGroups as group (group.key)}
+        {#each group.sessions as session, indexInGroup (session.key)}
+            {@const row = sessionRow(session, repoPath, checkouts, pathOpts)}
+            {@const where = session.checkout ?? session.repoPath}
+            {@const index = sessionListFlat.findIndex((candidate) => candidate.key === session.key)}
+            {@const focused = session.key === activeId && row.here}
+            <div
+              id="terminal-session-option-{index}"
+              class="session-row {focused ? 'bg-accent/10 rounded-lg' : ''} {index === sessionListIndex ? 'ring-1 ring-inset ring-accent/40 rounded-lg' : ''}"
+              role="option"
+              data-testid="session-row"
+              data-focused={focused ? "true" : "false"}
+              aria-selected={index === sessionListIndex}
+              tabindex="-1"
+              use:revealSessionRow={index === sessionListIndex}
+              onclick={(event) => {
+                const target = event.target;
+                if (target instanceof Element && target.closest("[data-testid='session-group']")) return;
+                if (session.reveal) void goToSession(session);
+              }}
+              onkeydown={(event) => {
+                if (event.key !== "Enter" || !session.reveal) return;
+                event.preventDefault();
+                event.stopPropagation();
+                void goToSession(session);
+              }}
+            >
+              {#if indexInGroup === 0}
+                <div class="session-group-head flex items-baseline gap-2 pt-1.5 pb-0.5" data-testid="session-group">
+                  <span class="font-medium" data-testid="session-repository">{group.repository}</span>
+                  <span class="text-textMuted">{group.sessions.length} {group.sessions.length === 1 ? "session" : "sessions"}</span>
+                  {#if group.here}<span class="text-textMuted">This repository</span>{/if}
+                </div>
+              {/if}
+              <span class="min-w-0 flex items-center gap-1.5">
+                {#if row.agent}<span class="shrink-0 rounded border border-accent/40 px-1 text-[10px] leading-4 text-accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
+                <span class="min-w-0 truncate">
+                  <span class="font-medium text-textPrimary">{session.title?.trim() || session.label.trim() || "Shell"}</span>
+                  {#if row.checkout}<span class="text-textMuted" aria-hidden="true"> · </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
+                  <span class="text-textMuted"> · <span data-testid="session-status">{sessionStatusLabel(session.status)}</span></span>
+                  <span class="sr-only">{session.status}</span>
+                  {#if session.taskRunId}<span class="text-textMuted"> · task attempt</span>{:else if session.continuesRunId}<span class="text-textMuted"> · resumed conversation</span>{/if}
+                </span>
+              </span>
+              <span class="session-path truncate font-mono text-textMuted" data-testid="session-path" title={where}>{where}</span>
+              <span class="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  class="gp-btn py-0!"
+                  disabled={!session.reveal}
+                  title={session.reveal
+                    ? (row.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
+                    : "This session's panel is not mounted, so it cannot be shown"}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    void goToSession(session);
+                  }}
+                >Go to</button>
+                {#if row.taskRunId}
+                  <button
+                    type="button"
+                    class="gp-btn py-0!"
+                    data-session-aux
+                    data-testid="session-open-task"
+                    title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      void openListedTask(row.taskRunId);
+                    }}
+                  >Task</button>
+                {/if}
+                <button
+                  type="button"
+                  class="gp-btn py-0! ml-3 text-textMuted"
+                  data-session-aux
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    void closeListed(session);
+                  }}
+                >Close session</button>
+              </span>
+            </div>
+        {/each}
       {/each}
     </div>
   {/if}
@@ -1064,27 +1204,6 @@
       <button type="button" class="text-xs hover:text-white" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
-  {#if shortcutsOpen}
-    <div class="terminal-popover px-3 py-2 flex flex-wrap gap-x-5 gap-y-1 text-[10px] text-textMuted bg-surface border-b border-border/60 gp-section-edge" aria-label="Terminal keyboard shortcuts">
-      <span><kbd>Ctrl+Shift+T</kbd> New shell</span>
-      <span><kbd>Ctrl+Shift+W</kbd> Close session</span>
-      <span><kbd>Ctrl+Tab / Ctrl+Shift+Tab</kbd> Next / previous tab</span>
-      <span><kbd>{platformChord("⌘F", "Ctrl+Shift+F", $hostPlatform.os)}</kbd> Find</span>
-      <span><kbd>Enter / Shift+Enter</kbd> Next / previous match</span>
-      <span><kbd>Esc</kbd> Close find</span>
-      <span><kbd>{platformChord("⌘ + / − / 0", "Ctrl+Shift+ + / − / 0", $hostPlatform.os)}</kbd> Text size</span>
-      <span><kbd>← / → / Home / End</kbd> Navigate focused tabs</span>
-      {#if $hostPlatform.os === "macos"}
-        <span><kbd>{shortcutKeyLabel("⌘← / ⌘→", $hostPlatform.os)}</kbd> Start / end of line</span>
-        <span><kbd>{shortcutKeyLabel("⌥← / ⌥→", $hostPlatform.os)}</kbd> Back / forward a word</span>
-        <span><kbd>{shortcutKeyLabel("⌘⌫", $hostPlatform.os)}</kbd> Delete to start of line</span>
-      {/if}
-      <span>A new shell opens in the directory of the shell beside it. Closing a running job, or pasting several lines into a shell that would run each one, asks first.</span>
-      <span>Find session searches this repository's tabs. All terminal sessions searches across repositories.</span>
-      <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
-    </div>
-  {/if}
-
   <!-- Tab strip + sessions. Rendered in BOTH modes and merely hidden in
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
@@ -1503,6 +1622,20 @@
      The session-type picker is the exception: a compact `gp-menu` overlay
      (with the float blur) so opening it cannot shove the PTY down. */
   .terminal-popover { flex-shrink: 0; max-height: 40%; overflow: auto; }
+  /* A long session list scrolls inside the dock. 18rem is the hard cap so an
+     expanded dock cannot grow the list over the window. */
+  .terminal-session-list { max-height: min(18rem, 40%); }
+  /* Repository, then the checkout path, then the actions. The path fills the
+     space a tooltip used to float over. */
+  .session-group-head { grid-column: 1 / -1; }
+  .session-row {
+    display: grid;
+    grid-template-columns: minmax(8rem, 16rem) minmax(6rem, 1fr) auto;
+    column-gap: 0.75rem;
+    align-items: center;
+    padding: 0.125rem 0;
+  }
+  .session-path { min-width: 0; }
   .terminal-tab-scroller {
     overscroll-behavior-x: contain;
     scrollbar-width: thin;

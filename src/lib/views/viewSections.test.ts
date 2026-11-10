@@ -64,6 +64,15 @@ describe("view sections", () => {
     expect(activeSectionFor("history", { history: "nonsense" })).toBe("graph");
   });
 
+  it("lands a remembered Code Search or Blame on Explorer, which now holds both", () => {
+    // Search and Blame were sections of Code; they are toggles inside
+    // Explorer now. A session saved on either must reopen on Explorer (the
+    // file it was blaming is still the selection), not on an empty pane.
+    expect(sectionsFor("code").map((s) => s.id)).toEqual(["explorer", "map"]);
+    expect(activeSectionFor("code", { code: "search" })).toBe("explorer");
+    expect(activeSectionFor("code", { code: "blame" })).toBe("explorer");
+  });
+
   it("keeps a remembered section", () => {
     expect(activeSectionFor("history", { history: "suspects" })).toBe("suspects");
   });

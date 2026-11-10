@@ -88,8 +88,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         title: "Code",
         entries: &[
             ("section:code:explorer", "Explorer"),
-            ("section:code:blame", "Blame"),
-            ("section:code:search", "Search"),
             ("section:code:map", "Map"),
         ],
     },
@@ -107,7 +105,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
             ("section:insights:pulse", "Pulse"),
             ("section:insights:coverage", "Coverage"),
             ("section:insights:health", "Health"),
-            ("section:insights:secrets", "Secrets"),
             ("section:insights:storage", "Storage"),
         ],
     },
@@ -330,15 +327,17 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        // 17 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // 14 is owned by `scripts/view-menu-contract.test.ts`, which compares
         // this catalog against the frontend view registry entry by entry and
         // label by label. This assertion is the cheap smoke check beside it —
         // it went stale at 16 once when the section count dropped, again at 15
         // when History gained Suspects, and again at 16 when Insights gained
-        // Secrets, at 17 when Code gained Search, and at 18 when Reflog folded
-        // into History › Graph; the parity contract is what proves the number
-        // is the right one rather than just the current one.
-        assert_eq!(entries.len(), 17);
+        // Secrets, at 17 when Code gained Search, at 18 before Secrets folded
+        // into Health (17) and Code's Search and Blame became toggles inside
+        // Explorer (15), and at 15 when Reflog folded into History › Graph
+        // (14); the parity contract is what proves the number is the right
+        // one rather than just the current one.
+        assert_eq!(entries.len(), 14);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -352,6 +351,9 @@ mod tests {
             "section:work:diff",
             "section:history:diff:extra",
             "section:__proto__:graph",
+            // Retired: Search and Blame are toggles inside Code's Explorer.
+            "section:code:search",
+            "section:code:blame",
         ] {
             assert_eq!(NativeAction::parse(id), None);
         }

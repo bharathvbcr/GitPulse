@@ -16,14 +16,14 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views with 17 specialized sections. Each view keeps related sections together.
+GitPulse has 4 application views with 14 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **[Code](#2-code-code)** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
-| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves) · Diff · Suspects |
-| **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
+| **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
+| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits or HEAD moves, the reflog) · Diff · Suspects |
+| **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
 
@@ -34,7 +34,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 17 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 14 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -51,9 +51,9 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Search · Map — file selection, text search and code/docs map"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph (commits or HEAD moves) · Diff · Suspects — three lenses on commit history"]
-        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
+        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
     end
 
     subgraph NotViews["Not views — available under every view"]
@@ -253,12 +253,15 @@ copy limits and the distinction between terminal handoffs and managed runs.
 
 ## 2. Code (`code`)
 
-Four sections under one view. Explorer and Blame are two lenses on one **file**
-(`selectedFilePath` survives the switch). Search scans file contents across the
-working tree or revisions. Map is the structural navigator over the DevMap repo
-map, the code/doc graph, and repository markdown — not a fourth reading of the
-same open file. Sections switch from the segmented control
-(`⌥1` / `⌥2` / `⌥3` / `⌥4` while Code is active) or by name in the command palette.
+Two sections under one view. Explorer is the **file**: its side column toggles
+between the tree and content search, and the open file toggles between the
+editor and its blame — Search and Blame were sections of their own once, and
+each sent the reader back to Explorer for the file it had just named. Map is
+the structural navigator over the DevMap repo map, the code/doc graph, and
+repository markdown — not another reading of the same open file. Sections
+switch from the segmented control (`⌥1` / `⌥2` while Code is active) or by
+name in the command palette, which also keeps `Open Search — …` and
+`Open Blame — …` commands that open Explorer with the toggle on.
 
 ### 2.1 Explorer
 
@@ -280,7 +283,9 @@ same open file. Sections switch from the segmented control
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
 - **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. Toggles between lines-of-code (`loc`) and percentage (`percentage`) mode. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
 
-### 2.2 Blame
+### 2.2 Blame (an Explorer toggle)
+
+Blame is a lens on the file open in Explorer, not a separate section: the **Blame** toggle in the open file's path bar swaps the editor for that file's blame, beside Explorer's own tree, and follows the active tab until it is toggled off. The command palette's `Open Blame — line authorship and code age` opens Explorer with it on.
 
 - **Line Authorship Viewer**: Interactive gutter displaying commit author, commit age and commit SHA for every line. Hardened with an SWR (stale-while-revalidate) architecture and deep equality guards to eliminate unnecessary re-renders. The age follows the shared timestamp preference (relative or `YYYY-MM-DD`), with the other form on hover.
 - **Commit Blocks**: Consecutive lines from one commit state their hash and author once, at the head of the block; a continuation line keeps its hash reachable on hover or focus, and hovering any line marks the whole commit down the left edge.
@@ -293,13 +298,15 @@ same open file. Sections switch from the segmented control
 - **Commit Navigation**: One-click navigation from any blamed line directly to its full commit diff and history details.
 - **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
 
-### 2.3 Search
+### 2.3 Search (an Explorer toggle)
+
+Content search lives in Explorer's side column: the search button beside the Explorer toggle swaps the file tree for the search pane (the tree keeps its folds and filter), and a hit opens in the editor beside its results.
 
 - **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision via `git grep`.
 - **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
 - **Honest Outcome Reporting**: A search that is cancelled, timed out, capped, or truncated explicitly declares its partial status and reason, rather than presenting a partial match count as complete.
-- **Search Controls**: Case-sensitive (`Aa`), regular expressions (`.*`), and path-pattern scopes with previous/next match navigation.
-- **Navigation & Shortcuts**: Reached via `⌥3` while in Code view, `⌘⇧F` / `Ctrl+Shift+F`, the command palette (`Open Search — find text across the repository`), or the View menu. Selecting a match opens the target file in Explorer at the exact matched line.
+- **Search Controls**: Regular expressions, match case, and an optional revision to search instead of the working tree. Cancel stops the search in flight and keeps its partial answer, labelled.
+- **Navigation**: Reached with the search button in Explorer's tab strip or the command palette (`Open Search — find text across the repository`). Selecting a match opens the file in the editor beside the results, at the matched line (a search run at a revision opens the working-tree file without a line), and turns Blame off so the line is visible.
 
 ### 2.4 Map
 
@@ -473,15 +480,19 @@ rather than presenting a floor as a total.
 - **Code map status & dead symbols**: When a DevMap store is present (the vendored reader is schema 29), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **Pinned Advisory Columns**: Table columns for security advisories and vulnerability details are pinned to fixed widths to prevent layout jitter across scans.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
-- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
+- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, the working-tree secrets scan, and repository health signals into a single explicit verdict with one canonical owner per repeated decision. Secrets reads as unknown until a complete scan has been shown, and any finding is critical.
+- **Coding-agent tasks**: The agent bar above the page sends *Fix dependencies*, *Improve coverage*, *Fix secrets* or *Optimize storage* to Claude Code, Codex or another configured CLI in GitPulse's terminal, or copies the prompt. *Fix dependencies* attaches the report on screen and *Fix secrets* attaches the secrets scan on screen (rule, path, line and location — never a value); the Secrets section's **Fix with agent** selects that task and opens its prompt for review before anything launches.
+- **Previewed lists**: Every list on the page — vulnerabilities, Dependabot and code scanning alerts, secret findings, issues, outdated packages, manifests and dead-code candidates — opens on its first eight rows with a **Show all N** control beneath it. Section headings still state the scan's own count and any cap; the control speaks only for rows it can reveal.
 
-### 4.4 Secrets
+### 4.4 Secrets (a section of Health)
+
+Secrets was its own Insights section until it folded into Health, which gave it the shared verdict and agent bar. A session that had Secrets open restores onto Health.
 
 - **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
 - **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
 - **Located Findings**: Rows are sorted with the actionable ones first, so a token in committed source does not sit among build output. Location chips (tracked, untracked, ignored, `.git` metadata, nested repository) filter the list, rows that hold the same value are marked, and each row can be revealed in the file manager.
 - **Stated Scope and Age**: The panel says what a scan covers — the working tree only, the file-size limit, symlinks, and inline ignores — and the header shows the scan's age. A result older than five minutes refreshes when the section is reopened.
-- **One Scan at a Time**: Opening the section runs one scan, and a newer scan cancels an older one, so switching repositories never queues scanners. Every location of a repeated value is listed rather than deduplicated away.
+- **One Scan at a Time**: Opening Health runs one secrets scan beside the dependency scan, and a newer scan cancels an older one, so switching repositories never queues scanners. The section is drawn whether the dependency scan is loading, failed or done; moving between those states joins the scan already running instead of starting another. Every location of a repeated value is listed rather than deduplicated away.
 - **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
 - **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that Kingfisher itself marked partial (an unreadable file) reports explicitly as unverified / not clean, never as an all-clear.
 
@@ -720,7 +731,7 @@ stop per checkout.
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
-Suspects, Insights' Pulse / Coverage / Health / Secrets / Storage — are switched by that
+Suspects, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
 section directly, including all five Work sections.

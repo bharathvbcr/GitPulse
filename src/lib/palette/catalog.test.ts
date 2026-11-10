@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable } from "./catalog";
-import { PALETTE_MODES } from "./model";
+import { PALETTE_MODES, rankItems } from "./model";
 import { interfaceStore } from "../stores/interfaceStore";
 import { themeStore } from "../stores/themeStore";
 import { completePrompt, cancelPrompt, promptState } from "../stores/modalStore";
@@ -11,6 +11,7 @@ import { openSetupWizard } from "../tools/onboardingStore";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { LAUNCHERS } from "../terminal/tabs";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
+import { explorerLens, resetExplorerLens } from "../files/explorerLens";
 
 vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
@@ -55,6 +56,45 @@ describe("command catalog and context", () => {
     // must be switched after it.
     expect(calls).toEqual(["tab:history:graph", "list:moves"]);
     expect(buildCommands(ready(), () => {}).some(item => item.id === "history:reflog")).toBe(false);
+  });
+  it("keeps a door to Search and Blame, which are toggles inside Explorer rather than sections", async () => {
+    // They were sections of Code, and the registry generated their commands.
+    // Folding them into Explorer must not cost the palette its way to them:
+    // each still answers to its old id and label, lands on Explorer, and
+    // arrives with its toggle on.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    resetExplorerLens();
+    const commands = buildCommands(ready(), () => {});
+    const search = commands.find(command => command.id === "code:search");
+    expect(search?.label).toBe("Open Search — find text across the repository");
+    expect(search?.disabledReason).toBeUndefined();
+    await search?.action();
+    expect(navigate).toHaveBeenLastCalledWith("code", "explorer");
+    expect(surface).toHaveBeenLastCalledWith("repository");
+    expect(get(explorerLens)).toMatchObject({ rail: "search", searchFocusPending: true, lens: "edit" });
+    const blame = commands.find(command => command.id === "code:blame");
+    expect(blame?.label).toBe("Open Blame — line authorship and code age");
+    await blame?.action();
+    expect(navigate).toHaveBeenLastCalledWith("code", "explorer");
+    expect(get(explorerLens).lens).toBe("blame");
+    expect(buildCommands(snapshot({ currentPath: null }), () => {}).find(command => command.id === "code:search")?.disabledReason).toBeTruthy();
+    // Ids stay unique now that two are hand-written beside the generated ones.
+    const ids = commands.map(command => command.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    resetExplorerLens();
+  });
+  it("still finds secrets after the Secrets section folded into Health", async () => {
+    // "Scan working tree for secrets" was the retired section's door. Typing
+    // "secrets" must still land on the pane that scans them, not on nothing.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.some(c => c.id === "insights:secrets")).toBe(false);
+    const sections = rankItems(commands, "secrets").filter(c => c.id.startsWith("insights:"));
+    expect(sections[0]?.id).toBe("insights:health");
+    expect(sections[0]?.label).toBe("Scan dependencies and secrets");
+    await sections[0]?.action();
+    expect(navigate).toHaveBeenLastCalledWith("insights", "health");
   });
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});

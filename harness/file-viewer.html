@@ -22,7 +22,7 @@ addEventListener("error", event => errors.push(event.message));
 addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
 const root = "/fixture/GitPulse";
 const file = "src/app.ts";
-const unexpected = [], saves = [], blobReads = [];
+const unexpected = [], saves = [], blobReads = [], searches = [], blameReads = [];
 // While set, a file read answers only once this promise settles.
 let blobGate = null;
 let blobFails = false;
@@ -53,15 +53,21 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
     case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
     case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+    // Explorer's other two readings: content search in its rail, blame as the editor's lens.
+    case "cmd_search_content": searches.push(args); return { matches: [{ path: file, line: 2, column: 1, text: "two", text_clipped: false }], files: 1, truncated: false, truncated_reason: null, revision: null };
+    case "cmd_codeintel_cancel": return true;
+    case "cmd_get_file_blame": blameReads.push(args); return [1, 2].map(line_no => ({ line_no, commit_id: "c".repeat(40), author_name: "Ada", author_email: "ada@example.invalid", timestamp: Math.floor(Date.now() / 1000) - 86400, content: line_no === 1 ? "one" : "two" }));
+    case "cmd_get_file_coverage": return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [], totals: { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false, lines_truncated: false };
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
 });
-const { mount, tick } = await import("svelte");
+const { mount, tick, unmount } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
 const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
 const { requestReveal, revealRequest } = await import("../src/lib/files/revealRequests");
 const Viewer = (await import("../src/lib/components/FileViewer.svelte")).default;
+const lens = await import("../src/lib/files/explorerLens");
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
 const until = async (test, label) => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Timed out: " + label); };
@@ -73,7 +79,7 @@ const type = async value => { const area = textarea(); area.value = value; area.
 
 (async () => { try {
   await repoStore.openRepo(root);
-  mount(Viewer, { target: host });
+  let app = mount(Viewer, { target: host });
   repoStore.selectFilePath(file);
   await until(() => button("Edit"), "the file is open with an Edit button");
 
@@ -180,6 +186,99 @@ const type = async value => { const area = textarea(); area.value = value; area.
   check("the draft is kept under that banner", () => textarea()?.value === "agent again\nmy line\n");
   check("the banner is announced as an alert", () => banner().getAttribute("role") === "alert");
   check("and the unsaved draft is not written by showing it", () => disk.text === "third version\n");
+
+  // --- Explorer's Search rail ----------------------------------------------
+  // Search used to be a section of Code that replaced the editor; it is the
+  // Explorer column's other pane now, so a hit opens beside its results.
+  const searchToggle = () => host.querySelector("[data-search-toggle]");
+  const rail = () => host.querySelector("[data-explorer-rail]");
+  const searchBox = () => host.querySelector('input[aria-label="Search file contents"]');
+  const searchRailIsUp = () => searchToggle()?.getAttribute("aria-pressed") === "true";
+  check("Explorer offers a Search toggle beside its own", () => searchToggle()?.getAttribute("aria-pressed") === "false");
+  check("and opens on the file tree", () => rail()?.dataset.explorerRail === "files" && !!host.querySelector('[role="tree"]'));
+  searchToggle().click(); await tick();
+  await until(() => searchBox() && document.activeElement === searchBox(), "the search box takes focus");
+  check("the toggle swaps the tree for content search and focuses its box", () =>
+    rail().dataset.explorerRail === "search" && searchToggle().getAttribute("aria-pressed") === "true" && document.activeElement === searchBox());
+  // The save checks above leave the file open in edit mode with a draft.
+  const editorShown = () => Boolean(textarea() || button("Edit"));
+  const draftBefore = textarea()?.value ?? null;
+  check("the editor stays open beside it", () => editorShown());
+  const treeWhileSearching = host.querySelector('[role="tree"]');
+  check("the tree is hidden, not torn down, so its folds and filter survive", () =>
+    Boolean(treeWhileSearching) && treeWhileSearching.closest(".hidden") !== null);
+  const searchPane = searchBox().closest("[data-content-search]");
+  check("the search form fits the rail without widening it", () => searchPane.scrollWidth <= searchPane.clientWidth + 1);
+  searchBox().value = "two"; searchBox().dispatchEvent(new Event("input", { bubbles: true })); await tick();
+  searchPane.querySelector("form").requestSubmit();
+  await until(() => host.querySelector("[data-search-match]"), "a search hit is listed");
+  check("a search from the rail runs against the repository", () => searches.length === 1 && searches[0].pattern === "two");
+  lens.setEditorLens("blame"); await tick();
+  host.querySelector("[data-search-match]").click(); await tick(); await wait();
+  check("a hit that names a line brings the editor back from Blame", () => get(lens.explorerLens).lens === "edit");
+  await until(() => host.textContent.includes("Ln 2, Col 1"), "the hit lands on its line");
+  check("and lands on that line, with the results still up beside it", () =>
+    host.textContent.includes("Ln 2, Col 1") && Boolean(host.querySelector("[data-search-match]")));
+  searchToggle().click(); await tick();
+  check("toggling again brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
+  lens.showExplorerRail("search"); lens.showExplorerRail("files"); await tick(); await wait();
+  check("a search request that was never shown leaves the editor's focus alone", () => document.activeElement !== searchBox());
+  lens.consumeSearchFocus();
+
+  // --- Blame as the editor's lens -------------------------------------------
+  const blameToggle = () => host.querySelector("[data-blame-lens]");
+  check("the open file offers Blame as a toggle", () => blameToggle()?.getAttribute("aria-pressed") === "false");
+  blameToggle().click(); await tick();
+  await until(() => host.querySelector("[data-blame-line]"), "blame rows render in the editor pane");
+  check("Blame reads the open file in place of the editor", () =>
+    blameReads.at(-1)?.filePath === file && !editorShown() && blameToggle().getAttribute("aria-pressed") === "true");
+  check("beside Explorer's tree, with no second tree of its own", () => host.querySelectorAll('[role="tree"]').length === 1);
+  blameToggle().click(); await tick();
+  await until(() => editorShown(), "the editor returns");
+  check("toggling Blame off returns to the editor", () => !host.querySelector("[data-blame-line]") && editorShown());
+  check("and an unsaved draft survives the round trip through Blame", () =>
+    draftBefore === null || textarea()?.value === draftBefore);
+  lens.resetExplorerLens();
+
+  // --- the palette asks for Search before Explorer is on screen ---------------
+  // The usual case: "Open Search" from another view sets the request, then
+  // Explorer mounts and hydrates this repository's pane preferences — which
+  // here say the column was hidden. The request must still show the column
+  // and focus the box, on a wide layout and on a compact one.
+  const remountWithSearchRequested = async () => {
+    await unmount(app); await tick();
+    lens.showExplorerRail("search");
+    app = mount(Viewer, { target: host });
+    await tick();
+  };
+  const hideToggle = () => [...host.querySelectorAll("button")].find(el => el.getAttribute("aria-label") === "Hide Explorer");
+  hideToggle()?.click(); await tick();
+  check("(setup) the Explorer column is hidden and remembered so", () => !rail());
+  await remountWithSearchRequested();
+  await until(() => searchBox() && document.activeElement === searchBox(), "a pre-mount search request is focused");
+  check("a search requested before Explorer mounted shows the column on Search", () =>
+    rail()?.dataset.explorerRail === "search" && searchRailIsUp());
+  check("and focuses the box", () => document.activeElement === searchBox());
+  check("and the request is spent, so a later remount does not steal focus", () => get(lens.explorerLens).searchFocusPending === false);
+
+  host.style.width = "600px"; await wait(120);
+  check("(setup) a 600px pane is the compact layout", () => host.querySelector("[data-pane-layout]")?.dataset.paneLayout === "compact");
+  hideToggle()?.click(); await tick(); await wait();
+  await remountWithSearchRequested();
+  await until(() => searchBox() && document.activeElement === searchBox(), "a compact pre-mount search request is focused");
+  check("on a compact layout the request brings the search column forward", () =>
+    host.querySelector("[data-pane-layout]").dataset.paneLayout === "compact" && rail()?.dataset.explorerRail === "search" && !editorShown());
+  // A hit in the file that is already selected: setting the same selection
+  // again announces nothing, so the hit must open through the tree's handler.
+  check("(setup) the hit names the file already selected", () => get(repoStore).selectedFilePath === file);
+  searchBox().value = "two"; searchBox().dispatchEvent(new Event("input", { bubbles: true })); await tick();
+  searchBox().closest("form").requestSubmit();
+  await until(() => host.querySelector("[data-search-match]"), "a compact search hit is listed");
+  host.querySelector("[data-search-match]").click(); await tick();
+  await until(() => editorShown(), "the editor comes forward");
+  check("a hit in the selected file brings the editor forward on a compact layout", () => editorShown() && !rail());
+  host.style.width = ""; await wait(120);
+  lens.resetExplorerLens();
 
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);
