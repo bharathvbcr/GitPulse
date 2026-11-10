@@ -29,8 +29,6 @@ function harness() {
   const state = {
     failing: false,
     statusCalls: 0,
-    /** The arguments of every `cmd_get_status`, in order. */
-    statusArgs: [] as Array<Record<string, unknown> | undefined>,
     failedCalls: 0,
     /** Every answer names a different file, so every poll announces a change. */
     changing: false,
@@ -46,7 +44,6 @@ function harness() {
         return { path, name: "r", is_bare: false, common_dir: `${path}/.git` } as never;
       case "cmd_get_status":
         state.statusCalls += 1;
-        state.statusArgs.push(args);
         if (state.holdNext) {
           state.holdNext = false;
           return new Promise((_resolve, reject) => {
@@ -98,24 +95,6 @@ function statusWarnings(warn: { mock: { calls: unknown[][] } }) {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-});
-
-describe("the status poll's read", () => {
-  it("alone asks the backend to answer from a kept read; a hydrate always reads", async () => {
-    vi.useFakeTimers();
-    const { store, state } = harness();
-    await store.openRepo("/r/polled");
-    const hydrated = state.statusArgs.length;
-    expect(hydrated).toBeGreaterThan(0);
-    for (let i = 0; i < 40 && state.statusArgs.length === hydrated; i += 1) {
-      await vi.advanceTimersByTimeAsync(1_000);
-    }
-    expect(state.statusArgs.length).toBeGreaterThan(hydrated);
-    for (const args of state.statusArgs.slice(0, hydrated)) {
-      expect(args?.skipIfUnchanged).toBeUndefined();
-    }
-    expect(state.statusArgs[hydrated]).toEqual({ repoPath: "/r/polled", skipIfUnchanged: true });
-  });
 });
 
 describe("a status poll that keeps failing", () => {

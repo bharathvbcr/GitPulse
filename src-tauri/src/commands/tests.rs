@@ -196,12 +196,7 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
     let dir = repo_with_tracked_and_untracked();
     let root = dir.path().to_string_lossy().to_string();
     let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
-    let error = tauri::async_runtime::block_on(inspect::get_status_through_watch(
-        WatcherState::default(),
-        root,
-        false,
-    ))
-    .expect_err("the read is shed");
+    let error = tauri::async_runtime::block_on(cmd_get_status(root)).expect_err("the read is shed");
     assert_eq!(
         error.kind,
         crate::ipc_error::IpcErrorKind::DeferredUnderLoad,

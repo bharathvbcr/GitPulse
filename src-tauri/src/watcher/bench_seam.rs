@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use notify::Event;
 
 use super::{
-    parse_ignored_directories_exact, record_event_signal, start_watch_observed, ChangeAccumulator,
+    parse_ignored_directories, record_event_signal, start_watch_observed, ChangeAccumulator,
     IgnoreRules, WatcherState,
 };
 
@@ -60,13 +60,10 @@ impl StormClassifier {
     /// `ignored_directories_z` is `git ls-files -o -i --directory --exclude-standard -z`
     /// output. `ignored_prefixes` reports how many the parser kept.
     pub fn new(worktree: &Path, git_dir: &Path, ignored_directories_z: &str) -> (Self, usize) {
-        let (prefixes, exact, truncated) = parse_ignored_directories_exact(ignored_directories_z);
+        let (prefixes, truncated) = parse_ignored_directories(ignored_directories_z);
         let kept = prefixes.len();
         let rules = IgnoreRules {
             prefixes,
-            // The benchmark has no repository to ask: it treats every listed
-            // directory as rule-excluded, which is the volume it measures.
-            exact: exact.into_iter().collect(),
             load_error: None,
             truncated,
         };

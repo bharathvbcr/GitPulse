@@ -1,4 +1,4 @@
-use super::facts::{WatchFacts, ROOT_WATCH_MODE};
+use super::filter::{EventFilter, ROOT_WATCH_MODE};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,14 +22,14 @@ pub struct RepoFileWatcher {
     /// [`Self::waker`]). It also means the receiver no longer disconnects when
     /// the backend dies; [`Self::backend_alive`] is how that is noticed.
     wake: SyncSender<Result<Event, notify::Error>>,
-    /// Shared with the native callback, which filters with it and counts the
-    /// epoch it reports; see [`super::facts`].
-    facts: Arc<WatchFacts>,
+    /// Shared with the native callback, which filters with it; the debounce
+    /// loop publishes the ignore rules it classifies with (see [`super::filter`]).
+    filter: Arc<EventFilter>,
 }
 
 impl RepoFileWatcher {
-    pub(crate) fn facts(&self) -> Arc<WatchFacts> {
-        Arc::clone(&self.facts)
+    pub(crate) fn filter(&self) -> Arc<EventFilter> {
+        Arc::clone(&self.filter)
     }
 
     /// A sender onto this watcher's event channel, for waking its reader.
@@ -63,8 +63,6 @@ impl RepoFileWatcher {
     /// reads. notify's Windows Drop only queues Stop; dropping its Rust handle
     /// alone does not mean ReadDirectoryChangesW has relinquished the tree.
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
-        // Whatever this watch said before it ended is not to be relied on after.
-        self.facts.end();
         if let Some(watcher) = self.watcher.take() {
             drop(watcher);
             match self.retired.recv_timeout(Duration::from_secs(2)) {
@@ -102,8 +100,8 @@ impl RepoFileWatcher {
     /// Choosing `Recursive` removes that filter, adds no stream and no
     /// registration, and lets a nested edit be seen. What would then flood the
     /// bounded event queue (a build writing thousands of files under `target/`)
-    /// is dropped by [`WatchFacts::admit`] on the callback thread, before it
-    /// takes a slot.
+    /// is dropped by [`EventFilter::admit`] on the callback thread, before it
+    /// takes a slot; see [`super::filter`] for what that gate may be wrong about.
     ///
     /// On Linux and Windows it stays NON-recursive (top-level entries only):
     /// inotify watches one descriptor per directory and ReadDirectoryChangesW
@@ -168,24 +166,20 @@ impl RepoFileWatcher {
                 internal_roots.push(common.to_path_buf());
             }
         }
-        let facts = WatchFacts::new(
+        let filter = EventFilter::new(
             worktree_root.filter(|root| *root != git_dir),
             internal_roots,
             root_mode,
         );
-        let callback_facts = Arc::clone(&facts);
+        let callback_filter = Arc::clone(&filter);
 
         let mut watcher = RecommendedWatcher::new(
             move |res| {
                 // The sender's lifetime follows every native callback owner.
                 // It is never sent to: disconnect is the shutdown receipt.
                 std::hint::black_box(&lifetime);
-                if !callback_facts.admit(&res) {
-                    return;
-                }
-                // A full queue loses the event; the epoch says so.
-                if forward_event(&tx, &callback_overflow, res) {
-                    callback_facts.lost_something();
+                if callback_filter.admit(&res) {
+                    forward_event(&tx, &callback_overflow, res);
                 }
             },
             Config::default().with_poll_interval(Duration::from_millis(150)),
@@ -241,26 +235,22 @@ impl RepoFileWatcher {
             receiver: rx,
             overflow,
             wake,
-            facts,
+            filter,
         })
     }
 }
 
 /// Hands one native event to the debounce loop without ever blocking the
-/// backend's callback thread: a full queue records an overflow instead and
-/// returns true, so the caller can account for the event it lost.
+/// backend's callback thread: a full queue records an overflow instead.
 fn forward_event(
     tx: &SyncSender<Result<Event, notify::Error>>,
     overflow: &AtomicBool,
     res: Result<Event, notify::Error>,
-) -> bool {
+) {
     match tx.try_send(res) {
-        Err(TrySendError::Full(_)) => {
-            overflow.store(true, Ordering::Release);
-            true
-        }
+        Err(TrySendError::Full(_)) => overflow.store(true, Ordering::Release),
         // The consumer is gone; the loop's own disconnect handling reports it.
-        Err(TrySendError::Disconnected(_)) | Ok(()) => false,
+        Err(TrySendError::Disconnected(_)) | Ok(()) => {}
     }
 }
 
@@ -275,25 +265,6 @@ impl Drop for RepoFileWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The callback moves the watch's epoch for an event the queue could not
-    /// take, so a read that began before it is not mistaken for covering it.
-    #[test]
-    fn a_dropped_event_is_reported_to_the_caller_that_owns_the_epoch() {
-        let (tx, _rx) = sync_channel(1);
-        let overflow = AtomicBool::new(false);
-        assert!(!forward_event(
-            &tx,
-            &overflow,
-            Ok(Event::new(notify::EventKind::Any))
-        ));
-        assert!(forward_event(
-            &tx,
-            &overflow,
-            Ok(Event::new(notify::EventKind::Any))
-        ));
-        assert!(overflow.load(Ordering::Acquire));
-    }
 
     #[test]
     fn a_full_queue_records_one_overflow_instead_of_growing() {

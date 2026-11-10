@@ -241,9 +241,6 @@ Closed since (2026-10-07):
   is non-recursive on Linux and Windows, where a path list names top-level
   entries and means "at least these"; on macOS it is recursive and filtered
   (see the 2026-11-09 section at the end), and a path list names the files.
-  Where it is recursive the backend can also prove a worktree unchanged since a
-  read began, within the limits that section states; where it is not, nothing
-  can and the status poll is the detector.
 
 ## Current gate status
 
@@ -2652,35 +2649,22 @@ How to read the new field: the periodic gate line now ends with the call sites b
 - Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing of its own, so the leader's source is credited and the joiner's is not.
 - A thread that hops (`thread::scope`, a pool) starts `unattributed`; carry the source across with `with_spawn_source(current_spawn_source(), ...)`, as `current_admission()` is carried.
 
-## 2026-11-09: macOS worktree root watched recursively; the status poll answered from a kept read (ft-cb978b2f6a22e7c93aa9f69715b40426)
+## 2026-11-09: macOS worktree root watched recursively, events filtered for delivery only (ft-cb978b2f6a22e7c93aa9f69715b40426)
 
-On macOS the worktree root is registered with the same FSEvents stream as `.git`, which is recursive in the kernel; the backend's `NonRecursive` mode only discarded nested paths in user space. It is now `Recursive` (`watcher/facts.rs` `ROOT_WATCH_MODE`), with ignored and transient paths dropped on the backend's callback before they take a slot in the bounded event queue. Linux and Windows keep the non-recursive root watch. Every event that could move `git status` advances an epoch on that callback; `cmd_get_status` with `skipIfUnchanged` (only the poll sets it) returns the read it kept under the epoch taken before that read began, with no git spawned, and reads otherwise.
+On macOS the worktree root is registered with the same FSEvents stream as `.git`, which is recursive in the kernel; the backend's `NonRecursive` mode only discarded nested paths in user space. It is now `Recursive` (`watcher/filter.rs` `ROOT_WATCH_MODE`), so an edit, create, delete or rename at any depth announces `repo-changed` within the debounce instead of waiting for the 6 s status poll. Linux and Windows keep the non-recursive root watch (inotify holds a descriptor per directory; ReadDirectoryChangesW reports a whole tree).
 
-### What the kept read is trusted for
+What would flood the bounded event queue (a build writing thousands of files under `target/`) is dropped on the backend's own callback thread by the same classifier the debounce loop uses (`event_has_signal`), before it takes a slot. A full queue is answered with one full refresh, which is the cost the filter avoids.
 
-- Only while the watch is recursive and alive, its ignore rules are loaded and not stale, and the root directory is the registered inode.
-- What may be dropped without an epoch move is decided by rules, not by contents. `git ls-files -o -i --directory` prints `build/` whenever every file now in it is ignored (a directory holding only `*.o` or a swap file), though no rule excludes `build/`; the next source file there is untracked and shown. So the list is only a candidate list: one `git check-ignore -- <dirs>` (no trailing slash; the slash form also matches `logs/`-style directory-only rules and over-reports) keeps the directories a rule itself excludes, and one `git ls-files -c -i` removes every ancestor of a tracked-but-ignored file. A path is dropped only if it is strictly beneath such a directory, spelled as git printed it (never by case folding). Git does not descend into a rule-excluded directory and a pattern cannot re-include below it, so nothing created there later can reach `git status`. A listed directory that fails the test (`build/`, `src/x/`, a re-included `!logs/keep/`) is still not delivered as a refresh, but it costs an epoch, so the next poll reads. Verified on git 2.56.0 in a scratch repository: trailing-slash form over-reports `logs2/`, no-slash form reports exactly `out/deep`, `vendor`, `vendor/keep`, `logs2/other`; `check-ignore -z` requires `--stdin`, so the confirmation uses the newline form and treats a name git would print quoted as unconfirmed.
-- The rules are re-asked, never assumed. A write to this checkout's `index` or `HEAD` (what is tracked changes the answer), `config` or `config.worktree` (`core.excludesFile`, `core.ignorecase`), a `.gitignore` or `info/exclude` edit, a new directory, and every "you may have missed something" signal (must-rescan flag, backend error, eventless wake, full queue) mark them stale until reloaded. A reload is at most `1 + 1 + ceil(bytes/16 KiB)` git spawns inside a 6 s budget on the watch thread, coalesced to one per 2 s window; a failed or out-of-budget confirmation leaves nothing confirmed (every listed directory then costs an epoch) and is retried every 30 s. Edits to the global excludes file and `~/.gitconfig` are not seen, by design (see the table).
-- Only for 60 s (`KEPT_STATUS_MAX_AGE`). A stream can stay registered and deliver nothing (this host's `fseventsd` has wedged), and the watch cannot see a global excludes file. The cap is the trade: an idle tab costs one `git status` a minute against ten at the 6 s poll, and the worst case for a silently dead stream is a minute of stale rows; 300 s, the first value, would have made that five minutes.
-- Only while it keeps earning it. The `index` and `HEAD` stat identity is recorded with each kept read and checked before it is served; a read at an unmoved epoch that differs from the kept answer is a second witness. Either makes the watch suspect, and three seconds later with the epoch still unmoved it is convicted: logged once, and every poll reads as it did before until the watch is re-registered (the pool parks and wakes watches). Nothing short of that lifts it: "a later read differs and the epoch moved" is satisfied by one unrelated event on an otherwise dead stream, so it is not evidence that the stream delivers.
-- Not for file-pattern ignores themselves: a write to a `*.log` file in an ordinary directory is not filtered (no rule excludes that directory), so it costs an epoch and a refresh as before. Generated-state directories (`.devcouncil`, `.devmap`) cost an epoch unless a rule excludes them.
+### What the filter may be wrong about
 
-### How stale can "clean" be
+Only delivery. The 6 s status poll reads every time, exactly as before this change, and nothing treats the absence of an event as proof that the worktree is unchanged. A path wrongly dropped therefore costs one refresh at most one poll late, which is what a nested edit cost before. The ignore list behind the filter is `git ls-files -o -i --directory`: it says which directories hold only ignored files now, not which are excluded by a rule (a `:build/` holding only a swap file is listed), and it can be stale (renaming a directory that holds a `.gitignore` leaves its old names listed). Two reproductions of exactly those cases are tests (`a_renamed_ancestor_of_a_rule_file_costs_at_most_a_poll`, `a_directory_listed_as_ignored_only_because_of_its_contents_costs_at_most_a_poll`): the event is dropped, the poll reads and shows the file.
 
-| failure mode | bound on a stale answer | why |
-| --- | --- | --- |
-| healthy watch | 0 | every event that could move status advances the epoch before the loop sees it; a read keeps its answer under the epoch taken before it began |
-| dropped event with a rescan flag, backend error, eventless wake, full queue | 0 | the epoch moves and the rules are marked stale; the next poll reads, and nothing is dropped until the rules reload |
-| silent stream (registered, delivers nothing) | up to 60 s (`KEPT_STATUS_MAX_AGE`); an `index`/`HEAD` change is caught at the next poll by the stat identity | the read at the cap disagrees, the watch is suspect, then convicted after 3 s; from then on every poll reads |
-| rules that cannot be known (global excludes file, `~/.gitconfig` edit) | up to 60 s, then convicted as above if it matters | no worktree watch observes those files; a dropped directory the edit un-ignored shows at the read at the cap |
+Never dropped: a backend error, a must-rescan flag, an event with no path, an event naming the worktree root (the only trace of a repository that moved away).
+
+### When the ignore list is reloaded
+
+One bounded (3 s) `git ls-files` on the watch thread, when a `.gitignore` or `info/exclude` event arrives or a directory appears outside `.git`, or every 30 s while the last attempt failed. At most one per `SCAN_COALESCE` (2 s) however many triggers arrive: a trigger that falls inside the window is remembered and served when it ends. A write to `index`, `HEAD` or `config` is not a trigger, so a terminal full of `git add` reloads nothing (`index_writes_never_reload_the_rules_and_a_directory_storm_reloads_at_most_once_per_window`: 20 index writes, 0 reloads; 30 new directories over about 3 s, at most one reload per window).
 
 ### Measured
 
-`cargo test --lib watcher::tests::measure_idle -- --ignored --nocapture`, one M-series Mac (macOS 27), `src-tauri/src/watcher/mod.rs`. Counter-based: `git status` spawns counted at the spawn site for one idle open worktree over the 10 polls one minute holds at 6 s (`STATUS_POLL_INTERVAL_MS`). The polls are issued back to back, so this counts spawns per 10 polls, not wall-clock time; the 60 s cap adds one read a minute in steady state. Baseline: the same poll with `skipIfUnchanged` off, which is what the code did (and still does where the root watch is not recursive).
-
-| arm | n | spawns per 10 polls | spread |
-| --- | --- | --- | --- |
-| before (every poll reads) | 5, interleaved with after | 10, 10, 10, 10, 10 | none |
-| after (served from the kept read) | 5 | 1, 1, 1, 1, 1 | none |
-
-Churn arm (same run): 10,000 file writes under a directory git ignores, then one sentinel: 32,348 paths classified by the callback, the epoch moved 3 times (the sentinel's own events), 1 refresh announced, 0 status reads. Load average (1 min) at start 20.1, at end 14.6, below the 30 line, so this run is a result. The first run of the same test (before the cap and the trust checks), at load 11.7 to 12.1, gave 10 and 1 spawns in all 5 repetitions and 32,211 paths classified with 3 epoch moves. Not measured: the spawns per minute of a real app over wall-clock time, the cost of a rules reload on a large tree, and anything on Linux or Windows.
+Not a before/after of git spawns: this stage does not change what the poll does, so the idle `git status` count per minute is the same as before (about 10 per 10 polls). What is asserted instead, by `ten_thousand_writes_under_an_ignored_directory_are_never_announced` through the real watcher and loop: 10,000 files written under a directory a `.gitignore` names announce nothing, the callback classifies each delivered path once (no git is spawned per event), and nothing reloads the rules. The idle-poll saving is a separate stage, not part of this one.
