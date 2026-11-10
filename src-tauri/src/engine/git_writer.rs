@@ -1235,17 +1235,21 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<GitIdentity, CommandError> {
-        // One read of the cached listing answers every key, so a commit starts
-        // no `git config --get` child. The cache's stamp does not see a file
-        // pulled in by `include.path`, so an answer that leaves a field unset
-        // is confirmed straight from git before anything refuses on it.
-        let cached = Self::identity_from_config(&config_snapshot(repo)?, lookup);
-        if cached.name.is_some() && cached.email.is_some() {
-            return Ok(cached);
-        }
+        // For display only (the commit box). The cache's stamp does not see a
+        // file pulled in by `include.path`, so what it answers can be a
+        // minute old: nothing that gates a write reads this, see
+        // [`Self::identity_fresh`].
+        Ok(Self::identity_from_config(&config_snapshot(repo)?, lookup))
+    }
+
+    /// The identity as git resolves it right now, from one `config --list`
+    /// that bypasses the cache. A refusal to commit is decided on this: a
+    /// cached "set" for a key the user just removed from an included file
+    /// would let git record a host-derived address.
+    fn identity_fresh(repo: &Path) -> Result<GitIdentity, CommandError> {
         Ok(Self::identity_from_config(
             &config_snapshot_fresh(repo)?,
-            lookup,
+            &|name| std::env::var(name).ok(),
         ))
     }
 
@@ -1286,7 +1290,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// otherwise either fail with its own multi-line advice or, on a machine
     /// with a resolvable hostname, quietly record `user@host.local`.
     fn require_identity(repo: &Path) -> Result<(), CommandError> {
-        let identity = Self::identity_in(repo)?;
+        let identity = Self::identity_fresh(repo)?;
         let missing: Vec<&str> = [
             ("user.name", identity.name.is_none()),
             ("user.email", identity.email.is_none()),
@@ -6936,6 +6940,80 @@ mod tests {
         assert_eq!(identity.email.as_deref(), Some("ada@example.org"));
 
         assert_eq!(config_get_spawns(&repo) - before, 0);
+    }
+
+    /// Every `git config --list` child recorded for `repo` so far.
+    fn config_list_spawns(repo: &std::path::Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(repo)
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--list")
+            })
+            .count()
+    }
+
+    /// A repository whose identity comes from a file pulled in by
+    /// `include.path` (the shape of a work `includeIf`), blank everywhere
+    /// else. The cache stamps `.git/config` and the user's config files, not
+    /// the included one, and does not trust a stamp younger than its racy
+    /// window, so the config sits for longer than that before the cache is
+    /// warmed.
+    fn repo_with_included_identity() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = init_repo_with_commit();
+        let repo = dir.path().canonicalize().unwrap();
+        blank_identity(&repo);
+        let included = repo.join(".git").join("identity.inc");
+        std::fs::write(
+            &included,
+            "[user]\n\tname = Included\n\temail = included@example.org\n",
+        )
+        .unwrap();
+        // Appended after the blank `user.*`, so the included values win.
+        git_ok(&repo, &["config", "include.path", "identity.inc"]);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        (dir, repo, included)
+    }
+
+    /// F-8, the gate: the refusal decision reads the effective config
+    /// straight from git, in one `config --list` and no `config --get`. A
+    /// cached listing cannot be trusted with it (see the next test).
+    #[test]
+    fn the_commit_gate_reads_identity_in_one_config_list_and_no_config_get() {
+        let (_dir, repo, _included) = repo_with_included_identity();
+        GitWriter::require_identity(&repo).expect("the included identity is set");
+        let (gets, lists) = (config_get_spawns(&repo), config_list_spawns(&repo));
+        for _ in 0..3 {
+            GitWriter::require_identity(&repo).unwrap();
+        }
+        assert_eq!(config_get_spawns(&repo) - gets, 0, "no `config --get`");
+        assert_eq!(
+            config_list_spawns(&repo) - lists,
+            3,
+            "one `config --list` per check, even with a warm cache"
+        );
+    }
+
+    /// The defect: the cached snapshot does not see an included file change,
+    /// so a commit within the cache's life of the user removing their identity
+    /// from it was let through, and git recorded a host-derived address.
+    #[test]
+    fn a_commit_is_refused_when_the_included_identity_is_removed_while_the_cache_is_warm() {
+        let (_dir, repo, included) = repo_with_included_identity();
+        GitWriter::require_identity(&repo).expect("the included identity is set");
+        // Warm the cached listing the display path reads.
+        let none = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(&repo, &none).unwrap().email.as_deref(),
+            Some("included@example.org")
+        );
+        std::fs::write(&included, "[user]\n").unwrap();
+        let refused = GitWriter::require_identity(&repo)
+            .expect_err("no identity is configured any more");
+        assert!(
+            refused.message().starts_with(IDENTITY_MISSING),
+            "{}",
+            refused.message()
+        );
     }
 
     /// The `user.email` rules over a listing, without the machine's own
