@@ -23,6 +23,7 @@ use common::fixture::{build_repo, count_git_processes, dirty_files, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
 use gitpulse_lib::engine::git_reader::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 
 struct Shape {
     label: &'static str,
@@ -124,7 +125,14 @@ fn main() {
         touch: 5,
         linked_worktrees: 0,
     };
-    for dirty in [1usize, 50] {
+    // Each arm reports wall time, the CPU the git children it started used
+    // (user + system, from `getrusage(RUSAGE_CHILDREN)` deltas around the
+    // call), and the number of children (counted in a separate untimed pass).
+    // 500 dirty files is the largest the pathspec limit covers (512); at 2 000
+    // the shipped read falls back to the whole tree, so the two arms are the
+    // same code, and two raw `git diff --numstat -z` arms (whole tree, and
+    // limited to all 2 000 paths) price the limit past its bound.
+    for dirty in [1usize, 50, 500, 2_000] {
         let repo = build_repo(&temp.path().join(format!("wide-{dirty}")), &wide_spec);
         dirty_files(&repo, &wide_spec, dirty);
         let (limited, whole) = (
@@ -142,34 +150,92 @@ fn main() {
             "the arms disagree on {dirty} dirty files"
         );
         let total = churn(&limited);
+        let (_, limited_children) = count_git_processes(|| status(&repo));
+        let (_, whole_children) =
+            count_git_processes(|| GitReader::get_status_whole_tree_numstat(repo.path()));
         let repo = std::sync::Arc::new(repo);
         let shipped = std::sync::Arc::clone(&repo);
+        let oracle = std::sync::Arc::clone(&repo);
         cases.push(Case::new(
             format!("get_status 50k files {dirty} dirty, numstat limited to changed paths"),
             move || {
+                let cpu = ChildCpu::start();
                 let rows = status(&shipped);
+                let cpu_ms = cpu.spent_ms();
                 std::hint::black_box(&rows);
                 Sample::default()
                     .counter("rows", rows.len() as u64)
                     .counter("churn", total)
+                    .counter("git_processes", limited_children)
+                    .metric("child_cpu_ms", cpu_ms)
             },
         ));
         cases.push(Case::new(
             format!("get_status 50k files {dirty} dirty, numstat over the whole tree"),
             move || {
-                let rows = GitReader::get_status_whole_tree_numstat(repo.path())
+                let cpu = ChildCpu::start();
+                let rows = GitReader::get_status_whole_tree_numstat(oracle.path())
                     .expect("whole-tree status");
+                let cpu_ms = cpu.spent_ms();
                 std::hint::black_box(&rows);
                 Sample::default()
                     .counter("rows", rows.len() as u64)
                     .counter("churn", total)
+                    .counter("git_processes", whole_children)
+                    .metric("child_cpu_ms", cpu_ms)
             },
         ));
+        if dirty == 2_000 {
+            let names = git_bytes(&repo.main, &["diff", "--name-only", "-z"]);
+            let specs: Vec<String> = names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| format!(":(literal){}", String::from_utf8_lossy(name)))
+                .collect();
+            assert_eq!(specs.len(), dirty, "every dirty file is named");
+            let whole_out = git_bytes(&repo.main, &["diff", "--numstat", "-z"]);
+            let mut limited_args = vec!["diff", "--numstat", "-z", "--"];
+            limited_args.extend(specs.iter().map(String::as_str));
+            assert_eq!(
+                whole_out,
+                git_bytes(&repo.main, &limited_args),
+                "the raw arms read the same numstat"
+            );
+            let (whole_repo, limited_repo) = (std::sync::Arc::clone(&repo), repo);
+            cases.push(Case::new(
+                "raw git diff --numstat -z, 50k files 2000 dirty, whole tree",
+                move || {
+                    let cpu = ChildCpu::start();
+                    let out = git_bytes(&whole_repo.main, &["diff", "--numstat", "-z"]);
+                    let cpu_ms = cpu.spent_ms();
+                    Sample::default()
+                        .counter("bytes", out.len() as u64)
+                        .counter("git_processes", 1)
+                        .metric("child_cpu_ms", cpu_ms)
+                },
+            ));
+            cases.push(Case::new(
+                "raw git diff --numstat -z, 50k files 2000 dirty, 2000 literal pathspecs",
+                move || {
+                    let mut args = vec!["diff", "--numstat", "-z", "--"];
+                    args.extend(specs.iter().map(String::as_str));
+                    let cpu = ChildCpu::start();
+                    let out = git_bytes(&limited_repo.main, &args);
+                    let cpu_ms = cpu.spent_ms();
+                    Sample::default()
+                        .counter("bytes", out.len() as u64)
+                        .counter("git_processes", 1)
+                        .metric("child_cpu_ms", cpu_ms)
+                },
+            ));
+        }
     }
     report.note(
-        "50k-file repository (500 dirs, 2 commits), 1 and 50 tracked files modified: the same \
-         get_status with the numstat limited to the reported paths against the whole-tree numstat \
-         it replaced; the pair is interleaved and asserted row-for-row equal before timing"
+        "50k-file repository (500 dirs, 24-line files, 2 commits), 1/50/500/2000 tracked files \
+         modified, one repository per count shared by both arms: get_status with the numstat \
+         limited to the reported paths (falls back to the whole tree above 512) against the \
+         whole-tree numstat it replaced, with wall time, child CPU (user+system) and git \
+         processes; at 2000, two raw numstat arms price the limit past its bound"
             .to_string(),
     );
 
@@ -319,9 +385,55 @@ fn main() {
          detail_json, and a transcript edit (object path plus 4-field detail_json)"
     ));
 
-    let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
+    // `GITPULSE_BENCH_ONLY=<substring>` runs only the rows whose name contains
+    // it, so one measurement does not pay for every other row.
+    if let Ok(only) = std::env::var("GITPULSE_BENCH_ONLY") {
+        cases.retain(|case| case.name.contains(&only));
+    }
+    let rounds = std::env::var("GITPULSE_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| report.opts.samples(15));
+    let rows = interleave(cases, rounds, report.opts.warmup(2));
     report.extend(rows);
     report.finish();
+}
+
+/// CPU time (user + system) of the child processes this process has reaped,
+/// as a delta from [`ChildCpu::start`]. `RUSAGE_CHILDREN` accumulates every
+/// waited-for child, so the delta around a call is what the git children that
+/// call started and waited for used; the cases run one at a time.
+struct ChildCpu(f64);
+
+impl ChildCpu {
+    fn now_ms() -> f64 {
+        // SAFETY: `usage` is a valid, writable `rusage` for the call to fill.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let status = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+        assert_eq!(status, 0, "getrusage(RUSAGE_CHILDREN) failed");
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1_000.0 + t.tv_usec as f64 / 1_000.0;
+        ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    fn start() -> Self {
+        Self(Self::now_ms())
+    }
+
+    fn spent_ms(&self) -> f64 {
+        Self::now_ms() - self.0
+    }
+}
+
+/// Stdout of `git <args>` in `dir`; a failed git aborts the bench.
+fn git_bytes(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output_locked()
+        .expect("spawn git");
+    assert!(output.status.success(), "git {args:?} failed");
+    output.stdout
 }
 
 const REDACT_ROUNDS: usize = 2_000;
