@@ -29,6 +29,7 @@
   import { createPaneCrashReporter } from "./lib/diagnostics/paneCrash";
   import { activity } from "./lib/diagnostics/activity";
   import { get } from "svelte/store";
+  import { requestConflictsFocus } from "./lib/ui/workConflicts";
   import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
     subscribeNativeShell,
@@ -724,6 +725,14 @@
           return;
         }
         interfaceStore.setGlobalSurface("repository");
+        // The tray, the status popover's Conflicts card and its `3` key all
+        // send Overview while a merge is stopped; Overview leads with the
+        // editor then, so land on it rather than wherever the rows were left.
+        const operation = $repoStore.operation;
+        if (tab === "work" && section === "overview" &&
+          (operation.operation !== null || operation.probeFailed || get(repoStore.conflictedCount) > 0)) {
+          requestConflictsFocus();
+        }
         repoStore.setActiveTab(tab, section);
       },
       shortcuts: openShortcuts,

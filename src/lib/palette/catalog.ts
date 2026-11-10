@@ -15,6 +15,7 @@ import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
 import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
 import { openManviFocus } from "../ui/openManviFocus";
+import { openConflicts } from "../ui/workConflicts";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
@@ -98,10 +99,11 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       {
         id: "work:conflicts", label: "Resolve conflicts — finish a parked merge or rebase",
         description: "Work → Overview · The conflict editor leads Overview while a merge, rebase or cherry-pick is parked.",
-        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work, disabledReason: unavailable,
+        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
+        disabledReason: unavailable ?? (state.operation.operation || state.operation.probeFailed || state.statuses.some(file => file.is_conflicted) ? undefined : "No merge, rebase or cherry-pick is waiting on you."),
         action: () => {
           interfaceStore.setGlobalSurface("repository");
-          repoStore.setActiveTab("work", "overview");
+          openConflicts();
         },
       },
       ...MANVI_FOCUS_LIST.map(target => ({

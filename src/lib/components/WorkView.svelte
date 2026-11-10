@@ -72,7 +72,7 @@
   import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
   import BranchTagCleanup from "./BranchTagCleanup.svelte";
   import PolicyActivity, { policyActivityVisible } from "./PolicyActivity.svelte";
-  import { WORK_CONFLICTS_ID } from "../ui/workConflicts";
+  import { openConflicts } from "../ui/workConflicts";
   import {
     manviFocusRequest,
     manviSectionId,
@@ -187,10 +187,7 @@
    * nothing would read as a dead button.
    */
   function showConflicts(): void {
-    repoStore.setActiveTab("work", "overview");
-    void tick().then(() => {
-      document.getElementById(WORK_CONFLICTS_ID)?.scrollIntoView({ block: "start" });
-    });
+    openConflicts();
   }
 
   function reviewChanges(): void {

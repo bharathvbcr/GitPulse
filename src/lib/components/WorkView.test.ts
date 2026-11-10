@@ -173,8 +173,9 @@ describe("WorkView", () => {
     // from Overview itself, where the reader may be scrolled among the rows.
     expect(source).not.toContain('"policy"');
     const body = functionBody(source, "showConflicts");
-    expect(body).toContain('repoStore.setActiveTab("work", "overview")');
-    expect(body).toContain("document.getElementById(WORK_CONFLICTS_ID)?.scrollIntoView({ block: \"start\" })");
+    // The one door navigates and leaves a request the Overview pane takes,
+    // which scrolls to the editor whether or not the switch remounted it.
+    expect(body).toContain("openConflicts();");
     expect(source.match(/onclick=\{showConflicts\}/g)).toHaveLength(3);
   });
 

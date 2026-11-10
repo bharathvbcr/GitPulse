@@ -1,7 +1,8 @@
 <script lang="ts">
+  import { tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { conflictSessions } from "../diff/conflictSession";
-  import { WORK_CONFLICTS_ID } from "../ui/workConflicts";
+  import { WORK_CONFLICTS_ID, conflictsFocusRequest, takeConflictsFocus } from "../ui/workConflicts";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import WorkView from "./WorkView.svelte";
 
@@ -51,6 +52,23 @@
   });
   let reviewingDrafts = $state(false);
   const showEditor = $derived(live || (reviewingDrafts && retainedDrafts > 0));
+
+  // A door to the conflicts (status bar, tray, merge dialog, palette, a row)
+  // asks for the editor; it is taken here, on mount or while mounted, and
+  // cleared even when nothing is parked any more, so it cannot fire on a
+  // later visit. Scroll and focus are instant, like every other deep link.
+  $effect(() => {
+    if (!$conflictsFocusRequest) return;
+    untrack(() => {
+      takeConflictsFocus();
+      if (!showEditor) return;
+      void tick().then(() => {
+        const section = document.getElementById(WORK_CONFLICTS_ID);
+        section?.scrollIntoView({ block: "start" });
+        section?.focus({ preventScroll: true });
+      });
+    });
+  });
 </script>
 
 <div
@@ -60,7 +78,7 @@
   {#if showEditor}
     <!-- One scroller for the pane. The editor keeps the full pane height it
          had as its own section, so resolving is unchanged; Overview follows. -->
-    <section id={WORK_CONFLICTS_ID} aria-label="Conflicts" class="work-conflicts shrink-0 flex flex-col">
+    <section id={WORK_CONFLICTS_ID} tabindex="-1" aria-label="Conflicts" class="work-conflicts shrink-0 flex flex-col">
       {#if !live}
         <div class="flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted">
           <span>Retained conflict drafts</span>

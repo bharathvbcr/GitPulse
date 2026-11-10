@@ -142,7 +142,11 @@ describe("WorkOverviewPane", () => {
       join(dirname(fileURLToPath(import.meta.url)), "WorkView.svelte"),
       "utf8",
     );
-    expect(view).toContain("WORK_CONFLICTS_ID");
+    // The buttons reach the anchor through the one door, which the pane
+    // answers by scrolling to this id (ui/workConflicts.test.ts).
+    expect(view).toContain("openConflicts();");
+    const own = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "WorkOverviewPane.svelte"), "utf8");
+    expect(own).toContain("document.getElementById(WORK_CONFLICTS_ID)");
   });
 });
 

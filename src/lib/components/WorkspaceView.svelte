@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { openConflicts } from "../ui/workConflicts";
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewContextBar from "./ViewContextBar.svelte";
@@ -51,7 +52,7 @@
     <ViewContextBar label="Conflicts">
       <button
         type="button"
-        onclick={() => repoStore.setViewSection("work", "overview")}
+        onclick={openConflicts}
         class="ml-auto shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors"
         title="{conflictedCount} file{conflictedCount === 1 ? '' : 's'} still carry conflict markers"
       >

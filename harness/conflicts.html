@@ -23,6 +23,7 @@ import {repoStore} from "../src/lib/stores/repoStore";
 import {conflictSessions} from "../src/lib/diff/conflictSession";
 import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
 import WorkOverviewPane from "../src/lib/components/WorkOverviewPane.svelte";
+import {openConflicts} from "../src/lib/ui/workConflicts";
 const params = new URLSearchParams(location.search);
 if(params.has("check"))conflictSessions.clear();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
@@ -123,6 +124,11 @@ if(params.has("check")){
   check("overview leads with the conflict editor at full pane height, the workspace below",scroller&&Math.abs(page.getBoundingClientRect().height-scroller.clientHeight)<=2&&overview.getBoundingClientRect().top>=page.getBoundingClientRect().bottom-1);
   scroller.scrollTop=scroller.scrollHeight;await settle();
   check("overview scrolls as one pane down to the workspace",scroller.scrollTop>0&&overview.getBoundingClientRect().top<host.getBoundingClientRect().bottom);
+  // A conflict door used while the reader is down among the rows (status bar,
+  // tray, palette, a row's Resolve) brings the editor back and focuses it.
+  openConflicts();await settle();
+  const editorSection=host.querySelector("#work-conflicts");
+  check("a conflict door scrolls back to the editor and focuses it",Math.abs(editorSection.getBoundingClientRect().top-scroller.getBoundingClientRect().top)<=2&&document.activeElement===editorSection);
   // The merge finishes under the reader (an agent's doing): the editor goes,
   // the opened file's draft is kept as a row, and Overview is the same node.
   const parkedFiles=files, operation=fixture.cmd_repo_operation;
