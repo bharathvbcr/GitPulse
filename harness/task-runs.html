@@ -540,9 +540,9 @@
       (button("Review requests")??button("Refresh requests")).click();await wait(()=>document.querySelector('[aria-label="Complete agent request"]'));
       const panel=()=>document.querySelector('[aria-label="Agent requests"]');
       check("Permission review preserves the exact request including large numbers and duplicate fields",panel().querySelector('textarea').value===exactPayload);
-      loseDecision=true;button("Allow once").click();await wait(()=>button("Retry saved decision"));
+      loseDecision=true;button("Allow once").click();await wait(()=>button("Try again"));
       check("An uncertain decision disables alternative responses",[...panel().querySelectorAll('fieldset button')].every(b=>b.matches(':disabled')));
-      button("Retry saved decision").click();await wait(()=>!button("Retry saved decision")&&panel().textContent.includes("Saved response: Allow once"));
+      button("Try again").click();await wait(()=>!button("Try again")&&panel().textContent.includes("Saved response: Allow once"));
       check("Decision retry preserves the request and records one saved response",decisionWrites.length===2&&decisionWrites[0]===decisionWrites[1]&&decisions.get("allow").revision===2);
       check("Saving a decision does not claim provider delivery",panel().textContent.includes("Decision saved · delivery pending")&&!panel().textContent.includes("Provider confirmed"));
       button("Deny request").click();await wait(()=>panel().textContent.includes("Saved response: Deny"));

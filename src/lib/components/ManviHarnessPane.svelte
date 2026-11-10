@@ -67,21 +67,29 @@
     Pick<StatusPresentation, "cardClass" | "badgeClass">
   > = {
     ready: {
-      cardClass: "border-emerald-500/25 bg-emerald-500/5",
-      badgeClass: "text-emerald-300",
+      cardClass: "border-ok/35 bg-ok/5",
+      badgeClass: "text-ok",
     },
     warning: {
-      cardClass: "border-amber-500/30 bg-amber-500/5",
-      badgeClass: "text-amber-300",
+      cardClass: "border-warn/35 bg-warn/5",
+      badgeClass: "text-warn",
     },
     error: {
-      cardClass: "border-rose-500/30 bg-rose-500/5",
-      badgeClass: "text-rose-300",
+      cardClass: "border-danger/35 bg-danger/5",
+      badgeClass: "text-danger",
     },
     neutral: {
-      cardClass: "border-border/70 bg-background",
+      cardClass: "border-edge bg-background",
       badgeClass: "text-textMuted",
     },
+  };
+
+  /** The `gp-notice` tone for each status tone. "Neutral" here means nothing was determined, which is the unknown tone. */
+  export const NOTICE_TONE: Record<StatusTone, "ok" | "warn" | "danger" | "unknown"> = {
+    ready: "ok",
+    warning: "warn",
+    error: "danger",
+    neutral: "unknown",
   };
 
   function presentation(
@@ -100,7 +108,7 @@
     if (refreshError) {
       return presentation(
         "Status stale",
-        `The latest MANVI status request failed: ${redactDiagnosticText(refreshError)} No runner capability is claimed until status is checked again.`,
+        `Couldn't check Manvi status. ${redactDiagnosticText(refreshError)} No runner capability is claimed until status is checked again.`,
         "error",
       );
     }
@@ -108,25 +116,25 @@
       case "connected":
         return presentation(
           "Guarded",
-          "Health and coverage commands require a click, a purpose allowlist, direct argv execution, the MANVI policy gate, hard timeouts, bounded output, and stop-on-failure accounting.",
+          "Health and coverage commands require a click, a purpose allowlist, direct argv execution, the Manvi policy gate, hard timeouts, bounded output, and stop-on-failure accounting.",
           "ready",
         );
       case "unguarded":
         return presentation(
           "Not checked",
-          "User-started health and coverage commands still use a purpose allowlist, direct argv execution, hard timeouts, bounded output, and stop-on-failure accounting. MANVI is not installed, so no policy check runs.",
+          "User-started health and coverage commands still use a purpose allowlist, direct argv execution, hard timeouts, bounded output, and stop-on-failure accounting. Manvi is not installed, so no policy check runs.",
           "warning",
         );
       case "blocked":
         return presentation(
           "Blocked",
-          "Guarded health and coverage commands are refused while MANVI policy checks are failing. Reconnect after the policy gate recovers.",
+          "Guarded health and coverage commands are refused while Manvi policy checks are failing. Reconnect after the policy gate recovers.",
           "error",
         );
       default:
         return presentation(
           "Status unknown",
-          "The MANVI policy capability has not been checked yet. User-started commands remain behind the purpose allowlist; reconnect to establish whether the policy gate can run.",
+          "The Manvi policy capability has not been checked yet. User-started commands remain behind the purpose allowlist; reconnect to establish whether the policy gate can run.",
           "neutral",
         );
     }
@@ -164,7 +172,7 @@
     if (refreshError) {
       statuses.push(
         presentation(
-          "Latest MANVI status request failed",
+          "Couldn't check Manvi status",
           `${redactDiagnosticText(refreshError)} Displayed capability status may be stale.`,
           "error",
         ),
@@ -264,6 +272,9 @@
     type ScanResult,
   } from "../ai/scan";
   import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { manviSectionId } from "../ui/manviFocus";
   import { beginGeneration } from "../async/guard";
   import {
@@ -321,6 +332,12 @@
    * an OS dialog the backend draws, so this button is a request, not the
    * decision; a declined or refused adoption is reported here, never swallowed.
    */
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
   async function adoptLedger() {
     const repo = $currentRepoPath;
     if (!repo || adopting) return;
@@ -330,7 +347,7 @@
       await invoke<string[]>("cmd_adopt_ledger", { repoPath: repo });
       await harnessStore.catchUp(repo);
     } catch (error: unknown) {
-      adoptError = redactDiagnosticText(formatError(error));
+      adoptError = failure("adopt", "the activity history", redactDiagnosticText(formatError(error)));
     } finally {
       adopting = false;
     }
@@ -383,7 +400,7 @@
       grantClock = Date.now();
     } catch (error: unknown) {
       if (!grantRequests.isCurrent(generation) || $repoStore.currentPath !== repo) return;
-      grantsLoadError = redactDiagnosticText(formatError(error));
+      grantsLoadError = failure("refresh", "grant history", redactDiagnosticText(formatError(error)));
       if (showLoading) grants = null;
     } finally {
       if (!grantRequests.isCurrent(generation) || $repoStore.currentPath !== repo) return;
@@ -455,25 +472,24 @@
     return new Date(ts).toLocaleTimeString();
   }
 
-  function verdictChip(status: string): string {
+  /** The `gp-chip` tone for a verdict status; an unchecked one is unknown, never neutral. */
+  function verdictTone(status: string): string {
     switch (status) {
       case "blocked":
-        return "bg-rose-500/20 text-rose-300 border-rose-500/40";
+        return "danger";
       case "granted":
-        return "bg-purple-500/20 text-purple-300 border-purple-500/40";
+        return "accent";
       case "demoted":
-        return "bg-blue-500/20 text-blue-300 border-blue-500/40";
-      case "widened":
-        return "bg-amber-500/20 text-amber-300 border-amber-500/40";
-      case "degraded":
-        return "bg-yellow-500/20 text-yellow-300 border-yellow-500/40";
       case "warned":
-        return "bg-sky-500/15 text-sky-300 border-sky-500/30";
+        return "info";
+      case "widened":
+      case "degraded":
+        return "warn";
       case "allowed":
-        return "bg-emerald-500/10 text-emerald-300 border-emerald-500/25";
+        return "ok";
       case "unchecked":
       default:
-        return "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
+        return "unknown";
     }
   }
 
@@ -527,7 +543,7 @@
     } catch (e) {
       // Reported, not swallowed: a sweep that failed is not a machine with no
       // models on it.
-      scanError = formatError(e);
+      scanError = failure("scan", "local model servers", e);
       scan = null;
     } finally {
       scanning = false;
@@ -558,7 +574,7 @@
       branchSuggestion = result.text;
       branchWarnings = result.warnings;
     } catch (err: unknown) {
-      branchError = formatError(err);
+      branchError = failure("suggest", "a branch name", err);
     } finally {
       isSuggesting = false;
     }
@@ -572,132 +588,136 @@
     if (outcome.ok) {
       branchSuggestion = "";
     } else {
-      branchError = outcome.error ?? "The branch could not be created.";
+      branchError = outcome.error ?? "Couldn't create the branch.";
     }
   }
 </script>
 
 <div class="space-y-4">
-  <!-- Harness -->
+  <!-- Policy connection -->
   <section id={manviSectionId("harness")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between gap-2">
-      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">MANVI harness</h3>
+      <h3 class="gp-label">Manvi policy</h3>
       <button
         onclick={() => harnessStore.reconnect()}
-        class="gp-btn py-1! text-[11px]!"
-        title="Restart the MANVI sidecar and sweep for model servers again"
+        class="gp-btn"
+        data-size="sm"
+        title="Restart Manvi and scan for model servers again"
       >
         <RefreshCw size={12} class={$harnessStore.isProbing ? "animate-spin" : ""} />
         <span>Reconnect</span>
       </button>
     </div>
     {#if harnessError}
-      <div class="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 space-y-1.5">
-        <div class="flex items-center gap-2 text-rose-400 font-medium">
-          <ShieldAlert size={14} />
-          <span>Latest MANVI status request failed</span>
+      <div class="gp-notice" data-tone="unknown" role="alert">
+        <ShieldAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 space-y-1.5">
+          <div class="font-medium">Couldn't check Manvi status</div>
+          <p class="text-textMuted leading-relaxed wrap-break-word">
+            {redactDiagnosticText(harnessError)} Any previously displayed connection state may be stale;
+            press Reconnect to check again.
+          </p>
         </div>
-        <p class="text-textMuted leading-relaxed wrap-break-word">
-          {redactDiagnosticText(harnessError)} Any previously displayed connection state may be stale;
-          press Reconnect to check again.
-        </p>
       </div>
     {:else if permissionMode === "connected" && harness}
-      <div class="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3 space-y-1.5">
-        <div class="flex items-center gap-2 text-emerald-400 font-medium">
-          <ShieldCheck size={14} />
-          <span>Connected — protocol {harness.protocol}, posture {harness.posture}</span>
-        </div>
-        <div class="font-mono text-[11px] text-textMuted break-all">{harness.binary}</div>
-        <p class="text-textMuted leading-relaxed">
-          Commits, pushes, merges, rebases, branch deletions, discards and conflict-editor
-          saves are put to the harness's gates before they run. Hard rules — force pushes,
-          verification bypass flags, writes to credential paths — are refused here.
-        </p>
-        <div class="flex flex-wrap gap-1 pt-1">
-          {#each harness.ops as op}
-            <span class="px-1.5 py-0.5 rounded-full bg-surfaceHover border border-border/80 font-mono text-[10px] text-textMuted">{op}</span>
-          {/each}
+      <div class="gp-notice" data-tone="ok">
+        <ShieldCheck size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 space-y-1.5">
+          <div class="font-medium">Connected · protocol {harness.protocol}, mode {harness.posture}</div>
+          <div class="font-mono text-meta text-textMuted break-all">{harness.binary}</div>
+          <p class="text-textMuted leading-relaxed">
+            Commits, pushes, merges, rebases, branch deletions, discards and conflict-editor
+            saves are put to Manvi's gates before they run. Hard rules — force pushes,
+            verification bypass flags, writes to credential paths — are refused here.
+          </p>
+          <div class="flex flex-wrap gap-1 pt-1">
+            {#each harness.ops as op}
+              <span class="gp-chip font-mono" data-tone="neutral" data-kind="label">{op}</span>
+            {/each}
+          </div>
         </div>
       </div>
     {:else if permissionMode === "unguarded"}
-      <div class="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3 space-y-1.5">
-        <div class="flex items-center gap-2 text-amber-400 font-medium">
-          <ShieldAlert size={14} />
-          <span>MANVI is not installed</span>
+      <div class="gp-notice" data-tone="warn">
+        <ShieldAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 space-y-1.5">
+          <div class="font-medium">Manvi is not installed</div>
+          <p class="text-textMuted leading-relaxed">
+            {harnessPermissionSummary(harness)} Install Manvi, or point
+            <span class="font-mono">GITPULSE_MANVI_BIN</span> at the binary, then press Reconnect.
+          </p>
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            onclick={() => openSetupWizard("manvi", "explain")}
+          >
+            Set up Manvi
+          </button>
+          <ExternalToolsPanel
+            only="manvi"
+            compact
+            onInstalled={() => harnessStore.reconnect()}
+          />
         </div>
-        <p class="text-textMuted leading-relaxed">
-          {harnessPermissionSummary(harness)} Install MANVI, or point
-          <span class="font-mono">GITPULSE_MANVI_BIN</span> at the binary, then press Reconnect.
-        </p>
-        <button
-          type="button"
-          class="gp-btn text-[11px] px-2 py-0.5"
-          onclick={() => openSetupWizard("manvi", "explain")}
-        >
-          Set up manvi
-        </button>
-        <ExternalToolsPanel
-          only="manvi"
-          compact
-          onInstalled={() => harnessStore.reconnect()}
-        />
       </div>
     {:else if permissionMode === "blocked"}
-      <div class="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 space-y-1.5">
-        <div class="flex items-center gap-2 text-rose-400 font-medium">
-          <ShieldAlert size={14} />
-          <span>Policy gate failed — mutations blocked</span>
+      <div class="gp-notice" data-tone="danger" role="alert">
+        <ShieldAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+        <div class="min-w-0 flex-1 space-y-1.5">
+          <div class="font-medium">Policy gate failed — mutations blocked</div>
+          <p class="text-textMuted leading-relaxed">{harnessPermissionSummary(harness)}</p>
+          <p class="text-textMuted leading-relaxed">
+            Press Reconnect after resolving the failure. GitPulse will not treat a timed-out,
+            busy, unavailable, or incompatible policy check as approval.
+          </p>
         </div>
-        <p class="text-textMuted leading-relaxed">{harnessPermissionSummary(harness)}</p>
-        <p class="text-textMuted leading-relaxed">
-          Press Reconnect after resolving the sidecar failure. GitPulse will not treat a timed-out,
-          busy, unavailable, or incompatible policy check as approval.
-        </p>
       </div>
     {:else}
-      <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted">
+      <div class="gp-notice" data-tone="unknown" role="status">
         {harnessPermissionSummary(harness)}
       </div>
     {/if}
   </section>
 
   <!-- The live `hello` response is intentionally narrow: GitPulse embeds
-       MANVI's policy and local-model planes only. This card keeps that wire
+       Manvi's policy and local-model planes only. This card keeps that wire
        truth separate from app-owned, user-confirmed command execution. -->
   <section class="gp-card p-4 space-y-3">
     <div class="space-y-1">
-      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Capability boundary</h3>
+      <h3 class="gp-label">Capability boundary</h3>
       <p class="text-textMuted leading-relaxed">
         No autonomous PTY or app-control API is exposed by <span class="font-mono">manvi serve</span>.
-        GitPulse adds narrow, explicit controls around the planes the sidecar actually provides.
+        GitPulse adds narrow, explicit controls around the planes Manvi actually provides.
       </p>
     </div>
 
     <div class="grid gap-2 sm:grid-cols-2">
-      <div class="rounded-xl border border-border/70 bg-background p-3 space-y-1">
+      <div class="rounded-xl bg-background p-3 space-y-1">
         <div class="flex items-center gap-2 text-textPrimary font-medium">
           <SquareTerminal size={13} class="text-textMuted" />
           <span>Interactive shell</span>
-          <span class="ml-auto text-[10px] uppercase text-amber-300">User only</span>
+          <span class="gp-chip ml-auto" data-tone="warn" data-kind="label">User only</span>
         </div>
         <p class="text-textMuted leading-relaxed">
-          MANVI never receives the PTY handle or keystrokes. Shell commands are typed and owned by you.
+          Manvi never receives the PTY handle or keystrokes. Shell commands are typed and owned by you.
         </p>
       </div>
-      <div class="rounded-xl border p-3 space-y-1 {runnerPresentation.cardClass}">
-        <div class="flex items-center gap-2 text-textPrimary font-medium">
-          {#if runnerPresentation.tone === "ready"}
-            <ShieldCheck size={13} class={runnerPresentation.badgeClass} />
-          {:else}
-            <ShieldAlert size={13} class={runnerPresentation.badgeClass} />
-          {/if}
-          <span>Scoped action runner</span>
-          <span class="ml-auto text-[10px] uppercase {runnerPresentation.badgeClass}">{runnerPresentation.label}</span>
+      <div class="gp-notice" data-tone={NOTICE_TONE[runnerPresentation.tone]}>
+        <div class="min-w-0 flex-1 space-y-1">
+          <div class="flex items-center gap-2 text-textPrimary font-medium">
+            {#if runnerPresentation.tone === "ready"}
+              <ShieldCheck size={13} class={runnerPresentation.badgeClass} />
+            {:else}
+              <ShieldAlert size={13} class={runnerPresentation.badgeClass} />
+            {/if}
+            <span>Scoped action runner</span>
+            <span class="ml-auto text-micro {runnerPresentation.badgeClass}">{runnerPresentation.label}</span>
+          </div>
+          <p class="text-textMuted leading-relaxed">
+            {runnerPresentation.detail}
+          </p>
         </div>
-        <p class="text-textMuted leading-relaxed">
-          {runnerPresentation.detail}
-        </p>
       </div>
     </div>
 
@@ -706,7 +726,7 @@
         class="gp-btn justify-start"
         disabled={!$repoStore.currentPath}
         onclick={() => openCapability("health")}
-        title="Scan dependencies, ask MANVI for a remediation plan, and run approved steps"
+        title="Scan dependencies, ask Manvi for a remediation plan, and run approved steps"
       >
         <Wrench size={12} /> Health fixes
       </button>
@@ -741,7 +761,7 @@
 
   <!-- Model servers -->
   <section id={manviSectionId("model")} tabindex="-1" class="gp-card p-4 space-y-2">
-    <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Local model servers</h3>
+    <h3 class="gp-label">Local model servers</h3>
     {#if ai}
       <!--
         Discovery. Separate from the endpoint list above, which reports servers
@@ -752,43 +772,40 @@
         <button
           onclick={() => void runScan()}
           disabled={scanning}
-          class="text-[10px] text-textMuted hover:text-accent underline inline-flex items-center gap-1 disabled:opacity-50"
+          class="gp-btn"
+          data-variant="ghost"
+          data-size="sm"
           title="Probe the well-known local endpoints and list what each server serves"
         >
           <RefreshCw size={11} class={scanning ? "animate-spin" : ""} />
           <span>{scanning ? "Scanning…" : "Scan local servers"}</span>
         </button>
         {#if scan}
-          <span class="text-[10px] text-textMuted">{sweepSummary(scan)}</span>
+          <span class="text-micro text-textMuted">{sweepSummary(scan)}</span>
         {/if}
       </div>
 
       {#if scanError}
-        <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-2.5 text-[11px] text-amber-400">
-          The scan did not complete, so this is not a list of what is running: {scanError}
+        <div class="gp-notice" data-tone="unknown" role="status">
+          {scanError} This is not a list of what is running.
         </div>
       {:else if scan && scan.servers.length > 0}
         <div class="space-y-1.5">
           {#each scan.servers as server, i (`${server.base_url}#${i}`)}
-            <div class="rounded-xl border border-border/70 bg-background p-2.5 space-y-1">
-              <div class="flex items-center gap-2 text-[11px]">
+            <div class="rounded-xl bg-background p-2.5 space-y-1">
+              <div class="flex items-center gap-2 text-meta">
                 <Server size={12} class="text-accent shrink-0" />
                 <span class="font-mono truncate">{server.base_url}</span>
-                <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1.5 text-textMuted">
-                  {server.runtime}
-                </span>
+                <span class="gp-chip shrink-0" data-tone="neutral" data-kind="label">{server.runtime}</span>
                 {#if server.version}
-                  <span class="shrink-0 text-[9px] text-textMuted">v{server.version}</span>
+                  <span class="shrink-0 text-micro text-textMuted">v{server.version}</span>
                 {/if}
               </div>
               {#each server.models as model, i (`${model.id || "model"}#${i}`)}
                 <button
                   onclick={() => pick({ base_url: server.base_url, model: model.id })}
-                  class="w-full px-2 py-1 rounded-lg flex items-center gap-2 text-left text-[10px] transition-colors
-                    {isSelected(server.base_url, model.id)
-                      ? 'bg-accent/15 text-accent'
-                      : 'hover:bg-surfaceHover text-textPrimary'}
-                    {usable(model) ? '' : 'opacity-50'}"
+                  class="gp-row w-full text-left text-micro {usable(model) ? '' : 'opacity-50'}"
+                  data-selected={isSelected(server.base_url, model.id)}
                   title={usable(model)
                     ? `${contextWindowLabel(model)} · ${toolSupportLabel(model)}`
                     : "This model does not generate text — an embedding model answers the same listing as every chat model."}
@@ -801,12 +818,9 @@
                     capable model look incapable.
                   -->
                   <span
-                    class="shrink-0 text-[9px] rounded-full px-1.5 border
-                      {!model.capabilities_known
-                        ? 'text-textMuted border-border/80'
-                        : model.supports_tools
-                          ? 'text-accent border-accent/40'
-                          : 'text-textMuted border-border/80'}"
+                    class="gp-chip shrink-0"
+                    data-kind="label"
+                    data-tone={!model.capabilities_known ? "unknown" : model.supports_tools ? "accent" : "neutral"}
                   >{toolSupportLabel(model)}</span>
                 </button>
               {/each}
@@ -816,32 +830,32 @@
       {/if}
 
       {#if ai.endpoints.filter((e) => e.reachable).length === 0}
-        <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
-          {ai.detail || "No local model server answered."}
-          <p class="mt-1.5">
-            GitPulse only ever talks to a model server on this machine: the transport refuses
-            any address that is not loopback, so a diff cannot leave the machine through a
-            mistyped setting.
-          </p>
+        <div class="gp-notice" data-tone="unknown" role="status">
+          <div class="min-w-0 flex-1">
+            {ai.detail || "No local model server answered."}
+            <p class="mt-1.5 text-textMuted">
+              GitPulse only ever talks to a model server on this machine: the transport refuses
+              any address that is not loopback, so a diff cannot leave the machine through a
+              mistyped setting.
+            </p>
+          </div>
         </div>
       {:else}
         <div class="space-y-2">
           {#each ai.endpoints.filter((e) => e.reachable) as endpoint}
-            <div class="rounded-xl border border-border/70 bg-background p-3 space-y-2">
+            <div class="rounded-xl bg-background p-3 space-y-2">
               <div class="flex items-center gap-2 text-textPrimary font-medium">
                 <Server size={13} class="text-accent" />
-                <span class="font-mono text-[11px]">{endpoint.base_url}</span>
+                <span class="font-mono text-meta">{endpoint.base_url}</span>
               </div>
               <div class="grid grid-cols-1 gap-1">
                 {#each endpoint.models as model}
                   <button
                     onclick={() => pick({ base_url: endpoint.base_url, model })}
-                    class="px-2.5 py-1.5 rounded-full flex items-center justify-between gap-2 text-left transition-colors
-                      {isSelected(endpoint.base_url, model)
-                        ? 'bg-accent/15 text-accent border border-accent/40'
-                        : 'hover:bg-surfaceHover border border-transparent text-textPrimary'}"
+                    class="gp-row justify-between text-left"
+                    data-selected={isSelected(endpoint.base_url, model)}
                   >
-                    <span class="font-mono text-[11px] truncate">{model}</span>
+                    <span class="font-mono text-meta truncate">{model}</span>
                     {#if isSelected(endpoint.base_url, model)}
                       <Check size={13} />
                     {/if}
@@ -853,7 +867,9 @@
           {#if preferred}
             <button
               onclick={() => pick(null)}
-              class="text-[11px] text-textMuted hover:text-textPrimary underline"
+              class="gp-btn"
+              data-variant="ghost"
+              data-size="sm"
             >
               Clear the pinned model and let discovery choose
             </button>
@@ -862,7 +878,7 @@
       {/if}
 
       {#if ai.model_info}
-        <div class="rounded-xl border border-border/70 bg-background p-3 space-y-1">
+        <div class="rounded-xl bg-background p-3 space-y-1">
           <div class="text-textPrimary font-medium">{ai.model_info.model}</div>
           <!-- Provenance, not just a number: a window read off the server
                and one typed into a default produce the same request and
@@ -870,36 +886,37 @@
           <div class="text-textMuted">
             Context: {ai.model_info.describe}
             {#if !ai.model_info.discovered}
-              <span class="text-amber-400"> (declared, not discovered)</span>
+              <span class="text-warn"> (declared, not discovered)</span>
             {/if}
           </div>
           {#if ai.model_info.capabilities_known}
             <div class="flex flex-wrap gap-1 pt-1">
-              {#if ai.model_info.supports_tools}<span class="px-1.5 py-0.5 rounded-full bg-surfaceHover border border-border/80 text-[10px]">tools</span>{/if}
-              {#if ai.model_info.supports_vision}<span class="px-1.5 py-0.5 rounded-full bg-surfaceHover border border-border/80 text-[10px]">vision</span>{/if}
-              {#if ai.model_info.supports_reasoning}<span class="px-1.5 py-0.5 rounded-full bg-surfaceHover border border-border/80 text-[10px]">reasoning</span>{/if}
+              {#if ai.model_info.supports_tools}<span class="gp-chip" data-tone="neutral" data-kind="label">tools</span>{/if}
+              {#if ai.model_info.supports_vision}<span class="gp-chip" data-tone="neutral" data-kind="label">vision</span>{/if}
+              {#if ai.model_info.supports_reasoning}<span class="gp-chip" data-tone="neutral" data-kind="label">reasoning</span>{/if}
             </div>
           {:else}
             <div class="text-textMuted">The server published no capability list.</div>
           {/if}
         </div>
       {:else if ai.model_detail}
-        <div class="text-amber-400">{ai.model_detail}</div>
+        <div class="gp-notice" data-tone="warn" role="status">{ai.model_detail}</div>
       {/if}
     {:else}
-      <div class="text-textMuted">Probing…</div>
+      <Skeleton variant="text" count={2} />
     {/if}
   </section>
 
   <!-- Branch naming -->
   {#if $repoStore.currentPath}
     <section class="gp-card p-4 space-y-2">
-      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Name a branch for the work in progress</h3>
+      <h3 class="gp-label">Name a branch for the work in progress</h3>
       <div class="flex items-center gap-2">
         <button
           onclick={suggestBranch}
           disabled={isSuggesting || !ai?.ready}
-          class="gp-btn-primary"
+          class="gp-btn"
+          data-variant="primary"
         >
           <GitBranch size={13} />
           <span>{isSuggesting ? "Thinking…" : "Suggest a name"}</span>
@@ -907,6 +924,7 @@
         {#if branchSuggestion}
           <input
             bind:value={branchSuggestion}
+            aria-label="Suggested branch name"
             class="gp-field flex-1 min-w-0 font-mono"
           />
           <button
@@ -918,10 +936,10 @@
         {/if}
       </div>
       {#if branchError}
-        <div class="text-rose-400">{branchError}</div>
+        <div class="gp-notice" data-tone="danger" role="alert">{branchError}</div>
       {/if}
       {#each branchWarnings as warning}
-        <div class="text-amber-400">{warning}</div>
+        <div class="gp-notice" data-tone="warn" role="status">{warning}</div>
       {/each}
     </section>
   {/if}
@@ -929,7 +947,7 @@
   <!-- Grant ledger: who waived which rule, and until when -->
   {#if grantsLoading || grantsLoadError || grants?.available}
     <section class="gp-card p-4 space-y-2">
-      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted flex items-center gap-1.5">
+      <h3 class="gp-label flex items-center gap-1.5">
         <ShieldAlert size={11} />
         <span>
           {grants?.available
@@ -938,15 +956,13 @@
         </span>
       </h3>
       {#if grantsLoading}
-        <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed" role="status">
-          Checking grant history…
-        </div>
+        <div role="status" aria-label="Checking grant history"><Skeleton variant="text" count={2} /></div>
       {:else}
         {#if grantsLoadError}
-          <div class="rounded-xl border border-rose-500/40 bg-rose-500/5 p-3 text-[11px] text-rose-400 leading-relaxed" role="alert">
-            Grant history could not be refreshed. {grants
+          <div class="gp-notice" data-tone="unknown" role="alert">
+            {grantsLoadError} {grants
               ? "The last verified snapshot remains below."
-              : "No authority state is inferred."} {grantsLoadError}
+              : "No authority state is inferred."}
           </div>
         {/if}
         {#if grants?.error}
@@ -954,29 +970,31 @@
             Invalid entries are refused by the backend, while valid entries
             remain visible. The warning and list must therefore be independent.
           -->
-          <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3 text-[11px] text-amber-400 leading-relaxed">
+          <div class="gp-notice" data-tone="warn" role="status">
             Some grant records were refused, so this list is not the whole
             truth: {redactDiagnosticText(grants.error)}
           </div>
         {/if}
         {#if grants?.grants.length === 0}
-          <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
-            {grants.error
-              ? "No valid grant record could be displayed."
-              : "No rule has been waived in this repository."}
-          </div>
+          {#if grants.error}
+            <div class="gp-notice" data-tone="unknown" role="status">
+              No valid grant record could be displayed.
+            </div>
+          {:else}
+            <EmptyState compact icon={ShieldCheck} title="No rules waived" hint="A grant appears here when someone waives a policy rule in this repository." />
+          {/if}
         {:else if grants && grants.grants.length > 0}
-          <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-40 overflow-y-auto">
+          <div class="rounded-xl bg-background p-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
             {#each orderedGrants as grant, i (`${grant.id}#${i}`)}
-              <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]">
+              <div class="rounded-lg px-2 py-1.5 flex flex-col gap-0.5 text-meta hover:bg-surfaceHover">
                 <div class="flex items-center gap-1.5 min-w-0">
-                  <span class="font-mono text-[10px] text-accent truncate">
+                  <span class="font-mono text-micro text-accent truncate">
                     {grant.scope.rules.length > 0 ? grant.scope.rules.join(", ") : "invalid scope: no policy rule"}
                   </span>
                   {#if grant.scope.once}
-                    <span class="shrink-0 text-[9px] uppercase text-textMuted">one use</span>
+                    <span class="shrink-0 text-micro text-textMuted">one use</span>
                   {/if}
-                  <span class="ml-auto shrink-0 text-[9px] uppercase text-textMuted">
+                  <span class="ml-auto shrink-0 text-micro text-textMuted">
                     {grantLifecycle(grant, grantClock)}
                   </span>
                 </div>
@@ -995,8 +1013,8 @@
               </div>
             {/each}
           </div>
-          <p class="text-[10px] text-textMuted">
-            Current MANVI CLI has no grant-revocation command. A grant stops applying after it is consumed or expires.
+          <p class="text-micro text-textMuted">
+            Current Manvi CLI has no grant-revocation command. A grant stops applying after it is consumed or expires.
             GitPulse only reads the ledger at <code class="font-mono break-all">{grants.path}</code>.
           </p>
         {/if}
@@ -1007,15 +1025,17 @@
   <!-- Agent activity journal -->
   <section id={manviSectionId("activity")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between">
-      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted flex items-center gap-1.5">
+      <h3 class="gp-label flex items-center gap-1.5">
         <History size={11} />
         <span>Agent activity ({recentActions.length})</span>
       </h3>
-      <div class="flex items-center gap-3">
+      <div class="flex items-center gap-1">
         {#if recentActions.length > 0}
           <button
             onclick={() => void copyLog()}
-            class="text-[10px] text-textMuted hover:text-textPrimary underline inline-flex items-center gap-1"
+            class="gp-btn"
+            data-variant="ghost"
+            data-size="sm"
             title="Copy the activity log to the clipboard"
           >
             <Clipboard size={11} />
@@ -1023,7 +1043,9 @@
           </button>
           <button
             onclick={() => harnessStore.clearActions()}
-            class="text-[10px] text-textMuted hover:text-textPrimary underline"
+            class="gp-btn"
+            data-variant="ghost"
+            data-size="sm"
           >
             Clear
           </button>
@@ -1032,19 +1054,21 @@
     </div>
     <div class="grid gap-2 md:grid-cols-2" aria-label="Activity history status">
       {#each activityHistory as status, i (`${status.label}#${i}`)}
-        <div class="rounded-xl border p-3 {status.cardClass}" role="status">
-          <div class="text-[10px] font-semibold uppercase tracking-wider {status.badgeClass}">
-            {status.label}
+        <div class="gp-notice" data-tone={NOTICE_TONE[status.tone]} role="status">
+          <div class="min-w-0 flex-1">
+            <div class="text-micro font-semibold {status.badgeClass}">
+              {status.label}
+            </div>
+            <p class="mt-1 text-meta text-textMuted leading-relaxed wrap-break-word">
+              {status.detail}
+            </p>
           </div>
-          <p class="mt-1 text-[11px] text-textMuted leading-relaxed wrap-break-word">
-            {status.detail}
-          </p>
         </div>
       {/each}
     </div>
     {#if adoptable}
-      <div class="rounded-xl border border-border/70 bg-background p-3 flex flex-col gap-2">
-        <p class="text-[11px] text-textMuted leading-relaxed">
+      <div class="rounded-xl bg-background p-3 flex flex-col gap-2">
+        <p class="text-meta text-textMuted leading-relaxed">
           If this checkout is a repository whose activity history was recorded elsewhere (moved
           across devices, restored from a backup, or copied with the original gone), adopt that
           history to keep recording into it. You will be asked to confirm in a system dialog, and
@@ -1054,49 +1078,50 @@
           <button
             onclick={() => void adoptLedger()}
             disabled={adopting}
-            class="text-[11px] px-2 py-1 rounded-lg border border-border hover:bg-surfaceHover disabled:opacity-50"
+            class="gp-btn"
+            data-size="sm"
           >
             {adopting ? "Adopting…" : ADOPT_LEDGER_LABEL}
           </button>
         </div>
         {#if adoptError}
-          <p class="text-[11px] text-rose-400 wrap-break-word" role="alert">{adoptError}</p>
+          <div class="gp-notice" data-tone="danger" role="alert">{adoptError}</div>
         {/if}
       </div>
     {/if}
     {#if recentActions.length === 0}
-      <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
+      <div class="gp-notice" data-tone="unknown" role="status">
         No activity rows are currently available. The history status above says whether this
         means no recorded actions or incomplete data.
       </div>
     {:else}
-      <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-56 overflow-y-auto">
-          {#each recentActions as action, i (`${action.identity}#${i}`)}
-          <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]" title={action.verdict?.detail ?? action.label}>
+      <div class="rounded-xl bg-background p-1 flex flex-col gap-0.5 max-h-56 overflow-y-auto">
+        {#each recentActions as action, i (`${action.identity}#${i}`)}
+          <div class="rounded-lg px-2 py-1.5 flex flex-col gap-0.5 text-meta hover:bg-surfaceHover" title={action.verdict?.detail ?? action.label}>
             <div class="flex items-center gap-2">
-              <span class="font-mono text-[10px] text-textMuted shrink-0">{actionTime(action.ts)}</span>
-              <span class="shrink-0 px-1.5 py-0.5 rounded-full font-mono text-[9px] uppercase border {verdictChip(
+              <span class="font-mono text-micro text-textMuted shrink-0">{actionTime(action.ts)}</span>
+              <span class="gp-chip shrink-0 font-mono" data-kind="label" data-tone={verdictTone(
                 !action.ok ? 'blocked' : (action.verdict?.status ?? 'unchecked')
-              )}">
+              )}>
                 {action.verdict?.status ?? action.kind}
               </span>
-              <span class="truncate {action.ok ? 'text-textPrimary' : 'text-rose-400'}">{action.label || "—"}</span>
+              <span class="truncate {action.ok ? 'text-textPrimary' : 'text-danger'}">{action.label || "—"}</span>
               {#if action.verdict?.task_id}
-                <span class="ml-auto font-mono text-[9px] px-1.5 py-0.2 rounded bg-surfaceHover text-textMuted shrink-0">
+                <span class="gp-chip ml-auto shrink-0 font-mono" data-tone="neutral" data-kind="label">
                   {action.verdict.task_id}
                 </span>
               {/if}
             </div>
             {#if action.verdict?.grant_id}
-              <div class="text-[10px] text-purple-300/80 font-mono pl-14">
+              <div class="text-micro text-accent/80 font-mono pl-14">
                 Grant {action.verdict.grant_id} by {action.verdict.granted_by || "human"} · {action.verdict.reason || "waived"}
               </div>
             {:else if action.verdict?.demoted}
-              <div class="text-[10px] text-blue-300/80 font-mono pl-14">
-                Posture demoted: {action.verdict.demoted}
+              <div class="text-micro text-info/80 font-mono pl-14">
+                Checks demoted: {action.verdict.demoted}
               </div>
             {:else if action.verdict?.widened}
-              <div class="text-[10px] text-amber-300/80 font-mono pl-14">
+              <div class="text-micro text-warn/80 font-mono pl-14">
                 Scope widened: {action.verdict.widened}
               </div>
             {/if}

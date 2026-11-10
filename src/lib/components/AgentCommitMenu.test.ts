@@ -13,15 +13,15 @@ const source = readFileSync(
 describe("AgentCommitMenu", () => {
   it("renders regular button by default", () => {
     const { body } = render(AgentCommitMenu, { props: { compact: false } });
-    expect(body).toContain("Ask Agent to Commit");
+    expect(body).toContain("Ask agent to commit");
     expect(body).toContain('aria-haspopup="dialog"');
     expect(body).toContain('data-agent-commit-menu');
   });
 
   it("renders compact button when compact is true", () => {
     const { body } = render(AgentCommitMenu, { props: { compact: true } });
-    expect(body).toContain("Ask Agent");
-    expect(body).toContain('rounded-full');
+    expect(body).toContain("Ask agent");
+    expect(body).toContain('gp-btn');
     expect(body).toContain('data-agent-commit-menu');
   });
 
@@ -36,7 +36,7 @@ describe("AgentCommitMenu", () => {
   it("provides Developer CLI and Python SDK inspection and copying", () => {
     expect(source).toContain("getAgentCommitCliCommand");
     expect(source).toContain("getAgentCommitSdkSnippet");
-    expect(source).toContain("CLI & Developer SDK");
+    expect(source).toContain("CLI & developer SDK");
     expect(source).toContain("handleCopy");
     expect(source).toContain("copyText");
   });

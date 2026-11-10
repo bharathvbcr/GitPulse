@@ -37,9 +37,9 @@ describe("segmented-control semantics", () => {
     expect(text).toContain('aria-pressed={filter === "direct"}');
   });
 
-  it("announces MANVI and Markdown modes as pressed-button groups", () => {
+  it("announces Manvi and Markdown modes as pressed-button groups", () => {
     const manvi = source("ManviOpsPanel.svelte");
-    expect(manvi).toContain('class="gp-segmented" role="group" aria-label="MANVI view"');
+    expect(manvi).toContain('class="gp-segmented" role="group" aria-label="Manvi view"');
     // The panes render from one catalog, so the pressed state is declared once
     // for every option instead of per hand-written button: a pane added to the
     // catalog cannot reach the header without it.
