@@ -30,6 +30,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
   import { formatError } from "../../ui/formatError";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import { highlightMatches } from "../../branches/groupBranches";
   import {
     ancestorsOf,
@@ -307,11 +308,16 @@
    * in the rail is what overflowed the old pills off the right edge.
    */
   const STATUS_SCOPES = [
-    { id: "modified", label: "Modified", mark: statusBadgeLabel("unstaged"), tint: "text-amber-300", on: "bg-amber-500/25 text-amber-300 border-amber-500/50" },
-    { id: "staged", label: "Staged", mark: statusBadgeLabel("staged"), tint: "text-emerald-300", on: "bg-emerald-500/25 text-emerald-300 border-emerald-500/50" },
-    { id: "untracked", label: "Untracked", mark: statusBadgeLabel("untracked"), tint: "text-cyan-300", on: "bg-cyan-500/25 text-cyan-300 border-cyan-500/50" },
-    { id: "conflicted", label: "Conflicted", mark: statusBadgeLabel("conflict"), tint: "text-rose-300", on: "bg-rose-500/25 text-rose-300 border-rose-500/50" },
-  ] as const satisfies readonly { id: Exclude<StatusFilter, "all">; label: string; mark: string; tint: string; on: string }[];
+    { id: "modified", label: "Modified", mark: statusBadgeLabel("unstaged"), tone: "warn" },
+    { id: "staged", label: "Staged", mark: statusBadgeLabel("staged"), tone: "ok" },
+    { id: "untracked", label: "Untracked", mark: statusBadgeLabel("untracked"), tone: "info" },
+    { id: "conflicted", label: "Conflicted", mark: statusBadgeLabel("conflict"), tone: "danger" },
+  ] as const satisfies readonly {
+    id: Exclude<StatusFilter, "all">;
+    label: string;
+    mark: string;
+    tone: "ok" | "warn" | "danger" | "info";
+  }[];
 
   let anyChanges = $derived(
     statusCounts.modified + statusCounts.staged + statusCounts.untracked + statusCounts.conflicted >
@@ -574,7 +580,7 @@
       target,
       parentDir,
       {
-        title: "New File",
+        title: "New file",
         message: parentDir ? `Create file in ${parentDir}/` : "Create file in repository root",
         placeholder: "example.ts",
         confirmLabel: "Create",
@@ -597,10 +603,10 @@
       target,
       parentDir,
       {
-        title: "New Folder",
+        title: "New folder",
         message: parentDir ? `Create folder in ${parentDir}/` : "Create folder in repository root",
         placeholder: "components",
-        confirmLabel: "Create Folder",
+        confirmLabel: "Create folder",
       },
       (name) => (parentDir ? `${parentDir}/${name}/.gitkeep` : `${name}/.gitkeep`),
     );
@@ -619,7 +625,7 @@
     const target = repoStore.captureTarget();
     if (!repo || !target) return;
     const answer = await askText({
-      title: row.kind === "dir" ? "Rename or Move Folder" : "Rename or Move File",
+      title: row.kind === "dir" ? "Rename or move folder" : "Rename or move file",
       message: `New repository-relative path for ${row.path}`,
       initialValue: row.path,
       confirmLabel: "Move",
@@ -651,7 +657,7 @@
       $repoStore.statuses.filter((s) => isUntrackedStatusCode(s.status_code)).map((s) => s.path),
     );
     const confirmed = await askConfirm({
-      title: row.kind === "dir" ? "Delete Folder" : "Delete File",
+      title: row.kind === "dir" ? "Delete folder" : "Delete file",
       message: describeDelete(row.path, row.kind === "dir" ? "dir" : "file", files, untracked),
       confirmLabel: "Delete",
       destructive: true,
@@ -686,9 +692,9 @@
     // The repository this file belongs to, held across the confirm.
     const target = repoStore.captureTarget();
     const confirmed = await askConfirm({
-      title: "Discard Changes",
-      message: `Are you sure you want to discard all uncommitted changes to ${path}? This cannot be undone.`,
-      confirmLabel: "Discard Changes",
+      title: "Discard changes",
+      message: `Discard all uncommitted changes to ${path}? This cannot be undone.`,
+      confirmLabel: "Discard changes",
     });
     if (!confirmed) return;
     const outcome = await repoStore.discardChanges(path, target);
@@ -884,7 +890,7 @@
 
 </script>
 
-<div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 overflow-hidden border-r border-border/70 select-none">
+<div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 overflow-hidden select-none">
   <!--
     Explorer chrome.
 
@@ -896,19 +902,19 @@
     filter: `filtersOpen` is the toggle OR'd with "a filter is actually
     applied", so a narrowed listing always shows what narrowed it.
   -->
-  <div class="relative shrink-0 h-9 border-b border-border/60 gp-section-edge bg-surface/80" data-tip-place="above">
+  <div class="relative shrink-0 h-9 bg-surface/80" data-tip-place="above">
     <div bind:this={explorerChrome} class="gp-header-scroll h-full">
       <div class="flex items-center justify-between gap-1 px-2.5 h-9 min-w-max w-full">
     <div class="flex items-baseline gap-1.5 min-w-0">
-      <span class="text-[11px] font-bold uppercase tracking-wider text-textMuted">Explorer</span>
+      <span class="gp-label">Explorer</span>
       <span
-        class="text-[10px] tabular-nums font-mono {filterTruncated ? 'text-amber-400' : 'text-textMuted/80'}"
+        class="text-micro tabular-nums font-mono {filterTruncated ? 'text-warn' : 'text-textMuted'}"
         title={filterTruncated
           ? `At least ${filteredPaths.length} of ${listedPaths.length} files match — the filter stopped at its time budget, so this is a partial count`
           : `${filteredPaths.length} of ${listedPaths.length} files shown`}
       >
         {#if filterTruncated}≥{/if}{filteredPaths.length}{#if isFiltering}<span
-            class="text-textMuted/60">/{listedPaths.length}</span
+            class="text-faint">/{listedPaths.length}</span
           >{/if}
       </span>
     </div>
@@ -918,7 +924,8 @@
         onclick={() => createNewFile("")}
         title="New file in repository root"
         aria-label="New file in repository root"
-        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn"
+        data-size="sm"
       >
         <FilePlus size={13} />
       </button>
@@ -927,7 +934,8 @@
         onclick={() => createNewFolder("")}
         title="New folder in repository root"
         aria-label="New folder in repository root"
-        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn"
+        data-size="sm"
       >
         <FolderPlus size={13} />
       </button>
@@ -936,7 +944,8 @@
         onclick={allCollapsed ? expandAll : collapseAll}
         title={allCollapsed ? "Expand all folders" : "Collapse all folders"}
         aria-label={allCollapsed ? "Expand all folders" : "Collapse all folders"}
-        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn"
+        data-size="sm"
       >
         <FoldVertical size={13} />
       </button>
@@ -947,7 +956,8 @@
         aria-controls="file-tree-filters"
         title="Sort and file-type filters"
         aria-label="Sort and file-type filters"
-        class="gp-icon-btn p-1! {filtersOpen ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn {filtersOpen ? 'text-accent bg-accent/15' : ''}"
+        data-size="sm"
       >
         <SlidersHorizontal size={13} />
       </button>
@@ -957,9 +967,9 @@
     <ScrollCue target={explorerChrome} axis="x" />
   </div>
 
-  <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain border-b border-border/60 gp-section-edge bg-surface/30 space-y-1.5">
-    <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
-      <Search size={12} class="text-textMuted shrink-0" />
+  <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain bg-surface/30 space-y-1.5">
+    <div class="relative">
+      <Search size={12} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted" />
       <input
         type="text"
         bind:value={query}
@@ -970,7 +980,7 @@
         placeholder="Filter files"
         title={QUERY_SYNTAX}
         spellcheck="false"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
+        class="gp-field w-full pl-7! {query ? 'pr-8!' : ''}"
       />
       {#if query}
         <button
@@ -978,7 +988,8 @@
           onclick={() => { query = ""; applyQuery.cancel(); debouncedQuery = ""; }}
           aria-label="Clear filter"
           title="Clear filter"
-          class="gp-icon-btn p-0.5! text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn absolute right-1 top-1/2 -translate-y-1/2"
+          data-size="sm"
         >
           <X size={11} />
         </button>
@@ -992,13 +1003,13 @@
       mid-token and could not be read even once.
     -->
     {#if parsedQuery.error}
-      <p class="text-[10px] text-rose-400 px-1">{parsedQuery.error}</p>
+      <p class="text-meta text-danger px-1">{parsedQuery.error}</p>
     {:else if filterTruncated}
-      <p class="text-[10px] text-amber-400 px-1">
+      <p class="text-meta text-warn px-1">
         Filter stopped at its time budget — showing partial results. Narrow the pattern.
       </p>
     {:else if queryFocused}
-      <p class="text-[10px] text-textMuted/70 px-1.5 leading-snug">{QUERY_SYNTAX}</p>
+      <p class="text-meta text-faint px-1.5 leading-snug">{QUERY_SYNTAX}</p>
     {/if}
 
     <!--
@@ -1015,9 +1026,9 @@
           onclick={() => (statusFilter = "all")}
           aria-pressed={statusFilter === "all"}
           title="Show all files"
-          class="px-2 py-0.5 text-[10px] rounded-full border transition-colors shrink-0 font-medium {statusFilter === 'all'
-            ? 'bg-accent/20 text-accent font-semibold border-accent/40'
-            : 'text-textMuted hover:bg-surfaceHover border-transparent'}"
+          class="gp-chip shrink-0 {statusFilter === 'all' ? 'font-semibold' : ''}"
+          data-tone={statusFilter === "all" ? "accent" : "neutral"}
+          data-kind="count"
         >All</button>
         {#each STATUS_SCOPES as scope (scope.id)}
           {@const count = statusCounts[scope.id]}
@@ -1028,11 +1039,13 @@
               aria-pressed={statusFilter === scope.id}
               aria-label="{scope.label} ({count})"
               title="{scope.label} ({count})"
-              class="flex-1 min-w-0 px-1.5 py-0.5 rounded-full border transition-colors flex items-center justify-center gap-1 font-mono text-[10px] {statusFilter === scope.id
-                ? `${scope.on} font-bold`
-                : `border-transparent ${scope.tint} hover:bg-surfaceHover`}"
+              class="gp-chip min-w-0 flex-1 gap-1 font-mono {statusFilter === scope.id
+                ? 'font-semibold ring-1 ring-inset ring-current'
+                : ''}"
+              data-tone={scope.tone}
+              data-kind="count"
             >
-              <span class="font-bold" aria-hidden="true">{scope.mark}</span>
+              <span class="font-semibold" aria-hidden="true">{scope.mark}</span>
               <span class="tabular-nums">{count}</span>
             </button>
           {/if}
@@ -1043,8 +1056,8 @@
     {#if filtersOpen}
       <div id="file-tree-filters" class="space-y-1.5 pt-0.5">
         <label class="flex items-center gap-1.5">
-          <span class="text-[10px] text-textMuted shrink-0">Sort</span>
-          <select bind:value={sortOrder} class="gp-select flex-1 text-[10px]">
+          <span class="text-meta text-textMuted shrink-0">Sort</span>
+          <select bind:value={sortOrder} class="gp-select flex-1">
             <option value="name-asc">Name, A to Z</option>
             <option value="name-desc">Name, Z to A</option>
             <option value="status">Git status</option>
@@ -1059,9 +1072,9 @@
                 type="button"
                 onclick={() => (selectedExt = selectedExt === ext ? null : ext)}
                 aria-pressed={selectedExt === ext}
-                class="px-1.5 py-0.5 text-[9px] rounded font-mono uppercase transition-colors {selectedExt === ext
-                  ? 'bg-accent/20 text-accent font-bold border border-accent/40'
-                  : 'text-textMuted/80 hover:bg-surfaceHover border border-transparent'}"
+                class="gp-chip font-mono {selectedExt === ext ? 'font-semibold' : ''}"
+                data-tone={selectedExt === ext ? "accent" : "neutral"}
+                data-kind="count"
               >{ext.replace('.', '')}</button>
             {/each}
           </div>
@@ -1074,11 +1087,12 @@
     <div
       role="status"
       data-testid="file-tree-stale"
-      class="shrink-0 px-3 py-1.5 border-b border-border/40 bg-amber-500/10 text-[11px] text-amber-600 dark:text-amber-300"
+      class="gp-notice shrink-0 text-meta"
+      data-tone="warn"
     >
       <div class="flex items-center justify-between gap-2">
-        <span>Could not refresh the file list. Showing the last successful listing.</span>
-        <button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
+        <span>{describeFailure({ verb: "refresh", object: "the file list" }, errorMsg).headline} Showing the last successful listing.</span>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Try again</button>
       </div>
       <div class="text-textMuted truncate" title={errorMsg}>{errorMsg}</div>
     </div>
@@ -1088,7 +1102,7 @@
   <div
     class="flex-1 min-h-0 relative"
     role="tree"
-    aria-label="Workspace Files"
+    aria-label="Workspace files"
     aria-activedescendant={selectedIndex >= 0 && selectedIndex < rows.length
       ? treeItemId(rows[selectedIndex])
       : undefined}
@@ -1103,9 +1117,10 @@
         <Skeleton variant="tree-row" count={14} />
       </div>
     {:else if errorMsg && !hasLoaded}
-      <div class="h-full flex flex-col items-center justify-center gap-2 text-rose-400 text-xs p-4 text-center">
-        <span>{errorMsg}</span>
-        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
+      <div class="h-full flex flex-col items-center justify-center gap-2 text-xs p-4 text-center">
+        <span class="font-medium text-danger">{describeFailure({ verb: "list", object: "the files" }, errorMsg).headline}</span>
+        <span class="text-textMuted">{errorMsg}</span>
+        <button type="button" class="gp-btn" data-size="sm" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Try again</button>
       </div>
     {:else if rows.length === 0}
       <EmptyState
@@ -1176,11 +1191,11 @@
                   name instead.
                 -->
                 {#if isOpen}
-                  <span class="absolute inset-y-0 left-0 w-[2px] bg-accent" aria-hidden="true"></span>
+                  <span class="absolute inset-y-0 left-0 w-0.5 bg-accent" aria-hidden="true"></span>
                 {/if}
                 {#each { length: r.depth } as _, level (level)}
                   <span
-                    class="absolute inset-y-0 w-px bg-border/45 pointer-events-none"
+                    class="absolute inset-y-0 w-px bg-edgeSoft pointer-events-none"
                     style="left: {INDENT_BASE + level * INDENT_STEP}px;"
                     aria-hidden="true"
                   ></span>
@@ -1193,17 +1208,19 @@
                   {#if r.kind === "dir"}
                     {#if isCollapsed(r.path)}
                       <ChevronRight size={12} class="shrink-0 text-textMuted" />
-                      <Folder size={13} class="shrink-0 text-amber-400/80" />
+                      <Folder size={13} class="shrink-0 text-warn/80" />
                     {:else}
                       <ChevronDown size={12} class="shrink-0 text-textMuted" />
-                      <FolderOpen size={13} class="shrink-0 text-amber-400" />
+                      <FolderOpen size={13} class="shrink-0 text-warn" />
                     {/if}
                     <span class="whitespace-nowrap text-textPrimary font-medium">{r.name}</span>
                     {#if dirtyCount > 0}
                       <!-- A collapsed folder says how much it is hiding, not
                            merely that it hides something. -->
                       <span
-                        class="shrink-0 px-1 rounded-full text-[9px] font-mono tabular-nums bg-amber-500/15 text-amber-300/90"
+                        class="gp-chip shrink-0 font-mono"
+                        data-tone="warn"
+                        data-kind="count"
                         title="{dirtyCount} changed {dirtyCount === 1 ? 'file' : 'files'} inside"
                       >{dirtyCount}</span>
                     {/if}
@@ -1219,23 +1236,23 @@
                 <!-- Right: Git Status Badge & Churn -->
                 <div class="ml-auto flex items-center gap-1 shrink-0 pl-2">
                   {#if status && changeKind !== "clean"}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(changeKind)}">{statusBadgeLabel(changeKind)}</span>
+                    <span class="px-1 py-0.5 text-micro font-semibold rounded {statusBadgeClass(changeKind)}">{statusBadgeLabel(changeKind)}</span>
                     {#if status.additions > 0 || status.deletions > 0}
                       {@const churnWarnings = status.warnings ?? []}
                       <!-- A count the backend flagged as possibly understated
                            must not render identically to one it verified: the
                            tilde and amber say "at least this much". -->
                       <span
-                        class="text-[9px] font-mono {churnWarnings.length > 0
-                          ? 'text-amber-400'
-                          : 'text-emerald-400'}"
+                        class="text-micro font-mono {churnWarnings.length > 0
+                          ? 'text-warn'
+                          : 'text-ok'}"
                         title={churnWarnings.length > 0
                           ? `Line counts may understate this file — ${churnWarnings.join("; ")}`
                           : undefined}>{churnWarnings.length > 0 ? "~" : ""}+{status.additions}</span>
                       <span
-                        class="text-[9px] font-mono {churnWarnings.length > 0
-                          ? 'text-amber-400'
-                          : 'text-rose-400'}">-{status.deletions}</span>
+                        class="text-micro font-mono {churnWarnings.length > 0
+                          ? 'text-warn'
+                          : 'text-danger'}">-{status.deletions}</span>
                     {/if}
                   {/if}
 
@@ -1275,49 +1292,50 @@
     class="fixed min-w-52 max-h-[calc(100vh-1rem)] overflow-y-auto gp-menu gp-pop text-xs text-textPrimary py-1"
     style="z-index: {LAYERS.MENU}"
   >
-    <div class="px-2.5 py-1 text-[10px] text-textMuted font-mono border-b border-border/60 truncate max-w-xs font-semibold">
+    <div class="px-2.5 py-1 text-micro text-textMuted font-mono truncate max-w-xs font-semibold">
       {row.path}
     </div>
+    <div class="gp-menu-sep" role="separator"></div>
 
     {#if row.kind === "dir"}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => createNewFile(row.path)}>
         <FilePlus size={13} class="text-accent" />
-        <span>New File in folder…</span>
+        <span>New file in folder…</span>
       </button>
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => createNewFolder(row.path)}>
         <FolderPlus size={13} class="text-accent" />
-        <span>New Folder in folder…</span>
+        <span>New folder in folder…</span>
       </button>
       <div class="gp-menu-sep" role="separator"></div>
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => movePath(row)}>
         <PencilLine size={13} class="text-textMuted" />
-        <span>Rename or Move Folder…</span>
+        <span>Rename or move folder…</span>
       </button>
-      <button type="button" role="menuitem" class="gp-menu-item text-rose-300" onclick={() => deletePath(row)}>
+      <button type="button" role="menuitem" class="gp-menu-item text-danger" onclick={() => deletePath(row)}>
         <Trash2 size={13} />
-        <span>Delete Folder…</span>
+        <span>Delete folder…</span>
       </button>
     {:else}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
-        <span>Open in Editor</span>
+        <span>Open in editor</span>
       </button>
 
       {#if status}
         {#if status.is_staged}
-          <button type="button" role="menuitem" class="gp-menu-item text-amber-300" onclick={() => unstageFile(row.path)}>
+          <button type="button" role="menuitem" class="gp-menu-item text-warn" onclick={() => unstageFile(row.path)}>
             <Undo2 size={13} />
-            <span>Unstage Changes</span>
+            <span>Unstage changes</span>
           </button>
         {/if}
         {#if hasUnstagedChanges(status)}
-          <button type="button" role="menuitem" class="gp-menu-item text-emerald-300" onclick={() => stageFile(row.path)}>
+          <button type="button" role="menuitem" class="gp-menu-item text-ok" onclick={() => stageFile(row.path)}>
             <Check size={13} />
-            <span>Stage File</span>
+            <span>Stage file</span>
           </button>
-          <button type="button" role="menuitem" class="gp-menu-item text-rose-300" onclick={() => discardFile(row.path)}>
+          <button type="button" role="menuitem" class="gp-menu-item text-danger" onclick={() => discardFile(row.path)}>
             <Undo2 size={13} />
-            <span>Discard Changes…</span>
+            <span>Discard changes…</span>
           </button>
         {/if}
       {/if}
@@ -1325,23 +1343,23 @@
       <div class="gp-menu-sep" role="separator"></div>
 
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('history', 'diff'); closeContextMenu(); }}>
-        <Layers size={13} class="text-cyan-400" />
-        <span>View in Diff Tab</span>
+        <Layers size={13} class="text-info" />
+        <span>View in diff tab</span>
       </button>
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('code', 'blame'); closeContextMenu(); }}>
-        <GitCommit size={13} class="text-purple-400" />
-        <span>View Git Blame</span>
+        <GitCommit size={13} class="text-accent" />
+        <span>View Git blame</span>
       </button>
 
       <div class="gp-menu-sep" role="separator"></div>
 
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => movePath(row)}>
         <PencilLine size={13} class="text-textMuted" />
-        <span>Rename or Move…</span>
+        <span>Rename or move…</span>
       </button>
-      <button type="button" role="menuitem" class="gp-menu-item text-rose-300" onclick={() => deletePath(row)}>
+      <button type="button" role="menuitem" class="gp-menu-item text-danger" onclick={() => deletePath(row)}>
         <Trash2 size={13} />
-        <span>Delete File…</span>
+        <span>Delete file…</span>
       </button>
     {/if}
 
@@ -1349,23 +1367,23 @@
 
     <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(row.path)}>
       <Copy size={13} class="text-textMuted" />
-      <span>Copy Relative Path</span>
+      <span>Copy relative path</span>
     </button>
 
     {#if $repoStore.currentPath}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(`${$repoStore.currentPath}/${row.path}`)}>
         <Copy size={13} class="text-textMuted" />
-        <span>Copy Full Path</span>
+        <span>Copy full path</span>
       </button>
     {/if}
 
     <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInSystem(row.path)}>
       <ExternalLink size={13} class="text-textMuted" />
-      <span>Open with Default App</span>
+      <span>Open with default app</span>
     </button>
     <button type="button" role="menuitem" class="gp-menu-item" onclick={() => revealInFinder(row.path)}>
       <FolderOpen size={13} class="text-textMuted" />
-      <span>Reveal in File Manager</span>
+      <span>Reveal in file manager</span>
     </button>
   </div>
 {/if}

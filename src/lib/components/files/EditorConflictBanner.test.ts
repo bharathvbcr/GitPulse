@@ -12,13 +12,13 @@ const props = {
 };
 
 describe("EditorConflictBanner", () => {
-  it("names the file, says the draft was kept, and offers Reload, Compare and Overwrite", () => {
+  it("names the file, says the draft was kept, and offers Refresh, Compare and Overwrite", () => {
     const { body } = render(EditorConflictBanner, { props });
     expect(body).toContain('role="alert"');
     expect(body).toContain("Changed on disk");
     expect(body).toContain("src/a.ts");
     expect(body).toContain("Your draft is kept and nothing was written");
-    for (const label of ["Reload", "Compare", "Overwrite"]) expect(body).toContain(label);
+    for (const label of ["Refresh", "Compare", "Overwrite"]) expect(body).toContain(label);
   });
 
   it("holds the comparison back until Compare is pressed", () => {

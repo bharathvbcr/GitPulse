@@ -365,7 +365,7 @@
           check("an empty file draws no timeline at all", () => !strip() && rows().length === 0);
 
           diagnostics.clear();
-          setMode("error"); await until(() => !!buttonNamed("Retry"));
+          setMode("error"); await until(() => !!buttonNamed("Try again"));
           check("the failure also lands in the diagnostics ring, tagged blame", () => {
             let kept = [];
             diagnostics.subscribe(entries => { kept = entries; })();
@@ -374,8 +374,8 @@
           check("a failed blame explains itself and offers a way back", () =>
             text().includes("fixture refused") && !strip());
           mode = "mixed";
-          buttonNamed("Retry").click(); await until(() => rows().length > 0);
-          check("Retry reloads the same file without a new selection", () => !!strip() && text().includes("100 lines"));
+          buttonNamed("Try again").click(); await until(() => rows().length > 0);
+          check("Try again reloads the same file without a new selection", () => !!strip() && text().includes("100 lines"));
 
           // --- a selection belongs to its file --------------------------------
           columns().filter(column => linesClaimed(column) > 0)[0].click(); await tick();

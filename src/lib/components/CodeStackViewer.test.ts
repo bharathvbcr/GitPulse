@@ -134,8 +134,10 @@ describe("CodeStackViewer accessibility", () => {
   });
 
   it("keeps banner text readable in light theme", () => {
-    expect(source).toContain("text-rose-700 dark:text-rose-300");
-    expect(source).not.toContain("text-rose-300 {");
+    // The tone is a role, resolved per theme by the notice itself, not a
+    // palette pair that has to be remembered for light mode.
+    expect(source).toContain('class="gp-notice mb-3! max-w-3xl" data-tone="danger"');
+    expect(source).not.toMatch(/text-rose-|dark:text-/);
   });
 
   it("marks the busy row for assistive tech", () => {

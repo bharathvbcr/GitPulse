@@ -760,7 +760,7 @@
     and Left/Right/Home/End move between them, which is what `role="tab"`
     already promised a keyboard user.
   -->
-  <div class="flex items-center px-1.5 bg-surface/90 border-b border-border/70 gp-section-edge shrink-0 h-9 gap-1.5">
+  <div class="flex items-center px-1.5 bg-surface/90 gp-section-edge shrink-0 h-9 gap-1.5">
     <button
       type="button"
       onclick={() => toggleSidePane("explorer")}
@@ -833,7 +833,7 @@
             <span class="truncate">{tab.name}</span>
             {#if tabDirty}
               <span
-                class="w-1.5 h-1.5 rounded-full bg-amber-400 not-italic shrink-0"
+                class="w-1.5 h-1.5 rounded-full bg-warn not-italic shrink-0"
                 title="Unsaved changes"
                 aria-label="Unsaved changes"
               ></span>
@@ -848,7 +848,7 @@
               type="button"
               tabindex="-1"
               onclick={(e) => closeTab(tab.path, e)}
-              class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400 transition-opacity shrink-0"
+              class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-danger transition-opacity shrink-0"
               aria-label={`Close ${tab.name}`}
               title="Close tab"
             >
@@ -879,7 +879,7 @@
           onclick={closeAllTabs}
           aria-label="Close all tabs"
           title="Close All Tabs"
-          class="gp-icon-btn p-1! text-textMuted hover:text-rose-400"
+          class="gp-icon-btn p-1! text-textMuted hover:text-danger"
         >
           <XCircle size={13} />
         </button>
@@ -892,8 +892,8 @@
         aria-pressed={paneLayout.dashboardVisible}
         aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
         title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard ({shortcutTextLabel('⌘⇧D', $hostPlatform.os)})"
-        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
-          ? 'border-accent/60 bg-accent/15 text-accent font-semibold'
+        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta {paneLayout.dashboardVisible
+          ? 'border-accent bg-accent/15 text-accent font-semibold'
           : ''}"
       >
         <Activity size={12} />
@@ -910,11 +910,11 @@
       question a breadcrumb exists to answer — "where is this?" — and the
       answer used to require scrolling the tree by hand.
     -->
-    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 border-b border-border/50 gp-section-edge shrink-0 text-xs">
+    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 gp-section-edge shrink-0 text-xs">
       <div class="relative min-w-0 flex-1">
       <nav
         bind:this={pathStrip}
-        class="gp-header-scroll text-[11px] text-textMuted font-mono"
+        class="gp-header-scroll text-meta text-textMuted font-mono"
         aria-label="Path to the open file"
       >
         <div class="flex items-center gap-0.5 min-w-max py-0.5">
@@ -936,12 +936,12 @@
         {/each}
 
         {#if activeKind !== "clean"}
-          <span class="ml-1.5 shrink-0 px-1.5 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(activeKind)}">
+          <span class="ml-1.5 shrink-0 px-1.5 py-0.2 text-micro font-semibold rounded {statusBadgeClass(activeKind)}">
             {statusBadgeLabel(activeKind, true)}
           </span>
         {/if}
         {#if activeTabDirty}
-          <span class="ml-1.5 shrink-0 text-[10px] font-semibold text-amber-400">Unsaved</span>
+          <span class="ml-1.5 shrink-0 text-micro font-semibold text-warn">Unsaved</span>
         {/if}
         </div>
       </nav>
@@ -974,7 +974,7 @@
         <button
           type="button"
           onclick={inspectInDiff}
-          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 text-cyan-400"
+          class="gp-btn py-0.5! px-1.5! text-micro flex items-center gap-1 text-info"
           title="View in Diff Tab"
         >
           <Layers size={11} />
@@ -988,9 +988,9 @@
           onclick={toggleBlameLens}
           aria-pressed={$explorerLens.lens === "blame"}
           data-blame-lens
-          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 {$explorerLens.lens === 'blame'
-            ? 'text-purple-300 bg-purple-500/15 border-purple-400/50!'
-            : 'text-purple-400'}"
+          class="gp-btn py-0.5! px-1.5! text-micro flex items-center gap-1 {$explorerLens.lens === 'blame'
+            ? 'text-accent bg-accent/15 border-accent!'
+            : 'text-accent'}"
           title={$explorerLens.lens === "blame" ? "Back to the editor" : "Show Git blame for this file"}
         >
           <GitCommit size={11} />
@@ -1026,13 +1026,13 @@
           <LazyView load={loadBlame} name="Blame" />
         {:else if isLoadingFile && !blobIsCurrent}
           <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
-            <span>Loading file contents...</span>
+            <span>Loading file contents…</span>
           </div>
         {:else if fileError}
-          <div class="flex-1 flex flex-col items-center justify-center text-rose-400 text-xs p-6 text-center">
-            <ShieldAlert size={28} class="mb-2 text-rose-400" />
-            <span class="font-bold text-sm text-rose-300 mb-1">Failed to read file</span>
-            <span class="max-w-md font-mono text-[11px]">{fileError}</span>
+          <div class="flex-1 flex flex-col items-center justify-center text-danger text-xs p-6 text-center">
+            <ShieldAlert size={28} class="mb-2 text-danger" />
+            <span class="font-semibold text-sm text-danger mb-1">Couldn't read this file.</span>
+            <span class="max-w-md font-mono text-meta">{fileError}</span>
           </div>
         {:else if activeBlob && activeTabPath}
           {#if activeConflict && activeDraft}

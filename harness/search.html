@@ -103,7 +103,7 @@
           check("every search carries a cancel token", () => typeof last().cancelToken === "string" && last().cancelToken.length > 0);
           check("a complete answer is stated without hedging", () =>
             summary().textContent.trim() === "3 matches in 2 files in the working tree");
-          check("and is not styled as a warning", () => !summary().className.includes("amber"));
+          check("and is not styled as a warning", () => !summary().className.includes("bg-warn"));
           check("matches are grouped under their file", () => text().includes("src/a.ts (2)") && text().includes("lib/b.rs (1)"));
           check("each match shows its line number", () => matches()[1].textContent.includes("9"));
           check("a clipped line says it was clipped", () => matches()[2].textContent.trim().endsWith("…"));
@@ -126,7 +126,7 @@
           await until(() => summary()?.textContent.includes("partial"));
           check("a capped answer is marked partial with its reason", () =>
             summary().textContent.includes("the match limit was reached") && summary().textContent.includes("more matches may exist"));
-          check("and styled as a warning", () => summary().className.includes("amber"));
+          check("and styled as a warning", () => summary().className.includes("bg-warn"));
 
           // --- cancel ------------------------------------------------------------
           mode = "hold";

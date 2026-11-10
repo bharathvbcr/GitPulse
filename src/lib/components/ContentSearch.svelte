@@ -176,7 +176,7 @@
      squeezing the box. -->
 <div class="flex-1 flex flex-col min-h-0 min-w-0 bg-surface/50 text-xs" data-content-search>
   <form
-    class="px-2 pt-2 pb-1.5 border-b border-border/60 gp-section-edge bg-surface/30 flex flex-col gap-1.5 shrink-0"
+    class="px-2 pt-2 pb-1.5 gp-section-edge bg-surface/30 flex flex-col gap-1.5 shrink-0"
     onsubmit={(event) => { event.preventDefault(); void run(); }}
   >
     <label class="relative w-full">
@@ -186,14 +186,14 @@
     <div class="flex items-center gap-1.5 min-w-0">
       <input class="gp-field flex-1 min-w-0 font-mono" placeholder="Revision (optional)" aria-label="Revision to search" bind:value={revision} />
       {#if running}
-        <button type="button" class="gp-btn shrink-0 py-1! px-2.5! text-[11px]! flex items-center gap-1" onclick={cancel}><X size={12} /> Cancel</button>
+        <button type="button" class="gp-btn shrink-0 py-1! px-2.5! text-meta! flex items-center gap-1" onclick={cancel}><X size={12} /> Cancel</button>
       {:else}
-        <button type="submit" class="gp-btn shrink-0 py-1! px-2.5! text-[11px]!" disabled={!pattern}>Search</button>
+        <button type="submit" class="gp-btn shrink-0 py-1! px-2.5! text-meta!" disabled={!pattern}>Search</button>
       {/if}
     </div>
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">
-      <label class="flex items-center gap-1 text-[11px] text-textMuted"><input type="checkbox" checked={!fixedStrings} onchange={(e) => (fixedStrings = !e.currentTarget.checked)} /> regex</label>
-      <label class="flex items-center gap-1 text-[11px] text-textMuted"><input type="checkbox" checked={!ignoreCase} onchange={(e) => (ignoreCase = !e.currentTarget.checked)} /> match case</label>
+      <label class="flex items-center gap-1 text-meta text-textMuted"><input type="checkbox" checked={!fixedStrings} onchange={(e) => (fixedStrings = !e.currentTarget.checked)} /> regex</label>
+      <label class="flex items-center gap-1 text-meta text-textMuted"><input type="checkbox" checked={!ignoreCase} onchange={(e) => (ignoreCase = !e.currentTarget.checked)} /> match case</label>
     </div>
   </form>
 
@@ -201,7 +201,7 @@
     <div
       data-search-summary
       role="status"
-      class="px-2.5 py-1.5 border-b border-border/40 text-[11px] shrink-0 {running ? 'opacity-60' : ''} {report.truncated ? 'bg-amber-500/10 text-amber-600 dark:text-amber-300' : 'text-textMuted'}"
+      class="px-2.5 py-1.5 text-meta shrink-0 {running ? 'opacity-60' : ''} {report.truncated ? 'bg-warn/10 text-warn' : 'text-textMuted'}"
     >
       {describeSearchReport(report)}
     </div>
@@ -211,15 +211,15 @@
        labelled, rather than reading as the current one. -->
   <div class="flex-1 min-h-0 overflow-auto px-1 py-1.5 {running && report ? 'opacity-60' : ''}" aria-busy={running}>
     {#if running && report}
-      <p class="px-2 pb-1 text-[11px] text-textMuted" data-search-running>Searching… showing the previous results.</p>
+      <p class="px-2 pb-1 text-meta text-textMuted" data-search-running>Searching… showing the previous results.</p>
     {/if}
     {#if report?.revision && report.matches.length > 0 && !error}
-      <p class="px-2 pb-1 text-[11px] text-textMuted" data-search-revision-note>
+      <p class="px-2 pb-1 text-meta text-textMuted" data-search-revision-note>
         Searched at {report.revision.slice(0, 7)}. Opening a hit shows the working-tree file.
       </p>
     {/if}
     {#if error}
-      <div class="p-3 text-rose-400" role="alert">{error}</div>
+      <div class="p-3 text-danger" role="alert">{error}</div>
     {:else if running && !report}
       <div class="p-3 text-textMuted">Searching…</div>
     {:else if !report}
@@ -229,11 +229,11 @@
     {:else}
       {#each groups as group (group.path)}
         <section class="mb-2">
-          <button type="button" class="w-full text-left px-2 py-1 font-mono text-[11px] text-accent hover:underline truncate" title="Open {group.path}" onclick={() => open(group.path)}>
+          <button type="button" class="w-full text-left px-2 py-1 font-mono text-meta text-accent hover:underline truncate" title="Open {group.path}" onclick={() => open(group.path)}>
             {group.path} <span class="text-textMuted">({group.matches.length})</span>
           </button>
           {#each group.matches as match (`${match.line}:${match.column}`)}
-            <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-[11px]" onclick={() => open(match.path, match)}>
+            <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-meta" onclick={() => open(match.path, match)}>
               <span class="w-9 shrink-0 text-right text-textMuted/60 tabular-nums">{match.line}</span>
               <span class="whitespace-pre truncate text-textPrimary">{match.text}{match.text_clipped ? " …" : ""}</span>
             </button>

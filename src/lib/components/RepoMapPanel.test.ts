@@ -20,7 +20,7 @@ describe("RepoMapPanel", () => {
     expect(source).toContain("getDevmapCliStatus");
     expect(source).toContain("is_fresh");
     expect(source).toContain("schema_outdated");
-    expect(source).toContain("coverage_gaps");
+    expect(source).toContain("coverageGapSummary(statusPayload)");
     expect(source).toContain("generation_id");
   });
 
@@ -35,7 +35,7 @@ describe("RepoMapPanel", () => {
   it("prefers unwired and dead candidates over unreliable unreachable", () => {
     expect(source).toContain("preferredDeadLists");
     expect(source).toContain("unreachableSuppressed");
-    expect(source).toContain("liveness_unreachable_unreliable");
+    expect(source).toContain("marks that list as unreliable");
   });
 
   it("does not present capped samples as complete", () => {
