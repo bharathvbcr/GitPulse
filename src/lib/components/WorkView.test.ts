@@ -54,6 +54,15 @@ describe("WorkView", () => {
     expect(source.indexOf("{degraded}")).toBeLessThan(rows);
   });
 
+  it("gives both could-not-check banners a Rescan that is the header's own refresh", () => {
+    const banner = (needle: string) => source.slice(source.indexOf(needle), source.indexOf("</div>", source.indexOf(needle)));
+    for (const needle of ["Could not check overlapping files", "<span>{degraded}</span>"]) {
+      const body = banner(needle);
+      expect(body).toContain(">Rescan</button>");
+      expect(body).toContain("void refresh($repoStore.currentPath)");
+    }
+  });
+
   it("tells an absent task store apart from a task store with nothing in it", () => {
     // The distinction is still consulted and still changes what the reader
     // sees — it drives the header subtitle and the catch-all row's label. It

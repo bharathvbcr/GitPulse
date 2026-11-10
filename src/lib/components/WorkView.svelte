@@ -596,6 +596,7 @@
     >
       <AlertTriangle size={14} class="shrink-0 mt-px text-unknown" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
+      <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={loading} onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}>Rescan</button>
     </div>
   {/if}
   {#if collisions && collisions.shared_worktrees.length > 0}
@@ -686,6 +687,7 @@
     >
       <AlertTriangle size={14} class="shrink-0 mt-px text-unknown" />
       <span>{degraded}</span>
+      <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={loading} onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}>Rescan</button>
     </div>
   {/if}
 
