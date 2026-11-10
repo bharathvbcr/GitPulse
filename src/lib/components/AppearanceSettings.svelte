@@ -442,7 +442,7 @@
       <div class="gp-notice" data-tone="info" role="status" data-material-unavailable>
         <div class="min-w-0 flex-1">
           Glass material settings aren't available on this computer. Material intensity, float blur, the background
-          field and transparency tune the translucent window GitPulse draws on macOS.
+          field and transparency tune a translucent window material, which this computer's window doesn't use.
         </div>
       </div>
     {/if}
