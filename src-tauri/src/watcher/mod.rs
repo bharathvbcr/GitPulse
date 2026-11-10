@@ -369,6 +369,14 @@ const IGNORE_RETRY: Duration = Duration::from_secs(30);
 pub(crate) struct IgnoreRules {
     /// Folded, `/`-separated directory prefixes (`scratch`, `pkg/generated`).
     prefixes: HashSet<String>,
+    /// The same prefixes in the spelling git printed them, which is the
+    /// on-disk spelling an event path carries. The refresh classifier folds
+    /// case (a refresh that is merely too eager is harmless); the question
+    /// "may this change be assumed away" does not: only an exact match is
+    /// proof that git ignores the directory, so a directory that differs from
+    /// an ignored one only by case never counts as ignored, whatever the
+    /// volume does with case.
+    exact: HashSet<String>,
     /// `None` only when the query finished and the prefix list was complete.
     load_error: Option<String>,
     /// True when the query finished and the list was cut at
@@ -385,6 +393,7 @@ impl IgnoreRules {
     fn builtin() -> Self {
         Self {
             prefixes: HashSet::new(),
+            exact: HashSet::new(),
             load_error: None,
             truncated: false,
         }
@@ -407,7 +416,7 @@ impl IgnoreRules {
             IGNORE_QUERY_TIMEOUT,
         ) {
             Ok(stdout) => {
-                let (prefixes, truncated) = parse_ignored_directories(&stdout);
+                let (prefixes, exact, truncated) = parse_ignored_directories_exact(&stdout);
                 if truncated {
                     let error = format!(
                         "ignore directory list truncated at {MAX_IGNORE_PREFIXES}; further ignored directories were not recorded"
@@ -415,12 +424,14 @@ impl IgnoreRules {
                     log::warn!(target: "watcher", "{}: {error}", repo.display());
                     Self {
                         prefixes,
+                        exact,
                         load_error: Some(error),
                         truncated: true,
                     }
                 } else {
                     Self {
                         prefixes,
+                        exact,
                         load_error: None,
                         truncated: false,
                     }
@@ -434,6 +445,7 @@ impl IgnoreRules {
                 );
                 Self {
                     prefixes: HashSet::new(),
+                    exact: HashSet::new(),
                     load_error: Some(error.into_message()),
                     truncated: false,
                 }
@@ -442,27 +454,33 @@ impl IgnoreRules {
     }
 }
 
+#[cfg(test)]
 fn parse_ignored_directories(stdout: &str) -> (HashSet<String>, bool) {
+    let (folded, _, truncated) = parse_ignored_directories_exact(stdout);
+    (folded, truncated)
+}
+
+/// [`parse_ignored_directories`] that also returns the prefixes as printed.
+fn parse_ignored_directories_exact(stdout: &str) -> (HashSet<String>, HashSet<String>, bool) {
     let mut prefixes = HashSet::new();
+    let mut exact = HashSet::new();
     let mut truncated = false;
     for field in stdout.split('\0') {
         if field.is_empty() || !(field.ends_with('/') || field.ends_with('\\')) {
             continue;
         }
-        let folded = field
-            .trim_end_matches(['/', '\\'])
-            .trim_start_matches("./")
-            .to_ascii_lowercase();
-        if folded.is_empty() {
+        let printed = field.trim_end_matches(['/', '\\']).trim_start_matches("./");
+        if printed.is_empty() {
             continue;
         }
         if prefixes.len() >= MAX_IGNORE_PREFIXES {
             truncated = true;
             break;
         }
-        prefixes.insert(folded);
+        prefixes.insert(printed.to_ascii_lowercase());
+        exact.insert(printed.to_string());
     }
-    (prefixes, truncated)
+    (prefixes, exact, truncated)
 }
 
 /// Directories that are build output by construction. Ordinary source names
@@ -502,15 +520,23 @@ enum IgnoreVerdict {
 
 fn ignore_verdict(relative: &Path, rules: Option<&IgnoreRules>) -> IgnoreVerdict {
     let mut named = false;
-    let mut accumulated = String::new();
+    let mut folded = String::new();
+    let mut printed = String::new();
     for component in relative.components() {
         let name = component.as_os_str().to_string_lossy();
-        if !accumulated.is_empty() {
-            accumulated.push('/');
+        if !folded.is_empty() {
+            folded.push('/');
+            printed.push('/');
         }
-        accumulated.push_str(&name.to_ascii_lowercase());
-        if rules.is_some_and(|rules| rules.prefixes.contains(&accumulated)) {
-            return IgnoreVerdict::Confirmed;
+        folded.push_str(&name.to_ascii_lowercase());
+        printed.push_str(&name);
+        if let Some(rules) = rules {
+            if rules.exact.contains(&printed) {
+                return IgnoreVerdict::Confirmed;
+            }
+            // Equal after folding but not as printed: ignored enough to skip
+            // a refresh, not enough to assume nothing changed.
+            named |= rules.prefixes.contains(&folded);
         }
         named |= is_build_dir_name(&name);
     }
@@ -1595,6 +1621,11 @@ pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
 /// nothing, and the call reads. A read is always kept when the watch can vouch,
 /// whoever asked, so a refresh that followed an event also serves the poll that
 /// comes after it; only a caller that says `may_reuse` is ever served one.
+///
+/// A watch also has to earn its trust (see [`facts`]): a kept read is refused
+/// when this checkout's index or `HEAD` changed under it with no event, one
+/// older than [`facts::KEPT_STATUS_MAX_AGE`] is not served, and a watch caught
+/// missing a change is convicted, after which every call reads.
 pub(crate) fn status_through_watch<F>(
     state: &WatcherState,
     repo_path: &str,
@@ -1611,16 +1642,21 @@ where
         return read();
     };
     let started = Instant::now();
-    let covered = facts.cover();
+    let covered = facts.cover_at(started);
+    let epoch_before = facts.epoch_now();
+    // Taken before the read, like the epoch: whatever git rewrites during the
+    // read leaves the kept answer with an identity that no longer matches.
+    let identity = facts.identity();
     if may_reuse {
-        if let Some(rows) = covered.and_then(|epoch| facts.kept(epoch, started)) {
+        if let Some(rows) = covered.and_then(|epoch| facts.serve(epoch, started, &identity)) {
             return Ok(rows.as_ref().clone());
         }
     }
     let rows = read()?;
     if let Some(epoch) = covered {
-        facts.keep(epoch, &rows, started);
+        facts.settle(epoch, &rows, identity, started);
     }
+    facts.observe(epoch_before, &rows);
     Ok(rows)
 }
 
@@ -5218,11 +5254,7 @@ mod tests {
     #[test]
     fn a_failed_ignore_query_is_retried_only_while_it_could_succeed() {
         let now = Instant::now();
-        let mut rules = IgnoreRules {
-            prefixes: HashSet::new(),
-            load_error: None,
-            truncated: false,
-        };
+        let mut rules = IgnoreRules::builtin();
         assert_eq!(rules_retry_at(&rules, now), None);
         rules.load_error = Some("git ls-files timed out".into());
         assert_eq!(rules_retry_at(&rules, now), Some(now + IGNORE_RETRY));
@@ -5264,6 +5296,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + PRIME_DEADLINE;
         while !condition() {
@@ -5278,16 +5311,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn wait_for_a_still_epoch(facts: &WatchFacts) {
         let still = DEBOUNCE_MAX_WAIT + Duration::from_millis(500);
-        wait_for("the ignore rules", || facts.cover().is_some());
-        let mut seen = facts.cover();
+        // Waits on the rules and the raw epoch, not on `cover()`, so that a
+        // watch that never vouches (the non-recursive root) reaches the
+        // assertions and fails them on behaviour.
+        wait_for("the ignore rules", || facts.rules_fresh());
+        let mut seen = facts.epoch_now();
         let mut since = Instant::now();
         wait_for("a still epoch", || {
-            let now = facts.cover();
+            let now = facts.epoch_now();
             if now != seen {
                 seen = now;
                 since = Instant::now();
             }
-            now.is_some() && since.elapsed() >= still
+            facts.rules_fresh() && since.elapsed() >= still
         });
     }
 
@@ -5432,11 +5468,11 @@ mod tests {
             }
             assert_eq!(reads.load(Ordering::SeqCst), 1, "nothing moved: no git");
 
-            let epoch = facts.cover();
+            let epoch = facts.epoch_now();
             std::fs::create_dir_all(root.join("src").join("deep")).unwrap();
             std::fs::write(root.join("src").join("deep").join("new.rs"), "x").unwrap();
             wait_for("the nested edit to reach the watch", || {
-                facts.cover() != epoch
+                facts.epoch_now() != epoch
             });
             let rows = poll(state, path);
             assert_eq!(reads.load(Ordering::SeqCst), 2, "an event makes it read");
@@ -5457,11 +5493,11 @@ mod tests {
             start_watch_inner(state, path.to_string(), |_| {}).unwrap();
             let facts = state.facts_for(path).expect("a live session has facts");
             wait_for_a_still_epoch(&facts);
-            let epoch = facts.cover();
+            let epoch = facts.epoch_now();
             let early = status_through_watch(state, path, true, || {
                 let before = crate::engine::git_reader::GitReader::get_status(path)?;
                 std::fs::write(root.join("during.txt"), "x").unwrap();
-                wait_for("the edit to reach the watch", || facts.cover() != epoch);
+                wait_for("the edit to reach the watch", || facts.epoch_now() != epoch);
                 Ok(before)
             })
             .unwrap();
@@ -5567,7 +5603,7 @@ mod tests {
             poll(state, path);
             assert_eq!(reads.load(Ordering::SeqCst), 1);
             let settled = announced.lock().unwrap().len();
-            let epoch = facts.cover().unwrap();
+            let epoch = facts.epoch_now();
 
             for i in 0..10_000u32 {
                 std::fs::write(
@@ -5586,9 +5622,9 @@ mod tests {
             // Everything above was delivered before this file, in order.
             std::fs::write(root.join("sentinel.txt"), "x").unwrap();
             wait_for("the sentinel to reach the watch", || {
-                facts.cover() != Some(epoch)
+                facts.epoch_now() != epoch
             });
-            let moved = facts.cover().unwrap() - epoch;
+            let moved = facts.epoch_now() - epoch;
             // The sentinel's own events (a create, a modify, the root's
             // metadata: 3 to 5 observed) are all of it; the churn is 10,000
             // writes and about three times as many raw events.
@@ -5615,6 +5651,244 @@ mod tests {
                 facts.examined()
             );
             assert!(!facts.rules_stale(), "nothing in `out/` reloads the rules");
+        });
+    }
+
+    /// A repository whose watch is registered and says nothing: the stream is
+    /// simulated by not injecting events. Platform independent.
+    fn silent_watch<T>(
+        body: impl FnOnce(&WatcherState, &str, &Path, &Arc<WatchFacts>, &Arc<AtomicUsize>) -> T,
+    ) -> T {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            let facts = WatchFacts::new(
+                Some(root),
+                vec![root.join(".git")],
+                notify::RecursiveMode::Recursive,
+            );
+            facts.publish_rules(Arc::new(IgnoreRules::builtin()), 0);
+            {
+                let mut guard = state.lock_sessions().unwrap();
+                insert_watch_session(&mut guard, path, &[], None).unwrap();
+                guard.get_mut(path).unwrap().facts = Some(Arc::clone(&facts));
+            }
+            body(state, path, root, &facts, reads)
+        })
+    }
+
+    /// B2: git rewrote the index and the stream said nothing. The kept read is
+    /// not served, and once the event has had its grace the watch is convicted
+    /// and every later poll reads, as it did before the watch existed.
+    #[test]
+    fn a_silent_stream_while_the_index_changes_is_refused_then_convicted_and_every_poll_reads() {
+        silent_watch(|state, path, root, facts, reads| {
+            facts.set_timings(Duration::from_secs(60), Duration::from_millis(300));
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "kept while nothing moved");
+            std::fs::write(root.join("staged.txt"), "x").unwrap();
+            git_in(root, &["add", "staged.txt"]);
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "the kept read is refused");
+            assert!(rows.iter().any(|r| r.path == "staged.txt" && r.is_staged));
+            assert!(!facts.is_convicted(), "the event is given its grace");
+            thread::sleep(Duration::from_millis(350));
+            poll(state, path);
+            assert!(facts.is_convicted());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 5, "every poll reads now");
+        });
+    }
+
+    /// Steps shared by the plain-edit tests: a file changes under a stream
+    /// that says nothing; the kept read serves the old answer until the cap,
+    /// the read at the cap disagrees, and the watch is convicted.
+    fn convict_by_a_silent_plain_edit(
+        state: &WatcherState,
+        path: &str,
+        root: &Path,
+        facts: &WatchFacts,
+        reads: &AtomicUsize,
+    ) {
+        facts.set_timings(Duration::from_millis(400), Duration::from_millis(200));
+        poll(state, path);
+        std::fs::write(root.join("plain.txt"), "x").unwrap();
+        let stale = poll(state, path);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "served within the cap");
+        assert!(stale.is_empty(), "this is the bounded staleness: {stale:?}");
+        thread::sleep(Duration::from_millis(450));
+        let rows = poll(state, path);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "the cap forces a real read"
+        );
+        assert!(rows.iter().any(|r| r.path == "plain.txt"), "{rows:?}");
+        assert!(!facts.is_convicted());
+        thread::sleep(Duration::from_millis(250));
+        poll(state, path);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert!(facts.is_convicted(), "caught missing a change");
+    }
+
+    #[test]
+    fn a_silent_stream_while_a_plain_file_changes_is_stale_at_most_until_the_cap_then_convicted() {
+        silent_watch(|state, path, root, facts, reads| {
+            convict_by_a_silent_plain_edit(state, path, root, facts, reads);
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 5, "every poll reads");
+        });
+    }
+
+    #[test]
+    fn a_conviction_lifts_when_delivery_is_proven_again() {
+        silent_watch(|state, path, root, facts, reads| {
+            convict_by_a_silent_plain_edit(state, path, root, facts, reads);
+            // The stream comes back: a file changes and its event arrives.
+            std::fs::write(root.join("later.txt"), "x").unwrap();
+            assert!(facts.admit(&Ok(
+                Event::new(EventKind::Any).add_path(root.join("later.txt"))
+            )));
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 4);
+            assert!(rows.iter().any(|r| r.path == "later.txt"));
+            assert!(!facts.is_convicted(), "an event and a confirming read");
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 5, "kept and served again");
+        });
+    }
+
+    /// GitPulse's own reads run with `GIT_OPTIONAL_LOCKS=0`, so a read does not
+    /// touch the index; a healthy watch is therefore never suspected by them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_healthy_watch_is_never_convicted_by_gitpulses_own_reads() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            facts.set_timings(Duration::from_secs(60), Duration::from_millis(500));
+            for _ in 0..4 {
+                status_through_watch(state, path, false, || {
+                    crate::engine::git_reader::GitReader::get_status(path)
+                })
+                .unwrap();
+                thread::sleep(Duration::from_millis(300));
+            }
+            let before = reads.load(Ordering::SeqCst);
+            poll(state, path);
+            thread::sleep(Duration::from_millis(700));
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), before, "still served");
+            assert!(!facts.is_convicted());
+            assert!(facts.cover().is_some());
+        });
+    }
+
+    /// The pool parks a watch with `cmd_unwatch_repo`, which is `unwatch`, and
+    /// wakes it with `cmd_watch_repo`. The woken watch is a new session with
+    /// new facts: it inherits nothing the parked one kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_woken_watch_does_not_inherit_what_the_parked_one_kept() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let parked = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&parked);
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            unwatch(state, path.to_string()).unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let woken = state.facts_for(path).expect("a live session has facts");
+            assert!(!Arc::ptr_eq(&parked, &woken));
+            wait_for_a_still_epoch(&woken);
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "the first poll reads");
+            poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// B1, the reviewer's probe. `out/` is ignored, so edits under it are
+    /// dropped by the callback; once `out/sub/f.txt` is tracked (`add -f`) an
+    /// edit to it is a change `git status` reports, and the poll must see it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_that_becomes_tracked_inside_an_ignored_directory_is_seen_when_edited() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            std::fs::create_dir_all(root.join("out/sub")).unwrap();
+            std::fs::write(root.join("out/sub/f.txt"), "one\n").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+
+            git_in(root, &["add", "-f", "out/sub/f.txt"]);
+            git_in(
+                root,
+                &["commit", "-m", "track a file under an ignored directory"],
+            );
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            poll(state, path);
+            let settled = reads.load(Ordering::SeqCst);
+
+            std::fs::write(root.join("out/sub/f.txt"), "two\n").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            let rows = poll(state, path);
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                settled + 1,
+                "an edit to a tracked file must make the poll read; rows={rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "out/sub/f.txt" && r.status_code.contains('M')),
+                "{rows:?}"
+            );
+        });
+    }
+
+    /// B1 by another road: a checkout writes a tracked file into the ignored
+    /// directory and rewrites the index and HEAD, with no `.gitignore` event.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_checkout_that_tracks_a_file_under_an_ignored_directory_is_seen_when_edited() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "base"]);
+            git_in(root, &["branch", "-M", "main"]);
+            git_in(root, &["checkout", "-q", "-b", "tracks"]);
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            std::fs::write(root.join("out/gen.txt"), "one\n").unwrap();
+            git_in(root, &["add", "-f", "out/gen.txt"]);
+            git_in(root, &["commit", "-m", "tracks a generated file"]);
+            git_in(root, &["checkout", "-q", "main"]);
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            std::fs::write(root.join("out/seed.o"), "x").unwrap();
+
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let facts = state.facts_for(path).expect("a live session has facts");
+            wait_for_a_still_epoch(&facts);
+            git_in(root, &["checkout", "-q", "tracks"]);
+            wait_for_a_still_epoch(&facts);
+            poll(state, path);
+            poll(state, path);
+            let settled = reads.load(Ordering::SeqCst);
+
+            std::fs::write(root.join("out/gen.txt"), "two\n").unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            let rows = poll(state, path);
+            assert_eq!(reads.load(Ordering::SeqCst), settled + 1, "rows={rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "out/gen.txt" && r.status_code.contains('M')),
+                "{rows:?}"
+            );
         });
     }
 
@@ -5689,7 +5963,7 @@ mod tests {
             let facts = state.facts_for(path).expect("a live session has facts");
             wait_for_a_still_epoch(&facts);
             let (epoch, examined, settled) = (
-                facts.cover().unwrap(),
+                facts.epoch_now(),
                 facts.examined(),
                 announced.load(Ordering::SeqCst),
             );
@@ -5701,13 +5975,13 @@ mod tests {
                 .unwrap();
             }
             std::fs::write(root.join("sentinel.txt"), "x").unwrap();
-            wait_for("the sentinel", || facts.cover() != Some(epoch));
+            wait_for("the sentinel", || facts.epoch_now() != epoch);
             wait_for("the sentinel's refresh", || {
                 announced.load(Ordering::SeqCst) > settled
             });
             (
                 facts.examined() - examined,
-                facts.cover().unwrap() - epoch,
+                facts.epoch_now() - epoch,
                 announced.load(Ordering::SeqCst) - settled,
             )
         });
@@ -5742,20 +6016,19 @@ mod tests {
     fn an_ignore_edit_withdraws_the_watch_until_the_rules_reload() {
         let temp = TempDir::new().unwrap();
         let (rx, stop, root, facts, waker) = spawn_loop_observed(temp.path());
-        wait_for("the first rules", || facts.cover().is_some());
+        wait_for("the first rules", || facts.rules_fresh());
         let fresh = root.join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(fresh.join("seed.o"), "x").unwrap();
+        let wanted = facts.rules_wanted();
         std::fs::write(root.join(".gitignore"), "fresh/\n").unwrap();
         // The loop is asleep until something wakes it; the real watch's own
         // event does that, and so does this.
         let _ = waker.try_send(Ok(Event::new(EventKind::Other)));
-        wait_for("the rules to be stale or already reloaded", || {
-            facts.rules_stale() || facts.cover().is_some()
+        wait_for("the edit to reach the watch", || {
+            facts.rules_wanted() > wanted
         });
-        wait_for("the reload", || {
-            facts.cover().is_some() && !facts.rules_stale()
-        });
+        wait_for("the reload", || facts.rules_fresh());
         prime_watcher(&rx, &root, PRIME_DEADLINE);
 
         for i in 0..200 {
