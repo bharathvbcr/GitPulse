@@ -23,6 +23,7 @@
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "../ipc/invoke";
   import { readGitHubContext } from "../ipc/githubContext";
@@ -286,10 +287,12 @@
   // stamp must not wake the renderer behind other windows.
   $effect(() => createAdaptiveTimer(() => (clockTick = Date.now()), 30_000));
   // One read a minute while the pane is on screen and the window is in front;
-  // the timer itself pauses behind other windows.
+  // the timer itself pauses behind other windows. Switching to another Work
+  // section unmounts the pane, but the global Tasks, Agents and Fleet surfaces
+  // only hide the repository surface, so the timer exists only while it shows.
   $effect(() => {
     const repo = $currentRepoPath;
-    if (!repo) return;
+    if (!repo || $interfaceStore.globalSurface !== "repository") return;
     return createAdaptiveTimer(() => void refreshQuietly(repo), BACKGROUND_REFRESH_MS);
   });
   const fetchedAgo = $derived(

@@ -110,7 +110,10 @@ sections once; their content now lives with the subject it acts on — see
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
 - **Runs Update While You Watch Them**: While any run is queued or executing,
   the run list refreshes itself; once everything has settled it stops, so a
-  repository nobody is deploying runs no timer at all. The poll asks only for
+  repository nobody is deploying runs no run poll at all. (Separately, the
+  whole context is re-read quietly once a minute while Remote is on screen —
+  the issue monitor Policy used to run — reusing a read a neighbour just made,
+  and never while the window, or a global surface, hides it.) The poll asks only for
   the run listing — one `gh` call, not the four the full context costs — skips
   a tick while the previous call is still out, backs off on failure, and is
   bounded by both a wall-clock ceiling and a poll count so a run waiting on a

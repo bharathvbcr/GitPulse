@@ -78,6 +78,14 @@ describe("GitHubPanel silent background refresh", () => {
     expect(source).toContain("createAdaptiveTimer(() => void refreshQuietly(repo), BACKGROUND_REFRESH_MS)");
   });
 
+  it("runs no timer while a global surface hides the repository", () => {
+    // Tasks, Agents and Fleet hide the repository surface without unmounting
+    // it; a minute's gh read for a pane nobody can see is pure cost.
+    const effect = source.slice(source.indexOf("const repo = $currentRepoPath;\n    if (!repo ||"));
+    const guard = effect.slice(0, effect.indexOf("createAdaptiveTimer("));
+    expect(guard).toContain('$interfaceStore.globalSurface !== "repository") return;');
+  });
+
   it("claims neither loading nor the action banner, and yields to a read a person asked for", () => {
     const body = source.slice(source.indexOf("async function refreshQuietly"), source.indexOf("/** A failed refresh over data already on screen"));
     expect(body).toContain("if (quietRefreshing || loading || $repoStore.currentPath !== repo) return;");
