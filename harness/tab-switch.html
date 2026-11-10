@@ -106,6 +106,7 @@
       const fixtures = {
         cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
         cmd_list_branches: (a) => DATA[a.repoPath]?.branches ?? [],
+        cmd_get_accessibility_display: () => ({ reduceTransparency: "standard", reason: null, seq: 1 }),
         cmd_get_status: (a) => DATA[a.repoPath]?.statuses ?? [],
         cmd_list_tags: () => ({ tags: [], truncated: false }),
         cmd_repo_operation: () => null,

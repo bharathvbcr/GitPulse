@@ -81,6 +81,9 @@ site | src/commands/tests.rs | a_third_background_job_waits_until_one_of_the_fir
 # src/commands/worktrees.rs
 site | src/commands/worktrees.rs | seed_devmap_clones_the_store_and_starts_the_worktrees_own_build | 0 | bounded-poll
 
+# src/desktop/accessibility.rs
+site | src/desktop/accessibility.rs | a_display_option_change_is_emitted_to_the_webviews | 0 | bounded-poll
+
 # src/desktop/instance_tests.rs
 site | src/desktop/instance_tests.rs | a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch | 0 | bounded-poll
 site | src/desktop/instance_tests.rs | a_panicking_job_keeps_its_worker_and_gives_back_its_slot | 0 | bounded-poll

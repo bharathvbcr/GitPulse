@@ -1,5 +1,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { ACCENTS } from "./accents";
+import { TEXT_MIN } from "./color/guard";
+import { SHIPPED_BASE_HEX, SHIPPED_CONTRAST, deriveTokens, type TokenKey } from "./color/derive";
+import { contrastRatio, formatHex, type Rgb } from "./color/oklch";
 
 const css = readFileSync(new URL("../../app.css", import.meta.url), "utf8");
 const lightCss = css.match(/html\.light\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
@@ -69,5 +73,110 @@ describe("light-theme contrast contract", () => {
     expect(css).toMatch(/html\.light\s*:where\([\s\S]*?\[class~=["']text-textMuted\/40["']\]/);
     expect(css).toMatch(/\[class~=["']text-accent\/80["']\]/);
     expect(css).toMatch(/\[class~=["']text-amber-400\/80["']\]/);
+  });
+});
+
+/**
+ * The foundation roles (design language §4.1) held to the §4.3 guard, read from
+ * the stylesheet that ships so a hand edit of a triplet is caught, and compared
+ * with deriveTokens() so the CSS and the derivation cannot drift apart.
+ */
+describe("foundation color roles meet the contrast guard in both themes", () => {
+  const darkStart = css.indexOf("html.dark {");
+  const darkCss = css.slice(darkStart, css.indexOf("\n  }", darkStart));
+  const blocks = { dark: darkCss, light: lightCss } as const;
+  const ROLES = ["ok", "warn", "danger", "info", "unknown"] as const;
+
+  function triplet(theme: "dark" | "light", name: string): Rgb {
+    const match = blocks[theme].match(new RegExp(`--${name}:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)`));
+    if (!match) throw new Error(`missing --${name} in the ${theme} theme`);
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  }
+
+  /** Straight-alpha composite, unrounded: the browser does not round it either. */
+  function over(foreground: Rgb, background: Rgb, alpha: number): Rgb {
+    return [
+      foreground[0] * alpha + background[0] * (1 - alpha),
+      foreground[1] * alpha + background[1] * (1 - alpha),
+      foreground[2] * alpha + background[2] * (1 - alpha),
+    ];
+  }
+
+  it("finds the dark block it is meant to be checking", () => {
+    expect(darkStart).toBeGreaterThan(0);
+    expect(darkCss).toContain("--c-bg:");
+    expect(darkCss).toContain("--c-ok:");
+  });
+
+  describe.each(["dark", "light"] as const)("%s theme", (theme) => {
+    const surfaces = ["c-bg", "c-surface", "c-surface-hover"].map((name) => triplet(theme, name));
+
+    it.each([...ROLES, "accent"])("keeps %s text at 4.5:1 on every surface", (role) => {
+      for (const surface of surfaces) {
+        expect(contrastRatio(triplet(theme, `c-${role}`), surface)).toBeGreaterThanOrEqual(TEXT_MIN);
+      }
+    });
+
+    it("keeps faint text at 4.5:1 on every surface", () => {
+      for (const surface of surfaces) {
+        expect(contrastRatio(triplet(theme, "c-text-faint"), surface)).toBeGreaterThanOrEqual(TEXT_MIN);
+      }
+    });
+
+    it.each([...ROLES, "accent"])("keeps the ink on a %s fill at 4.5:1", (role) => {
+      expect(contrastRatio(triplet(theme, `c-on-${role}`), triplet(theme, `c-${role}`))).toBeGreaterThanOrEqual(TEXT_MIN);
+    });
+
+    it.each(ROLES)("keeps %s text readable on its own 10% chip tint over every surface", (role) => {
+      // 10% is the strongest tint that holds 4.5:1 for every role in both
+      // themes (measured worst case 4.57); 15% dropped light `ok` to 4.30.
+      const color = triplet(theme, `c-${role}`);
+      for (const surface of surfaces) {
+        expect(contrastRatio(color, over(color, surface, 0.1))).toBeGreaterThanOrEqual(TEXT_MIN);
+      }
+    });
+
+    it("paints every gp-chip and icon-button tint at the 10% this test measures", () => {
+      const chip = css.slice(css.indexOf("@utility gp-chip"), css.indexOf("@utility gp-floor"));
+      const iconButton = css.slice(css.indexOf("@utility gp-icon-btn"), css.indexOf("@utility gp-pill"));
+      const tints = [...(chip + iconButton).matchAll(/background-color: rgb\(var\(--c-[a-z]+\) \/ ([\d.]+)\)/g)].map(
+        (match) => match[1],
+      );
+      expect(tints.length).toBeGreaterThanOrEqual(7);
+      expect([...new Set(tints)]).toEqual(["0.1"]);
+    });
+
+    it("paints the selected row at the 12% this test measures", () => {
+      const row = css.slice(css.indexOf("@utility gp-row"), css.indexOf("@utility gp-label"));
+      expect(row).toMatch(/\[data-selected="true"\]\s*\{\s*background-color: rgb\(var\(--c-accent\) \/ 0\.12\)/);
+    });
+
+    it("keeps accent text readable on a selected row's 12% accent tint over every surface", () => {
+      const accent = triplet(theme, "c-accent");
+      for (const surface of surfaces) {
+        expect(contrastRatio(accent, over(accent, surface, 0.12))).toBeGreaterThanOrEqual(TEXT_MIN);
+      }
+    });
+
+    it("keeps the default on-accent ink readable on every preset accent, so a preset needs no ink of its own", () => {
+      const ink = triplet(theme, "c-on-accent");
+      for (const preset of ACCENTS) {
+        expect(contrastRatio(ink, preset.rgb[theme]), `${preset.id} (${theme})`).toBeGreaterThanOrEqual(TEXT_MIN);
+      }
+    });
+
+    it("is what deriveTokens produces for the shipped base (the CSS has not drifted from the derivation)", () => {
+      const result = deriveTokens(
+        { base: SHIPPED_BASE_HEX[theme], accent: formatHex(triplet(theme, "c-accent")), contrast: SHIPPED_CONTRAST },
+        theme,
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const names = ["c-text-faint", "c-on-accent", ...ROLES.flatMap((role) => [`c-${role}`, `c-on-${role}`])];
+      for (const name of names) {
+        // The key is built from a name this test wrote, so a typo fails as undefined.
+        expect(triplet(theme, name).join(" "), `--${name}`).toBe(result.tokens[`--${name}` as TokenKey]);
+      }
+    });
   });
 });

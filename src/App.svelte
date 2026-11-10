@@ -161,6 +161,7 @@
   import { applyAccent } from "./lib/ui/accents";
   import { applyTabWidth } from "./lib/ui/codeDisplay";
   import { applyReduceMotion } from "./lib/motion/motionPreference";
+  import { installTransparencyPreference } from "./lib/ui/transparencyPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
@@ -1003,6 +1004,7 @@
     applyAccent($interfaceStore.accent, $themeStore);
   });
 
+  void installTransparencyPreference();
   $effect(() => {
     applyReduceMotion($interfaceStore.reduceMotion);
   });

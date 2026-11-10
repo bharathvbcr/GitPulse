@@ -144,6 +144,138 @@ describe("macOS material", () => {
   });
 
   /*
+   * WKWebView does not implement `prefers-reduced-transparency` (verified
+   * 2026-11-09), so the media block above never fires for a user who switched
+   * the system setting on. lib/ui/transparencyPreference.ts stamps
+   * `html[data-transparency="reduced"]` from the native setting, and the block
+   * after the media query is the same rules keyed on it. A media query and an
+   * attribute cannot share a selector, so the two lists are pinned equal here,
+   * rule for rule, the way motionPreference.test.ts pins the motion pair.
+   */
+  describe("reduced transparency has two triggers and needs both", () => {
+    const ATTRIBUTE = '[data-transparency="reduced"]';
+    const MEDIA = "@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active)";
+
+    interface Rule {
+      selectors: string[];
+      body: string;
+    }
+
+    /** Splits on commas that are not inside parentheses or brackets. */
+    function topLevelSplit(selector: string): string[] {
+      const parts: string[] = [];
+      let depth = 0;
+      let start = 0;
+      for (let i = 0; i < selector.length; i += 1) {
+        const ch = selector[i];
+        if (ch === "(" || ch === "[") depth += 1;
+        else if (ch === ")" || ch === "]") depth -= 1;
+        else if (ch === "," && depth === 0) {
+          parts.push(selector.slice(start, i));
+          start = i + 1;
+        }
+      }
+      parts.push(selector.slice(start));
+      return parts.map((part) => part.trim().replace(/\s+/g, " "));
+    }
+
+    /** Every flat `selector { declarations }` rule in `text`, comments removed. */
+    function rulesOf(text: string): Rule[] {
+      const clean = text.replace(/\/\*[\s\S]*?\*\//g, "");
+      return [...clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((match) => ({
+        selectors: topLevelSplit(match[1]),
+        body: match[2].trim().replace(/\s+/g, " "),
+      }));
+    }
+
+    /** The body of the balanced block that opens at the first `{` after `from`. */
+    function blockAfter(from: number): string {
+      const open = css.indexOf("{", from);
+      let depth = 0;
+      for (let i = open; i < css.length; i += 1) {
+        if (css[i] === "{") depth += 1;
+        if (css[i] === "}") {
+          depth -= 1;
+          if (depth === 0) return css.slice(open + 1, i);
+        }
+      }
+      throw new Error("unbalanced block");
+    }
+
+    const mediaRules = rulesOf(blockAfter(css.indexOf(MEDIA)));
+    const attributeRules = rulesOf(css).filter((rule) => rule.selectors.some((selector) => selector.includes(ATTRIBUTE)));
+
+    /** `html.macos …` / `html.macos.light …` gain the attribute on their html compound. */
+    function mirror(selector: string): string {
+      const mirrored = selector.replace(/^html(\.macos(?:\.light)?)/, `html$1${ATTRIBUTE}`);
+      expect(mirrored, `not anchored on html.macos: ${selector}`).not.toBe(selector);
+      return mirrored;
+    }
+
+    it("finds the media rules it is meant to mirror", () => {
+      // A parser that finds nothing would make the equality below vacuous.
+      expect(css).toContain(MEDIA);
+      expect(mediaRules.length).toBeGreaterThanOrEqual(8);
+    });
+
+    it("keys the same rules on the attribute, selector for selector and declaration for declaration", () => {
+      expect(attributeRules).toEqual(
+        mediaRules.map((rule) => ({ selectors: rule.selectors.map(mirror), body: rule.body })),
+      );
+    });
+
+    it("keeps the attribute block after the media block, so equal specificity resolves to the same answer", () => {
+      expect(css.indexOf(ATTRIBUTE)).toBeGreaterThan(css.indexOf(MEDIA));
+    });
+
+    it("clears the float blur for every surface that wears a float shadow, in both triggers", () => {
+      // The blur rule filters by shadow tier, so the opt-out has to name the
+      // same tier or a toast keeps its filter under Reduce Transparency.
+      const floatOptOut = (rules: Rule[]) =>
+        rules.find(
+          (rule) =>
+            rule.selectors.length === 1 &&
+            rule.selectors[0].includes('[class~="shadow-float"]') &&
+            rule.selectors[0].includes('[class~="shadow-pop"]'),
+        );
+      expect(floatOptOut(mediaRules)?.body).toContain("backdrop-filter: none;");
+      expect(floatOptOut(attributeRules)?.body).toContain("backdrop-filter: none;");
+    });
+
+    it("never claims reduced for an unknown or standard reading", () => {
+      // Only `reduced` selects the rules; `unknown` is stamped as itself so a
+      // read that could not run never looks like the setting being on or off.
+      expect(css).not.toMatch(/data-transparency="(?:unknown|standard)"/);
+    });
+  });
+
+  it("gives every gp-btn variant its own fill, and lets only the secondary button wear the glass ladder", () => {
+    // The glass ladder is an unlayered rule, which beats the layered utility
+    // regardless of specificity: a primary, danger, success or ghost button
+    // listed there would lose its own fill (ghost would become a grey pill).
+    const ladder = css.match(/html\.macos :where\(([^{]*\.gp-keycap)\) \{\s*background-color: var\(--mac-fill-surface\);/)?.[1];
+    expect(ladder, "the glass ladder rule is missing from app.css").toBeDefined();
+    expect(ladder).toContain(".gp-btn:not([data-variant])");
+    expect(ladder).toContain('.gp-btn[data-variant="secondary"]');
+    for (const variant of ["primary", "danger", "success", "ghost"]) {
+      expect(ladder, `${variant} must not be on the glass ladder`).not.toContain(`"${variant}"`);
+    }
+  });
+
+  it("presses every gp-btn alias the same way, success included", () => {
+    // gp-btn-success was missing from all four press and reduced rules, so it
+    // never pressed on macOS and never stopped pressing under reduced motion.
+    // Three :active rules: the live press, and the reduced-motion twin on each trigger.
+    const press = [...css.matchAll(/:is\(([^)]*\.gp-btn[^)]*)\)(?::active)/g)].map((match) => match[1]);
+    expect(press.length).toBeGreaterThanOrEqual(3);
+    for (const group of press) {
+      for (const name of [".gp-btn", ".gp-btn-primary", ".gp-btn-success", ".gp-btn-danger", ".gp-icon-btn"]) {
+        expect(group, `${name} missing from a press rule`).toContain(name);
+      }
+    }
+  });
+
+  /*
    * Native window transparency: three things that only work together.
    *
    * Tauri merges `tauri.macos.conf.json` over the base with JSON Merge Patch
