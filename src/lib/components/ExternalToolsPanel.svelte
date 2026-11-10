@@ -115,29 +115,29 @@
 
 <div class="space-y-2">
   {#if loadError}
-    <p class="text-amber-600 dark:text-amber-400 text-[10px]">{loadError}</p>
+    <p class="text-warn text-micro">{loadError}</p>
   {:else if !status}
-    <p class="text-textMuted text-[10px]">Checking installed tools…</p>
+    <p class="text-textMuted text-micro">Checking installed tools…</p>
   {:else}
     {#each rows as row, i (`${row.tool}#${i}`)}
       <div
-        class="rounded-xl border border-border/70 bg-background/60 {compact
+        class="rounded-xl border border-edge bg-background/60 {compact
           ? 'p-2'
           : 'p-2.5'} space-y-1.5"
       >
         <div class="flex items-start gap-2">
           <div class="min-w-0 flex-1">
-            <div class="text-textPrimary text-[11px] font-medium font-mono">{row.tool}</div>
-            <div class="text-textMuted text-[10px] font-mono break-all leading-snug">
+            <div class="text-textPrimary text-meta font-medium font-mono">{row.tool}</div>
+            <div class="text-textMuted text-micro font-mono break-all leading-snug">
               {toolStatusSummary(row)}
             </div>
             {#if !row.installed && row.source_checkout}
-              <div class="text-textMuted text-[10px] mt-0.5 break-all">
+              <div class="text-textMuted text-micro mt-0.5 break-all">
                 Source: {row.source_checkout}
               </div>
             {/if}
             {#if !row.install_ready && row.install_block}
-              <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-0.5">
+              <div class="text-warn text-micro mt-0.5">
                 {row.install_block}
               </div>
             {/if}
@@ -145,7 +145,7 @@
           <div class="flex shrink-0 items-center gap-1">
             <button
               type="button"
-              class="gp-btn py-0.5! px-2! text-[10px]"
+              class="gp-btn py-0.5! px-2! text-micro"
               onclick={() => openSetupWizard(row.tool, "explain")}
             >
               Setup
@@ -153,7 +153,7 @@
             {#if installing === row.tool}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                class="gp-btn py-0.5! px-2! text-micro inline-flex items-center gap-1"
                 onclick={() => void cancel()}
               >
                 <X size={10} />
@@ -162,21 +162,21 @@
             {:else}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[10px]"
+                class="gp-btn py-0.5! px-2! text-micro"
                 onclick={() => void toggleDisabled(row.tool, !row.disabled)}
               >
                 {row.disabled ? "Enable" : "Disable"}
               </button>
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[10px]"
+                class="gp-btn py-0.5! px-2! text-micro"
                 onclick={() => void uninstall(row.tool)}
               >
                 Uninstall
               </button>
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                class="gp-btn py-0.5! px-2! text-micro inline-flex items-center gap-1"
                 disabled={!row.install_ready || installing !== null || row.disabled === true}
                 title={row.install_command}
                 onclick={() => void runInstall(row.tool)}
@@ -192,7 +192,7 @@
           </div>
         </div>
         {#if !compact}
-          <p class="text-textMuted text-[10px] font-mono break-all leading-snug opacity-80">
+          <p class="text-textMuted text-micro font-mono break-all leading-snug opacity-80">
             {row.install_command}
           </p>
         {/if}
@@ -202,9 +202,9 @@
 
   {#if lastOutcome && (!only || lastOutcome.tool === only)}
     <div
-      class="rounded-lg border px-2 py-1.5 text-[10px] leading-snug {lastOutcome.ok
-        ? 'border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
-        : 'border-rose-500/30 text-rose-700 dark:text-rose-300'}"
+      class="rounded-lg border px-2 py-1.5 text-micro leading-snug {lastOutcome.ok
+        ? 'border-ok/35 text-ok'
+        : 'border-danger/35 text-danger'}"
     >
       {#if lastOutcome.ok}
         Installed {lastOutcome.tool} at {lastOutcome.binary}
@@ -217,7 +217,7 @@
   {/if}
 
   {#if installing}
-    <p class="text-textMuted text-[10px] flex items-center gap-1.5">
+    <p class="text-textMuted text-micro flex items-center gap-1.5">
       <RefreshCw size={10} class="animate-spin" />
       Installing {installing}… this can take several minutes.
     </p>

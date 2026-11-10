@@ -16,6 +16,12 @@ const source = readFileSync(
   "utf8",
 );
 
+// Appearance rows moved out of the modal into their own component; both files stamp `data-setting` ids.
+const appearanceSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "AppearanceSettings.svelte"),
+  "utf8",
+);
+
 const appCss = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "..", "..", "app.css"),
   "utf8",
@@ -106,7 +112,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="dialog"');
     expect(body).toContain('aria-label="Theme appearance"');
-    expect(body).toContain('aria-label="Branch spacing"');
+    expect(body).toContain('aria-label="Density"');
     expect(body).toContain('aria-label="Graph width"');
     // Every option is a pressed/unpressed toggle.
     expect(body).toContain('aria-pressed="true"');
@@ -117,6 +123,7 @@ describe("SettingsModal", () => {
     expect(body).toContain("Dark");
     // Density options (sole owner since the FilterBar control moved here).
     expect(body).toContain("Spacious");
+    expect(body).toContain("Comfortable");
     expect(body).toContain("Compact");
     expect(body).toContain("Balanced");
     expect(body).toContain("Wide");
@@ -128,7 +135,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="switch"');
     expect(body).toContain('aria-label="Show the language mix in the status bar"');
-    expect(body).toContain('aria-label="Show MANVI status badges"');
+    expect(body).toContain('aria-label="Show Manvi status badges"');
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
@@ -187,7 +194,7 @@ describe("SettingsModal layout options", () => {
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
     expect(layout).toContain('aria-label="Show the language mix in the status bar"');
-    expect(layout).toContain('aria-label="Show MANVI status badges"');
+    expect(layout).toContain('aria-label="Show Manvi status badges"');
   });
 
   it("says a hidden status bar still comes back for anything that needs attention", () => {
@@ -339,9 +346,10 @@ describe("SettingsModal restore defaults", () => {
     );
     expect(fn).toContain("askConfirm");
     expect(fn).toContain("if (!confirmed) return;");
-    // All three owners, or "defaults" would silently mean "some of them".
+    // Both owners, or "defaults" would silently mean "some of them". Density
+    // is a field of the interface preferences now, so `reset()` restores it.
     expect(fn).toContain("interfaceStore.reset()");
-    expect(fn).toContain("densityStore.setDensity");
+    expect(fn).not.toContain("densityStore");
     expect(fn).toContain("setTheme(");
   });
 });
@@ -349,7 +357,7 @@ describe("SettingsModal restore defaults", () => {
 
 describe("SettingsModal is wired to the search catalog", () => {
   /** Every `data-setting` id the template stamps on a control row. */
-  const stamped = [...source.matchAll(/data-setting="([^"]+)"/g)].map((m) => m[1]);
+  const stamped = [...(source + appearanceSource).matchAll(/data-setting="([^"]+)"/g)].map((m) => m[1]);
 
   it("stamps each id exactly once, so a filter cannot half-hide a row", () => {
     expect(new Set(stamped).size).toBe(stamped.length);
@@ -361,6 +369,7 @@ describe("SettingsModal is wired to the search catalog", () => {
     // nothing in it. That is what happened to the agent rows inside
     // external-tools.
     expect(nestedSettings(source)).toEqual([]);
+    expect(nestedSettings(appearanceSource)).toEqual([]);
     expect(nestedSettings('<div data-setting="a"><div data-setting="b"></div></div>')).toEqual(["b in a"]);
     expect(nestedSettings('<div data-setting="a"></div><div data-setting="b"><div></div></div>')).toEqual([]);
   });
@@ -406,7 +415,7 @@ describe("SettingsModal is wired to the search catalog", () => {
     for (const id of stamped) {
       if (soleControl.has(id)) continue;
       expect(
-        prose(source),
+        prose(source + appearanceSource),
         `data-setting="${id}" is not gated on the filter`,
       ).toContain(`data-setting="${id}" hidden={!shown("${id}")}`);
     }
@@ -482,9 +491,9 @@ describe("SettingsModal appearance additions", () => {
     }
     // Same shape as every other single-choice control here: a labelled group
     // of aria-pressed buttons, exactly one of them pressed.
-    expect(appearance).toContain('role="group" aria-label="Accent colour"');
+    expect(appearance).toContain('role="group" aria-label="Accent color"');
     const swatches = appearance.slice(
-      appearance.indexOf('aria-label="Accent colour"'),
+      appearance.indexOf('aria-label="Accent color"'),
       appearance.indexOf('data-setting="ui-scale"'),
     );
     expect(swatches.match(/aria-pressed="true"/g) ?? []).toHaveLength(1);

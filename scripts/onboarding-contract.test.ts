@@ -40,8 +40,11 @@ describe("onboarding integration and native permission purposes", () => {
 
     const settings = read("src/lib/components/SettingsModal.svelte");
     expect(settings).toContain('import { productTour } from "../tools/productTour";');
-    expect(settings).toContain('data-setting="walkthrough-replay"');
-    expect(settings).toContain("onclick={replayWalkthrough}");
+    // The row moved into AppearanceSettings; the modal still owns replayWalkthrough and hands it down.
+    const appearance = read("src/lib/components/AppearanceSettings.svelte");
+    expect(appearance).toContain('data-setting="walkthrough-replay"');
+    expect(appearance).toContain("onclick={onReplayTour}");
+    expect(settings).toContain("onReplayTour={replayWalkthrough}");
     // Settings has to close before the guide opens: the tour renders below
     // this dialog by design, and its live steps point at controls it covers.
     expect(settings).toMatch(

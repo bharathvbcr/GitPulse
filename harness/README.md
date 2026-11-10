@@ -547,3 +547,33 @@ and every wheel case. The storm's oracle reads item boxes, not `scrollWidth`,
 so padding cannot pass for content; under 2.5px hidden it skips as undecidable.
 A failing storm prints its seed. Replay it on the dev server with
 `/harness/scroll-cue.html?seed=<n>&ops=<n>`.
+
+
+## `appearance.html` — Settings -> Appearance against the real stylesheet
+
+Mounts `AppearanceSettings` (the panel the modal renders) next to probe elements
+(a menu, a float, a panel wearing the surface fill, a radius probe) and drives it
+through the real controls. Vitest has no cascade, so what the settings DO to a live
+document is held here: density and corner style move `--gp-row-h` and the radius
+ladder; a code font reaches `--font-mono`; a near-black custom accent is adjusted
+and the computed `--c-accent` reads at 4.5:1 on every surface in both themes;
+float blur 20 / 40 compute `blur(Npx)` and **0 computes `backdrop-filter: none`**;
+material intensity moves the surface fill's alpha and is held at the measured
+floor in the light theme; an imported theme round-trips through export, and a CSS
+string, a `url()`, a filter key and a z-index key are each refused with a
+`describeFailure` notice that changes nothing; **reduced transparency wins**: with
+the setting on Reduced (or the system answer reduced) the surface is opaque and the
+float has no blur whatever the sliders say, and a focus re-read of a `standard`
+system answer does not undo the reader's choice; off a native-material host the
+Material group says so instead of showing dead sliders.
+
+It is not in `BROWSER_HARNESSES` yet (that list is pinned to the Swift runner's
+allow-list by `scripts/browser-regressions.test.ts`). Run it with the measurement
+runner, from the checkout whose code it should test:
+
+```bash
+node harness/runPage.mjs chrome /harness/appearance.html   # or: webkit
+```
+
+`frame-rate.html` takes `?blur=<0..40>` to measure the float at a chosen blur radius
+the way Settings sets it (`--gp-float-blur`, or `data-float-blur="off"` at 0).

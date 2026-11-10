@@ -38,8 +38,11 @@ it("strips a comment whose removal exposes another opener", () => {
 
 describe("the two limits: agents running at once, terminal sessions open at once", () => {
   /** The modal's usage of the shared control for one field, attributes and note. */
+  const key = (field: string) => (field === "max_live_runs" ? "liveRuns" : "terminalSessions");
   const usage = (field: string) => {
-    const at = modal.indexOf(`field="${field}"`);
+    // The modal names the backend keys once, in LIMIT_FIELDS, and the rows read them from it.
+    expect(modal).toContain(`${key(field)}: "${field}"`);
+    const at = modal.indexOf(`field={LIMIT_FIELDS.${key(field)}}`);
     expect(at, `${field} has no AgentLimitSetting`).toBeGreaterThan(0);
     return modal.slice(modal.lastIndexOf("<AgentLimitSetting", at), modal.indexOf("</AgentLimitSetting>", at));
   };
@@ -53,7 +56,9 @@ describe("the two limits: agents running at once, terminal sessions open at once
     for (const word of words) expect(entry?.keywords, `"${word}" does not find ${id}`).toContain(word);
     // Its own wrapper in the modal: inside the permission panel's, a search
     // for "concurrent" hid it along with the permission rows.
-    expect(modal).toMatch(new RegExp(`data-setting="${id}"[^>]*>\\s*<AgentLimitSetting\\s+field="${field}"`));
+    expect(modal).toMatch(
+      new RegExp(`data-setting="${id}"[^>]*>\\s*<AgentLimitSetting\\s+field=\\{LIMIT_FIELDS\\.${key(field)}\\}`),
+    );
     expect(panel).not.toContain(field);
   });
 

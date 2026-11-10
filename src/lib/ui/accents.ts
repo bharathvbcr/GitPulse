@@ -88,6 +88,20 @@ export function accentSwatch(id: string, theme: Theme): string {
   return `rgb(${accentFor(id).rgb[theme].join(" ")})`;
 }
 
+/**
+ * A custom accent (or an imported theme's) for the CURRENT theme, as the
+ * `R G B` channels `--c-accent` expects, already through the contrast guard.
+ * `applyAccent` stays the one writer of `--c-accent`: App.svelte calls it on
+ * every accent or theme change, so a second writer elsewhere would lose that
+ * race. The appearance applier (ui/appearance/apply.ts) sets this, then calls
+ * `applyAccent` itself.
+ */
+let accentOverride: string | null = null;
+
+export function setAccentOverride(channels: string | null): void {
+  accentOverride = channels;
+}
+
 /** The element whose inline style carries the override; normally `<html>`. */
 export interface AccentTarget {
   readonly style: {
@@ -117,6 +131,10 @@ export function applyAccent(
   const root =
     target ?? (typeof document !== "undefined" ? document.documentElement : null);
   if (!root) return;
+  if (accentOverride !== null) {
+    root.style.setProperty("--c-accent", accentOverride);
+    return;
+  }
   if (!isAccentId(id) || id === DEFAULT_ACCENT) {
     root.style.removeProperty("--c-accent");
     return;

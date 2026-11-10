@@ -11,7 +11,7 @@ import type { HostOS } from "../platform";
  * output — which is only true for as long as this holds.
  */
 function bodyFor(os: HostOS): string {
-  resetHostPlatformForTests({ os, dock_hiding: os === "macos", browser_sessions: os === "macos" });
+  resetHostPlatformForTests({ os, dock_hiding: os === "macos", browser_sessions: os === "macos", native_material: os === "macos" });
   return render(CoachMark, {
     props: {
       id: "coach-test-platform",

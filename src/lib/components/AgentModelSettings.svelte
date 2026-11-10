@@ -185,9 +185,9 @@
 </script>
 
 <fieldset>
-  <legend class="text-textPrimary text-[11px]">Agent models</legend>
+  <legend class="text-textPrimary text-meta">Agent models</legend>
   {#if rows.length === 0}
-    <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid="agent-models-unavailable">
+    <p class="text-textMuted text-micro leading-snug mt-1" data-testid="agent-models-unavailable">
       This build of GitPulse's backend does not offer model settings.
     </p>
   {:else}
@@ -195,15 +195,15 @@
       {#each rows as row (row.kind)}
         {@const choice = modelChoiceOf(view.defaults, row.kind)}
         <div class="flex flex-col gap-1" data-testid={`agent-models-${row.kind}`}>
-          <span class="text-[11px] text-textPrimary font-medium">{row.label}</span>
+          <span class="text-meta text-textPrimary font-medium">{row.label}</span>
           <div class="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] items-center gap-x-2 gap-y-1">
             {#each row.fields as field (field)}
               {@const id = `agent-model-${row.kind}-${field}`}
-              <label for={id} class="text-[10px] text-textMuted">{FIELD_LABELS[field]}</label>
+              <label for={id} class="text-micro text-textMuted">{FIELD_LABELS[field]}</label>
               {#if field === "effort"}
                 <select
                   {id}
-                  class="gp-input text-[11px] py-0.5! min-w-0"
+                  class="gp-input text-meta py-0.5! min-w-0"
                   data-testid={id}
                   disabled={busy}
                   value={choice.effort ?? ""}
@@ -221,7 +221,7 @@
                   type="text"
                   spellcheck="false"
                   autocomplete="off"
-                  class="gp-input text-[11px] py-0.5! min-w-0 font-mono"
+                  class="gp-input text-meta py-0.5! min-w-0 font-mono"
                   data-testid={id}
                   disabled={busy}
                   placeholder={field === "advisor" ? "Off unless your settings turn it on" : field === "fallback" ? "None" : "CLI default"}
@@ -244,14 +244,14 @@
             {@const status = catalogStatus(row.kind)}
             {@const listed = view.modelListing[row.kind] === "listed"}
             {@const known = listedModel(catalogs[row.kind], choice.model)}
-            <div class="flex items-start gap-2 text-[10px]">
+            <div class="flex items-start gap-2 text-micro">
               {#if status}
-                <span class={status.problem ? "text-amber-600 dark:text-amber-400" : "text-textMuted"} data-testid={`agent-models-${row.kind}-catalog`}>{status.text}</span>
+                <span class={status.problem ? "text-warn" : "text-textMuted"} data-testid={`agent-models-${row.kind}-catalog`}>{status.text}</span>
               {/if}
               {#if listed}
                 <button
                   type="button"
-                  class="ml-auto shrink-0 rounded border border-border px-1.5 py-px text-[10px] text-textPrimary hover:bg-bgSecondary disabled:opacity-50"
+                  class="ml-auto shrink-0 rounded border border-border px-1.5 py-px text-micro text-textPrimary hover:bg-bgSecondary disabled:opacity-50"
                   data-testid={`agent-models-${row.kind}-list`}
                   disabled={catalogs[row.kind]?.status === "loading"}
                   onclick={() => void loadAgentModels(row.kind, shownCatalog(catalogs[row.kind]) !== null)}
@@ -261,14 +261,14 @@
               {/if}
             </div>
             {#if listed && known === false}
-              <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px]" data-testid={`agent-models-${row.kind}-unlisted`}>
+              <div class="flex items-start gap-1.5 text-warn text-micro" data-testid={`agent-models-${row.kind}-unlisted`}>
                 <AlertTriangle size={12} class="shrink-0 mt-px" />
                 <span>"{choice.model}" is not in the list your account returned. Antigravity would start with its default model instead.</span>
               </div>
             {/if}
           {/if}
           {#if errors[row.kind]}
-            <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px]">
+            <div class="flex items-start gap-1.5 text-warn text-micro">
               <AlertTriangle size={12} class="shrink-0 mt-px" />
               <span data-testid={`agent-models-${row.kind}-error`}>{errors[row.kind]}</span>
             </div>
@@ -277,9 +277,9 @@
       {/each}
     </div>
   {/if}
-  <p class="text-textMuted text-[10px] leading-snug mt-1.5" data-testid="agent-models-note">
-    The model each agent starts with when GitPulse starts it in a terminal, for task attempts and new agent tabs alike. Empty means the CLI's own choice.
-    A task attempt first checks that the installed CLI offers each control (and the effort level you picked), and refuses to start if it does not.
+  <p class="text-textMuted text-micro leading-snug mt-1.5" data-testid="agent-models-note">
+    The model each agent starts with when GitPulse starts it in a terminal, for task runs and new agent tabs alike. Empty means the CLI's own choice.
+    A task run first checks that the installed CLI offers each control (and the effort level you picked), and refuses to start if it does not.
     GitPulse checks that a name is well-formed, not that the model exists — the CLI reports a model it cannot use in the session.
     Antigravity does not stop for an unknown name: it falls back to its default model and prints a warning in the terminal. Its names are the ones <span class="font-mono">agy models</span> lists.
     Claude's advisor needs access to the advisor model, and Claude Code reports a pairing it cannot use (the advisor must be at least as capable as the main model).

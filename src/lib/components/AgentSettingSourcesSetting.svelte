@@ -78,10 +78,10 @@
 </script>
 
 <fieldset>
-  <legend class="text-textPrimary text-[11px]">Claude Code settings files</legend>
+  <legend class="text-textPrimary text-meta">Claude Code settings files</legend>
   <div class="mt-1.5 flex flex-col gap-1" data-testid="agent-setting-sources">
     {#each CLAUDE_SETTING_SOURCES as source (source)}
-      <label class="flex items-start gap-2 text-[11px] text-textPrimary">
+      <label class="flex items-start gap-2 text-meta text-textPrimary">
         <input
           type="checkbox"
           class="mt-0.5"
@@ -97,13 +97,13 @@
       </label>
     {/each}
   </div>
-  <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid="agent-setting-sources-note">
-    Which settings files Claude Code loads when GitPulse starts it in a terminal, for task attempts and new Claude tabs alike.
-    Turning off project and local stops a repository's own settings from widening an agent's permissions, but also drops that repository's allow-lists and hooks.
+  <p class="text-textMuted text-micro leading-snug mt-1" data-testid="agent-setting-sources-note">
+    Which settings files Claude Code loads when GitPulse starts it in a terminal, for task runs and new Claude tabs alike.
+    Turning off the repository and local sources stops a repository's own settings from widening an agent's permissions, but also drops that repository's allow-lists and hooks.
     Instructions in CLAUDE.md are read either way. Managed sessions always load your user settings only.
   </p>
   {#if error}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
+    <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
       <span data-testid="agent-setting-sources-error">{error}</span>
     </div>

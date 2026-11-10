@@ -32,7 +32,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "appearance",
     label: "Appearance",
-    summary: "Theme and how large the interface draws.",
+    summary: "Theme, colors, type, shape, material, motion and density.",
   },
   {
     id: "layout",
@@ -47,7 +47,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "graph",
     label: "Commit graph",
-    summary: "Lane spacing, graph width and the author gutter.",
+    summary: "Graph width, which refs are drawn and the author gutter.",
   },
   {
     id: "diff",

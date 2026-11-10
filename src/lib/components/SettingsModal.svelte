@@ -2,7 +2,6 @@
   import { untrack } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { themeStore, type ThemePreference } from "../stores/themeStore";
-  import { densityStore, type DensityMode } from "../stores/densityStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import {
     backdropFade,
@@ -64,16 +63,14 @@
   import type { StatusBarMode } from "../ui/statusBarMode";
   import type { DiagnosticsButtonMode } from "../ui/diagnosticsButton";
   import type { CodePercentageMode } from "../language/barStats";
-  import { ACCENTS, accentSwatch } from "../ui/accents";
   import {
     TAB_WIDTHS,
     type DiffLayout,
     type TabWidth,
   } from "../ui/codeDisplay";
-  import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
-  import type { BranchRowLayout } from "../sidebar/metrics";
+  import AppearanceSettings from "./AppearanceSettings.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
@@ -97,6 +94,13 @@
     isOpen?: boolean;
     onClose?: () => void;
   } = $props();
+
+  // Identifiers that are data, not copy: the first agent tool to try, and the
+  // two CLIs the install ladder manages.
+  const FIRST_AGENT_TOOL = "gitpulse_insights";
+  // Backend setting keys the two limit rows write; `AgentLimitSetting` owns the IPC.
+  const LIMIT_FIELDS = { liveRuns: "max_live_runs", terminalSessions: "max_terminal_sessions" } as const;
+  const CLI_NAMES = { codeMap: "devmap", policy: "manvi" } as const;
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
@@ -178,6 +182,9 @@
       // switched off still needs the row in order to be told so.
       appleIntelligence: $hostPlatform.os === "macos",
       macos: $hostPlatform.os === "macos",
+      // By capability: the glass tokens mean something only over a native
+      // translucent window, which the backend reports; the OS name does not.
+      nativeMaterial: $hostPlatform.native_material,
     }),
   );
   const filter = $derived(matchSettings(query, unsupported));
@@ -335,12 +342,11 @@
     const confirmed = await askConfirm({
       title: "Restore default settings?",
       message:
-        "Appearance (theme, accent, scale, motion, timestamps), layout, view visibility, graph, diff and analysis preferences all go back to their defaults. Repositories, tabs and history are untouched.",
+        "Appearance (theme, colors, type, shape, material, motion, density, timestamps), layout, view visibility, graph, diff and analysis preferences all go back to their defaults. Repositories, tabs and history are untouched.",
       confirmLabel: "Restore defaults",
     });
     if (!confirmed) return;
     interfaceStore.reset();
-    densityStore.setDensity("spacious");
     setTheme("system");
   }
 
@@ -355,25 +361,6 @@
     hygiene: ShieldCheck,
     updates: RefreshCw,
   };
-
-  const THEME_OPTIONS: readonly { value: ThemePreference; label: string; title: string }[] = [
-    { value: "system", label: "System", title: "Follow the operating system appearance" },
-    { value: "light", label: "Light", title: "Always use the light theme" },
-    { value: "dark", label: "Dark", title: "Always use the dark theme" },
-  ];
-
-  const DENSITY_OPTIONS: readonly { value: DensityMode; label: string; title: string }[] = [
-    {
-      value: "spacious",
-      label: "Spacious",
-      title: "Spacious branch spacing (keeps adjacent lanes visually separated)",
-    },
-    {
-      value: "compact",
-      label: "Compact",
-      title: "Compact branch spacing (fits more history on screen)",
-    },
-  ];
 
   const GRAPH_WIDTH_OPTIONS: readonly { value: GraphWidthMode; label: string; title: string }[] = [
     { value: "balanced", label: "Balanced", title: "Balanced width keeps commit messages prominent" },
@@ -432,36 +419,6 @@
     },
   ];
 
-  const TIMESTAMP_OPTIONS: readonly {
-    value: TimestampStyle;
-    label: string;
-    title: string;
-  }[] = [
-    { value: "relative", label: "Relative", title: "How long ago, e.g. 3d ago" },
-    {
-      value: "absolute",
-      label: "Date",
-      title: "Calendar date as YYYY-MM-DD — fixed width and the same in every locale",
-    },
-  ];
-
-  const BRANCH_ROW_OPTIONS: readonly {
-    value: BranchRowLayout;
-    label: string;
-    title: string;
-  }[] = [
-    {
-      value: "two-line",
-      label: "Two lines",
-      title: "Name on its own line, churn and counts below — long names stay readable",
-    },
-    {
-      value: "one-line",
-      label: "One line",
-      title: "Everything on one line: about 45% more refs on screen, names truncate sooner",
-    },
-  ];
-
   const DIFF_LAYOUT_OPTIONS: readonly { value: DiffLayout; label: string; title: string }[] = [
     {
       value: "unified",
@@ -475,13 +432,6 @@
     },
   ];
 
-  const TERMINAL_SCROLLBACK_OPTIONS: readonly { value: string; label: string; title: string }[] =
-    [500, 1000, 2000, 5000, 10000, 20000].map((rows) => ({
-      value: String(rows),
-      label: rows.toLocaleString("en-US"),
-      title: `Keep ${rows.toLocaleString("en-US")} rows of history`,
-    }));
-
   const TAB_WIDTH_OPTIONS: readonly { value: string; label: string; title: string }[] =
     TAB_WIDTHS.map((width) => ({
       value: String(width),
@@ -489,13 +439,6 @@
       title: `Render a tab as ${width} columns`,
     }));
 
-  /**
-   * A fixed instant and a fixed "now" three days after it, so the preview
-   * beside the control shows what each style looks like rather than drifting
-   * with the clock (and rendering "13mo ago" a year from now).
-   */
-  const TIMESTAMP_SAMPLE = 1_756_000_000;
-  const TIMESTAMP_SAMPLE_NOW = TIMESTAMP_SAMPLE + 3 * 86_400;
 </script>
 
 {#if isOpen}
@@ -517,7 +460,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-3xl h-136 max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between gap-3 shrink-0">
+      <div class="p-4 flex items-center justify-between gap-3 shrink-0">
         <div
           id="settings-modal-title"
           class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0"
@@ -547,7 +490,7 @@
             }}
             placeholder="Search settings"
             aria-label="Search settings"
-            class="w-full rounded-lg border border-border/70 bg-surfaceHover/40 py-1 pl-6 pr-6 text-[11px] text-textPrimary placeholder:text-textMuted focus:border-accent/60 focus:outline-hidden"
+            class="w-full rounded-lg border border-edge bg-surfaceHover/40 py-1 pl-6 pr-6 text-meta text-textPrimary placeholder:text-textMuted focus:border-accent focus:outline-hidden"
           />
           {#if query}
             <button
@@ -570,7 +513,7 @@
           role="tablist"
           aria-label="Settings sections"
           aria-orientation="vertical"
-          class="w-36 shrink-0 overflow-y-auto border-r border-border/60 bg-surfaceHover/30 p-2 space-y-0.5"
+          class="w-36 shrink-0 overflow-y-auto bg-surfaceHover/30 p-2 space-y-0.5"
         >
           {#each railSections as entry (entry.id)}
             {@const Icon = SECTION_ICONS[entry.id]}
@@ -584,7 +527,7 @@
               tabindex={active ? 0 : -1}
               onclick={() => (activeSection = entry.id)}
               onkeydown={onRailKeydown}
-              class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors duration-100 {active
+              class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors {active
                 ? 'bg-surface text-accent font-semibold shadow-xs'
                 : 'text-textMuted hover:text-textPrimary hover:bg-surface/60'}"
             >
@@ -593,7 +536,7 @@
             </button>
           {/each}
           {#if noMatches}
-            <p class="px-2 py-1.5 text-[10px] leading-snug text-textMuted">
+            <p class="px-2 py-1.5 text-micro text-textMuted">
               No setting matches that.
             </p>
           {/if}
@@ -601,7 +544,7 @@
 
         <div class="min-h-0 flex-1 overflow-y-auto min-w-0 p-4">
           {#if noMatches}
-            <p class="text-textMuted text-[11px] leading-snug" role="status">
+            <p class="text-textMuted text-meta" role="status">
               Nothing on this page matches <span class="text-textPrimary">“{query}”</span>.
               Try a shorter term, or clear the search to see every category again.
             </p>
@@ -614,282 +557,18 @@
               hidden={noMatches || activeSection !== entry.id}
             >
               <h2 class="text-textPrimary text-sm font-semibold">{entry.label}</h2>
-              <p class="text-textMuted text-[10px] leading-snug mt-0.5 mb-3">{entry.summary}</p>
+              <p class="text-textMuted text-micro mt-0.5 mb-3">{entry.summary}</p>
 
               {#if entry.id === "appearance"}
-                <div class="space-y-4">
-                  <div data-setting="theme" hidden={!shown("theme")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Theme</div>
-                    <SettingSegment
-                      ariaLabel="Theme appearance"
-                      options={THEME_OPTIONS}
-                      value={themePreference}
-                      onselect={setTheme}
-                    />
-                  </div>
-
-                  <div data-setting="accent" hidden={!shown("accent")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Accent colour</div>
-                    <!-- `group` + `aria-pressed`, not `radiogroup` + `radio`,
-                         matching every other single-choice control on this
-                         page (SettingSegment). A radiogroup would promise
-                         arrow-key movement and one tab stop, which is a
-                         second keyboard contract to honour for no gain over
-                         the pattern the rest of the modal already uses. -->
-                    <div class="flex flex-wrap gap-1.5" role="group" aria-label="Accent colour">
-                      {#each ACCENTS as accent (accent.id)}
-                        {@const picked = $interfaceStore.accent === accent.id}
-                        <button
-                          type="button"
-                          aria-pressed={picked}
-                          aria-label="{accent.label} accent"
-                          title="{accent.label} accent"
-                          onclick={() => interfaceStore.setAccent(accent.id)}
-                          class="h-6 w-6 rounded-full border transition-transform {picked
-                            ? 'border-textPrimary scale-110'
-                            : 'border-border/70 hover:scale-105'}"
-                          style="background-color: {accentSwatch(accent.id, $themeStore)}"
-                        >
-                          {#if picked}
-                            <Check size={12} class="mx-auto text-white drop-shadow" />
-                          {/if}
-                        </button>
-                      {/each}
-                    </div>
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
-                      Tints selection, focus rings and the commit graph's current-row
-                      marker. Every choice carries a separate light and dark shade,
-                      each checked against WCAG AA, so switching theme never leaves the
-                      accent unreadable.
-                    </p>
-                  </div>
-
-                  <div data-setting="ui-scale" hidden={!shown("ui-scale")}>
-                    <div class="flex items-center justify-between text-[11px] mb-1">
-                      <span class="text-textPrimary font-medium">UI Font Scale</span>
-                      <span class="font-mono text-accent font-semibold"
-                        >{Math.round($interfaceStore.uiFontScale * 100)}%</span
-                      >
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onclick={() => interfaceStore.zoomOut()}
-                        class="gp-btn py-0.5! px-2! text-xs"
-                        title="Zoom Out ({shortcutTextLabel('⌘-', $hostPlatform.os)})">-</button
-                      >
-                      <input
-                        type="range"
-                        min="0.75"
-                        max="1.4"
-                        step="0.05"
-                        value={$interfaceStore.uiFontScale}
-                        oninput={(e) => interfaceStore.setFontScale(parseFloat(e.currentTarget.value))}
-                        class="flex-1"
-                        aria-label="UI Font Scale Slider"
-                      />
-                      <button
-                        type="button"
-                        onclick={() => interfaceStore.zoomIn()}
-                        class="gp-btn py-0.5! px-2! text-xs"
-                        title="Zoom In ({shortcutTextLabel('⌘+', $hostPlatform.os)})">+</button
-                      >
-                      <button
-                        type="button"
-                        onclick={() => interfaceStore.resetZoom()}
-                        class="gp-btn py-0.5! px-2! text-[10px]"
-                        title="Reset Zoom ({shortcutTextLabel('⌘0', $hostPlatform.os)})">Reset</button
-                      >
-                    </div>
-                  </div>
-
-                  <div data-setting="motion" hidden={!shown("motion")}>
-                    <SettingToggle
-                      label="Reduce motion"
-                      description="Drops view entrances, modal scaling, the theme crossfade and spinner rotation. Spinners keep their glyph, so nothing stops telling you it is working."
-                      ariaLabel="Reduce interface motion"
-                      checked={$interfaceStore.reduceMotion}
-                      onchange={(next) => interfaceStore.setReduceMotion(next)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug">
-                      Leaving this off follows the system setting. It can only add
-                      reduction: if the operating system already asks for less motion,
-                      GitPulse honours that whatever this says.
-                    </p>
-                  </div>
-
-                  <div data-setting="terminal-screen-reader" hidden={!shown("terminal-screen-reader")}>
-                    <SettingToggle
-                      label="Terminal screen reader support"
-                      description="Builds an accessible row-by-row tree of the terminal grid and announces new output. Without it the terminal is a picture of text to assistive technology."
-                      ariaLabel="Terminal screen reader support"
-                      checked={$interfaceStore.terminalScreenReader}
-                      onchange={(next) => interfaceStore.setTerminalScreenReader(next)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug">
-                      Off by default because the tree is rebuilt as output arrives, which
-                      costs time on a session that prints continuously. It does not make
-                      the shell's input line an editable field: text-expansion tools that
-                      rewrite the focused field still cannot act inside a terminal.
-                    </p>
-                  </div>
-
-                  <div data-setting="terminal-gpu" hidden={!shown("terminal-gpu")}>
-                    <SettingToggle
-                      label="GPU terminal rendering"
-                      description="Draws the terminals you can see with WebGL instead of page elements, which keeps a continuously redrawing agent off the interface's main thread."
-                      ariaLabel="GPU terminal rendering"
-                      checked={$interfaceStore.terminalGpu}
-                      onchange={(next) => interfaceStore.setTerminalGpu(next)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug">
-                      On by default. Turn it off if terminal text draws wrongly on your
-                      graphics hardware. A terminal whose GPU context is lost goes back to
-                      the ordinary renderer for the rest of its life on its own.
-                    </p>
-                  </div>
-
-                  <div data-setting="terminal-option-as-meta" hidden={!shown("terminal-option-as-meta")}>
-                    <SettingToggle
-                      label="Option as Meta in terminals"
-                      description="Option+B and Option+F move by word and Option+key reaches shell and agent shortcuts, instead of typing a symbol."
-                      ariaLabel="Option as Meta in terminals"
-                      checked={$interfaceStore.terminalOptionAsMeta}
-                      onchange={(next) => interfaceStore.setTerminalOptionAsMeta(next)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug">
-                      On by default. Turn it off if your keyboard layout types a
-                      character with Option, such as @ on a German layout: with it on,
-                      that character cannot be typed inside a terminal. Option-click
-                      still selects text in programs that capture the mouse. Applies to
-                      open terminals at once.
-                    </p>
-                  </div>
-
-                  <div data-setting="terminal-smooth-wheel" hidden={!shown("terminal-smooth-wheel")}>
-                    <SettingToggle
-                      label="Smooth mouse-wheel scrolling in terminals"
-                      description="A mouse-wheel notch glides over a moment instead of jumping several rows."
-                      ariaLabel="Smooth mouse-wheel scrolling in terminals"
-                      checked={$interfaceStore.terminalSmoothWheel}
-                      onchange={(next) => interfaceStore.setTerminalSmoothWheel(next)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug">
-                      On by default. A trackpad always scrolls directly, and a system
-                      setting for reduced motion turns the glide off whatever this says.
-                      Applies to open terminals at once.
-                    </p>
-                  </div>
-
-                  <div data-setting="terminal-scrollback" hidden={!shown("terminal-scrollback")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Terminal scrollback: shells (rows)</div>
-                    <SettingSegment
-                      ariaLabel="Shell terminal scrollback rows"
-                      options={TERMINAL_SCROLLBACK_OPTIONS}
-                      value={String($interfaceStore.terminalScrollback)}
-                      onselect={(rows) => interfaceStore.setTerminalScrollback(Number(rows))}
-                    />
-                    <div class="text-textMuted text-[10px] mt-2 mb-1.5">Terminal scrollback: agents and task runs (rows)</div>
-                    <SettingSegment
-                      ariaLabel="Agent terminal scrollback rows"
-                      options={TERMINAL_SCROLLBACK_OPTIONS}
-                      value={String($interfaceStore.terminalAgentScrollback)}
-                      onselect={(rows) => interfaceStore.setTerminalAgentScrollback(Number(rows))}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
-                      Rows of history each terminal keeps. Every terminal holds about
-                      twelve bytes per column per row whether or not the row has text
-                      (roughly 12 MB for 5,000 rows at 200 columns), and the terminals
-                      of every repository tab you have visited stay open, so agents
-                      default to 1,000. Lowering a value trims open terminals at once.
-                    </p>
-                  </div>
-
-                  <div data-setting="timestamps" hidden={!shown("timestamps")}>
-                    <div class="flex items-center justify-between mb-1.5">
-                      <span class="text-textMuted text-[10px]">Timestamps</span>
-                      <span class="text-textMuted text-[10px] font-mono">
-                        {formatTimestamp(
-                          TIMESTAMP_SAMPLE,
-                          $interfaceStore.timestampStyle,
-                          TIMESTAMP_SAMPLE_NOW,
-                        )}
-                      </span>
-                    </div>
-                    <SettingSegment
-                      ariaLabel="Timestamp style"
-                      options={TIMESTAMP_OPTIONS}
-                      value={$interfaceStore.timestampStyle}
-                      onselect={(style) => interfaceStore.setTimestampStyle(style)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
-                      Applies to the commit list, branch tooltips, the diff's change
-                      picker, Work and the stack. Hovering a commit time in the list
-                      shows the other form, and the graph's node card keeps showing both
-                      whichever way this is set.
-                    </p>
-                  </div>
-
-                  <div data-setting="branch-rows" hidden={!shown("branch-rows")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Sidebar branch rows</div>
-                    <SettingSegment
-                      ariaLabel="Sidebar branch row layout"
-                      options={BRANCH_ROW_OPTIONS}
-                      value={$interfaceStore.branchRowLayout}
-                      onselect={(layout) => interfaceStore.setBranchRowLayout(layout)}
-                    />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
-                      On one line the branch name is the only thing that can shrink, so a
-                      row of counters and buttons squeezes it down to a few characters.
-                      Two lines give the name the full width and move every number —
-                      lines changed, ahead and behind, files, author and age — underneath
-                      it. Branch spacing under Commit graph still sets how tall each line
-                      is.
-                    </p>
-                  </div>
-
-                  <div
-                    data-setting="coach-marks"
-                    hidden={!shown("coach-marks")}
-                    class="flex items-center justify-between gap-3"
-                  >
-                    <div class="min-w-0">
-                      <div class="text-textPrimary text-[11px] font-medium">First-run coach marks</div>
-                      <div class="text-textMuted text-[10px] leading-snug">
-                        Bring back the one-time tips shown on a fresh install.
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onclick={resetTips}
-                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
-                    >
-                      Reset Tips
-                    </button>
-                    {#if tipsStatus}<span class="text-textMuted text-[10px]" role="status">{tipsStatus}</span>{/if}
-                  </div>
-
-                  <div
-                    data-setting="walkthrough-replay"
-                    hidden={!shown("walkthrough-replay")}
-                    class="flex items-center justify-between gap-3"
-                  >
-                    <div class="min-w-0">
-                      <div class="text-textPrimary text-[11px] font-medium">Guided walkthrough</div>
-                      <div class="text-textMuted text-[10px] leading-snug">
-                        Replay the six-step tour. It starts from where you left off, or from the
-                        beginning once finished.
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onclick={replayWalkthrough}
-                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
-                    >
-                      Replay Tour
-                    </button>
-                  </div>
-                </div>
+                <AppearanceSettings
+                  {shown}
+                  filtering={!filter.all}
+                  {themePreference}
+                  onTheme={setTheme}
+                  {tipsStatus}
+                  onResetTips={resetTips}
+                  onReplayTour={replayWalkthrough}
+                />
               {:else if entry.id === "layout"}
                 <div class="space-y-4">
                   <div data-setting="status-icon" hidden={!shown("status-icon")}>
@@ -933,7 +612,7 @@
                       />
                       {#if launchRow.note}
                         <p
-                          class="mt-1 text-[10px] {launchRow.note.tone === 'warn' ? 'text-amber-500' : 'text-textMuted'}"
+                          class="mt-1 text-micro {launchRow.note.tone === 'warn' ? 'text-warn' : 'text-textMuted'}"
                           role="status"
                         >
                           {launchRow.note.text}
@@ -942,14 +621,14 @@
                     </div>
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Status bar</div>
+                    <div class="text-textMuted text-micro mb-1.5">Status bar</div>
                     <SettingSegment
                       ariaLabel="Status bar detail"
                       options={STATUS_BAR_OPTIONS}
                       value={$interfaceStore.statusBarMode}
                       onselect={(mode) => interfaceStore.setStatusBarMode(mode)}
                     />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                    <p class="text-textMuted text-micro mt-1.5">
                       A hidden bar still comes back for a parked merge or rebase, unresolved
                       conflicts, or a stalled file watcher — decluttering never costs you a
                       warning.
@@ -957,7 +636,7 @@
                   </div>
 
                   <div data-setting="diagnostics-button" hidden={!shown("diagnostics-button")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Diagnostics button</div>
+                    <div class="text-textMuted text-micro mb-1.5">Diagnostics button</div>
                     <SettingSegment
                       ariaLabel="Diagnostics button visibility"
                       options={DIAGNOSTICS_OPTIONS}
@@ -1013,15 +692,15 @@
                         onchange={(next) => interfaceStore.setShowLanguageBar(next)}
                       />
                       {#if $interfaceStore.showLanguageBar}
-                        <div class="mt-2 ml-4 pl-3 border-l border-border/60 space-y-1.5">
-                          <div class="text-textMuted text-[10px]">Code percentage basis</div>
+                        <div class="mt-2 ml-4 pl-3 space-y-1.5">
+                          <div class="text-textMuted text-micro">Code percentage basis</div>
                           <SettingSegment
                             ariaLabel="Code percentage calculation options"
                             options={CODE_PERCENTAGE_OPTIONS}
                             value={$interfaceStore.codePercentageMode}
                             onselect={(mode) => interfaceStore.setCodePercentageMode(mode)}
                           />
-                          <p class="text-textMuted text-[10px] leading-snug">
+                          <p class="text-textMuted text-micro">
                             {$interfaceStore.codePercentageMode === "code-only"
                               ? "Percentages reflect only programming code files; markdowns and notes are excluded."
                               : "Note: Markdowns and note files are counted toward percentages with an explanatory note."}
@@ -1031,9 +710,9 @@
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle
-                        label="MANVI status badges"
-                        description="Harness and local-model chips in the toolbar."
-                        ariaLabel="Show MANVI status badges"
+                        label="Manvi status badges"
+                        description="Manvi check and local-model chips in the toolbar."
+                        ariaLabel="Show Manvi status badges"
                         checked={$interfaceStore.showHarnessBadges}
                         onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
                       />
@@ -1042,7 +721,7 @@
                 </div>
               {:else if entry.id === "views"}
                 <div class="space-y-3" data-setting="view-visibility">
-                  <p class="text-textMuted text-[10px] leading-snug">
+                  <p class="text-textMuted text-micro">
                     Unchecking a view removes it from the header only. It stays reachable from
                     the command palette ({shortcutTextLabel("⌘K", $hostPlatform.os)}) and the View menu, the view you are currently in
                     always shows, and Work reappears on its own while conflicts are
@@ -1056,7 +735,7 @@
                     {#each VIEW_NAV as item (item.id)}
                       {@const shown = !hiddenViews.includes(item.id)}
                       <label
-                        class="flex items-center gap-2 rounded-lg px-1.5 py-1 text-[11px] text-textPrimary hover:bg-surfaceHover/60 cursor-pointer"
+                        class="flex items-center gap-2 rounded-lg px-1.5 py-1 text-meta text-textPrimary hover:bg-surfaceHover/60 cursor-pointer"
                       >
                         <input
                           type="checkbox"
@@ -1076,7 +755,7 @@
 
                   <div class="gp-separator" aria-hidden="true"></div>
                   <div class="flex items-center justify-between gap-3 pt-1">
-                    <span class="text-textMuted text-[10px]">
+                    <span class="text-textMuted text-micro">
                       {hiddenViews.length === 0
                         ? "Every view is listed in the header."
                         : `${hiddenViews.length} view${hiddenViews.length === 1 ? "" : "s"} hidden from the header.`}
@@ -1085,7 +764,7 @@
                       type="button"
                       onclick={() => interfaceStore.showAllViews()}
                       disabled={hiddenViews.length === 0}
-                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
+                      class="gp-btn shrink-0" data-size="sm"
                     >
                       Show all
                     </button>
@@ -1093,17 +772,8 @@
                 </div>
               {:else if entry.id === "graph"}
                 <div class="space-y-4">
-                  <div data-setting="branch-spacing" hidden={!shown("branch-spacing")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Branch spacing</div>
-                    <SettingSegment
-                      ariaLabel="Branch spacing"
-                      options={DENSITY_OPTIONS}
-                      value={$densityStore}
-                      onselect={(mode) => densityStore.setDensity(mode)}
-                    />
-                  </div>
                   <div data-setting="graph-width" hidden={!shown("graph-width")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Graph width</div>
+                    <div class="text-textMuted text-micro mb-1.5">Graph width</div>
                     <SettingSegment
                       ariaLabel="Graph width"
                       options={GRAPH_WIDTH_OPTIONS}
@@ -1112,17 +782,17 @@
                     />
                   </div>
                   <div data-setting="ref-scope" hidden={!shown("ref-scope")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Refs drawn</div>
+                    <div class="text-textMuted text-micro mb-1.5">Refs drawn</div>
                     <SettingSegment
                       ariaLabel="Refs drawn"
                       options={REF_SCOPE_OPTIONS}
                       value={$interfaceStore.graphRefScope}
                       onselect={(scope) => interfaceStore.setGraphRefScope(scope)}
                     />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                    <p class="text-textMuted text-micro mt-1.5">
                       Namespaces outside branches, remotes and tags — agent turn
                       checkpoints, prefetch mirrors, CI pull refs — can add dozens of
-                      lanes nothing in the UI can name. They are left out by default,
+                      branches nothing in the UI can name. They are left out by default,
                       and whatever is left out is named above the graph rather than
                       silently dropped.
                     </p>
@@ -1135,7 +805,7 @@
                     <div class="gp-separator" aria-hidden="true"></div>
                     <SettingToggle
                       label="Author avatars"
-                      description="Initial badges beside the branch lanes."
+                      description="Initial badges beside the branches in the graph."
                       ariaLabel="Show author avatars in the commit graph"
                       checked={$interfaceStore.showGraphAvatars}
                       onchange={(next) => interfaceStore.setShowGraphAvatars(next)}
@@ -1144,14 +814,14 @@
                 </div>
               {:else if entry.id === "diff"}
                 <div class="space-y-4">
-                  <p class="text-textMuted text-[10px] leading-snug">
+                  <p class="text-textMuted text-micro">
                     The first three set what a diff <em>opens</em> as. The toolbar above
                     each diff still switches the file in front of you; what changes here
                     is where it starts, which used to reset on every file.
                   </p>
 
                   <div data-setting="diff-layout" hidden={!shown("diff-layout")}>
-                    <div class="text-textMuted text-[10px] mb-1.5">Default layout</div>
+                    <div class="text-textMuted text-micro mb-1.5">Default layout</div>
                     <SettingSegment
                       ariaLabel="Default diff layout"
                       options={DIFF_LAYOUT_OPTIONS}
@@ -1196,7 +866,7 @@
                     class="pt-1"
                   >
                     <div class="gp-separator" aria-hidden="true"></div>
-                    <div class="text-textMuted text-[10px] mb-1.5">Tab width</div>
+                    <div class="text-textMuted text-micro mb-1.5">Tab width</div>
                     <SettingSegment
                       ariaLabel="Tab width"
                       options={TAB_WIDTH_OPTIONS}
@@ -1204,7 +874,7 @@
                       onselect={(width) =>
                         interfaceStore.setTabWidth(Number(width) as TabWidth)}
                     />
-                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                    <p class="text-textMuted text-micro mt-1.5">
                       Columns a literal tab advances to, in the diff, the file viewer,
                       blame and the conflict editor. Display only — GitPulse never
                       rewrites the bytes in the file.
@@ -1225,7 +895,7 @@
                   <div data-setting="auto-coverage" hidden={!shown("auto-coverage")}>
                     <SettingToggle
                       label="Generate coverage automatically"
-                      description="Off by default. When on, opening a repository with missing coverage runs its test suites once per session — minutes of CPU on a large project — and writes coverage artifacts into the working tree. A run that only completes because files were excluded is always labelled, never reported as a clean result."
+                      description="Off by default. When on, opening a repository with missing coverage runs its test suites once per session — minutes of CPU on a large repository — and writes coverage artifacts into the working tree. A run that only completes because files were excluded is always labelled, never reported as a clean result."
                       ariaLabel="Automatically generate coverage for repositories that have none"
                       checked={$interfaceStore.autoRunCoverage}
                       onchange={(next) => interfaceStore.setAutoRunCoverage(next)}
@@ -1234,15 +904,14 @@
                 </div>
               {:else if entry.id === "agents"}
                 <div data-setting="apple-intelligence" hidden={!shown("apple-intelligence")}>
-                  <div class="text-textMuted text-[10px] mb-1.5">Apple Intelligence</div>
-                  <p class="text-textMuted text-[10px] leading-snug mb-2">
+                  <div class="text-textMuted text-micro mb-1.5">Apple Intelligence</div>
+                  <p class="text-textMuted text-micro mb-2">
                     Drafts task titles and descriptions with the on-device model. Nothing leaves
                     this computer, and no local model server is needed. Choose it per task in
                     the enhancement panel.
                   </p>
-                  <div class="flex items-start gap-1.5 text-[10px]"
-                    class:text-amber-600={apple !== null && !appleReady(apple)}
-                    class:dark:text-amber-400={apple !== null && !appleReady(apple)}
+                  <div class="flex items-start gap-1.5 text-micro"
+                    class:text-warn={apple !== null && !appleReady(apple)}
                     class:text-textMuted={apple === null || appleReady(apple)}>
                     {#if apple !== null && !appleReady(apple)}
                       <AlertTriangle size={12} class="shrink-0 mt-px" />
@@ -1259,19 +928,19 @@
                   <button
                     type="button"
                     onclick={() => void loadApple()}
-                    class="gp-btn py-0.5! px-2.5! text-[11px] mt-2"
+                    class="gp-btn mt-2" data-size="sm"
                   >
-                    Recheck
+                    Refresh
                   </button>
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="lappi" hidden={!shown("lappi")}>
+                <div class="mt-3 pt-3" data-setting="lappi" hidden={!shown("lappi")}>
                   <LappiSettings active={isOpen && activeSection === "agents"} />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="host-load" hidden={!shown("host-load")}>
+                <div class="mt-3 pt-3" data-setting="host-load" hidden={!shown("host-load")}>
                   <HostLoadSetting active={isOpen && activeSection === "agents"} />
                 </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
-                  <p class="text-textMuted text-[10px] leading-snug mb-2">
+                  <p class="text-textMuted text-micro mb-2">
                     Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
                     ships a manifest for each. The one read and copied below is the Codex manifest
                     (<code class="font-mono">.codex-plugin/plugin.json</code> +
@@ -1280,29 +949,29 @@
                   </p>
                   {#if mcpError}
                     <div
-                      class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mb-2"
+                      class="flex items-start gap-1.5 text-warn text-micro mb-2"
                     >
                       <AlertTriangle size={12} class="shrink-0 mt-px" />
                       <span>{mcpError}</span>
                     </div>
                   {:else if !mcpInfo}
-                    <p class="text-textMuted text-[10px] mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
+                    <p class="text-textMuted text-micro mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
                   {:else}
-                    <div class="space-y-1.5 rounded-xl border border-border/70 bg-surfaceHover/40 p-2.5">
+                    <div class="space-y-1.5 rounded-xl border border-edge bg-surfaceHover/40 p-2.5">
                       <div class="flex items-start gap-2">
                         <Plug size={13} class="text-accent shrink-0 mt-0.5" />
                         <div class="min-w-0">
-                          <div class="text-textPrimary text-[11px] font-medium">
+                          <div class="text-textPrimary text-meta font-medium">
                             {mcpInfo.server_name} · MCP {mcpInfo.protocol_version}
                           </div>
-                          <div class="text-textMuted text-[10px] font-mono break-all">
+                          <div class="text-textMuted text-micro font-mono break-all">
                             {#if mcpInfo.binary_found}
                               {mcpInfo.binary_path}
                             {:else}
                               {mcpInfo.binary_error}
                             {/if}
                           </div>
-                          <div class="text-textMuted text-[10px] font-mono break-all" data-testid="hook-binary-status">
+                          <div class="text-textMuted text-micro font-mono break-all" data-testid="hook-binary-status">
                             gitpulse-hook:
                             {#if mcpInfo.hook_found}
                               {mcpInfo.hook_path}
@@ -1311,7 +980,7 @@
                             {/if}
                           </div>
                           {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
-                            <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
+                            <div class="text-warn text-micro mt-1" data-testid="path-status">
                               {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
                                 <code class="font-mono">gitpulse-mcp</code> and <code class="font-mono">gitpulse-hook</code> are not on PATH, so the plugin's own manifests cannot start them.
                               {:else if !mcpInfo.binary_on_path}
@@ -1322,11 +991,11 @@
                               Copy the manifests below instead: they name the binaries by absolute path.
                             </div>
                           {/if}
-                          <div class="text-textMuted text-[10px] mt-1">
+                          <div class="text-textMuted text-micro mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
                               {#if mcpInfo.plugin_error.trim()}
-                                <span class="text-amber-600 dark:text-amber-400 break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
+                                <span class="text-warn break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
                               {/if}
                             {:else}
                               {mcpInfo.plugin_error}
@@ -1337,7 +1006,7 @@
                       <div class="flex flex-wrap gap-1.5 pt-1">
                         <button
                           type="button"
-                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
                           disabled={!mcpInfo.plugin_manifest_json}
                           onclick={() => void copyMcp("plugin", mcpInfo?.plugin_manifest_json ?? "")}
                         >
@@ -1346,7 +1015,7 @@
                         </button>
                         <button
                           type="button"
-                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
                           disabled={!mcpInfo.mcp_config_json}
                           onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
                         >
@@ -1355,7 +1024,7 @@
                         </button>
                         <button
                           type="button"
-                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
                           disabled={!mcpInfo.hooks_config_json}
                           onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
                         >
@@ -1364,18 +1033,18 @@
                         </button>
                       </div>
                       {#if mcpInfo.hooks_config_json}
-                        <p class="text-[10px] text-textMuted" data-testid="hooks-version-floor">
+                        <p class="text-micro text-textMuted" data-testid="hooks-version-floor">
                           On Windows the copied safety hooks block a call when gitpulse-hook cannot start only on Claude Code 2.1.295 or later; older versions let it through.
                         </p>
                       {/if}
                       {#if mcpInfo.tools.length > 0}
                         <details class="pt-1">
-                          <summary class="cursor-pointer text-[10px] text-textMuted">
-                            {mcpInfo.tools.length} tools (start with gitpulse_insights)
+                          <summary class="cursor-pointer text-micro text-textMuted">
+                            {mcpInfo.tools.length} tools (start with {FIRST_AGENT_TOOL})
                           </summary>
                           <ul class="mt-1 space-y-0.5 max-h-32 overflow-y-auto">
                             {#each mcpInfo.tools as tool, i (`${tool.name}#${i}`)}
-                              <li class="font-mono text-[10px] text-textPrimary">
+                              <li class="font-mono text-micro text-textPrimary">
                                 {tool.name}
                                 <span class="text-textMuted font-sans"> — {tool.title}</span>
                               </li>
@@ -1387,24 +1056,24 @@
                   {/if}
                 </div>
                 <div data-setting="external-tools" hidden={!shown("external-tools")} class="mt-3 space-y-1.5">
-                  <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+                  <h4 class="gp-label">
                     External CLIs
                   </h4>
-                  <p class="text-textMuted text-[10px] leading-snug">
-                    Install or update <span class="font-mono">devmap</span> (Code → Map) and
-                    <span class="font-mono">manvi</span> (policy harness) via the install ladder:
+                  <p class="text-textMuted text-micro">
+                    Install or update <span class="font-mono">{CLI_NAMES.codeMap}</span> (the code map) and
+                    <span class="font-mono">{CLI_NAMES.policy}</span> (policy checks) via the install ladder:
                     PATH → prebuilt release → cargo/go install → local checkout. Env vars still win
                     over saved config.
                   </p>
                   <button
                     type="button"
-                    class="gp-btn text-[11px] px-2 py-0.5"
+                    class="gp-btn" data-size="sm"
                     onclick={runToolsSetup}
                   >
                     Run setup
                   </button>
                   <ExternalToolsPanel />
-                  <div class="border-border/70 mt-3 border-t pt-3">
+                  <div class="mt-3 pt-3">
                     <DevcouncilSuitePanel
                       repoPath={$repoStore.currentPath}
                       active={isOpen && activeSection === "agents"}
@@ -1414,10 +1083,10 @@
                 <!-- Siblings of the external-tools wrapper, never inside it:
                      a search that matched one of these but not the CLIs hid
                      its parent and so hid it too, leaving an empty panel. -->
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
+                <div class="mt-3 pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
                   <SessionAlertSettings active={isOpen && activeSection === "agents"} />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="bell-asks" hidden={!shown("bell-asks")}>
+                <div class="mt-3 pt-3" data-setting="bell-asks" hidden={!shown("bell-asks")}>
                   <SettingToggle
                     label="Count a terminal bell as waiting for you"
                     description="On by default: an agent without hooks can only ask for you by ringing the bell, so turning this off stops those asks from counting on the board, the task pane, the Agents view and the menu-bar count. The Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
@@ -1426,26 +1095,26 @@
                     onchange={(next) => interfaceStore.setBellAsksForReader(next)}
                   />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
+                <div class="mt-3 pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
                   <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
+                <div class="mt-3 pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
                   <AgentLimitSetting
-                    field="max_live_runs"
+                    field={LIMIT_FIELDS.liveRuns}
                     label="Agents running at once"
                     testid="agent-live-runs"
                     max={MAX_LIVE_RUNS}
                     fallback={DEFAULT_LIVE_RUNS}
                     active={isOpen && activeSection === "agents"}
                   >
-                    Task attempts that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
-                    Each checkout still runs one at a time; a busy one gives the next attempt its own worktree.
-                    Terminal attempts also need a free terminal session.
+                    Task runs that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
+                    Each checkout still runs one at a time; a busy one gives the next run its own worktree.
+                    Terminal runs also need a free terminal session.
                   </AgentLimitSetting>
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="terminal-sessions" hidden={!shown("terminal-sessions")}>
+                <div class="mt-3 pt-3" data-setting="terminal-sessions" hidden={!shown("terminal-sessions")}>
                   <AgentLimitSetting
-                    field="max_terminal_sessions"
+                    field={LIMIT_FIELDS.terminalSessions}
                     label="Terminal sessions open at once"
                     testid="terminal-sessions"
                     max={MAX_TERMINAL_SESSIONS}
@@ -1456,18 +1125,18 @@
                     Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
                   </AgentLimitSetting>
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
+                <div class="mt-3 pt-3" data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
                   <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
+                <div class="mt-3 pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
                   <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />
                 </div>
-                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-models" hidden={!shown("agent-models")}>
+                <div class="mt-3 pt-3" data-setting="agent-models" hidden={!shown("agent-models")}>
                   <AgentModelSettings active={isOpen && activeSection === "agents"} />
                 </div>
                 <!-- Part of the external-tools entry (it has no catalog row of
                      its own), so it follows that entry's visibility. -->
-                <div class="border-border/70 mt-3 border-t pt-3" hidden={!shown("external-tools")}>
+                <div class="mt-3 pt-3" hidden={!shown("external-tools")}>
                   <AgentIntegrationPanel
                     repoPath={isOpen && activeSection === "agents"
                       ? $repoStore.currentPath
@@ -1479,7 +1148,7 @@
                   <div data-setting="hygiene-defaults" hidden={!shown("hygiene-defaults")}>
                     {#if isOpen && activeSection === "hygiene"}<HygieneDefaultsPanel />{/if}
                   </div>
-                  <div class="border-border/70 border-t pt-3" data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
+                  <div class="pt-3" data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
                 </div>
               {:else if entry.id === "updates"}
                 <div class="space-y-3">
@@ -1498,12 +1167,12 @@
                     hidden={!shown("update-now")}
                     class="pt-1 flex items-center justify-between gap-3"
                   >
-                    <span class="text-textMuted text-[11px]">Check now</span>
+                    <span class="text-textMuted text-meta">Check now</span>
                     <button
                       type="button"
                       onclick={runManualUpdateCheck}
                       disabled={checkingUpdate}
-                      class="gp-btn py-0.5! px-2.5! text-[11px] flex items-center gap-1.5"
+                      class="gp-btn flex items-center gap-1.5" data-size="sm"
                     >
                       <RefreshCw size={11} class={checkingUpdate ? "animate-spin" : ""} />
                       {checkingUpdate ? "Checking…" : "Check"}
@@ -1512,10 +1181,10 @@
 
                   {#if updateStatus}
                     <div
-                      class="text-[10px] leading-snug {updateStatus.kind === 'available'
+                      class="text-micro {updateStatus.kind === 'available'
                         ? 'text-accent'
                         : updateStatus.kind === 'failed'
-                          ? 'text-red-400'
+                          ? 'text-danger'
                           : 'text-textMuted'}"
                       role="status"
                     >
@@ -1539,18 +1208,18 @@
       </div>
 
       <div
-        class="p-4 border-t border-border/60 gp-section-edge bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
+        class="p-4 bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
       >
         <button
           type="button"
           onclick={restoreDefaults}
-          class="gp-btn py-0.5! px-2.5! text-[11px] flex items-center gap-1.5"
+          class="gp-btn flex items-center gap-1.5" data-size="sm"
           title="Restore every setting on this page to its default"
         >
           <RotateCcw size={11} />
           <span>Restore defaults</span>
         </button>
-        <button onclick={onClose} class="gp-btn">Done</button>
+        <button onclick={onClose} class="gp-btn" data-size="sm">Done</button>
       </div>
     </div>
   </div>

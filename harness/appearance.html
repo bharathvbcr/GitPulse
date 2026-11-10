@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en" class="macos dark">
+<head>
+  <meta charset="utf-8" />
+  <title>Appearance settings</title>
+  <style>
+    body { margin: 0; }
+    #result { position: fixed; right: 8px; bottom: 8px; font: 11px ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<pre id="result">Running…</pre>
+<script type="module">
+  // Settings -> Appearance against the real stylesheet. Vitest never runs
+  // $effect and has no cascade, so what the controls DO to a live document is
+  // held here: an imported theme round-trips, an accent passes through the
+  // contrast guard, float blur 0 computes `none`, and reduced transparency still
+  // wins over every material setting.
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { createChecks } from "./checks.ts";
+  import AppearanceHost from "./AppearanceHost.svelte";
+  import { interfaceStore } from "../src/lib/stores/interfaceStore";
+  import { themeStore } from "../src/lib/stores/themeStore";
+  import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
+  import { applyTransparency, TRANSPARENCY_ATTRIBUTE } from "../src/lib/ui/transparencyPreference";
+  import { validateTheme } from "../src/lib/ui/appearance/themeSchema";
+  import { get } from "svelte/store";
+
+  const params = new URLSearchParams(location.search);
+  const errors = [];
+  addEventListener("error", (event) => errors.push(event.message));
+  addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+  const { results, check, stopped } = createChecks();
+  const root = document.documentElement;
+
+  const settle = async () => { await tick(); await new Promise((resolve) => setTimeout(resolve, 40)); await tick(); };
+  const $ = (selector, scope = document) => scope.querySelector(selector);
+  const cs = (element) => getComputedStyle(element);
+  const filterOf = (element) => {
+    const style = cs(element);
+    return style.backdropFilter || style.getPropertyValue("-webkit-backdrop-filter") || "none";
+  };
+  /** Alpha of a computed colour: rgba(), `rgb(r g b / a)` and `color(srgb r g b / a)`. */
+  const alphaOf = (color) => {
+    const slash = /\/\s*([\d.]+%?)\s*\)/.exec(color);
+    if (slash) return slash[1].endsWith("%") ? parseFloat(slash[1]) / 100 : parseFloat(slash[1]);
+    const rgba = /rgba\(([^)]+)\)/.exec(color);
+    if (rgba) return parseFloat(rgba[1].split(/[ ,]+/)[3]);
+    return 1;
+  };
+  const channels = (triplet) => triplet.trim().split(/\s+/).map(Number);
+  const luminance = ([r, g, b]) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+  const ratio = (a, b) => { const [x, y] = [luminance(a), luminance(b)]; return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+
+  async function press(scope, text) {
+    const button = [...scope.querySelectorAll("button")].find((b) => b.textContent.trim() === text || b.getAttribute("aria-label") === text);
+    if (!button) throw new Error(`no button "${text}"`);
+    button.click(); await settle();
+  }
+  async function setValue(input, value, events = ["input", "change"]) {
+    input.value = String(value);
+    for (const name of events) input.dispatchEvent(new Event(name, { bubbles: true }));
+    await settle();
+  }
+  async function pickFile(text) {
+    const input = $("[data-theme-file-input]");
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([text], "theme.json", { type: "application/json" }));
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    // file.text() resolves a tick later than the change handler.
+    await new Promise((resolve) => setTimeout(resolve, 80)); await settle();
+  }
+
+  // The export click makes a Blob URL and an anchor click; capture the first and cancel the second.
+  let exported = null;
+  URL.createObjectURL = (blob) => { exported = blob; return "blob:gp-harness"; };
+  URL.revokeObjectURL = () => {};
+  document.addEventListener("click", (event) => { if (event.target?.closest?.("a[download]")) event.preventDefault(); }, true);
+
+  async function run() {
+    themeStore.setTheme("dark");
+    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true });
+    mount(AppearanceHost, { target: document.getElementById("app") });
+    await settle();
+    const page = $("[data-appearance-settings]");
+
+    // --- structure -----------------------------------------------------------
+    check("renders the seven groups of the design language", () =>
+      ["theme", "colors", "type", "shape", "material", "motion", "density"].every((group) => $(`[data-group="${group}"]`)));
+    check("keeps walkthrough replay and coach marks", () => $('[data-setting="walkthrough-replay"] button') && $('[data-setting="coach-marks"] button'));
+    check("the class macos survived the theme store, so the glass rules apply", () => root.classList.contains("macos") && root.classList.contains("dark"));
+    check("defaults: comfortable density is stamped", () => root.getAttribute("data-density") === "comfortable");
+    check("defaults: the surface fill is the shipped half-transparent one", () => Math.abs(alphaOf(cs($("#probe-surface")).backgroundColor) - 0.5) < 0.03);
+    check("defaults: the float computes the shipped blur(34px)", () => filterOf($("#probe-float")).includes("blur(34px)"));
+
+    // --- density -------------------------------------------------------------
+    await press($('[data-setting="density"]'), "Compact");
+    check("Compact stamps data-density and moves the row token to 24px", () => root.getAttribute("data-density") === "compact" && cs(root).getPropertyValue("--gp-row-h").trim() === "24px");
+    await press($('[data-setting="density"]'), "Spacious");
+    check("Spacious moves it to 32px", () => cs(root).getPropertyValue("--gp-row-h").trim() === "32px");
+    await press($('[data-setting="density"]'), "Comfortable");
+    check("Comfortable returns to 28px", () => cs(root).getPropertyValue("--gp-row-h").trim() === "28px");
+
+    // --- corner style --------------------------------------------------------
+    await press($('[data-setting="corner-style"]'), "Round");
+    check("Round scales the radius ladder by 1.25 (12px -> 15px)", () => cs($("#probe-radius")).borderTopLeftRadius === "15px");
+    await press($('[data-setting="corner-style"]'), "Sharp");
+    check("Sharp halves it (12px -> 6px)", () => cs($("#probe-radius")).borderTopLeftRadius === "6px");
+    await press($('[data-setting="corner-style"]'), "Soft");
+    check("Soft removes the override, back to 12px", () => !root.hasAttribute("data-radius-scale") && cs($("#probe-radius")).borderTopLeftRadius === "12px");
+
+    // --- fonts ---------------------------------------------------------------
+    await setValue($('[data-setting="font-mono"] input'), "Menlo", ["change"]);
+    check("a code font lands in --font-mono, ahead of the system stack", () => cs(root).getPropertyValue("--font-mono").trim().startsWith('"Menlo", ui-monospace'));
+    check("the Markdown code font and font-mono utility follow it", () => { const probe = document.createElement("code"); probe.className = "font-mono"; document.body.append(probe); const family = cs(probe).fontFamily; probe.remove(); return family.includes("Menlo"); });
+    check("an installed family is reported as installed", () => $('[data-setting="font-mono"] [role="status"]')?.textContent.includes("is installed"));
+    await setValue($('[data-setting="font-ui"] input'), "Definitely Not A Real Font", ["change"]);
+    check("a family that is not installed says so and falls back", () => $('[data-setting="font-ui"] [role="status"]')?.textContent.includes("isn't installed"));
+    await setValue($('[data-setting="font-ui"] input'), "x; background: url(//evil.example)", ["change"]);
+    check("a CSS-shaped font name is refused, not stored", () => $('[data-setting="font-ui"] [role="alert"]') && get(interfaceStore).fontUi === "Definitely Not A Real Font");
+    await setValue($('[data-setting="font-ui"] input'), "", ["change"]);
+    await setValue($('[data-setting="font-mono"] input'), "", ["change"]);
+    check("clearing both fonts removes the overrides", () => !root.style.getPropertyValue("--gp-font-ui") && !root.style.getPropertyValue("--gp-font-mono"));
+
+    // --- accent through the guard -------------------------------------------
+    const darkSurfaces = [[11, 14, 23], [20, 26, 41], [31, 39, 58]];
+    await setValue($("[data-accent-hex]"), "#1d2a52");
+    check("a near-black accent is adjusted, and the readout says so", () => $('[data-accent-guard="adjusted"]'));
+    check("the computed --c-accent reads at 4.5:1 on every dark surface", () => { const accent = channels(cs(root).getPropertyValue("--c-accent")); return darkSurfaces.every((surface) => ratio(accent, surface) >= 4.5); });
+    check("the computed --accent-color follows --c-accent (the graph reads it)", () => cs(root).getPropertyValue("--accent-color").match(/\d+/g).slice(0, 3).join(",") === channels(cs(root).getPropertyValue("--c-accent")).join(","));
+    await setValue($("[data-accent-hex]"), "#8aa4ff");
+    check("a colour that already reads passes unchanged", () => $('[data-accent-guard="passes"]'));
+    themeStore.setTheme("light"); await settle();
+    const lightSurfaces = [[243, 244, 250], [255, 255, 255], [236, 238, 248]];
+    check("switching theme re-derives the accent for light and keeps 4.5:1", () => { const accent = channels(cs(root).getPropertyValue("--c-accent")); return lightSurfaces.every((surface) => ratio(accent, surface) >= 4.5); });
+    themeStore.setTheme("dark"); await settle();
+    await press($('[data-setting="accent"]'), "Rose accent");
+    check("choosing a preset clears the custom colour", () => get(interfaceStore).customAccent === "" && get(interfaceStore).accent === "rose" && !$("[data-accent-guard]"));
+    await press($('[data-setting="accent"]'), "Blue accent");
+
+    // --- material intensity --------------------------------------------------
+    const material = $('[data-setting="material-intensity"] input[type="range"]');
+    check("the dark slider's floor is the shipped alphas", () => Number(material.min) === 0);
+    await setValue(material, 1);
+    check("intensity 1 makes the surface fill opaque", () => alphaOf(cs($("#probe-surface")).backgroundColor) > 0.97);
+    await setValue(material, 0.5);
+    check("intensity 0.5 sits halfway between shipped and opaque (~0.75)", () => Math.abs(alphaOf(cs($("#probe-surface")).backgroundColor) - 0.75) < 0.04);
+    await setValue(material, 0);
+
+    // --- float blur ----------------------------------------------------------
+    const blur = $('[data-setting="float-blur"] input[type="range"]');
+    await setValue(blur, 20);
+    check("blur 20 computes blur(20px) on a float and on a menu", () => filterOf($("#probe-float")).includes("blur(20px)") && filterOf($("#probe-menu")).includes("blur(20px)"));
+    await setValue(blur, 40);
+    check("blur 40 computes blur(40px)", () => filterOf($("#probe-float")).includes("blur(40px)"));
+    await setValue(blur, 0);
+    check("blur 0 stamps data-float-blur=off", () => root.getAttribute("data-float-blur") === "off");
+    check("blur 0 computes backdrop-filter none on a float, not blur(0px)", () => filterOf($("#probe-float")) === "none");
+    check("blur 0 computes none on a menu too", () => filterOf($("#probe-menu")) === "none");
+    check("the slider labels 0 as Off", () => $('[data-setting="float-blur"]').textContent.includes("Off"));
+    await setValue(blur, 34);
+    check("back at the shipped 34 the override is gone", () => !root.hasAttribute("data-float-blur") && !root.style.getPropertyValue("--gp-float-blur") && filterOf($("#probe-float")).includes("blur(34px)"));
+
+    // --- background field ----------------------------------------------------
+    const shell = document.createElement("div"); shell.className = "gp-shell"; shell.style.cssText = "position:fixed;left:700px;top:20px;width:40px;height:40px"; document.body.append(shell);
+    check("vivid is the shipped field gain (no override)", () => !root.style.getPropertyValue("--mac-hue-gain"));
+    await press($('[data-setting="background-field"]'), "Off");
+    check("Off sets the field gain to 0", () => cs(root).getPropertyValue("--mac-hue-gain").trim() === "0");
+    await press($('[data-setting="background-field"]'), "Subtle");
+    check("Subtle is half the shipped dark gain (0.5)", () => cs(root).getPropertyValue("--mac-hue-gain").trim() === "0.5");
+    await press($('[data-setting="background-field"]'), "Vivid");
+    await setValue($('[data-setting="background-field"] input[type="range"]'), 120);
+    check("a hue turn rewrites all four field colours", () => ["a", "b", "c", "d"].every((key) => root.style.getPropertyValue(`--mac-hue-${key}`).split(" ").length === 3));
+    await setValue($('[data-setting="background-field"] input[type="range"]'), 0);
+    check("hue 0 returns to the stylesheet's colours", () => !root.style.getPropertyValue("--mac-hue-a"));
+    shell.remove();
+
+    // --- transparency: reduced wins -----------------------------------------
+    await setValue(material, 0); await setValue(blur, 40);
+    check("precondition: translucent and blurred", () => alphaOf(cs($("#probe-surface")).backgroundColor) < 0.6 && filterOf($("#probe-float")).includes("blur(40px)"));
+    await press($('[data-setting="transparency"]'), "Reduced");
+    check("Reduced stamps html[data-transparency=reduced] through the bridge", () => root.getAttribute(TRANSPARENCY_ATTRIBUTE) === "reduced");
+    check("reduced makes the surface fill opaque", () => alphaOf(cs($("#probe-surface")).backgroundColor) > 0.99);
+    check("reduced removes the float blur even at 40px", () => filterOf($("#probe-float")) === "none" && filterOf($("#probe-menu")) === "none");
+    await setValue(material, 0.3);
+    check("moving the intensity slider cannot make a reduced window translucent again", () => alphaOf(cs($("#probe-surface")).backgroundColor) > 0.99 && filterOf($("#probe-float")) === "none");
+    applyTransparency("standard");
+    check("a focus re-read of a standard system answer leaves the reader's choice in force", () => root.getAttribute(TRANSPARENCY_ATTRIBUTE) === "reduced");
+    await press($('[data-setting="transparency"]'), "Auto");
+    check("Auto hands control back to the system", () => !root.hasAttribute(TRANSPARENCY_ATTRIBUTE) && filterOf($("#probe-float")).includes("blur(40px)"));
+    applyTransparency("reduced");
+    check("and a system Reduce Transparency still wins with the setting on Auto", () => root.getAttribute(TRANSPARENCY_ATTRIBUTE) === "reduced" && filterOf($("#probe-float")) === "none");
+    applyTransparency("standard");
+    await setValue(blur, 34); await setValue(material, 0);
+
+    // --- light theme floor ---------------------------------------------------
+    themeStore.setTheme("light"); await settle();
+    check("the light theme's slider floor is the measured 30%", () => Number($('[data-setting="material-intensity"] input[type="range"]').min) === 0.3);
+    check("an intensity of 0 is held at the floor in light mode", () => cs(root).getPropertyValue("--gp-material").trim() === "0.3");
+    themeStore.setTheme("dark"); await settle();
+
+    // --- theme import / export ----------------------------------------------
+    const theme = { schema: "gitpulse-theme/1", name: "Dusk", appearance: "dark", colors: { base: "#14101f", accent: "#c08cff", contrast: 0.5 }, shape: { radiusScale: 1.25 }, fonts: { ui: "Helvetica Neue", mono: "Menlo" } };
+    await pickFile(JSON.stringify(theme));
+    check("a valid theme imports and is named in the readout", () => $("[data-theme-active]")?.textContent.includes("Dusk"));
+    check("the imported palette reaches the document", () => channels(cs(root).getPropertyValue("--c-bg")).join(",") !== "11,14,23" && cs(root).getPropertyValue("--c-bg").trim().length > 0);
+    check("the theme's corner scale and fonts came with it", () => get(interfaceStore).radiusScale === 1.25 && get(interfaceStore).fontMono === "Menlo");
+    await press($("[data-theme-file]"), "Export theme");
+    const roundTrip = exported ? validateTheme(JSON.parse(await exported.text())) : null;
+    check("export writes JSON the validator accepts", () => roundTrip?.ok === true);
+    check("the exported theme is the imported one (name, base, shape, fonts)", () => roundTrip.theme.name === "Dusk" && roundTrip.theme.colors.base === "#14101f" && roundTrip.theme.shape.radiusScale === 1.25 && roundTrip.theme.fonts.mono === "Menlo");
+    const before = JSON.stringify(get(interfaceStore).customTheme);
+    for (const [label, bad] of [
+      ["a CSS string in a colour", { ...theme, colors: { ...theme.colors, accent: "red; background: url(//evil.example)" } }],
+      ["a url() in the name", { ...theme, name: "url(https://evil.example/x.png)" }],
+      ["a filter key", { ...theme, filter: "blur(9px)" }],
+      ["a z-index key", { ...theme, zIndex: 99999 }],
+    ]) {
+      await pickFile(JSON.stringify(bad));
+      check(`${label} is refused with a describeFailure notice`, () => $("[data-theme-failure]")?.textContent.includes("Couldn't import the theme."));
+      check(`${label} changes nothing`, () => JSON.stringify(get(interfaceStore).customTheme) === before);
+    }
+    await pickFile("{ not json");
+    check("text that is not JSON is refused the same way", () => $("[data-theme-failure]")?.textContent.includes("isn't valid JSON"));
+    await press($("[data-theme-file]"), "Remove");
+    check("removing the theme returns the shipped palette", () => !root.style.getPropertyValue("--c-bg") && !$("[data-theme-active]"));
+
+    // --- reset, gating -------------------------------------------------------
+    await press(page, "Reset appearance");
+    check("Reset appearance restores every default", () => { const p = get(interfaceStore); return p.density === "comfortable" && p.radiusScale === 1 && p.floatBlur === 34 && p.fieldLevel === "vivid" && p.customAccent === "" && !p.reduceTransparency && p.customTheme === null; });
+    check("and leaves the document clean", () => root.style.getPropertyValue("--gp-material") === "" && !root.hasAttribute("data-float-blur") && !root.hasAttribute("data-radius-scale"));
+    resetHostPlatformForTests({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false });
+    interfaceStore.setFloatBlur(0); interfaceStore.setMaterialIntensity("dark", 1); await settle();
+    check("without the capability the Material group explains itself instead of showing dead sliders", () => $("[data-material-unavailable]") && !$("[data-group='material']").hidden);
+    check("and writes no glass token even when a stored value exists", () => !root.hasAttribute("data-float-blur") && !root.style.getPropertyValue("--gp-material"));
+    check("density and corner style still work off macOS", () => !$('[data-setting="density"]').hidden && !$('[data-setting="corner-style"]').hidden);
+    interfaceStore.reset();
+    check("no runtime errors", () => errors.length === 0);
+    document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+  }
+
+  // `?shot=dark|light[&desktop=white|black]`: mount the panel over a stand-in desktop and
+  // stop, for screenshots. Not a check.
+  async function shot() {
+    const desktop = params.get("desktop") ?? "grey";
+    document.body.style.background = { white: "#fff", black: "#000", grey: "linear-gradient(135deg,#6b7a99,#c9b79c 55%,#8aa0a8)" }[desktop] ?? "#888";
+    themeStore.setTheme(params.get("shot") === "light" ? "light" : "dark");
+    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true });
+    mount(AppearanceHost, { target: document.getElementById("app") });
+    await settle();
+    document.getElementById("result").textContent = "";
+    document.title = "appearance shot ready";
+  }
+
+  if (params.has("shot")) { await shot(); } else
+  try { await run(); } catch (error) { document.getElementById("result").textContent = stopped(error); }
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ checks: results.length }) }));
+  if (!params.has("shot") && params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+</script>
+</body>
+</html>

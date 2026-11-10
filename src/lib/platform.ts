@@ -57,6 +57,7 @@ export interface HostPlatform {
   readonly os: string;
   readonly dock_hiding: boolean;
   readonly browser_sessions: boolean;
+  readonly native_material: boolean;
 }
 
 /** The same facts with `os` narrowed to a host this app knows how to address. */
@@ -66,6 +67,8 @@ export interface HostProfile {
   readonly dock_hiding: boolean;
   /** Whether browser sessions (a dev server's page in the terminal dock) are built in. */
   readonly browser_sessions: boolean;
+  /** Whether the window sits on a native translucent material the glass settings tune. */
+  readonly native_material: boolean;
 }
 
 export function isHostOS(value: unknown): value is HostOS {
@@ -102,7 +105,7 @@ export function hostOSFromUserAgent(
  * capability claimed and is refined once `cmd_host_platform` answers.
  */
 export function fallbackHostPlatform(): HostProfile {
-  return { os: hostOSFromUserAgent(), dock_hiding: false, browser_sessions: false };
+  return { os: hostOSFromUserAgent(), dock_hiding: false, browser_sessions: false, native_material: false };
 }
 
 /** Parses the `cmd_host_platform` envelope, falling back on anything unexpected. */
@@ -113,5 +116,10 @@ export function parseHostPlatform(value: unknown): HostProfile {
   // read as "unknown" rather than silently inheriting the webview's guess,
   // which would claim a platform the backend just contradicted.
   const os = isHostOS(raw.os) ? raw.os : "unknown";
-  return { os, dock_hiding: raw.dock_hiding === true, browser_sessions: raw.browser_sessions === true };
+  return {
+    os,
+    dock_hiding: raw.dock_hiding === true,
+    browser_sessions: raw.browser_sessions === true,
+    native_material: raw.native_material === true,
+  };
 }
