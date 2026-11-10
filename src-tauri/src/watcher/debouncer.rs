@@ -63,6 +63,8 @@ impl RepoFileWatcher {
     /// reads. notify's Windows Drop only queues Stop; dropping its Rust handle
     /// alone does not mean ReadDirectoryChangesW has relinquished the tree.
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+        // Whatever this watch said before it ended is not to be relied on after.
+        self.filter.skip().end();
         if let Some(watcher) = self.watcher.take() {
             drop(watcher);
             match self.retired.recv_timeout(Duration::from_secs(2)) {

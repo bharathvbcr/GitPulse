@@ -241,6 +241,9 @@ Closed since (2026-10-07):
   is non-recursive on Linux and Windows, where a path list names top-level
   entries and means "at least these"; on macOS it is recursive and filtered
   (see the 2026-11-09 section at the end), and a path list names the files.
+  There the backend also answers a status poll from the read it kept when the
+  stream delivered no event at all since; where the watch is not recursive
+  nothing can, and the status poll is the detector.
 
 ## Current gate status
 
@@ -2665,6 +2668,56 @@ Never dropped: a backend error, a must-rescan flag, an event with no path, an ev
 
 One bounded (3 s) `git ls-files` on the watch thread, when a `.gitignore` or `info/exclude` event arrives or a directory appears outside `.git`, or every 30 s while the last attempt failed. At most one per `SCAN_COALESCE` (2 s) however many triggers arrive: a trigger that falls inside the window is remembered and served when it ends. A write to `index`, `HEAD` or `config` is not a trigger, so a terminal full of `git add` reloads nothing (`index_writes_never_reload_the_rules_and_a_directory_storm_reloads_at_most_once_per_window`: 20 index writes, 0 reloads; 30 new directories over about 3 s, at most one reload per window).
 
+### Event volume
+
+Asserted, not timed, by `ten_thousand_writes_under_an_ignored_directory_are_never_announced` through the real watcher and loop: 10,000 files written under a directory a `.gitignore` names announce nothing, the callback classifies each delivered path once (no git is spawned per event), and nothing reloads the rules.
+
+### The status poll skips its read only when nothing happened
+
+`cmd_get_status` takes `skipIfUnchanged` (only the 6 s poll sets it; a refresh the user or the watcher asked for always reads). When the worktree has a live recursive watch, a read kept from an earlier poll is returned again, with no `git status` spawned, if the stream delivered NO event of any kind since that read began: not on an ignored path, not inside `.git`, not one the delivery filter would drop, not a rescan flag or a backend error. The callback counts every invocation before it filters (`watcher/skip.rs`, `EventFilter::admit`), so no path is ever classified as unable to matter. Three earlier designs that did classify (by ignore rules) were each broken by a rename of a directory holding a `.gitignore`, a directory named like a git pathspec (`:build`), and a listing artefact; none of those reasonings exist now. The epoch is taken before a read starts and the answer is kept under it, so an event that lands while the read runs is never covered by it.
+
+An active build in an ignored directory therefore makes every poll read, exactly as before; an idle worktree skips.
+
+Unknown is never clean: the poll reads, and keeps nothing, when the root watch is not recursive (Linux, Windows: `ROOT_WATCH_MODE`), the watch has ended or was never registered (failed registration, parked, evicted), the worktree root is no longer the directory that was registered (checked by device and inode, since a moved root sends no event), or the watch is convicted. A kept read older than 60 s is not served, and an answer of more than 4096 rows is not kept (it is logged once; such a worktree reads every poll).
+
+#### Does GitPulse's own read move the epoch?
+
+Measured with a recursive FSEvents watch while the read set of a refresh ran five times (status, `diff --numstat` both ways, refs, `rev-parse`, stash, log) with `GIT_OPTIONAL_LOCKS=0`, which every GitPulse git child already has and which this change does not depend on:
+
+| config | events from GitPulse's own reads |
+| --- | --- |
+| default | 0 |
+| `core.untrackedCache`, `feature.manyFiles`, `index.version=4` | 0 |
+| `core.fsmonitor=true` | 15: `.git/fsmonitor--daemon/cookies/<pid>-<n>`, one per read |
+| `core.splitIndex=true` | 10: `.git/sharedindex.<sha>` touched by every index read |
+
+On the default configuration an idle worktree and ten rounds of the whole refresh read set move the epoch zero times with the real watcher (`an_idle_worktree_and_its_own_reads_move_no_epoch_so_the_poll_is_skipped`). Under `core.fsmonitor` and `core.splitIndex` git itself writes under `.git` on a read, the epoch moves on every read, and the poll reads every time, which is what it did before: the skip is inert there, not wrong. Excluding those two paths would be a path-based guess about which events cannot matter, which is the thing this design refuses to do; preventing them at the source would mean disabling fsmonitor or the split index for GitPulse's own reads, which costs the users who turned them on for speed. Not done.
+
+#### How stale can an answer be
+
+| situation | bound on a stale answer | why |
+| --- | --- | --- |
+| healthy watch | the stream's delivery latency (not measured; the stream is created with zero latency and no deferral), corrected by the next poll | an event is counted when the callback runs; a change made a moment before a poll may not have been delivered yet, and is seen by the following poll |
+| dropped queue entry, rescan flag, backend error | same | each is a callback invocation, so each moves the epoch |
+| silent stream (registered, delivers nothing) | up to 60 s (`KEPT_STATUS_MAX_AGE`) | the read at the cap is compared with the kept one; if the paths or status codes differ with no event, the watch is suspect, and convicted after 3 s without one |
+| a change no worktree watch can see (global excludes file, `~/.gitconfig`) | up to 60 s | indistinguishable from a silent stream, and handled the same way: the read at the cap differs, the watch is convicted |
+| convicted | none; every poll reads | until the watch is re-registered |
+
+Only paths and status codes are compared between two reads. Line counts and warnings depend on a budget (an untracked-file scan stops at 2,000 file opens, and a warm cache does not spend it), so they differ between two reads of an unchanged tree and convicted a healthy watch with 2,100 untracked files (`a_large_unchanged_tree_with_budget_limited_counts_is_not_convicted`).
+
+A conviction is visible in the `watcher` log target, in words that say what happens (the poll now reads every time for that worktree) and that the cause may be a change no worktree watch can see rather than a lost event; so is an answer too large to keep. There is no backend-to-frontend channel for watch health today (`watchState.ts` is fed by the result of `cmd_watch_repo` and by `repo-gone`), so the status bar does not show it; adding one is an IPC change and was not done here.
+
 ### Measured
 
-Not a before/after of git spawns: this stage does not change what the poll does, so the idle `git status` count per minute is the same as before (about 10 per 10 polls). What is asserted instead, by `ten_thousand_writes_under_an_ignored_directory_are_never_announced` through the real watcher and loop: 10,000 files written under a directory a `.gitignore` names announce nothing, the callback classifies each delivered path once (no git is spawned per event), and nothing reloads the rules. The idle-poll saving is a separate stage, not part of this one.
+`cargo test --lib watcher::tests::measure_poll_skip -- --ignored --nocapture`, one M-series Mac (macOS 27), `src-tauri/src/watcher/mod.rs`. Counter-based: `git status` spawns counted at the spawn site over ten real polls at the production cadence (`STATUS_POLL_INTERVAL_MS`, 6 s, so 60 s). Four arms run side by side in every repetition, each in its own repository: an idle worktree and one with a build writing a file into an ignored directory every 200 ms, each polled the old way (`skipIfUnchanged` off: what the poll did before, and what stage 1 leaves untouched) and the new way.
+
+| arm (n = 5 repetitions, arms side by side) | spawns per 10 polls (60 s) | spread |
+| --- | --- | --- |
+| idle, every poll reads (before) | 10, 10, 10, 10, 10 | none |
+| idle, skip | 1, 1, 1, 1, 1 | none |
+| build churning an ignored directory, every poll reads (before) | 10, 10, 10, 10, 10 | none |
+| build churning an ignored directory, skip | 10, 10, 10, 10, 10 | none |
+
+Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30 line, so this run is a result. A first run of the same test started at load 43.9 (the build of the test binary raised it) and is not a result; it printed the same counts. The ten polls span 54 s, inside the 60 s cap, so "1" is the first read; in steady state the cap adds one read per minute, about two per minute for an idle worktree against ten before. The churn arm shows the cost of the dumb rule on purpose: a build writing in an ignored directory ends the skip for every poll, exactly as before this change.
+
+Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.

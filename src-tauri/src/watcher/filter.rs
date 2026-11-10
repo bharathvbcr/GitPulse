@@ -22,6 +22,10 @@
 //! [`super::event_may_change_ignore_rules`]). Nothing here, and nothing built on
 //! it, may rely on a path having been classified as unable to matter.
 //!
+//! The poll's "nothing happened since the read I kept" fact ([`super::skip`])
+//! does not use this gate's verdict either: the callback counts every
+//! invocation, before any filtering, so an event dropped here still ends it.
+//!
 //! What is never dropped: a backend error, a must-rescan flag, an event with no
 //! path, and an event naming the worktree root itself (the only trace of a repository
 //! that moved away, and what wakes the loop to notice).
@@ -30,6 +34,7 @@
 //! descriptor per directory and ReadDirectoryChangesW reports a whole tree), so
 //! the backend never delivers nested paths and this gate forwards everything.
 
+use super::skip::PollSkip;
 use super::{event_has_signal, is_worktree_root, IgnoreRules};
 use notify::{Event, RecursiveMode};
 use std::path::{Path, PathBuf};
@@ -51,6 +56,9 @@ pub(crate) struct EventFilter {
     /// The rule set the debounce loop classifies with, published by it after
     /// every load: one load serves both.
     rules: RwLock<Arc<IgnoreRules>>,
+    /// Counts every callback invocation, before any filtering, so the poll can
+    /// tell that nothing at all happened (see [`super::skip`]).
+    skip: PollSkip,
     /// Paths classified by the callback; the bound a test holds a storm to.
     #[cfg(test)]
     examined: std::sync::atomic::AtomicU64,
@@ -65,8 +73,10 @@ impl EventFilter {
         internal_roots: Vec<PathBuf>,
         root_mode: RecursiveMode,
     ) -> Arc<Self> {
+        let recursive = root.is_some() && root_mode == RecursiveMode::Recursive;
         Arc::new(Self {
-            recursive: root.is_some() && root_mode == RecursiveMode::Recursive,
+            recursive,
+            skip: PollSkip::new(root, recursive),
             root: root.map(Path::to_path_buf).unwrap_or_default(),
             root_canonical: root.and_then(|root| root.canonicalize().ok()),
             internal_roots,
@@ -78,6 +88,10 @@ impl EventFilter {
             #[cfg(test)]
             loads: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn skip(&self) -> &PollSkip {
+        &self.skip
     }
 
     pub(crate) fn publish_rules(&self, rules: Arc<IgnoreRules>) {
@@ -103,6 +117,9 @@ impl EventFilter {
         if !self.recursive {
             return true;
         }
+        // Whatever this is, the poll may not skip on the strength of a read
+        // that began before it. Nothing below may influence that.
+        self.skip.event();
         let Ok(event) = res else {
             return true;
         };
@@ -199,6 +216,44 @@ mod tests {
         assert!(filter.admit(&write(root.join("gen/out/a.o"))));
         assert!(filter.admit(&write(root.join(".git/index.lock"))));
         assert_eq!(filter.examined(), 0, "no classification where none is due");
+    }
+
+    /// The poll's premise: EVERY callback invocation moves the epoch, whether
+    /// or not the event is forwarded, and whatever it is.
+    #[test]
+    fn every_callback_invocation_moves_the_epoch_whatever_the_filter_says() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let filter = filter(&root, RecursiveMode::Recursive);
+        with_rules(&filter, &["gen"]);
+        let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(root.join("src/a.rs"));
+        let cases: Vec<(&str, Result<Event, notify::Error>, bool)> = vec![
+            ("a source edit", write(root.join("src/a.rs")), true),
+            ("an ignored-directory write", write(root.join("gen/x.o")), false),
+            ("a build-looking directory write", write(root.join("target/x")), false),
+            ("git-internal noise", write(root.join(".git/index.lock")), false),
+            ("an access event", Ok(access), false),
+            ("a must-rescan flag", Ok(rescan), true),
+            ("a backend error", Err(notify::Error::generic("lost")), true),
+            ("an event with no path", Ok(Event::new(EventKind::Other)), true),
+        ];
+        for (what, event, forwarded) in cases {
+            let before = filter.skip().epoch_now();
+            assert_eq!(filter.admit(&event), forwarded, "{what}: forwarded");
+            assert_eq!(filter.skip().epoch_now(), before + 1, "{what}: epoch");
+        }
+    }
+
+    /// Where the root watch is not recursive nothing is counted: the poll
+    /// there always reads (see `PollSkip::cover_at`).
+    #[test]
+    fn a_non_recursive_watch_cannot_vouch_for_anything() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let filter = filter(&root, RecursiveMode::NonRecursive);
+        assert_eq!(filter.skip().cover_at(std::time::Instant::now()), None);
     }
 
     /// Ten thousand writes under an ignored directory: each is classified once,

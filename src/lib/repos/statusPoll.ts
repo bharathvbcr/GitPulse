@@ -40,9 +40,11 @@ export interface PollRestInput {
  * nothing under `.git` and raises no event: this poll is the primary detector
  * of ordinary edits there. On macOS the watch is recursive but its event
  * filter may be wrong about delivery (`watcher/filter.rs`), and a wrongly
- * dropped event is covered by this poll, so it keeps its cadence too. Either
- * way a quiet minute must not make the first edit after it up to a minute
- * late.
+ * dropped event is covered by this poll; the backend answers a poll from the
+ * read it kept when the stream delivered no event at all since
+ * ({@link statusPollRequest}), so the cadence stays and the git process goes.
+ * Either way a quiet minute must not make the first edit after it up to a
+ * minute late.
  */
 export function statusPollRestMs(input: PollRestInput): number {
   const base = STATUS_POLL_INTERVAL_MS;
@@ -51,6 +53,21 @@ export function statusPollRestMs(input: PollRestInput): number {
       ? input.lastDurationMs * STATUS_POLL_COST_FACTOR
       : 0;
   return Math.min(STATUS_POLL_MAX_INTERVAL_MS, Math.max(base, cost));
+}
+
+/**
+ * The poll's `cmd_get_status` arguments. `skipIfUnchanged` lets the backend
+ * return the status it kept from an earlier read, with no git spawned, when the
+ * repository's watch can show that nothing under the worktree has changed
+ * since that read began (`watcher::status_through_watch`). "Nothing" is
+ * literal: no event of any kind on any path, ignored or not, inside `.git` or
+ * not. The backend says nothing of the sort unless the worktree has a live
+ * recursive watch, so everywhere else, and for a watch that is parked, lost
+ * events, or was convicted, the call reads exactly as it did before. Only the poll
+ * passes it: a refresh the user or the watcher asked for always reads.
+ */
+export function statusPollRequest(repoPath: string): { repoPath: string; skipIfUnchanged: true } {
+  return { repoPath, skipIfUnchanged: true };
 }
 
 /**

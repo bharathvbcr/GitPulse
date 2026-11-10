@@ -3,14 +3,23 @@ import {
   STATUS_POLL_COST_FACTOR,
   STATUS_POLL_INTERVAL_MS,
   STATUS_POLL_MAX_INTERVAL_MS,
+  statusPollRequest,
   statusPollRestMs,
 } from "./statusPoll";
 
+describe("statusPollRequest", () => {
+  it("is the only status read that lets the backend answer from a kept read", () => {
+    expect(statusPollRequest("/repo")).toEqual({ repoPath: "/repo", skipIfUnchanged: true });
+  });
+});
+
 describe("statusPollRestMs", () => {
   it("keeps the usual interval for a cheap poll, however long nothing has changed", () => {
-    // There is no input for "quiet": the worktree watch is non-recursive
-    // (watcher/debouncer.rs), so the poll is the primary detector of nested
-    // edits and a quiet stretch must not slow it.
+    // There is no input for "quiet": the worktree watch is non-recursive on
+    // Linux and Windows (watcher/debouncer.rs), so the poll is the primary
+    // detector of nested edits there and a quiet stretch must not slow it. On
+    // macOS the cadence is the same; the backend answers a poll that finds
+    // nothing moved without spawning git (statusPollRequest).
     expect(statusPollRestMs({ lastDurationMs: 40 })).toBe(STATUS_POLL_INTERVAL_MS);
     expect(statusPollRestMs({ lastDurationMs: null })).toBe(STATUS_POLL_INTERVAL_MS);
   });

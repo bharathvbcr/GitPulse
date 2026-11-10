@@ -136,6 +136,7 @@ import {
   changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
+  statusPollRequest,
   statusPollRestMs,
   statusesEqual,
 } from "../repos/statusPoll";
@@ -536,9 +537,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     try {
       let statuses: FileStatus[];
       try {
-        statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
-          repoPath: path,
-        });
+        statuses = await invokeFn<FileStatus[]>("cmd_get_status", statusPollRequest(path));
       } catch (error) {
         // Only a refused read counts. One failure is a repo that vanished (the
         // next full refresh reports it) or a blip; a run of them is a status

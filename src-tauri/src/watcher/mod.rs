@@ -3,6 +3,7 @@
 pub mod bench_seam;
 pub mod debouncer;
 pub(crate) mod filter;
+pub(crate) mod skip;
 #[cfg(test)]
 mod registration_timing;
 #[cfg(all(test, unix))]
@@ -13,6 +14,7 @@ pub use debouncer::RepoFileWatcher;
 use crate::engine::git_cli::{
     git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
+use crate::engine::git_reader::FileStatus;
 use crate::ipc_error::CommandError;
 use notify::{Event, EventKind};
 use serde::Serialize;
@@ -92,6 +94,9 @@ pub struct WatchSession {
     /// directory disappears and canonicalization starts failing (which
     /// would otherwise leak one of MAX_WATCHES slots forever).
     aliases: Vec<String>,
+    /// The callback filter and the poll-skip state it feeds; see [`skip`].
+    /// `None` only for a slot reserved without a backend.
+    filter: Option<Arc<filter::EventFilter>>,
 }
 
 impl Drop for WatchSession {
@@ -259,6 +264,15 @@ impl WatcherState {
         Ok(crate::supervisor::lock_or_recover(&self.sessions))
     }
 
+    /// The filter of the watch on `key` (a canonical repository path). A path
+    /// with no session (never watched, failed to register, parked, evicted,
+    /// unwatched, or reaped by its own loop) has none, which is the same answer
+    /// as a watch that cannot vouch: the caller reads.
+    fn filter_for(&self, key: &str) -> Option<Arc<filter::EventFilter>> {
+        let guard = self.lock_sessions().ok()?;
+        guard.get(key)?.filter.clone()
+    }
+
     /// Drops a reserved slot only if it is still the session we inserted.
     /// Used when thread spawn fails after the sessions lock has been released.
     fn abandon_watch_slot(&self, key: &str, stop: &Arc<StopSignal>) -> Result<(), String> {
@@ -298,6 +312,7 @@ fn insert_watch_session(
             stop: stop.clone(),
             retired,
             aliases,
+            filter: None,
         },
     );
     Ok(Some(stop))
@@ -1410,7 +1425,12 @@ where
             Some(retired_rx),
         )? {
             None => return Ok(key),
-            Some(stop) => stop,
+            Some(stop) => {
+                if let Some(session) = guard.get_mut(&key) {
+                    session.filter = Some(watcher.filter());
+                }
+                stop
+            }
         }
     };
     // Before the loop exists: a stop that lands in between is replayed here.
@@ -1557,6 +1577,44 @@ pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
     }
     drop(guard);
     retire_sessions(retired)
+}
+
+/// The status of `repo_path`: `read`'s answer, or, when `may_reuse` and the
+/// watch saw no event of any kind since the read that produced it began, that
+/// earlier answer with no git spawned. See [`skip`] for the rule and for what a
+/// watch must do to keep earning it.
+///
+/// A read is always kept when the watch can vouch, whoever asked, so a refresh
+/// that followed an event also serves the poll that comes after it; only a
+/// caller that says `may_reuse` is ever served one.
+pub(crate) fn status_through_watch<F>(
+    state: &WatcherState,
+    repo_path: &str,
+    may_reuse: bool,
+    read: F,
+) -> Result<Vec<FileStatus>, CommandError>
+where
+    F: FnOnce() -> Result<Vec<FileStatus>, CommandError>,
+{
+    let filter = validate_repo(repo_path)
+        .ok()
+        .and_then(|repo| state.filter_for(&repo.to_string_lossy()));
+    let Some(filter) = filter else {
+        return read();
+    };
+    let skip = filter.skip();
+    let started = Instant::now();
+    let covered = skip.cover_at(started);
+    if may_reuse {
+        if let Some(rows) = covered.and_then(|epoch| skip.serve(epoch, started)) {
+            return Ok(rows.as_ref().clone());
+        }
+    }
+    let rows = read()?;
+    if let Some(epoch) = covered {
+        skip.settle(epoch, &rows, started);
+    }
+    Ok(rows)
 }
 
 pub fn unwatch_all(state: &WatcherState) -> Result<(), String> {
@@ -5381,90 +5439,467 @@ mod tests {
         stop.stop();
     }
 
-    // ---- A wrongly dropped event costs at most one poll ----------------------
+    // ---- The poll skips its read only when NOTHING happened -----------------
 
-    /// One `get_status` as the 6 s poll makes it, and how many `git status`
-    /// spawns it cost.
+    /// Waits until the epoch has not moved for `still`: the setup's own events
+    /// (git init, directory creations) have been delivered, so a later change
+    /// is the test's.
     #[cfg(target_os = "macos")]
-    fn poll_once(root: &Path) -> (Vec<crate::engine::git_reader::FileStatus>, usize) {
-        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&spawns);
-        let scope = root.to_path_buf();
-        let rows = crate::engine::worktree::status_probes::with_probe(
-            std::slice::from_ref(&scope),
+    fn wait_for_a_still_epoch(skip: &skip::PollSkip) {
+        let still = DEBOUNCE_MAX_WAIT + Duration::from_millis(500);
+        let mut seen = skip.epoch_now();
+        let mut since = Instant::now();
+        wait_for("a still epoch", || {
+            let now = skip.epoch_now();
+            if now != seen {
+                seen = now;
+                since = Instant::now();
+            }
+            since.elapsed() >= still
+        });
+    }
+
+    /// A trusted repository under a live session, and a counter of the `git
+    /// status` spawns made for it while `body` runs.
+    fn watched_repo_counting_status_reads<T>(
+        body: impl FnOnce(&WatcherState, &str, &Path, &Arc<std::sync::atomic::AtomicUsize>) -> T,
+    ) -> T {
+        let temp = TempDir::new().unwrap();
+        git_init(temp.path(), false);
+        crate::test_support::trust_repo(temp.path());
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        let state = WatcherState::default();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let out = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&root),
             move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
             },
-            || crate::engine::git_reader::GitReader::get_status(&root.to_string_lossy()),
-        )
-        .expect("status");
-        (rows, spawns.load(Ordering::SeqCst))
+            || body(&state, &path, &root, &reads),
+        );
+        let _ = unwatch_all(&state);
+        out
     }
 
-    /// The invariant that lets the callback filter be a plain ignore list:
-    /// nothing treats a dropped event as proof of "unchanged", so when the list
-    /// is wrong (it is only a snapshot of which directories git ignored at some
-    /// moment) the poll still reads and shows the file. The two reproductions
-    /// are the ones a review used to break a design that skipped the poll.
-    ///
-    /// A: `a/.gitignore` says `gen/`, then `a` is renamed away and another
-    /// directory with an untracked `gen/` takes its name; the list still names
-    /// `a/gen` although git no longer ignores it, and no rule file or folder
-    /// creation event arrives (renames are `Modify(Name)`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_renamed_ancestor_of_a_rule_file_costs_at_most_a_poll() {
-        let temp = TempDir::new().unwrap();
-        let git_root = temp.path().canonicalize().unwrap();
-        git_init(&git_root, false);
-        crate::test_support::trust_repo(&git_root);
-        std::fs::create_dir_all(git_root.join("a/gen")).unwrap();
-        std::fs::write(git_root.join("a/.gitignore"), "gen/\n").unwrap();
-        std::fs::write(git_root.join("a/gen/seed.rs"), "x").unwrap();
-        std::fs::create_dir_all(git_root.join("c/gen")).unwrap();
-        std::fs::write(git_root.join("c/gen/seed.rs"), "x").unwrap();
-        let (rx, stop, root, filter) = spawn_loop_observed(temp.path());
-        wait_for("the rules", || filter.loads() >= 1);
-        prime_watcher(&rx, &root, PRIME_DEADLINE);
-
-        std::fs::rename(root.join("a"), root.join("z")).unwrap();
-        std::fs::rename(root.join("c"), root.join("a")).unwrap();
-        std::fs::write(root.join("a/gen/new.rs"), "x").unwrap();
-        thread::sleep(Duration::from_millis(1500));
-        let (rows, spawns) = poll_once(&root);
-        assert_eq!(spawns, 1, "the poll reads");
-        assert!(
-            rows.iter().any(|row| row.path.starts_with("a/gen")),
-            "git lists a/gen/new.rs: {rows:?}"
-        );
-        stop.stop();
+    fn poll(state: &WatcherState, path: &str) -> Vec<FileStatus> {
+        status_through_watch(state, path, true, || {
+            crate::engine::git_reader::GitReader::get_status(path)
+        })
+        .expect("status")
     }
 
-    /// B: a directory named `:build` holding only a swap file is listed as
-    /// ignored (the listing describes contents, not rules); the source file
-    /// written next is untracked and status shows it.
+    fn skip_of(state: &WatcherState, path: &str) -> Arc<filter::EventFilter> {
+        state.filter_for(path).expect("a live session has a filter")
+    }
+
+    fn reads_of(reads: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        reads.load(Ordering::SeqCst)
+    }
+
+    /// The premise of the whole skip: an idle worktree delivers no event, and
+    /// neither does GitPulse's own refresh read set (it runs with
+    /// `GIT_OPTIONAL_LOCKS=0`), so the poll is answered from the kept read.
+    /// Measured with the real stream; under `core.fsmonitor` and
+    /// `core.splitIndex` git itself writes under `.git` on a read (cookie files,
+    /// a shared-index touch), the epoch moves, and the poll reads every time as
+    /// it did before. See `docs/PERFORMANCE.md`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_directory_listed_as_ignored_only_because_of_its_contents_costs_at_most_a_poll() {
-        let temp = TempDir::new().unwrap();
-        let git_root = temp.path().canonicalize().unwrap();
-        git_init(&git_root, false);
-        crate::test_support::trust_repo(&git_root);
-        std::fs::write(git_root.join(".gitignore"), "build\n*.swp\n").unwrap();
-        std::fs::create_dir_all(git_root.join(":build")).unwrap();
-        std::fs::write(git_root.join(":build/.a.swp"), "x").unwrap();
-        let (rx, stop, root, filter) = spawn_loop_observed(temp.path());
-        wait_for("the rules", || filter.loads() >= 1);
-        prime_watcher(&rx, &root, PRIME_DEADLINE);
+    fn an_idle_worktree_and_its_own_reads_move_no_epoch_so_the_poll_is_skipped() {
+        use crate::engine::git_reader::GitReader;
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+            git_in(root, &["add", "tracked.txt"]);
+            git_in(root, &["commit", "-m", "seed"]);
+            git_in(root, &["tag", "v1"]);
+            git_in(root, &["branch", "topic"]);
+            std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
+            std::fs::write(root.join("staged.txt"), "s\n").unwrap();
+            git_in(root, &["add", "staged.txt"]);
+            std::fs::write(root.join("untracked.txt"), "u\n").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            let epoch = filter.skip().epoch_now();
+            for _ in 0..10 {
+                // The reads one refresh makes, then the poll.
+                GitReader::get_status(path).expect("status");
+                GitReader::list_branches(path).expect("branches");
+                GitReader::list_tags(path).expect("tags");
+                GitReader::branch_stats(path).expect("stats");
+                crate::engine::stash::list(path).expect("stash");
+                GitReader::head_id(path).expect("head");
+                poll(state, path);
+            }
+            thread::sleep(Duration::from_millis(1500));
+            assert_eq!(filter.skip().epoch_now(), epoch, "GitPulse's own reads moved the epoch");
+            let before = reads_of(reads);
+            for _ in 0..5 {
+                poll(state, path);
+            }
+            assert_eq!(reads_of(reads), before, "nothing happened: the polls are skipped");
+        });
+    }
 
-        std::fs::write(root.join(":build/a.rs"), "x").unwrap();
-        thread::sleep(Duration::from_millis(1500));
-        let (rows, spawns) = poll_once(&root);
-        assert_eq!(spawns, 1, "the poll reads");
-        assert!(
-            rows.iter().any(|row| row.path.starts_with(":build")),
-            "git lists :build/a.rs: {rows:?}"
+    /// Any event at all ends the skip: a plain edit, a write into an ignored
+    /// directory, and a touch of git-internal noise.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn any_event_at_all_makes_the_next_poll_read() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads_of(reads), 1, "the second poll is skipped");
+            type Act = fn(&Path);
+            let cases: [(&str, Act); 3] = [
+                ("a plain edit", |root| {
+                    std::fs::write(root.join("plain.txt"), "x").unwrap()
+                }),
+                ("a write into an ignored directory", |root| {
+                    std::fs::write(root.join("out/build.o"), "x").unwrap()
+                }),
+                ("git-internal noise", |root| {
+                    std::fs::write(root.join(".git/index.lock"), "").unwrap()
+                }),
+            ];
+            for (what, act) in cases {
+                wait_for_a_still_epoch(filter.skip());
+                let (epoch, before) = (filter.skip().epoch_now(), reads_of(reads));
+                act(root);
+                wait_for(what, || filter.skip().epoch_now() != epoch);
+                poll(state, path);
+                assert_eq!(reads_of(reads), before + 1, "{what} must make the poll read");
+                poll(state, path);
+                assert_eq!(reads_of(reads), before + 1, "and the read is kept again");
+            }
+        });
+    }
+
+    /// The rename that broke the ignore-list design: `a/gen` was ignored by
+    /// `a/.gitignore`, then `a` was renamed away and another directory took its
+    /// name. The events move the epoch, so the poll reads and shows the file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_renamed_ancestor_of_a_rule_file_is_seen_because_the_events_move_the_epoch() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::create_dir_all(root.join("a/gen")).unwrap();
+            std::fs::write(root.join("a/.gitignore"), "gen/\n").unwrap();
+            std::fs::write(root.join("a/gen/seed.rs"), "x").unwrap();
+            std::fs::create_dir_all(root.join("c/gen")).unwrap();
+            std::fs::write(root.join("c/gen/seed.rs"), "x").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            let (epoch, before) = (filter.skip().epoch_now(), reads_of(reads));
+            std::fs::rename(root.join("a"), root.join("z")).unwrap();
+            std::fs::rename(root.join("c"), root.join("a")).unwrap();
+            std::fs::write(root.join("a/gen/new.rs"), "x").unwrap();
+            wait_for("the renames to reach the watch", || {
+                filter.skip().epoch_now() != epoch
+            });
+            thread::sleep(Duration::from_millis(1500));
+            let rows = poll(state, path);
+            assert_eq!(reads_of(reads), before + 1, "the poll reads");
+            assert!(rows.iter().any(|r| r.path == "a/gen/new.rs"), "{rows:?}");
+        });
+    }
+
+    /// The `:build` directory that `git check-ignore` read as a pathspec: it
+    /// holds only a swap file, then a source file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_colon_directory_holding_only_a_swap_file_is_seen_when_a_source_file_arrives() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "build\n*.swp\n").unwrap();
+            std::fs::create_dir_all(root.join(":build")).unwrap();
+            std::fs::write(root.join(":build/.a.swp"), "x").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            let (epoch, before) = (filter.skip().epoch_now(), reads_of(reads));
+            std::fs::write(root.join(":build/a.rs"), "x").unwrap();
+            wait_for("the write to reach the watch", || {
+                filter.skip().epoch_now() != epoch
+            });
+            let rows = poll(state, path);
+            assert_eq!(reads_of(reads), before + 1);
+            assert!(rows.iter().any(|r| r.path.starts_with(":build")), "{rows:?}");
+        });
+    }
+
+    /// Review 2's sequence: a directory created holding only `.a.rs.swp`
+    /// (so the ignore listing prints it), then the source file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_that_holds_only_a_swap_file_shows_the_source_file_written_next() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "*.swp\n").unwrap();
+            git_in(root, &["add", ".gitignore"]);
+            git_in(root, &["commit", "-m", "ignore swap files"]);
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            std::fs::create_dir_all(root.join("src/x")).unwrap();
+            std::fs::write(root.join("src/x/.a.rs.swp"), "x").unwrap();
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            let (epoch, before) = (filter.skip().epoch_now(), reads_of(reads));
+            std::fs::write(root.join("src/x/a.rs"), "fn main() {}\n").unwrap();
+            wait_for("the write to reach the watch", || {
+                filter.skip().epoch_now() != epoch
+            });
+            let rows = poll(state, path);
+            assert_eq!(reads_of(reads), before + 1);
+            assert!(rows.iter().any(|r| r.path.starts_with("src/x")), "{rows:?}");
+        });
+    }
+
+    /// Review 1's sequence: a file under an ignored directory becomes tracked
+    /// (`git add -f`), then is edited.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_that_becomes_tracked_inside_an_ignored_directory_is_seen_when_edited() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+            std::fs::create_dir_all(root.join("out/sub")).unwrap();
+            std::fs::write(root.join("out/sub/f.txt"), "one\n").unwrap();
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            git_in(root, &["add", "-f", "out/sub/f.txt"]);
+            git_in(root, &["commit", "-m", "track a file under an ignored directory"]);
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            let (epoch, before) = (filter.skip().epoch_now(), reads_of(reads));
+            std::fs::write(root.join("out/sub/f.txt"), "two\n").unwrap();
+            wait_for("the edit to reach the watch", || {
+                filter.skip().epoch_now() != epoch
+            });
+            let rows = poll(state, path);
+            assert_eq!(reads_of(reads), before + 1);
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "out/sub/f.txt" && r.status_code.contains('M')),
+                "{rows:?}"
+            );
+        });
+    }
+
+    /// Finding C: 2,100 untracked files (past the 2,000-file scan budget) in an
+    /// unchanged tree. The read at the cap returns different line counts from
+    /// the first, which once convicted a healthy watch; paths and status codes
+    /// do not differ, so the watch stays trusted and the poll keeps skipping.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_large_unchanged_tree_with_budget_limited_counts_is_not_convicted() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            let dir = root.join("many");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..2_100 {
+                std::fs::write(dir.join(format!("u{i}.txt")), format!("line {i}\n")).unwrap();
+            }
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            filter
+                .skip()
+                .set_timings(Duration::from_millis(500), Duration::from_millis(200));
+            let first = poll(state, path);
+            assert!(first.len() >= 2_100, "{} rows", first.len());
+            thread::sleep(Duration::from_millis(600));
+            poll(state, path);
+            thread::sleep(Duration::from_millis(300));
+            poll(state, path);
+            assert!(!filter.skip().is_convicted(), "a healthy watch was convicted");
+            assert_eq!(reads_of(reads), 2, "the cap forced one more real read");
+        });
+    }
+
+    /// A stream that registers and says nothing, simulated by a session whose
+    /// filter is never fed. A real change under it is served stale for at most
+    /// the cap, then the read at the cap disagrees and the watch is convicted:
+    /// every poll reads from then on.
+    #[test]
+    fn a_silent_stream_is_stale_at_most_until_the_cap_then_convicted() {
+        watched_repo_counting_status_reads(|state, path, root, reads| {
+            let filter = filter::EventFilter::new(
+                Some(root),
+                vec![root.join(".git")],
+                notify::RecursiveMode::Recursive,
+            );
+            {
+                let mut guard = state.lock_sessions().unwrap();
+                insert_watch_session(&mut guard, path, &[], None).unwrap();
+                guard.get_mut(path).unwrap().filter = Some(Arc::clone(&filter));
+            }
+            filter
+                .skip()
+                .set_timings(Duration::from_millis(400), Duration::from_millis(200));
+            poll(state, path);
+            std::fs::write(root.join("plain.txt"), "x").unwrap();
+            let stale = poll(state, path);
+            assert_eq!(reads_of(reads), 1, "served within the cap");
+            assert!(stale.is_empty(), "this is the bounded staleness: {stale:?}");
+            thread::sleep(Duration::from_millis(450));
+            let rows = poll(state, path);
+            assert_eq!(reads_of(reads), 2, "the cap forces a real read");
+            assert!(rows.iter().any(|r| r.path == "plain.txt"), "{rows:?}");
+            assert!(!filter.skip().is_convicted());
+            thread::sleep(Duration::from_millis(250));
+            poll(state, path);
+            assert_eq!(reads_of(reads), 3);
+            assert!(filter.skip().is_convicted(), "caught missing a change");
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads_of(reads), 5, "every poll reads now");
+        });
+    }
+
+    /// Unknown is never clean, at the poll: a failed registration and a parked
+    /// or evicted watch have no filter, so every poll reads.
+    #[test]
+    fn a_failed_or_parked_watch_makes_every_poll_read() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            assert!(start_watch_inner(state, "/nonexistent/for/sure".into(), |_| {}).is_err());
+            assert!(state.filter_for("/nonexistent/for/sure").is_none());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads_of(reads), 2, "never watched");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_parked_watch_has_no_kept_read_to_serve() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            let filter = skip_of(state, path);
+            wait_for_a_still_epoch(filter.skip());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads_of(reads), 1);
+            unwatch(state, path.to_string()).unwrap();
+            assert!(filter.skip().cover_at(Instant::now()).is_none());
+            poll(state, path);
+            poll(state, path);
+            assert_eq!(reads_of(reads), 3, "parked: every poll reads");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_average_1m() -> f64 {
+        let mut load = [0f64; 3];
+        // SAFETY: `getloadavg` writes at most `3` doubles into the array.
+        let got = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+        if got >= 1 {
+            load[0]
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Counter-based measurement: `git status` spawns for one open worktree
+    /// over ten real polls at the production cadence (`STATUS_POLL_INTERVAL_MS`,
+    /// 6 s, so 60 s), counted at the spawn site. Four arms run side by side in
+    /// each repetition, in separate repositories so the counters cannot mix:
+    /// an idle worktree and one with a build writing into an ignored directory
+    /// every 200 ms, each polled the old way (`may_reuse` off: what the poll did
+    /// before the skip, which stage 1 leaves untouched) and the new way. Run
+    /// on a quiet host: `cargo test --lib watcher::tests::measure_poll_skip --
+    /// --ignored --nocapture`. A run that starts or ends above load 30 is
+    /// printed as CONTAMINATED and is not a result.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "measurement; five minutes of real polls on a quiet host"]
+    fn measure_poll_skip_spawns_on_an_idle_and_a_churning_worktree() {
+        const POLLS: usize = 10;
+        const POLL_EVERY: Duration = Duration::from_secs(6);
+        const REPS: usize = 5;
+        let load_start = load_average_1m();
+        // [idle-old, idle-new, churn-old, churn-new] spawns, per repetition.
+        let mut spawns = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for _ in 0..REPS {
+            let arms: Vec<_> = [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .map(|(churn, may_reuse)| {
+                    thread::spawn(move || {
+                        watched_repo_counting_status_reads(|state, path, root, reads| {
+                            std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+                            std::fs::create_dir_all(root.join("out")).unwrap();
+                            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+                            let filter = skip_of(state, path);
+                            wait_for_a_still_epoch(filter.skip());
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let writer = churn.then(|| {
+                                let (stop, out) = (Arc::clone(&stop), root.join("out"));
+                                thread::spawn(move || {
+                                    let mut n = 0u32;
+                                    while !stop.load(Ordering::Acquire) {
+                                        let _ = std::fs::write(out.join(format!("f{}.o", n % 64)), "x");
+                                        n += 1;
+                                        thread::sleep(Duration::from_millis(200));
+                                    }
+                                })
+                            });
+                            for _ in 0..POLLS {
+                                status_through_watch(state, path, may_reuse, || {
+                                    crate::engine::git_reader::GitReader::get_status(path)
+                                })
+                                .unwrap();
+                                thread::sleep(POLL_EVERY);
+                            }
+                            stop.store(true, Ordering::Release);
+                            if let Some(writer) = writer {
+                                let _ = writer.join();
+                            }
+                            reads_of(reads)
+                        })
+                    })
+                })
+                .collect();
+            for (arm, handle) in arms.into_iter().enumerate() {
+                spawns[arm].push(handle.join().unwrap());
+            }
+        }
+        let load_end = load_average_1m();
+        let contaminated = load_start > 30.0 || load_end > 30.0 || load_start.is_nan();
+        eprintln!(
+            "MEASURE git status spawns per {POLLS} polls at 6 s (60 s), n={REPS}, arms side by side per repetition: \
+             idle/always-read={:?} idle/skip={:?} churn-in-ignored-dir/always-read={:?} churn/skip={:?}; \
+             load 1m start={load_start:.1} end={load_end:.1} {}",
+            spawns[0],
+            spawns[1],
+            spawns[2],
+            spawns[3],
+            if contaminated { "CONTAMINATED (above 30): not a result" } else { "clean" }
         );
-        stop.stop();
+        assert!(spawns[0].iter().chain(&spawns[2]).all(|n| *n == POLLS));
+    }
+
+    /// Linux and Windows: the root watch is not recursive, so nothing can show
+    /// a worktree unchanged and every poll reads.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn without_a_recursive_root_watch_every_poll_reads() {
+        watched_repo_counting_status_reads(|state, path, _, reads| {
+            start_watch_inner(state, path.to_string(), |_| {}).unwrap();
+            for _ in 0..4 {
+                poll(state, path);
+            }
+            assert_eq!(reads_of(reads), 4);
+        });
     }
 }
