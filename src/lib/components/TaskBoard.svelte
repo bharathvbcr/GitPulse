@@ -2550,7 +2550,7 @@
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
 {#snippet scopeRail(overlay: boolean)}
-  <!-- The keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
+  <!-- Justified: the keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
     {#if overlay && !railNarrow}
