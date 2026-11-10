@@ -27,7 +27,8 @@ export function sanitizeHistoryList(raw: unknown): HistoryList {
  * Besides the field itself, a session written before the fold says "moves" by
  * having been left on the retired Reflog section (`viewSections.history`) or
  * on the older top-level Reflog view (`viewTab`). Both land on Graph through
- * the registry's default; this is what keeps them on the reflog.
+ * the registry's `RETIRED_SECTIONS` (and `RETIRED_VIEWS` for the old view);
+ * this is what keeps them on the reflog.
  */
 export function restoredHistoryList(record: {
   historyList?: unknown;
