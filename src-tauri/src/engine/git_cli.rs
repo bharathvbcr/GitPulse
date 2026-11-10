@@ -2741,16 +2741,19 @@ const CANCELLED_BEFORE_SPAWN: &str = " cancelled before spawn";
 /// Whether `error` is a cancellation (a read whose callers have gone, or any
 /// spawn cancelled while it queued) and so no fault of the process: it is not
 /// counted as a process failure, which feeds health reporting.
+///
+/// Decided by the kind its producer gave it, never by its words: git's stderr
+/// becomes error text, and a line of it that matched a marker must not pass for
+/// a cancel. The kind survives a layer that wraps the message.
 fn is_cancellation(error: &CommandError) -> bool {
-    error.message() == read_cancel::CANCELLED_MESSAGE
-        || error.message().ends_with(CANCELLED_BEFORE_SPAWN)
+    error.origin() == Some(crate::ipc_error::IpcErrorKind::ReadCancelled)
 }
 
 /// A cancelled spawn of a read whose request can be cancelled, as that read's
 /// cancellation: the same words as one cancelled while it ran.
 fn as_read_cancellation(error: CommandError, cancellable: bool) -> CommandError {
-    if cancellable && error.message().ends_with(CANCELLED_BEFORE_SPAWN) {
-        read_cancel::CANCELLED_MESSAGE.into()
+    if cancellable && is_cancellation(&error) {
+        read_cancel::cancelled()
     } else {
         error
     }
@@ -2772,7 +2775,10 @@ pub(crate) fn refusal_message_at(
     let deferred =
         |text: String| CommandError::typed(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text);
     match refusal {
-        Refusal::Cancelled => format!("{label}{CANCELLED_BEFORE_SPAWN}").into(),
+        Refusal::Cancelled => CommandError::typed(
+            crate::ipc_error::IpcErrorKind::ReadCancelled,
+            format!("{label}{CANCELLED_BEFORE_SPAWN}"),
+        ),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
@@ -5063,7 +5069,7 @@ fn run_read_shared_once(
         drop(result);
         let Some(shared) = shared else {
             if left_by_cancel {
-                return SharedAttempt::Done(Err(read_cancel::CANCELLED_MESSAGE.into()));
+                return SharedAttempt::Done(Err(read_cancel::cancelled()));
             }
             return SharedAttempt::Done(deadline_expired(label, timeout));
         };
@@ -6259,7 +6265,7 @@ fn git_run_inner(
             .as_ref()
             .is_some_and(read_cancel::ReadCancel::is_cancelled)
         {
-            return Err(read_cancel::CANCELLED_MESSAGE.into());
+            return Err(read_cancel::cancelled());
         }
         let cmd = git_command(repo, args);
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -6311,7 +6317,7 @@ fn git_run_inner(
             // Stopped because nobody waits for it. Not a result: the output
             // is a partial stream, and an error is what keeps every caller
             // from parsing, keeping or sharing it as one.
-            return Err(read_cancel::CANCELLED_MESSAGE.into());
+            return Err(read_cancel::cancelled());
         }
         if out.success || matches!(out.incomplete, Some(Incomplete::Deadline { .. })) {
             return Ok((out.stdout, out.incomplete));

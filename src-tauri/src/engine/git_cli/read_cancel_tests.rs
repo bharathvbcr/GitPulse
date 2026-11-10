@@ -4,8 +4,9 @@
 
 use super::read_cancel::{self, ReadScope, CANCELLED_MESSAGE};
 use super::*;
+use crate::ipc_error::IpcErrorKind;
 use crate::procguard::LockedSpawn;
-use crate::test_support::{coverage_relaxed, process_alive, wait_gone};
+use crate::test_support::{coverage_relaxed, process_alive, wait_gone, wait_until};
 
 /// How long a cancelled child may take to leave: the ask, the grace
 /// ([`crate::procguard::CHILD_GRACE`]) and a margin, relaxed under coverage.
@@ -126,41 +127,38 @@ impl Rig {
         script: String,
     ) -> thread::JoinHandle<Result<BoundedRun, CommandError>> {
         let reader = self.read(id, script);
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        while !super::shared_reads()
+        assert!(
+            wait_until(Duration::from_secs(10), || self.flight_queued()),
+            "the leader never queued"
+        );
+        reader
+    }
+
+    /// Whether a flight for this rig's directory is in the shared table.
+    fn flight_queued(&self) -> bool {
+        super::shared_reads()
             .lock()
             .unwrap()
             .keys()
             .any(|key| key.cwd == self.cwd)
-        {
-            assert!(Instant::now() < until, "the leader never queued");
-            thread::sleep(Duration::from_millis(5));
-        }
-        reader
     }
 
     fn wait_started(&self, count: usize) -> Vec<u32> {
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        loop {
-            let pids = self.started();
-            if pids.len() >= count {
-                return pids;
-            }
-            assert!(
-                Instant::now() < until,
-                "only {} child(ren) started",
-                pids.len()
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || self.started().len() >= count),
+            "only {} child(ren) started",
+            self.started().len()
+        );
+        self.started()
     }
 
     fn wait_joined(&self, joiners: u64) {
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        while self.gate.counters()[Admission::Reactive.index()].coalesced < joiners {
-            assert!(Instant::now() < until, "the readers never queued together");
-            thread::sleep(Duration::from_millis(5));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                self.gate.counters()[Admission::Reactive.index()].coalesced >= joiners
+            }),
+            "the readers never queued together"
+        );
     }
 }
 
@@ -214,11 +212,10 @@ fn a_cancelled_git_read_is_an_error_and_never_an_answer() {
                 git_text_capped(&path, &args, 4096)
             }
         });
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        while recorded(&pids).is_empty() {
-            assert!(Instant::now() < until, "the git child never started");
-            thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || !recorded(&pids).is_empty()),
+            "the git child never started"
+        );
         let pid = recorded(&pids)[0];
         assert!(read_cancel::cancel(id));
         let outcome = reader.join().unwrap();
@@ -319,19 +316,10 @@ fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
     assert!(read_cancel::cancel("rc-late-1"));
     assert!(read_cancel::cancel("rc-late-2"));
     // The decision is made by the leader's poll while it waits in the queue.
-    let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-    while super::shared_reads()
-        .lock()
-        .unwrap()
-        .keys()
-        .any(|key| key.cwd == rig.cwd)
-    {
-        assert!(
-            Instant::now() < until,
-            "the cancelled flight stayed joinable"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        wait_until(Duration::from_secs(10), || !rig.flight_queued()),
+        "the cancelled flight stayed joinable"
+    );
     let late = rig.read(None, script);
     drop(held);
     let fresh = late.join().unwrap().expect("a fresh read");
@@ -435,7 +423,15 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
             }
         }
         // The last click has settled: give the cancelled children their grace.
-        thread::sleep(gone_within());
+        if cancellable {
+            let alive_now = || {
+                rig.started()
+                    .iter()
+                    .filter(|pid| process_alive(**pid))
+                    .count()
+            };
+            wait_until(gone_within(), || alive_now() <= 1);
+        }
         let pids = rig.started();
         let alive = pids.iter().filter(|pid| process_alive(**pid)).count();
         let child_seconds = began.elapsed().as_secs_f64() * alive as f64;
@@ -471,16 +467,16 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
     let _in = scope.enter();
     let cwd = rig.cwd.clone();
     let canceller = thread::spawn(move || {
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(10));
-        while !super::shared_reads()
-            .lock()
-            .unwrap()
-            .keys()
-            .any(|key| key.cwd == cwd)
-        {
-            assert!(Instant::now() < until, "the read never queued");
-            thread::sleep(Duration::from_millis(5));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                super::shared_reads()
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|key| key.cwd == cwd)
+            }),
+            "the read never queued"
+        );
         assert!(read_cancel::cancel("rc-queued"));
     });
     let before = PROCESS_FAILURES.get();
@@ -500,31 +496,46 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
         before,
         "a cancel was counted as a failure"
     );
+    let as_read = as_read_cancellation(error, true);
     assert_eq!(
-        as_read_cancellation(error, true).message(),
+        as_read.message(),
         CANCELLED_MESSAGE,
         "the runner words it as the mid-read cancellation"
     );
+    assert_eq!(as_read.kind(), IpcErrorKind::ReadCancelled);
     assert!(rig.started().is_empty(), "nothing was spawned");
     drop(held);
 }
 
-/// The cancellation is recognised, and nothing else is.
+/// The cancellation is recognised by its kind, and nothing else is: text that
+/// says the same words, as git's stderr can, is not a cancel.
 #[test]
 fn only_a_cancellation_is_exempt_from_the_failure_count() {
-    let cancelled: CommandError = CANCELLED_MESSAGE.into();
+    let cancelled = read_cancel::cancelled();
     assert!(is_cancellation(&cancelled));
+    assert_eq!(cancelled.kind(), IpcErrorKind::ReadCancelled);
     assert!(is_cancellation(&refusal_message(
         "git log",
         Refusal::Cancelled
     )));
+    // A layer that puts its own words round the cancel leaves it a cancel.
+    let wrapped = read_cancel::cancelled().wrap(|text| format!("graph window: {text}"));
+    assert!(is_cancellation(&wrapped));
     for other in [
         "git log timed out after 90s",
         "Failed to spawn git log: forced by test",
         "git log exited with status 128",
+        CANCELLED_MESSAGE,
+        "git log cancelled before spawn",
     ] {
-        assert!(!is_cancellation(&CommandError::from(other)), "{other}");
+        assert!(
+            !is_cancellation(&CommandError::from(other)),
+            "text alone is not a cancel: {other}"
+        );
     }
+    // The same words from a process's stderr are a process failure.
+    let stderr = CommandError::from(format!("git log failed: {CANCELLED_MESSAGE}"));
+    assert!(!is_cancellation(&stderr));
     // A request that cannot be cancelled keeps the refusal's own words.
     let plain = as_read_cancellation(refusal_message("git log", Refusal::Cancelled), false);
     assert!(plain.message().ends_with(CANCELLED_BEFORE_SPAWN));

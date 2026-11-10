@@ -28,9 +28,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::ipc_error::{CommandError, IpcErrorKind};
+
 /// What a cancelled read returns. Its caller has gone, so nobody sees it; it
 /// is an error so that nothing downstream parses, keeps or shares the output.
 pub(crate) const CANCELLED_MESSAGE: &str = "git read cancelled: its caller is gone";
+
+/// The cancellation a read returns, typed where it is produced so that the
+/// failure counter and the IPC edge read its kind, not its words.
+pub(crate) fn cancelled() -> CommandError {
+    CommandError::typed(IpcErrorKind::ReadCancelled, CANCELLED_MESSAGE)
+}
 
 /// Ids longer than this are not registered: the read runs, uncancellable.
 const MAX_ID_LEN: usize = 64;
