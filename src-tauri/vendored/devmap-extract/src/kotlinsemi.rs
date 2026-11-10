@@ -39,6 +39,19 @@
 //! line by a declaration: `class A { .. } class B { .. }` wants one between the
 //! two classes, and the grammar reads the pair as an error until it has it.
 //!
+//! A file both modes leave with an error is tried a last time with a **third
+//! mode**, which also repairs a second shape: a `;` that sits between a property
+//! and its accessor on one line, `var m: Double? = null; private set`. It runs
+//! only after the first two have failed, so by construction it cannot change a
+//! file they repair (`lock(); get()` in a function body is theirs, not this
+//! mode's, and is also refused by the `val`/`var` test below). The grammar
+//! reads the `;` as ending the property, finds a stray `set`, and makes the
+//! whole file an ERROR. The same text with a space for the `;` (or the accessor
+//! on the next line) parses cleanly, so the rewrite writes a **space over that
+//! `;`**: same length, same offsets. The `;` is found as a token of the failed
+//! tree (outside strings and comments) that is followed on its line by an
+//! optional visibility word and `get` or `set`.
+//!
 //! The result is accepted **only if the re-parse is fully clean**. Anything
 //! else, including a deadline, leaves the file exactly as it was: `Partial`.
 //!
@@ -53,7 +66,7 @@ use std::time::Instant;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::model::TextRange;
-use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
+use crate::treesitter::{DEADLINE_CHECK_STRIDE, bounded_parent, parse_until, walk_deadline_passed};
 
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;
@@ -117,12 +130,26 @@ pub(crate) enum Repair {
         tree: Tree,
         ranges: Vec<TextRange>,
         edits: usize,
+        /// How many of `edits` are a `;` before a property accessor, written
+        /// over with a space rather than the other way round.
+        accessors: usize,
         /// The second mode was needed: a separator was written between two
         /// declarations that share a line.
         boundaries: bool,
     },
     /// Nothing changed: the original tree is handed back, with the reason.
     Unchanged { tree: Tree, why: String },
+}
+
+/// Which edits a rewrite may write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A separator before each closing brace that follows code on its line.
+    Separators,
+    /// The above, and one between two declarations that share a line.
+    Boundaries,
+    /// The above, and a space over a `;` before a property accessor.
+    Accessors,
 }
 
 /// Why a rewrite stopped without a clean tree.
@@ -145,18 +172,22 @@ enum Stop {
 /// second mode runs only where the first has already failed, so it cannot
 /// change a file the first repairs.
 pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: Instant) -> Repair {
-    let first = match rewrite(parser, &tree, source, deadline, false) {
-        Ok(done) => return done,
-        Err(stop) => stop,
-    };
-    let why = match first {
-        Stop::Final(why) => why,
-        Stop::Retry(why) => match rewrite(parser, &tree, source, deadline, true) {
+    let mut why = String::new();
+    for mode in [Mode::Separators, Mode::Boundaries, Mode::Accessors] {
+        match rewrite(parser, &tree, source, deadline, mode) {
             Ok(done) => return done,
-            Err(Stop::Final(later)) => later,
-            Err(Stop::Retry(_)) => why,
-        },
-    };
+            Err(Stop::Final(later)) => {
+                // A cap, a deadline or a bad rewrite: nothing else is tried.
+                why = later;
+                break;
+            }
+            Err(Stop::Retry(first)) => {
+                if why.is_empty() {
+                    why = first;
+                }
+            }
+        }
+    }
     Repair::Unchanged { tree, why }
 }
 
@@ -166,8 +197,9 @@ fn rewrite(
     tree: &Tree,
     source: &str,
     deadline: Instant,
-    boundaries: bool,
+    mode: Mode,
 ) -> Result<Repair, Stop> {
+    let boundaries = mode != Mode::Separators;
     let mut text = source.as_bytes().to_vec();
     let mut edited: Vec<usize> = Vec::new();
     let mut current = tree.clone();
@@ -178,14 +210,17 @@ fn rewrite(
                 tree: current,
                 ranges,
                 edits: edited.len(),
+                accessors: edited
+                    .iter()
+                    .filter(|&&at| source.as_bytes()[at] == b';')
+                    .count(),
                 boundaries,
             });
         }
         if pass == MAX_PASSES {
             break;
         }
-        let fresh =
-            candidates(current.root_node(), &text, &edited, boundaries).map_err(Stop::Final)?;
+        let fresh = candidates(current.root_node(), &text, &edited, mode).map_err(Stop::Final)?;
         if fresh.is_empty() {
             return Err(Stop::Retry(
                 "no space before a closing brace is left to write a separator over".into(),
@@ -197,10 +232,12 @@ fn rewrite(
             )));
         }
         for at in fresh {
-            text[at] = b';';
+            // A `;` before an accessor becomes a space; any other site is a
+            // space or tab that becomes a `;`.
+            text[at] = if text[at] == b';' { b' ' } else { b';' };
             edited.push(at);
         }
-        // Only an ASCII space or tab was replaced by an ASCII byte.
+        // Only an ASCII space, tab or `;` was replaced by an ASCII byte.
         let Ok(rewritten) = std::str::from_utf8(&text) else {
             return Err(Stop::Final("the rewritten text is not UTF-8".into()));
         };
@@ -209,7 +246,7 @@ fn rewrite(
             _ => {
                 return Err(Stop::Final(
                     "the re-parse did not finish within the budget".into(),
-                ))
+                ));
             }
         }
     }
@@ -274,15 +311,80 @@ fn boundary_after(text: &[u8], at: usize) -> Option<usize> {
     starts_a_declaration.then_some(at + 1)
 }
 
+/// The offset of the one `;` that lies alone, with blanks, between the end of
+/// the node before and the start of the node at `to`.
+fn semicolon_in_gap(text: &[u8], from: usize, to: usize) -> Option<usize> {
+    let gap = text.get(from..to)?;
+    if gap.len() > 64 || !gap.contains(&b';') {
+        return None;
+    }
+    let mut semicolons = gap.iter().enumerate().filter(|(_, b)| **b == b';');
+    let (first, _) = semicolons.next()?;
+    let alone = semicolons.next().is_none() && gap.iter().all(|b| matches!(b, b' ' | b'\t' | b';'));
+    alone.then_some(from + first)
+}
+
+/// Whether the `;` at `at` ends a property statement: the last `val` or `var`
+/// (a whole word) earlier on its line is followed by no `{`, `(` or `;` before
+/// it, so the `;` is the property's own and not that of a statement in a
+/// function body further along the line.
+fn line_declares_a_property(text: &[u8], at: usize) -> bool {
+    let start = text[..at]
+        .iter()
+        .rposition(|b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |newline| newline + 1);
+    let line = &text[start..at];
+    let is_word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let mut keyword_end = None;
+    let mut from = 0;
+    for word in line.split(|b| !is_word(b)) {
+        let end = from + word.len();
+        if word == b"val" || word == b"var" {
+            keyword_end = Some(end);
+        }
+        from = end + 1;
+    }
+    keyword_end.is_some_and(|end| !line[end..].iter().any(|b| matches!(b, b'{' | b'(' | b';')))
+}
+
+/// Whether the `;` at `at` ends a property on a line that goes on with its
+/// accessor: whitespace, an optional visibility word, then `get` or `set` as a
+/// whole word.
+fn accessor_after(text: &[u8], at: usize) -> bool {
+    if !line_declares_a_property(text, at) {
+        return false;
+    }
+    let skip = |mut next: usize| {
+        while matches!(text.get(next), Some(b' ' | b'\t')) {
+            next += 1;
+        }
+        next
+    };
+    let word_at = |from: usize| {
+        let rest = text.get(from..).unwrap_or_default();
+        let len = rest
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        (&rest[..len], from + len)
+    };
+    let (mut word, end) = word_at(skip(at + 1));
+    if matches!(word, b"private" | b"internal" | b"protected" | b"public") {
+        let after = skip(end);
+        if after == end {
+            return false;
+        }
+        word = word_at(after).0;
+    }
+    matches!(word, b"get" | b"set")
+}
+
 /// The offsets of the spaces to write `;` over: one directly before each
 /// closing `}` that follows code on its line, in the top-level statements that
 /// hold an error, outside strings and comments.
-fn candidates(
-    root: Node,
-    text: &[u8],
-    done: &[usize],
-    boundaries: bool,
-) -> Result<Vec<usize>, String> {
+fn candidates(root: Node, text: &[u8], done: &[usize], mode: Mode) -> Result<Vec<usize>, String> {
+    let boundaries = mode != Mode::Separators;
+    let accessors = mode == Mode::Accessors;
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     // Each node waits with the end of the last sibling before it that is not a
@@ -320,6 +422,27 @@ fn candidates(
         let kind = node.kind();
         if kind.contains("string") || kind.contains("template") || kind.ends_with("comment") {
             continue;
+        }
+        // The failed tree does not show the `;` itself (the grammar consumes it
+        // as a hidden token), but it shows the gap: a `;` between two nodes with
+        // only blanks around it, ending where an accessor starts.
+        if let Some(end) = code_end.filter(|_| accessors) {
+            if let Some(at) = semicolon_in_gap(text, end, node.start_byte()) {
+                if accessor_after(text, at) && !done.contains(&at) {
+                    found.push(at);
+                }
+            }
+        }
+        // Or the grammar kept it: an ERROR node, a property or a `;` token whose
+        // last byte is the `;`.
+        if accessors
+            && (node.is_error() || kind == "property_declaration" || kind == ";")
+            && node.end_byte() > 0
+            && text.get(node.end_byte() - 1) == Some(&b';')
+            && accessor_after(text, node.end_byte() - 1)
+            && !done.contains(&(node.end_byte() - 1))
+        {
+            found.push(node.end_byte() - 1);
         }
         if !node.is_named() && kind == "}" {
             let at = node.start_byte();
@@ -426,6 +549,29 @@ fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `;` of `lock();` after a `val` on the same line ends a statement of a
+    /// function body, not a property: `{`, `(` and `;` lie between the two.
+    #[test]
+    fn a_semicolon_ends_a_property_only_when_no_brace_paren_or_semicolon_lies_between() {
+        let semicolon_after =
+            |text: &str, needle: &str| text.find(needle).map(|at| at + needle.len() - 1).unwrap();
+        let body = b"class A { val x = 1; fun f() { lock(); get() } }";
+        assert!(!accessor_after(
+            body,
+            semicolon_after(std::str::from_utf8(body).unwrap(), "lock();")
+        ));
+        assert!(!line_declares_a_property(
+            body,
+            semicolon_after(std::str::from_utf8(body).unwrap(), "lock();")
+        ));
+        // The property's own `;` still counts.
+        let own = b"class A { var x = 1; private set }";
+        assert!(accessor_after(own, 19));
+        // A `val` after an earlier statement's `;` is the one that is read.
+        let later = b"fun f() { g(); val y = 2; private set }";
+        assert!(line_declares_a_property(later, 24));
+    }
 
     #[test]
     fn the_last_character_is_decoded_not_taken_as_a_byte() {

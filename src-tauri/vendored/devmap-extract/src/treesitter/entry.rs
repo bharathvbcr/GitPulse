@@ -558,19 +558,35 @@ pub(super) fn extract_treesitter_before_deadline(
                         tree,
                         ranges,
                         edits,
+                        accessors,
                         boundaries,
                     } => (
                         ParseAttempt::Parsed(tree),
                         ranges,
-                        Some(format!(
-                            "kotlin one-line class body{}: {edits} separator(s) written over \
-                             spaces so the file parses; offsets are the file's own",
-                            if boundaries {
-                                " (declarations sharing a line)"
-                            } else {
-                                ""
-                            }
-                        )),
+                        Some(if accessors == 0 {
+                            format!(
+                                "kotlin one-line class body{}: {edits} separator(s) written over \
+                                 spaces so the file parses; offsets are the file's own",
+                                if boundaries {
+                                    " (declarations sharing a line)"
+                                } else {
+                                    ""
+                                }
+                            )
+                        } else if edits == accessors {
+                            format!(
+                                "kotlin property accessor: {accessors} `;` before a property \
+                                 accessor replaced by a space so the file parses; offsets are \
+                                 the file's own"
+                            )
+                        } else {
+                            format!(
+                                "kotlin one-line class body: {} separator(s) written over spaces \
+                                 and {accessors} `;` before a property accessor replaced by a \
+                                 space so the file parses; offsets are the file's own",
+                                edits - accessors
+                            )
+                        }),
                     ),
                     crate::kotlinsemi::Repair::Unchanged { tree, why } => (
                         ParseAttempt::Parsed(tree),
@@ -1066,6 +1082,27 @@ pub(super) fn extract_treesitter_before_deadline(
                 // everything below, which reads `extraction.symbols`.
                 if lang == "kotlin" {
                     crate::kotlinloss::recover(&mut extraction, source, &lost, deadline);
+                    // One qualified name is one node, so a property whose id a
+                    // function, a type, an enum entry or an earlier property
+                    // holds is withheld, and the withholding is recorded. After
+                    // the recovery, so a re-derived property is settled too.
+                    let (callable, property, alias) = crate::langdecl::kotlin::settle_property_ids(
+                        source,
+                        &mut extraction.symbols,
+                    );
+                    if callable + property > 0 {
+                        extraction.diagnostics.push(format!(
+                            "kotlin property id withheld: {callable} shared the id of another \
+                             declaration of the same owner (a function, type or enum entry), \
+                             {property} of an earlier property"
+                        ));
+                    }
+                    if alias > 0 {
+                        extraction.diagnostics.push(format!(
+                            "kotlin typealias id withheld: {alias} shared the id of a function \
+                             or type declared in the same file"
+                        ));
+                    }
                 }
 
                 // The code inside a template language's `<script>` blocks, in

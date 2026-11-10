@@ -623,8 +623,11 @@ pub fn inspect_regular(path: &Path) -> io::Result<EntryStatus> {
 }
 
 impl PinnedDir {
+    /// Status of the child `name` by `fstatat(AT_SYMLINK_NOFOLLOW)` on the
+    /// pinned directory; `NotFound` when it is absent, refused when it is not
+    /// a regular file.
     #[cfg(unix)]
-    fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
+    pub fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
         use std::os::fd::AsRawFd;
         check_child_name(name)?;
         let directory = self
@@ -673,7 +676,7 @@ impl PinnedDir {
     }
 
     #[cfg(windows)]
-    fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
+    pub fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
         let file = self.open_file(name, Access::Read, Creation::Never)?;
         let metadata = file.metadata()?;
         Ok(EntryStatus {

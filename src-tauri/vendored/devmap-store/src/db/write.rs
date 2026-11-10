@@ -2813,7 +2813,7 @@ impl BoundStmt {
     fn bind_text(&self, index: i32, text: &str) -> Result<()> {
         let rc = unsafe {
             let (ptr, len) = if text.is_empty() {
-                (b"\0".as_ptr().cast::<std::os::raw::c_char>(), 0)
+                (c"".as_ptr(), 0)
             } else {
                 (
                     text.as_ptr().cast::<std::os::raw::c_char>(),

@@ -7,7 +7,7 @@ use super::*;
 /// The blobs live in the repository state directory, not in sqlite. A resolver
 /// change that alters a file's edges without changing its content hash bumps
 /// this; a mismatch is a miss, and the file is resolved again.
-pub const RESOLUTION_REUSE_EPOCH: &str = "1";
+pub const RESOLUTION_REUSE_EPOCH: &str = "2";
 
 /// One file's resolution before the whole-tree post-pass.
 ///
@@ -1352,7 +1352,7 @@ impl Resolver {
                     {
                         if call.receiver_expr.is_none() {
                             if let Some(target_symbol) = self
-                                .lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                                .lexical_call_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
                                 .filter(|identity| {
                                     !self.file_declares_as(&ext.file_path, identity, |kind| {
                                         Self::never_a_call_target(family, kind)

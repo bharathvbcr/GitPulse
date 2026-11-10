@@ -113,9 +113,14 @@ fn every_language_maps_to_its_own_resolution_family() {
     }
     assert_family("go", LangFamily::Go);
     assert_family("rust", LangFamily::Rust);
-    for lang in ["c", "cpp", "csharp", "java", "objc"] {
+    // The C-like group is one family; Java and C# each have their own. (This
+    // expectation changed with the split: it used to put java and csharp in
+    // `CStyle`.) Metal has no key of its own, it rides `cpp`.
+    for lang in ["c", "cpp", "objc", "cuda"] {
         assert_family(lang, LangFamily::CStyle);
     }
+    assert_family("java", LangFamily::Java);
+    assert_family("csharp", LangFamily::CSharp);
     // An unmapped language falls back rather than joining someone else.
     assert_family("cobol", LangFamily::Generic);
     assert_family("", LangFamily::Generic);
@@ -128,6 +133,8 @@ fn every_language_maps_to_its_own_resolution_family() {
         LangFamily::from_lang("go"),
         LangFamily::from_lang("rust"),
         LangFamily::from_lang("c"),
+        LangFamily::from_lang("java"),
+        LangFamily::from_lang("csharp"),
         LangFamily::from_lang("cobol"),
     ];
     for (index, left) in families.iter().enumerate() {

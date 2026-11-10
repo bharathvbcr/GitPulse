@@ -931,7 +931,8 @@ impl GenerationEdges {
         self.generation
     }
 
-    /// Label the index with the generation its rows came from.
+    /// Label the index with the generation its rows came from. Store-only:
+    /// the store is the one reader that knows.
     pub fn with_generation(mut self, generation: u32) -> Self {
         self.generation = Some(generation);
         self

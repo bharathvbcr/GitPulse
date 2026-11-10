@@ -565,7 +565,7 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::Ruby => RUBY_BUILTINS,
         LangFamily::Php => PHP_BUILTINS,
         LangFamily::Shell => SHELL_BUILTINS,
-        // C/C++/C#/Java have no free-function builtins that reach the resolver
+        // C-like, Java and C# have no free-function builtins that reach the resolver
         // this way, and `Generic` spans languages with no curated set at all.
         //
         // The six added when embedded-script extraction landed
@@ -577,6 +577,8 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         // `length/1` or `echo` as a possible defect and bury the real ones,
         // the exact signal loss SC18 closed.
         LangFamily::CStyle
+        | LangFamily::Java
+        | LangFamily::CSharp
         | LangFamily::Scala
         | LangFamily::Lua
         | LangFamily::R
@@ -1127,8 +1129,8 @@ pub const JAVA_LANG_TYPES: &[&str] = &[
 
 /// Whether `name` is a type `java.lang` supplies to every Java file.
 ///
-/// Language-specific, not family-specific: `LangFamily::CStyle` is also C, C++,
-/// C# and Objective-C, whose `String` and `Object` are other types. The caller
+/// Language-specific, not family-specific: C, C++, C# and Objective-C have
+/// `String` and `Object` of their own, other types. The caller
 /// establishes that the file is Java, and that no JVM-language file of the
 /// corpus declares the name.
 pub fn is_java_lang_type(name: &str) -> bool {
@@ -1741,6 +1743,8 @@ mod tests {
             LangFamily::Python,
             LangFamily::Rust,
             LangFamily::CStyle,
+            LangFamily::Java,
+            LangFamily::CSharp,
             LangFamily::Generic,
         ] {
             assert_eq!(
@@ -1910,6 +1914,8 @@ mod tests {
 
         // Families with no curated set must classify nothing.
         assert!(!is_builtin(LangFamily::CStyle, "len"));
+        assert!(!is_builtin(LangFamily::Java, "len"));
+        assert!(!is_builtin(LangFamily::CSharp, "len"));
         assert!(!is_builtin(LangFamily::Generic, "print"));
 
         // Library API is never a builtin: these must stay visible as genuine

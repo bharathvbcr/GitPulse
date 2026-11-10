@@ -1215,9 +1215,9 @@ impl Store {
     }
 
     /// Materialize and atomically write the `<db_path>.csr` zero-copy mmap sidecar
-    /// for the store's latest generation, propagating filesystem/serialization errors.
-    /// Returns `Ok(None)` for an in-memory store, a read-only store, or a store with
-    /// no generations.
+    /// for the store's latest generation, propagating filesystem and serialization
+    /// errors. Returns `Ok(None)` for an in-memory store, a read-only store, or a
+    /// store with no generations.
     pub fn write_latest_csr_sidecar_strict(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
         if self.read_only {
             return Ok(None);
@@ -1253,13 +1253,15 @@ impl Store {
     }
 
     /// Best-effort wrapper around [`Self::write_latest_csr_sidecar_strict`] for
-    /// opportunistic read-time caching where a read-only directory is non-fatal,
-    /// while still surfacing SQLite errors from reading the generation edges.
+    /// opportunistic read-time caching, where an unwritable directory is not
+    /// fatal. Errors from reading the generation's edges out of SQLite are still
+    /// surfaced; only the filesystem write is best-effort.
     pub fn write_latest_csr_sidecar(&self) -> Result<Option<std::path::PathBuf>> {
         if self.read_only || self.db_path.is_none() {
             return Ok(None);
         }
-        let _ = self.generation_edges_with_id()?;
+        // A store with no readable edges is an error, not a missing sidecar.
+        self.generation_edges_with_id()?;
         Ok(self.write_latest_csr_sidecar_strict().ok().flatten())
     }
 

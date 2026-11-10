@@ -498,6 +498,20 @@ impl Store {
     /// recover. This is the missing write: same generation id, same hashes,
     /// current HEAD.
     pub fn restamp_latest_head(&self, head_sha: &str) -> Result<()> {
+        self.restamp_head(head_sha, true)
+    }
+
+    /// [`Self::restamp_latest_head`] for a store seeded copy-on-write that has
+    /// not yet written a generation of its own: the stamp moves, and the seed
+    /// rebind and the donor's historical `generations.repo_root` rows stay as
+    /// they are, so the history keeps sharing pages with the donor. The first
+    /// generation the store writes normalises them, as it does for any seeded
+    /// store.
+    pub fn restamp_latest_head_keeping_seed_rebind(&self, head_sha: &str) -> Result<()> {
+        self.restamp_head(head_sha, false)
+    }
+
+    fn restamp_head(&self, head_sha: &str, normalize_seed_rebind: bool) -> Result<()> {
         self.refuse_if_read_only()?;
         validate_head_sha(head_sha)?;
         let mut conn = lock_conn(&self.conn)?;
@@ -512,15 +526,17 @@ impl Store {
                 "no generation to restamp: nothing has been indexed yet — run `devmap build`",
             ));
         }
-        let owner: Option<String> = tx
-            .query_row(
-                "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        Self::clear_seed_rebind_and_normalize_generations(&tx, owner.as_deref())?;
+        if normalize_seed_rebind {
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT NULLIF(repo_root, '') FROM pending_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            Self::clear_seed_rebind_and_normalize_generations(&tx, owner.as_deref())?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -533,6 +549,7 @@ impl Store {
     /// once this returns true. `false` means a full rebuild (or a drain that
     /// re-reads the tree) is required; an error means the question could not
     /// be asked, which callers must treat as "do not skip".
+    #[cfg(feature = "parse")]
     pub fn latest_generation_matches_working_tree(&self) -> Result<bool> {
         if !self.latest_generation_payload_is_current()? {
             return Ok(false);

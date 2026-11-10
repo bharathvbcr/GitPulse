@@ -415,10 +415,7 @@ impl Store {
         if stamped == 0 || !Self::schema_is_migratable(stamped) {
             return Ok(());
         }
-        let owner = match Self::stored_repo_root(&conn, stamped) {
-            Ok(owner) => owner,
-            Err(error) => return Err(error),
-        };
+        let owner = Self::stored_repo_root(&conn, stamped)?;
         match Self::classify_owner(owner, &root)? {
             RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, &root)),
             RepoRootOwner::Unbound | RepoRootOwner::Same | RepoRootOwner::Gone(_) => Ok(()),

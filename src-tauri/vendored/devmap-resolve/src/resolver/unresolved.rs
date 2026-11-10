@@ -20,8 +20,45 @@ impl Resolver {
         caller: Option<&str>,
         name: &str,
     ) -> Option<String> {
+        self.lexical_scope_target(file, family, caller, name, false)
+    }
+
+    /// [`Self::lexical_target`] for a bare **call**: a Kotlin property of an
+    /// enclosing class is skipped and the walk goes on outward. `val log = "t"`
+    /// in a class does not hide a top-level `fun log()` from `log("x")`, because
+    /// a call can only reach the function (a property is reached through a
+    /// receiver, and the walk is otherwise stopped by it and refused by the
+    /// call filter). Accepted residual: a function-typed property whose type is
+    /// not indexed is called by Kotlin where this binds the outer function.
+    pub(super) fn lexical_call_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        self.lexical_scope_target(file, family, caller, name, true)
+    }
+
+    fn lexical_scope_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        name: &str,
+        for_a_call: bool,
+    ) -> Option<String> {
         // Absent everywhere: no scope can declare it.
-        self.symbol_index.get(name)?;
+        let declared = self.symbol_index.get(name)?;
+        // A Kotlin `typealias` spells a type declared elsewhere: a use of its
+        // name reaches that declaration, as it did before the alias was a node
+        // (see `drop_kotlin_aliases_shadowing_a_declaration`), so a same-file
+        // alias must not hide it from the walk.
+        let alias_spells_a_class = family == LangFamily::Kotlin
+            && declared.iter().any(|(_, kind, declared_family, _)| {
+                *declared_family == LangFamily::Kotlin
+                    && Self::kotlin_declaration_an_alias_yields_to(*kind)
+            });
         let mut scope = caller.unwrap_or(file);
         for _ in 0..1024 {
             let mut candidates = self
@@ -31,6 +68,14 @@ impl Resolver {
                 .flatten()
                 .filter(|(kind, _)| {
                     !Self::family_needs_explicit_receiver(family) || *kind != SymbolKind::Method
+                })
+                .filter(|(kind, _)| !(for_a_call && Self::is_kotlin_member_property(family, *kind)))
+                // The right-hand side of `typealias T = pkg.T` names another
+                // declaration, never the alias it sits in.
+                .filter(|(kind, identity)| {
+                    !(family == LangFamily::Kotlin
+                        && *kind == SymbolKind::Struct
+                        && (alias_spells_a_class || Some(identity.as_ref()) == caller))
                 })
                 .map(|(_, identity)| identity.as_ref());
             if let Some(first) = candidates.next() {
@@ -426,7 +471,7 @@ impl Resolver {
                 }
                 // J-T1, the last route of a Java type name: declaration, same
                 // package and imports have all failed, so `java.lang` is what is
-                // left. `CStyle` is C, C++ and C# too, so it is the Java *file*
+                // left. C, C++ and C# have a `String` of their own, so it is the Java *file*
                 // that gates the table, and a JVM-language declaration of the
                 // name anywhere in the corpus keeps the miss unexplained: it may
                 // be a bind failure, not the JDK's type. A namesake in another

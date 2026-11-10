@@ -351,6 +351,10 @@ impl Resolver {
             // property surface. A typed or implicit `self` receiver reaches it
             // through `type_methods`, which this does not touch.
             || Self::is_swift_member_property(family, kind)
+            // A Kotlin property is the same shape: a member its owner's
+            // receiver names. `val size` beside a call `size()` is not an edge
+            // (ft-4617a335), and a Kotlin enum entry is never called bare.
+            || Self::is_kotlin_member_property(family, kind)
             || (kind == SymbolKind::Interface
                 && matches!(
                     family,
@@ -363,6 +367,13 @@ impl Resolver {
     /// case (the two share `Field`).
     pub(super) fn is_swift_member_property(family: LangFamily, kind: SymbolKind) -> bool {
         family == LangFamily::Swift && kind == SymbolKind::Field
+    }
+
+    /// Whether a symbol of `kind` in `family` is a Kotlin member or top-level
+    /// property (or enum entry, which shares `Field`): reached through a
+    /// receiver or a `Type.NAME` reference, never by calling its bare name.
+    pub(super) fn is_kotlin_member_property(family: LangFamily, kind: SymbolKind) -> bool {
+        family == LangFamily::Kotlin && kind == SymbolKind::Field
     }
 
     /// Swift use edges whose target is not the identity of a symbol the target

@@ -500,6 +500,15 @@ pub struct PendingWatermark {
     revision: i64,
 }
 
+impl PendingWatermark {
+    /// The store's per-creation epoch: 32 lowercase hex characters minted once
+    /// when the store is created. A store deleted and rebuilt gets a new one,
+    /// so it tells two stores apart that share a generation id and `HEAD`.
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+}
+
 /// One pending row claimed for a drain attempt.
 ///
 /// `queued_at` is diagnostic only. The store epoch and monotonic revision

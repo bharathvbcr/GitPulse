@@ -242,13 +242,21 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
+        // Admit through a short-lived immutable peek that closes here, so a
+        // schema this reader cannot use is refused before any connection can
+        // create `-wal`/`-shm`.
+        Self::admit_store_for_read(path)?;
         let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Immutable when no `-wal` exists. A plain read-only open of a WAL
-        // database creates `-wal` and `-shm`, which is a write from a command
-        // that was asked only to read.
-        let mut conn = Self::open_owner_peek(path)?;
+        // The `Store` returned here is held by long-lived readers (the MCP
+        // cache keeps one per path), so it is a plain read-only connection that
+        // takes locks and follows a writer committing in place. `?immutable=1`
+        // disables change detection and must never back such a reader.
+        let mut conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         Self::harden_connection(&conn)?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let first_read = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
@@ -256,6 +264,14 @@ impl Store {
         let stamped: i32 = match first_read {
             Ok(version) => version,
             Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                // The one case that still hands out an immutable reader: the
+                // directory cannot hold `-wal`/`-shm`, so a live reader is
+                // impossible. It will not see a later write; say so.
+                eprintln!(
+                    "devmap-store: {} is in a directory that cannot hold WAL sidecars; \
+                     opened immutable, so this reader will not see later writes",
+                    path.display()
+                );
                 conn = Self::open_immutable(path)?;
                 conn.busy_timeout(Self::BUSY_TIMEOUT)?;
                 conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
@@ -1071,10 +1087,35 @@ impl Store {
         db_path: P,
         repo_root_override: Option<String>,
     ) -> Result<Self> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
             .map_err(|error| refusal(error.to_string()))?;
-        let path = resolved.as_path();
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        let file = SafeFile::open(&resolved, Access::Read, Creation::Never).map_err(|error| {
+            refusal(format!(
+                "cannot open immutable snapshot {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        Self::open_immutable_snapshot_file(&file, &resolved, repo_root_override)
+    }
+
+    /// [`Self::open_immutable_snapshot`] for a file the caller already holds.
+    ///
+    /// On macOS the connection is bound to `file`'s descriptor (`/dev/fd/N`,
+    /// which is not a symlink there), so renaming, replacing or deleting the name
+    /// `label` before or after the open cannot change what the store reads. On
+    /// Linux `/dev/fd/N` is a symlink into `/proc/self/fd`, which SQLite resolves
+    /// to a name, so the open is path-bound there: callers rely on that name
+    /// being inside a directory only the owner writes (the lane's own `stack/`).
+    /// `label` is the name the store reports and where its sidecars would sit.
+    /// Elsewhere the connection opens `label`.
+    pub fn open_immutable_snapshot_file(
+        file: &std::fs::File,
+        label: &Path,
+        repo_root_override: Option<String>,
+    ) -> Result<Self> {
+        let path = label;
+        let metadata = file.metadata().map_err(|error| {
             refusal(format!(
                 "cannot inspect immutable snapshot {}: {error}",
                 path.display()
@@ -1133,6 +1174,12 @@ impl Store {
         let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(unix)]
+        let conn = {
+            use std::os::fd::AsRawFd;
+            Self::open_immutable(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?
+        };
+        #[cfg(not(unix))]
         let conn = Self::open_immutable(path)?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

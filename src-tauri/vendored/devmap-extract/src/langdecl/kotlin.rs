@@ -1,6 +1,6 @@
 //! Kotlin declarations.
 //!
-//! Three shapes the generic path could not read, each verified against
+//! Four shapes the generic path could not read, each verified against
 //! tree-sitter-kotlin-ng's own parse tree:
 //!
 //! * `class`, `interface` and `enum class` are all `class_declaration`. The word
@@ -14,17 +14,34 @@
 //!   the `name` field. Reading only `name` emitted `Main.kt::extra` and lost the
 //!   receiver, which is the identity Go receivers keep under SC9 and Rust `impl`
 //!   methods under SC11.
+//! * A property is a `Field` keyed on its **name node**, not on the
+//!   `property_declaration`: see [`property_declaring_node`].
 
 use tree_sitter::Node;
 
-use crate::model::{SymbolKind, WiringKind};
-use crate::treesitter::{get_child_text, get_node_text};
+use crate::model::{ExtractedSymbol, SymbolKind, WiringKind};
+use crate::treesitter::{bounded_parent, get_child_text, get_node_text};
 
-use super::{enclosing_owner, Declaration};
+use super::{Declaration, enclosing_owner};
 
 /// A Kotlin declaration, or `None` when `node` declares nothing this graph
 /// records.
 pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
+    // A property is keyed on its name node, which is a leaf: it can never be
+    // the nearest enclosing declaration of a call, so the initializer of a
+    // property keeps being attributed to the class or file around it.
+    if let Some(property) = property_declaring_node(node, source) {
+        // `private` is the one visibility the extractor can act on (see
+        // `is_exported`): a private property would be an unexported `Field` and
+        // so a dead-code candidate, because a read of it is not an edge.
+        if !is_exported(property, source) {
+            return None;
+        }
+        // Owned by the class's bare name, as a method is: a read writes
+        // `trip.name` against the type. Only an enum entry takes the full path.
+        let owner = enclosing_owner(node, source, self_identity);
+        return Declaration::new(SymbolKind::Field, owner, get_node_text(node, source));
+    }
     let (declared_kind, name) = self_identity(node, source)?;
     // An extension function belongs to the type it extends, not to the file:
     // `fun Person.extra()` is called as `person.extra()` and must join to
@@ -62,6 +79,13 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         "function_declaration" => {
             Some((SymbolKind::Function, get_child_text(node, "name", source)?))
         }
+        // `typealias Id = Long`, `actual typealias P = Path`. The grammar puts
+        // the alias's own name in the field called `type` (the aliased type is
+        // an unnamed `type` child), so `name` would read nothing. `Struct`, as
+        // Go's `type_alias` is: an alias of a class is constructible by name
+        // (`typealias Pt = Pair<Int, Int>; Pt(1, 2)`), and a `Struct` is a call
+        // candidate where an `Interface` is not.
+        "type_alias" => Some((SymbolKind::Struct, get_child_text(node, "type", source)?)),
         // `val Task.label: String get() = …` is an extension property: a
         // callable keyed by its receiver exactly like an extension function, and
         // the only kind of Kotlin property that is a symbol here. An ordinary
@@ -87,6 +111,190 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         }
         _ => None,
     }
+}
+
+/// The `property_declaration` or `class_parameter` that `name` is the name of,
+/// when it declares a **member or top-level property**.
+///
+/// * `val`/`var` written directly in a class, interface, enum, object or
+///   companion body, or at file level.
+/// * A primary-constructor parameter that carries `val` or `var`.
+///
+/// Anything else is not a symbol here: a `val` inside a function, accessor,
+/// initializer or lambda is a local the scope pass binds; a destructuring
+/// declaration (`val (a, b) = pair`, whose names sit in a
+/// `multi_variable_declaration`) names no single property; an extension
+/// property is already a callable; and a property of an anonymous
+/// `object : T { }` belongs to no named owner. Requiring the declaration's
+/// *direct* parent to be a body is what keeps a `val` in a getter from being
+/// read as a member of the type that getter belongs to.
+pub(crate) fn property_declaring_node<'t>(name: Node<'t>, source: &str) -> Option<Node<'t>> {
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let parent = bounded_parent(name)?;
+    let first_identifier = |of: Node<'_>| {
+        let mut cursor = of.walk();
+        let first = of
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "identifier");
+        first.is_some_and(|first| first.id() == name.id())
+    };
+    match parent.kind() {
+        "variable_declaration" => {
+            let declaration = bounded_parent(parent)?;
+            (declaration.kind() == "property_declaration"
+                && first_identifier(parent)
+                && extension_property_receiver(declaration).is_none()
+                && is_member_or_top_level(declaration, source))
+            .then_some(declaration)
+        }
+        "class_parameter" => {
+            let stored = parent
+                .children(&mut parent.walk())
+                .any(|child| matches!(child.kind(), "val" | "var"));
+            let parameters = bounded_parent(parent)?;
+            let constructor = bounded_parent(parameters)?;
+            let class = bounded_parent(constructor)?;
+            (stored
+                && first_identifier(parent)
+                && parameters.kind() == "class_parameters"
+                && constructor.kind() == "primary_constructor"
+                && is_named_owner(class, source))
+            .then_some(parent)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a property declaration sits at file level or directly in the body of
+/// a named owner.
+fn is_member_or_top_level(declaration: Node<'_>, source: &str) -> bool {
+    let Some(container) = bounded_parent(declaration) else {
+        return false;
+    };
+    match container.kind() {
+        "source_file" => true,
+        "class_body" | "enum_class_body" => {
+            bounded_parent(container).is_some_and(|owner| is_named_owner(owner, source))
+        }
+        _ => false,
+    }
+}
+
+/// A class, object or companion whose members belong to a name. The wrapper the
+/// loss recovery puts a swallowed statement in owns nothing, so what it holds is
+/// top level, exactly as `self_identity` names it.
+fn is_named_owner(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "class_declaration" => {
+            node.child_by_field_name("name").is_some()
+                || crate::kotlinloss::is_recovery_wrapper(node, source)
+        }
+        "object_declaration" => node.child_by_field_name("name").is_some(),
+        "companion_object" => true,
+        _ => false,
+    }
+}
+
+/// One qualified name is one node (SC14), so a property whose id is already
+/// taken is withheld: a `val size` beside a `fun size()` (Kotlin allows both in
+/// one class, and a `val Foo` beside a `class Foo`) leaves the id to the
+/// declaration that is not a property; among properties with one id (an outer
+/// `val z` and a companion's `val z`, both `Holder.z`) the first in source order
+/// keeps it.
+///
+/// A `typealias` (the one Kotlin `Struct`) is withheld the same way when a
+/// callable or type holds its id: `typealias Pt = Pair<Int, Int>` beside
+/// `fun Pt(x: Int): Pt`, the fake-constructor idiom, is one id and the
+/// declaration that is not an alias keeps it.
+///
+/// Returns `(withheld for a non-property, withheld for an earlier property,
+/// aliases withheld)`.
+/// Runs on the symbols the walk emitted, which are in source order; only a
+/// group with a duplicate id is looked at, so a file with none pays one hash
+/// pass.
+pub(crate) fn settle_property_ids(
+    source: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) -> (usize, usize, usize) {
+    let mut by_id: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (at, symbol) in symbols.iter().enumerate() {
+        by_id
+            .entry(symbol.qualified_name.as_str())
+            .or_default()
+            .push(at);
+    }
+    let mut drop = vec![false; symbols.len()];
+    let (mut by_callable, mut by_property, mut by_declaration) = (0, 0, 0);
+    for group in by_id.values().filter(|group| group.len() > 1) {
+        let is_alias = |at: usize| symbols[at].kind == SymbolKind::Struct;
+        let mut group = group.clone();
+        if group.iter().any(|&at| !is_alias(at)) {
+            for &at in group.iter().filter(|&&at| is_alias(at)) {
+                drop[at] = true;
+                by_declaration += 1;
+            }
+            group.retain(|&at| !is_alias(at));
+        }
+        let mut properties: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&at| is_property_symbol(source, &symbols[at]))
+            .collect();
+        if properties.is_empty() {
+            continue;
+        }
+        // Source order, not vector order: a recovered declaration is appended
+        // after the walk's own symbols.
+        properties.sort_by_key(|&at| symbols[at].span.start_byte);
+        let others = group.len() - properties.len();
+        let keep = usize::from(others == 0);
+        for &at in &properties[keep..] {
+            drop[at] = true;
+            if others > 0 {
+                by_callable += 1;
+            } else {
+                by_property += 1;
+            }
+        }
+    }
+    if by_callable + by_property + by_declaration > 0 {
+        let mut at = 0;
+        symbols.retain(|_| {
+            at += 1;
+            !drop[at - 1]
+        });
+    }
+    (by_callable, by_property, by_declaration)
+}
+
+/// Whether `symbol` is a property: a `Field` whose name is written directly
+/// after `val` or `var` (a constructor parameter and a body property both are;
+/// an enum entry follows a `,`, `{` or `;`). Read from the symbol and the file
+/// text rather than from a tree, so a declaration the loss recovery re-derived
+/// from a wrapper, whose outer tree holds an ERROR there, is judged like any
+/// other, and no flag has to be added to every symbol.
+///
+/// Known residual (not fixed): a comment between `val`/`var` and the name
+/// (`val /*x*/ n`) hides the keyword from the `trim_end` read, so such a field
+/// is not seen as a property and is not settled against a function of its id.
+fn is_property_symbol(source: &str, symbol: &ExtractedSymbol) -> bool {
+    if symbol.kind != SymbolKind::Field {
+        return false;
+    }
+    let Some(before) = source.get(..symbol.span.start_byte) else {
+        return false;
+    };
+    let before = before.trim_end();
+    ["val", "var"].iter().any(|word| {
+        before.strip_suffix(word).is_some_and(|rest| {
+            !rest
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    })
 }
 
 /// `class`, `interface` or `enum class`, read from the tokens the grammar keeps
@@ -187,6 +395,8 @@ fn extension_property_receiver(node: Node) -> Option<Node> {
 /// `protected` is not claimed either: its callers are subclasses, which can be
 /// declared in any module that depends on this one.
 pub(crate) fn is_exported(node: Node, source: &str) -> bool {
+    // A property symbol's node is its name; the modifiers are the declaration's.
+    let node = property_declaring_node(node, source).unwrap_or(node);
     visibility_modifier(node, source).as_deref() != Some("private")
 }
 

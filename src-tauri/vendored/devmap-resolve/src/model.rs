@@ -9,7 +9,18 @@ pub enum LangFamily {
     JsTs,
     Go,
     Rust,
+    /// The C-like group: C, C++, Objective-C and CUDA (Metal rides the `cpp`
+    /// grammar key). The identifier is kept from when Java and C# shared it,
+    /// so ledger text (`family CStyle`) and serialized rows for this group are
+    /// unchanged; only Java and C# rows moved, to [`Self::Java`] and
+    /// [`Self::CSharp`].
     CStyle,
+    /// Java. Not link-compatible with the C-like group or with C#, so a bare
+    /// call here never binds a declaration there. Kotlin reaches Java through
+    /// the JVM bridge (`jvm_qualified_member`), which is not family equality.
+    Java,
+    /// C#. See [`Self::Java`].
+    CSharp,
     /// Swift and Kotlin are primary languages for this repository and each gets
     /// its own bucket rather than sharing `Generic`.
     ///
@@ -67,7 +78,9 @@ impl LangFamily {
             // `cuda_forward` call sat in `generation_unresolved` while an
             // otherwise identical C->C cross-file call resolved. Metal needs no
             // entry here — it rides the `cpp` grammar key.
-            "c" | "cpp" | "csharp" | "java" | "objc" | "cuda" => LangFamily::CStyle,
+            "c" | "cpp" | "objc" | "cuda" => LangFamily::CStyle,
+            "java" => LangFamily::Java,
+            "csharp" => LangFamily::CSharp,
             // Template languages whose code lives in an embedded `<script>`.
             //
             // `crates/devmap-extract/src/embedded.rs` routes those regions back
