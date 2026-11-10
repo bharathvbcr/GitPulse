@@ -752,6 +752,13 @@ mod mac {
   await step('bounds', 'cmd_browser_set_bounds', {{ id, bounds: {{ x: 7, y: 8, width: 200, height: 100 }} }});
   await step('hide', 'cmd_browser_set_visible', {{ id, visible: false }});
   await step('navigate', 'cmd_browser_navigate', {{ id, url: '{child}?again' }});
+  // navigate returns once the load is requested. A reload issued while it is
+  // still provisional cancels it and reloads `/child` (seen at load ~50,
+  // 2026-11-10), so wait, bounded, for the navigated page to finish loading.
+  const landed = (e) => e.id === id && e.kind === 'loaded' && String(e.url).endsWith('?again');
+  for (let waited = 0; waited < 10000 && !r.events.some(landed); waited += 50) {{
+    await new Promise((done) => setTimeout(done, 50));
+  }}
   await step('remote', 'cmd_browser_navigate', {{ id, url: 'https://example.com/' }});
   await step('go', 'cmd_browser_go', {{ id, to: 'reload' }});
   await step('badGo', 'cmd_browser_go', {{ id, to: 'home' }});
