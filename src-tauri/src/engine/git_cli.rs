@@ -32,6 +32,14 @@ mod thread_io;
 
 mod shared_budget;
 
+pub(crate) mod read_cancel;
+
+#[cfg(test)]
+mod read_cancel_tests;
+
+#[cfg(test)]
+mod alloc_probe;
+
 #[cfg(test)]
 mod awaiting_adversarial_tests;
 
@@ -4669,6 +4677,15 @@ struct SharedReadKey {
 struct SharedRead {
     result: Mutex<Option<Result<BoundedRun, CommandError>>>,
     done: Condvar,
+    /// Every request waiting on this flight, the leader's first. A request
+    /// that named no id is `None` and waits for good, so a flight with one is
+    /// never cancelled; otherwise the flight is cancelled when every flag is
+    /// set (see [`abandon_if_all_gone`]). Pushed only while the table is held.
+    waiters: Mutex<Vec<Option<read_cancel::ReadCancel>>>,
+    /// Set, with the flight leaving the table, by the decision to cancel it.
+    /// A flight that is abandoned is never joined: a caller that arrives
+    /// later, however it found the flight, starts a read of its own.
+    abandoned: std::sync::atomic::AtomicBool,
     /// Where this flight's joiners go when its leader's deadline passed
     /// before theirs: the one flight that asks again for all of them, set by
     /// the first to arrive. It stays reachable from here after the gate has
@@ -4682,8 +4699,73 @@ impl SharedRead {
         Arc::new(Self {
             result: Mutex::new(None),
             done: Condvar::new(),
+            waiters: Mutex::new(Vec::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             retry: Mutex::new(None),
         })
+    }
+}
+
+/// How often a joiner looks at its own cancel flag while it waits for the
+/// leader's answer.
+const JOINER_CANCEL_POLL: Duration = Duration::from_millis(20);
+
+/// Cancels `flight` if every request waiting on it has been cancelled, and
+/// says whether it is (now or already) cancelled.
+///
+/// The decision and the flight's leaving the table are one step under the
+/// table lock, which is also what a joiner holds while it joins and registers
+/// itself: a joiner is either counted here, and the flight lives, or it comes
+/// after and finds no flight, and starts a read of its own. Nobody inherits a
+/// cancellation.
+fn abandon_if_all_gone(key: &SharedReadKey, flight: &Arc<SharedRead>) -> bool {
+    use std::sync::atomic::Ordering;
+    if flight.abandoned.load(Ordering::Acquire) {
+        return true;
+    }
+    let all_gone = |waiters: &[Option<read_cancel::ReadCancel>]| {
+        waiters
+            .iter()
+            .all(|waiter| waiter.as_ref().is_some_and(read_cancel::ReadCancel::is_cancelled))
+    };
+    // Without the table: nearly every poll of a flight someone still wants.
+    if !all_gone(
+        &flight
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ) {
+        return false;
+    }
+    let mut reads = shared_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let waiters = flight
+        .waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !all_gone(&waiters) {
+        return false;
+    }
+    flight.abandoned.store(true, Ordering::Release);
+    if reads
+        .get(key)
+        .is_some_and(|entry| Arc::ptr_eq(entry, flight))
+    {
+        reads.remove(key);
+    }
+    true
+}
+
+/// The leader's observer: the child stops when nobody waits for its answer.
+struct FlightObserver<'a> {
+    key: &'a SharedReadKey,
+    flight: &'a Arc<SharedRead>,
+}
+
+impl ProcessObserver for FlightObserver<'_> {
+    fn cancelled(&self) -> bool {
+        abandon_if_all_gone(self.key, self.flight)
     }
 }
 
@@ -4711,6 +4793,8 @@ fn run_read_shared(
 ) -> Result<BoundedRun, CommandError> {
     let deadline = Instant::now() + timeout;
     let mut attempt = timeout;
+    // The request this thread is serving, if its caller can cancel it.
+    let cancel = read_cancel::current();
     // The flight whose leader timed out last, and the longest prefix any such
     // leader printed: a keeping caller's rerun may reach its deadline with
     // less than that.
@@ -4725,6 +4809,7 @@ fn run_read_shared(
             stdout_cap,
             gate,
             after.as_ref(),
+            cancel.as_ref(),
         ) {
             SharedAttempt::Done(result) => result,
             SharedAttempt::LeaderTimedOut { flight, printed } => {
@@ -4845,6 +4930,7 @@ fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, Comman
     Err(error)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_read_shared_once(
     cmd: &mut Command,
     label: &str,
@@ -4853,15 +4939,22 @@ fn run_read_shared_once(
     stdout_cap: usize,
     gate: &'static SpawnGate,
     after: Option<&Arc<SharedRead>>,
+    cancel: Option<&read_cancel::ReadCancel>,
 ) -> SharedAttempt {
     let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
+        // Never shared, so its one waiter is its own request.
+        let mut own = cancel.map(read_cancel::OwnCancel);
+        let observer: &mut dyn ProcessObserver = match own.as_mut() {
+            Some(observer) => observer,
+            None => &mut (),
+        };
         return SharedAttempt::Done(run_with_gate(
             cmd,
             label,
             timeout,
             None,
             stdout_cap,
-            &mut (),
+            observer,
             gate,
         ));
     };
@@ -4886,10 +4979,17 @@ fn run_read_shared_once(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        // A flight that was cancelled is joined by no one, however it is found.
+        let live = |flight: &Arc<SharedRead>| {
+            !flight
+                .abandoned
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
         let known = retry
             .as_deref()
             .and_then(Clone::clone)
-            .or_else(|| reads.get(&key).cloned());
+            .filter(live)
+            .or_else(|| reads.get(&key).cloned().filter(live));
         let (flight, leader) = match known {
             Some(flight) => (flight, false),
             None => {
@@ -4899,8 +4999,17 @@ fn run_read_shared_once(
             }
         };
         if let Some(slot) = retry.as_deref_mut() {
-            slot.get_or_insert_with(|| Arc::clone(&flight));
+            if slot.as_ref().is_none_or(|held| !live(held)) {
+                *slot = Some(Arc::clone(&flight));
+            }
         }
+        // Counted as a waiter in the same step that found the flight, so the
+        // decision to cancel it (also under the table) sees this request.
+        flight
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(cancel.cloned());
         (flight, leader)
     };
     if !leader {
@@ -4912,24 +5021,38 @@ fn run_read_shared_once(
         // The leader always publishes, even when it panics (`Publish`), but
         // its child may outlast this caller's deadline: wait no longer than
         // that. An answer that is there wins over a deadline that has just
-        // passed. There is no cancel on this path to poll: the read runs
-        // without an observer, so only the deadline bounds the wait.
+        // passed. A joiner whose own request is cancelled leaves at once and
+        // the leader runs on for whoever still waits (the leader stops only
+        // when all of them have left, see [`abandon_if_all_gone`]).
+        let mut left_by_cancel = false;
         let shared = loop {
             if let Some(shared) = result.as_ref() {
                 break Some(shared.clone());
+            }
+            if cancel.is_some_and(read_cancel::ReadCancel::is_cancelled) {
+                left_by_cancel = true;
+                break None;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break None;
             }
+            let slice = if cancel.is_some() {
+                left.min(JOINER_CANCEL_POLL)
+            } else {
+                left
+            };
             result = flight
                 .done
-                .wait_timeout(result, left)
+                .wait_timeout(result, slice)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         };
         drop(result);
         let Some(shared) = shared else {
+            if left_by_cancel {
+                return SharedAttempt::Done(Err(read_cancel::CANCELLED_MESSAGE.into()));
+            }
             return SharedAttempt::Done(deadline_expired(label, timeout));
         };
         if is_deadline_outcome(&shared) && Instant::now() < deadline {
@@ -4976,13 +5099,19 @@ fn run_read_shared_once(
         label,
         outcome: None,
     };
+    // The leader's observer is the flight's, not its own request's: the child
+    // serves every waiter, so it stops when none is left.
+    let mut observer = FlightObserver {
+        key: &key,
+        flight: &flight,
+    };
     let outcome = run_admitted(
         cmd,
         label,
         timeout,
         None,
         stdout_cap,
-        &mut (),
+        &mut observer,
         gate,
         &|| close_shared_read(&key, &flight),
     );
@@ -6098,17 +6227,39 @@ fn git_run_inner(
     // whole stream (`git_timeout`, `git_text_shared`) still turn that prefix
     // into an error. Callers that opted into a cap (pulse) show it.
     let _keep_deadline_prefix = KeepDeadlinePrefix::enter();
+    // The request this thread serves, when its caller can cancel it (see
+    // [`read_cancel`]). A command that runs hooks is a write and has its own
+    // cancel, so it never takes this one.
+    let cancel = read_cancel::current().filter(|_| hooked.is_none());
     loop {
+        // A cancelled request starts nothing more: a reader that falls back to
+        // a second command when the first fails must not spawn it for a caller
+        // who has gone.
+        if cancel.as_ref().is_some_and(read_cancel::ReadCancel::is_cancelled) {
+            return Err(read_cancel::CANCELLED_MESSAGE.into());
+        }
         let cmd = git_command(repo, args);
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()).into());
         }
         // A hook-running command is cancellable and can write, so it is
-        // never shared whatever the caller asked: the shared path has no
-        // observer to poll.
+        // never shared whatever the caller asked. A shared read observes its
+        // flight (see [`FlightObserver`]); one that is not shared observes
+        // its own request.
         let mut out = if shared && stdin_bytes.is_none() && hooked.is_none() {
             run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
+        } else if let Some(cancel) = &cancel {
+            let mut cmd = cmd;
+            let mut observer = read_cancel::OwnCancel(cancel);
+            run_observed(
+                &mut cmd,
+                &label,
+                remaining,
+                stdin_bytes,
+                stdout_cap,
+                &mut observer,
+            )?
         } else if let Some((_, run)) = &hooked {
             let mut cmd = cmd;
             let mut observer = HookObserver(run);
@@ -6130,6 +6281,11 @@ fn git_run_inner(
             if let Some(Incomplete::Deadline { message, .. }) = &mut out.incomplete {
                 *message = hooks::timeout_message(repo, sub, message);
             }
+        } else if out.cancelled {
+            // Stopped because nobody waits for it. Not a result: the output
+            // is a partial stream, and an error is what keeps every caller
+            // from parsing, keeping or sharing it as one.
+            return Err(read_cancel::CANCELLED_MESSAGE.into());
         }
         if out.success || matches!(out.incomplete, Some(Incomplete::Deadline { .. })) {
             return Ok((out.stdout, out.incomplete));
