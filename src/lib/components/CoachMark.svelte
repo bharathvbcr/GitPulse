@@ -37,7 +37,7 @@
 
 {#if !isSeen}
   <div
-    class="gp-pop gp-card rounded-2xl p-3 border border-accent/35 bg-surface shadow-float max-w-xs select-none {extraClass}"
+    class="gp-pop gp-card fixed rounded-2xl p-3 border border-accent/35 bg-surface shadow-float max-w-xs select-none {extraClass}"
     style="z-index: {LAYERS.TOUR}"
     in:scale={cardScale()}
     out:fade={backdropFadeOut()}
