@@ -195,6 +195,10 @@ impl super::ProcessObserver for OwnCancel<'_> {
     fn cancelled(&self) -> bool {
         self.0.is_cancelled()
     }
+
+    fn cancellation(&self) -> Option<CommandError> {
+        Some(cancelled())
+    }
 }
 
 #[cfg(test)]

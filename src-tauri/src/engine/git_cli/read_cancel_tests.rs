@@ -221,6 +221,7 @@ fn a_cancelled_git_read_is_an_error_and_never_an_answer() {
         let outcome = reader.join().unwrap();
         let error = outcome.expect_err("a cancelled read must not return its partial output");
         assert_eq!(error.message(), CANCELLED_MESSAGE, "shared={shared}");
+        assert_eq!(error.kind(), IpcErrorKind::ReadCancelled, "shared={shared}");
         assert!(wait_gone(pid, gone_within()), "shared={shared}: pid {pid}");
     }
 }
@@ -235,7 +236,9 @@ fn a_cancelled_request_starts_no_further_child() {
     assert!(read_cancel::cancel("rc-no-more"));
     let (outcome, spawned) =
         spawn_labels_during(|| git_text(repo.path(), &["status", "--porcelain"]));
-    assert_eq!(outcome.unwrap_err().message(), CANCELLED_MESSAGE);
+    let refused = outcome.unwrap_err();
+    assert_eq!(refused.message(), CANCELLED_MESSAGE);
+    assert_eq!(refused.kind(), IpcErrorKind::ReadCancelled);
     assert!(
         spawned.is_empty(),
         "spawned for a cancelled request: {spawned:?}"
@@ -291,6 +294,7 @@ fn a_joiner_leaving_returns_promptly_and_the_leader_is_untouched() {
     assert!(read_cancel::cancel("rc-j2"));
     let error = joiner.join().unwrap().expect_err("the joiner left");
     assert_eq!(error.message(), CANCELLED_MESSAGE);
+    assert_eq!(error.kind(), IpcErrorKind::ReadCancelled);
     assert!(left.elapsed() < gone_within(), "{:?}", left.elapsed());
     drop(held);
     let answer = leader.join().unwrap().expect("the leader is untouched");
@@ -423,14 +427,27 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
             }
         }
         // The last click has settled: give the cancelled children their grace.
+        let alive_now = || {
+            rig.started()
+                .iter()
+                .filter(|pid| process_alive(**pid))
+                .count()
+        };
         if cancellable {
-            let alive_now = || {
-                rig.started()
-                    .iter()
-                    .filter(|pid| process_alive(**pid))
-                    .count()
-            };
-            wait_until(gone_within(), || alive_now() <= 1);
+            assert!(
+                wait_until(gone_within(), || alive_now() <= 1),
+                "the cancelled children were not gone within the grace: {} alive",
+                alive_now()
+            );
+        } else {
+            // Nothing was cancelled, so the children must still all be running
+            // after the same window: that the condition "fewer are alive" never
+            // holds for the whole of it is what is being shown.
+            assert!(
+                !wait_until(gone_within(), || alive_now() < CLICKS),
+                "a child exited although nothing cancelled it: {} alive",
+                alive_now()
+            );
         }
         let pids = rig.started();
         let alive = pids.iter().filter(|pid| process_alive(**pid)).count();
@@ -486,23 +503,17 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
     let outcome = run_read_shared(cmd, "queued-test", Duration::from_secs(60), 4096, rig.gate);
     canceller.join().unwrap();
     let error = outcome.expect_err("a cancelled read does not run");
-    assert!(
-        error.message().ends_with(CANCELLED_BEFORE_SPAWN),
-        "{}",
-        error.message()
+    assert_eq!(
+        error.message(),
+        CANCELLED_MESSAGE,
+        "the same cancellation as one cancelled while it ran"
     );
+    assert_eq!(error.kind(), IpcErrorKind::ReadCancelled);
     assert_eq!(
         PROCESS_FAILURES.get(),
         before,
         "a cancel was counted as a failure"
     );
-    let as_read = as_read_cancellation(error, true);
-    assert_eq!(
-        as_read.message(),
-        CANCELLED_MESSAGE,
-        "the runner words it as the mid-read cancellation"
-    );
-    assert_eq!(as_read.kind(), IpcErrorKind::ReadCancelled);
     assert!(rig.started().is_empty(), "nothing was spawned");
     drop(held);
 }
@@ -514,10 +525,6 @@ fn only_a_cancellation_is_exempt_from_the_failure_count() {
     let cancelled = read_cancel::cancelled();
     assert!(is_cancellation(&cancelled));
     assert_eq!(cancelled.kind(), IpcErrorKind::ReadCancelled);
-    assert!(is_cancellation(&refusal_message(
-        "git log",
-        Refusal::Cancelled
-    )));
     // A layer that puts its own words round the cancel leaves it a cancel.
     let wrapped = read_cancel::cancelled().wrap(|text| format!("graph window: {text}"));
     assert!(is_cancellation(&wrapped));
@@ -536,9 +543,33 @@ fn only_a_cancellation_is_exempt_from_the_failure_count() {
     // The same words from a process's stderr are a process failure.
     let stderr = CommandError::from(format!("git log failed: {CANCELLED_MESSAGE}"));
     assert!(!is_cancellation(&stderr));
-    // A request that cannot be cancelled keeps the refusal's own words.
-    let plain = as_read_cancellation(refusal_message("git log", Refusal::Cancelled), false);
-    assert!(plain.message().ends_with(CANCELLED_BEFORE_SPAWN));
+}
+
+/// Only a read-cancel observer's cancel is a `ReadCancelled`. A secrets, hooks,
+/// tool-install, devmap or commit-graph cancel keeps the wire kind it has on
+/// main (unclassified), whether it is counted as a failure or not.
+#[test]
+fn another_observers_cancel_keeps_its_wire_kind() {
+    struct SomeoneElse;
+    impl ProcessObserver for SomeoneElse {
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+    assert!(SomeoneElse.cancellation().is_none());
+    assert!(().cancellation().is_none());
+    let refused = refusal_message("kingfisher", Refusal::Cancelled);
+    assert!(refused.message().ends_with(CANCELLED_BEFORE_SPAWN));
+    assert_eq!(refused.kind(), IpcErrorKind::Unclassified);
+    assert!(!is_cancellation(&refused));
+    // The two that are read-cancel observers say so.
+    let flag = read_cancel::ReadCancel::new();
+    assert_eq!(
+        read_cancel::OwnCancel(&flag)
+            .cancellation()
+            .map(|e| e.kind()),
+        Some(IpcErrorKind::ReadCancelled)
+    );
 }
 
 /// A history window is read as one long walk cut into chunks. Cancelled at that

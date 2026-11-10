@@ -2749,16 +2749,6 @@ fn is_cancellation(error: &CommandError) -> bool {
     error.origin() == Some(crate::ipc_error::IpcErrorKind::ReadCancelled)
 }
 
-/// A cancelled spawn of a read whose request can be cancelled, as that read's
-/// cancellation: the same words as one cancelled while it ran.
-fn as_read_cancellation(error: CommandError, cancellable: bool) -> CommandError {
-    if cancellable && is_cancellation(&error) {
-        read_cancel::cancelled()
-    } else {
-        error
-    }
-}
-
 /// [`refusal_message`], naming the bucket that refused and its level when the
 /// gate knows them. The text before the level is unchanged, so every reader
 /// that matches on the deferral (see [`is_deferred_under_load`]) reads it as
@@ -2775,10 +2765,7 @@ pub(crate) fn refusal_message_at(
     let deferred =
         |text: String| CommandError::typed(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text);
     match refusal {
-        Refusal::Cancelled => CommandError::typed(
-            crate::ipc_error::IpcErrorKind::ReadCancelled,
-            format!("{label}{CANCELLED_BEFORE_SPAWN}"),
-        ),
+        Refusal::Cancelled => format!("{label}{CANCELLED_BEFORE_SPAWN}").into(),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
@@ -3064,6 +3051,14 @@ pub(crate) enum OutputStream {
 pub(crate) trait ProcessObserver {
     fn cancelled(&self) -> bool {
         false
+    }
+    /// The error a spawn that was cancelled while it queued returns, when this
+    /// observer's cancel has a meaning of its own. `None` keeps the runner's
+    /// plain "cancelled before spawn", which is what every other observer
+    /// (secrets, hooks, tool install, devmap, the commit graph) gets and what
+    /// reaches the frontend unclassified.
+    fn cancellation(&self) -> Option<CommandError> {
+        None
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
     /// True when the observer keeps what it needs from stdout itself, so the
@@ -4794,6 +4789,10 @@ impl ProcessObserver for FlightObserver<'_> {
     fn cancelled(&self) -> bool {
         abandon_if_all_gone(self.key, self.flight)
     }
+
+    fn cancellation(&self) -> Option<CommandError> {
+        Some(read_cancel::cancelled())
+    }
 }
 
 fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
@@ -5700,7 +5699,14 @@ fn run_admitted_inner(
         with_admission(class, || {
             gate.acquire_judged(queue_deadline, &|| observer.cancelled())
         })
-        .map_err(|(refusal, level)| refusal_message_at(label, refusal, level))?,
+        .map_err(|(refusal, level)| {
+            // Decided here, where the observer that cancelled is known: only a
+            // read-cancel observer's cancel is a `ReadCancelled`.
+            match observer.cancellation() {
+                Some(cancelled) if refusal == Refusal::Cancelled => cancelled,
+                _ => refusal_message_at(label, refusal, level),
+            }
+        })?,
     );
     gate.note_admitted_label(label);
     on_admitted();
@@ -6303,9 +6309,10 @@ fn git_run_inner(
         } else {
             run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)
         };
-        // A read cancelled while it queued for a slot is the same cancellation
-        // as one cancelled while it ran, not a refusal with a label of its own.
-        let mut out = ran.map_err(|error| as_read_cancellation(error, cancel.is_some()))?;
+        // A read cancelled while it queued for a slot has already come back as
+        // the same cancellation as one cancelled while it ran
+        // (`ProcessObserver::cancellation`), not a refusal with a label of its own.
+        let mut out = ran?;
         if let Some((repo, _)) = &hooked {
             if out.cancelled {
                 return Err(hooks::cancelled_message(repo, sub).into());
