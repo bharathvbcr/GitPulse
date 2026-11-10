@@ -11,6 +11,7 @@ mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
 pub mod analyzer;
+pub mod browser;
 pub mod ci_local;
 pub mod codeintel;
 pub mod commands;
@@ -385,6 +386,12 @@ pub fn run() {
             workbench::cmd_workbench_launch_terminal,
             workbench::cmd_inbox_decompose_task,
             host_platform::cmd_host_platform,
+            browser::commands::cmd_browser_open,
+            browser::commands::cmd_browser_set_bounds,
+            browser::commands::cmd_browser_set_visible,
+            browser::commands::cmd_browser_navigate,
+            browser::commands::cmd_browser_go,
+            browser::commands::cmd_browser_close,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,

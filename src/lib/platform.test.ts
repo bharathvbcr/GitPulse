@@ -113,6 +113,7 @@ describe("host OS identity", () => {
       expect(fallback.os).toBe("macos");
       // Even on macOS: the webview cannot know whether the code compiled in.
       expect(fallback.dock_hiding).toBe(false);
+      expect(fallback.browser_sessions).toBe(false);
     });
   });
 
@@ -125,13 +126,15 @@ describe("host OS identity", () => {
 
 describe("host platform envelope", () => {
   it("reads the backend's snake_case capability fields", () => {
-    expect(parseHostPlatform({ os: "windows", dock_hiding: false })).toEqual({
+    expect(parseHostPlatform({ os: "windows", dock_hiding: false, browser_sessions: false })).toEqual({
       os: "windows",
       dock_hiding: false,
+      browser_sessions: false,
     });
-    expect(parseHostPlatform({ os: "macos", dock_hiding: true })).toEqual({
+    expect(parseHostPlatform({ os: "macos", dock_hiding: true, browser_sessions: true })).toEqual({
       os: "macos",
       dock_hiding: true,
+      browser_sessions: true,
     });
   });
 
@@ -151,6 +154,15 @@ describe("host platform envelope", () => {
     ["a numeric flag", { os: "macos", dock_hiding: 1 }],
   ])("denies the capability given %s", (_label, value) => {
     expect(parseHostPlatform(value).dock_hiding).toBe(false);
+  });
+
+  it.each([
+    ["no field (an older backend)", { os: "macos", dock_hiding: true }],
+    ["a camelCased field name", { os: "macos", browserSessions: true }],
+    ["a truthy non-boolean", { os: "macos", browser_sessions: "yes" }],
+    ["a numeric flag", { os: "macos", browser_sessions: 1 }],
+  ])("offers no browser sessions given %s", (_label, value) => {
+    expect(parseHostPlatform(value).browser_sessions).toBe(false);
   });
 
   it("reports an OS name it does not recognise as unknown", () => {

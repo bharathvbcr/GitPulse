@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import { isSessionId, type LauncherKind } from "./tabs";
+import { isSessionId, type LauncherKind, type SessionKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 
@@ -20,7 +20,7 @@ export function isPromptLauncher(value: unknown): value is PromptLauncher {
  */
 
 /** Interactive CLIs that accept an initial prompt. No shell interpolation. */
-export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string[] | null {
+export function agentPromptArgs(launcher: SessionKind, prompt?: string): string[] | null {
   if (prompt === undefined) return null;
   if (!isPromptLauncher(launcher)) {
     throw new Error("Initial prompts require Claude Code, Codex, Grok, or Antigravity");
@@ -57,9 +57,11 @@ interface LaunchRequest {
    * request, open a tab and report capacity refusals, and `agentPromptArgs`
    * already returns "no arguments" for a promptless launch of any kind.
    */
-  launcher: LauncherKind;
+  launcher: SessionKind;
   /** Absent for a plain session; a literal CLI argument when present. */
   prompt?: string;
+  /** A browser session's first address (`requestBrowser`); absent otherwise. */
+  url?: string;
   complete(error?: string): void;
 }
 
@@ -79,6 +81,34 @@ export function createTerminalLaunchRequests() {
   const sessions = writable<AgentTerminal[]>([]);
   let pending: LaunchRequest | null = null;
   let busy = false;
+
+  /** Hands one launch to the panel for `fields.repoPath`; resolves once it is claimed and opened. */
+  function enqueue(fields: Omit<LaunchRequest, "complete">, signal?: AbortSignal): Promise<void> {
+    if (!fields.repoPath.trim()) return Promise.reject(new Error("Open a repository before starting a terminal session"));
+    if (signal?.aborted) return Promise.reject(new Error("Terminal launch cancelled"));
+    if (busy) return Promise.reject(new Error("A terminal launch is already pending"));
+    return new Promise<void>((resolve, reject) => {
+      busy = true;
+      let settled = false;
+      const complete = (error?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        pending = null;
+        busy = false;
+        store.set(null);
+        if (error) reject(new Error(error));
+        else resolve();
+      };
+      const abort = () => complete("Terminal launch cancelled");
+      const timer = setTimeout(() => complete("The terminal did not open. Try again or copy the prompt."), 10000);
+      signal?.addEventListener("abort", abort, { once: true });
+      pending = { ...fields, complete };
+      store.set(pending);
+    });
+  }
+
   return {
     subscribe: store.subscribe,
     sessions: { subscribe: sessions.subscribe },
@@ -91,34 +121,26 @@ export function createTerminalLaunchRequests() {
     forget(id: string) {
       sessions.update(rows => rows.filter(row => row.id !== id));
     },
-    async request(repoPath: string, launcher: LauncherKind, prompt?: string, signal?: AbortSignal): Promise<void> {
-      if (!repoPath.trim()) throw new Error("Open a repository before starting a terminal session");
+    async request(repoPath: string, launcher: SessionKind, prompt?: string, signal?: AbortSignal): Promise<void> {
       // Validates here, at the boundary, so a bad prompt is refused before a
       // panel is asked to open a tab for it. A promptless launch returns null
       // for every launcher, which is what makes "new shell" fit this channel.
       agentPromptArgs(launcher, prompt);
-      if (signal?.aborted) throw new Error("Terminal launch cancelled");
-      if (busy) throw new Error("A terminal launch is already pending");
-      return new Promise<void>((resolve, reject) => {
-        busy = true;
-        let settled = false;
-        const complete = (error?: string) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          pending = null;
-          busy = false;
-          store.set(null);
-          if (error) reject(new Error(error));
-          else resolve();
-        };
-        const abort = () => complete("Terminal launch cancelled");
-        const timer = setTimeout(() => complete("The terminal did not open. Try again or copy the prompt."), 10000);
-        signal?.addEventListener("abort", abort, { once: true });
-        pending = { repoPath, launcher, prompt, complete };
-        store.set(pending);
-      });
+      return enqueue({ repoPath, launcher, prompt }, signal);
+    },
+    /**
+     * A browser session on `url` in `repoPath`'s dock: a session already on
+     * that address is brought forward and reloaded, otherwise a tab opens on
+     * it. The address is judged again by the backend, which only loads
+     * loopback ones.
+     */
+    async requestBrowser(repoPath: string, url: string, signal?: AbortSignal): Promise<void> {
+      if (!url.trim() || url.length > 2048) throw new Error("A browser session needs an address of at most 2048 characters");
+      return enqueue({ repoPath, launcher: "browser", url: url.trim() }, signal);
+    },
+    /** Whether a launch is waiting to be claimed; a caller with its own queue waits for this. */
+    get busy(): boolean {
+      return busy;
     },
     /**
      * Claims the pending launch when it is for `repoPath`'s checkout, by

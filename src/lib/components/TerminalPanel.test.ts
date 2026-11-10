@@ -99,7 +99,7 @@ describe("TerminalPanel session ownership", () => {
   it("refits the visible session when its host is shown again", () => {
     const body = source.slice(source.indexOf("const revealedId = $derived"));
     expect(body).toContain('const revealedId = $derived(visible && mode === "shell" ? activeId : null);');
-    expect(body).toContain("sessions[id]?.reveal()");
+    expect(body).toContain("revealTab(id)");
     expect(body).toContain('if (!visible || mode !== "shell" || activeId !== id) return;');
   });
 
@@ -116,8 +116,8 @@ describe("TerminalPanel session ownership", () => {
     expect(synchronous).toContain("const id = revealedId;");
     expect(synchronous).toContain("untrack(() => {");
     const tracked = synchronous.replace(/untrack\(\(\) => \{[\s\S]*?\n    \}\);/, "");
-    expect(tracked).not.toMatch(/\b(unread|sessions|visible|mode|activeId)\b/);
-    expect(effect.slice(effect.indexOf("void tick()"))).toContain("sessions[id]?.reveal()");
+    expect(tracked).not.toMatch(/\b(unread|sessions|browsers|visible|mode|activeId)\b/);
+    expect(effect.slice(effect.indexOf("void tick()"))).toContain("revealTab(id)");
   });
 
   it("holds no PTY lifecycle of its own", () => {

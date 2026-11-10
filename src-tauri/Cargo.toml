@@ -241,6 +241,11 @@ objc2-user-notifications = { version = "0.3.2", default-features = false, featur
     "UNNotificationTrigger",
     "UNUserNotificationCenter",
 ] }
+# The browser pane builds its webview with wry directly, not through Tauri, so
+# the page gets no IPC bridge (see src/browser/mod.rs). The same vendored crate
+# Tauri's runtime uses ([patch.crates-io] below), with the same features, so
+# nothing extra is compiled. Owner-approved 2026-11-09 for M0.
+wry = { version = "0.57.0", default-features = false, features = ["os-webview"] }
 
 [build-dependencies]
 tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd", features = [] }
@@ -272,6 +277,12 @@ harness = false
 
 [[test]]
 name = "native_status_material"
+harness = false
+
+# The browser pane's webview is built on AppKit's main thread, which a libtest
+# harness never runs a case on.
+[[test]]
+name = "browser_pane_isolation"
 harness = false
 
 [[test]]

@@ -24,6 +24,18 @@
  * to the identity value, so a scale can never be applied twice.
  */
 
+import { writable, type Readable } from "svelte/store";
+
+const appliedPageZoom = writable(1);
+
+/**
+ * The webview page zoom actually in effect: the scale when the native zoom
+ * took it, 1 under the CSS fallback (which scales fonts, not CSS pixels).
+ * Native views laid over the page — browser sessions — are placed in window
+ * points, which are CSS pixels times this.
+ */
+export const pageZoom: Readable<number> = { subscribe: appliedPageZoom.subscribe };
+
 /** Bounds mirrored from interfaceStore's clampScale; see MIN/MAX there. */
 export const MIN_UI_SCALE = 0.75;
 export const MAX_UI_SCALE = 1.5;
@@ -72,6 +84,7 @@ export async function applyUiScale(
       // variable at the user's value here would scale the root font a second
       // time on top of it.
       root?.style.setProperty("--ui-font-scale", "1");
+      appliedPageZoom.set(value);
       return "webview-zoom";
     } catch {
       /* fall through to the stylesheet path */
@@ -79,6 +92,7 @@ export async function applyUiScale(
   }
 
   root?.style.setProperty("--ui-font-scale", String(value));
+  appliedPageZoom.set(1);
   return "css-fallback";
 }
 

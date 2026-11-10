@@ -120,6 +120,15 @@ pub enum Request {
         /// The edited file, relative to `repo`.
         path: String,
     },
+    /// An agent asking for a browser session on a local dev server in the
+    /// terminal dock of repository `repo` (`gitpulse_browser_open`). One-way,
+    /// like [`Request::Open`]: the window opens the repository and the tab.
+    Browse {
+        /// The repository (absolute) whose dock gets the session.
+        repo: String,
+        /// A loopback `http`/`https` URL (`browser::policy`).
+        url: String,
+    },
 }
 
 impl Request {
@@ -195,6 +204,21 @@ impl Request {
                     return Err("scan path must be relative to its repository".into());
                 }
                 Ok(())
+            }
+            Request::Browse { repo, url } => {
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("browse repository must be an absolute path".into());
+                }
+                if url.len() > crate::browser::MAX_URL_CHARS {
+                    return Err("browse URL is too long".into());
+                }
+                crate::browser::policy::check_loopback(url)
+                    .map(|_| ())
+                    .map_err(|why| format!("browse URL refused: {why}"))
             }
         }
     }

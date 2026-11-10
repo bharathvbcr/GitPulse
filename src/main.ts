@@ -1,7 +1,8 @@
 import "./app.css";
 import App from "./App.svelte";
 import { mount } from "svelte";
-import { applyPlatformClass } from "./lib/platform";
+import { applyPlatformClass, isTauri } from "./lib/platform";
+import { installBrowseRequests } from "./lib/browser/browseRequests";
 import { loadHostPlatform } from "./lib/stores/platformStore";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
 import { installResponsivenessDiagnostics } from "./lib/diagnostics/responsiveness";
@@ -63,5 +64,15 @@ import.meta.hot?.dispose(() => {
 const app = mount(App, {
   target: document.getElementById("app")!,
 });
+
+// Browser sessions an agent asks for (`gitpulse_browser_open`), heard from the
+// start so a request does not wait for a dock to be opened first.
+if (isTauri()) {
+  const stopBrowseRequests = installBrowseRequests().catch((error: unknown) => {
+    console.warn("[browser] agent browser session requests are not being heard:", error);
+    return null;
+  });
+  import.meta.hot?.dispose(() => void stopBrowseRequests.then((stop) => stop?.()));
+}
 
 export default app;

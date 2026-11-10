@@ -121,6 +121,10 @@ fn requests_are_bounded_before_anything_acts_on_them() {
             id: "gitpulse-session-abc".into(),
             snooze: false,
         },
+        Request::Browse {
+            repo: "/r".into(),
+            url: "http://localhost:5173/".into(),
+        },
     ];
     for request in ok {
         assert_eq!(request.validate(), Ok(()), "{request:?}");
@@ -154,10 +158,82 @@ fn requests_are_bounded_before_anything_acts_on_them() {
             id: "x".repeat(MAX_NATIVE_ID + 1),
             snooze: false,
         },
+        Request::Browse {
+            repo: "relative/repo".into(),
+            url: "http://localhost:5173/".into(),
+        },
+        Request::Browse {
+            repo: "/a\0b".into(),
+            url: "http://localhost:5173/".into(),
+        },
+        Request::Browse {
+            repo: "/r".into(),
+            url: "https://example.com/".into(),
+        },
+        Request::Browse {
+            repo: "/r".into(),
+            url: "file:///etc/passwd".into(),
+        },
+        Request::Browse {
+            repo: "/r".into(),
+            url: format!(
+                "http://localhost/{}",
+                "x".repeat(crate::browser::MAX_URL_CHARS)
+            ),
+        },
     ];
     for request in refused {
         assert!(request.validate().is_err(), "accepted {request:?}");
     }
+}
+
+/// What `gitpulse_browser_open` sends reaches the owner's sink as is, and an
+/// owner that does not know the request (a GitPulse built before browser
+/// sessions) refuses it with a reason rather than accepting it silently.
+#[test]
+fn a_browse_request_reaches_the_owner_and_an_older_owner_refuses_it() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let requests = recorder(&owner);
+    crate::browser::ask_app_to_browse(dir.path(), "/repo", "http://localhost:5173/")
+        .expect("the owner takes a browse request");
+    assert_eq!(
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delivered"),
+        Request::Browse {
+            repo: "/repo".into(),
+            url: "http://localhost:5173/".into(),
+        }
+    );
+    let refused = crate::browser::ask_app_to_browse(dir.path(), "/repo", "https://example.com/")
+        .expect_err("a remote URL is refused before it is sent");
+    assert!(refused.contains("loopback"), "{refused}");
+
+    // The frame an older owner would have to parse: an unknown variant.
+    let (mut stream, mut reader) = raw(dir.path());
+    let ack = ack_of(
+        &mut stream,
+        &mut reader,
+        b"{\"v\":1,\"request\":{\"kind\":\"browse_v2\",\"repo\":\"/r\",\"url\":\"http://localhost/\"}}\n",
+    );
+    assert!(!ack.accepted, "an unknown request is refused");
+    assert!(
+        ack.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("malformed request")),
+        "refusal: {:?}",
+        ack.reason
+    );
+    drop(owner);
+}
+
+#[test]
+fn a_browse_request_with_no_app_running_says_so() {
+    let dir = profile();
+    let error = crate::browser::ask_app_to_browse(dir.path(), "/repo", "http://localhost:5173/")
+        .expect_err("nobody owns this profile");
+    assert!(error.contains("not running"), "{error}");
 }
 
 #[test]

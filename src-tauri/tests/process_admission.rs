@@ -226,6 +226,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("adv_w6l4_ascii_oracle.rs", "no git spawn: pure parsers (github::parse_github_remote_url, tasks::scan_briefs)"),
     ("agent_notify_socket.rs", "subprocess-only: the socket protocol against built binaries; alerts::bridge parsers"),
     ("ai_transport_integration.rs", "no git spawn: ai::http URL parsing"),
+    ("browser_pane_isolation.rs", "no git spawn: a webview in a native window against a loopback test server"),
     ("cli_io_process.rs", "subprocess-only: drives built binaries; hooks and mcp parsers"),
     ("codeintel_real_store.rs", "no git spawn: codeintel reads a store; validate_repo only reads the filesystem"),
     ("command_rendering_integration.rs", "no git spawn: harness::render_command renders text"),

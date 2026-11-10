@@ -7,7 +7,7 @@ import {
   TERMINAL_FONT_DEFAULT,
   TERMINAL_SCROLLBACK_DEFAULT,
 } from "../terminal/viewControls";
-import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
+import { SESSION_TYPES, type SessionKind } from "../terminal/tabs";
 import { setSignalledAsksForReader } from "../terminal/sessionActivity";
 import {
   isGraphWidthMode,
@@ -311,7 +311,7 @@ export interface InterfacePrefs {
    * it wrong. Hidden sessions never hold a context either way.
    */
   terminalGpu: boolean;
-  terminalLauncher: LauncherKind;
+  terminalLauncher: SessionKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
   /**
@@ -570,7 +570,7 @@ function readPrefs(): InterfacePrefs {
       terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
       terminalSmoothWheel: bool(parsed.terminalSmoothWheel, DEFAULTS.terminalSmoothWheel),
       terminalGpu: bool(parsed.terminalGpu, DEFAULTS.terminalGpu),
-      terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
+      terminalLauncher: SESSION_TYPES.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
       // to grab or tall enough to swallow the view.
@@ -836,7 +836,7 @@ function createInterfaceStore() {
     setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
     setTerminalSmoothWheel: (on: boolean) => patch({ terminalSmoothWheel: on }),
     setTerminalGpu: (on: boolean) => patch({ terminalGpu: on }),
-    setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
+    setTerminalLauncher: (launcher: SessionKind) => patch({ terminalLauncher: SESSION_TYPES.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
     setCheckForUpdates: (enabled: boolean) =>

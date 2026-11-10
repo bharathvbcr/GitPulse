@@ -164,6 +164,8 @@
   import { createScrollFeel, isScrolledBack, scrollFeelOptions, type ScrollFeel } from "../terminal/scrollFeel";
   import { wheelDiagnostic } from "../terminal/wheelDiagnostic";
   import { openExternal } from "../desktop/openExternal";
+  import { isLoopbackUrl } from "../browser/browserSession";
+  import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import { requestReveal } from "../files/revealRequests";
@@ -419,6 +421,17 @@
       return;
     }
     if (action.kind === "url") {
+      // A local dev server opens in a browser session beside this terminal,
+      // where an agent can be pointed at it; anything else, or a session that
+      // cannot open, goes to the system browser as before.
+      if (opensInBrowserSession(action.url)) {
+        try {
+          await terminalLaunchRequests.requestBrowser(repoPath, action.url);
+          return;
+        } catch (err) {
+          warning = `${action.url} opened in your browser: a browser session could not (${formatError(err)}).`;
+        }
+      }
       try {
         await openExternal(action.url);
       } catch (err) {
@@ -452,10 +465,19 @@
     repoStore.setActiveTab("code");
   }
 
+  /** Whether a clicked link goes to a browser session rather than the system browser. */
+  function opensInBrowserSession(url: string): boolean {
+    return get(hostPlatform).browser_sessions && isLoopbackUrl(url);
+  }
+
   /** Hover text for a link, so the target is readable before it is clicked. */
   function linkTitle(text: string): string {
     const action = resolveLinkAction(text, workPath);
-    if (action.kind === "url") return `Open ${action.url} in your browser`;
+    if (action.kind === "url") {
+      return opensInBrowserSession(action.url)
+        ? `Open ${action.url} in a browser session (the address bar's ↗ opens it in your browser)`
+        : `Open ${action.url} in your browser`;
+    }
     if (action.kind === "file") {
       const at = action.line === null ? "" : ` (line ${action.line}${action.column === null ? "" : `, column ${action.column}`})`;
       return `Open ${action.path}${at}`;
