@@ -53,9 +53,9 @@ describe("DiagnosticsModal", () => {
     expect(body).toContain("clone failed");
     expect(body).toContain("watch out");
     expect(body).toContain("pane-crash");
-    // Severity chips render lowercase text styled uppercase via CSS.
-    expect(body).toContain('tracking-wider text-rose-400">error</span>');
-    expect(body).toContain('tracking-wider text-amber-400">warning</span>');
+    // Severity chips render the lowercase severity word in its status role.
+    expect(body).toContain('text-micro font-semibold text-danger">error</span>');
+    expect(body).toContain('text-micro font-semibold text-warn">warning</span>');
     // Header filter counts reflect occurrences per severity.
     expect(body).toContain('aria-label="Filter by severity"');
     expect(body).not.toContain("No frontend diagnostics recorded");

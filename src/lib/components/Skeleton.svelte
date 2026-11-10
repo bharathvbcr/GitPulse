@@ -27,17 +27,17 @@
   {#each items as i (i)}
     {#if variant === "circle"}
       <div
-        class="rounded-full bg-surfaceHover/80 border border-border/40 shrink-0 {animated ? 'animate-pulse' : ''}"
+        class="rounded-full bg-surfaceHover/80 border border-edgeSoft shrink-0 {animated ? 'animate-pulse' : ''}"
         style="width: {width || '2rem'}; height: {height || '2rem'};"
       ></div>
     {:else if variant === "rect"}
       <div
-        class="rounded-xl bg-surfaceHover/80 border border-border/40 w-full {animated ? 'animate-pulse' : ''}"
+        class="rounded-xl bg-surfaceHover/80 border border-edgeSoft w-full {animated ? 'animate-pulse' : ''}"
         style="width: {width || '100%'}; height: {height || '4rem'};"
       ></div>
     {:else if variant === "card"}
       <div
-        class="rounded-2xl bg-surface border border-border/70 p-4 space-y-2.5 w-full shadow-card {animated ? 'animate-pulse' : ''}"
+        class="rounded-2xl bg-surface border border-edge p-4 space-y-2.5 w-full shadow-card {animated ? 'animate-pulse' : ''}"
       >
         <div class="h-3.5 bg-surfaceHover/90 rounded-full w-1/3"></div>
         <div class="h-2.5 bg-surfaceHover/70 rounded-full w-3/4"></div>
@@ -66,7 +66,7 @@
     {:else}
       <!-- Default Text Variant -->
       <div
-        class="rounded-full bg-surfaceHover/80 border border-border/40 {animated ? 'animate-pulse' : ''}"
+        class="rounded-full bg-surfaceHover/80 border border-edgeSoft {animated ? 'animate-pulse' : ''}"
         style="width: {width || (i === items.length - 1 && items.length > 1 ? '65%' : '100%')}; height: {height || '0.75rem'};"
       ></div>
     {/if}

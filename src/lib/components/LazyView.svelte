@@ -97,8 +97,8 @@
     role="alert"
   >
     <span class="text-sm text-textPrimary">{name} could not be loaded.</span>
-    <span class="text-[11px] text-textMuted max-w-md">{failure}</span>
-    <span class="text-[11px] text-textMuted max-w-md">
+    <span class="text-meta text-textMuted max-w-md">{failure}</span>
+    <span class="text-meta text-textMuted max-w-md">
       This view ships as its own chunk, so a failed load means the install is
       incomplete — not that the view has nothing to show.
     </span>

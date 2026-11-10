@@ -12,7 +12,7 @@ describe("CommandPalette optional-tools entry points", () => {
   it("distinguishes cannot-search from zero symbol hits", () => {
     expect(source).toContain("symbolSearchNote");
     expect(source).toContain("not the same as zero matches");
-    expect(source).toContain("Set up devmap");
+    expect(source).toContain("Set up code map");
   });
 
   it("offers optional tools setup from the palette", () => {

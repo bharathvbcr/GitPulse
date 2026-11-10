@@ -187,17 +187,17 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-3xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
+      class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-edgeStrong"
     >
       <!-- Header -->
-      <div class="p-4 border-b border-border/70 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
+      <div class="p-4 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
         <div class="flex items-center gap-2.5">
           <div class="p-2 rounded-xl bg-accent/10 text-accent ring-1 ring-accent/25">
             <Keyboard size={18} />
           </div>
           <div>
             <h2 class="text-sm font-semibold text-textPrimary">Keyboard Shortcuts</h2>
-            <p class="text-[11px] text-textMuted">GitPulse navigation and workflow accelerators</p>
+            <p class="text-meta text-textMuted">GitPulse navigation and workflow accelerators</p>
           </div>
         </div>
 
@@ -235,11 +235,11 @@
 
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {#each category.shortcuts as item}
-                <div class="flex items-center justify-between gap-3 p-2 rounded-xl bg-background/50 border border-border/60 hover:border-border transition-colors">
+                <div class="flex items-center justify-between gap-3 p-2 rounded-xl bg-background/50 border border-edge hover:border-border transition-colors">
                   <span class="text-xs text-textMuted leading-tight truncate">{item.description}</span>
                   <div class="flex items-center gap-1 shrink-0">
                     {#each item.keys as key}
-                      <kbd class="gp-keycap text-[11px] font-sans font-medium px-1.5 py-0.5">{key}</kbd>
+                      <kbd class="gp-keycap text-meta font-sans font-medium px-1.5 py-0.5">{key}</kbd>
                     {/each}
                   </div>
                 </div>
@@ -256,7 +256,7 @@
       </div>
 
       <!-- Footer -->
-      <div class="p-3 border-t border-border/70 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-[11px] text-textMuted px-5">
+      <div class="p-3 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-meta text-textMuted px-5">
         <span>Tip: Press <kbd class="gp-keycap">?</kbd> anywhere to reopen</span>
         <button type="button" class="gp-btn py-1! px-3!" onclick={close}>Done</button>
       </div>

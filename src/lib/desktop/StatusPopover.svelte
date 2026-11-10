@@ -311,7 +311,7 @@
      declaration rather than two that have to be kept in step. */
   .status-shell[data-material="native"],
   .status-shell[data-material="preview"] {
-    --liquid-ease:cubic-bezier(0.22, 1, 0.36, 1);
+    --liquid-ease:var(--gp-ease-effect);
     /* Hue blobs — same four colours as .gp-shell in app.css, dark theme. */
     --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
     --hue-gain:1;
@@ -389,8 +389,8 @@
   @media (prefers-reduced-motion: no-preference) {
     .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip),
     .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip) {
-      transition-property:color, background-color, border-color, box-shadow, transform;
-      transition-duration:180ms;
+      transition-property:color, background-color, border-color, transform;
+      transition-duration:var(--gp-dur-fast);
       transition-timing-function:var(--liquid-ease);
     }
     .status-shell[data-material="native"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled),
@@ -435,7 +435,7 @@
   header { display:flex; align-items:center; gap:10px; padding:20px 20px 17px; }
   .mark { width:34px; height:34px; flex-shrink:0; display:grid; place-items:center; border:1px solid var(--line); border-radius:10px; background:var(--surface); }
   .identity { min-width:0; flex:1; }
-  .repository { display:flex; align-items:center; gap:6px; max-width:100%; font-weight:650; font-size:15px; letter-spacing:-.2px; text-align:left; }
+  .repository { display:flex; align-items:center; gap:6px; max-width:100%; font-weight:600; font-size:15px; letter-spacing:-.2px; text-align:left; }
   .repository span,.branch span,.upstream { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .repository:not(:disabled):hover { color:var(--blue); }
   .branch { display:flex; align-items:center; gap:4px; margin-top:5px; color:var(--muted); font-size:11px; }
@@ -450,17 +450,17 @@
   [data-tone="warning"] .status-dot { background:var(--amber); }
   [data-tone="changed"] .status-dot,[data-tone="busy"] .status-dot { background:var(--blue); }
   .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-  .metric { text-align:left; padding:12px 10px; border:1px solid var(--line); background:var(--surface); border-radius:10px; min-width:0; transition:background .14s,border-color .14s; }
+  .metric { text-align:left; padding:12px 10px; border:1px solid var(--line); background:var(--surface); border-radius:10px; min-width:0; transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
   .metric:hover:not(:disabled) { border-color:var(--blue); background:var(--soft); }
   .metric-label { display:flex; align-items:center; gap:4px; font-size:10px; color:var(--muted); }
-  .metric strong { display:block; margin-top:8px; font-size:27px; line-height:1; font-weight:550; letter-spacing:-1px; font-variant-numeric:tabular-nums; }
+  .metric strong { display:block; margin-top:8px; font-size:27px; line-height:1; font-weight:600; letter-spacing:-1px; font-variant-numeric:tabular-nums; }
   .metric.attention { color:var(--amber); border-color:color-mix(in srgb,var(--amber) 40%,var(--line)); background:color-mix(in srgb,var(--amber) 7%,var(--surface)); }
   .sync { display:flex; align-items:center; gap:8px; min-width:0; color:var(--muted); margin:14px 0 18px; font-size:10px; }
   .sync-counts { display:flex; gap:9px; color:var(--text); font-variant-numeric:tabular-nums; }
   .sync-counts span { display:flex; align-items:center; gap:2px; }
   .upstream { flex:1; }
   .caption { font-size:9px; }
-  .primary { display:flex; align-items:center; justify-content:center; gap:8px; width:100%; min-height:34px; color:#fff; background:var(--action); border-radius:8px; font-size:12px; font-weight:550; box-shadow:0 1px 2px #00000012; }
+  .primary { display:flex; align-items:center; justify-content:center; gap:8px; width:100%; min-height:34px; color:#fff; background:var(--action); border-radius:8px; font-size:12px; font-weight:600; box-shadow:0 1px 2px #00000012; }
   .primary:hover:not(:disabled) { background:var(--action-hover); }
   .primary:disabled { opacity:.45; }
   .details-toggle { display:flex; align-items:center; justify-content:space-between; width:100%; min-height:43px; font-size:10px; color:var(--muted); }
@@ -473,14 +473,14 @@
   .live.degraded>span { background:var(--amber); }
   .details { max-height:190px; overflow:auto; padding:0 0 14px; margin-bottom:2px; font-size:10px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
   .detail-rows>div { display:flex; gap:8px; padding:7px 0; border-top:1px solid var(--line); }
-  .detail-rows span { flex:0 0 62px; font-weight:550; }
+  .detail-rows span { flex:0 0 62px; font-weight:500; }
   .detail-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding-bottom:12px; }
   .detail-action { display:flex; align-items:center; gap:6px; padding:9px 8px; border:1px solid var(--line); border-radius:7px; background:var(--surface); }
   .detail-action strong { margin-left:auto; color:var(--text); font-variant-numeric:tabular-nums; }
   .detail-action:disabled { opacity:.55; }
   .detail-action:hover:not(:disabled) { color:var(--text); background:var(--soft); }
   .shortcut-block { padding:10px 0 0; border-top:1px solid var(--line); }
-  .group-label { display:block; margin-bottom:6px; font-size:10px; font-weight:550; }
+  .group-label { display:block; margin-bottom:6px; font-size:10px; font-weight:500; }
   .shortcuts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding-bottom:10px; }
   .shortcut { display:flex; align-items:center; gap:6px; padding:8px; border-radius:6px; text-align:left; font-size:10px; }
   .shortcut:hover:not(:disabled) { color:var(--text); background:var(--soft); }
@@ -503,7 +503,7 @@
   .repositories button { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; padding:8px; border-radius:5px; }
   .repositories span { min-width:0; display:flex; flex-direction:column; gap:3px; }
   .repositories strong,.repositories em { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .repositories strong { font-weight:550; }
+  .repositories strong { font-weight:500; }
   .repositories em { font-size:10px; font-style:normal; color:var(--muted); }
   .repositories button:hover,.repositories .current { background:var(--soft); }
   .repo-badges { display:flex; flex-direction:row; gap:4px; margin-top:2px; }
@@ -517,8 +517,8 @@
   .error { display:flex; gap:7px; color:var(--amber); font-size:11px; line-height:1.4; margin:0 0 14px; }
   .error>span { min-width:0; overflow-wrap:anywhere; }
   .error :global(svg) { flex-shrink:0; margin-top:1px; }
-  :global(.rotating) { animation:spin 1.5s linear infinite; }
-  .pulse { animation:pulse 1.5s ease-in-out infinite; }
+  :global(.rotating) { animation:spin calc(var(--gp-dur-emphasis) * 3) linear infinite; }
+  .pulse { animation:pulse calc(var(--gp-dur-emphasis) * 3) var(--gp-ease-effect) infinite; }
   .reduce-motion :global(*) { animation:none!important; transition:none!important; }
   @keyframes spin { to { transform:rotate(360deg); } }
   @keyframes pulse { 50% { opacity:.35; } }

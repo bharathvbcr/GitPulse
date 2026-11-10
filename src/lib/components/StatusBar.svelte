@@ -2,6 +2,7 @@
   import { repoStore } from "../stores/repoStore";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
+  import { LAYERS } from "../ui/layers";
   import { graphStore } from "../stores/graphStore";
   import CommitCadence from "./CommitCadence.svelte";
   import LanguageSegment from "./LanguageSegment.svelte";
@@ -111,7 +112,8 @@
 {#if detail !== "hidden"}
 <footer
   title={forcedTip}
-  class="gp-glass h-6 shrink-0 bg-surface border-t border-border/70 gp-section-edge px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none z-20"
+  class="gp-glass h-6 shrink-0 bg-surface gp-section-edge px-3 flex items-center justify-between text-meta font-sans text-textMuted select-none"
+  style:z-index={LAYERS.SCROLL_CUE}
   role="status"
   aria-label="Repository Status Bar"
 >
@@ -123,14 +125,14 @@
       title="Current Branch: {currentBranch}"
     >
       <GitBranch size={12} class="text-accent shrink-0" />
-      <span class="truncate max-w-[140px] font-mono text-[11px]">{currentBranch}</span>
+      <span class="truncate max-w-[140px] font-mono text-meta">{currentBranch}</span>
     </div>
 
     <!-- Live-update health. Absent when the watcher is working, which is
          the overwhelmingly common case. -->
     {#if watchLabel}
       <span
-        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-amber-500/50 bg-amber-500/10 px-1.5 py-0.2 font-medium text-amber-600 dark:text-amber-400"
+        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-warn/65 bg-warn/10 px-1.5 py-0.2 font-medium text-warn"
         title={describeWatch(watchState)}
       >
         <RadioTower size={11} class="shrink-0" />
@@ -142,7 +144,7 @@
          below are the last ones read, not current ones. Absent while it answers. -->
     {#if statusUnavailableSince !== null}
       <span
-        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-amber-500/50 bg-amber-500/10 px-1.5 py-0.2 font-medium text-amber-600 dark:text-amber-400"
+        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-warn/65 bg-warn/10 px-1.5 py-0.2 font-medium text-warn"
         title="git status has not answered since {statusUnavailableSince
           ? new Date(statusUnavailableSince).toLocaleTimeString()
           : ''}; the file list and counts may be out of date. The Diagnostics log has the error."
@@ -160,10 +162,10 @@
         onclick={() => repoStore.setActiveTab("insights", "health")}
         class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.2 font-medium transition-colors {loadChip.tone ===
         'danger'
-          ? 'border-rose-500/50 bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20'
+          ? 'border-danger/65 bg-danger/10 text-danger hover:bg-danger/20'
           : loadChip.tone === 'warn'
-            ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
-            : 'border-border/60 bg-surfaceHover text-textMuted hover:text-textPrimary'}"
+            ? 'border-warn/65 bg-warn/10 text-warn hover:bg-warn/20'
+            : 'border-edge bg-surfaceHover text-textMuted hover:text-textPrimary'}"
         title={loadChip.title}
         data-testid="status-host-load"
       >
@@ -178,8 +180,8 @@
         type="button"
         onclick={() => repoStore.setActiveTab("work", "resolve")}
         class="inline-flex items-center gap-1 px-1.5 py-0.2 rounded border font-medium transition-colors {operationState.probeFailed
-          ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
-          : 'border-accent/50 bg-accent/10 text-accent hover:bg-accent/20'}"
+          ? 'border-warn/65 bg-warn/10 text-warn hover:bg-warn/20'
+          : 'border-accent/35 bg-accent/10 text-accent hover:bg-accent/20'}"
         title={operationTip}
       >
         {#if operationState.probeFailed}
@@ -187,23 +189,23 @@
         {:else}
           <GitMerge size={11} class="shrink-0" />
         {/if}
-        <span class="font-mono text-[10px]">{operationMarker}</span>
+        <span class="font-mono text-micro">{operationMarker}</span>
       </button>
     {/if}
 
     <!-- Sync status (Ahead / Behind) -->
     {#if aheadCount > 0 || behindCount > 0}
       <div
-        class="inline-flex items-center gap-1 font-mono text-[10px] text-textMuted px-1.5 py-0.2 rounded bg-surfaceHover border border-border/60"
+        class="inline-flex items-center gap-1 font-mono text-micro text-textMuted px-1.5 py-0.2 rounded bg-surfaceHover border border-edge"
         title="{aheadCount} commits ahead, {behindCount} commits behind upstream"
       >
         {#if aheadCount > 0}
-          <span class="flex items-center text-emerald-600 dark:text-emerald-400">
+          <span class="flex items-center text-ok">
             <ArrowUp size={10} />{aheadCount}
           </span>
         {/if}
         {#if behindCount > 0}
-          <span class="flex items-center text-sky-600 dark:text-sky-400">
+          <span class="flex items-center text-info">
             <ArrowDown size={10} />{behindCount}
           </span>
         {/if}
@@ -224,17 +226,17 @@
         class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors"
         title="View {dirtyCount} changed file{dirtyCount === 1 ? '' : 's'} ({stagedCount} staged)"
       >
-        <FileDiff size={12} class="text-amber-500 shrink-0" />
+        <FileDiff size={12} class="text-warn shrink-0" />
         <span>{dirtyCount} modified</span>
         {#if stagedCount > 0}
-          <span class="text-[10px] text-emerald-600 dark:text-emerald-400 font-mono">
+          <span class="text-micro text-ok font-mono">
             ({stagedCount} staged)
           </span>
         {/if}
       </button>
     {:else if detail === "full"}
       <span class="inline-flex items-center gap-1 text-textMuted/70">
-        <CheckCircle2 size={11} class="text-emerald-500/80" />
+        <CheckCircle2 size={11} class="text-ok/80" />
         <span>Clean</span>
       </span>
     {/if}
@@ -244,7 +246,7 @@
       <button
         type="button"
         onclick={() => repoStore.setActiveTab("work", "resolve")}
-        class="inline-flex items-center gap-1 font-semibold text-rose-600 dark:text-rose-400 hover:brightness-110 transition-colors animate-pulse"
+        class="inline-flex items-center gap-1 font-semibold text-danger hover:brightness-110 transition-colors animate-pulse"
         title="{conflictedCount} unresolved conflict{conflictedCount === 1 ? '' : 's'}"
       >
         <AlertTriangle size={12} class="shrink-0" />
@@ -254,7 +256,7 @@
   </div>
 
   <!-- Center Segment: Language mix and background activity -->
-  <div class="hidden sm:flex items-center gap-3 text-[10px] min-w-0">
+  <div class="hidden sm:flex items-center gap-3 text-micro min-w-0">
     <!-- The language breakdown used to be its own 32px strip. It is reference
          material, not a control, so it rides here and expands on demand. -->
     {#if detail === "full" && $interfaceStore.showLanguageBar}
@@ -285,7 +287,7 @@
         type="button"
         onclick={() => repoStore.toggleTerminal()}
         aria-pressed={$repoStore.terminalOpen}
-        class="inline-flex items-center gap-1 transition-colors text-[10px] {$repoStore
+        class="inline-flex items-center gap-1 transition-colors text-micro {$repoStore
           .terminalOpen
           ? 'text-accent'
           : 'text-textMuted hover:text-textPrimary'}"
@@ -299,7 +301,7 @@
     <button
       type="button"
       onclick={openCommandPalette}
-      class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-[10px]"
+      class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-micro"
       title="Open Command Palette"
     >
       <span class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</span>
@@ -309,7 +311,7 @@
     <button
       type="button"
       onclick={openShortcuts}
-      class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-[10px]"
+      class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-micro"
       title="Open Keyboard Shortcuts"
     >
       <Keyboard size={11} class="shrink-0" />

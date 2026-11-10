@@ -1052,7 +1052,7 @@
     <!-- Minimal crash isolation: a broken pane never takes down the window. -->
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatDiagnosticFailure(error)}>
       <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
-      <span class="text-[11px] text-textMuted">See Diagnostics for crash details</span>
+      <span class="text-meta text-textMuted">See Diagnostics for crash details</span>
       <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
     </div>
   {/snippet}
@@ -1071,7 +1071,7 @@
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("header", error)}>
     <header
-    class="gp-glass gp-titlebar bg-surface border-b border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
+    class="gp-glass gp-titlebar bg-surface border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
       ? 'h-12 pr-3'
       : 'h-10 px-3'}"
   >
@@ -1079,7 +1079,7 @@
       <div class="w-[76px] h-full shrink-0" data-tauri-drag-region></div>
     {/if}
     <div
-      class="gp-drag-children flex items-center gap-2 font-bold text-sm tracking-tight text-accent shrink-0"
+      class="gp-drag-children flex items-center gap-2 font-semibold text-sm tracking-tight text-accent shrink-0"
       data-tauri-drag-region
     >
       <Logo size={19} variant="badge" />
@@ -1117,7 +1117,7 @@
         <Bug size={14} />
         {#if diagnosticErrorCount > 0}
           <span
-            class="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-rose-500 text-white text-[9px] leading-[15px] font-semibold text-center"
+            class="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-danger text-white text-micro leading-[15px] font-semibold text-center"
             title="{diagnosticErrorCount} error{diagnosticErrorCount === 1 ? '' : 's'} recorded"
           >
             {diagnosticErrorCount > 99 ? "99+" : diagnosticErrorCount}
@@ -1163,7 +1163,7 @@
         <Logo size={68} variant="badge" animated />
 
         <div>
-          <h1 class="text-xl font-bold text-textPrimary">Welcome to GitPulse</h1>
+          <h1 class="text-xl font-semibold text-textPrimary">Welcome to GitPulse</h1>
           <p class="text-xs text-textMuted mt-1">High-performance, native Git client built with Rust & Svelte</p>
         </div>
 
@@ -1177,13 +1177,13 @@
           </button>
           <button onclick={openCloneDialog} class="gp-btn flex-1 py-2.5! px-4!">
             <Download size={15} />
-            <span>Clone Repo</span>
+            <span>Clone repository</span>
           </button>
         </div>
 
         {#if $repoStore.recentRepos.length > 0}
           <div class="w-full text-left pt-4">
-            <div class="flex items-center gap-1.5 text-[11px] font-semibold text-textMuted uppercase tracking-wider mb-2">
+            <div class="flex items-center gap-1.5 gp-label mb-2">
               <Clock size={12} />
               <span>Recent Repositories</span>
             </div>
@@ -1191,10 +1191,10 @@
               {#each $repoStore.recentRepos as repo}
                 <button
                   onclick={() => repoStore.openRepo(repo)}
-                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-xs hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
+                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-edge hover:border-accent/65 shadow-xs hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-colors text-left"
                 >
                   <span class="font-medium truncate">{displayName(repo)}</span>
-                  <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{repo}</span>
+                  <span class="text-micro text-textMuted font-mono truncate max-w-xs">{repo}</span>
                 </button>
               {/each}
             </div>
@@ -1279,25 +1279,25 @@
 
     {#if $showFirstRunCard}
       <div
-        class="gp-pop gp-card fixed bottom-10 left-6 z-30 max-w-sm rounded-2xl border border-accent/40 bg-surface p-3 shadow-float"
+        style:z-index={LAYERS.TOUR} class="gp-pop gp-card fixed bottom-10 left-6 max-w-sm rounded-2xl border border-accent/35 bg-surface p-3 shadow-float"
         role="status"
       >
-        <div class="text-xs font-bold text-textPrimary mb-1">Optional tools</div>
-        <p class="text-[11px] text-textMuted leading-relaxed mb-2">
-          Install <span class="font-mono">devmap</span> (Code → Map) and
-          <span class="font-mono">manvi</span> (policy) when you want them — GitPulse works without either.
+        <div class="text-xs font-semibold text-textPrimary mb-1">Optional tools</div>
+        <p class="text-meta text-textMuted leading-relaxed mb-2">
+          Set up the code map (Code → Map) and
+          Manvi (policy) when you want them — GitPulse works without either.
         </p>
         <div class="flex items-center gap-2">
           <button
             type="button"
-            class="gp-btn text-[11px] px-2 py-0.5"
+            class="gp-btn text-meta px-2 py-0.5"
             onclick={() => openSetupWizard("devmap", "explain")}
           >
             Set up
           </button>
           <button
             type="button"
-            class="text-[11px] text-textMuted hover:text-textPrimary"
+            class="text-meta text-textMuted hover:text-textPrimary"
             onclick={() => void dismissFirstRun()}
           >
             Dismiss
@@ -1347,11 +1347,11 @@
 
   {#if dropActive}
     <div
-      class="gp-overlay absolute inset-0 bg-accent/10 backdrop-blur-sm p-4 flex items-center justify-center pointer-events-none gp-gpu"
+      class="gp-overlay absolute inset-0 bg-accent/10 p-4 flex items-center justify-center pointer-events-none gp-gpu"
       style="z-index: {LAYERS.DROP_OVERLAY}"
     >
-      <div class="w-full h-full rounded-3xl border-2 border-dashed border-accent/70 bg-accent/5 flex items-center justify-center">
-        <div class="gp-pop px-6 py-4 rounded-2xl bg-surface border border-accent/50 text-sm font-semibold text-textPrimary shadow-float">
+      <div class="w-full h-full rounded-2xl border-2 border-dashed border-accent/65 bg-accent/5 flex items-center justify-center">
+        <div class="gp-pop px-6 py-4 rounded-2xl bg-surface border border-accent/35 text-sm font-semibold text-textPrimary shadow-float">
           Drop a Git repository to open
         </div>
       </div>

@@ -112,7 +112,7 @@
   .gitpulse-trace {
     stroke-dasharray: 64;
     stroke-dashoffset: 64;
-    animation: gitpulse-draw 1s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    animation: gitpulse-draw calc(var(--gp-dur-emphasis) * 2) var(--gp-ease-effect) forwards;
   }
 
   @keyframes gitpulse-draw {

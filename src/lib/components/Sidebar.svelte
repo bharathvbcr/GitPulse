@@ -1,5 +1,6 @@
 <script lang="ts">
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { LAYERS } from "../ui/layers";
   import { displayName } from "../repos/paths";
   import { repoScope } from "../repos/repoScope.svelte";
   import BranchList from "./BranchList.svelte";
@@ -143,7 +144,7 @@
   }
 
   function pathClass(conflicted: boolean): string {
-    return conflicted ? "text-amber-400 font-bold" : "text-textPrimary";
+    return conflicted ? "text-warn font-semibold" : "text-textPrimary";
   }
 
   /* --- Drag-to-resize (Pointer Events + capture) ---------------------------- */
@@ -205,8 +206,8 @@
 </script>
 
 <aside
-  class="gp-glass gp-sidebar relative bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
-    ? 'transition-[width] duration-150'
+  class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
+    ? 'transition-[width] duration-(--gp-dur-fast)'
     : ''}"
   style="width:{$layoutStore.collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
 >
@@ -215,7 +216,7 @@
     <div class="p-3 flex items-center justify-between bg-surfaceHover/30 gap-1">
       <div class="flex items-center gap-2 truncate">
         <FolderGit2 size={15} class="text-accent shrink-0" />
-        <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No Repo"}>
+        <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No repository"}>
           {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No Repository"}
         </span>
       </div>
@@ -243,7 +244,7 @@
 
     {#if $repoStore.currentPath}
       <!-- At-a-glance repo pulse strip -->
-      <div class="mx-3 mt-2 rounded-xl border border-border/70 bg-surface p-2.5 space-y-1.5">
+      <div class="mx-3 mt-2 rounded-xl border border-edge bg-surface p-2.5 space-y-1.5">
         <div class="flex items-center gap-1.5 min-w-0">
           <GitBranch size={13} class="text-accent shrink-0" />
           <span
@@ -257,7 +258,7 @@
           <div class="ml-auto flex items-center gap-1 shrink-0">
             {#if aheadCount > 0}
               <span
-                class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25"
+                class="text-micro font-mono font-semibold px-1 py-0 rounded-full bg-ok/15 text-ok border border-ok/35"
                 title={`${aheadCount} commit${aheadCount === 1 ? "" : "s"} ahead of upstream`}
               >
                 ↑{aheadCount}
@@ -265,7 +266,7 @@
             {/if}
             {#if behindCount > 0}
               <span
-                class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
+                class="text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
                 title={`${behindCount} commit${behindCount === 1 ? "" : "s"} behind upstream`}
               >
                 ↓{behindCount}
@@ -273,7 +274,7 @@
             {/if}
             {#if currentBranchInfo?.is_default}
               <span
-                class="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0 rounded-full border border-border/70 bg-surface text-textMuted"
+                class="text-micro font-semibold px-1.5 py-0 rounded-full border border-edge bg-surface text-textMuted"
                 title="The current branch is this repository's default branch"
               >
                 default
@@ -284,25 +285,25 @@
 
         {#if dirtyCount === 0}
           <div class="flex items-center gap-1.5 text-textMuted/70" title="No uncommitted changes">
-            <CheckCircle2 size={12} class="text-green-400/80 shrink-0" />
+            <CheckCircle2 size={12} class="text-ok/80 shrink-0" />
             <span>Working tree clean</span>
           </div>
         {:else}
           <div class="flex items-center justify-between gap-1.5 min-w-0 w-full">
             <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-accent" title="Preview uncommitted files and modifications">
               <span
-                class="font-mono text-[11px] shrink-0"
+                class="font-mono text-meta shrink-0"
                 title="Total added / deleted lines across all changed files"
               >
-                <span class="text-green-400">+{totalAdditions}</span>
-                <span class="text-red-400">−{totalDeletions}</span>
+                <span class="text-ok">+{totalAdditions}</span>
+                <span class="text-danger">−{totalDeletions}</span>
               </span>
               <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
                 {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
               </span>
               {#if conflictedCount > 0}
                 <span
-                  class="ml-auto flex items-center gap-1 shrink-0 text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
+                  class="ml-auto flex items-center gap-1 shrink-0 text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
                   title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
                 >
                   <AlertTriangle size={10} class="shrink-0" />
@@ -398,7 +399,7 @@
             onclick={() => toggleSection("staged")}
             aria-expanded={!sections.staged}
             title={sections.staged ? "Expand staged changes" : "Collapse staged changes"}
-            class="flex items-center gap-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
+            class="flex items-center gap-1 gp-label hover:text-textPrimary transition-colors"
           >
             {#if sections.staged}
               <ChevronRight size={12} />
@@ -416,7 +417,7 @@
               type="button"
               onclick={unstageAll}
               title="Unstage all files"
-              class="text-[9px] lowercase font-normal text-textMuted hover:text-red-400 transition-colors"
+              class="text-micro lowercase font-normal text-textMuted hover:text-danger transition-colors"
             >
               unstage all
             </button>
@@ -424,7 +425,7 @@
         </div>
         {#if !sections.staged}
           {#if filteredStaged.length === 0}
-            <div class="text-[11px] text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-textMuted/60 px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "No staged changes"}
             </div>
           {:else}
@@ -435,12 +436,12 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
-                    class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
+                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, true)}
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                      <span class="text-textMuted/60 text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
@@ -452,7 +453,7 @@
                     }}
                     title="Unstage file"
                     aria-label="Unstage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-red-400 shrink-0"
+                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-danger shrink-0"
                   >
                     <Minus size={12} />
                   </button>
@@ -461,7 +462,7 @@
               {#if filteredStaged.length > visibleStaged.length}
                 <button
                   type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[10px] text-textMuted hover:text-textPrimary"
+                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
                   onclick={() => (stagedLimit = growLimit(stagedLimit, filteredStaged.length))}
                 >
                   {showMoreLabel(filteredStaged.length, visibleStaged.length)}
@@ -480,7 +481,7 @@
             onclick={() => toggleSection("unstaged")}
             aria-expanded={!sections.unstaged}
             title={sections.unstaged ? "Expand working tree changes" : "Collapse working tree changes"}
-            class="flex items-center gap-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
+            class="flex items-center gap-1 gp-label hover:text-textPrimary transition-colors"
           >
             {#if sections.unstaged}
               <ChevronRight size={12} />
@@ -498,7 +499,7 @@
               type="button"
               onclick={stageAll}
               title="Stage all files"
-              class="text-[9px] lowercase font-normal text-textMuted hover:text-green-400 transition-colors"
+              class="text-micro lowercase font-normal text-textMuted hover:text-ok transition-colors"
             >
               stage all
             </button>
@@ -506,7 +507,7 @@
         </div>
         {#if !sections.unstaged}
           {#if filteredUnstaged.length === 0}
-            <div class="text-[11px] text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-textMuted/60 px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "Working tree clean"}
             </div>
           {:else}
@@ -517,12 +518,12 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
-                    class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
+                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, false)}
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                      <span class="text-textMuted/60 text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
@@ -534,7 +535,7 @@
                     }}
                     title="Stage file"
                     aria-label="Stage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-green-400 shrink-0"
+                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-ok shrink-0"
                   >
                     <Plus size={12} />
                   </button>
@@ -543,7 +544,7 @@
               {#if filteredUnstaged.length > visibleUnstaged.length}
                 <button
                   type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[10px] text-textMuted hover:text-textPrimary"
+                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
                   onclick={() => (unstagedLimit = growLimit(unstagedLimit, filteredUnstaged.length))}
                 >
                   {showMoreLabel(filteredUnstaged.length, visibleUnstaged.length)}
@@ -573,9 +574,9 @@
       <FolderGit2 size={15} class="text-accent shrink-0" />
       {#if $repoStore.currentPath}
         <button type="button" onclick={() => void repoStore.previewUncommitted()}
-          class="text-[9px] font-mono font-bold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
-            ? 'bg-amber-500/15 text-amber-400 border border-amber-500/25'
-            : 'border border-border/70 bg-surface text-textMuted'}"
+          class="text-micro font-mono font-semibold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
+            ? 'bg-warn/15 text-warn border border-warn/35'
+            : 'border border-edge bg-surface text-textMuted'}"
           title={`${dirtyCount} changed file${dirtyCount === 1 ? "" : "s"}`}
         >
           {dirtyCount}
@@ -605,7 +606,7 @@
       aria-valuemin={SIDEBAR_MIN_WIDTH}
       aria-valuemax={SIDEBAR_MAX_WIDTH}
       aria-valuenow={$layoutStore.width}
-      class="absolute top-0 right-[-3px] z-10 h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
+      style:z-index={LAYERS.STICKY} class="absolute top-0 right-[-3px] h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
       title="Drag to resize · double-click to reset · ←/→ to nudge"
       onpointerdown={startResize}
       onpointermove={moveResize}

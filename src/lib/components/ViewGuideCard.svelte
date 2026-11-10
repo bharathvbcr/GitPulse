@@ -21,15 +21,15 @@
     <div class="flex items-center justify-between gap-2">
       <div class="text-xs font-semibold leading-tight text-textPrimary">{guide.title}</div>
       {#if guide.shortcut}
-        <kbd class="gp-keycap shrink-0 text-[10px]">{shortcutTextLabel(guide.shortcut, $hostPlatform.os)}</kbd>
+        <kbd class="gp-keycap shrink-0 text-micro">{shortcutTextLabel(guide.shortcut, $hostPlatform.os)}</kbd>
       {/if}
     </div>
-    <p class="mt-1 text-[11px] leading-relaxed text-textMuted">{guide.summary}</p>
+    <p class="mt-1 text-meta leading-relaxed text-textMuted">{guide.summary}</p>
     {#if guide.chips.length > 0}
       <div class="mt-2 flex flex-wrap gap-1">
         {#each guide.chips as chip (chip.id)}
           <span
-            class="rounded-full px-1.5 py-0.5 text-[9px] font-medium {chip.active
+            class="rounded-full px-1.5 py-0.5 text-micro font-medium {chip.active
               ? 'bg-accent/15 text-accent'
               : 'bg-background text-textMuted'}"
           >

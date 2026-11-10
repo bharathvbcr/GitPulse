@@ -41,7 +41,7 @@
     </div>
     <p class="font-semibold text-textPrimary text-xs">{title}</p>
     {#if hint}
-      <p class="mt-1.5 text-[11px] leading-relaxed text-textMuted">{hint}</p>
+      <p class="mt-1.5 text-meta leading-relaxed text-textMuted">{hint}</p>
     {/if}
 
     {#if action}

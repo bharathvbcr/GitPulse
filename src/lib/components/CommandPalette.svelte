@@ -229,7 +229,7 @@
     onkeydown={event => event.stopPropagation()}
     in:fade={backdropFade()} class="gp-scrim palette-scrim bg-black/40" style="z-index: {LAYERS.MODAL}">
     <!-- Immediate teardown restores focus before a follow-on prompt mounts. -->
-    <div use:trapFocus={{ initial: () => inputEl ?? null }} in:scale={cardScale()} class="palette-card gp-card bg-surface text-textPrimary border border-border/80 shadow-float">
+    <div use:trapFocus={{ initial: () => inputEl ?? null }} in:scale={cardScale()} class="palette-card gp-card bg-surface text-textPrimary border border-edgeStrong shadow-float">
       <header class="palette-header">
         <div class="palette-heading"><span class="palette-brand"><Search size={14} /> <h2 id="command-palette-title">Command palette</h2></span>
           <span class="palette-repo" title={repoPath ?? "No repository open"}><FolderGit2 size={12} />{repoPath ? displayName(repoPath) : "Workspace"}</span>
@@ -253,7 +253,7 @@
           <p>{searchNote ?? historyNote}</p>
           {#if isRemoteSearch}
             <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Retry search</button>
-            {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { close(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up devmap</button>{/if}
+            {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { close(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
           {/if}
           {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
         </div>
@@ -327,7 +327,7 @@
   .palette-pages button { padding:0 6px; }
   button:focus-visible { outline:2px solid var(--color-accent); outline-offset:-2px; }
   button:disabled { opacity:.4; }
-  .palette-card :global(.palette-spinner) { animation:palette-spin 1s linear infinite; }
+  .palette-card :global(.palette-spinner) { animation:palette-spin calc(var(--gp-dur-emphasis) * 2) linear infinite; }
   @keyframes palette-spin { to { transform:rotate(360deg); } }
   @media (prefers-reduced-motion:reduce) { .palette-card :global(.palette-spinner) { animation:none; } }
   @media (max-width:540px) { .palette-scrim { padding:16px 8px; } .palette-card { max-height:calc(100dvh - 32px); } .palette-category { display:none; } .palette-header { padding:12px 12px 0; } .palette-results { max-height:none; } }
