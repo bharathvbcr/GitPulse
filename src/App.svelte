@@ -1005,7 +1005,6 @@
   });
 
   void installTransparencyPreference();
-
   $effect(() => {
     applyReduceMotion($interfaceStore.reduceMotion);
   });

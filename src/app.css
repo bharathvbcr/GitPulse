@@ -737,9 +737,8 @@
     --c-text-muted: 148 161 190;
     /* Foundation roles (design language §4.1). Values are what
        deriveTokens() in lib/ui/color/derive.ts returns for the shipped dark
-       base; foundationTokens.contract.test.ts fails if they drift, and
-       themeContrast.test.ts holds every one to the §4.3 guard against the
-       worst dark surface. Ink on an accent or status fill is near-black here:
+       base; themeContrast.test.ts fails if they drift from that derivation
+       and holds every one to the §4.3 guard against the worst dark surface. Ink on an accent or status fill is near-black here:
        white reaches only ~2.7:1 on the light dark-theme accent. */
     --c-text-faint: 130 143 171;
     --c-on-accent: 3 3 6;
