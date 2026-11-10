@@ -65,7 +65,7 @@ describe("TaskManviAssist", () => {
     expect(source).toContain("Keep title");
     expect(source).toContain("Keep description");
     expect(source).toContain("explainEnhancementFailure");
-    expect(source).toContain("Resolve uncertain attempt");
+    expect(source).toContain("Resolve uncertain run");
     expect(source).toContain('{proposal.state === "running" ? "Cancel" : "Dismiss"}');
   });
 

@@ -18,6 +18,8 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { fade, scale } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { explainError, mergeTasks, type MergeResult, type TaskCard } from "../workbench/client";
 
   let { cards, repositoryId, onClose, onMerged }: {
@@ -57,9 +59,9 @@
   }
 </script>
 
-<div use:portal class="merge-backdrop gp-scrim" role="presentation" style="z-index:{LAYERS.PROMPT}">
-  <div class="merge-dialog gp-card gp-glass shadow-float" role="dialog" aria-modal="true" aria-label="Merge tasks" tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}} data-testid="task-merge-dialog">
-    <header><h2>Merge {cards.length} tasks</h2><button class="gp-icon-btn" aria-label="Close merge" disabled={busy} onclick={close}><X size={16} /></button></header>
+<div use:portal class="merge-backdrop gp-scrim bg-black/50" role="presentation" style="z-index:{LAYERS.PROMPT}" in:fade={backdropFade()} out:fade={backdropFadeOut()}>
+  <div class="merge-dialog gp-card gp-glass shadow-float" in:scale={cardScale()} out:scale={cardScaleOut()} role="dialog" aria-modal="true" aria-label="Merge tasks" tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}} data-testid="task-merge-dialog">
+    <header><h2>Merge {cards.length} tasks</h2><button type="button" class="gp-icon-btn" data-size="md" aria-label="Close merge" disabled={busy} onclick={close}><X size={16} /></button></header>
     <div class="body">
       {#if result === null}
         <p>The task you keep gets a section with each other task's description, their acceptance criteria, labels, checklist and links, and the most urgent priority, severity and due date. The others are deleted; they stay in history and can be restored from the archive's Deleted view.</p>
@@ -84,15 +86,33 @@
       {/if}
     </div>
     <footer>
-      <button bind:this={cancelButton} class="gp-btn" disabled={busy} onclick={close}>{result ? "Done" : "Cancel"}</button>
+      <button bind:this={cancelButton} type="button" class="gp-btn" data-variant="secondary" disabled={busy} onclick={close}>{result ? "Done" : "Cancel"}</button>
       {#if result === null}
-        <button class="gp-btn-primary" disabled={!ready} onclick={run} data-testid="task-merge-run"><Merge size={13} /> {busy ? "Merging…" : `Merge ${sources.length} into this one`}</button>
+        <button type="button" class="gp-btn" data-variant="primary" disabled={!ready} onclick={run} data-testid="task-merge-run"><Merge size={13} /> {busy ? "Merging…" : `Merge ${sources.length} into this one`}</button>
       {:else if !result.ok}
-        <button class="gp-btn-primary" disabled={busy} onclick={() => { result = null; }}>Review and run again</button>
+        <button type="button" class="gp-btn" data-variant="primary" disabled={busy} onclick={() => { result = null; }}>Review and run again</button>
       {/if}
     </footer>
   </div>
 </div>
 <style>
-  .merge-backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;background:#0005;color:rgb(var(--c-text))}.merge-dialog{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:16px;overflow:hidden}header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}header{border-bottom:1px solid rgb(var(--c-border)/.5)}h2{font-size:15px;font-weight:650;margin:0}.body{padding:0 20px;overflow:auto;font-size:12px}p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}fieldset{border:0;padding:0;margin:0 0 12px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}legend{font-weight:600;margin-bottom:6px}fieldset label{display:flex;gap:8px;align-items:flex-start}fieldset span{overflow-wrap:anywhere}.reason{display:flex;flex-direction:column;gap:6px;font-weight:600}textarea{font:inherit;font-weight:400;resize:vertical}ul{list-style:none;padding:0;margin:0;max-height:260px;overflow:auto}li{padding:10px 0;border-bottom:1px solid rgb(var(--c-border)/.4);display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between}li span{overflow-wrap:anywhere;flex:1;min-width:160px}li p{flex-basis:100%;margin:4px 0}.error{color:#dc6565}small{color:rgb(var(--c-text-muted))}footer{justify-content:flex-end}
+  .merge-backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;color:rgb(var(--c-text))}
+  .merge-dialog{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
+  header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}
+  h2{font-size:0.9375rem;font-weight:600;margin:0}
+  .body{padding:0 20px;overflow:auto;font-size:12px}
+  p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}
+  fieldset{border:0;padding:0;margin:0 0 12px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+  legend{font-weight:600;margin-bottom:6px}
+  fieldset label{display:flex;gap:8px;align-items:flex-start}
+  fieldset span{overflow-wrap:anywhere}
+  .reason{display:flex;flex-direction:column;gap:6px;font-weight:600}
+  textarea{font:inherit;font-weight:400;resize:vertical}
+  ul{list-style:none;padding:0;margin:0;max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+  li{padding:8px 0;display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between}
+  li span{overflow-wrap:anywhere;flex:1;min-width:160px}
+  li p{flex-basis:100%;margin:4px 0}
+  .error{color:rgb(var(--c-danger))}
+  small{color:rgb(var(--c-text-muted))}
+  footer{justify-content:flex-end}
 </style>

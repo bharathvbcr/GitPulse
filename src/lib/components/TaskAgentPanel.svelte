@@ -21,6 +21,8 @@
   import { onDestroy, untrack } from "svelte";
   import { ChevronDown, ChevronRight, RotateCw, SquareTerminal } from "@lucide/svelte";
   import AttemptReview from "./AttemptReview.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import AgentDecisions from "./AgentDecisions.svelte";
   import RunActivity from "./RunActivity.svelte";
   import SendToAgent from "./SendToAgent.svelte";
@@ -41,7 +43,6 @@
   import { formatRelativeTime } from "../format";
   import {
     cancelTaskRun,
-    explainError,
     getTaskRun,
     launchManagedRun,
     listPendingDecisions,
@@ -182,6 +183,28 @@
   let now = $state(Date.now());
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
 
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+  /** What each row action was doing, as a bare verb and its object, for the failure line. */
+  const ACTION_FAILURES: Record<string, readonly [verb: string, object: string]> = {
+    "Opening terminal": ["open", "the terminal"],
+    "Trusting": ["trust", "the checkout"],
+    "Opening conversation": ["open", "the conversation"],
+    "Stopping": ["stop", "the agent"],
+    "Cancelling": ["cancel", "the preparation"],
+    "Resuming": ["resume", "the run"],
+    "Releasing": ["release", "the checkout"],
+    "Reading output": ["read", "the output"],
+    "Opening checkout": ["open", "the checkout"],
+    "Opening changes": ["open", "the changes"],
+    "Merging": ["merge", "the worktree"],
+    "Discarding": ["discard", "the worktree"],
+  };
+  const STAGE_TONES = { live: "accent", ask: "warn", bad: "danger", done: "neutral" } as const;
+
   const capacityFull = $derived($terminalSessions.length >= $terminalSessionLimit);
   /** History and live reads joined by id; the newer revision of a run wins. */
   const allRuns = $derived.by(() => {
@@ -231,12 +254,12 @@
   // and waits for a first successful read: an unread history is not an empty one.
   const formOpen = $derived(expandedForm ?? (readOnce && live.length === 0));
   const summary = $derived.by(() => {
-    if (!total && !allRuns.length) return historyError ? "Attempts could not be read." : loading ? "Loading attempts…" : "No attempts yet.";
+    if (!total && !allRuns.length) return historyError ? "Runs could not be read." : loading ? "Reading runs…" : "No runs yet.";
     const floor = liveComplete ? "" : "at least ";
     const working = live.length ? `${floor}${live.length} working now` : "Nothing working now";
     const asking = askingCount ? ` · ${askingCount} ${askingCount === 1 ? "needs" : "need"} you` : "";
     const count = Math.max(total, allRuns.length);
-    return `${working}${asking} · ${count} ${count === 1 ? "attempt" : "attempts"}`;
+    return `${working}${asking} · ${count} ${count === 1 ? "run" : "runs"}`;
   });
 
   $effect(() => { onCount?.(live.length); });
@@ -302,7 +325,7 @@
       historyError = "";
       readOnce = true;
       if (working) void readPending(working.runs, ticket);
-    } catch (cause) { if (!disposed && ticket === generation) historyError = explainError(cause); }
+    } catch (cause) { if (!disposed && ticket === generation) historyError = failure("read", "the runs", cause); }
     finally { loading = false; schedule(); }
   }
   /**
@@ -392,14 +415,17 @@
    */
   async function act(run: Pick<TaskRun, "id">, how: { label: string; mutates: boolean }, work: () => Promise<void>) {
     if (!canAct(run.id, inflight, mutationHolder, how.mutates)) {
-      if (!inflight[run.id]) say(run.id, "note", slotHeldNote(run.id, inflight, mutationHolder) ?? "Another attempt's action is running.");
+      if (!inflight[run.id]) say(run.id, "note", slotHeldNote(run.id, inflight, mutationHolder) ?? "Another run's action is running.");
       return;
     }
     inflight = { ...inflight, [run.id]: how.label };
     if (how.mutates) mutationHolder = run.id;
     unsay(run.id);
     try { await work(); }
-    catch (cause) { say(run.id, "error", explainError(cause)); }
+    catch (cause) {
+      const [verb, object] = ACTION_FAILURES[how.label] ?? ["finish", "the action"];
+      say(run.id, "error", failure(verb, object, cause));
+    }
     finally {
       if (!disposed) {
         const rest = { ...inflight };
@@ -432,7 +458,7 @@
     return act(run, { label: "Stopping", mutates: false }, async () => {
       if (!(await closeWithConfirmation(record))) return;
       say(run.id, "note", record.taskRunId === run.id
-        ? `${PROVIDER_LABELS[run.provider] ?? run.provider} was stopped. The attempt has ended; start a new one to continue.`
+        ? `${PROVIDER_LABELS[run.provider] ?? run.provider} was stopped. The run has ended; start a new one to continue.`
         : "The resumed conversation was stopped.");
     });
   }
@@ -454,7 +480,7 @@
     reviewingRunID = current.id;
     // Recovered: whatever failure was recorded for its start is history.
     if (current.state === "running") noteAttempt(current.id, "running", `Managed ${PROVIDER_LABELS[current.provider]} is running.`);
-    say(current.id, "note", current.state === "running" ? `Managed ${PROVIDER_LABELS[current.provider]} started. Review its requests below.` : `Managed attempt: ${current.state}.`);
+    say(current.id, "note", current.state === "running" ? `Managed ${PROVIDER_LABELS[current.provider]} started. Review its requests below.` : `Managed run: ${current.state}.`);
   }
   function resumeManaged(run: TaskRun) { return act(run, { label: "Resuming", mutates: true }, () => manage(run)); }
   function stopManaged(run: TaskRun) {
@@ -481,7 +507,7 @@
       const result = await resumeTaskConversation(run);
       if (result.outcome === "unavailable") say(run.id, "note", result.reason);
       else if (result.outcome === "queued") say(run.id, "note", queuedTerminalNote(run.cwd));
-      else say(run.id, "note", "Resuming the conversation in its checkout. It is listed under this attempt; Show conversation to continue it.");
+      else say(run.id, "note", "Resuming the conversation in its checkout. It is listed under this run; Show conversation to continue it.");
     });
   }
 
@@ -557,7 +583,7 @@
       <!-- One ladder for every attempt (taskSessions.ts::attemptStage). Polite,
            so a transition is announced without interrupting; fixed in the
            head row, so a longer label wraps the row rather than moving it. -->
-      <span class="state" role="status" aria-live="polite" data-tone={stage.tone} data-stage={stage.stage} data-testid="agent-stage" title={runStatusLabel(run, clock)}>{stage.label}</span>
+      <span class="state gp-chip" role="status" aria-live="polite" data-tone={STAGE_TONES[stage.tone]} data-stage={stage.stage} data-testid="agent-stage" title={runStatusLabel(run, clock)}>{stage.label}</span>
     </div>
     <small class="facts">
       <span title={run.cwd} data-testid="agent-checkout">{place.repository}{#if place.checkout} / {place.checkout}{/if}</span>
@@ -570,13 +596,13 @@
       <!-- From the repository tab GitPulse has open on this checkout, and only
            when that tab has read its status: a 0 from a tab still loading is a
            read that did not happen. A shared checkout's changes may be anyone's. -->
-      <small class="changes" data-testid="agent-changes" title={changes.shared ? "This attempt runs in a checkout it shares, so these changes may not all be its own." : "Uncommitted changes in this attempt's worktree."}>
-        {changes.files === 0 ? "No uncommitted changes" : `${changes.files} ${changes.files === 1 ? "file" : "files"} changed`}{changes.shared ? " in this shared checkout" : ""}{changes.branch ? ` · ${changes.branch}` : ""}
+      <small class="changes" data-testid="agent-changes" title={changes.shared ? "This run uses a worktree it shares, so these changes may not all be its own." : "Uncommitted changes in this run's worktree."}>
+        {changes.files === 0 ? "No uncommitted changes" : `${changes.files} ${changes.files === 1 ? "file" : "files"} changed`}{changes.shared ? " in this shared worktree" : ""}{changes.branch ? ` · ${changes.branch}` : ""}
       </small>
     {/if}
 
     {#if view.sessions.length || view.waiting || row.disconnected || row.unstarted || asked || row.failure}
-      <ul class="sessions" aria-label="What this attempt is doing">
+      <ul class="sessions" aria-label="What this run is doing">
         {#each view.sessions as session, index (session.record.key)}
           {@const glance = row.glances[index]}
           <li data-phase={session.phase} data-tone={glance.tone} data-testid="agent-session">
@@ -621,10 +647,10 @@
     <RunActivity {run} {now} {active} />
 
     {#if run.reason}<p>{run.reason}</p>{/if}
-    {#if run.state === "unresolved"}<p class="error">This attempt's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</p>
-    {:else if run.outcome_uncertain}<p>Released without an observed exit. Review what it changed before relying on it.</p>{/if}
-    {#if expired}<p>This preparation expired before it started, so it no longer holds its checkout. Cancel it to clear it from the history, then prepare a new attempt.</p>{/if}
-    {#if message}<p class="row-message" data-tone={message.tone} role={message.tone === "error" ? "alert" : "status"} data-testid="agent-run-message">{message.text}</p>{/if}
+    {#if run.state === "unresolved"}<div class="gp-notice" data-tone="danger">This run's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</div>
+    {:else if run.outcome_uncertain}<div class="gp-notice" data-tone="warn">Released without an observed exit. Review what it changed before relying on it.</div>{/if}
+    {#if expired}<p>This preparation expired before it started, so it no longer holds its checkout. Cancel it to clear it from the history, then prepare a new run.</p>{/if}
+    {#if message}<p class="gp-notice row-message" data-tone={message.tone === "error" ? "danger" : "info"} role={message.tone === "error" ? "alert" : "status"} data-testid="agent-run-message">{message.text}</p>{/if}
 
     <!-- Why a button is disabled: this card's own action, or (only on cards with
          a mutating button) another attempt holding the git/checkout slot. -->
@@ -633,38 +659,38 @@
 
     <div class="actions">
       {#if run.kind === "external_terminal" && OPENABLE.includes(run.state) && !expired}
-        <button class="gp-btn-primary" type="button" onclick={() => showTerminal(run)} disabled={!free}><SquareTerminal size={12} /> Show terminal</button>
+        <button class="gp-btn" data-variant="primary" data-size="sm" type="button" onclick={() => showTerminal(run)} disabled={!free}><SquareTerminal size={12} /> Show terminal</button>
       {/if}
       {#if view.waiting?.role === "attempt" && view.waiting.reason === "trust"}
-        <button class="gp-btn-primary" type="button" onclick={() => trust(run)} disabled={!mayMutate} data-testid="agent-trust" title="Asks whether to trust this checkout's repository. The agent starts once you do.">Trust checkout…</button>
+        <button class="gp-btn" data-variant="primary" data-size="sm" type="button" onclick={() => trust(run)} disabled={!mayMutate} data-testid="agent-trust" title="Asks whether to trust this checkout's repository. The agent starts once you do.">Trust checkout…</button>
       {/if}
       {#if own && own.phase !== "adopted"}
-        <button class="gp-btn" type="button" onclick={() => stopSession(run, own.record)} disabled={!free} title="Stops the agent. You are asked first, because stopping ends this attempt.">Stop agent</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => stopSession(run, own.record)} disabled={!free} title="Stops the agent. You are asked first, because stopping ends this run.">Stop agent</button>
       {/if}
       {#if view.waiting?.role === "resumed" && view.waiting.reason === "checkout"}
         <!-- Its checkout did not open in the background; opening it in front
              is what starts the conversation, and says why if it cannot. -->
-        <button class="gp-btn-primary" type="button" onclick={() => showWaitingConversation(run)} disabled={!free}><SquareTerminal size={12} /> Show conversation</button>
+        <button class="gp-btn" data-variant="primary" data-size="sm" type="button" onclick={() => showWaitingConversation(run)} disabled={!free}><SquareTerminal size={12} /> Show conversation</button>
       {/if}
       {#each view.sessions.filter((session) => session.role === "resumed") as session (session.record.key)}
-        <button class="gp-btn" type="button" onclick={() => showSession(run, session.record)} disabled={!free}>Show conversation</button>
-        <button class="gp-btn" type="button" onclick={() => stopSession(run, session.record)} disabled={!free}>Stop conversation</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => showSession(run, session.record)} disabled={!free}>Show conversation</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => stopSession(run, session.record)} disabled={!free}>Stop conversation</button>
       {/each}
       {#if run.kind === "managed"}
-        {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => resumeManaged(run)} disabled={!mayMutate}>Start or recover managed launch</button>{/if}
-        {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" type="button" onclick={() => stopManaged(run)} disabled={!free}>Stop managed run</button>{/if}
-        <button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={!free}>View output and settings</button>{/if}
-      {#if (run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={!mayMutate} title={`Starts ${run.provider === "agy" ? "an Antigravity" : "a Claude Code"} tab in this attempt's checkout that continues its conversation, in the same permission mode. You stay on this task.`}>Resume conversation</button>{/if}
-      {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={!free}>Cancel preparation</button>{/if}
-      <button class="gp-btn" type="button" onclick={() => openCheckout(run)} disabled={!free} data-testid="agent-open-checkout" title={`Opens ${run.cwd} as the active repository tab. Starts nothing.`}>Open checkout</button>
-      {#if offer.review}<button class="gp-btn" type="button" onclick={() => review(run)} disabled={!free} data-testid="agent-review" title={`Opens ${run.cwd} on its uncommitted changes.`}>Review changes</button>{/if}
+        {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" data-size="sm" type="button" onclick={() => resumeManaged(run)} disabled={!mayMutate}>Start or recover managed run</button>{/if}
+        {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" data-size="sm" type="button" onclick={() => stopManaged(run)} disabled={!free}>Stop managed run</button>{/if}
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => inspect(run)} disabled={!free}>View output and settings</button>{/if}
+      {#if (run.provider === "claude" || run.provider === "agy") && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" data-size="sm" type="button" onclick={() => resume(run)} disabled={!mayMutate} title={`Starts ${run.provider === "agy" ? "an Antigravity" : "a Claude Code"} tab in this run's checkout that continues its conversation, in the same permission mode. You stay on this task.`}>Resume conversation</button>{/if}
+      {#if run.state === "prepared"}<button class="gp-btn" data-size="sm" type="button" onclick={() => cancel(run)} disabled={!free}>Cancel preparation</button>{/if}
+      <button class="gp-btn" data-size="sm" type="button" onclick={() => openCheckout(run)} disabled={!free} data-testid="agent-open-checkout" title={`Opens ${run.cwd} as the active repository tab. Starts nothing.`}>Open checkout</button>
+      {#if offer.review}<button class="gp-btn" data-size="sm" type="button" onclick={() => review(run)} disabled={!free} data-testid="agent-review" title={`Opens ${run.cwd} on its uncommitted changes.`}>Review changes</button>{/if}
       {#if offer.ownWorktree}
         {@const target = mergeTargetLabel(run.cwd)}
-        <button class="gp-btn" type="button" onclick={() => merge(run)} disabled={!mayMutate} data-testid="agent-merge" title="Merges this attempt's branch into the main checkout's branch and removes its worktree. You are asked first.">{target ? `Merge into ${target}` : "Merge into main checkout"}</button>
-        <button class="gp-btn" type="button" onclick={() => discard(run)} disabled={!mayMutate} data-testid="agent-discard" title="Removes this attempt's worktree. You are told how many uncommitted files are lost, and asked first.">Discard worktree</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => merge(run)} disabled={!mayMutate} data-testid="agent-merge" title="Merges this run's branch into the main worktree's branch and removes its worktree. You are asked first.">{target ? `Merge into ${target}` : "Merge into main worktree"}</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => discard(run)} disabled={!mayMutate} data-testid="agent-discard" title="Removes this run's worktree. You are told how many uncommitted files are lost, and asked first.">Discard worktree</button>
       {/if}
-      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={!mayMutate} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
-      {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
+      {#if canRelease(run)}<button class="gp-btn" data-size="sm" type="button" onclick={() => release(run)} disabled={!mayMutate} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
+      {#if run.session_id && run.kind === "managed"}<button class="gp-btn" data-size="sm" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
 
     <!-- A message back to this attempt's agent. Offered whenever there is an agent that ran; the host says which
@@ -678,7 +704,7 @@
         <textarea class="gp-field gp-field-multi" readonly rows="7" aria-label="Managed agent output" value={detail.output ?? "No output saved yet."}></textarea>
         {#if detail.output_truncated}<p>Output reached the 128 KiB retention limit.</p>{/if}
         <details><summary>Effective provider settings</summary><textarea class="gp-field gp-field-multi" readonly rows="7" aria-label="Effective provider settings" value={detail.effective_configuration ?? "Settings are not recorded yet."}></textarea></details>
-        <div class="actions"><button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={!free}>Refresh output</button><button class="gp-btn" type="button" onclick={() => { detail = null; }}>Close details</button></div>
+        <div class="actions"><button class="gp-btn" data-size="sm" type="button" onclick={() => inspect(run)} disabled={!free}>Refresh output</button><button class="gp-btn" data-size="sm" type="button" onclick={() => { detail = null; }}>Close details</button></div>
       </section>
     {/if}
     {#if offer.ownWorktree || removedWorktrees.has(run.id)}<AttemptReview {run} onlanded={() => worktreeRemoved(run.id)} />{/if}
@@ -689,16 +715,16 @@
 <section class="task-runs" aria-label="Task agent runs" data-testid="task-agent-panel">
   <header class="agents-head">
     <div class="min-w-0">
-      <h3>Agents</h3>
+      <h3 class="text-sm font-semibold">Agents</h3>
       <p class="meta" data-testid="agents-summary">{summary}</p>
     </div>
-    <button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading} title="Refresh this task's attempts"><RotateCw size={12} /> Refresh</button>
+    <button class="gp-btn" data-size="sm" type="button" onclick={() => refresh()} disabled={loading} title="Refresh this task's runs"><RotateCw size={12} /> Refresh</button>
   </header>
 
-  {#if historyError}<p class="error" role="alert">{historyError} <button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading}>Retry</button></p>{/if}
+  {#if historyError}<div class="gp-notice" data-tone="danger" role="alert"><span class="min-w-0 flex-1">{historyError}</span><button class="gp-btn shrink-0" data-size="sm" type="button" onclick={() => refresh()} disabled={loading}>Try again</button></div>{/if}
 
   {#if live.length || pendingRow}
-    <h4 class="group-heading">Working now</h4>
+    <h4 class="gp-label">Working now</h4>
     <div class="run-list" data-testid="agents-working">
       {#if pendingRow}
         <!-- Optimistic: shown from the moment Launch is pressed until the
@@ -707,7 +733,7 @@
           <div class="run-head">
             <strong>{PROVIDER_LABELS[pendingRow.provider] ?? pendingRow.provider}</strong>
             <span class="kind">{pendingRow.kind === "managed" ? "Managed" : "Terminal"}</span>
-            <span class="state" role="status" aria-live="polite" data-tone="live" data-stage="preparing" data-testid="agent-stage">{pendingRow.worktree ? "Preparing worktree" : "Preparing"}</span>
+            <span class="state gp-chip" role="status" aria-live="polite" data-tone="accent" data-stage="preparing" data-testid="agent-stage">{pendingRow.worktree ? "Preparing worktree" : "Preparing"}</span>
           </div>
           <small class="facts">{pendingRow.worktree ? "Creating its worktree and running the repository's setup, then the agent starts." : "Checking the task and the checkout, then the agent starts."}</small>
         </article>
@@ -718,15 +744,15 @@
 
   <button
     type="button"
-    class="form-toggle"
+    class="gp-btn w-full"
     data-testid="task-agent-toggle"
     aria-expanded={formOpen}
     aria-controls="task-agent-launch"
     onclick={() => { expandedForm = !formOpen; }}
   >
     {#if formOpen}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
-    <span class="flex-1 text-left" data-testid="task-agent-toggle-label">{live.length ? "New attempt" : "Send to an agent"}</span>
-    <span class="meta">Revision {task.revision}</span>
+    <span class="flex-1 text-left" data-testid="task-agent-toggle-label">{live.length ? "New run" : "Send to an agent"}</span>
+    <span class="text-meta font-normal text-textMuted">Revision {task.revision}</span>
   </button>
 
   <div id="task-agent-launch" hidden={!formOpen}>
@@ -754,8 +780,8 @@
       onPending={(next) => { preparePending = next; }}
     />
     <div class="launch-row">
-      <button class="gp-btn-primary" type="button" onclick={() => void form?.launch()} disabled={!gate.ok}>
-        {launching ? "Preparing…" : preparePending ? "Retry preparation" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
+      <button class="gp-btn" data-variant="primary" data-size="md" type="button" onclick={() => void form?.launch()} disabled={!gate.ok}>
+        {launching ? "Preparing…" : preparePending ? "Try preparing again" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Run in ${PROVIDER_LABELS[settings.provider]}`}
       </button>
       {#if !gate.ok && gate.reason}<span class="meta gate">{gate.reason}</span>{/if}
     </div>
@@ -763,74 +789,67 @@
   </div>
 
   <div class="history-heading">
-    <h4>History{#if ended.length}<span class="meta"> · {ended.length}{cursor ? "+" : ""}</span>{/if}</h4>
+    <h4 class="gp-label">History{#if ended.length}<span class="meta"> · {ended.length}{cursor ? "+" : ""}</span>{/if}</h4>
     {#if total}<span class="meta">{runs.length} of {total} loaded</span>{/if}
   </div>
-  {#if !runs.length}<p>{loading ? "Loading runs…" : historyError ? "Attempts could not be read." : "No runs yet."}</p>
-  {:else if !ended.length}<p>No ended attempts{cursor ? " loaded yet" : ""}.</p>{/if}
+  {#if !runs.length}
+    {#if loading}<Skeleton variant="text" count={2} />
+    {:else}<p>{historyError ? "Runs could not be read." : "No runs yet."}</p>{/if}
+  {:else if !ended.length}<p>No ended runs{cursor ? " loaded yet" : ""}.</p>{/if}
   <div class="run-list" data-testid="agents-history">
     {#each ended as run (run.id)}{@render runCard(run)}{/each}
   </div>
-  {#if cursor && runs.length >= MAX_LOADED_RUNS}<p class="meta" data-testid="agents-history-cap">Showing the newest {runs.length} of {total} attempts. Older ones are not loaded here.</p>
-  {:else if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading}>Load more ({runs.length} of {total})</button>{/if}
+  {#if cursor && runs.length >= MAX_LOADED_RUNS}<p class="meta" data-testid="agents-history-cap">Showing the newest {runs.length} of {total} runs. Older ones are not loaded here.</p>
+  {:else if cursor}<button class="gp-btn" data-size="sm" type="button" onclick={() => refresh(true)} disabled={loading}>Load more ({runs.length} of {total})</button>{/if}
 </section>
 
 <style>
-  .task-runs{font-size:12px;padding-top:2px;display:flex;flex-direction:column;gap:10px}
+  .task-runs{font-size:0.75rem;padding-top:2px;display:flex;flex-direction:column;gap:10px}
   .agents-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
-  .agents-head h3{margin:0;font-size:13px;font-weight:650}
+  .agents-head h3{margin:0}
   .agents-head .meta{margin:2px 0 0}
-  h4{margin:0;font-weight:650}
-  .group-heading{font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
+  h4{margin:0}
   p{color:rgb(var(--c-text-muted));line-height:1.5;margin:0}
-  .meta{color:rgb(var(--c-text-muted));font-size:11px}
-  .form-toggle{display:flex;align-items:center;gap:7px;width:100%;padding:7px 8px;border:1px solid rgb(var(--c-border));border-radius:8px;font-weight:600;background:rgb(var(--c-bg)/.35)}
-  .form-toggle:hover{background:rgb(var(--c-surface-hover)/.7)}
-  .form-toggle:focus-visible{outline:2px solid rgb(var(--c-accent)/.6);outline-offset:-1px}
+  .meta{color:rgb(var(--c-text-muted));font-size:0.6875rem}
   #task-agent-launch[hidden]{display:none}
   .launch-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0 8px}
   .gate{flex:1;min-width:8rem}
-  .history-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding-top:12px;border-top:1px solid rgb(var(--c-border))}
+  .history-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px}
   .run-list{display:flex;flex-direction:column;gap:8px}
-  .run{padding:10px 11px;border:1px solid rgb(var(--c-border));border-radius:9px;background:rgb(var(--c-bg)/.3);min-width:0}
-  .run.is-live{border-color:rgb(var(--c-accent)/.55);box-shadow:inset 3px 0 0 rgb(var(--c-accent))}
+  .run{padding:10px 11px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg)/.3);min-width:0}
+  .run.is-live{border-color:rgb(var(--c-accent)/.65);box-shadow:inset 3px 0 0 rgb(var(--c-accent))}
   .run p{margin:7px 0 0}
+  .run > :global(.gp-notice){margin:7px 0 0}
   .run-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
-  .kind{font-size:11px;color:rgb(var(--c-text-muted))}
-  .state{margin-left:auto;font-size:10.5px;font-weight:600;padding:1px 7px;border-radius:999px;background:rgb(var(--c-text-muted)/.12);color:rgb(var(--c-text-muted));white-space:nowrap}
-  .state[data-tone="live"]{background:rgb(var(--c-accent)/.14);color:rgb(var(--c-accent))}
-  .state[data-tone="bad"]{background:rgb(220 101 101/.14);color:#dc6565}
-  .state[data-tone="ask"]{background:rgb(210 153 34/.16);color:#d29922}
-  .row-message{padding:6px 8px;border-radius:7px;background:rgb(var(--c-accent)/.08);color:rgb(var(--c-text));overflow-wrap:anywhere}
-  .row-message[data-tone="error"]{background:rgb(220 101 101/.1);color:#dc6565}
+  .kind{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .state{margin-left:auto}
+  .row-message{overflow-wrap:anywhere}
   .cause{color:rgb(var(--c-text));overflow-wrap:anywhere}
-  li[data-tone="error"] .cause{color:#dc6565}
+  li[data-tone="error"] .cause{color:rgb(var(--c-danger))}
   .facts{display:block;color:rgb(var(--c-text-muted));margin:5px 0 0;overflow-wrap:anywhere}
   .sessions{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:5px}
   .sessions li{display:flex;align-items:baseline;gap:7px;color:rgb(var(--c-text));line-height:1.45;min-width:0}
   .glance{display:flex;flex-direction:column;min-width:0;flex:1}
-  .headline{font-weight:550}
+  .headline{font-weight:500}
   .said{color:rgb(var(--c-text));overflow-wrap:anywhere}
   .said::before{content:"“"}
   .said::after{content:"”"}
-  .doing{color:rgb(var(--c-text-muted));font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .doing{color:rgb(var(--c-text-muted));font-size:0.6875rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .changes{display:block;margin-top:3px;color:rgb(var(--c-text-muted))}
   .dot{width:7px;height:7px;border-radius:999px;flex-shrink:0;transform:translateY(-1px);background:rgb(var(--c-text-muted)/.6)}
-  li[data-tone="active"] .dot{background:#3fb950}
-  li[data-tone="needs-you"] .dot{background:#d29922;box-shadow:0 0 0 3px rgb(210 153 34/.22)}
-  li[data-tone="starting"] .dot,li[data-tone="signalled"] .dot{background:#d29922}
+  li[data-tone="active"] .dot{background:rgb(var(--c-ok))}
+  li[data-tone="needs-you"] .dot{background:rgb(var(--c-warn));box-shadow:0 0 0 3px rgb(var(--c-warn)/.22)}
+  li[data-tone="starting"] .dot,li[data-tone="signalled"] .dot{background:rgb(var(--c-warn))}
   li[data-tone="finished"] .dot{background:rgb(var(--c-accent))}
-  li[data-tone="error"] .dot,li[data-tone="problem"] .dot{background:#dc6565}
+  li[data-tone="error"] .dot,li[data-tone="problem"] .dot{background:rgb(var(--c-danger))}
   li[data-tone="adopted"] .dot{background:rgb(var(--c-accent)/.6)}
-  li[data-tone="needs-you"] .headline{color:#d29922}
-  li[data-tone="error"] .headline{color:#dc6565}
-  .run[data-tone="needs-you"],.run[data-tone="error"]{border-color:rgb(210 153 34/.6);box-shadow:inset 3px 0 0 #d29922}
-  .run[data-tone="error"]{border-color:rgb(220 101 101/.6);box-shadow:inset 3px 0 0 #dc6565}
-  @media (prefers-reduced-motion:no-preference){li[data-tone="active"] .dot{animation:gp-agent-pulse 1.6s ease-in-out infinite}}
+  li[data-tone="needs-you"] .headline{color:rgb(var(--c-warn))}
+  li[data-tone="error"] .headline{color:rgb(var(--c-danger))}
+  .run[data-tone="needs-you"]{border-color:rgb(var(--c-warn)/.65);box-shadow:inset 3px 0 0 rgb(var(--c-warn))}
+  .run[data-tone="error"]{border-color:rgb(var(--c-danger)/.65);box-shadow:inset 3px 0 0 rgb(var(--c-danger))}
+  @media (prefers-reduced-motion:no-preference){li[data-tone="active"] .dot{animation:gp-agent-pulse calc(var(--gp-dur-emphasis) * 3) var(--gp-ease-effect) infinite}}
   @keyframes gp-agent-pulse{50%{opacity:.45}}
   .actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
   .actions :global(svg){display:inline;vertical-align:-2px;margin-right:3px}
-  textarea{min-width:0;width:100%;padding:7px;border:1px solid rgb(var(--c-border));border-radius:6px;background:var(--mac-fill-bg,rgb(var(--c-bg)));color:inherit;margin-top:6px}
-  button:disabled{opacity:.5}
-  .error{color:#dc6565}
+  textarea{min-width:0;width:100%;margin-top:6px}
 </style>

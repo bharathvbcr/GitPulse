@@ -17,6 +17,8 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { fade, scale } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { hostPlatform } from "../stores/platformStore";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
@@ -94,9 +96,11 @@
   }
 </script>
 
-<div use:portal class="backdrop gp-scrim" role="presentation" style="z-index:{LAYERS.PROMPT}">
+<div use:portal class="backdrop gp-scrim bg-black/50" role="presentation" style="z-index:{LAYERS.PROMPT}" in:fade={backdropFade()} out:fade={backdropFadeOut()}>
   <div
     class="sheet gp-card gp-glass shadow-float"
+    in:scale={cardScale()}
+    out:scale={cardScaleOut()}
     role="dialog"
     aria-modal="true"
     aria-label="Send task to an agent"
@@ -111,7 +115,7 @@
         <p class="title" title={card.title}>{card.title}</p>
         <p class="meta">Saved revision {card.revision} · {describeHandoff(settings)}</p>
       </div>
-      <button bind:this={closeButton} type="button" class="gp-icon-btn" aria-label="Close agent handoff" disabled={!closable} onclick={onClose}><X size={14} /></button>
+      <button bind:this={closeButton} type="button" class="gp-icon-btn" data-size="md" aria-label="Close agent handoff" disabled={!closable} onclick={onClose}><X size={14} /></button>
     </header>
 
     <div class="body">
@@ -134,13 +138,13 @@
 
     <footer>
       {#if prepared}
-        <span class="meta gate">{busy ? "Attempt prepared and starting. Closing this sheet does not stop it." : "Attempt prepared. Resume or cancel it from this task's Agents tab."}</span>
-        <button type="button" class="gp-btn-primary" onclick={onClose}>Done</button>
+        <span class="meta gate">{busy ? "Run prepared and starting. Closing this sheet does not stop it." : "Run prepared. Resume or cancel it from this task's Agents tab."}</span>
+        <button type="button" class="gp-btn" data-variant="primary" onclick={onClose}>Done</button>
       {:else}
-        <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to launch` : gate.reason}</span>
-        <button type="button" class="gp-btn" disabled={busy} onclick={onClose}>Cancel</button>
-        <button type="button" class="gp-btn-primary" disabled={!gate.ok} onclick={launch}>
-          {busy ? "Preparing…" : pending ? "Retry preparation" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
+        <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to run` : gate.reason}</span>
+        <button type="button" class="gp-btn" data-variant="secondary" disabled={busy} onclick={onClose}>Cancel</button>
+        <button type="button" class="gp-btn" data-variant="primary" disabled={!gate.ok} onclick={launch}>
+          {busy ? "Preparing…" : pending ? "Try preparing again" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Run in ${PROVIDER_LABELS[settings.provider]}`}
         </button>
       {/if}
     </footer>
@@ -148,14 +152,13 @@
 </div>
 
 <style>
-  .backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;background:#0005;color:rgb(var(--c-text))}
-  .sheet{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:16px;overflow:hidden}
-  header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:16px 20px 12px;border-bottom:1px solid rgb(var(--c-border)/.5);flex-shrink:0}
-  h2{display:flex;align-items:center;gap:6px;font-size:14px;font-weight:650;margin:0}
-  .title{margin:6px 0 2px;font-size:12px;font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .meta{margin:0;font-size:11px;color:rgb(var(--c-text-muted));line-height:1.5}
+  .backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;color:rgb(var(--c-text))}
+  .sheet{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
+  header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:16px 20px 12px;flex-shrink:0}
+  h2{display:flex;align-items:center;gap:6px;font-size:0.8125rem;font-weight:600;margin:0}
+  .title{margin:6px 0 2px;font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta{margin:0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));line-height:1.5}
   .body{padding:14px 20px;overflow:auto}
-  footer{display:flex;align-items:center;gap:10px;padding:12px 20px 16px;border-top:1px solid rgb(var(--c-border)/.45);flex-shrink:0}
+  footer{display:flex;align-items:center;gap:10px;padding:12px 20px 16px;flex-shrink:0}
   .gate{flex:1;min-width:0}
-  button:disabled{opacity:.5}
 </style>

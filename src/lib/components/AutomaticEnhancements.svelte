@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { scale } from "svelte/transition";
+  import { X } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { cardScale, cardScaleOut } from "../ui/transitions";
   import { LAYERS } from "../ui/layers";
   import { automaticQueueCount, automaticUpdates, enhancementConfiguration, explainError, getAutomation, newID, putAutomation, wakeAutomatic, watchAutomatic, WorkbenchError, type AutomationSettings } from "../workbench/client";
@@ -88,8 +91,8 @@
 
 <section bind:this={container} class="automation" class:compact aria-label="Automatic Manvi suggestions">
   <div class="summary">
-    <button bind:this={trigger} type="button" class={compact ? "gp-pill" : "gp-btn"} aria-expanded={opened} aria-controls={settingsID} disabled={saving || pending !== null} onclick={toggle}>{compact ? "Auto" : "Automatic suggestions"} <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
-    {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" class={compact ? "gp-btn" : ""} onclick={() => wakeAutomatic()}>Resume</button>{/if}
+    <button bind:this={trigger} type="button" class="gp-btn" data-size={compact ? "sm" : "md"} aria-expanded={opened} aria-controls={settingsID} disabled={saving || pending !== null} onclick={toggle}>{compact ? "Auto" : "Automatic suggestions"} <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
+    {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" class="gp-btn" data-size="sm" onclick={() => wakeAutomatic()}>Resume</button>{/if}
   </div>
   {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions could not start: {$automaticUpdates.error}</p>{/if}
   {#if (!compact || opened) && status?.reason}<p role="status">{status.reason}</p>{/if}
@@ -97,30 +100,30 @@
     <div id={settingsID} class="settings" class:gp-card={compact} class:shadow-float={compact}
       style={compact ? `z-index: ${LAYERS.MENU}` : undefined}
       in:scale={cardScale()} out:scale={cardScaleOut()}>
-      {#if compact}<div class="settings-heading"><strong>Automatic suggestions</strong><button class="gp-icon-btn" type="button" aria-label="Close automatic settings" disabled={saving || pending !== null} onclick={() => dismiss(true)}>✕</button></div>{/if}
+      {#if compact}<div class="settings-heading"><strong>Automatic suggestions</strong><button class="gp-icon-btn" type="button" aria-label="Close automatic settings" data-size="sm" disabled={saving || pending !== null} onclick={() => dismiss(true)}><X size={12} aria-hidden="true" /></button></div>{/if}
       <p>Applies to this GitPulse profile across all workspaces and repositories. Saved title and description changes are queued after one second; moving cards does not generate suggestions.</p>
-      {#if loading}<p role="status">Loading settings…</p>{/if}
+      {#if loading}<div role="status" aria-label="Loading settings"><Skeleton variant="text" count={2} /></div>{/if}
       {#if settings}
         <fieldset disabled={loading || saving || pending !== null}>
-          <label class="check"><input type="checkbox" bind:checked={enabled} />Suggest clearer task titles and descriptions automatically</label>
-          <label class="check"><input type="checkbox" bind:checked={override} />Use a provider and model for this profile</label>
+          <Checkbox label="Suggest clearer task titles and descriptions automatically" checked={enabled} onchange={(next) => { enabled = next; }} />
+          <Checkbox label="Use a provider and model for this profile" checked={override} onchange={(next) => { override = next; }} />
           {#if override}<div class="pair"><label>Automatic provider<input class="gp-field" bind:value={provider} maxlength="128" placeholder="Provider name" /></label><label>Automatic model<input class="gp-field" bind:value={model} maxlength="512" placeholder="Model name" /></label></div>
           {:else}<p>Manvi selection: {configured || "Loading…"}</p>{/if}
-          <div class="actions"><button class="gp-btn" type="button" onclick={() => save()} disabled={override && (!provider.trim() || !model.trim())}>Save automatic settings</button><button class="gp-btn" type="button" onclick={() => save(true)} disabled={!settings.enabled}>Stop automatic suggestions</button></div>
+          <div class="actions"><button class="gp-btn" data-variant="primary" type="button" onclick={() => save()} disabled={override && (!provider.trim() || !model.trim())}>Save automatic settings</button><button class="gp-btn" data-variant="secondary" type="button" onclick={() => save(true)} disabled={!settings.enabled}>Stop automatic suggestions</button></div>
         </fieldset>
         <p>{queued === null ? "Queue count unavailable" : `${queued} saved tasks waiting`} · One generation at a time · Up to 20 automatic suggestions per hour</p>
         <p>Only unlocked fields are proposed. Review suggestions in each task’s Manvi enhancements panel. No automatic acceptance or provider fallback.</p>
       {/if}
       {#if error}<p role="alert">{error}</p>{/if}
       {#if note}<p role="status">{note}</p>{/if}
-      {#if pending}<p>The settings result is uncertain. Retry the same request to reconcile it.</p><button class="gp-btn" type="button" disabled={saving} onclick={() => save()}>Retry settings request</button>{:else}<button class="gp-btn" type="button" disabled={loading || saving} onclick={() => load()}>Reload automatic settings</button>{/if}
+      {#if pending}<p>The settings result is uncertain. Try the same request again to reconcile it.</p><button class="gp-btn" type="button" disabled={saving} onclick={() => save()}>Try again</button>{:else}<button class="gp-btn" type="button" disabled={loading || saving} onclick={() => load()}>Refresh automatic settings</button>{/if}
     </div>
   {/if}
 </section>
 
 <style>
-  .automation{border-bottom:1px solid rgb(var(--c-border));padding:8px 24px;font-size:12px;position:relative}
+  .automation{padding:8px 24px;font-size:12px;position:relative}
   .automation.compact{border:0;padding:0}
   .automation.compact .settings{position:absolute;right:0;top:calc(100% + 6px);width:min(360px,70vw);padding:10px 12px;border:1px solid rgb(var(--c-border));border-radius:10px;max-height:min(560px,calc(100vh - 150px));overflow:auto}
-  .summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:11px}button{border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px;font-size:11px}button:disabled,fieldset:disabled{opacity:.55}button:hover{background:var(--mac-fill-surface-hover,rgb(var(--c-surface-hover)))}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:#d15a64}.settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.check{display:flex;align-items:center;gap:8px;margin:9px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.pair input{padding:7px;border:1px solid rgb(var(--c-border));background:var(--mac-fill-surface,rgb(var(--c-surface)));border-radius:6px;color:inherit}.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  .summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}fieldset:disabled{opacity:.55}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:rgb(var(--c-danger))}.settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 </style>

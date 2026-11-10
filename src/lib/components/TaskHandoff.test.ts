@@ -29,7 +29,7 @@ describe("the agent handoff has one implementation", () => {
     // rather than launching.
     expect(form).toContain("HOST_PRESSURE_REFUSAL");
     expect(form).toContain("refusedByPressure");
-    expect(form).toContain(">Retry</button>");
+    expect(form).toContain(">Try again</button>");
     expect(form).toContain(">Admit anyway</button>");
     expect(form).toMatch(/await admitAnyway\(\);\s*\} catch \(cause\) \{\s*error = explainError\(cause\);\s*return;/);
   });
@@ -142,7 +142,7 @@ describe("the agent handoff has one implementation", () => {
 
   it("says the store answered when its reply to a preparation could not be read", () => {
     expect(form).toContain('cause.code === "protocol_error"');
-    expect(form).toContain("this attempt may exist: check this task's Agents before launching again.");
+    expect(form).toContain("this run may exist: check this task's Agents before running it again.");
   });
 
   it("asks whether a checkout is taken by its Git directory, without ever waiting on the answer", () => {
@@ -174,7 +174,7 @@ describe("the agent handoff has one implementation", () => {
     // would be missed, and one editable control makes "Retry preparation" a lie.
     // One named exception: Discard is the way out of the lock, so it is
     // usable exactly while the lock holds, and refused only mid-request.
-    const discard = '<button type="button" class="gp-btn discard" disabled={busy} onclick={discard}>Discard it</button>';
+    const discard = '<button type="button" class="gp-btn discard" data-size="sm" disabled={busy} onclick={discard}>Discard it</button>';
     expect(form).toContain(discard);
     const markup = form.slice(form.indexOf("</script>")).replace(discard, "");
     const gates = markup.match(/\sdisabled=\{[^}]*\}/g) ?? [];

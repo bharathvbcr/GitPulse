@@ -1,6 +1,8 @@
 <script lang="ts">
   import { PRIORITY_LABELS, priorityLabel } from "../workbench/taskOrganize";
   import { STATUS_LABELS, type TaskOrganization } from "../workbench/client";
+  import { X } from "@lucide/svelte";
+  import Skeleton from "./Skeleton.svelte";
 
   /**
    * Manvi's reviewable priority proposal. It only presents. The board owns the
@@ -42,25 +44,26 @@
   }
 </script>
 
-<section id="task-organize" class="organize" data-testid="task-organize" aria-label="Priority proposal" aria-busy={loading || applying}>
+<section id="task-organize" class="organize gp-card" data-testid="task-organize" aria-label="Priority proposal" aria-busy={loading || applying}>
   <div class="head">
-    <h2>Organise by priority</h2>
-    <button type="button" class="gp-btn" data-testid="task-organize-accept-all" onclick={() => onAcceptAll(pending.map((change) => change.id))} disabled={loading || applying || pending.length === 0}>Accept all</button>
-    <button type="button" class="gp-btn" onclick={onRefresh} disabled={loading || applying}>{loading ? "Asking Manvi…" : "Refresh"}</button>
-    <button type="button" class="gp-icon-btn" aria-label="Close the priority proposal" onclick={onClose} disabled={applying}>×</button>
+    <h2 class="text-xs font-semibold">Organize by priority</h2>
+    <button type="button" class="gp-btn" data-size="sm" data-testid="task-organize-accept-all" onclick={() => onAcceptAll(pending.map((change) => change.id))} disabled={loading || applying || pending.length === 0}>Accept all</button>
+    <button type="button" class="gp-btn" data-size="sm" onclick={onRefresh} disabled={loading || applying}>{loading ? "Asking Manvi…" : "Refresh"}</button>
+    <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Close the priority proposal" onclick={onClose} disabled={applying}><X size={14} /></button>
   </div>
   {#if error}
-    <p class="note" role="alert" data-testid="task-organize-error">{error}</p>
+    <div class="gp-notice" data-tone="danger" role="alert" data-testid="task-organize-error">{error}</div>
   {:else if result === null}
-    <p class="note" role="status">{loading ? "Reading the open board…" : "Nothing asked yet."}</p>
+    {#if loading}<Skeleton variant="text" count={3} />{/if}
+    <p class={loading ? "sr-only" : "note"} role="status">{loading ? "Reading the open board…" : "Nothing asked yet."}</p>
   {:else}
     <p class="note" data-testid="task-organize-order">{result.order_note}</p>
     <p class="note">Nothing on the board changes until you accept a row. Accepted rows use the revision this proposal was built from.</p>
     {#if partial}
-      <p class="note" role="status" data-testid="task-organize-partial">
-        <strong>Proposal over part of the board.</strong>
+      <div class="gp-notice" data-tone="warn" role="status" data-testid="task-organize-partial">
+        <strong class="font-semibold">Proposal over part of the board.</strong>
         Read {result.coverage.read}. {partialNote}
-      </p>
+      </div>
     {:else}
       <p class="note" role="status">Read all {result.coverage.read} open tasks in scope.</p>
     {/if}
@@ -71,21 +74,21 @@
         {#each result.changes as change (change.id)}
           {@const outcome = outcomes[change.id]}
           {@const skipped = rejected.includes(change.id)}
-          <li class="row" data-testid="task-organize-change" data-task-id={change.id} data-rule={change.rule}>
-            <button type="button" class="title" onclick={() => onOpen(change.id)}>{change.title}</button>
+          <li class="row gp-row" data-testid="task-organize-change" data-task-id={change.id} data-rule={change.rule}>
+            <button type="button" class="gp-btn row-title" data-variant="ghost" data-size="sm" onclick={() => onOpen(change.id)}>{change.title}</button>
             <span class="chips">
-              <span class="chip" data-priority={change.from}>{PRIORITY_LABELS[change.from] ?? priorityLabel(change.from)}</span>
+              <span class="gp-chip" data-tone={change.from === 0 ? "danger" : "neutral"}>{PRIORITY_LABELS[change.from] ?? priorityLabel(change.from)}</span>
               <span class="arrow" aria-hidden="true">→</span>
-              <span class="chip" data-priority={change.to}>{PRIORITY_LABELS[change.to] ?? priorityLabel(change.to)}</span>
-              <span class="chip muted">{STATUS_LABELS[change.status] ?? change.status}</span>
+              <span class="gp-chip" data-tone={change.to === 0 ? "danger" : "neutral"}>{PRIORITY_LABELS[change.to] ?? priorityLabel(change.to)}</span>
+              <span class="gp-chip" data-tone="neutral">{STATUS_LABELS[change.status] ?? change.status}</span>
             </span>
             <span class="reason">{change.reason}</span>
             {#if outcome}
               <span class="outcome" data-testid="task-organize-outcome">{outcome}</span>
             {:else}
               <span class="actions">
-                <button type="button" class="gp-btn" data-testid="task-organize-accept" disabled={applying || skipped} onclick={() => onAccept(change.id)}>Accept</button>
-                <button type="button" class="gp-btn" data-testid="task-organize-reject" aria-pressed={skipped} disabled={applying} onclick={() => toggleReject(change.id)}>{skipped ? "Rejected" : "Reject"}</button>
+                <button type="button" class="gp-btn" data-size="sm" data-testid="task-organize-accept" disabled={applying || skipped} onclick={() => onAccept(change.id)}>Accept</button>
+                <button type="button" class="gp-btn" data-size="sm" data-testid="task-organize-reject" aria-pressed={skipped} disabled={applying} onclick={() => toggleReject(change.id)}>{skipped ? "Rejected" : "Reject"}</button>
               </span>
             {/if}
           </li>
@@ -103,20 +106,17 @@
 </section>
 
 <style>
-  .organize{margin:8px 14px 0;padding:10px 12px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px}
+  .organize{margin:8px 14px 0;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
   .head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  h2{font-size:12px;font-weight:650;margin:0;flex:1}
+  h2{margin:0;flex:1}
   .list,.groups{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
-  .row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:6px 8px;border-radius:8px}
-  .row:hover{background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)))}
-  .title{border:0;background:transparent;padding:0;text-align:left;font-size:12px;font-weight:550;cursor:pointer;overflow-wrap:anywhere}
+  .row{flex-wrap:wrap;gap:6px 8px;padding-block:6px;height:auto}
+  .row-title{white-space:normal;text-align:left;padding-inline:0;font-size:0.75rem;font-weight:500;overflow-wrap:anywhere}
   .chips{display:flex;gap:4px;align-items:center;flex-shrink:0}
-  .chip{font-size:9px;padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent)}
-  .chip[data-priority="0"]{background:rgb(209 90 100 / .16);color:#d15a64}
-  .chip.muted,.reason,.note,.groups,.outcome{font-size:11px;color:rgb(var(--c-text-muted))}
+  .reason,.note,.groups,.outcome{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
   .note,.groups{margin:0}
   .reason{flex:1;min-width:12em}
-  .arrow{font-size:11px;color:rgb(var(--c-text-muted))}
+  .arrow{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
   .actions{display:flex;gap:4px}
   .outcome{flex-basis:100%}
 </style>

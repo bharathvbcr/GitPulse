@@ -95,7 +95,7 @@
       message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in the inbox.`;
       result = null;
       try { onApplied(await getTask(reviewedProposal.task_id)); }
-      catch (reread) { message += ` The task could not be re-read (${explainError(reread)}); reload it to see the result.`; }
+      catch (reread) { message += ` The task could not be re-read (${explainError(reread)}); refresh it to see the result.`; }
     } catch (cause) {
       if (cause instanceof WorkbenchError && cause.code === "revision_conflict") {
         // Refused, nothing written. Say which side moved, show the task as it is now, and ask again against it.
@@ -145,8 +145,8 @@
       {#if result.rationale}<p class="rationale">{result.rationale}</p>{/if}
 
       {#if diff.criteria.length > 0}
-        <h4>Acceptance criteria</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-acceptance_criteria" checked={chosen.includes("acceptance_criteria")} disabled={locked.includes("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} /> Add these to the task{#if locked.includes("acceptance_criteria")} <em>(locked on this task)</em>{/if}</label>
+        <h4 class="gp-label">Acceptance criteria</h4>
+        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-acceptance_criteria" checked={chosen.includes("acceptance_criteria")} disabled={locked.includes("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} /> Add these to the task{#if locked.includes("acceptance_criteria")} <em>(locked on this task)</em>{/if}</label>
         <ul class="rows">
           {#each diff.criteria as row}
             <li class:present={row.state === "present"}>
@@ -158,8 +158,8 @@
       {/if}
 
       {#if diff.duplicates.length > 0}
-        <h4>Possible duplicates</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-duplicate_of" checked={chosen.includes("duplicate_of")} disabled={locked.includes("duplicate_of")} onchange={() => toggle("duplicate_of")} /> Link these as the original</label>
+        <h4 class="gp-label">Possible duplicates</h4>
+        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-duplicate_of" checked={chosen.includes("duplicate_of")} disabled={locked.includes("duplicate_of")} onchange={() => toggle("duplicate_of")} /> Link these as the original</label>
         <ul class="rows">
           {#each diff.duplicates as row}
             <li class:present={row.state === "present"}>
@@ -170,8 +170,8 @@
       {/if}
 
       {#if diff.splits.length > 0}
-        <h4>Split into</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-split_into" checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} /> Create these as new inbox tasks</label>
+        <h4 class="gp-label">Split into</h4>
+        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-split_into" checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} /> Create these as new inbox tasks</label>
         <ul class="rows">
           {#each diff.splits as part, index}
             <li data-testid="task-refine-split-{index}">
@@ -183,7 +183,7 @@
       {/if}
 
       {#if diff.criteria.length + diff.duplicates.length + diff.splits.length > 0}
-        <button type="button" class="gp-btn primary" data-testid="task-refine-apply" disabled={blocked} onclick={() => apply()}>
+        <button type="button" class="gp-btn" data-variant="primary" data-testid="task-refine-apply" disabled={blocked} onclick={() => apply()}>
           {applying ? "Applying…" : "Apply selected"}
         </button>
         {#if held}
@@ -210,20 +210,20 @@
 </section>
 
 <style>
-  .refine{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:12px}
+  .refine{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:.75rem}
   .bar{display:flex;align-items:center;gap:8px}
   .hint,.meta,.rationale,.grounding{margin:0;color:rgb(var(--c-text-muted))}
-  .error{margin:0;color:rgb(var(--c-status-red))}
-  .ok{margin:0;color:rgb(var(--c-accent))}
-  .warn{color:rgb(var(--c-status-red))}
-  h4{margin:6px 0 0;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:rgb(var(--c-text-muted))}
-  .proposal{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65)}
+  .error{margin:0;color:rgb(var(--c-danger))}
+  .ok{margin:0;color:rgb(var(--c-ok))}
+  .warn{color:rgb(var(--c-danger))}
+  h4{margin:6px 0 0}
+  .proposal{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;border:1px solid var(--gp-edge)}
   .rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
   .present{opacity:.65}
-  .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-status-red))}
+  .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-danger))}
   .held p,.held ul{margin:0}
   .part{display:flex;align-items:center;gap:6px}
   ins{text-decoration:none;color:rgb(var(--c-accent))}
-  .cites{display:block;font-size:10px;color:rgb(var(--c-text-muted))}
-  pre{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
+  .cites{display:block;font-size:.625rem;color:rgb(var(--c-text-muted))}
+  pre{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem}
 </style>

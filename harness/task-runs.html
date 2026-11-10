@@ -234,7 +234,7 @@
       const dockShown=()=>{const el=dock();return !!el&&el.offsetParent!==null&&getComputedStyle(el).display!=="none";};
       const pane=()=>document.querySelector('[data-testid="task-agent-panel"]');
       const paneSessions=()=>[...pane().querySelectorAll('[data-testid="agent-session"]')];
-      button("Launch in Claude Code").click();await wait(()=>button("Reconnect attempt"));
+      button("Run in Claude Code").click();await wait(()=>button("Reconnect attempt"));
       check("Launching keeps the reader on the task: no surface switch, no dock opened",
         read(interfaceStore).globalSurface==="tasks"&&!read(repoStore).terminalOpen&&!dockShown());
       check(`The agent starts unseen, at a usable terminal grid${report.launchGrid.rows>=10&&report.launchGrid.cols>=40?"":` (got ${JSON.stringify(report.launchGrid)})`}`,report.taskSpawns===1&&report.launchGrid.rows>=10&&report.launchGrid.cols>=40);
@@ -383,7 +383,7 @@
         check("Fresh output reads as recent output, never as working",/Output (just now|\ds ago)/.test(line().textContent)&&!/working/i.test(line().querySelector(".headline").textContent));
         await wait(()=>card().querySelector('[data-testid="agent-changes"]'));
         check("The checkout's uncommitted changes show once its status has been read",
-          card().querySelector('[data-testid="agent-changes"]').textContent.includes("1 file changed in this shared checkout"));
+          card().querySelector('[data-testid="agent-changes"]').textContent.includes("1 file changed in this shared worktree"));
         await emit("gitpulse-session-attention",{session:sid,channel:"hook",event:"permission_prompt",detail:"Bash: cargo test"});
         await wait(()=>card().dataset.tone==="needs-you");
         check("An agent asking for permission says so in its row, with what it asked",
@@ -442,7 +442,7 @@
         completePrompt(false);await pause(150);
         check("Declining in the pane stops nothing and says nothing was stopped",report.kills===0&&!pane().textContent.includes("was stopped"));
       }
-      check("A launched attempt folds its form away and keeps the run in view",launchForm().hidden&&toggleLabel()==="New attempt"&&formToggle().getAttribute("aria-expanded")==="false");
+      check("A launched attempt folds its form away and keeps the run in view",launchForm().hidden&&toggleLabel()==="New run"&&formToggle().getAttribute("aria-expanded")==="false");
       await openLaunchForm();
       check("An ordinary permission mode survives its launch",field("Permission mode").value==="ask");
       button("Suspend run updates").click();await pause(100);const suspended=report.lists;await pause(1700);
@@ -484,26 +484,26 @@
       button("Show conversation").click();await wait(()=>read(interfaceStore).globalSurface==="repository");
       check("Show conversation focuses the open conversation rather than starting a second",report.resumes.length===1);
       await openLaunchForm();set("Permission mode","edit");await pause(30);
-      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===2);
+      button("Run in Claude Code").click();await wait(()=>report.taskSpawns===2);
       await openLaunchForm();
       check("A deliberate permission mode is remembered for the next launch",field("Permission mode").value==="edit");
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();set("Permission mode","bypass");await pause(30);
-      check("Bypass requires acknowledgment on this attempt",button("Launch in Claude Code").disabled);
+      check("Bypass requires acknowledgment on this attempt",button("Run in Claude Code").disabled);
       // The bypass acknowledgement, by its own words. `label.ack input` also
       // matches the worktree-provisioning checkbox added beside it, so the
       // harness ticked that one and Launch stayed disabled.
       const bypassAck=()=>[...document.querySelectorAll("label.ack")].find(label=>label.textContent.includes("I authorize bypass"))?.querySelector("input")??null;
       bypassAck().click();await pause(30);
-      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===3);
+      button("Run in Claude Code").click();await wait(()=>report.taskSpawns===3);
       await openLaunchForm();
       check("Bypass never survives the attempt it was authorized for",field("Permission mode").value==="ask"&&!bypassAck());
       await finish();button("Refresh").click();await pause(100);
-      await openLaunchForm();losePreparation=true;button("Launch in Claude Code").click();await wait(()=>button("Retry preparation"));
+      await openLaunchForm();losePreparation=true;button("Run in Claude Code").click();await wait(()=>button("Try preparing again"));
       const uncertain=preparations.at(-1);
       check("Lost preparation reply locks every launch field",
         [...group("Coding agent").querySelectorAll("button"),...group("Connection").querySelectorAll("button"),field("Permission mode"),field("Checkout path")].every(el=>el.matches(":disabled")));
-      button("Retry preparation").click();await wait(()=>report.taskSpawns===4);
+      button("Try preparing again").click();await wait(()=>report.taskSpawns===4);
       check("Preparation retry preserves the exact saved request",preparations.at(-1)===uncertain);
       await finish();button("Refresh").click();await pause(100);
       // A model for one launch is for that launch. This pane keeps its form
@@ -514,7 +514,7 @@
       check("The Agent pane offers a model for this launch",!!launchModel());
       launchModel().value="opus";launchModel().dispatchEvent(new Event("change",{bubbles:true}));await pause(30);
       const spawnsBeforeModel=report.taskSpawns;
-      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===spawnsBeforeModel+1);
+      button("Run in Claude Code").click();await wait(()=>report.taskSpawns===spawnsBeforeModel+1);
       check("The launch carries the chosen model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
       await openLaunchForm();
       check("The chosen model is cleared once that launch is accepted",launchModel()?.value==="");
@@ -522,7 +522,7 @@
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
       check("A lost managed launch response retains one provider session",report.managedSpawns===1);
-      button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
+      button("Start or recover managed run").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
       check("Managed retry reuses the original session",report.managedSpawns===1);
       check("Run history does not fetch full output or effective settings",report.detailReads===0);
       const current=[...runs.values()].find(run=>run.kind==="managed"), now=Math.floor(Date.now()/1000);
@@ -619,13 +619,13 @@
         // shown, or it runs 80 columns wide in a dock that fits more or fewer.
         repoStore.setTerminalOpen(false);await wait(()=>!dockShown());
         const hiddenBefore=report.taskSpawns;
-        await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
-        button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===hiddenBefore+1);
+        await wait(()=>button("Run in Claude Code")&&!button("Run in Claude Code").disabled);
+        button("Run in Claude Code").click();await wait(()=>report.taskSpawns===hiddenBefore+1);
         const hiddenRun=[...runs.values()].find(run=>run.session_id===`task-session-${report.taskSpawns}`);
         check("An agent started with the dock closed opens at 24 × 80, not at a hidden measurement",
           !dockShown()&&report.launchGrids.at(-1).rows===24&&report.launchGrids.at(-1).cols===80);
         const resizesBefore=report.resizes.length;
-        pane().querySelector(`[data-run-id="${hiddenRun.id}"] button.gp-btn-primary`).click();
+        pane().querySelector(`[data-run-id="${hiddenRun.id}"] button.gp-btn[data-variant="primary"]`).click();
         await wait(()=>dockShown()&&report.resizes.slice(resizesBefore).some(r=>r.id===hiddenRun.session_id));
         const fitted=report.resizes.slice(resizesBefore).filter(r=>r.id===hiddenRun.session_id).at(-1);
         check(`Showing it sends the grid the dock really fits (${fitted.rows} × ${fitted.cols})`,
@@ -635,8 +635,8 @@
         const before=report.taskSpawns, BURST=5;
         for(let i=0;i<BURST;i++){
           await openLaunchForm();
-          await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
-          button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===before+i+1);
+          await wait(()=>button("Run in Claude Code")&&!button("Run in Claude Code").disabled);
+          button("Run in Claude Code").click();await wait(()=>report.taskSpawns===before+i+1);
         }
         const working=()=>[...pane().querySelectorAll('[data-testid="agents-working"] [data-testid="agent-run"]')];
         await wait(()=>working().length===BURST&&working().every(card=>card.querySelector('[data-testid="agent-session"][data-phase="running"]')));
@@ -652,8 +652,8 @@
         }
         setTerminalSessionLimit(read(terminalSessions).length);
         await openLaunchForm();
-        await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
-        button("Launch in Claude Code").click();
+        await wait(()=>button("Run in Claude Code")&&!button("Run in Claude Code").disabled);
+        button("Run in Claude Code").click();
         await wait(()=>pane().querySelector('[data-testid="agent-session-waiting"]'));
         check("A launch with every terminal slot taken says, in the pane, that it waits for one",
           pane().querySelector('[data-testid="agent-session-waiting"]').textContent.includes("Waiting for a terminal slot")&&report.taskSpawns===before+BURST);
@@ -668,7 +668,7 @@
         runs.set(orphan.id,orphan);button("Refresh").click();
         await wait(()=>pane().querySelector('[data-run-id="orphan-prepared"] [data-testid="agent-session-unstarted"]'));
         check("A prepared attempt nothing is starting says so, and offers Show terminal to start it",
-          !!pane().querySelector('[data-run-id="orphan-prepared"]').querySelector("button.gp-btn-primary")?.textContent.includes("Show terminal"));
+          !!pane().querySelector('[data-run-id="orphan-prepared"]').querySelector('button.gp-btn[data-variant="primary"]')?.textContent.includes("Show terminal"));
         runs.delete(orphan.id);button("Refresh").click();await pause(100);
         // An agent older than a full page of history is read only from the
         // live list. Polling once looked at the history page alone, so it
@@ -707,7 +707,7 @@
         const visible=el=>!!el&&el.offsetParent!==null;
         const lastPrepared=()=>JSON.parse(preparations.at(-1)).id;
         let preparedBefore=0;
-        const launchNow=async()=>{preparedBefore=preparations.length;await openLaunchForm();await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);button("Launch in Claude Code").click();};
+        const launchNow=async()=>{preparedBefore=preparations.length;await openLaunchForm();await wait(()=>button("Run in Claude Code")&&!button("Run in Claude Code").disabled);button("Run in Claude Code").click();};
         interfaceStore.setGlobalSurface("tasks");
         await finish();button("Refresh").click();await pause(100);
         // The pane is remounted while the store is still answering the
@@ -801,7 +801,7 @@
         check("Merge runs against the repository's main checkout, and the host's refusal shows in the row",
           mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"&&mergeCall.expectedTip==="def5678"
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("still working in this worktree")
-          &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').dataset.tone==="error");
+          &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').dataset.tone==="danger");
         row(attempt.id).querySelector('[data-testid="agent-discard"]').click();
         await wait(()=>read(promptState));
         check("Discard asks first and says how many changed files are lost",read(promptState).options.message.includes("2 uncommitted files in it will be lost"));
@@ -848,11 +848,11 @@
         const summaryText=()=>document.querySelector('[data-testid="agents-summary"]').textContent.trim();
         const panelText=()=>document.querySelector('[data-testid="task-agent-panel"]').textContent;
         check("A failed first read says the attempts could not be read, not that there are none",
-          summaryText()==="Attempts could not be read."&&!panelText().includes("No attempts yet")&&!panelText().includes("No runs yet"));
+          summaryText()==="Runs could not be read."&&!panelText().includes("No runs yet"));
         check("An unread history does not open the launch form",launchForm().hidden);
-        failRunsList=false;button("Retry").click();
-        await wait(()=>summaryText()==="No attempts yet.");
-        check("Retry reads the history, and only then is the task empty and the launch form open",!launchForm().hidden&&!document.querySelector('[data-testid="task-agent-panel"] [role="alert"]'));
+        failRunsList=false;button("Try again").click();
+        await wait(()=>summaryText()==="No runs yet.");
+        check("Try again reads the history, and only then is the task empty and the launch form open",!launchForm().hidden&&!document.querySelector('[data-testid="task-agent-panel"] [role="alert"]'));
         for(const run of kept)runs.set(run.id,run);button("Refresh").click();await pause(100);
       }
       check("No unrelated shell was started",report.shellSpawns===0);

@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The Tasks board's "View" popover: density, card order, lanes, which
+   * The Tasks board's "View" popover: density, card order, grouping, which
    * columns are on screen and which chips a card carries.
    *
    * Follows the Fleet grid's Columns menu deliberately — same `gp-menu` shell,
@@ -97,7 +97,7 @@
         {@render mark(compact)}<span class="flex-1 text-textPrimary">Compact cards</span>
       </button>
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-order-label">Order</p>
+      <p class="gp-label px-1.5 pt-2 pb-1" id="task-order-label">Order</p>
       <div role="radiogroup" aria-labelledby="task-order-label" class="flex flex-col gap-0.5">
         {#each TASK_ORDERS as option (option)}
           <button
@@ -115,7 +115,7 @@
       </div>
       {#if order === "priority"}<p class="note" data-testid="task-order-note">The List layout puts the most urgent rows first across every status. A search ranked by relevance keeps its own order. Priority first is priority, then due date. Suggest next also weighs severity, blockers, age, and verification.</p>{/if}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-lanes-label">Lanes</p>
+      <p class="gp-label px-1.5 pt-2 pb-1" id="task-lanes-label">Group by</p>
       <div role="radiogroup" aria-labelledby="task-lanes-label" class="flex flex-col gap-0.5">
         {#each SWIMLANES as option (option)}
           <button
@@ -130,10 +130,10 @@
           </button>
         {/each}
       </div>
-      {#if laneIgnored}<p class="note" data-testid="task-lanes-note">The board's columns are already statuses, so status lanes group the List layout only.</p>{/if}
-      {#if lane !== "none" && !laneIgnored}<p class="note">Dragging a card into another lane changes its status only.</p>{/if}
+      {#if laneIgnored}<p class="note" data-testid="task-lanes-note">The board's columns are already statuses, so grouping by status applies to the List layout only.</p>{/if}
+      {#if lane !== "none" && !laneIgnored}<p class="note">Dragging a card into another group changes its status only.</p>{/if}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Columns</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Columns</p>
       {#each STATUSES as status (status)}
         {@const hideable = canHideStatus($interfaceStore.taskHiddenColumns, status)}
         <button
@@ -150,7 +150,7 @@
         </button>
       {/each}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Work-in-progress limits</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Work-in-progress limits</p>
       <p class="note">For {boardName} only. A column over its limit is marked; nothing is refused.</p>
       {#each STATUSES as status (status)}
         <label class="limit">
@@ -177,7 +177,7 @@
         </label>
       {/each}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Card shows</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Card shows</p>
       {#each TASK_CARD_FIELDS as field (field)}
         <button
           type="button"
@@ -191,14 +191,13 @@
         </button>
       {/each}
 
-      <div class="border-t border-border/60 mt-1 pt-1">
-        <button
-          type="button"
-          class="reset"
-          disabled={!customized}
-          onclick={() => interfaceStore.resetTaskView()}
-        >Reset board view</button>
-      </div>
+      <div class="gp-menu-sep" role="separator"></div>
+      <button
+        type="button"
+        class="reset"
+        disabled={!customized}
+        onclick={() => interfaceStore.resetTaskView()}
+      >Reset board view</button>
     </div>
   {/if}
 </div>
@@ -210,7 +209,7 @@
 <style>
   .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;width:100%}
   .row:hover{background:rgb(var(--c-surface-hover) / 0.7)}
-  .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent) / 0.6);outline-offset:-1px}
+  .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
   .reset{width:100%;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;color:rgb(var(--c-text-muted))}
   .reset:hover:not(:disabled){color:rgb(var(--c-text));background:rgb(var(--c-surface-hover) / 0.7)}
   .reset:disabled{opacity:.5}
