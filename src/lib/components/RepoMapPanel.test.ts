@@ -20,7 +20,9 @@ describe("RepoMapPanel", () => {
     expect(source).toContain("getDevmapCliStatus");
     expect(source).toContain("is_fresh");
     expect(source).toContain("schema_outdated");
-    expect(source).toContain("coverage_gaps");
+    // The strip names coverage gaps in words; the raw `coverage_gaps` id is no
+    // longer printed as a tooltip, so the read of it is what is pinned.
+    expect(source).toContain("coverageGapSummary(statusPayload)");
     expect(source).toContain("generation_id");
   });
 
@@ -147,7 +149,7 @@ describe("RepoMapPanel template honesty", () => {
     expect(source).toContain("brokenLinksSection(");
     expect(source).toContain("brokenError = reportMapFailure(");
     expect(source).toContain('data-testid="docs-broken-error"');
-    expect(template).toContain("Could not check links. {boundStrip(brokenError)}");
+    expect(template).toContain("Couldn't check links. {boundStrip(brokenError)}");
     const empty = template.indexOf('{:else if brokenSection === "empty"}');
     const noneFound = template.indexOf("None found in the indexed vault.");
     expect(empty).toBeGreaterThan(-1);
@@ -273,6 +275,8 @@ describe("RepoMapPanel docs search", () => {
   });
 });
 
+const TREEITEM_SELECTED = "aria-selected={row.subsystemIndex === null ? undefined : isSelected}";
+
 describe("RepoMapPanel map view tablist", () => {
   const template = source.slice(source.lastIndexOf("</script>"));
 
@@ -281,7 +285,9 @@ describe("RepoMapPanel map view tablist", () => {
     expect(source).toContain("handleTablistKeydown(");
     expect(source).toContain("focusTabAt(tablistEl");
     expect(template).not.toMatch(/role="tab"/);
-    expect(template).not.toMatch(/aria-selected=/);
+    // Tabs get aria-selected from tabProps. The navigator's tree rows carry their
+    // own (aria-selected on a treeitem), pinned in "navigator tree" below.
+    expect(template.replace(TREEITEM_SELECTED, "")).not.toMatch(/aria-selected=/);
     expect(source).toContain("const MAP_VIEWS");
     for (const id of ["navigator", "files", "symbols", "subsystems", "docgraph", "docs", "links"]) {
       expect(source).toContain(`{ id: "${id}"`);
@@ -396,6 +402,103 @@ describe("RepoMapPanel view switching", () => {
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     expect(source.slice(start, end)).toContain("graphLoad = null;");
+  });
+});
+
+describe("RepoMapPanel navigator tree", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+  const nav = template.slice(template.indexOf('aria-label="Subsystems"'), template.indexOf("<!-- Detail -->"));
+
+  it("renders the area tree, not the flat subsystem list keyed by area string", () => {
+    expect(source).toContain("buildAreaTree(map.subsystems)");
+    expect(nav).toContain("{#each visibleRows as row (row.key)}");
+    expect(template).not.toContain("{#each doc.subsystems as sub");
+    expect(source).not.toContain("selectedArea");
+    expect(source).not.toContain("s.area === selectedArea");
+  });
+
+  it("is an ARIA tree with a roving tab stop", () => {
+    expect(nav).toContain('role="tree"');
+    expect(nav).toContain('role="treeitem"');
+    expect(nav).toContain("aria-level={row.depth + 1}");
+    expect(nav).toContain("aria-expanded={row.hasChildren ? open : undefined}");
+    expect(nav).toContain("aria-selected={row.subsystemIndex === null ? undefined : isSelected}");
+    expect(nav).toContain("tabindex={row.key === tabStopKey ? 0 : -1}");
+    expect(nav).toContain("onkeydown={(e) => onRowKeydown(e, row)}");
+    expect(source).toContain("treeKeyOutcome(e.key, visibleRows, row.key, treeCollapsed)");
+  });
+
+  it("selects by row key and keeps the first subsystem as the default", () => {
+    expect(source).toContain("areaRows.find((r) => r.subsystemIndex === 0)");
+    expect(source).toContain("map.subsystems[selectedRow.subsystemIndex]");
+    // A group row only expands and collapses.
+    expect(source).toContain("if (row.subsystemIndex === null) toggleRow(row.key);");
+  });
+
+  it("shows duplicates as a count, the full area in the title and the summary without its area", () => {
+    expect(nav).toContain("row.duplicateCount > 1");
+    expect(nav).toContain("title={row.area}");
+    expect(nav).toContain("summaryWithoutArea(doc.subsystems[row.subsystemIndex])");
+    expect(template).toContain("summaryWithoutArea(selected)");
+  });
+
+  it("filters through the same visibility function the keyboard uses, with a real field class", () => {
+    expect(source).toContain("visibleAreaRows(areaRows, collapsed, treeFilter)");
+    expect(nav).toContain('class="gp-field w-full"');
+    expect(nav).toContain("bind:value={treeFilter}");
+    expect(template).not.toContain("gp-input");
+  });
+
+  it("keeps the cap line as a visible chip that names what was dropped", () => {
+    expect(nav).toContain('data-testid="map-subsystems-cap"');
+    expect(nav).toContain("Showing {doc.liveness_meta.subsystems.shown} of {doc.liveness_meta.subsystems.total}");
+    expect(nav).toContain("dropped (no area)");
+  });
+
+  it("turns neighbors that exist in the map into buttons that select them", () => {
+    expect(template).toContain("neighborRowKey(areaRows, neighbor)");
+    expect(template).toContain("onclick={() => selectKey(neighborKey)}");
+    // A neighbor outside the map stays text.
+    expect(template).toMatch(/\{:else\}\s*<span class="gp-chip font-mono text-textMuted"/);
+    expect(template).not.toContain("selected.neighbors.join");
+  });
+
+  it("selecting a neighbor opens whatever hides it", () => {
+    const select = source.slice(source.indexOf("function selectKey"), source.indexOf("function toggleRow"));
+    expect(select).toContain("ancestorKeys(areaRows, key)");
+    expect(select).toContain('treeFilter = "";');
+    expect(select).toContain("selectedKey = key;");
+  });
+
+  it("Show on map switches to the subsystems view and hands the canvas the node id", () => {
+    const show = source.slice(source.indexOf("function showOnMap"), source.indexOf("function openFile"));
+    expect(show).toContain("focusNodeId = subsystemNodeId(sub.area);");
+    expect(show).toContain('setView("subsystems");');
+    expect(template).toContain("onclick={() => showOnMap(selected)}");
+    expect(template).toContain('focusNodeId={mapView === "subsystems" ? focusNodeId : null}');
+    // The request does not outlive the subsystems view.
+    expect(source).toContain('if (view !== "subsystems") focusNodeId = null;');
+  });
+
+  it("leaves no uppercase labels, palette colours or hairline region separators in the template", () => {
+    expect(template).not.toMatch(/uppercase|tracking-wide/);
+    expect(template).not.toMatch(/\b(?:text|bg|border)-(?:amber|rose|emerald|red|green|yellow)-\d/);
+    expect(template).not.toMatch(/dark:/);
+    // The view tablist is another owner's block (header segmented tabs).
+    const outsideTablist = template.replace(/<!-- View switcher[\s\S]*?(?=\n  \{#if actionNote\})/, "");
+    expect(outsideTablist.length).toBeLessThan(template.length);
+    expect(outsideTablist).not.toMatch(/(?:^|\s)border-[btlr](?:\s|")/);
+  });
+
+  it("uses the shared notice, empty and loading shapes and plain-word copy", () => {
+    expect(template).toContain("gp-notice gp-notice-warn");
+    expect(template).toContain("<EmptyState");
+    expect(template).toContain("No code map yet");
+    expect(template).not.toContain("Loading…");
+    expect(template).not.toContain(">Retry<");
+    expect(template).toContain(">Try again<");
+    expect(template).not.toMatch(/title="(?:schema_outdated|coverage_gaps|generation_id|devmap status is_fresh)"/);
+    expect(template).not.toContain("devmap CLI missing");
   });
 });
 

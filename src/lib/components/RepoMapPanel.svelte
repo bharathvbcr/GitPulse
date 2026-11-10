@@ -81,6 +81,18 @@
     roleSample,
     unwiredExclusionSummary,
   } from "../codeintel/repoMap";
+  import { buildAreaTree, summaryWithoutArea } from "../codeintel/areaTree";
+  import {
+    ancestorKeys,
+    neighborRowKey,
+    NO_KEYS,
+    subsystemNodeId,
+    treeKeyOutcome,
+    visibleAreaRows,
+  } from "../codeintel/areaTreeNav";
+  import { tick } from "svelte";
+  import { ChevronDown, ChevronRight, Map as MapIcon } from "@lucide/svelte";
+  import EmptyState from "./EmptyState.svelte";
   import type {
     DevmapCliStatus,
     DevmapStatusPayload,
@@ -169,7 +181,15 @@
 
   let load = $state<RepoMapLoad | null>(null);
   let cliStatus = $state<DevmapCliStatus | null>(null);
-  let selectedArea = $state<string | null>(null);
+  // Navigator selection is a tree row key, not an area string: two subsystems
+  // can carry one area, and the tree merges them into one row.
+  let selectedKey = $state<string | null>(null);
+  let treeFocusKey = $state<string | null>(null);
+  let treeFilter = $state("");
+  let collapsed = $state<ReadonlySet<string>>(new Set());
+  let treeEl: HTMLDivElement | undefined = $state();
+  // Graph node "Show on map" hands to the subsystems canvas; cleared on leaving it.
+  let focusNodeId = $state<string | null>(null);
   let loading = $state(false);
   let building = $state(false);
   let errorMsg = $state<string | null>(null);
@@ -275,13 +295,27 @@
     return snapshot?.phase === "paused" ? indexPausedText(snapshot.reason) : null;
   });
   const cliKnownAbsent = $derived(cliStatus != null && !cliStatus.available);
+  const areaRows = $derived(map ? buildAreaTree(map.subsystems) : []);
+  const filtering = $derived(treeFilter.trim() !== "");
+  const treeCollapsed = $derived(filtering ? NO_KEYS : collapsed);
+  const visibleRows = $derived(visibleAreaRows(areaRows, collapsed, treeFilter));
+  // The first subsystem is selected until the user picks another.
+  const selectedRow = $derived(
+    areaRows.find((r) => r.subsystemIndex !== null && r.key === selectedKey) ??
+      areaRows.find((r) => r.subsystemIndex === 0) ??
+      null,
+  );
   const selected = $derived.by((): RepoMapSubsystem | null => {
-    if (!map) return null;
-    if (selectedArea) {
-      return map.subsystems.find((s) => s.area === selectedArea) ?? map.subsystems[0] ?? null;
-    }
-    return map.subsystems[0] ?? null;
+    if (!map || selectedRow?.subsystemIndex == null) return null;
+    return map.subsystems[selectedRow.subsystemIndex] ?? null;
   });
+  // The one row in the tab order: the focused row, else the selection, else the first.
+  const tabStopKey = $derived(
+    visibleRows.find((r) => r.key === treeFocusKey)?.key ??
+      visibleRows.find((r) => r.key === selectedRow?.key)?.key ??
+      visibleRows[0]?.key ??
+      null,
+  );
   const deadLists = $derived(map ? preferredDeadLists(map) : null);
   const tests = $derived(selected ? roleSample(selected, "tests") : null);
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
@@ -373,8 +407,6 @@
           load = mapResult.value;
           if (!mapResult.value.available) {
             errorMsg = mapResult.value.reason ?? "repo map unavailable";
-          } else if (selectedArea == null && mapResult.value.map?.subsystems[0]) {
-            selectedArea = mapResult.value.map.subsystems[0].area;
           }
         } else {
           load = null;
@@ -585,9 +617,9 @@
         liveIndex: liveIndex.get(repository),
         errors: [errorMsg, actionNote, docsError, brokenError, linksError],
       }, live);
-      if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
+      if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Couldn't copy DevMap logs. Try again.";
     } catch (error) {
-      if (live()) copyLogsNote = `Could not copy DevMap logs: ${reportMapFailure("copy logs", repository, error)}`;
+      if (live()) copyLogsNote = `Couldn't copy DevMap logs: ${reportMapFailure("copy logs", repository, error)}`;
     } finally {
       if (live()) copyingLogs = false;
     }
@@ -599,7 +631,11 @@
       cancelRequests();
       load = null;
       cliStatus = null;
-      selectedArea = null;
+      selectedKey = null;
+      treeFocusKey = null;
+      treeFilter = "";
+      collapsed = new Set();
+      focusNodeId = null;
       graphLoad = null;
       docsStatus = null;
       // A repository's docs search comes back as it was left; nothing re-runs.
@@ -635,6 +671,8 @@
       // The previous view's payload must not stay painted (and interactive)
       // under the new tab while the new one loads.
       graphLoad = null;
+      // A "Show on map" request belongs to the visit it started.
+      if (view !== "subsystems") focusNodeId = null;
       if (actionNoteKind === "ok") clearNote();
       if (path) reloadView(path, view);
     });
@@ -669,8 +707,58 @@
     }
   }
 
-  function selectSubsystem(area: string) {
-    selectedArea = area;
+  /** Move the roving tab stop to a row and give it DOM focus once it is drawn. */
+  function focusRow(key: string) {
+    treeFocusKey = key;
+    void tick().then(() => {
+      for (const el of treeEl?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? []) {
+        if (el.dataset.rowKey === key) {
+          el.focus();
+          el.scrollIntoView?.({ block: "nearest" });
+          return;
+        }
+      }
+    });
+  }
+
+  /** Select a row, opening what hides it: collapsed ancestors and a filter that excludes it. */
+  function selectKey(key: string) {
+    const ancestors = ancestorKeys(areaRows, key);
+    if (ancestors.some((k) => collapsed.has(k))) {
+      collapsed = new Set([...collapsed].filter((k) => !ancestors.includes(k)));
+    }
+    if (!visibleAreaRows(areaRows, collapsed, treeFilter).some((r) => r.key === key)) treeFilter = "";
+    selectedKey = key;
+    focusRow(key);
+  }
+
+  function toggleRow(key: string) {
+    if (filtering) return;
+    const next = new Set(collapsed);
+    if (!next.delete(key)) next.add(key);
+    collapsed = next;
+  }
+
+  function onRowClick(row: (typeof areaRows)[number]) {
+    treeFocusKey = row.key;
+    if (row.subsystemIndex === null) toggleRow(row.key);
+    else selectedKey = row.key;
+  }
+
+  function onRowKeydown(e: KeyboardEvent, row: (typeof areaRows)[number]) {
+    if (e.target !== e.currentTarget || e.altKey || e.ctrlKey || e.metaKey) return;
+    const outcome = treeKeyOutcome(e.key, visibleRows, row.key, treeCollapsed);
+    if (!outcome) return;
+    e.preventDefault();
+    if (outcome.collapsed && !filtering) collapsed = outcome.collapsed;
+    if (outcome.select) selectedKey = outcome.select;
+    focusRow(outcome.focusKey);
+  }
+
+  /** Switch to the subsystem map and ask the canvas to focus this subsystem's node. */
+  function showOnMap(sub: RepoMapSubsystem) {
+    focusNodeId = subsystemNodeId(sub.area);
+    setView("subsystems");
   }
 
   function openFile(path: string) {
@@ -708,42 +796,40 @@
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
   <!-- Freshness strip from cmd_devmap_status -->
   <div
-    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-3 py-2 text-[11px] text-textMuted"
+    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 bg-surface/60 px-3 py-2 text-[11px] text-textMuted"
     role="status"
   >
     {#if loading && !map}
-      <span>Loading map…</span>
+      <Skeleton variant="text" width="7rem" height="0.75rem" class="w-28!" />
     {:else if statusPayload}
       <span
-        class={statusPayload.is_fresh
-          ? "text-emerald-600 dark:text-emerald-400"
-          : "text-amber-600 dark:text-amber-300"}
-        title="devmap status is_fresh"
+        class={statusPayload.is_fresh ? "text-textMuted" : "gp-chip gp-notice-warn text-textPrimary"}
+        title={statusPayload.is_fresh ? "The index matches the latest commit" : "The index is behind the latest commit"}
       >
         {statusPayload.is_fresh ? "Fresh" : "Stale"}
       </span>
-      <span title="generation_id">gen {statusPayload.generation_id ?? "—"}</span>
+      <span title="Index build number">index {statusPayload.generation_id ?? "—"}</span>
       {#if statusPayload.schema_outdated}
-        <span class="text-rose-600 dark:text-rose-400" title="schema_outdated">
-          schema outdated ({statusPayload.schema_version ?? "?"} → {statusPayload.expected_schema_version ?? "?"})
+        <span class="gp-chip gp-notice-error" title="The index format is older than this version of GitPulse expects">
+          index format out of date ({statusPayload.schema_version ?? "?"} → {statusPayload.expected_schema_version ?? "?"})
         </span>
       {:else if statusPayload.schema_version != null}
-        <span>schema {statusPayload.schema_version}</span>
+        <span>format {statusPayload.schema_version}</span>
       {/if}
       {#if statusPayload.node_count != null}
         <span>{statusPayload.node_count} nodes · {statusPayload.edge_count ?? "?"} edges</span>
       {/if}
       {#if coverageGapSummary(statusPayload)}
-        <span class="text-amber-600 dark:text-amber-300" title="coverage_gaps">
+        <span class="gp-chip gp-notice-warn text-textPrimary" title="Languages and files the index couldn't fully cover">
           gaps: {coverageGapSummary(statusPayload)}
         </span>
       {/if}
     <!-- `mapFailureMessage` bounds what it returns, but these fallbacks reach
          the strip without passing through it, and both are process output. -->
     {:else if cliStatus && !cliStatus.available}
-      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "devmap CLI missing"}</span>
+      <span class="text-textPrimary">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "DevMap isn't installed"}</span>
     {:else if load && !load.available}
-      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? boundStrip(load.reason) ?? "map unavailable"}</span>
+      <span class="text-textPrimary">{mapFailureText ?? boundStrip(load.reason) ?? "The code map isn't available"}</span>
     {:else}
       <span>Status unknown</span>
     {/if}
@@ -792,8 +878,8 @@
   {/if}
 
   {#if cliStatus && !cliStatus.available}
-    <div class="shrink-0 border-b border-border/50 px-3 py-2 space-y-2">
-      <p class="text-[11px] text-amber-600 dark:text-amber-400">{mapFailureMessage("no_cli")}</p>
+    <div class="gp-notice gp-notice-warn shrink-0 space-y-2">
+      <p class="text-xs text-textPrimary">{mapFailureMessage("no_cli")}</p>
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
@@ -810,16 +896,16 @@
       />
     </div>
   {:else if load && !load.available && mapFailureMode !== "other"}
-    <div class="shrink-0 border-b border-border/50 px-3 py-2 space-y-1">
+    <div class={["gp-notice shrink-0 space-y-1", !indexActivity && "gp-notice-warn"]}>
       {#if indexActivity}
-        <p class="text-[11px] text-textMuted" data-testid="map-index-activity">{indexActivity}</p>
+        <p class="text-xs text-textMuted" data-testid="map-index-activity">{indexActivity}</p>
       {:else}
-        <p class="text-[11px] text-amber-600 dark:text-amber-400">{mapFailureText}</p>
+        <p class="text-xs text-textPrimary">{mapFailureText}</p>
       {/if}
     </div>
   {:else if indexPaused}
-    <div class="shrink-0 border-b border-border/50 px-3 py-2">
-      <p class="text-[11px] text-amber-600 dark:text-amber-400" data-testid="map-index-paused">{indexPaused}</p>
+    <div class="gp-notice gp-notice-warn shrink-0">
+      <p class="text-xs text-textPrimary" data-testid="map-index-paused">{indexPaused}</p>
     </div>
   {/if}
 
@@ -846,7 +932,7 @@
   </div>
 
   {#if actionNote}
-    <div class="shrink-0 px-3 py-1.5 text-[11px] text-textMuted border-b border-border/40" role="status">
+    <div class={["gp-notice shrink-0", actionNoteKind === "error" ? "gp-notice-error" : "text-textMuted"]} role="status">
       {boundStrip(actionNote)}
     </div>
   {/if}
@@ -859,23 +945,23 @@
   >
   {#if CODE_GRAPH_VIEWS.has(mapView)}
     <div class="flex-1 min-h-0 flex flex-col">
-      <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} />
+      <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} focusNodeId={mapView === "subsystems" ? focusNodeId : null} />
     </div>
   {:else if mapView === "docs"}
     <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-4" data-testid="docs-panel">
       {#if docsStatus}
-        <p class="text-[11px] text-textMuted" role="status">
+        <p class="text-xs text-textMuted" role="status">
           {docsStatus.noteCount} note{docsStatus.noteCount === 1 ? "" : "s"} indexed
         </p>
       {/if}
       {#if docsHonesty}
-        <p class="text-[10px] text-amber-600 dark:text-amber-300" role="note" data-testid="docs-status-honesty">
+        <p class="text-xs text-textPrimary" role="note" data-testid="docs-status-honesty">
           {docsHonesty}
         </p>
       {/if}
 
       <section aria-labelledby="docs-search-heading">
-        <h3 id="docs-search-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
+        <h3 id="docs-search-heading" class="text-xs font-medium text-textMuted mb-1.5">
           Search docs
         </h3>
         <form
@@ -887,7 +973,7 @@
         >
           <input
             type="search"
-            class="gp-input flex-1 text-[12px] py-1 px-2"
+            class="gp-field flex-1"
             placeholder="Full-text markdown search…"
             bind:value={docsQuery}
             aria-label="Search repository markdown"
@@ -897,12 +983,12 @@
           </button>
         </form>
         {#if searchHonesty}
-          <p class="mt-1 text-[10px] text-amber-600 dark:text-amber-300" data-testid="docs-search-honesty">
+          <p class="mt-1 text-xs text-textPrimary" data-testid="docs-search-honesty">
             {searchHonesty}
           </p>
         {/if}
         {#if docsError}
-          <p class="mt-2 text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-search-error">{boundStrip(docsError)}</p>
+          <p class="mt-2 text-xs text-textPrimary" role="alert" data-testid="docs-search-error">{boundStrip(docsError)}</p>
         {/if}
         {#if searchPrompt === "none"}
           <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-no-hits">No hits for "{searchedQuery}".</p>
@@ -931,23 +1017,23 @@
         {/if}
       </section>
 
-      <section aria-labelledby="docs-broken-heading" class="border-t border-border/50 pt-3">
-        <h3 id="docs-broken-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
+      <section aria-labelledby="docs-broken-heading">
+        <h3 id="docs-broken-heading" class="text-xs font-medium text-textMuted mb-1.5">
           Broken links
           {#if brokenSection === "list" || brokenSection === "empty"}
-            <span class="normal-case tracking-normal ml-1">({brokenLinks.length})</span>
+            <span class="font-normal ml-1">({brokenLinks.length})</span>
           {/if}
         </h3>
         {#if brokenSection === "loading"}
-          <p class="text-[11px] text-textMuted">Loading…</p>
+          <Skeleton variant="text" count={3} />
         {:else if brokenSection === "error"}
-          <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-broken-error">Could not check links. {boundStrip(brokenError)}</p>
-          <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Retry</button>
+          <p class="text-xs text-textPrimary" role="alert" data-testid="docs-broken-error">Couldn't check links. {boundStrip(brokenError)}</p>
+          <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Try again</button>
         {:else if brokenSection === "empty"}
           <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>
         {:else}
           {#if brokenDisplay.honesty}
-            <p class="mb-1 text-[10px] text-amber-600 dark:text-amber-300" data-testid="docs-broken-honesty">
+            <p class="mb-1 text-xs text-textPrimary" data-testid="docs-broken-honesty">
               {brokenDisplay.honesty}
             </p>
           {/if}
@@ -956,10 +1042,10 @@
               <li class="text-[11px]">
                 <button
                   type="button"
-                  class="font-mono text-accent hover:underline"
+                  class="gp-btn font-mono max-w-full"
                   onclick={() => openFile(link.source)}
                 >
-                  {link.source}
+                  <span class="truncate">{link.source}</span>
                 </button>
                 <span class="text-textMuted"> → </span>
                 <span class="font-mono text-textMuted">{link.target}</span>
@@ -972,7 +1058,7 @@
   {:else if mapView === "links"}
     <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-3" data-testid="link-candidates-panel">
       <header>
-        <h3 class="text-[10px] uppercase tracking-wide text-textMuted">Cross-repo link candidates</h3>
+        <h3 class="text-xs font-medium text-textMuted">Cross-repo link candidates</h3>
         <p class="text-[11px] text-textMuted mt-0.5">
           Import-graph edges between registered workspace repos — not name-matched call edges.
         </p>
@@ -983,14 +1069,14 @@
         </p>
       {/if}
       {#if linksError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(linksError)}</p>
+        <p class="text-xs text-textPrimary" role="alert">{boundStrip(linksError)}</p>
       {/if}
       {#if linksLoading}
-        <p class="text-[11px] text-textMuted">Loading…</p>
+        <Skeleton variant="text" count={3} />
       {:else if linkResult && linkResult.links.length > 0}
         <ul class="space-y-1.5">
           {#each keyedList(linkResult.links, (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
-            <li class="rounded-md border border-border/40 px-2 py-1.5 text-[11px]">
+            <li class="rounded-md bg-surface/60 px-2 py-1.5 text-[11px]">
               <div class="font-mono text-textPrimary truncate">
                 [{link.from_repo}] {link.from_file}
               </div>
@@ -1025,19 +1111,22 @@
     </div>
   {:else if !map}
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
-      <p class="text-sm text-textPrimary">No repository map</p>
+      <EmptyState
+        icon={MapIcon}
+        title="No code map yet"
+        hint={indexBusy && indexActivity
+          ? ""
+          : (mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests.")}
+      />
       {#if indexBusy && indexActivity}
-        <p class="text-[11px] text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
+        <p class="text-xs text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
           <Loader2 size={12} class="animate-spin" aria-hidden="true" />
           {indexActivity}
         </p>
       {:else}
-        <p class="text-[11px] text-textMuted max-w-md">
-          {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
-        </p>
         <button
           type="button"
-          class="gp-btn mt-2"
+          class="gp-btn"
           disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
           title={buildBlockedReason ?? "Build the map index"}
           aria-busy={building && buildKind === "build"}
@@ -1053,58 +1142,118 @@
     </div>
   {:else}
     {@const doc = map as RepoMapDocument}
-    <div class="flex-1 flex min-h-0">
-      <!-- Subsystem list -->
+    <div class="flex-1 flex min-h-0 gap-2 p-2">
+      <!-- Subsystem tree -->
       <nav
-        class="w-56 shrink-0 border-r border-border/60 overflow-y-auto"
+        class="w-64 shrink-0 flex flex-col min-h-0 rounded-xl bg-surface/60"
         aria-label="Subsystems"
       >
-        <div class="px-2.5 py-2 text-[10px] uppercase tracking-wide text-textMuted">
-          Subsystems
-          <span class="normal-case tracking-normal ml-1">
-            {formatCap(
-              doc.liveness_meta.subsystems.shown,
-              doc.liveness_meta.subsystems.total,
-              doc.liveness_meta.subsystems.truncated,
-            )}
-          </span>
+        <div class="shrink-0 space-y-2 px-2.5 pt-2.5 pb-2">
+          <div class="text-xs font-medium text-textMuted">
+            Subsystems
+            <span class="font-normal ml-1">
+              {formatCap(
+                doc.liveness_meta.subsystems.shown,
+                doc.liveness_meta.subsystems.total,
+                doc.liveness_meta.subsystems.truncated,
+              )}
+            </span>
+          </div>
+          {#if doc.liveness_meta.subsystems.truncated}
+            <span class="gp-chip gp-notice-warn text-textPrimary" data-testid="map-subsystems-cap">
+              Showing {doc.liveness_meta.subsystems.shown} of {doc.liveness_meta.subsystems.total}
+              {#if doc.liveness_meta.subsystems.dropped_no_area > 0}
+                · {doc.liveness_meta.subsystems.dropped_no_area} dropped (no area)
+              {/if}
+            </span>
+          {/if}
+          <input
+            type="search"
+            class="gp-field w-full"
+            placeholder="Filter areas"
+            aria-label="Filter subsystem areas"
+            bind:value={treeFilter}
+          />
         </div>
-        <ul class="px-1 pb-2">
-          {#each doc.subsystems as sub, i (`${sub.area}#${i}`)}
-            <li>
-              <button
-                type="button"
-                class="w-full text-left rounded-md px-2 py-1.5 text-[12px] hover:bg-surface/80 {selected?.area === sub.area
-                  ? 'bg-accent/15 text-textPrimary'
-                  : 'text-textMuted'}"
-                onclick={() => selectSubsystem(sub.area)}
-              >
-                <span class="font-mono block truncate" title={sub.area}>{sub.area}</span>
-                <span class="block truncate text-[10px] opacity-80" title={sub.summary}>{sub.summary}</span>
-              </button>
-            </li>
+        <div
+          bind:this={treeEl}
+          role="tree"
+          aria-label="Subsystem areas"
+          class="min-h-0 flex-1 overflow-y-auto px-1 pb-2"
+        >
+          {#each visibleRows as row (row.key)}
+            {@const isSelected = row.subsystemIndex !== null && row.key === selectedRow?.key}
+            {@const open = row.hasChildren && !treeCollapsed.has(row.key)}
+            {@const rowSummary = row.subsystemIndex === null ? "" : summaryWithoutArea(doc.subsystems[row.subsystemIndex])}
+            <div
+              role="treeitem"
+              data-row-key={row.key}
+              tabindex={row.key === tabStopKey ? 0 : -1}
+              aria-level={row.depth + 1}
+              aria-expanded={row.hasChildren ? open : undefined}
+              aria-selected={row.subsystemIndex === null ? undefined : isSelected}
+              title={row.area}
+              style="padding-left: {0.25 + row.depth * 0.875}rem"
+              class="flex cursor-pointer items-start gap-1 rounded-md py-1.5 pr-2 text-xs outline-none hover:bg-surfaceHover/70 focus-visible:ring-1 focus-visible:ring-accent/60 {isSelected
+                ? 'bg-accent/15 text-textPrimary'
+                : 'text-textMuted'}"
+              onclick={() => onRowClick(row)}
+              onkeydown={(e) => onRowKeydown(e, row)}
+            >
+              <span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden="true">
+                {#if row.hasChildren}
+                  {#if open}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
+                {/if}
+              </span>
+              <span class="min-w-0 flex-1">
+                <span class="flex items-center gap-1.5">
+                  <span class="min-w-0 flex-1 truncate font-mono">{row.label}</span>
+                  {#if row.duplicateCount > 1}
+                    <span
+                      class="gp-chip shrink-0"
+                      title="{row.duplicateCount} subsystems share this area"
+                    >×{row.duplicateCount}</span>
+                  {/if}
+                </span>
+                {#if rowSummary}
+                  <span class="block truncate opacity-80" title={rowSummary}>{rowSummary}</span>
+                {/if}
+              </span>
+            </div>
+          {:else}
+            <p class="px-2 py-2 text-xs text-textMuted" role="status">No areas match "{treeFilter.trim()}".</p>
           {/each}
-        </ul>
-        {#if doc.liveness_meta.subsystems.truncated}
-          <p class="px-2.5 pb-2 text-[10px] text-amber-600 dark:text-amber-300">
-            Showing {doc.liveness_meta.subsystems.shown} of {doc.liveness_meta.subsystems.total}
-            {#if doc.liveness_meta.subsystems.dropped_no_area > 0}
-              · {doc.liveness_meta.subsystems.dropped_no_area} dropped (no area)
-            {/if}
-          </p>
-        {/if}
+        </div>
       </nav>
 
       <!-- Detail -->
       <div class="flex-1 min-w-0 overflow-y-auto p-3 space-y-4">
         {#if selected}
-          <header>
-            <h2 class="font-mono text-[13px] text-textPrimary">{selected.area}</h2>
-            <p class="text-[11px] text-textMuted mt-0.5">{selected.summary}</p>
+          {@const detailSummary = summaryWithoutArea(selected)}
+          <header class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <h2 class="font-mono text-sm text-textPrimary break-all">{selected.area}</h2>
+              {#if detailSummary}
+                <p class="text-xs text-textMuted mt-0.5">{detailSummary}</p>
+              {/if}
+              {#if selectedRow && selectedRow.duplicateCount > 1}
+                <p class="text-xs text-textMuted mt-0.5" data-testid="map-duplicate-area">
+                  {selectedRow.duplicateCount} subsystems share this area; showing the first.
+                </p>
+              {/if}
+            </div>
+            <button
+              type="button"
+              class="gp-btn shrink-0"
+              title="Open the subsystem map focused on this subsystem"
+              onclick={() => showOnMap(selected)}
+            >
+              Show on map
+            </button>
           </header>
 
           <section aria-labelledby="map-entry-points">
-            <h3 id="map-entry-points" class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+            <h3 id="map-entry-points" class="text-xs font-medium text-textMuted mb-1">
               Entry points
             </h3>
             {#if selected.entry_points.length === 0}
@@ -1115,10 +1264,10 @@
                   <li>
                     <button
                       type="button"
-                      class="font-mono text-[11px] text-accent hover:underline truncate max-w-full"
+                      class="gp-btn font-mono max-w-full"
                       onclick={() => openFile(path)}
                     >
-                      {path}
+                      <span class="truncate">{path}</span>
                     </button>
                   </li>
                 {/each}
@@ -1127,7 +1276,7 @@
           </section>
 
           <section aria-labelledby="map-critical">
-            <h3 id="map-critical" class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+            <h3 id="map-critical" class="text-xs font-medium text-textMuted mb-1">
               Critical files
             </h3>
             {#if selected.critical_files.length === 0}
@@ -1138,10 +1287,10 @@
                   <li>
                     <button
                       type="button"
-                      class="font-mono text-[11px] text-accent hover:underline truncate max-w-full"
+                      class="gp-btn font-mono max-w-full"
                       onclick={() => openFile(path)}
                     >
-                      {path}
+                      <span class="truncate">{path}</span>
                     </button>
                   </li>
                 {/each}
@@ -1150,10 +1299,10 @@
           </section>
 
           <section aria-labelledby="map-tests">
-            <h3 id="map-tests" class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+            <h3 id="map-tests" class="text-xs font-medium text-textMuted mb-1">
               Tests
               {#if tests}
-                <span class="normal-case tracking-normal ml-1">
+                <span class="font-normal ml-1">
                   {formatCap(tests.paths.length, tests.total, tests.truncated)}
                 </span>
               {/if}
@@ -1170,16 +1319,16 @@
                   <li>
                     <button
                       type="button"
-                      class="font-mono text-[11px] text-accent hover:underline truncate max-w-full"
+                      class="gp-btn font-mono max-w-full"
                       onclick={() => openFile(path)}
                     >
-                      {path}
+                      <span class="truncate">{path}</span>
                     </button>
                   </li>
                 {/each}
               </ul>
               {#if tests.truncated}
-                <p class="mt-1 text-[10px] text-amber-600 dark:text-amber-300">
+                <p class="mt-1 text-xs text-textPrimary">
                   Sample of {tests.paths.length}; {tests.total} total for this area.
                 </p>
               {/if}
@@ -1188,23 +1337,39 @@
 
           {#if selected.neighbors.length > 0}
             <section aria-labelledby="map-neighbors">
-              <h3 id="map-neighbors" class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+              <h3 id="map-neighbors" class="text-xs font-medium text-textMuted mb-1">
                 Neighbors
               </h3>
-              <p class="font-mono text-[11px] text-textMuted">
-                {selected.neighbors.join(" · ")}
-              </p>
+              <ul class="flex flex-wrap gap-1.5">
+                {#each selected.neighbors as neighbor, i (`${neighbor}#${i}`)}
+                  {@const neighborKey = neighborRowKey(areaRows, neighbor)}
+                  <li class="min-w-0 max-w-full">
+                    {#if neighborKey}
+                      <button
+                        type="button"
+                        class="gp-btn font-mono max-w-full"
+                        title="Select {neighbor} in the tree"
+                        onclick={() => selectKey(neighborKey)}
+                      >
+                        <span class="truncate">{neighbor}</span>
+                      </button>
+                    {:else}
+                      <span class="gp-chip font-mono text-textMuted" title="{neighbor} is not in this map's subsystem list">{neighbor}</span>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
             </section>
           {/if}
         {/if}
 
         <!-- Dead / unwired candidates (prefer over unreachable) -->
         {#if deadLists}
-          <section class="border-t border-border/50 pt-3 space-y-3" aria-label="Dead and unwired candidates">
+          <section class="space-y-3" aria-label="Dead and unwired candidates">
             <div>
-              <h3 class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+              <h3 class="text-xs font-medium text-textMuted mb-1">
                 Unwired candidates
-                <span class="normal-case tracking-normal ml-1">
+                <span class="font-normal ml-1">
                   {formatCap(
                     doc.liveness_meta.unwired.shown,
                     doc.liveness_meta.unwired.total,
@@ -1236,9 +1401,9 @@
               {/if}
             </div>
             <div>
-              <h3 class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+              <h3 class="text-xs font-medium text-textMuted mb-1">
                 Dead symbol candidates
-                <span class="normal-case tracking-normal ml-1">
+                <span class="font-normal ml-1">
                   {formatCap(
                     doc.liveness_meta.dead_symbol.shown,
                     doc.liveness_meta.dead_symbol.total,
@@ -1257,13 +1422,13 @@
               {/if}
             </div>
             {#if deadLists.unreachableSuppressed}
-              <p class="text-[10px] text-amber-600 dark:text-amber-300">
+              <p class="text-xs text-textPrimary">
                 Unreachable files ignored — liveness_unreachable_unreliable is set.
                 Prefer unwired and dead-symbol candidates above.
               </p>
             {:else if deadLists.unreachable.length > 0}
               <div>
-                <h3 class="text-[10px] uppercase tracking-wide text-textMuted mb-1">
+                <h3 class="text-xs font-medium text-textMuted mb-1">
                   Unreachable files (secondary)
                 </h3>
                 <ul class="space-y-0.5 max-h-24 overflow-y-auto">
@@ -1277,7 +1442,7 @@
         {/if}
 
         {#if doc.liveness_meta.entry_roots.truncated || doc.liveness_meta.subsystems.role_files_truncated}
-          <p class="text-[10px] text-textMuted border-t border-border/40 pt-2">
+          <p class="text-xs text-textMuted">
             Caps:
             entry roots {formatCap(
               doc.liveness_meta.entry_roots.shown,
