@@ -323,11 +323,13 @@ describe("annotated but unregistered commands", () => {
     // cmd_inbox_withdraw, cmd_inbox_decompose_task), and 305 with
     // cmd_github_open_pr_worktree, and 311 with the browser session commands
     // (cmd_browser_open, cmd_browser_set_bounds, cmd_browser_set_visible,
-    // cmd_browser_navigate, cmd_browser_go, cmd_browser_close);
+    // cmd_browser_navigate, cmd_browser_go, cmd_browser_close), and 312 with
+    // cmd_get_accessibility_display (the system Reduce Transparency setting,
+    // which WKWebView cannot read);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(311);
+    expect(found.size).toBe(312);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

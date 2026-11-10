@@ -636,6 +636,7 @@ fn the_status_popover_is_granted_only_the_commands_it_calls() {
     assert_eq!(
         called,
         [
+            "cmd_get_accessibility_display",
             "cmd_get_status_state",
             "cmd_resize_status",
             "cmd_status_action"

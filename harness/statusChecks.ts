@@ -319,6 +319,15 @@ export async function checkStatusPopover() {
     check("light accessibility fallback is opaque and unfiltered", getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)" && backdrop() === "none");
     fallback.media.mediaText = media; await settle();
     check("restoring the preference restores glass without remounting", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
+    // WKWebView does not implement prefers-reduced-transparency, so the native
+    // bridge stamps this attribute instead. It has to give the same fallback.
+    const root = document.documentElement;
+    root.dataset.transparency = "reduced"; await settle();
+    check("data-transparency=reduced gives the opaque unfiltered fallback without the media feature", getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)" && backdrop() === "none" && getComputedStyle(element(".panel")).backgroundImage === "none");
+    root.dataset.transparency = "unknown"; await settle();
+    check("an unknown Reduce Transparency read does not claim reduced", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
+    delete root.dataset.transparency; await settle();
+    check("clearing data-transparency restores glass", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
     await select(2, "opaque");
     check("the non-native fallback stays opaque", backdrop() === "none" && getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)");
     await select(2, "preview");

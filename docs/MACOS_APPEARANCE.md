@@ -282,7 +282,15 @@ See [Svelte transitions](https://svelte.dev/docs/svelte/transition) and
   fixed at build time and cannot be withdrawn at runtime, so honouring the
   preference means the page covers the material rather than removing it. OS
   preference detection depends on the webview's support for these media
-  features.
+  features. WKWebView does not implement `prefers-reduced-transparency` (both
+  `reduce` and `no-preference` evaluate false, probed 2026-11-09 on macOS
+  27.2), so System Settings → Accessibility → Display → Reduce transparency is
+  bridged natively: `desktop/accessibility.rs` reads
+  `NSWorkspace.accessibilityDisplayShouldReduceTransparency` and observes
+  `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`, and
+  `lib/ui/transparencyPreference.ts` stamps `data-transparency="reduced"` on
+  `<html>` (`"unknown"` when the read could not run, which no rule treats as
+  reduced). The fallbacks key off the attribute beside the media query.
 - Reduced motion disables CSS movement and returns zero durations for
   Svelte transitions, including exits. Preferences are checked for each
   transition rather than captured once at startup. The liquid selector uses

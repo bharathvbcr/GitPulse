@@ -1,3 +1,4 @@
+pub mod accessibility;
 pub mod actions;
 pub mod confirm;
 pub mod exit;
