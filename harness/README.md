@@ -387,7 +387,21 @@ presented).
   (generated `/r/gen-N`). Record before a change and after it:
   `?c=FileTreePanel&scenario=flushcost&paths=100000&dirty=20&tabs=1&cycles=30` and
   `?c=RepoTabBar&scenario=flushcost&tabs=500&cycles=30` (also `tabs=1000`).
-  A pane that rendered nothing sets `armed: false`.
+  A pane that rendered nothing sets `armed: false`. Its timer reads 0 ms on both
+  the old and the new file tree (the rebuild lands after the flush it times), so
+  it is a smoke check, not evidence; use `treebuilds` for the rebuild question.
+- `treebuilds` counts how many times the Code view's file tree is built
+  (`fileTreeBuildCount()`, read at `buildFileTree`) per file click, per unrelated
+  publish and per status change, into `__gpResult.treebuilds`. A count, so load
+  does not move it. Expected on the current tree: 0, 0, 1. On the tree before
+  the identity fix (`git checkout 55d605b8 -- src/lib/components/files/FileTreePanel.svelte
+  src/lib/files/fileStatus.ts src/lib/files/fileQuery.ts`, then back with
+  `git checkout HEAD -- …`): 1, 1, 1.
+- Run either scenario with `node scripts/stress-probe.mjs "<query>"` (the browser
+  runner cannot select a stress.html scenario), e.g.
+  `"c=FileTreePanel&scenario=treebuilds&paths=20000&dirty=20&tabs=1&cycles=8"`.
+  The cost of one build is `bun scripts/tree-build-bench.ts` (skips itself above
+  a 1-minute load of 30).
 - `termtabs` drives the terminal strip through the real DOM (open / switch / close),
   because that state is internal to the component. Pair it with `TerminalPanel`:
   every open mounts an xterm into a visible box and hides the previous one, which

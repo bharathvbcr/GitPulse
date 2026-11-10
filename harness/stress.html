@@ -332,7 +332,7 @@
       // that the tree has real folders, flat enough that the listing is the cost.
       const repoFileFixture = Array.from({ length: PATHS }, (_, i) =>
         `src/d${Math.floor(i / 1000)}/m${Math.floor(i / 100) % 10}/f${i}.ts`);
-      const statusFixture = Array.from({ length: DIRTY }, (_, i) => ({
+      let statusFixture = Array.from({ length: DIRTY }, (_, i) => ({
         path: repoFileFixture[i * 7 % Math.max(1, PATHS)] ?? `untracked/n${i}.ts`,
         status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0,
       }));
@@ -471,6 +471,7 @@
 
       const { mount, unmount, flushSync } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { fileTreeBuildCount } = await import("../src/lib/files/fileTree.ts");
       const { locMetric, coverageMetric, storageMetric } = await import("../src/lib/metrics/repoMetrics.ts");
       const { pickNamedFunction } = await import("../src/lib/stress/pickNamedFunction.ts");
 
@@ -491,7 +492,7 @@
 
       // The flush-cost probe is the one scenario that needs more tabs than
       // there are named repositories (500 and 1000 are the numbers it records).
-      const repos = SCENARIO === "flushcost"
+      const repos = SCENARIO === "flushcost" || SCENARIO === "treebuilds"
         ? Array.from({ length: Math.max(1, TABS) }, (_, i) => ALL_REPOS[i] ?? `/r/gen-${i}`)
         : ALL_REPOS.slice(0, Math.max(1, TABS));
       for (const r of repos) await repoStore.openRepo(r, { activate: true });
@@ -519,6 +520,7 @@
       const armFailures = [];
       let termtabs = null;
       let flushcost = null;
+      let treebuilds = null;
       if (SCENARIO === "churn") {
         // Open and close repositories under the mounted pane. Every close
         // supersedes an in-flight subscription run.
@@ -626,6 +628,40 @@
         } else if (peakXterms === 0) {
           armFailures.push(`harness: termtabs opened ${seenTabs.size} terminal tabs but no xterm ever mounted -- the reveal effects it exists to stress never ran`);
         }
+      } else if (SCENARIO === "treebuilds") {
+        // How many times the Code view's file tree is BUILT, counted at
+        // `buildFileTree` itself: per file click (`selectFilePath`, the publish
+        // a click in the tree causes), per publish that touches neither the
+        // selection nor the statuses (an error banner set and cleared), and per
+        // change to the set of changed files. A count, so it reads the same on
+        // a loaded host and on a repository too small for a timer to resolve.
+        // Pair with `c=FileTreePanel&paths=N&dirty=M&tabs=1`.
+        const settle = async () => { flushSync(); await sleep(60); flushSync(); };
+        const countOver = async (n, act) => {
+          const counts = [];
+          for (let i = 0; i < n; i++) {
+            const before = fileTreeBuildCount();
+            await act(i);
+            await settle();
+            counts.push(fileTreeBuildCount() - before);
+          }
+          return counts;
+        };
+        for (let i = 0; i < 100 && target.textContent.trim().length === 0; i++) await sleep(100);
+        await settle();
+        const rendered = target.textContent.trim().length;
+        const perClick = await countOver(CYCLES, (i) => repoStore.selectFilePath(i % 2 === 0 ? "src/d0/m0/f0.ts" : "src/d0/m0/f1.ts"));
+        const perUnrelatedPublish = await countOver(CYCLES, (i) => repoStore.setError(i % 2 === 0 ? "probe-a" : null));
+        repoStore.setError(null);
+        const activePath = ALL_REPOS[0];
+        const perStatusChange = await countOver(Math.min(CYCLES, 5), async (i) => {
+          statusFixture = [...statusFixture, { path: `untracked/probe-${i}.ts`, status_code: "??", is_staged: false, is_conflicted: false, additions: 0, deletions: 0 }];
+          await repoStore.refresh(activePath, "status");
+        });
+        const sum = (xs) => xs.reduce((a, b) => a + b, 0);
+        treebuilds = { component: COMPONENT, paths: PATHS, dirty: DIRTY, renderedCharsBeforeProbe: rendered, perClick, perUnrelatedPublish, perStatusChange,
+          totals: { clicks: sum(perClick), unrelatedPublishes: sum(perUnrelatedPublish), statusChanges: sum(perStatusChange) } };
+        if (rendered === 0) armFailures.push(`harness: treebuilds mounted ${COMPONENT} but it rendered nothing before the probe`);
       } else if (SCENARIO === "flushcost") {
         // What one repoStore publish costs the mounted pane, in milliseconds.
         // The trigger is a file click (`selectFilePath`): a publish that changes
@@ -706,6 +742,7 @@
         armed: armFailures.length === 0,
         termtabs,
         flushcost,
+        treebuilds,
         tabsAtEnd: openPaths.length,
         depthExceeded: depthCount(),
         mountError,

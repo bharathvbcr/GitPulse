@@ -59,12 +59,24 @@ export function isValidRelativePath(raw: string): boolean {
   return segments.every((segment) => segment !== "." && segment !== "..");
 }
 
+let buildCount = 0;
+
+/**
+ * How many times `buildFileTree` has run. A probe seam, like `loadedViewCount`:
+ * the harness reads it before and after a click or a store publish to count
+ * tree rebuilds, which no timer can resolve on a small repository.
+ */
+export function fileTreeBuildCount(): number {
+  return buildCount;
+}
+
 /**
  * Builds the tree in O(total segments). Nested maps keyed by segment; null
  * marks "this is a file". Duplicate-heavy storms reuse existing nodes, so
  * 100k duplicates cost one 100-path build.
  */
 export function buildFileTree(paths: readonly string[]): FileTree {
+  buildCount += 1;
   // Recursive alias: a dir node maps segment -> nested node, and a file
   // claims its slot as null. The recursion is what lets ensureDir's
   // instanceof narrow return a properly-typed Node instead of an unknown.
