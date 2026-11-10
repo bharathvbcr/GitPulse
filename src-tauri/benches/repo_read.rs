@@ -18,6 +18,8 @@
 //! work and not the production gate's 8-spawns-per-second refill.
 
 mod common;
+#[path = "repo_read/numstat_paired.rs"]
+mod numstat_paired;
 
 use common::fixture::{build_repo, count_git_processes, dirty_files, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
@@ -112,132 +114,20 @@ fn main() {
         })
         .collect();
 
-    // The numstat limit (F-3): at 50k tracked files `get_status` used to run
-    // `git diff --numstat -z` over every index entry to find churn for the few
-    // paths `status` had just named. The two arms are the shipped read and the
-    // whole-tree oracle on one repository, interleaved by `interleave`, so the
-    // pair shares the host load of the moment. `rows` and `churn` must agree
-    // between the arms or the row is not a comparison.
-    let wide_spec = Spec {
-        files: 50_000,
-        dirs: 500,
-        extra_commits: 1,
-        touch: 5,
-        linked_worktrees: 0,
-    };
-    // Each arm reports wall time, the CPU the git children it started used
-    // (user + system, from `getrusage(RUSAGE_CHILDREN)` deltas around the
-    // call), and the number of children (counted in a separate untimed pass).
-    // 500 dirty files is the largest the pathspec limit covers (512); at 2 000
-    // the shipped read falls back to the whole tree, so the two arms are the
-    // same code, and two raw `git diff --numstat -z` arms (whole tree, and
-    // limited to all 2 000 paths) price the limit past its bound.
-    for dirty in [1usize, 50, 500, 2_000] {
-        let repo = build_repo(&temp.path().join(format!("wide-{dirty}")), &wide_spec);
-        dirty_files(&repo, &wide_spec, dirty);
-        let (limited, whole) = (
-            GitReader::get_status(repo.path()).expect("limited status"),
-            GitReader::get_status_whole_tree_numstat(repo.path()).expect("whole-tree status"),
-        );
-        let churn = |rows: &[gitpulse_lib::engine::git_reader::FileStatus]| {
-            rows.iter()
-                .map(|row| (row.additions + row.deletions) as u64)
-                .sum::<u64>()
-        };
-        assert_eq!(
-            format!("{limited:?}"),
-            format!("{whole:?}"),
-            "the arms disagree on {dirty} dirty files"
-        );
-        let total = churn(&limited);
-        let (_, limited_children) = count_git_processes(|| status(&repo));
-        let (_, whole_children) =
-            count_git_processes(|| GitReader::get_status_whole_tree_numstat(repo.path()));
-        let repo = std::sync::Arc::new(repo);
-        let shipped = std::sync::Arc::clone(&repo);
-        let oracle = std::sync::Arc::clone(&repo);
-        cases.push(Case::new(
-            format!("get_status 50k files {dirty} dirty, numstat limited to changed paths"),
-            move || {
-                let cpu = ChildCpu::start();
-                let rows = status(&shipped);
-                let cpu_ms = cpu.spent_ms();
-                std::hint::black_box(&rows);
-                Sample::default()
-                    .counter("rows", rows.len() as u64)
-                    .counter("churn", total)
-                    .counter("git_processes", limited_children)
-                    .metric("child_cpu_ms", cpu_ms)
-            },
-        ));
-        cases.push(Case::new(
-            format!("get_status 50k files {dirty} dirty, numstat over the whole tree"),
-            move || {
-                let cpu = ChildCpu::start();
-                let rows = GitReader::get_status_whole_tree_numstat(oracle.path())
-                    .expect("whole-tree status");
-                let cpu_ms = cpu.spent_ms();
-                std::hint::black_box(&rows);
-                Sample::default()
-                    .counter("rows", rows.len() as u64)
-                    .counter("churn", total)
-                    .counter("git_processes", whole_children)
-                    .metric("child_cpu_ms", cpu_ms)
-            },
-        ));
-        if dirty == 2_000 {
-            let names = git_bytes(&repo.main, &["diff", "--name-only", "-z"]);
-            let specs: Vec<String> = names
-                .split(|byte| *byte == 0)
-                .filter(|name| !name.is_empty())
-                .map(|name| format!(":(literal){}", String::from_utf8_lossy(name)))
-                .collect();
-            assert_eq!(specs.len(), dirty, "every dirty file is named");
-            let whole_out = git_bytes(&repo.main, &["diff", "--numstat", "-z"]);
-            let mut limited_args = vec!["diff", "--numstat", "-z", "--"];
-            limited_args.extend(specs.iter().map(String::as_str));
-            assert_eq!(
-                whole_out,
-                git_bytes(&repo.main, &limited_args),
-                "the raw arms read the same numstat"
-            );
-            let (whole_repo, limited_repo) = (std::sync::Arc::clone(&repo), repo);
-            cases.push(Case::new(
-                "raw git diff --numstat -z, 50k files 2000 dirty, whole tree",
-                move || {
-                    let cpu = ChildCpu::start();
-                    let out = git_bytes(&whole_repo.main, &["diff", "--numstat", "-z"]);
-                    let cpu_ms = cpu.spent_ms();
-                    Sample::default()
-                        .counter("bytes", out.len() as u64)
-                        .counter("git_processes", 1)
-                        .metric("child_cpu_ms", cpu_ms)
-                },
-            ));
-            cases.push(Case::new(
-                "raw git diff --numstat -z, 50k files 2000 dirty, 2000 literal pathspecs",
-                move || {
-                    let mut args = vec!["diff", "--numstat", "-z", "--"];
-                    args.extend(specs.iter().map(String::as_str));
-                    let cpu = ChildCpu::start();
-                    let out = git_bytes(&limited_repo.main, &args);
-                    let cpu_ms = cpu.spent_ms();
-                    Sample::default()
-                        .counter("bytes", out.len() as u64)
-                        .counter("git_processes", 1)
-                        .metric("child_cpu_ms", cpu_ms)
-                },
-            ));
-        }
+    // `GITPULSE_BENCH_ONLY=<substring>` runs only the rows whose name contains
+    // it (and the numstat pairs when it names "50k files"), so one measurement
+    // does not pay for every other row; `GITPULSE_BENCH_ROUNDS` sets n.
+    let only = std::env::var("GITPULSE_BENCH_ONLY").ok();
+    let rounds = std::env::var("GITPULSE_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| report.opts.samples(15));
+    if only
+        .as_deref()
+        .is_none_or(|only| only.contains("50k files"))
+    {
+        numstat_paired::run(&mut report, &temp.path().join("numstat"), rounds);
     }
-    report.note(
-        "50k-file repository (500 dirs, 24-line files, 2 commits), 1/50/500/2000 tracked files \
-         modified, one repository per count shared by both arms: get_status with the numstat \
-         limited to the reported paths (falls back to the whole tree above 512) against the \
-         whole-tree numstat it replaced, with wall time, child CPU (user+system) and git \
-         processes; at 2000, two raw numstat arms price the limit past its bound"
-            .to_string(),
-    );
 
     // Opening a file and saving it are the two reads of a file's bytes the
     // editor pays for, and both now also hash those bytes (the base token a
@@ -385,15 +275,9 @@ fn main() {
          detail_json, and a transcript edit (object path plus 4-field detail_json)"
     ));
 
-    // `GITPULSE_BENCH_ONLY=<substring>` runs only the rows whose name contains
-    // it, so one measurement does not pay for every other row.
-    if let Ok(only) = std::env::var("GITPULSE_BENCH_ONLY") {
-        cases.retain(|case| case.name.contains(&only));
+    if let Some(only) = &only {
+        cases.retain(|case| case.name.contains(only.as_str()));
     }
-    let rounds = std::env::var("GITPULSE_BENCH_ROUNDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| report.opts.samples(15));
     let rows = interleave(cases, rounds, report.opts.warmup(2));
     report.extend(rows);
     report.finish();
