@@ -96,7 +96,7 @@ describe("compact status popover", () => {
     // free to stay thin — their backdrop is already the panel above.
     expect(nativeBlock).toContain("--surface:rgb(var(--card-base) / .4)");
     // Liquid-ease cubic-bezier on interactive elements.
-    expect(nativeBlock).toContain("--liquid-ease:cubic-bezier(0.22, 1, 0.36, 1)");
+    expect(nativeBlock).toContain("--liquid-ease:var(--gp-ease-effect)");
     expect(nativeBlock).toContain("scale(0.97)");
   });
   it("tunes the browser fixture from the same rules as the native material", () => {

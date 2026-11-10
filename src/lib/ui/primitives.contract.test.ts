@@ -31,6 +31,7 @@ const TONES = ["ok", "warn", "danger", "info", "unknown"] as const;
 const TINT = 0.06;
 const notice = blockOf("@utility gp-notice {");
 const field = blockOf("@utility gp-field-multi {");
+const single = blockOf("@utility gp-field {");
 
 describe("gp-notice", () => {
   it("has one rule per tone, each pointing --gp-notice-tone at its status role", () => {
@@ -145,17 +146,18 @@ describe("gp-field-multi", () => {
     expect(shape).toContain("padding-block: var(--gp-space-2);");
   });
 
-  it("turns the edge and the focus ring to the danger role when invalid", () => {
-    expect(field).toContain('&[data-invalid]:not([data-invalid="false"]),');
-    expect(field).toContain('&[aria-invalid="true"] {');
-    expect(field).toMatch(/border-color:\s*rgb\(var\(--c-danger\)\);/);
-    expect(field).toContain("box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);");
+  it("turns the edge and the focus ring to the danger role when invalid (the state is gp-field's, so multi inherits it)", () => {
+    expect(single).toContain('&[data-invalid]:not([data-invalid="false"]),');
+    expect(single).toContain('&[aria-invalid="true"] {');
+    expect(single).toMatch(/border-color:\s*rgb\(var\(--c-danger\)\);/);
+    expect(single).toContain("box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);");
   });
 
-  it("dims and locks a disabled field", () => {
+  it("dims a disabled field, and a disabled multiline field also loses its resize handle", () => {
     const disabled = blockOf('&:disabled,\n  &[aria-disabled="true"] {');
     expect(disabled).toContain("@apply cursor-not-allowed opacity-40;");
-    expect(disabled).toContain("resize: none;");
+    expect(field).toContain('&[aria-disabled="true"] {');
+    expect(field).toContain("resize: none;");
   });
 
   it("keeps gp-field's focus: the accent edge and --ring-focus, inherited, not restated", () => {

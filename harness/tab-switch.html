@@ -534,11 +534,17 @@
             check("switcher: the flyout marks the section the view would reopen on", () =>
               fly?.querySelector('[data-remembered="true"]')?.dataset.section === "overview");
             group("work").dispatchEvent(new PointerEvent("pointerleave", { pointerType: "mouse" }));
-            await sleepUntil(() => !flyout(), 1000);
+            // The flyout closes on a timer (220 ms grace). A window the OS does not
+            // show as key can clamp timers to about a second, so the bound is the
+            // time to fail, not the grace: the condition is still "closed", and a
+            // flyout that never closes still fails after the bound.
+            await sleepUntil(() => !flyout(), 5000);
             check("switcher: leaving the pill closes the flyout after its grace", () => !flyout());
             group("code").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "touch" }));
-            await wait(300);
-            check("switcher: a touch has no hover, so it opens no flyout", () => !flyout());
+            // Watch the whole 300 ms for a flyout to appear, not only the last
+            // instant, so one that opens and is gone again would still be caught.
+            const touchOpened = await sleepUntil(() => !!flyout(), 300);
+            check("switcher: a touch has no hover, so it opens no flyout", () => !touchOpened && !flyout());
             group("history").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
             await wait(300);
             check("switcher: the active view opens no flyout; its sections are already out", () => !flyout());

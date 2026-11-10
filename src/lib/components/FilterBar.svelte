@@ -26,14 +26,14 @@
      only place it filters anything. -->
 <div class="flex-1 min-w-0 flex items-center gap-3 text-xs select-none">
   <div
-    class="flex-1 max-w-xl flex items-center gap-2 bg-background border border-border/80 rounded-full px-3 py-1 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-(--ring-focus)"
+    class="flex-1 max-w-xl flex items-center gap-2 bg-background border border-edgeStrong rounded-full px-3 py-1 transition-colors focus-within:border-accent/65 focus-within:shadow-(--ring-focus)"
   >
     <Search size={14} class="text-textMuted shrink-0" />
     <input
       bind:this={inputEl}
       id="gitpulse-filter"
       type="text"
-      placeholder="Search commits, authors, paths (e.g. author:alice, feat:)..."
+      placeholder="Search commits, authors, paths (e.g. author:alice, feat:)…"
       value={$filterStore.searchQuery}
       oninput={(e) => filterStore.setSearch((e.target as HTMLInputElement).value)}
       class="w-full bg-transparent text-textPrimary placeholder:text-textMuted/60 text-xs focus:outline-hidden"
@@ -49,7 +49,7 @@
     <button
       type="button"
       onclick={() => filterStore.selectBranch(null)}
-      class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 transition-colors"
+      class="gp-chip bg-accent/15 text-accent border-accent/35 hover:bg-accent/25 transition-colors"
       title="Clear branch filter"
     >
       <span class="truncate max-w-40">{$filterStore.selectedBranch}</span>

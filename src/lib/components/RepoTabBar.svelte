@@ -254,9 +254,9 @@
 
   function groupChrome(info: { hasActiveTab: boolean }): string {
     if (info.hasActiveTab) {
-      return "border-accent/50 bg-accent/10 text-accent font-medium";
+      return "border-accent/35 bg-accent/10 text-accent font-medium";
     }
-    return "border-border/70 bg-surface/70 text-textSecondary hover:border-accent/30 hover:bg-surfaceHover hover:text-textPrimary";
+    return "border-edge bg-surface/70 text-textSecondary hover:border-accent/35 hover:bg-surfaceHover hover:text-textPrimary";
   }
 
   let unusedRecents = $derived(
@@ -866,8 +866,8 @@
   function surfaceChipClass(active: boolean): string {
     return `shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors ${
       active
-        ? "border-accent/60 bg-accent/10 text-accent"
-        : "border-border/70 bg-background/50 text-textPrimary hover:border-accent/40 hover:bg-accent/5 hover:text-accent"
+        ? "border-accent/65 bg-accent/10 text-accent"
+        : "border-edge bg-background/50 text-textPrimary hover:border-accent/35 hover:bg-accent/5 hover:text-accent"
     }`;
   }
 
@@ -880,12 +880,12 @@
   function repoTabChrome(tab: { isActive: boolean }): string {
     const viewingRepo = $interfaceStore.globalSurface === "repository";
     if (tab.isActive && viewingRepo) {
-      return "border-accent/60 bg-accent/10 text-accent shadow-xs";
+      return "border-accent/65 bg-accent/10 text-accent shadow-xs";
     }
     if (tab.isActive) {
-      return "border-border/80 bg-surfaceHover text-textPrimary";
+      return "border-edgeStrong bg-surfaceHover text-textPrimary";
     }
-    return "border-border/70 bg-background/50 text-textPrimary hover:border-accent/40 hover:bg-accent/5 hover:text-accent";
+    return "border-edge bg-background/50 text-textPrimary hover:border-accent/35 hover:bg-accent/5 hover:text-accent";
   }
 
   function revealRepository() {
@@ -981,7 +981,7 @@
     >
       <button
         type="button"
-        class="h-7 px-2 flex items-center gap-1.5 rounded-lg border text-xs font-medium cursor-pointer transition-[color,background-color,border-color,box-shadow] duration-150 {groupChrome(info)} {dragHoverGroup === info.group ? 'ring-2 ring-accent border-accent' : ''}"
+        class="h-7 px-2 flex items-center gap-1.5 rounded-lg border text-xs font-medium cursor-pointer transition-colors {groupChrome(info)} {dragHoverGroup === info.group ? 'ring-2 ring-accent border-accent' : ''}"
         aria-expanded={!info.isCollapsed}
         aria-label={groupAriaLabel(info)}
         title={groupTitle(info)}
@@ -1017,13 +1017,13 @@
         >
           <Folder size={12} />
         </span>
-        <span class="whitespace-nowrap font-medium text-[11px]">{info.label}</span>
-        <span class="text-[10px] tabular-nums font-mono opacity-70">({info.tabCount})</span>
+        <span class="whitespace-nowrap font-medium text-meta">{info.label}</span>
+        <span class="text-micro tabular-nums font-mono opacity-70">({info.tabCount})</span>
         {#if info.isDirty}
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)] shrink-0" title="{info.label} has uncommitted changes"></span>
+          <span class="w-1.5 h-1.5 rounded-full bg-warn shadow-[0_0_6px_rgb(251_191_36/0.8)] shrink-0" title="{info.label} has uncommitted changes"></span>
         {/if}
         {#if info.conflictedCount > 0}
-          <span class="text-amber-400 text-[10px] font-mono shrink-0" title="{info.conflictedCount} conflicted files in {info.label}">{info.conflictedCount}</span>
+          <span class="text-warn text-micro font-mono shrink-0" title="{info.conflictedCount} conflicted files in {info.label}">{info.conflictedCount}</span>
         {/if}
         {#if info.terminalCount > 0}
           <span
@@ -1032,7 +1032,7 @@
           >
             <SquareTerminal size={10} aria-hidden="true" />
             {#if info.terminalCount > 1}
-              <span class="text-[9px] font-medium tabular-nums">{info.terminalCount}</span>
+              <span class="text-micro font-medium tabular-nums">{info.terminalCount}</span>
             {/if}
             <span class="sr-only">{info.terminalCount} terminal session{info.terminalCount === 1 ? '' : 's'} running</span>
           </span>
@@ -1066,9 +1066,9 @@
     oncontextmenu={(e) => onContext(e, tab.id)}
     ondragstart={(e) => onUnitDragStart(e, { kind: "tab", id: tab.id })}
     ondragend={endDrag}
-    class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
+    class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,opacity] {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
       ? 'opacity-60'
-      : ''} {dropHere ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
+      : ''} {dropHere ? 'border-accent/35' : ''} {repoTabChrome(tab)}"
   >
     {#if dropHere && dropTarget}
       <span
@@ -1112,7 +1112,7 @@
       {#if tab.pinned}
         <Pin size={10} class="text-accent shrink-0" />
       {:else}
-        <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
+        <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-danger' : 'text-accent'}" />
       {/if}
       <span class="whitespace-nowrap font-medium {tab.watch === 'parked' ? 'opacity-60' : ''}">{tab.label}</span>
       {#if tab.watch === "parked"}
@@ -1122,10 +1122,10 @@
         <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
       {/if}
       {#if tab.currentBranch}
-        <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
+        <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
       {/if}
       {#if tab.conflictedCount > 0}
-        <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
+        <span class="text-warn shrink-0">{tab.conflictedCount}</span>
       {/if}
       {#if terminalCounts.get(tab.path)}
         <!-- Not a button: the tab itself is the way in, and a second
@@ -1138,7 +1138,7 @@
         >
           <SquareTerminal size={10} aria-hidden="true" />
           {#if (terminalCounts.get(tab.path) ?? 0) > 1}
-            <span class="text-[9px] font-medium tabular-nums">{terminalCounts.get(tab.path)}</span>
+            <span class="text-micro font-medium tabular-nums">{terminalCounts.get(tab.path)}</span>
           {/if}
           <!-- `title` on a non-focusable span is not reliably
                announced; the tab's accessible name carries it. -->
@@ -1147,10 +1147,10 @@
       {/if}
     </button>
     {#if tab.isDirty}
-      <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+      <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-warn/15 focus-visible:ring-1 focus-visible:ring-accent"
         title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
         onclick={() => void repoStore.previewUncommitted(tab.path)}>
-        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+        <span class="w-1.5 h-1.5 rounded-full bg-warn shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
       </button>
     {/if}
     <button
@@ -1163,7 +1163,7 @@
         e.stopPropagation();
         void repoStore.closeTab(tab.id);
       }}
-      class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-rose-400 {tab.isActive ? 'opacity-100' : ''}"
+      class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-danger {tab.isActive ? 'opacity-100' : ''}"
     >
       <X size={11} />
     </button>
@@ -1191,11 +1191,11 @@
     ondragstart={(e) => onUnitDragStart(e, { kind: "stack", key: info.key })}
     ondragend={endDrag}
     oncontextmenu={(e) => openStackMenu(e, info)}
-    class="group relative flex items-center shrink-0 rounded-full border cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {info.isExpanded
+    class="group relative flex items-center shrink-0 rounded-full border cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,opacity] {info.isExpanded
       ? groupChrome(info)
       : repoTabChrome({ isActive: info.hasActiveTab })} {dragFrom?.kind === 'stack' && dragFrom.key === info.key
       ? 'opacity-60'
-      : ''} {dropHere ? 'border-accent/50' : ''}"
+      : ''} {dropHere ? 'border-accent/35' : ''}"
   >
     {#if dropHere && dropTarget}
       <span
@@ -1208,7 +1208,7 @@
     {#if info.isExpanded}
       <button
         type="button"
-        class="h-7 pl-2 pr-2.5 flex items-center gap-1.5 rounded-full text-[11px] font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+        class="h-7 pl-2 pr-2.5 flex items-center gap-1.5 rounded-full text-meta font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
         aria-expanded="true"
         aria-label={`${info.label}, ${info.tabCount} checkouts shown as tabs. Fold them into one tab`}
         data-stack-head={info.key}
@@ -1219,7 +1219,7 @@
         <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary" />
         <Layers size={11} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
         <span class="whitespace-nowrap">{info.label}</span>
-        <span class="text-[10px] tabular-nums font-mono opacity-70">({info.tabCount})</span>
+        <span class="text-micro tabular-nums font-mono opacity-70">({info.tabCount})</span>
       </button>
     {:else}
       {#if colorInfo.color}
@@ -1243,17 +1243,17 @@
         onkeydown={(e) => onStackKeydown(e, info)}
         class="h-7 pl-2.5 pr-1 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
       >
-        <Layers size={11} class="shrink-0 {current.error ? 'text-rose-400' : 'text-accent'}" />
+        <Layers size={11} class="shrink-0 {current.error ? 'text-danger' : 'text-accent'}" />
         <span class="whitespace-nowrap font-medium">{info.label}</span>
         {#if member.primary}
           {#if current.currentBranch}
-            <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{current.currentBranch}</span>
+            <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden sm:inline">{current.currentBranch}</span>
           {/if}
         {:else}
-          <span class="whitespace-nowrap text-[10px] font-mono opacity-80 max-w-40 truncate" data-stack-current>{member.name}</span>
+          <span class="whitespace-nowrap text-micro font-mono opacity-80 max-w-40 truncate" data-stack-current>{member.name}</span>
         {/if}
         {#if info.conflictedCount > 0}
-          <span class="text-amber-400 shrink-0" title="{info.conflictedCount} conflicted files across {info.label}">{info.conflictedCount}</span>
+          <span class="text-warn shrink-0" title="{info.conflictedCount} conflicted files across {info.label}">{info.conflictedCount}</span>
         {/if}
         {#if info.terminalCount > 0}
           <span
@@ -1262,17 +1262,17 @@
           >
             <SquareTerminal size={10} aria-hidden="true" />
             {#if info.terminalCount > 1}
-              <span class="text-[9px] font-medium tabular-nums">{info.terminalCount}</span>
+              <span class="text-micro font-medium tabular-nums">{info.terminalCount}</span>
             {/if}
           </span>
         {/if}
       </button>
       {#if current.isDirty}
-        <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+        <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-warn/15 focus-visible:ring-1 focus-visible:ring-accent"
           tabindex="-1"
           title="Preview uncommitted changes in {member.name}" aria-label="Preview uncommitted changes in {member.name}"
           onclick={() => void repoStore.previewUncommitted(current.path)}>
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+          <span class="w-1.5 h-1.5 rounded-full bg-warn shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
         </button>
       {/if}
       <button
@@ -1285,12 +1285,12 @@
         aria-label={`Switch checkout of ${info.label} (${info.tabCount} open)`}
         title={`${info.tabCount} checkouts of ${info.label} — switch, show as tabs, or close`}
         onclick={(e) => openStackMenu(e, info)}
-        class="mr-1 h-5 pl-1.5 pr-1 flex items-center gap-0.5 rounded-full border border-border/60 bg-background/60 text-[10px] font-mono tabular-nums hover:border-accent/50 hover:text-accent {switcherOpen ? 'border-accent/60 text-accent' : ''}"
+        class="mr-1 h-5 pl-1.5 pr-1 flex items-center gap-0.5 rounded-full border border-edge bg-background/60 text-micro font-mono tabular-nums hover:border-accent/35 hover:text-accent {switcherOpen ? 'border-accent/65 text-accent' : ''}"
       >
         <span>{info.tabCount}</span>
         {#if info.isDirty && !current.isDirty}
           <!-- Another checkout has changes: say so without naming which until asked. -->
-          <span class="w-1 h-1 rounded-full bg-amber-400" aria-hidden="true"></span>
+          <span class="w-1 h-1 rounded-full bg-warn" aria-hidden="true"></span>
         {/if}
         <ChevronDown size={10} class="shrink-0" />
       </button>
@@ -1298,7 +1298,7 @@
   </div>
 {/snippet}
 
-  <div class="gp-glass gp-repo-tabs relative z-20 h-11 bg-surface border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
+  <div style:z-index={LAYERS.SCROLL_CUE} class="gp-glass gp-repo-tabs relative h-11 bg-surface gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button
@@ -1318,7 +1318,7 @@
         class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
         aria-pressed={agentsOpen}
         onclick={() => interfaceStore.setAgentsOpen(true)}
-        title="Agents — checkouts on disk, processes this window started, and attempts that need you. A checkout is not a running process."
+        title="Agents — checkouts on disk, processes this window started, and runs that need you. A checkout is not a running process."
       >
         <Bot size={12} />
         <span>Agents</span>
@@ -1329,7 +1329,7 @@
       {#if agentsOpen}
         <button
           type="button"
-          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
+          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-danger"
           data-testid="agents-tab-close"
           aria-label="Close Agents"
           title="Close Agents"
@@ -1357,7 +1357,7 @@
       {#if tasksOpen}
         <button
           type="button"
-          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
+          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-danger"
           data-testid="tasks-tab-close"
           aria-label="Close Tasks"
           title="Close Tasks"
@@ -1461,7 +1461,7 @@
             </button>
             <div class="gp-separator shrink-0" aria-hidden="true"></div>
           {/if}
-          <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0">
+          <div class="px-2 pt-1 pb-1.5 gp-label shrink-0">
             Recent repositories
           </div>
           {#if $repoStore.recentRepos.length === 0}
@@ -1480,7 +1480,7 @@
                     class="flex-1 min-w-0 px-2 py-1.5 text-left hover:bg-surfaceHover rounded-lg transition-colors"
                   >
                     <div class="truncate text-textPrimary">{displayName(path)}</div>
-                    <div class="truncate text-[10px] text-textMuted font-mono">{path}</div>
+                    <div class="truncate text-micro text-textMuted font-mono">{path}</div>
                   </button>
                   <button
                     type="button"
@@ -1488,7 +1488,7 @@
                     aria-label={`Remove ${displayName(path)} from recent repositories`}
                     title="Remove from recents"
                     onclick={() => repoStore.removeRecent(path)}
-                    class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover shrink-0"
+                    class="p-1 rounded-full text-textMuted hover:text-danger hover:bg-surfaceHover shrink-0"
                   >
                     <X size={11} />
                   </button>
@@ -1497,7 +1497,7 @@
             </div>
           {/if}
           {#if unusedRecents.length === 0 && $repoStore.recentRepos.length > 0}
-            <div class="px-3 py-1.5 text-[10px] text-textMuted shrink-0 border-t border-border/40">All recents are already open</div>
+            <div class="px-3 py-1.5 text-micro text-textMuted shrink-0">All recents are already open</div>
           {/if}
         </div>
       {/if}
@@ -1517,9 +1517,9 @@
   onPick: (color: TabColor | null) => void,
 )}
   <div class="px-2 py-1.5" role="group" aria-label={label}>
-    <div class="text-[10px] uppercase tracking-wider text-textMuted font-medium">{label}</div>
+    <div class="gp-label">{label}</div>
     {#if detail}
-      <div class="pt-0.5 text-[10px] text-textMuted">{detail}</div>
+      <div class="pt-0.5 text-micro text-textMuted">{detail}</div>
     {/if}
     <div class="flex items-center gap-1 pt-1">
       <button
@@ -1540,7 +1540,7 @@
           aria-label={current === color ? `${TAB_COLOR_LABEL[color]}, selected` : TAB_COLOR_LABEL[color]}
           data-color-choice={color}
           title={TAB_COLOR_LABEL[color]}
-          class="size-4 rounded-full border border-black/15 {current === color ? 'ring-2 ring-textPrimary' : ''}"
+          class="size-4 rounded-full border border-edgeSoft {current === color ? 'ring-2 ring-textPrimary' : ''}"
           style:background-color={TAB_COLOR_INK[color]}
           onclick={() => onPick(color)}
         ></button>
@@ -1563,7 +1563,7 @@
       aria-label={`Repository actions for ${tab.label}`}
       tabindex="-1"
       onkeydown={handlePopupKeydown}
-      class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
+      class="fixed min-w-44 gp-menu gp-pop text-meta text-textPrimary"
       style="z-index: {LAYERS.MENU}"
     >
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
@@ -1768,7 +1768,7 @@
         </button>
       {/if}
       {#if tab.group}
-        <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => {
+        <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => {
           const g = tab.group!;
           const count = groupHeadersByName.get(g)?.tabCount ?? 1;
           closeMenu();
@@ -1806,10 +1806,10 @@
       aria-label={`Group actions for ${groupHeader.label}`}
       tabindex="-1"
       onkeydown={handlePopupKeydown}
-      class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
+      class="fixed min-w-44 gp-menu gp-pop text-meta text-textPrimary"
       style="z-index: {LAYERS.MENU}"
     >
-      <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0 font-medium">
+      <div class="px-2 pt-1 pb-1.5 gp-label shrink-0">
         Group: {groupHeader.label} ({groupHeader.tabCount})
       </div>
       {@render colorChoices(
@@ -1959,7 +1959,7 @@
       {#if tabLayout.groups.length > 1}
         <button
           role="menuitem"
-          class="gp-menu-item text-rose-400 hover:text-rose-300"
+          class="gp-menu-item text-danger hover:text-danger"
           onclick={() => void confirmCloseOtherGroups(groupHeader.group)}
         >
           Close other groups…
@@ -1967,7 +1967,7 @@
       {/if}
       <button
         role="menuitem"
-        class="gp-menu-item text-rose-400 hover:text-rose-300"
+        class="gp-menu-item text-danger hover:text-danger"
         onclick={() => {
           const g = groupHeader.group;
           const count = groupHeader.tabCount;
@@ -1995,10 +1995,10 @@
       aria-label={`Checkouts of ${info.label}`}
       tabindex="-1"
       onkeydown={handlePopupKeydown}
-      class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu gp-pop text-[11px] text-textPrimary flex flex-col"
+      class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu gp-pop text-meta text-textPrimary flex flex-col"
       style="z-index: {LAYERS.MENU}"
     >
-      <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0 font-medium truncate" title={info.root}>
+      <div class="px-2 pt-1 pb-1.5 gp-label shrink-0 truncate" title={info.root}>
         {info.label} · {info.tabCount} checkouts
       </div>
       <div class="overflow-y-auto overscroll-contain min-h-0 max-h-[min(22rem,calc(100vh-10rem))] space-y-0.5">
@@ -2021,23 +2021,23 @@
               <div class="flex items-center gap-1.5 min-w-0">
                 <span class="truncate font-medium">{name.primary ? `${name.name} (primary)` : name.name}</span>
                 {#if name.agent}
-                  <span class="gp-pill !px-1.5 !py-0 shrink-0 text-[9px]" title="Worktree created by {name.agent}">{name.agent}</span>
+                  <span class="gp-pill !px-1.5 !py-0 shrink-0 text-micro" title="Worktree created by {name.agent}">{name.agent}</span>
                 {/if}
                 {#if tab.isDirty}
-                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" title="Uncommitted changes"></span>
+                  <span class="w-1.5 h-1.5 rounded-full bg-warn shrink-0" title="Uncommitted changes"></span>
                   <span class="sr-only">uncommitted changes</span>
                 {/if}
                 {#if tab.conflictedCount > 0}
-                  <span class="text-amber-400 shrink-0 font-mono" title="{tab.conflictedCount} conflicted files">{tab.conflictedCount}</span>
+                  <span class="text-warn shrink-0 font-mono" title="{tab.conflictedCount} conflicted files">{tab.conflictedCount}</span>
                 {/if}
                 {#if terminalCounts.get(tab.path)}
                   <span class="shrink-0 inline-flex items-center gap-0.5 text-accent" title="{terminalCounts.get(tab.path)} terminal sessions running">
                     <SquareTerminal size={10} aria-hidden="true" />
-                    <span class="text-[9px] tabular-nums">{terminalCounts.get(tab.path)}</span>
+                    <span class="text-micro tabular-nums">{terminalCounts.get(tab.path)}</span>
                   </span>
                 {/if}
               </div>
-              <div class="truncate text-[10px] text-textMuted font-mono">
+              <div class="truncate text-micro text-textMuted font-mono">
                 {tab.currentBranch ?? (tab.error ? "unavailable" : tab.isLoading ? "loading…" : "detached")}
               </div>
             </button>
@@ -2046,7 +2046,7 @@
               role="menuitem"
               aria-label={`Close ${name.name}`}
               title="Close this tab (the worktree stays on disk)"
-              class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover shrink-0"
+              class="p-1 rounded-full text-textMuted hover:text-danger hover:bg-surfaceHover shrink-0"
               onclick={() => {
                 const id = tab.id;
                 // The focused row goes with the tab; put focus back in the
@@ -2076,11 +2076,11 @@
         {info.isExpanded ? "Fold into one tab" : "Show each checkout as a tab"}
       </button>
       {#if info.tabCount > 1}
-        <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => { const target = info; void confirmCloseCheckouts(target, target.current.id); }}>
-          Close other checkouts…
+        <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => { const target = info; void confirmCloseCheckouts(target, target.current.id); }}>
+          Close other worktrees…
         </button>
       {/if}
-      <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => { const target = info; void confirmCloseCheckouts(target, null); }}>
+      <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => { const target = info; void confirmCloseCheckouts(target, null); }}>
         Close all {info.tabCount} checkouts…
       </button>
       {#if info.group}
@@ -2156,7 +2156,7 @@
     aria-label="Repository tab strip actions"
     tabindex="-1"
     onkeydown={handlePopupKeydown}
-    class="fixed min-w-48 gp-menu gp-pop text-[11px] text-textPrimary"
+    class="fixed min-w-48 gp-menu gp-pop text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
     <button role="menuitem" class="gp-menu-item" onclick={() => { onOpen?.(); closeStripMenu(); }}>
@@ -2214,7 +2214,7 @@
     {/if}
     {#if $repoStore.openTabs.length > 0}
       <span class="gp-menu-sep" aria-hidden="true"></span>
-      <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => void confirmCloseAllTabs()}>
+      <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => void confirmCloseAllTabs()}>
         Close all repositories…
       </button>
     {/if}

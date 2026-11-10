@@ -321,7 +321,7 @@
 </script>
 
 <div class="h-full flex flex-col min-h-0" data-browser-session={tabId}>
-  <form class="shrink-0 flex items-center gap-1 px-2 h-8 border-b border-border/60 bg-surface/40" onsubmit={submit}>
+  <form class="shrink-0 flex items-center gap-1 px-2 h-8 bg-surface/40" onsubmit={submit}>
     <button type="button" class="gp-icon-btn" aria-label="Back" title="Back" disabled={!opened} onclick={() => step("back")}><ArrowLeft size={13} /></button>
     <button type="button" class="gp-icon-btn" aria-label="Forward" title="Forward" disabled={!opened} onclick={() => step("forward")}><ArrowRight size={13} /></button>
     <button type="button" class="gp-icon-btn" aria-label="Reload" title="Reload" disabled={!opened} onclick={() => step("reload")}>
@@ -335,16 +335,16 @@
       spellcheck="false"
       autocomplete="off"
       maxlength="2048"
-      class="flex-1 min-w-0 bg-background border border-border rounded px-2 py-0.5 text-[11px] font-mono"
+      class="flex-1 min-w-0 bg-background border border-border rounded px-2 py-0.5 text-meta font-mono"
       onfocus={() => (editing = true)}
       onblur={() => (editing = false)}
       onkeydown={onAddressKey}
     />
-    <button type="submit" class="gp-btn py-0! text-[11px]!">{opened ? "Go" : "Open"}</button>
+    <button type="submit" class="gp-btn py-0! text-meta!">{opened ? "Go" : "Open"}</button>
     <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
   {#if error}
-    <div class="shrink-0 px-3 py-1 border-b border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-start gap-1.5" role="alert" data-testid="browser-session-error">
+    <div class="shrink-0 px-3 py-1 bg-danger/10 text-danger text-meta flex items-start gap-1.5" role="alert" data-testid="browser-session-error">
       <AlertCircle size={12} class="shrink-0 mt-0.5" />
       <span class="flex-1" style="overflow-wrap:anywhere">{error}</span>
       <button type="button" class="text-xs hover:text-white" aria-label="Dismiss" onclick={() => (error = null)}>✕</button>
@@ -355,10 +355,10 @@
       <div class="h-full flex flex-col items-center justify-center gap-2 p-4 text-center text-textMuted text-xs">
         <Globe size={18} />
         <span>Open a local development server, like <code>localhost:3000</code> or just <code>5173</code>.</span>
-        <span class="text-[10px] max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
+        <span class="text-micro max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
       </div>
     {:else if onscreen && occluded}
-      <div class="h-full flex items-center justify-center text-[11px] text-textMuted" data-testid="browser-session-covered">
+      <div class="h-full flex items-center justify-center text-meta text-textMuted" data-testid="browser-session-covered">
         The page is hidden while a menu or dialog is open.
       </div>
     {/if}

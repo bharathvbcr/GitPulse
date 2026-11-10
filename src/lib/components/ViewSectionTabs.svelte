@@ -122,7 +122,7 @@
         data-section={section.id}
         data-tip-guide={guideKey}
         onclick={() => repoStore.setViewSection(view, section.id)}
-        class="gp-seg-btn gp-section-tab relative inline-flex h-[26px] items-center gap-1 text-[11px]! py-0! {isActive ? 'px-2!' : 'px-1.5!'}"
+        class="gp-seg-btn gp-section-tab relative inline-flex h-[26px] items-center gap-1 text-meta! py-0! {isActive ? 'px-2!' : 'px-1.5!'}"
       >
         {#if macos && isActive}
           <span
@@ -140,7 +140,7 @@
           <!-- A <b>, not a <span>: the Mac liquid tabs make every span in a
                tab position:relative, which would pull the badge into the row. -->
           <b
-            class="gp-attention-badge {flag.tone === 'rose' ? 'bg-rose-500' : 'bg-amber-500'} {flag.count === null ? 'gp-attention-dot' : ''}"
+            class="gp-attention-badge {flag.tone === 'rose' ? 'bg-danger' : 'bg-warn'} {flag.count === null ? 'gp-attention-dot' : ''}"
             aria-hidden="true">{flag.count ?? ""}</b
           >
         {/if}

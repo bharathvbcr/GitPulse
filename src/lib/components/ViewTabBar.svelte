@@ -83,7 +83,7 @@
   function tabClass(item: ViewNavItem, active: boolean): string {
     const warning = item.id === "work" && conflictedCount > 0;
     if (active && warning) {
-      return "text-amber-400!";
+      return "text-warn!";
     }
     return "";
   }
@@ -283,7 +283,7 @@
           <span>{formatViewTabLabel(item, conflictedCount)}</span>
           {#if flag}
             <b
-              class="gp-attention-badge {flag.tone === 'rose' ? 'bg-rose-500' : 'bg-amber-500'} {flag.count === null ? 'gp-attention-dot' : ''}"
+              class="gp-attention-badge {flag.tone === 'rose' ? 'bg-danger' : 'bg-warn'} {flag.count === null ? 'gp-attention-dot' : ''}"
               aria-hidden="true">{flag.count ?? ""}</b
             >
           {/if}
@@ -298,7 +298,7 @@
         {/if}
       </div>
       {#if item.id === "history" && $repoStore.statuses.length > 0}
-        <button type="button" class="px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-600 dark:text-amber-300 font-semibold hover:bg-amber-500/30"
+        <button type="button" class="px-1.5 py-0.5 rounded-full text-micro font-mono bg-warn/20 text-warn font-semibold hover:bg-warn/30"
           title="Preview uncommitted files and modifications" aria-label="Preview {$repoStore.statuses.length} uncommitted changes"
           onclick={() => void repoStore.previewUncommitted()}>{$repoStore.statuses.length}</button>
       {/if}
@@ -331,7 +331,7 @@
       <Icon size={14} class="shrink-0 text-accent" aria-hidden="true" />
       <span class="min-w-0">
         <span class="block font-semibold">{item?.label ?? view}</span>
-        {#if guide}<span class="block text-[11px] leading-snug text-textMuted whitespace-normal">{guide.summary}</span>{/if}
+        {#if guide}<span class="block text-meta leading-snug text-textMuted whitespace-normal">{guide.summary}</span>{/if}
       </span>
     </button>
     <div class="gp-separator my-1" aria-hidden="true"></div>
@@ -348,7 +348,7 @@
         <SectionIcon size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
         <span class="flex-1 min-w-0 truncate">{section.label}</span>
         {#if flag}
-          <span class="shrink-0 rounded-full px-1.5 text-[10px] font-semibold text-white {flag.tone === 'rose' ? 'bg-rose-500' : 'bg-amber-500'}" title={flag.reason}
+          <span class="shrink-0 rounded-full px-1.5 text-micro font-semibold text-white {flag.tone === 'rose' ? 'bg-danger' : 'bg-warn'}" title={flag.reason}
             >{flag.count ?? "!"}</span
           >
         {/if}

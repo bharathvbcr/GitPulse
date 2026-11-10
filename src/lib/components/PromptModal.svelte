@@ -83,7 +83,7 @@
       in:scale={cardScale()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between">
+      <div class="p-4 gp-section-edge flex items-center justify-between">
         <span class="text-sm font-semibold text-textPrimary">{options.title}</span>
       </div>
 
@@ -106,7 +106,7 @@
             }}
           />
           {#if problem}
-            <p role="alert" class="text-rose-400 leading-relaxed wrap-break-word">{problem}</p>
+            <p role="alert" class="text-danger leading-relaxed wrap-break-word">{problem}</p>
           {/if}
         {/if}
 

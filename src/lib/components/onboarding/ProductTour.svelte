@@ -158,7 +158,7 @@
           {#if $tour.error}<button class="gp-btn" onclick={() => tour.closeForSession()}>Close without saving</button>{/if}
         </div>
       {/if}
-      <footer class="flex items-center justify-between gap-3 pt-3 border-t border-border">
+      <footer class="flex items-center justify-between gap-3 pt-3 border-border">
         <button class="gp-btn" onclick={() => tour.dismiss()}>Later</button>
         <div class="flex gap-2">
           <button class="gp-btn" disabled={$tour.step === 0} onclick={() => move(false)}>Back</button>
@@ -171,7 +171,7 @@
 {/if}
 
 <style>
-  .tour-modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: #0006; }
+  .tour-modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: color-mix(in srgb, black 40%, transparent); }
   .tour-live { position: fixed; inset: 0; pointer-events: none; }
   .tour-card { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; pointer-events: auto; }
   .tour-coach { position: absolute; width: min(380px, calc(100vw - 32px)); padding: 20px; }
@@ -179,6 +179,6 @@
   .tour-success { display: flex; align-items: flex-start; gap: 8px; color: var(--color-textPrimary); }
   .tour-success :global(svg) { flex-shrink: 0; margin-top: 3px; color: var(--color-accent); }
   .tour-focus { font-size: 12px; color: var(--color-accent); text-decoration: underline; text-underline-offset: 3px; }
-  @media (prefers-reduced-motion: no-preference) { .tour-card { animation: tour-enter 150ms ease-out; } }
+  @media (prefers-reduced-motion: no-preference) { .tour-card { animation: tour-enter var(--gp-dur-fast) var(--gp-ease-effect); } }
   @keyframes tour-enter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 </style>

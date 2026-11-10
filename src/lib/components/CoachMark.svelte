@@ -2,6 +2,8 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { Sparkles, X } from "@lucide/svelte";
   import { fade, scale } from "svelte/transition";
+  import { LAYERS } from "../ui/layers";
+  import { backdropFadeOut, cardScale } from "../ui/transitions";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
 
@@ -35,9 +37,10 @@
 
 {#if !isSeen}
   <div
-    class="gp-pop gp-card rounded-2xl p-3 border border-accent/40 bg-surface shadow-float max-w-xs z-30 select-none {extraClass}"
-    in:scale={{ start: 0.95, duration: 180 }}
-    out:fade={{ duration: 120 }}
+    class="gp-pop gp-card fixed rounded-2xl p-3 border border-accent/35 bg-surface shadow-float max-w-xs select-none {extraClass}"
+    style="z-index: {LAYERS.TOUR}"
+    in:scale={cardScale()}
+    out:fade={backdropFadeOut()}
     role="tooltip"
     aria-label={title}
   >
@@ -48,7 +51,7 @@
 
       <div class="flex-1 min-w-0">
         <div class="flex items-center justify-between gap-1 mb-1">
-          <h4 class="text-xs font-bold text-textPrimary leading-tight">{title}</h4>
+          <h4 class="text-xs font-semibold text-textPrimary leading-tight">{title}</h4>
           <button
             type="button"
             onclick={dismiss}
@@ -59,13 +62,13 @@
           </button>
         </div>
 
-        <p class="text-[11px] text-textMuted leading-relaxed">
+        <p class="text-meta text-textMuted leading-relaxed">
           {shownDescription}
         </p>
 
         <div class="mt-2.5 flex items-center justify-between gap-2">
           {#if shortcut}
-            <kbd class="gp-keycap text-[10px]">{shownShortcut}</kbd>
+            <kbd class="gp-keycap text-micro">{shownShortcut}</kbd>
           {:else}
             <span></span>
           {/if}
@@ -73,7 +76,7 @@
           <button
             type="button"
             onclick={dismiss}
-            class="gp-btn-primary py-0.5! px-2.5! text-[10px]! font-semibold!"
+            class="gp-btn-primary py-0.5! px-2.5! text-micro! font-semibold!"
           >
             Got it
           </button>

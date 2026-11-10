@@ -63,7 +63,7 @@ describe("Sidebar resize shell", () => {
     expect(source).not.toContain("w-80 ");
     expect(source).toMatch(/style="width:\{\$layoutStore/);
     // No width transition mid-drag; smooth otherwise.
-    expect(source).toContain("transition-[width] duration-150");
+    expect(source).toContain("transition-[width] duration-(--gp-dur-fast)");
     expect(source).toContain("if (!dragging) return;");
   });
 
@@ -88,9 +88,9 @@ describe("Sidebar collapse toggle", () => {
     expect(source).toContain("SIDEBAR_COLLAPSED_WIDTH");
   });
 
-  it("shows the dirty-file badge with amber emphasis on the collapsed rail", () => {
+  it("shows the dirty-file badge with warn emphasis on the collapsed rail", () => {
     expect(source).toContain("{dirtyCount}");
-    expect(source).toMatch(/dirtyCount > 0\s*\?\s*'bg-amber-500\/15 text-amber-400/);
+    expect(source).toMatch(/dirtyCount > 0\s*\?\s*'bg-warn\/15 text-warn/);
   });
 });
 
@@ -107,9 +107,9 @@ describe("Sidebar repo pulse strip", () => {
     expect(source).toContain("{#if aheadCount > 0}");
     expect(source).toContain("{#if behindCount > 0}");
     expect(source).toContain("{#if currentBranchInfo?.is_default}");
-    // Chip styling matches BranchList's emerald-up / amber-down pills.
-    expect(source).toContain("bg-emerald-500/15 text-emerald-400 border border-emerald-500/25");
-    expect(source).toContain("bg-amber-500/15 text-amber-400 border border-amber-500/25");
+    // Chip styling matches BranchList's ok-up / warn-down pills.
+    expect(source).toContain("bg-ok/15 text-ok border border-ok/35");
+    expect(source).toContain("bg-warn/15 text-warn border border-warn/35");
   });
 
   it("summarizes the working tree with additions, deletions, conflicts, or clean state", () => {
@@ -165,10 +165,10 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("limit + FILE_LIST_STEP");
   });
 
-  it("styles conflicted paths amber-bold in both lists via one helper", () => {
+  it("styles conflicted paths warn-semibold in both lists via one helper", () => {
     const uses = source.match(/pathClass\(f\.is_conflicted\)/g) ?? [];
     expect(uses.length).toBe(2);
-    expect(source).toContain('return conflicted ? "text-amber-400 font-bold" : "text-textPrimary";');
+    expect(source).toContain('return conflicted ? "text-warn font-semibold" : "text-textPrimary";');
   });
 
   it("no longer nests interactive buttons inside a role=button row", () => {
