@@ -1,8 +1,8 @@
 //! The Dev Map preview: a self-contained `.devcouncil/map.html`.
 //!
 //! Reads the `repo_map.json` this crate's [`crate::manifest`] writes and
-//! renders one offline page — no network, no CDN, the force-graph bundle
-//! inlined. It supersedes the Python renderer that used to live at
+//! renders one offline page — no network, no CDN, the shared code-map page
+//! script inlined (see [`crate::page`]). It supersedes the Python renderer that used to live at
 //! `src/devcouncil/indexing/map_viz.py`, and the stub
 //! `render_subsystem_map_html` it replaced in [`crate::artifacts`].
 //!
@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::artifacts::{write_atomic, ArtifactFingerprint};
-use crate::escape::{html_escape, json_script_escape};
 use crate::linguist::{palette, LINGUIST_VERSION, NEUTRAL_COLOR};
 
 /// Liveness lists run to tens of thousands; the page shows a sample and says so.
@@ -38,15 +37,6 @@ const REPO_LANG_CAP: usize = 32;
 /// Unplaceable handoff texts listed in the payload, across every subsystem.
 /// The total and the per-subsystem counts are never capped.
 const UNRESOLVED_HANDOFF_CAP: usize = 100;
-
-/// The vendored force-graph build, inlined so the page works offline.
-///
-/// Read from this crate's own asset tree so `devmap-query` can be vendored or
-/// published without preserving DevCouncil's Python-package layout. The graph
-/// visualizer uses this same copy; one crate owns the renderer bytes.
-const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");
-
-const MAP_HTML_TEMPLATE: &str = include_str!("map_preview.html");
 
 fn as_str(value: &Value, key: &str) -> String {
     value
@@ -599,18 +589,13 @@ fn marker_or_evidence(repo_map: &Value, marker: &str, has_evidence: fn(&Value) -
 /// Render the self-contained preview page for a `repo_map.json` document.
 pub fn render_map_preview_html(repo_map: &Value, fingerprint: &ArtifactFingerprint) -> String {
     let payload = build_preview_payload(repo_map);
-    let raw = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-    // Escaped for a raw-text `<script>`: HTML entities are not decoded there,
-    // so `html_escape` would produce invalid JSON. `\uXXXX` keeps the HTML
-    // parser and `JSON.parse` on the same representation.
-    let safe_json = json_script_escape(&raw);
-
-    // `__DATA_JSON__` is substituted last. `str::replace` does not rescan what
-    // it inserts, so map content can never be mistaken for a later placeholder.
-    MAP_HTML_TEMPLATE
-        .replace("__FINGERPRINT__", &html_escape(&fingerprint.fingerprint))
-        .replace("__VENDOR_JS__", FORCE_GRAPH_JS)
-        .replace("__DATA_JSON__", &safe_json)
+    // The same shell the code graph uses; this page differs only in its
+    // payload, which the page script tells apart by its `subsystems` list.
+    crate::page::render_shell(
+        "DevCouncil Repo Map",
+        Some(&format!("fingerprint:{}", fingerprint.fingerprint)),
+        &payload,
+    )
 }
 
 /// Derive the artifact fingerprint from the map's own freshness stamps.
@@ -837,9 +822,19 @@ mod tests {
     /// total no producer emitted, so a capped list read as the whole set.
     #[test]
     fn every_key_the_page_reads_is_one_the_payload_carries() {
+        // Retargeted from the old inline script to the TypeScript that reads the
+        // payload now. The repo-map page reaches it only through the named
+        // `DATA` and `META` roots (`readPreview`), which is what the scan sees.
+        let page = [
+            include_str!("../assets/code-map/src/page/previewModel.ts"),
+            include_str!("../assets/code-map/src/page/repoMapPage.ts"),
+            include_str!("../assets/code-map/src/page/navigator.ts"),
+        ]
+        .join("\n");
+        assert!(page.contains("META."), "the scan has something to scan");
         let payload = build_preview_payload(&map_with_unplaceable_handoffs(3));
         let missing = crate::viz::page_reads_missing_from(
-            MAP_HTML_TEMPLATE,
+            &page,
             &[("DATA", &payload), ("META", &payload["meta"])],
         );
         assert!(missing.is_empty(), "the page reads {missing:?}");
@@ -916,16 +911,7 @@ mod tests {
         assert!(!html.contains("</script><script>"));
         assert!(html.contains("\\u003c"));
         // The payload still round-trips: escaping must not corrupt the JSON.
-        let blob = html
-            .split("const DATA = ")
-            .nth(1)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .strip_suffix(';')
-            .unwrap();
-        let parsed: Value = serde_json::from_str(blob).unwrap();
+        let parsed = crate::page::embedded_payload(&html);
         assert_eq!(
             parsed["subsystems"][0]["summary"],
             "</script><script>alert(1)</script>"
@@ -954,16 +940,7 @@ mod tests {
             "the angle brackets are what must be escaped"
         );
         // It survives, escaped, in the payload — inert but not lost.
-        let blob = html
-            .split("const DATA = ")
-            .nth(1)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .strip_suffix(';')
-            .unwrap();
-        let parsed: Value = serde_json::from_str(blob).unwrap();
+        let parsed = crate::page::embedded_payload(&html);
         assert_eq!(parsed["subsystems"][0]["area"], hostile);
     }
 
@@ -971,16 +948,19 @@ mod tests {
     fn page_is_offline_and_self_contained() {
         let html = render_map_preview_html(&sample_map(), &fp());
         assert!(html.contains("DevCouncil Repo Map"));
-        assert!(html.contains("vasturiano/force-graph"), "vendor inlined");
+        // Rewritten from `contains("vasturiano/force-graph")`, which pinned the
+        // old vendored renderer: the shared code-map page is the marker now.
+        assert!(html.contains("devmap-code-map"), "shared renderer inlined");
+        assert!(!html.contains("force-graph"), "the old renderer is retired");
         assert!(!html.contains("cdn.jsdelivr"));
         assert!(!html.contains("unpkg.com"));
         assert!(!html.contains("src=\"http"));
         assert!(html.contains("graph/graph.html"));
         assert!(html.contains("fingerprint:fp-test"));
-        // No placeholder survives substitution.
-        assert!(!html.contains("__VENDOR_JS__"));
-        assert!(!html.contains("__DATA_JSON__"));
-        assert!(!html.contains("__FINGERPRINT__"));
+        // One payload element and one mount point: nothing is substituted
+        // twice, so no map content can be mistaken for either.
+        assert_eq!(html.matches("id=\"devmap-payload\"").count(), 1);
+        assert_eq!(html.matches("id=\"app\"").count(), 1);
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub(super) const AFFECTED_SYMBOL_SAMPLE: usize = 8;
 pub(super) const EXPLORE_DEFINITION_OVERHEAD_TOKENS: u32 = 40;
 
 /// The `file::symbol` identity every traversal surface resolves.
-pub(super) fn node_id_of(file_path: &str, symbol_name: &str) -> String {
+pub(crate) fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     if file_path.is_empty() {
         return symbol_name.to_string();
     }
@@ -309,15 +309,18 @@ pub(super) fn indexed_traversal_starts(
 /// list the candidates. Shared so the store-backed and in-memory engines, and
 /// every verb, cannot disagree about when a name is ambiguous.
 pub(super) fn refuse_ambiguous(target: &str, starts: &[(String, String)]) -> anyhow::Result<()> {
-    let candidates: BTreeSet<String> = starts
+    // Dedup by the id the candidates print, not by the raw (symbol, file)
+    // pair: a bare `foo` and an already-qualified `a.rs::foo` in the same file
+    // are one node, and listing it twice was a false refusal.
+    let unique: BTreeSet<String> = starts
         .iter()
         .map(|(symbol, file)| node_id_of(file, symbol))
         .collect();
-    if candidates.len() > 1 {
-        let list: Vec<String> = candidates.into_iter().collect();
+    if unique.len() > 1 {
+        let candidates: Vec<String> = unique.into_iter().collect();
         anyhow::bail!(
             "ambiguous symbol '{target}'; use an exact ID or file::symbol; candidates: {}",
-            list.join(", ")
+            candidates.join(", ")
         );
     }
     Ok(())
@@ -767,5 +770,28 @@ mod tests {
         let json = serde_json::to_value(layer).expect("layer serializes");
         assert!(json.get("direct").is_none());
         assert!(json.get("dispatch").is_none());
+    }
+
+    #[test]
+    fn refuse_ambiguous_dedups_by_node_id_not_by_raw_pair() {
+        use super::refuse_ambiguous;
+        // The same definition reached once bare and once already qualified is
+        // one node, not an ambiguity.
+        let same_node = vec![
+            ("foo".to_string(), "a.rs".to_string()),
+            ("a.rs::foo".to_string(), "a.rs".to_string()),
+        ];
+        assert!(refuse_ambiguous("foo", &same_node).is_ok());
+
+        // Two genuinely distinct ids are still refused, and the candidates
+        // name each id once.
+        let distinct = vec![
+            ("foo".to_string(), "a.rs".to_string()),
+            ("foo".to_string(), "b.rs".to_string()),
+        ];
+        let error = refuse_ambiguous("foo", &distinct)
+            .expect_err("two distinct ids must be refused")
+            .to_string();
+        assert!(error.contains("a.rs::foo, b.rs::foo"), "{error}");
     }
 }

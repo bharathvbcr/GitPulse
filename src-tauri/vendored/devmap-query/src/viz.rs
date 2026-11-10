@@ -1,4 +1,4 @@
-//! A self-contained HTML view of the graph. No network, no build step.
+//! A self-contained HTML view of the graph. No network.
 //!
 //! Ported from `src/devcouncil/indexing/viz.py`. The Python version read
 //! `code_graph.json` back off disk to render it; this one projects the same
@@ -7,17 +7,15 @@
 //!
 //! # The cap is the interesting part
 //!
-//! A force layout over 12,000 nodes is not a visualization, it is a hairball
-//! that pins a CPU. So the view is capped — and a capped view that does not say
+//! A layout over 12,000 nodes is not a visualization, it is a hairball. So the view is capped — and a capped view that does not say
 //! so is worse than no view, because the reader concludes the graph is small.
 //!
 //! Nodes are therefore ranked by degree and the *most connected* survive: a cap
 //! that keeps hubs shows the shape of the graph, while a cap that keeps whatever
 //! the store happened to return first shows an arbitrary sample of leaves. Both
-//! counts ride in the payload and both are printed in the page header, so
+//! counts ride in the payload and the page prints both in its header, so
 //! "1,000 of 12,103 nodes" is what the reader sees, never "1,000 nodes".
 
-use crate::escape::html_escape;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -63,19 +61,6 @@ pub(crate) fn is_documentation(node: &Value) -> bool {
             )
         )
 }
-
-/// The vendored renderer, embedded so the page works offline and from a file://
-/// URL. force-graph v1.51.4, MIT (<https://github.com/vasturiano/force-graph>).
-///
-/// The `.bundle` suffix keeps it out of the index, and is not cosmetic. As
-/// `force-graph.min.js` this file is `is_indexable_source` — `vendor/` and
-/// `.min.js` exempt a path from *liveness*, not from *extraction* — and 177 KB
-/// of single-line minified JavaScript exhausts the 5 s per-file parse budget.
-/// A budget exhausted mid-walk is a race: `mutation_fuzz` caught two extractions
-/// of identical bytes disagreeing, which is an R4 determinism violation. An
-/// extension the detector does not map to a language is the contained fix; see
-/// the note in the commit for the general one.
-const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");
 
 /// Edge kinds that mean one *file* depends on another.
 const FILE_EDGE_KINDS: &[&str] = &["imports"];
@@ -382,8 +367,9 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
         .collect();
 
     // Only edges whose *both* ends survived the cap. An edge to a node that is
-    // not drawn is a line into empty space, and force-graph would invent a
-    // phantom node for it — a node the graph does not contain.
+    // not drawn is a line into empty space, and a renderer that binds endpoints
+    // by id would invent a phantom node for it — a node the graph does not
+    // contain.
     let total_links = projected.len();
     // A node cap alone cannot bound a dense graph. Keep the strongest visible
     // relationships with a deterministic tie break and report the full total.
@@ -440,327 +426,37 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
     })
 }
 
-/// Escape a JSON payload for embedding in a `<script>` block.
-///
-/// `</script>` inside a string literal ends the block, whatever the JSON
-/// grammar thinks, so a symbol named `</script>` would otherwise close the tag
-/// and inject the rest of the graph into the document as markup. Escaping the
-/// three characters that can start such a sequence is the standard fix and
-/// leaves the value byte-identical after `JSON.parse`.
-fn embed_json(value: &Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
-}
-
 /// Render the code graph: one HTML file, no network.
 pub fn render_html(graph: &Value, options: &VizOptions) -> String {
     let mut payload = build_payload(graph, options);
-    let counts = payload.get("counts").cloned().unwrap_or(json!({}));
-    let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
-    let total = counts["nodes_total"].as_u64().unwrap_or(0);
-    let truncated = counts["nodes_truncated"].as_bool().unwrap_or(false);
+    let truncated = payload["counts"]["nodes_truncated"]
+        .as_bool()
+        .unwrap_or(false);
 
-    // The headline states the cap in the page itself, not only in the payload.
-    // A reader who never opens devtools must still be unable to mistake a
-    // capped view for the whole graph.
-    let subtitle = if truncated {
-        format!("{shown} of {total} nodes (most connected first; raise --max-nodes to widen)",)
-    } else {
-        format!("{total} nodes")
-    };
+    // The page states the cap itself, from `counts`: "1,000 of 12,103 nodes"
+    // and that the view is not the whole graph. A reader who never opens
+    // devtools must still be unable to mistake a capped view for the whole
+    // graph, so the one thing the page cannot derive from the counts is what
+    // to do about it, and that rides here.
     payload["view"] = json!({
         "title": options.title,
-        "subtitle": subtitle,
         "level": if options.symbols { "symbols" } else { "files" },
         "suffix": "code graph",
+        "cap_hint": if truncated {
+            "Nodes are ranked by connections, most connected first; raise --max-nodes to widen the view."
+        } else {
+            ""
+        },
         "detail_fields": [
             ["Path", "path"], ["Kind", "kind"], ["Area", "area"],
             ["Community", "community"], ["Language", "language"],
             ["Liveness", "liveness"], ["Why", "liveness_reason"],
         ],
         "flag_filters": [["dead", "Dead candidates only"]],
-        "legend": [
-            ["#3d8bfd", "reached"], ["#e35d6a", "dead candidate"],
-            ["#34d399", "entry point"], ["#f0ad4e", "unwired"],
-            // A colour of its own, because the alternative is to paint a
-            // README the same blue as reached code or leave it grey and
-            // unexplained. Every isolated config file is its own singleton
-            // community and draws as a lone dot; in a picture whose legend
-            // names "dead" and "unwired", an unlabelled dot is read as one of
-            // them.
-            ["#8b9bb4", "data — not a liveness candidate"],
-        ],
     });
-    render_page(&payload)
-}
-
-/// The page both views share.
-///
-/// One shell, driven by `payload.view`: the two graphs differ in what a node
-/// *is*, not in how the page works, and a second copy of this would be the
-/// thing that drifts.
-fn render_page(payload: &Value) -> String {
-    let view = payload.get("view").cloned().unwrap_or(json!({}));
-    let level = view["level"].as_str().unwrap_or("");
-    let title = html_escape(view["title"].as_str().unwrap_or("devmap"));
-    let subtitle = view["subtitle"].as_str().unwrap_or("").to_string();
-    let data = embed_json(payload);
-
-    format!(
-        r#"<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{title} — {suffix}</title>
-<style>
-:root {{
-  --bg:#0f1419; --panel:#161d27; --fg:#e7ecf3; --muted:#8b9bb4; --line:#243044;
-  --accent:#3d8bfd; --dead:#e35d6a; --entry:#34d399; --unwired:#f0ad4e;
-}}
-* {{ box-sizing:border-box; }}
-html,body {{ height:100%; }}
-body {{ margin:0; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif;
-  background:var(--bg); color:var(--fg); display:flex; overflow:hidden; }}
-#side {{ width:340px; flex:none; background:var(--panel); border-right:1px solid var(--line);
-  display:flex; flex-direction:column; }}
-#head {{ padding:14px 16px; border-bottom:1px solid var(--line); }}
-h1 {{ font-size:15px; margin:0 0 4px; font-weight:600; }}
-.sub {{ color:var(--muted); font-size:12px; }}
-#controls {{ padding:12px 16px; border-bottom:1px solid var(--line); }}
-input {{ width:100%; padding:7px 9px; background:#0d1218; color:var(--fg);
-  border:1px solid var(--line); border-radius:5px; font:inherit; }}
-/* The rule above is for the search box. A checkbox stretched to 100% pushes its
-   own label onto the next line and reads as a broken control. */
-input[type=checkbox] {{ width:auto; flex:none; margin:0; padding:0; }}
-label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:var(--muted);
-  font-size:12px; white-space:nowrap; cursor:pointer; }}
-#legend {{ padding:12px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); }}
-#legend span.key {{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }}
-#detail {{ padding:14px 16px; overflow:auto; flex:1; }}
-#detail h2 {{ font-size:13px; margin:0 0 8px; word-break:break-all; }}
-#detail dt {{ color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; margin-top:9px; }}
-#detail dd {{ margin:2px 0 0; word-break:break-all; }}
-#detail ul {{ margin:4px 0 0; padding-left:18px; }}
-.tag {{ display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; margin-right:5px; }}
-.tag.dead {{ background:rgba(227,93,106,.18); color:var(--dead); }}
-.tag.entry {{ background:rgba(52,211,153,.18); color:var(--entry); }}
-.tag.unwired {{ background:rgba(240,173,78,.18); color:var(--unwired); }}
-#graph {{ flex:1; position:relative; min-width:0; }}
-#empty {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-  color:var(--muted); text-align:center; padding:32px; pointer-events:none; }}
-/* An author `display` beats the UA sheet's `[hidden] {{ display:none }}`, so the
-   overlay has to opt out explicitly or it never hides. */
-#empty[hidden] {{ display:none; }}
-</style>
-
-<div id="side">
-  <div id="head">
-    <h1>{title}</h1>
-    <div class="sub">{subtitle} · {level}</div>
-  </div>
-  <div id="controls">
-    <input id="q" type="search" placeholder="Filter by name or path…" autocomplete="off"/>
-    <div id="flagFilters"></div>
-    <label class="row" title="Hide document and note nodes and their relationships"><input type="checkbox" id="hideNotes"/> Hide notes &amp; Markdown</label>
-    <label class="row"><input type="checkbox" id="labels" checked/> Show labels</label>
-    <div class="sub" id="filterCount" role="status"></div>
-  </div>
-  <div id="legend"></div>
-  <div id="detail"><span class="sub">Click a node for detail.</span></div>
-</div>
-<div id="graph"></div>
-
-<script>{force_graph}</script>
-<script>
-const DATA = JSON.parse({data_literal});
-const flagsOf = n => (n.flags || []).map(f => f.flag);
-// Precedence, not an ordering accident. A node can carry several flags and only
-// one colour; `entry` outranks `unwired` because nothing calling an entry point
-// is what an entry point *is*, and painting one as a defect is a false alarm an
-// operator acts on. Every flag still shows as a tag in the detail panel.
-// `not_applicable` sits below the three findings and above the default. Below,
-// because a data file that somehow carried a finding should still show the
-// finding rather than hide behind its category. Above the default, because
-// "reached" is a claim about code and a README is not code — painting it the
-// same blue as a live module is the quieter half of the same mistake as
-// painting it red.
-const colorFor = n => {{
-  const f = flagsOf(n);
-  if (f.includes('dead')) return '#e35d6a';
-  if (f.includes('entry')) return '#34d399';
-  if (f.includes('unwired')) return '#f0ad4e';
-  if (n.liveness === 'not_applicable') return '#8b9bb4';
-  return '#3d8bfd';
-}};
-
-const VIEW = DATA.view || {{}};
-function esc(s) {{
-  return String(s).replace(/[&<>"']/g, c =>
-    ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
-}}
-
-document.getElementById('legend').innerHTML = (VIEW.legend || [])
-  .map(([color, label]) =>
-    '<div><span class="key" style="background:' + esc(color) + '"></span>' + esc(label) + '</div>')
-  .join('');
-
-const el = document.getElementById('graph');
-if (!DATA.nodes.length) {{
-  el.innerHTML = '<div id="empty">This generation has no ' + DATA.level +
-    '-level nodes to draw.<br/>Build the index first, or switch level.</div>';
-}} else {{
-  // force-graph mutates link endpoints from ids into node objects, so every
-  // filter below rebuilds from a pristine copy rather than from live state.
-  const source = JSON.parse(JSON.stringify(DATA));
-  let showLabels = true;
-  const MAX_FILTER_ZOOM = 4;
-  const FILTER_FIT_DELAY_MS = 80;
-  let filterFitTimer;
-
-  const graph = ForceGraph()(el)
-    .backgroundColor('#0f1419')
-    .nodeId('id')
-    .nodeLabel(n => esc(n.name + '  ·  ' + n.path))
-    .nodeColor(colorFor)
-    .nodeRelSize(3)
-    .nodeVal(n => 1 + Math.min(n.degree || 0, VIEW.degree_cap || 40))
-    .linkColor(l => (VIEW.link_colors || {{}})[l.kind] || 'rgba(139,155,180,0.22)')
-    .linkLabel(l => l.label ? esc(l.label) : '')
-    .linkDirectionalArrowLength(2.5)
-    .linkDirectionalArrowRelPos(1)
-    .onNodeClick(showDetail)
-    .graphData(JSON.parse(JSON.stringify(source)));
-
-  graph.nodeCanvasObjectMode(() => showLabels ? 'after' : undefined)
-    .nodeCanvasObject((n, ctx, scale) => {{
-      if (scale < 1.4) return;
-      ctx.font = (11 / scale) + 'px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillStyle = '#e7ecf3';
-      ctx.textAlign = 'center';
-      ctx.fillText(n.name, n.x, n.y - 7 / scale);
-    }});
-
-  // A filter that matches nothing must say so. An empty canvas is also what a
-  // camera pointed at the wrong place looks like, and the two need different
-  // reactions from the reader.
-  const noMatch = document.createElement('div');
-  noMatch.id = 'empty';
-  noMatch.hidden = true;
-  noMatch.textContent = 'Nothing matches this filter.';
-  el.appendChild(noMatch);
-
-  const detail = document.getElementById('detail');
-  function showDetail(n) {{
-    const tags = flagsOf(n).map(f => '<span class="tag ' + f + '">' + f + '</span>').join('');
-    let html = '<h2>' + esc(n.name) + '</h2>' + tags + '<dl>';
-    for (const [label, key] of (VIEW.detail_fields || [])) {{
-      let v = n[key];
-      if (key === 'path' && n.line) v = v + ':' + n.line;
-      html += row(label, v);
-    }}
-    html += row('Degree', String(n.degree)) + '</dl>';
-    detail.innerHTML = html;
-  }}
-  const row = (k, v) => v ? '<dt>' + k + '</dt><dd>' + esc(String(v)) + '</dd>' : '';
-  function fitFiltered(nodes) {{
-    const placed = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
-    if (!placed.length) return;
-    let minX = placed[0].x;
-    let maxX = placed[0].x;
-    let minY = placed[0].y;
-    let maxY = placed[0].y;
-    for (const node of placed.slice(1)) {{
-      minX = Math.min(minX, node.x);
-      maxX = Math.max(maxX, node.x);
-      minY = Math.min(minY, node.y);
-      maxY = Math.max(maxY, node.y);
-    }}
-    // A singleton and coincident nodes have a zero-size world bounding box.
-    // Give that box a real extent before deriving camera scale, then cap the
-    // scale so filtering cannot turn one ordinary node into a full-pane disk.
-    const spanX = Math.max(maxX - minX, 1);
-    const spanY = Math.max(maxY - minY, 1);
-    const width = Math.max(el.clientWidth - 80, 1);
-    const height = Math.max(el.clientHeight - 80, 1);
-    const targetZoom = Math.max(0.05,
-      Math.min(width / spanX, height / spanY, MAX_FILTER_ZOOM));
-    graph.centerAt((minX + maxX) / 2, (minY + maxY) / 2, 250);
-    graph.zoom(targetZoom, 250);
-  }}
-  function apply() {{
-    clearTimeout(filterFitTimer);
-    filterFitTimer = undefined;
-    const term = document.getElementById('q').value.trim().toLowerCase();
-    const hideNotes = document.getElementById('hideNotes').checked;
-    const required = (VIEW.flag_filters || [])
-      .filter(([flag]) => {{
-        const box = document.getElementById('flag-' + flag);
-        return box && box.checked;
-      }})
-      .map(([flag]) => flag);
-    const keep = source.nodes.filter(n => {{
-      if (hideNotes && n.documentation === true) return false;
-      const f = flagsOf(n);
-      if (required.some(r => !f.includes(r))) return false;
-      if (!term) return true;
-      return n.name.toLowerCase().includes(term) || (n.path || '').toLowerCase().includes(term);
-    }});
-    const ids = new Set(keep.map(n => n.id));
-    noMatch.hidden = keep.length > 0;
-    document.getElementById('filterCount').textContent = keep.length + ' of ' + source.nodes.length + ' match filters';
-    detail.innerHTML = '<span class="sub">Click a node for detail.</span>';
-    graph.graphData({{
-      nodes: JSON.parse(JSON.stringify(keep)),
-      links: source.links
-        .filter(l => ids.has(l.source) && ids.has(l.target))
-        .map(l => Object.assign({{}}, l)),
-    }});
-    // The survivors are fresh copies with no coordinates, so let the
-    // simulation place them before deriving a bounded camera. Canceling the
-    // previous timer prevents a stale quick-typing result from moving the
-    // camera after a newer filter has already won.
-    if (keep.length) {{
-      filterFitTimer = setTimeout(() => {{
-        filterFitTimer = undefined;
-        fitFiltered(graph.graphData().nodes);
-      }}, FILTER_FIT_DELAY_MS);
-    }}
-  }}
-  document.getElementById('q').addEventListener('input', apply);
-  document.getElementById('hideNotes').addEventListener('change', apply);
-  for (const [flag, label] of (VIEW.flag_filters || [])) {{
-    // Built as nodes, not markup: the id is read back verbatim by
-    // getElementById below, so escaping it into an HTML string would either
-    // break the lookup or leave the attribute breakable.
-    const wrap = document.createElement('label');
-    wrap.className = 'row';
-    const box = document.createElement('input');
-    box.type = 'checkbox';
-    box.id = 'flag-' + flag;
-    wrap.appendChild(box);
-    wrap.appendChild(document.createTextNode(' ' + label));
-    document.getElementById('flagFilters').appendChild(wrap);
-    box.addEventListener('change', apply);
-  }}
-  document.getElementById('labels').addEventListener('change', e => {{
-    showLabels = e.target.checked;
-    graph.nodeCanvasObjectMode(() => showLabels ? 'after' : undefined);
-  }});
-
-  const fit = () => graph.width(el.clientWidth).height(el.clientHeight);
-  fit();
-  window.addEventListener('resize', fit);
-}}
-</script>
-"#,
-        title = title,
-        suffix = html_escape(view["suffix"].as_str().unwrap_or("code graph")),
-        subtitle = html_escape(&subtitle),
-        level = level,
-        force_graph = FORCE_GRAPH_JS,
-        data_literal = embed_json(&Value::String(data)),
-    )
+    // One shell, driven by `payload.view`: this view and the repo map differ in
+    // what a node *is*, not in how the page works.
+    crate::page::render_shell(&format!("{} — code graph", options.title), None, &payload)
 }
 
 /// What a page's script reads off its payload that the payload does not carry.
@@ -830,21 +526,26 @@ mod tests {
     /// retired subsystem view left a note reading `unresolved_handoffs_total`
     /// and a detail pane reading `subsystems` here, neither of which the code
     /// graph payload has ever carried.
+    ///
+    /// Retargeted from the old inline script to the TypeScript that now reads
+    /// the payload (`graphView.ts`, `codeGraphPage.ts`): both reach the payload
+    /// through the named `DATA` root, which is what this scan can see. The
+    /// payload checked is the one the page really embeds, `view` included.
     #[test]
     fn every_key_the_page_reads_is_one_the_payload_carries() {
+        let page = [
+            include_str!("../assets/code-map/src/page/graphView.ts"),
+            include_str!("../assets/code-map/src/page/codeGraphPage.ts"),
+        ]
+        .join("\n");
+        assert!(page.contains("DATA."), "the scan has something to scan");
         for symbols in [false, true] {
             let options = VizOptions {
                 symbols,
                 ..Default::default()
             };
-            let html = render_html(&graph(), &options);
-            let script = html
-                .split("const DATA = JSON.parse(")
-                .nth(1)
-                .expect("the page script");
-            let mut payload = build_payload(&graph(), &options);
-            payload["view"] = json!({});
-            let missing = page_reads_missing_from(script, &[("DATA", &payload)]);
+            let payload = crate::page::embedded_payload(&render_html(&graph(), &options));
+            let missing = page_reads_missing_from(&page, &[("DATA", &payload)]);
             assert!(missing.is_empty(), "the page reads {missing:?}");
         }
     }
@@ -921,6 +622,11 @@ mod tests {
         assert_eq!(payload["counts"]["nodes_total"], json!(3));
         assert_eq!(payload["counts"]["nodes_truncated"], json!(true));
 
+        // The page words the cap itself, client-side, from `counts` (bun test
+        // `truncationLegend` pins "2 of 3 nodes" and "not the whole graph"; the
+        // browser probe pins that the page prints it). What the Rust side owes
+        // the page is the numbers, the hint about what to do, and a page that
+        // carries the wording at all.
         let html = render_html(
             &graph(),
             &VizOptions {
@@ -928,9 +634,18 @@ mod tests {
                 ..Default::default()
             },
         );
+        let embedded = crate::page::embedded_payload(&html);
+        assert_eq!(embedded["counts"]["nodes_shown"], json!(2));
+        assert_eq!(embedded["counts"]["nodes_total"], json!(3));
         assert!(
-            html.contains("2 of 3 nodes"),
-            "the page itself must state the cap, not only the payload"
+            embedded["view"]["cap_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("--max-nodes")),
+            "a capped view says how to widen it"
+        );
+        assert!(
+            html.contains("This is not the whole graph"),
+            "the page itself must carry the cap wording, not only the payload"
         );
     }
 
@@ -938,7 +653,15 @@ mod tests {
     fn an_uncapped_view_does_not_claim_truncation() {
         let payload = build_payload(&graph(), &VizOptions::default());
         assert_eq!(payload["counts"]["nodes_truncated"], json!(false));
-        assert!(render_html(&graph(), &VizOptions::default()).contains("3 nodes"));
+        let embedded =
+            crate::page::embedded_payload(&render_html(&graph(), &VizOptions::default()));
+        assert_eq!(embedded["counts"]["nodes_total"], json!(3));
+        assert_eq!(embedded["counts"]["nodes_truncated"], json!(false));
+        assert_eq!(
+            embedded["view"]["cap_hint"],
+            json!(""),
+            "nothing was cut, so there is nothing to widen"
+        );
     }
 
     #[test]
@@ -957,7 +680,7 @@ mod tests {
 
     #[test]
     fn no_link_survives_whose_endpoint_was_cut() {
-        // force-graph invents a node for an unknown endpoint, which would draw
+        // A renderer that binds endpoints by id invents a node for an unknown one, which would draw
         // a node the graph does not contain.
         let payload = build_payload(
             &graph(),
@@ -1011,23 +734,38 @@ mod tests {
             "the payload escaped its script block"
         );
         assert!(html.contains("\\u003c/script"));
+        // Escaping must not corrupt the value: the page parses it back intact.
+        let embedded = crate::page::embedded_payload(&html);
+        assert!(embedded["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "</script><img src=x onerror=alert(1)>"));
     }
 
     #[test]
     fn an_empty_generation_renders_a_page_that_says_so() {
         // Rather than a blank canvas, which reads as a broken renderer.
         let html = render_html(&json!({"nodes": [], "edges": []}), &VizOptions::default());
-        assert!(html.contains("no ' + DATA.level +"));
-        assert!(html.contains("\"nodes_total\\\":0") || html.contains("nodes_total"));
+        let embedded = crate::page::embedded_payload(&html);
+        assert_eq!(embedded["counts"]["nodes_total"], json!(0));
+        assert!(
+            html.contains("No nodes to display"),
+            "the page words the empty state"
+        );
     }
 
     #[test]
     fn the_page_carries_its_renderer_and_needs_no_network() {
         let html = render_html(&graph(), &VizOptions::default());
+        // Rewritten from `contains("force-graph")`, which pinned the old
+        // vendored renderer: the marker is now the shared code-map renderer's
+        // own stamp, and the retired renderer must be gone.
         assert!(
-            html.contains("force-graph"),
-            "the renderer must be embedded"
+            html.contains("devmap-code-map"),
+            "the shared renderer must be embedded"
         );
+        assert!(!html.contains("force-graph"), "the old renderer is retired");
         assert!(
             !html.contains("src=\"http"),
             "the page must not fetch anything: {}",

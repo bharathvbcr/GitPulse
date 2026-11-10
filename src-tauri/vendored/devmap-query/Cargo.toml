@@ -15,6 +15,10 @@ name = "it"
 name = "artifact_writer_security"
 
 [[test]]
+name = "stacked_cstyle_family_split"
+required-features = ["parse"]
+
+[[test]]
 name = "a_cold_query_pays_for_its_answer_not_the_generation"
 required-features = ["parse"]
 

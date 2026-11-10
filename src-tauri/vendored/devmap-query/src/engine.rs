@@ -19,7 +19,7 @@ mod gaps;
 mod hits;
 mod in_memory;
 mod trace;
-mod traversal;
+pub(crate) mod traversal;
 mod verdict;
 mod workspace;
 
@@ -231,7 +231,7 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
     ) -> anyhow::Result<Option<(u32, std::sync::Arc<GenerationEdges>)>> {
         if let Some(stacked) = self.stacked {
-            stacked.generation_edges_with_id()
+            stacked.generation_edges_with_id(&self.cancel)
         } else {
             Ok(self.store.generation_edges_with_id()?)
         }
@@ -496,7 +496,7 @@ impl<'a> StoreQueryEngine<'a> {
             // a symbol. Anything else is a symbol query and goes through the same
             // resolution `impact` uses.
             let snapshot = if let Some(stacked) = self.stacked {
-                stacked.file_edges(&req.query, req.min_confidence)?
+                stacked.file_edges(&req.query, req.min_confidence, &self.cancel)?
             } else {
                 self.store.file_edges(&req.query, req.min_confidence)?
             };
@@ -2385,7 +2385,7 @@ impl<'a> StoreQueryEngine<'a> {
             let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
             self.cancel.check()?;
             let page = if let Some(stacked) = self.stacked {
-                stacked.dead_page(limit)?
+                stacked.dead_page(limit, &self.cancel)?
             } else {
                 self.store.dead_page(limit)?
             };
@@ -2408,6 +2408,12 @@ impl<'a> StoreQueryEngine<'a> {
             response.hidden = response.total.saturating_sub(response.shown);
             response.truncated = response.hidden > 0;
             response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            // A lane's list is the base's with the delta's resurrections
+            // removed; what the delta killed is not in it, so say so.
+            if let Some(reason) = self.stacked.and_then(|s| s.dead_lower_bound_reason()) {
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(reason));
+            }
             self.note_failed_parses(&mut response)?;
             // The other half of the answer, and until now the half nothing could
             // see. A one-hop inbound-edge join structurally cannot report a
@@ -2416,7 +2422,11 @@ impl<'a> StoreQueryEngine<'a> {
             // entire class of finding. `DeadClusterScan::clusters` is capped at
             // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
             // own; what the cap dropped travels beside it.
-            if let Some(scan) = page.dead_clusters {
+            let dropped = self.stacked.and_then(|s| s.dead_clusters_dropped_reason());
+            if let Some(reason) = dropped {
+                // The base's scan describes the base, not this lane.
+                response.dead_clusters_incomplete = Some(reason);
+            } else if let Some(scan) = page.dead_clusters {
                 if scan.refused_oversized_graph {
                     // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
                     // empty list here would say the walk ran and found nothing.
@@ -3839,7 +3849,7 @@ impl<'a> StoreQueryEngine<'a> {
             // generation the floored set is a subset of the unfiltered one, so the
             // subtraction cannot underflow at all.
             let page = if let Some(stacked) = self.stacked {
-                stacked.callers_page(&at_risk, path, min_confidence)?
+                stacked.callers_page(&at_risk, path, min_confidence, &self.cancel)?
             } else {
                 self.store.callers_page(&at_risk, path, min_confidence)?
             };

@@ -30,6 +30,7 @@ pub mod manifest;
 pub mod map_preview;
 pub mod model;
 pub mod overlay;
+mod page;
 pub mod query_match;
 pub mod rung;
 pub mod scope;
@@ -88,7 +89,7 @@ pub use stacked::{
     legacy_base_store_anchor_root, provision_stacked_worktree, publish_base_snapshot,
     refuse_legacy_base_store_ref, seed_derived_artifacts_and_reuse_caches, BaseKey, BaseManifest,
     FileRecord, GcBasesReport, StackLease, StackedStatus, StackedStore, StackedSyncReport,
-    DEFAULT_REBASE_DELTA_BYTES, DEFAULT_REBASE_DIRTY_FILES, STACK_FORMAT_VERSION,
+    SyncTarget, DEFAULT_REBASE_DELTA_BYTES, DEFAULT_REBASE_DIRTY_FILES, STACK_FORMAT_VERSION,
 };
 
 pub use cas::{blake3_hash, CasAstStore, CAS_TOMBSTONE};
