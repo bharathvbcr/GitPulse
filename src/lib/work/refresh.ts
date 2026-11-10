@@ -15,7 +15,7 @@ export interface WorkRefreshObserver {
 
 /** One running refresh plus the latest requested refresh, shared across remounts. */
 export function createWorkRefresh(deps = { load: loadWork, collisions: getCollisionRisk }) {
-  type Job = { repo: string; observer: WorkRefreshObserver; controller: AbortController };
+  type Job = { repo: string; observer: WorkRefreshObserver; controller: AbortController; force: boolean };
   let running: Job | null = null;
   let pending: Job | null = null;
 
@@ -27,7 +27,7 @@ export function createWorkRefresh(deps = { load: loadWork, collisions: getCollis
       running = job;
       let error: string | null = null;
       try {
-        const result = await withDeadline(() => deps.load(job.repo, { signal: job.controller.signal }), WORK_TIMEOUT_MS, { signal: job.controller.signal, message: WORK_DEADLINE_MESSAGE });
+        const result = await withDeadline(() => deps.load(job.repo, { signal: job.controller.signal, forceGitHub: job.force }), WORK_TIMEOUT_MS, { signal: job.controller.signal, message: WORK_DEADLINE_MESSAGE });
         if (!job.controller.signal.aborted) {
           job.observer.projection(result, Date.now());
           // Finish this scan even when status notifications queued another load.
@@ -52,10 +52,17 @@ export function createWorkRefresh(deps = { load: loadWork, collisions: getCollis
       pending?.controller.abort();
       pending = null;
     },
-    request(repo: string, observer: WorkRefreshObserver): () => void {
+    /**
+     * `force` is a refresh the person asked for: GitHub is read again even
+     * inside the shared read's freshness window. A mount, a return to the view
+     * or a status-driven reload may reuse a fresh read. A request that replaces
+     * a queued forced one for the same repository keeps the force.
+     */
+    request(repo: string, observer: WorkRefreshObserver, options: { force?: boolean } = {}): () => void {
+      const force = options.force === true || (pending?.force === true && pending.repo === repo);
       pending?.controller.abort();
       if (running && running.repo !== repo) running.controller.abort();
-      const job: Job = { repo, observer, controller: new AbortController() };
+      const job: Job = { repo, observer, controller: new AbortController(), force };
       pending = job;
       void drain();
       return () => {

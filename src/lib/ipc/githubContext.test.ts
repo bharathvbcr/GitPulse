@@ -13,6 +13,7 @@ vi.mock("./invoke", () => ({
 }));
 
 import { loadWork } from "../work/load";
+import { createWorkRefresh } from "../work/refresh";
 import {
   GITHUB_CONTEXT_FRESH_MS,
   githubContextDegraded,
@@ -162,6 +163,48 @@ describe("Work, GitHubPanel and ManviOpsPanel share one read", () => {
     expect(work.sources.github.detail).not.toBe("");
     expect(githubCalls()).toBe(1);
     await readGitHubContext("/repo", { force: false });
+    expect(githubCalls()).toBe(2);
+  });
+});
+
+describe("Work's Refresh button", () => {
+  const githubCalls = () => calls.filter((c) => c === "cmd_github_context").length;
+
+  function refresher() {
+    const refresh = createWorkRefresh({
+      load: loadWork,
+      collisions: async () => {
+        throw new Error("collision check not part of this test");
+      },
+    });
+    return (options?: { force?: boolean }) =>
+      new Promise<void>((resolve) => {
+        refresh.request("/repo", { projection() {}, collisions() {}, finished: () => resolve() }, options);
+      });
+  }
+
+  it("a refresh the person asked for reads GitHub again inside the freshness window", async () => {
+    const request = refresher();
+    await request();
+    expect(githubCalls()).toBe(1);
+    await request(); // a mount, a return to the view, a status-driven reload
+    expect(githubCalls()).toBe(1);
+    await request({ force: true }); // the Refresh button
+    expect(githubCalls()).toBe(2);
+  });
+
+  it("WorkView's button asks for a forced refresh and nothing else does", () => {
+    const view = readFileSync(new URL("../components/WorkView.svelte", import.meta.url), "utf8");
+    expect(view.match(/refresh\(\s*\$repoStore\.currentPath\s*,\s*true\s*\)/g)).toHaveLength(1);
+    expect(view).toMatch(/function refresh\(\s*repo: string,\s*force = false\s*\)/);
+  });
+
+  it("a forced request replaced by an ordinary one for the same repository stays forced", async () => {
+    const request = refresher();
+    await request();
+    const first = request({ force: true });
+    const second = request();
+    await Promise.all([first, second]);
     expect(githubCalls()).toBe(2);
   });
 });

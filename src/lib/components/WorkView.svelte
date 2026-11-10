@@ -99,7 +99,7 @@
     unchecked: "text-textMuted bg-surfaceHover",
   };
 
-  function refresh(repo: string): void {
+  function refresh(repo: string, force = false): void {
     const epoch = ++refreshEpoch;
     loading = true;
     refreshError = null;
@@ -121,7 +121,7 @@
         refreshError = error;
         loading = false;
       },
-    });
+    }, { force });
   }
 
   // A repo switch hydrates from cache so the last join is on screen
@@ -320,7 +320,7 @@
       type="button"
       class="gp-btn shrink-0 mt-1"
       disabled={loading || !$repoStore.currentPath}
-      onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}
+      onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath, true)}
     >
       <RefreshCw size={12} class={loading ? "animate-spin" : ""} />
       {loading ? "Refreshing" : "Refresh"}

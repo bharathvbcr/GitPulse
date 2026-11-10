@@ -45,6 +45,8 @@ export interface WorkLoadDeps {
   invoke?: typeof invoke;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Read GitHub again even if a fresh shared read exists: a refresh the person asked for. */
+  forceGitHub?: boolean;
 }
 
 const ABSENT = { ok: true, present: false, detail: "" } as const;
@@ -89,7 +91,7 @@ export async function loadWork(
   const call: typeof invoke = async <T>(command: string, args?: Parameters<typeof invoke>[1], options?: Parameters<typeof invoke>[2]): Promise<T> => {
     if (deps.signal?.aborted) throw new Error("Overview refresh superseded");
     const read = sharesGitHub && command === "cmd_github_context"
-      ? () => readGitHubContext<T>(repoPath)
+      ? () => readGitHubContext<T>(repoPath, { force: deps.forceGitHub === true })
       : () => nativeCall<T>(command, args, options);
     const result = await withDeadline(read, deadline - Date.now(), { signal: deps.signal, message: WORK_DEADLINE_MESSAGE });
     validateWorkResponse(command, result);
