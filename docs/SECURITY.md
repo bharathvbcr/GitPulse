@@ -612,6 +612,14 @@ is built to have no way back in:
   (`browser/pane.rs`), not yet exercised by a test.
 - **Page text is data.** The URL and title a page reports are capped in the
   backend, and the title goes through the tab-title sanitizer.
+- **Agents can open, not drive.** `gitpulse_browser_open` lets an agent ask the
+  running app to open a session. It refuses an untrusted repository and a
+  non-loopback URL, and reaches the app only through the single-instance
+  mailbox, which accepts this user's processes alone (peer uid checked) and
+  validates the request again (absolute repository, loopback URL). The app
+  comes to the front to show it. There is no tool to read the page, run script
+  in it, navigate it elsewhere or close it; that wider control (board card M2)
+  is not approved.
 
 Once the page has keyboard focus it receives keystrokes, as any browser does;
 nothing typed there reaches GitPulse.

@@ -88,6 +88,23 @@ export function onPageEvents(id: string, handler: (event: PageEvent) => void): (
   };
 }
 
+/**
+ * Whether `raw` is an http(s) address on this machine (`localhost`,
+ * `127.0.0.0/8`, `[::1]`) — the addresses a browser session opens. Only a
+ * routing choice: the backend judges the address again before loading it.
+ */
+export function isLoopbackUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const host = url.hostname.toLowerCase();
+  return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
 /** What the address bar offers before anything has been typed. */
 export const DEFAULT_ADDRESS = "http://localhost:3000/";
 

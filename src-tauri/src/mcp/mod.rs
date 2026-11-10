@@ -23,7 +23,10 @@
 //! `gitpulse_worktree_release`, `gitpulse_worktree_send_message`,
 //! `gitpulse_worktree_prune`, `gitpulse_worktree_merge`),
 //! all behind the repository trust gate (`repository_trust::require`) and
-//! `harness::guard_command` (for git mutations). Destructive tools (`gitpulse_delete_task`,
+//! `harness::guard_command` (for git mutations). One tool acts on the running
+//! app instead of on state: `gitpulse_browser_open` asks it, through its
+//! single-instance mailbox, to open a Browser session on a loopback URL in a
+//! trusted repository's dock; it can open a page and nothing more. Destructive tools (`gitpulse_delete_task`,
 //! `gitpulse_merge_tasks`, `gitpulse_worktree_prune`, `gitpulse_worktree_merge`)
 //! carry `destructiveHint: true`, and every writing tool is held to the explicit
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
@@ -890,6 +893,17 @@ tool_args! {
             "Optional thread key/slug grouping messages into a persistent conversation or ask",
             1,
             80,
+        ),
+    }
+}
+
+tool_args! {
+    struct BrowserOpenArgs {
+        repo_path: String = repo_spec(),
+        url: String = Spec::bytes(
+            "A local dev server URL: http or https to localhost, 127.0.0.0/8 or [::1]",
+            1,
+            crate::browser::MAX_URL_CHARS,
         ),
     }
 }
@@ -1917,6 +1931,24 @@ fn build_tools() -> Vec<Value> {
             }),
             false,
         ),
+        mutating_tool(
+            "gitpulse_browser_open",
+            "Open a browser session on a local dev server",
+            "Ask the running GitPulse (macOS) to open a Browser session on a loopback URL (localhost, 127.0.0.0/8, [::1]) in this repository's terminal dock, for the person to see the page; a session already on that URL is brought forward instead of opened again. GitPulse and the repository come to the front. Opens only: it cannot read, drive or close the page. Refused when GitPulse is not running, the repository is not trusted, or the URL is not loopback",
+            BrowserOpenArgs::properties(),
+            &BrowserOpenArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "requested": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "url": { "type": "string" }
+                },
+                "required": ["ok", "requested", "repo_path", "url"]
+            }),
+            true,
+        ),
         tool(
             "gitpulse_worktree_inbox",
             "Read agent coordination inbox",
@@ -2381,7 +2413,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. Read tools (readOnlyHint: true) never mutate git or task state. Writes are restricted to the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — and the policy-gated worktree engine and lane coordination tools — gitpulse_worktree_create, gitpulse_worktree_switch, gitpulse_worktree_isolate, gitpulse_worktree_prune, gitpulse_worktree_merge, gitpulse_worktree_claim, gitpulse_worktree_release, gitpulse_worktree_send_message and gitpulse_worktree_overlay_sync (each gated by repository trust and harness::guard_command). gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk, gitpulse_worktree_claim, gitpulse_worktree_inbox, and gitpulse_worktree_radar before and during parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. Read tools (readOnlyHint: true) never mutate git or task state. Writes are restricted to the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — and the policy-gated worktree engine and lane coordination tools — gitpulse_worktree_create, gitpulse_worktree_switch, gitpulse_worktree_isolate, gitpulse_worktree_prune, gitpulse_worktree_merge, gitpulse_worktree_claim, gitpulse_worktree_release, gitpulse_worktree_send_message and gitpulse_worktree_overlay_sync (each gated by repository trust and harness::guard_command). gitpulse_browser_open asks the running GitPulse to open a Browser session on a loopback URL in a trusted repository's terminal dock, for the person to see; it changes no git or task state and cannot read or drive the page. gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk, gitpulse_worktree_claim, gitpulse_worktree_inbox, and gitpulse_worktree_radar before and during parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -3434,6 +3466,27 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             Ok(json!({
                 "ok": true,
                 "message": message
+            }))
+        }
+        "gitpulse_browser_open" => {
+            let a: BrowserOpenArgs = parse(name, arguments)?;
+            if !crate::browser::SUPPORTED {
+                return Err(crate::browser::UNSUPPORTED.to_string());
+            }
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let root = crate::engine::git_cli::find_git_root(std::path::Path::new(&a.repo_path))
+                .ok_or_else(|| format!("{} is not inside a git repository", a.repo_path))?;
+            let repo = root.to_string_lossy().into_owned();
+            let url = crate::browser::policy::check_loopback(a.url.trim())?.to_string();
+            let profile = crate::browser::profile_dir()
+                .ok_or("GitPulse's profile directory is unknown (no HOME)")?;
+            crate::browser::ask_app_to_browse(&profile, &repo, &url)?;
+            Ok(json!({
+                "ok": true,
+                "requested": true,
+                "repo_path": repo,
+                "url": url
             }))
         }
         "gitpulse_worktree_inbox" => {
@@ -4753,6 +4806,7 @@ mod tests {
                             | "gitpulse_worktree_claim"
                             | "gitpulse_worktree_release"
                             | "gitpulse_worktree_send_message"
+                            | "gitpulse_browser_open"
                             | "gitpulse_worktree_overlay_sync"
                             | "gitpulse_inbox_post"
                             | "gitpulse_inbox_withdraw"
@@ -5575,6 +5629,7 @@ mod tests {
         ("gitpulse_add_task", "one task record back, no list"),
         ("gitpulse_complete_task", "one task record back, no list"),
         ("gitpulse_delete_task", "one deletion receipt, no list"),
+        ("gitpulse_browser_open", "one request receipt, no list"),
         (
             "gitpulse_worktree_switch",
             "one worktree switch receipt, no list",
@@ -6038,6 +6093,64 @@ mod tests {
             }),
             &mut validated,
         );
+        // The app `gitpulse_browser_open` asks is a mailbox this test claims in
+        // its hermetic profile (HOME is rewritten per process, never the
+        // developer's), so the tool's success result is validated too, and
+        // what the app receives is checked.
+        #[cfg(target_os = "macos")]
+        {
+            use crate::desktop::instance::{claim, Claim, Request};
+            // A short temp profile of the test's own: never the developer's,
+            // and short enough for the mailbox's socket path.
+            let profile = tempfile::Builder::new()
+                .prefix("gpb")
+                .tempdir()
+                .expect("a profile directory");
+            crate::browser::TEST_PROFILE
+                .with(|slot| *slot.borrow_mut() = Some(profile.path().to_path_buf()));
+            let owner = match claim(profile.path(), std::time::Duration::from_secs(2)) {
+                Claim::Primary(owner) => owner,
+                _ => panic!("the test owns its profile's mailbox"),
+            };
+            assert_eq!(owner.mailbox_error(), None, "the mailbox is bound");
+            let (sent, received) = std::sync::mpsc::channel();
+            let sent = std::sync::Mutex::new(sent);
+            owner.attach(move |request| {
+                let _ = sent.lock().unwrap().send(request);
+            });
+            let arguments = json!({ "repo_path": wt_repo, "url": " http://localhost:5173/app " });
+            if let Err(error) = handle_tool_call("gitpulse_browser_open", &arguments) {
+                panic!("gitpulse_browser_open failed against the test's own mailbox: {error}");
+            }
+            // Drain the probe call's delivery before the validated one.
+            let _ = received.recv_timeout(std::time::Duration::from_secs(5));
+            let receipt = call_writer("gitpulse_browser_open", arguments, &mut validated);
+            assert_eq!(
+                receipt.as_ref().map(|r| r["url"].clone()),
+                Some(json!("http://localhost:5173/app")),
+                "{receipt:?}"
+            );
+            match received.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Request::Browse { repo, url }) => {
+                    assert_eq!(url, "http://localhost:5173/app");
+                    assert_eq!(
+                        Some(repo.as_str()),
+                        receipt.as_ref().and_then(|r| r["repo_path"].as_str())
+                    );
+                }
+                other => panic!("the app received {other:?}"),
+            }
+            let remote = handle_tool_call(
+                "gitpulse_browser_open",
+                &json!({ "repo_path": wt_repo, "url": "https://example.com/" }),
+            );
+            assert!(
+                remote.as_ref().is_err_and(|e| e.contains("loopback")),
+                "a remote URL is refused: {remote:?}"
+            );
+            drop(owner);
+            crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+        }
         call_writer(
             "gitpulse_inbox_post",
             json!({
@@ -7963,6 +8076,10 @@ mod tests {
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "body": "probe" }),
             ),
             (
+                "gitpulse_browser_open",
+                json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
+            ),
+            (
                 "gitpulse_inbox_post",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "body": "probe" }),
             ),
@@ -8842,6 +8959,7 @@ mod tests {
             ("gitpulse_worktree_claim", WorktreeClaimArgs),
             ("gitpulse_worktree_release", WorktreeReleaseArgs),
             ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
+            ("gitpulse_browser_open", BrowserOpenArgs),
             ("gitpulse_worktree_inbox", WorktreeInboxArgs),
             ("gitpulse_inbox_post", InboxPostArgs),
             ("gitpulse_inbox_read", InboxReadArgs),
@@ -8959,6 +9077,7 @@ mod tests {
                 ("gitpulse_worktree_claim", WorktreeClaimArgs),
                 ("gitpulse_worktree_release", WorktreeReleaseArgs),
                 ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
+                ("gitpulse_browser_open", BrowserOpenArgs),
                 ("gitpulse_worktree_inbox", WorktreeInboxArgs),
                 ("gitpulse_inbox_post", InboxPostArgs),
                 ("gitpulse_inbox_read", InboxReadArgs),

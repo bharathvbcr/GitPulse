@@ -23,9 +23,10 @@
    * While the page has keyboard focus it receives the keys, so the dock's
    * chords do not fire there; click the address bar or the tab strip first.
    */
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
-  import { AlertCircle, ArrowLeft, ArrowRight, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { AlertCircle, ArrowLeft, ArrowRight, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { openExternal } from "../desktop/openExternal";
   import { pageZoom } from "../ui/uiScale";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { formatError } from "../ui/formatError";
@@ -51,12 +52,18 @@
     tabId,
     onscreen = false,
     onTitle,
+    initialUrl,
+    onUrl,
   }: {
     tabId: string;
     /** This tab's pane is the one (or one of the split two) on screen. */
     onscreen?: boolean;
     /** The page's title, for the tab strip. */
     onTitle?: (title: string) => void;
+    /** Opened as soon as the tab mounts: an agent's or a link's request. */
+    initialUrl?: string;
+    /** The address the page last loaded, for the tab (`setTabUrl`). */
+    onUrl?: (url: string) => void;
   } = $props();
 
   let address = $state(lastAddress());
@@ -193,7 +200,10 @@
       case "loaded":
         loading = false;
         if (!editing) address = event.url;
-        if (event.url !== "about:blank") rememberAddress(event.url);
+        if (event.url !== "about:blank") {
+          rememberAddress(event.url);
+          onUrl?.(event.url);
+        }
         break;
       case "title":
         if (event.title.trim()) onTitle?.(event.title);
@@ -205,7 +215,15 @@
     }
   }
 
-  onMount(() => onPageEvents(tabId, onPage));
+  onMount(() => {
+    const stop = onPageEvents(tabId, onPage);
+    if (initialUrl) {
+      address = initialUrl;
+      // Once laid out, so the page opens where the tab is.
+      void tick().then(() => submit());
+    }
+    return stop;
+  });
 
   async function submit(event?: Event) {
     event?.preventDefault();
@@ -265,6 +283,27 @@
   }
 
   /** The tab was brought forward: a session with no page yet wants an address. */
+  /**
+   * Shows `url` here: the page loads it again if it is already on it (an
+   * agent asking again after an edit wants the change), and a session not yet
+   * opened opens on it.
+   */
+  export async function show(url: string): Promise<void> {
+    address = url;
+    await submit();
+  }
+
+  /** The address bar's address in the system browser, for what this session cannot do. */
+  async function openOutside() {
+    const url = normalizeAddress(address);
+    if (!url) return;
+    try {
+      await openExternal(url);
+    } catch (cause) {
+      error = `Could not open ${url} in your browser: ${formatError(cause)}`;
+    }
+  }
+
   export function reveal() {
     schedule();
     if (!opened) addressInput?.focus();
@@ -302,6 +341,7 @@
       onkeydown={onAddressKey}
     />
     <button type="submit" class="gp-btn py-0! text-[11px]!">{opened ? "Go" : "Open"}</button>
+    <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
   {#if error}
     <div class="shrink-0 px-3 py-1 border-b border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-start gap-1.5" role="alert" data-testid="browser-session-error">

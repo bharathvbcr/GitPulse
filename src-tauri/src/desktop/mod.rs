@@ -444,6 +444,18 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         // Answered on its own connection by the gate attached to the mailbox;
         // it never reaches the sink, and there is nothing here for the window.
         instance::Request::GateCommand { .. } | instance::Request::CollisionScan { .. } => {}
+        // An agent's `gitpulse_browser_open`. The window opens the repository
+        // and its dock's browser tab (`browseRequests.ts`); the request was
+        // validated (absolute repository, loopback URL) before it got here.
+        instance::Request::Browse { repo, url } => {
+            if let Err(error) = reveal_main(&handle) {
+                log::warn!(target: "desktop", "Could not reveal GitPulse for a browser session: {error}");
+            }
+            let request = crate::browser::BrowseRequest { repo, url };
+            if let Err(error) = handle.emit(crate::browser::BROWSE_EVENT, request) {
+                log::warn!(target: "browser", "A browser session request was not delivered to the window: {error}");
+            }
+        }
         instance::Request::Notification { id, snooze } => {
             if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
                 log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");

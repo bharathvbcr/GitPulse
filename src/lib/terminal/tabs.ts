@@ -83,6 +83,12 @@ export interface TerminalTab {
    * takes over (`cmd_terminal_attach`) instead of starting a process.
    */
   attachSessionId?: string;
+  /**
+   * A browser tab's address: the one it was opened on, then whatever its page
+   * last loaded (`setTabUrl`). What an agent's or a link's request for the
+   * same address finds (`browserTabFor`) instead of opening another tab.
+   */
+  url?: string;
 }
 
 /**
@@ -314,6 +320,50 @@ export function activateTab(state: TabState, id: string): TabState {
 }
 
 /** Records a title the running program reported for one tab. */
+/** One address spelled two ways (`localhost:3000` and `localhost:3000/`) is one address. */
+function sameAddress(a: string, b: string): boolean {
+  try {
+    return new URL(a).href === new URL(b).href;
+  } catch {
+    return a === b;
+  }
+}
+
+/** The longest address a tab keeps; the backend loads no longer one. */
+const MAX_TAB_URL = 2048;
+
+/**
+ * Opens a browser tab on `url` — or, when a browser tab is already on that
+ * address, brings it forward instead (`opened: false`), so a request repeated
+ * in an edit-reload loop reuses its session rather than piling up tabs.
+ */
+export function openBrowserTab(state: TabState, url?: string): { state: TabState; id: string | null; opened: boolean } {
+  const address = url?.trim().slice(0, MAX_TAB_URL) || undefined;
+  if (address) {
+    const existing = browserTabFor(state, address);
+    if (existing) return { state: activateTab(state, existing.id), id: existing.id, opened: false };
+  }
+  const next = openTab(state, "browser");
+  const added = next.tabs.find((tab) => !state.tabs.includes(tab));
+  if (!added) return { state, id: null, opened: false };
+  if (!address) return { state: next, id: added.id, opened: true };
+  return { state: setTabUrl(next, added.id, address), id: added.id, opened: true };
+}
+
+/** The browser tab on `url`, if one is. */
+export function browserTabFor(state: TabState, url: string): TerminalTab | undefined {
+  return state.tabs.find((tab) => tab.launcher === "browser" && tab.url !== undefined && sameAddress(tab.url, url));
+}
+
+/** Records the address a browser tab's page is on. */
+export function setTabUrl(state: TabState, id: string, url: string): TabState {
+  const tab = state.tabs.find((candidate) => candidate.id === id);
+  if (!tab || tab.launcher !== "browser") return state;
+  const address = url.slice(0, MAX_TAB_URL);
+  if (tab.url === address) return state;
+  return { ...state, tabs: state.tabs.map((candidate) => (candidate.id === id ? { ...candidate, url: address } : candidate)) };
+}
+
 export function setTabTitle(state: TabState, id: string, title: string): TabState {
   if (!state.tabs.some((tab) => tab.id === id)) return state;
   return {

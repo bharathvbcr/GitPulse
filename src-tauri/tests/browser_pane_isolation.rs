@@ -38,6 +38,9 @@
 //!     reload work; a remote URL, an unknown step, a bad id, impossible bounds
 //!     and an unknown session are refused with the reason; the page events
 //!     arrive through the event plugin; close is idempotent.
+//! 11. **An agent's request.** A `Request::Browse`, handed to the app's own
+//!     `desktop::answer_forwarded` as the single-instance mailbox does, reaches
+//!     the page as the `gitpulse-browse` event the frontend listens for.
 //!
 //! The test builds without the `custom-protocol` feature, so Tauri runs in
 //! its dev mode (`tauri::is_dev()`), the mode in which `devUrl` is Local. The
@@ -856,6 +859,50 @@ mod mac {
                 "ipc: close removes the pane, and closing it again is not an error ({closed:?})"
             ),
         );
+
+        // 11. An agent's `gitpulse_browser_open`, as the single-instance
+        //     mailbox hands it to the app, reaches the page as the event the
+        //     frontend listens for (`browseRequests.ts`).
+        let listening = on_main(app, |app| {
+            let main = app.get_webview_window("main").expect("main window");
+            main.eval(
+                r#"(async () => {
+  const r = { who: 'browse', events: [] };
+  const handler = window.__TAURI_INTERNALS__.transformCallback((e) => r.events.push(e.payload));
+  await window.__TAURI_INTERNALS__.invoke('plugin:event|listen', { event: 'gitpulse-browse', target: { kind: 'Any' }, handler });
+  await fetch('/report', { method: 'POST', body: JSON.stringify({ who: 'browse-ready' }) });
+  await new Promise((done) => setTimeout(done, 1500));
+  await fetch('/report', { method: 'POST', body: JSON.stringify(r) });
+})()"#,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .and_then(|()| report(main_reports, "browse-ready"));
+        match listening {
+            Ok(_) => {
+                on_main(app, |app| {
+                    gitpulse_lib::desktop::answer_forwarded(
+                        app,
+                        gitpulse_lib::desktop::instance::Request::Browse {
+                            repo: "/fixture/repo".into(),
+                            url: "http://localhost:5173/app".into(),
+                        },
+                    )
+                });
+                match report(main_reports, "browse") {
+                    Ok(r) => check.that(
+                        r["events"].as_array().is_some_and(|events| {
+                            events.iter().any(|e| {
+                                e["repo"] == "/fixture/repo" && e["url"] == "http://localhost:5173/app"
+                            })
+                        }),
+                        format!("browse: an agent's request reaches the page as gitpulse-browse (heard {})", r["events"]),
+                    ),
+                    Err(e) => check.that(false, format!("browse: {e}")),
+                }
+            }
+            Err(e) => check.that(false, format!("browse: the page did not start listening: {e}")),
+        }
         check
     }
 

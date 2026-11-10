@@ -76,6 +76,69 @@ pub const MAX_PANES: usize = 8;
 /// The event every pane's page activity is emitted as.
 pub const EVENT: &str = "browser-pane";
 
+/// The event an agent's request for a browser session reaches the window as
+/// (`gitpulse_browser_open` → `desktop::instance::Request::Browse`).
+pub const BROWSE_EVENT: &str = "gitpulse-browse";
+
+/// A browser session an agent asked for: repository `repo`'s dock, on `url`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BrowseRequest {
+    pub repo: String,
+    pub url: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own profile to ask instead of the hermetic HOME's, whose
+    /// mailbox path is too long for a unix socket.
+    pub(crate) static TEST_PROFILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The profile directory whose running GitPulse `gitpulse_browser_open` asks.
+pub(crate) fn profile_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_PROFILE.with(|slot| slot.borrow().clone()) {
+        return Some(dir);
+    }
+    crate::tool_config::default_config_dir()
+}
+
+/// How long `ask_app_to_browse` waits for the running app's greeting.
+#[cfg(target_os = "macos")]
+const BROWSE_HELLO: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Asks the GitPulse that owns profile directory `dir` to open a browser
+/// session on `url` in repository `repo`'s dock, through its single-instance
+/// mailbox (`desktop::instance`, this user only). `Ok` means the app took the
+/// request; the window then opens the repository and the tab. The URL is
+/// checked here and again by the app.
+pub fn ask_app_to_browse(dir: &std::path::Path, repo: &str, url: &str) -> Result<(), String> {
+    policy::check_loopback(url)?;
+    #[cfg(target_os = "macos")]
+    {
+        use crate::desktop::instance::{reach_owner, Request};
+        let owner = reach_owner(dir, BROWSE_HELLO)
+            .ok_or("GitPulse is not running, so there is no window to open a browser session in")?;
+        owner
+            .forward(&Request::Browse {
+                repo: repo.to_owned(),
+                url: url.to_owned(),
+            })
+            .map_err(|why| {
+                format!(
+                    "GitPulse did not take the request ({why}). A GitPulse built before browser \
+                     sessions refuses it: rebuild and reinstall the app."
+                )
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (dir, repo);
+        Err(UNSUPPORTED.to_owned())
+    }
+}
+
 /// What the commands answer where browser sessions are not built.
 pub const UNSUPPORTED: &str = "Browser sessions are available on macOS only for now";
 

@@ -243,6 +243,18 @@ address — `localhost:5173`, a bare port such as `3000`, or a full
   dialog and toast) are detected at any size; any other overlay is found by
   hit-testing a grid at most 64px apart (a ninth of the page on a larger
   one), so one smaller than that can be missed. The page hides a frame or two after an overlay appears.
+- **Localhost links open here.** Clicking a `localhost`, `127.x` or `[::1]`
+  address in terminal output opens it in a browser session in this dock
+  (another link, or a session that cannot open, still goes to your system
+  browser). **↗** in the address bar opens the current address in your system
+  browser.
+- **Agents can open one.** An agent calls the `gitpulse_browser_open` MCP tool
+  with a trusted repository and a local address; GitPulse comes to the front,
+  opens that repository and its dock, and shows the page — reusing, and
+  reloading, a session already on that address, so an agent that edits and
+  asks again shows the change. Requests from several agents wait their turn,
+  and one that cannot be carried out is shown as a notice. The tool only
+  opens pages: an agent cannot read, drive or close them.
 - **Keys go to the page while it has focus,** so the dock's shortcuts work again
   once you click the address bar or the tab strip.
 - A browser tab runs no process: it does not count against the terminal session

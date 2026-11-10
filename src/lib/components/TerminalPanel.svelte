@@ -69,6 +69,9 @@
     paneOnScreen,
     setTabStartDir,
     setTabTitle,
+    setTabUrl,
+    browserTabFor,
+    openBrowserTab,
     renameTab,
     moveTab,
     tabLabel,
@@ -612,6 +615,10 @@
       const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
       mode = "shell";
+      if (claimed.launcher === "browser") {
+        claimed.complete(openBrowserFor(claimed.url));
+        return;
+      }
       const opened = newTab(claimed.launcher, claimed.prompt);
       const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
@@ -679,6 +686,29 @@
     sessions = rest;
     const { [id]: _page, ...pages } = browsers;
     browsers = pages;
+  }
+
+  /**
+   * A browser session on `url` (an agent's request, a clicked localhost link):
+   * the tab already on that address is brought forward and loads it again —
+   * a request repeated after an edit wants the change — otherwise a tab opens
+   * on it. Returns why nothing opened, or undefined.
+   */
+  function openBrowserFor(url: string | undefined): string | undefined {
+    if (!repoPath) return "Open a repository first";
+    const existing = url ? browserTabFor(tabState, url) : undefined;
+    if (existing) {
+      selectTab(existing.id);
+      if (url) void tick().then(() => browsers[existing.id]?.show(url));
+      return undefined;
+    }
+    if (!canCreateKind("browser")) return capacityTitleFor("browser");
+    const opened = openBrowserTab(tabState, url);
+    if (!opened.id) return capacityTitleFor("browser");
+    focusTabStrip = false;
+    tabState = opened.state;
+    if (splitIds && activeId) splitIds = [splitIds[0], activeId];
+    return undefined;
   }
 
   /** Brings a tab's session forward: the terminal's grid, or the browser's page. */
@@ -1331,6 +1361,8 @@
               tabId={tab.id}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
+              initialUrl={tab.url}
+              onUrl={(url) => (tabState = setTabUrl(tabState, tab.id, url))}
             />
             {:else}
             <TerminalSession

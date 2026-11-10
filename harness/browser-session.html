@@ -223,6 +223,39 @@
       byText("button", "Open").click();
       await wait(() => of("cmd_browser_open").some(c => c.args.id === second && c.args.url === "http://localhost:3001"), "the retried open");
 
+      // ---- agents' requests -----------------------------------------------
+      // The queue an agent's `gitpulse_browser_open` lands in, against the real
+      // launch channel, panel and session; only opening the repository is a
+      // fixture (this page has no backend to open one with).
+      const { createBrowseQueue } = await import("../src/lib/browser/browseRequests.ts");
+      const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests.ts");
+      const notices = [];
+      const queue = createBrowseQueue({
+        open: async (repo) => repo,
+        showDock: () => {},
+        busy: () => terminalLaunchRequests.busy,
+        launch: (repo, url) => terminalLaunchRequests.requestBrowser(repo, url),
+        fail: (message) => notices.push(message),
+      });
+      const opensBefore = of("cmd_browser_open").length;
+      queue.push({ repo: "/fixture/GitPulse", url: "http://localhost:7001/" });
+      queue.push({ repo: "/fixture/GitPulse", url: "http://localhost:7002/" });
+      await queue.settled();
+      await wait(() => of("cmd_browser_open").length === opensBefore + 2, "two agents' sessions to open");
+      const agentOpens = of("cmd_browser_open").slice(opensBefore);
+      check("Two agents asking at once each get a session on their address, in order, with nothing refused",
+        () => agentOpens[0].args.url === "http://localhost:7001/" && agentOpens[1].args.url === "http://localhost:7002/" && notices.length === 0);
+      await emit("browser-pane", { id: agentOpens[0].args.id, kind: "loaded", url: "http://localhost:7001/" });
+      const tabsBefore = [...document.querySelectorAll("[role=tab]")].filter(seen).length;
+      const navigationsBefore = of("cmd_browser_navigate").length;
+      queue.push({ repo: "/fixture/GitPulse", url: "http://localhost:7001" });
+      await queue.settled();
+      await wait(() => of("cmd_browser_navigate").length === navigationsBefore + 1, "the reused session to load again");
+      check("Asking again for an open address brings its session forward and loads it again, with no new tab",
+        () => [...document.querySelectorAll("[role=tab]")].filter(seen).length === tabsBefore
+          && of("cmd_browser_navigate").at(-1).args.id === agentOpens[0].args.id
+          && session()?.dataset.browserSession === agentOpens[0].args.id);
+
       // ---- the panel going away -------------------------------------------
       host().setMounted(false);
       await wait(() => of("cmd_browser_close").some(c => c.args.id === second), "the close on unmount");

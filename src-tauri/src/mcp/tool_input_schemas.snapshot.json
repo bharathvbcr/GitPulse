@@ -661,6 +661,28 @@
     ],
     "type": "object"
   },
+  "gitpulse_browser_open": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "url": {
+        "description": "A local dev server URL: http or https to localhost, 127.0.0.0/8 or [::1] (up to 2 KiB)",
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "url"
+    ],
+    "type": "object"
+  },
   "gitpulse_change_context": {
     "additionalProperties": false,
     "properties": {
