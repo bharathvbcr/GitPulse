@@ -75,8 +75,9 @@ describe("dispatchNativeMenu", () => {
       }
     }
     // Written out so a registry that collapsed to nothing could not make the
-    // comparison below pass against an equally empty call list.
-    expect(expected).toHaveLength(18);
+    // comparison below pass against an equally empty call list. 17 since
+    // Secrets folded into Insights → Health.
+    expect(expected).toHaveLength(17);
     expect(h.calls).toEqual(expected);
   });
 

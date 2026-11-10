@@ -1,4 +1,4 @@
-//! Stress and adversarial coverage for the Insights → Secrets scan.
+//! Stress and adversarial coverage for the secrets scan (Insights → Health → Secrets).
 //!
 //! Every test drives `scan_with_binary` — the production path past PATH lookup
 //! — with a stub `kingfisher` shell script, so exit codes, malformed output,

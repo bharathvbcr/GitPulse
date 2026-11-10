@@ -23,11 +23,11 @@ Run `bun run test:browser -- --harness secrets` or
 `/harness/secrets.html` on the development server; `window.__gpSecrets` holds
 the fixture's log of scans and reveals.
 
-`SecretsPanel` is driven through every report shape the backend can send —
+`SecretsSection` (Health's secrets section, mounted inside a scroller as Health hosts it) is driven through every report shape the backend can send —
 findings across all seven Git locations, a complete empty scan, a partial and
 an unverified empty scan, unreadable rows, a missing scanner, a scan Kingfisher
 marked failed, missing Git status, a payload with no findings list, hostile
-paths, and 2,000 shown of 20,001 — and asserts:
+paths, and 2,000 shown of 20,001 (previewed at 8 rows, then expanded) — and asserts:
 
 - **Honesty.** "No secrets reported" appears for the complete empty scan and for
   nothing else; a lossy count reads as a floor and says how many rows it lost;

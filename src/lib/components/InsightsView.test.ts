@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { sectionsFor } from "../views/viewRegistry";
-import { RETIRED_VIEWS } from "../repos/persist";
+import { RETIRED_VIEWS, sanitizeViewSections } from "../repos/persist";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "InsightsView.svelte"), "utf8");
@@ -14,19 +14,26 @@ describe("InsightsView", () => {
       "pulse",
       "coverage",
       "health",
-      "secrets",
       "storage",
     ]);
   });
 
+  it("restores a remembered Secrets section onto Health, where secrets live now", () => {
+    // Secrets folded into Health. Falling back to the view's default would
+    // open Pulse, which reads as the scan having been deleted.
+    expect(sanitizeViewSections({ insights: "secrets" })).toEqual({ insights: "health" });
+    expect(sanitizeViewSections({ insights: "storage" })).toEqual({ insights: "storage" });
+    // The alias is per view: no other view gains a "secrets" redirect.
+    expect(sanitizeViewSections({ history: "secrets" })).toEqual({ history: "graph" });
+  });
+
   it("keeps every pane lazy", () => {
     // Opening Insights for the activity heatmap must not pay for the coverage
-    // parser, the dependency auditor, the secrets scanner or the disk walker.
+    // parser, the dependency and secrets scanners or the disk walker.
     for (const loader of [
       "loadPulse",
       "loadCoverage",
       "loadHealth",
-      "loadSecrets",
       "loadStorage",
     ]) {
       expect(source).toContain(`${loader}: ViewLoader`);
