@@ -66,16 +66,18 @@ export function restoredHistoryList(record: {
   viewSections?: unknown;
   viewTab?: unknown;
 }): HistoryList {
-  const stored = sanitizeHistoryList(record.historyList);
-  if (stored !== "commits") return stored;
-  if (record.viewTab === RETIRED_REFLOG_SECTION) return "moves";
+  // A retired section wins over the stored list. Only a build that still had
+  // the section can have written it, and that build recorded the list Graph was
+  // last left on whatever section was showing — so beside `history: "suspects"`
+  // a stored "moves" is a stale Graph setting, not what was on screen.
   const sections = record.viewSections;
   if (sections && typeof sections === "object" && !Array.isArray(sections)) {
     const history = (sections as Record<string, unknown>).history;
-    if (history === RETIRED_REFLOG_SECTION) return "moves";
     if (history === RETIRED_SUSPECTS_SECTION) return "suspects";
+    if (history === RETIRED_REFLOG_SECTION) return "moves";
   }
-  return "commits";
+  if (record.viewTab === RETIRED_REFLOG_SECTION) return "moves";
+  return sanitizeHistoryList(record.historyList);
 }
 
 /**

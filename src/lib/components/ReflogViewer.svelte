@@ -97,7 +97,10 @@
     untrack(() => {
       const prev = seenHead;
       seenHead = { repo, head };
-      if (prev && prev.repo === repo && head && prev.head !== head) void load();
+      // A null head is the graph not having loaded yet (a cold mount, a
+      // repository it had not cached): its arrival is not a move, and the
+      // repository effect below already loads for it.
+      if (prev && prev.repo === repo && prev.head && head && prev.head !== head) void load();
     });
   });
 

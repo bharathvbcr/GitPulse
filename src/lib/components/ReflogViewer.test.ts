@@ -54,7 +54,8 @@ describe("ReflogViewer interaction contract", () => {
     // A reset from the details pane (or a commit made in the terminal) adds an
     // entry; the list used to reload only on its own row actions.
     expect(source).toContain("const head = $graphStore.headId;");
-    expect(source).toContain("if (prev && prev.repo === repo && head && prev.head !== head) void load();");
+    // Not on the graph's first head after a cold mount: that is a load, not a move.
+    expect(source).toContain("if (prev && prev.repo === repo && prev.head && head && prev.head !== head) void load();");
   });
 
   it("discloses when the 200-entry request ceiling may hide older history", () => {

@@ -154,6 +154,20 @@ describe("resetKeepTo", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it("forgets the reflog label once HEAD has moved", async () => {
+    // Selectors shift on every HEAD move; a stale HEAD@{2} in the next prompt
+    // would name a different entry than the one on screen.
+    const { historySelectionLabel } = await import("../views/historyList");
+    const { get } = await import("svelte/store");
+    historySelectionLabel.set({ commitId: OID, label: "HEAD@{2}" });
+    confirmAnswer = false;
+    await resetKeepTo(OID, "HEAD@{2}");
+    expect(get(historySelectionLabel)).not.toBeNull();
+    confirmAnswer = true;
+    await resetKeepTo(OID, "HEAD@{2}");
+    expect(get(historySelectionLabel)).toBeNull();
+  });
+
   it("never resets hard", async () => {
     await resetKeepTo(OID);
     expect(resetTo.mock.calls.every((call) => call[0] === "keep")).toBe(true);
