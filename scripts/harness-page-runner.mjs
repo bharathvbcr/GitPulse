@@ -22,6 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { chromeBinary, chromeLaunch } from "./browser-regressions.mjs";
+import { allowWebkitPage } from "./webkit-allow-list.mjs";
 
 /**
  * @param {{ engine: "chrome" | "webkit", page: string, query: string, deadlineSeconds: number,
@@ -78,8 +79,7 @@ export async function runHarnessPage({ engine, page, query, deadlineSeconds, xte
       // The shipped Swift runner only opens pages in BROWSER_HARNESSES; this one
       // is not, so run a copy whose allow-list also names it.
       const source = fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url));
-      const patched = readFileSync(source, "utf8").replace(/"\/harness\/mutation-routing\.html"\]/, `"/harness/mutation-routing.html", "${page}"]`);
-      if (!patched.includes(page)) throw new Error("webkit-regressions.swift no longer has the allow-list this script patches");
+      const patched = allowWebkitPage(readFileSync(source, "utf8"), page);
       const copy = path.join(profile, "webkit-measure.swift");
       writeFileSync(copy, patched);
       browser = execFile("xcrun", ["swift", copy, url, String(deadlineSeconds + 5)], { timeout: (deadlineSeconds + 5) * 1000, maxBuffer: 1 << 20, killSignal: "SIGKILL" });
