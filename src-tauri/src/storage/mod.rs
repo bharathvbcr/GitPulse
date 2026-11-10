@@ -1389,6 +1389,16 @@ impl FileFacts {
     }
 }
 
+/// One multiply linked file as a scope has met it.
+#[cfg(target_os = "macos")]
+struct LinkTally {
+    len: u64,
+    nlink: u64,
+    /// Names of it the walk has seen inside the scope.
+    seen: u64,
+    private: Option<u64>,
+}
+
 /// One artifact scope the walk opened.
 struct FoundArtifact {
     /// The real repo-relative path (`/`-joined, exact bytes): it is what git
@@ -1405,10 +1415,11 @@ struct FoundArtifact {
     /// Files in this scope whose private size could not be read.
     #[cfg(target_os = "macos")]
     private_unread: u64,
-    /// Logical bytes in files that have another hard link, left out of
-    /// `private_bytes`.
+    /// Every multiply linked file met in this scope, by identity, with how many
+    /// of its names the walk saw here. Resolved in [`Self::sizing`]: a file all
+    /// of whose links are inside is freed with the scope, any other is not.
     #[cfg(target_os = "macos")]
-    hard_linked_bytes: u64,
+    links: HashMap<(u64, u64), LinkTally>,
     /// This tree was enumerated to the end. Starts false and is only set once
     /// the subtree has been walked and its budget came back unexhausted, so a
     /// scope the walk never finished keeps the honest answer.
@@ -1486,7 +1497,7 @@ impl ArtifactCollector {
             #[cfg(target_os = "macos")]
             private_unread: 0,
             #[cfg(target_os = "macos")]
-            hard_linked_bytes: 0,
+            links: HashMap::new(),
             complete: false,
         });
         self.open.push(self.found.len() - 1);
@@ -1510,15 +1521,29 @@ impl ArtifactCollector {
         }
     }
 
-    /// Records `bytes` in a file that has another hard link, in the innermost
-    /// open scope. The file's private size would be its whole length, yet
-    /// deleting this name frees none of it while the other name stands, so it
-    /// is left out of the private sum and reported on its own.
+    /// Records one name of a multiply linked file in the innermost open scope.
+    /// Its private size is its whole length, yet deleting one name frees none
+    /// of it while another stands: whether the scope frees it depends on
+    /// whether every link was seen inside, which [`FoundArtifact::sizing`]
+    /// settles once, per file, not per name.
     #[cfg(target_os = "macos")]
-    fn on_hard_linked(&mut self, bytes: u64) {
-        if let Some(&top) = self.open.last() {
-            self.found[top].hard_linked_bytes += bytes;
+    fn on_hard_linked(&mut self, facts: &FileFacts) {
+        if facts.len == 0 {
+            return;
         }
+        let Some(&top) = self.open.last() else {
+            return;
+        };
+        self.found[top]
+            .links
+            .entry((facts.dev, facts.ino))
+            .or_insert(LinkTally {
+                len: facts.len,
+                nlink: facts.nlink,
+                seen: 0,
+                private: facts.private,
+            })
+            .seen += 1;
     }
 
     fn on_file(&mut self, bytes: u64) {
@@ -1647,7 +1672,7 @@ fn walk_worktree(
                 // repeat names too: deleting this tree may free none of it.
                 #[cfg(target_os = "macos")]
                 if facts.nlink > 1 {
-                    ctx.collector.on_hard_linked(logical_len);
+                    ctx.collector.on_hard_linked(&facts);
                 }
 
                 if !is_dup {
@@ -2086,15 +2111,25 @@ impl FoundArtifact {
             if clone_size::volume_clones(&self.abs) == clone_size::VolumeClones::No {
                 return ReclaimSizing::Logical;
             }
-            if self.private_unread == 0 {
-                ReclaimSizing::Private {
-                    bytes: self.private_bytes,
-                    hard_linked: self.hard_linked_bytes,
+            let (mut bytes, mut unread, mut hard_linked) =
+                (self.private_bytes, self.private_unread, 0);
+            for link in self.links.values() {
+                if link.seen >= link.nlink {
+                    // Every name is inside: deleting the scope frees the file.
+                    match link.private {
+                        Some(private) => bytes += private,
+                        None => unread += 1,
+                    }
+                } else {
+                    hard_linked += link.len;
                 }
+            }
+            if unread == 0 {
+                ReclaimSizing::Private { bytes, hard_linked }
             } else {
                 ReclaimSizing::PrivateUnread {
-                    files: self.private_unread,
-                    hard_linked: self.hard_linked_bytes,
+                    files: unread,
+                    hard_linked,
                 }
             }
         }
@@ -2116,7 +2151,7 @@ impl FoundArtifact {
 /// scan time would not be run often enough to matter.
 ///
 /// `sizing` says, per artifact path, what its bytes mean; a path it does not
-/// name is sized as logical.
+/// name is reported as an unmeasured upper bound.
 fn build_reclaim(
     artifacts: &[ArtifactDir],
     sizing: &HashMap<String, ReclaimSizing>,
@@ -2145,11 +2180,15 @@ fn build_reclaim(
         };
         // What the figure is: clone-private bytes where the volume reports
         // them, otherwise the logical length, named as such.
-        // An artifact the scan did not size keeps its logical length, as it did
-        // before sizes were clone-aware; `scan_storage` sizes every one.
+        // `scan_storage` sizes every artifact. One it did not is a logical
+        // length nobody checked for sharing: an upper bound, never Measured.
         let (bytes, confidence, size_note) = match sizing.get(&artifact.path) {
             Some(sizing) => sizing.describe(artifact.bytes),
-            None => (artifact.bytes, ReclaimConfidence::Measured, String::new()),
+            None => (
+                artifact.bytes,
+                ReclaimConfidence::Estimated,
+                "Logical size, an upper bound: how much of it a clone, a snapshot or a hard link shares was not measured.".to_string(),
+            ),
         };
         items.push(ReclaimItem {
             category,
@@ -2196,7 +2235,7 @@ fn build_reclaim(
                 None
             },
         });
-        if let Some(item) = items.last_mut().filter(|_| !size_note.is_empty()) {
+        if let Some(item) = items.last_mut() {
             item.detail.push(' ');
             item.detail.push_str(&size_note);
         }
@@ -3180,6 +3219,112 @@ mod tests {
         );
     }
 
+    /// Walks `root` once and returns the `target` scope's sizing.
+    #[cfg(target_os = "macos")]
+    fn sizing_of_target_after_walking(root: &Path) -> ReclaimSizing {
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
+            root,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            &mut seen,
+            &mut seen_dirs,
+        );
+        walk_worktree(&mut ctx, root, 0, &mut budget);
+        collector
+            .found
+            .iter()
+            .find(|found| found.rel == "target")
+            .expect("target scope")
+            .sizing()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_payload(path: &Path, len: usize) {
+        let payload: Vec<u8> = (0..len)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+            .collect();
+        std::fs::write(path, payload).unwrap();
+        std::fs::File::open(path).unwrap().sync_all().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_whose_every_link_is_inside_the_tree_is_private_to_it_and_counted_once() {
+        const LEN: usize = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        write_payload(&root.join("target/a.bin"), LEN);
+        std::fs::hard_link(root.join("target/a.bin"), root.join("target/b.bin")).unwrap();
+
+        let sizing = sizing_of_target_after_walking(root);
+        let ReclaimSizing::Private { bytes, hard_linked } = sizing else {
+            panic!("private sizes are readable on APFS: {sizing:?}");
+        };
+        assert_eq!(
+            hard_linked, 0,
+            "both names are in the tree: it is all freed"
+        );
+        assert!(
+            bytes >= LEN as u64 / 2,
+            "deleting both names frees the file, once: {bytes}"
+        );
+        assert!(bytes <= LEN as u64, "and it is counted once: {bytes}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_with_a_link_outside_the_tree_is_named_once_however_many_links_are_inside() {
+        const LEN: usize = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        write_payload(&root.join("target/a.bin"), LEN);
+        std::fs::hard_link(root.join("target/a.bin"), root.join("target/b.bin")).unwrap();
+        std::fs::hard_link(root.join("target/a.bin"), root.join("outside.bin")).unwrap();
+
+        let sizing = sizing_of_target_after_walking(root);
+        let ReclaimSizing::Private { bytes, hard_linked } = sizing else {
+            panic!("private sizes are readable on APFS: {sizing:?}");
+        };
+        assert_eq!(bytes, 0, "a link outside keeps the blocks");
+        assert_eq!(
+            hard_linked, LEN as u64,
+            "the file's bytes are named once, not once per name"
+        );
+    }
+
+    #[test]
+    fn an_artifact_the_scan_did_not_size_is_never_labelled_measured() {
+        let (items, summary) = build_reclaim(
+            &[artifact("target", false, false)],
+            &HashMap::new(),
+            &GitStorage::default(),
+            &branches(),
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(items[0].confidence, ReclaimConfidence::Estimated);
+        assert_eq!(summary.reclaimable_bytes, 0);
+        assert!(
+            items[0].detail.contains("not measured"),
+            "{}",
+            items[0].detail
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_tree_the_walk_stopped_inside_does_not_claim_both_a_floor_and_an_exact_figure() {
@@ -3709,9 +3854,27 @@ mod tests {
         let mut half = artifact("target", false, false);
         half.scan_complete = false;
         let whole = artifact("other-target", false, false);
+        // Each tree's whole length is what deleting it frees: a figure the
+        // platform can call measured (macOS read it, elsewhere it is logical),
+        // or on Linux, where reflinks may share it, an upper bound.
+        let sizing: HashMap<String, ReclaimSizing> = [&half, &whole]
+            .iter()
+            .map(|dir| {
+                #[cfg(target_os = "macos")]
+                let sizing = ReclaimSizing::Private {
+                    bytes: dir.bytes,
+                    hard_linked: 0,
+                };
+                #[cfg(target_os = "linux")]
+                let sizing = ReclaimSizing::MayShare;
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let sizing = ReclaimSizing::Logical;
+                (dir.path.clone(), sizing)
+            })
+            .collect();
         let (items, summary) = build_reclaim(
             &[half, whole],
-            &HashMap::new(),
+            &sizing,
             &GitStorage::default(),
             &branches(),
             &[],
@@ -3747,9 +3910,15 @@ mod tests {
             ReclaimSafety::Safe,
             "a tree that WAS read to the end is still offered"
         );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             summary.reclaimable_bytes, read.bytes,
             "only the tree that was read in full counts towards reclaimable bytes"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            summary.reclaimable_bytes, 0,
+            "reflinks may share either tree, so neither is reclaimable"
         );
     }
 
