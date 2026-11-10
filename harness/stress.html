@@ -19,7 +19,7 @@
       const SCENARIO = q.get("scenario") ?? "mount";
       const TABS = Number(q.get("tabs") ?? 4);
       const CYCLES = Number(q.get("cycles") ?? 25);
-      // `scenario=flushcost` only: repository files listed by the Code view's
+      // `scenario=treebuilds` only: repository files listed by the Code view's
       // fixture, and changed files reported by `cmd_get_status`.
       const PATHS = Number(q.get("paths") ?? 0);
       const DIRTY = Number(q.get("dirty") ?? 0);
@@ -486,15 +486,10 @@
         StatusBar: () => import("../src/lib/components/StatusBar.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
         FileTreePanel: () => import("../src/lib/components/files/FileTreePanel.svelte"),
-        RepoTabBar: () => import("../src/lib/components/RepoTabBar.svelte"),
       };
       const Component = (await pickNamedFunction(LOADERS, COMPONENT, Object.keys(LOADERS))()).default;
 
-      // The flush-cost probe is the one scenario that needs more tabs than
-      // there are named repositories (500 and 1000 are the numbers it records).
-      const repos = SCENARIO === "flushcost" || SCENARIO === "treebuilds"
-        ? Array.from({ length: Math.max(1, TABS) }, (_, i) => ALL_REPOS[i] ?? `/r/gen-${i}`)
-        : ALL_REPOS.slice(0, Math.max(1, TABS));
+      const repos = ALL_REPOS.slice(0, Math.max(1, TABS));
       for (const r of repos) await repoStore.openRepo(r, { activate: true });
 
       // TerminalPanel is props-driven by design -- the dock hands each panel its
@@ -519,7 +514,6 @@
       // Reasons the chosen scenario could not arm. Non-empty means FAIL.
       const armFailures = [];
       let termtabs = null;
-      let flushcost = null;
       let treebuilds = null;
       if (SCENARIO === "churn") {
         // Open and close repositories under the mounted pane. Every close
@@ -662,62 +656,6 @@
         treebuilds = { component: COMPONENT, paths: PATHS, dirty: DIRTY, renderedCharsBeforeProbe: rendered, perClick, perUnrelatedPublish, perStatusChange,
           totals: { clicks: sum(perClick), unrelatedPublishes: sum(perUnrelatedPublish), statusChanges: sum(perStatusChange) } };
         if (rendered === 0) armFailures.push(`harness: treebuilds mounted ${COMPONENT} but it rendered nothing before the probe`);
-      } else if (SCENARIO === "flushcost") {
-        // What one repoStore publish costs the mounted pane, in milliseconds.
-        // The trigger is a file click (`selectFilePath`): a publish that changes
-        // neither the statuses nor the tab list, which is the publish the tree
-        // and the tab strip should not pay for. `flushSync` runs every derived
-        // and effect the publish scheduled, so the interval is the synchronous
-        // consumer cost, not a timer.
-        //
-        // Two arms, interleaved per iteration so host load hits both alike:
-        // `producer` with nothing mounted (the store's own publish) and
-        // `mounted` with the pane up. The consumer cost is mounted minus
-        // producer. Read the minimum and the median; a long task shows in p95.
-        const stats = (xs) => {
-          const s = [...xs].sort((a, b) => a - b);
-          const at = (p) => s[Math.min(s.length - 1, Math.floor(p * s.length))];
-          return { n: s.length, min: +s[0].toFixed(3), median: +at(0.5).toFixed(3), p95: +at(0.95).toFixed(3), max: +s[s.length - 1].toFixed(3) };
-        };
-        // The Code view lists asynchronously; wait for rows rather than sleeping
-        // a guess, and say so if none ever appear.
-        const waitForContent = async () => {
-          for (let i = 0; i < 100 && target.textContent.trim().length === 0; i++) await sleep(100);
-          await sleep(300);
-        };
-        await waitForContent();
-        const rendered = target.textContent.trim().length;
-        const publish = (i) => repoStore.selectFilePath(i % 2 === 0 ? "src/d0/m0/f0.ts" : "src/d0/m0/f1.ts");
-        const warm = 5;
-        const mountedMs = [];
-        const producerMs = [];
-        for (let i = 0; i < CYCLES + warm; i++) {
-          const t0 = performance.now();
-          publish(i);
-          flushSync();
-          const mountedCost = performance.now() - t0;
-          if (instance) { await unmount(instance); instance = null; }
-          const t1 = performance.now();
-          publish(i + 1);
-          flushSync();
-          const producerCost = performance.now() - t1;
-          instance = mount(Component, { target, props: propsFor() });
-          await waitForContent();
-          if (i >= warm) { mountedMs.push(mountedCost); producerMs.push(producerCost); }
-          cycles++;
-        }
-        const mounted = stats(mountedMs);
-        const producer = stats(producerMs);
-        flushcost = {
-          component: COMPONENT, trigger: "selectFilePath", tabs: repos.length, paths: PATHS, dirty: DIRTY,
-          renderedCharsBeforeProbe: rendered,
-          producer, mounted,
-          consumerMedianMs: +(mounted.median - producer.median).toFixed(3),
-          consumerMinMs: +(mounted.min - producer.min).toFixed(3),
-        };
-        if (rendered === 0) {
-          armFailures.push(`harness: flushcost mounted ${COMPONENT} but it rendered nothing before the probe -- the cost read is of an empty pane`);
-        }
       } else if (SCENARIO === "remount") {
         for (let i = 0; i < CYCLES; i++) {
           if (instance) await unmount(instance);
@@ -741,7 +679,6 @@
         component: COMPONENT, scenario: SCENARIO, cycles,
         armed: armFailures.length === 0,
         termtabs,
-        flushcost,
         treebuilds,
         tabsAtEnd: openPaths.length,
         depthExceeded: depthCount(),

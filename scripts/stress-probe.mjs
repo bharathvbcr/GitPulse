@@ -7,12 +7,9 @@
 // measurement rather than pass/fail checks:
 //
 //   node scripts/stress-probe.mjs "c=FileTreePanel&scenario=treebuilds&paths=20000&dirty=20&tabs=1&cycles=8"
-//   node scripts/stress-probe.mjs "c=FileTreePanel&scenario=flushcost&paths=20000&dirty=20&tabs=1&cycles=6"
-//   node scripts/stress-probe.mjs "c=RepoTabBar&scenario=flushcost&tabs=500&cycles=6"
 //
-// Prints one JSON line with `treebuilds` and `flushcost` (null for the scenario
-// not run), and the 1-minute load average before and after: a timing taken
-// above 30 is contaminated, a count is not affected by load.
+// Prints one JSON line with `treebuilds` and the 1-minute load average before and after (a count is not
+// affected by load).
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { loadavg, tmpdir } from "node:os";
@@ -67,8 +64,8 @@ try {
   const loadAfter = loadavg()[0];
   console.log(JSON.stringify({
     armed: result.armed, depthExceeded: result.depthExceeded, mountError: result.mountError, otherCrashes: result.otherCrashes,
-    treebuilds: result.treebuilds, flushcost: result.flushcost,
-    loadBefore, loadAfter, timingContaminated: loadBefore > 30 || loadAfter > 30,
+    treebuilds: result.treebuilds,
+    loadBefore, loadAfter,
   }));
 } catch (error) {
   console.error(String(error));
