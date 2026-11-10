@@ -3,11 +3,11 @@ import {
   hitTestCodeGraph,
   paintCodeGraph,
   DEFAULT_CODE_GRAPH_THEME,
-} from "../CodeGraphRenderer";
-import { buildCodeGraphModel } from "../../../codeintel/graphPayload";
+  buildCodeGraphModel,
+  type ProjectedPoint,
+} from "../../../codeintel/codeMap";
 import type { GraphVizPayload } from "../../../codeintel/types";
 import { getLanguageIconColor } from "../../../language/languageLogos";
-import type { ProjectedPoint } from "../../../codeintel/globeLayout";
 
 function recordingCtx() {
   const calls: string[] = [];

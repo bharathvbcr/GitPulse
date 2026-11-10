@@ -1,4 +1,4 @@
-import { disambiguateSuffixes } from "../codeintel/labelDisambiguation";
+import { disambiguateSuffixes } from "../codeintel/codeMap";
 
 export interface PathIdentityOptions {
   caseInsensitive: boolean;

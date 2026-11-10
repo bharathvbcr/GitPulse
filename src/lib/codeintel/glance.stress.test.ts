@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestOf } from "../__tests__/perfBudget";
 import { blastGlance, confidenceLabel, hedgedCount } from "./blastGlance";
-import { nodeLabel, nodeLabelText, nodeFilePath, looksLikePath } from "./nodeLabel";
+import { nodeLabel, nodeLabelText, nodeFilePath, looksLikePath } from "./codeMap";
 import { firstClause, summarizeWalkIncomplete, tooltipWalkIncomplete } from "./walkIncomplete";
 import { fileGlance, fileHonesty, markerForHonesty } from "./previewSummary";
 import type { ComposedBlastRadius, ComposedBlastLayer } from "./blastCompose";

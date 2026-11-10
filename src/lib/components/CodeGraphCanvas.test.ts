@@ -77,7 +77,7 @@ describe("CodeGraphCanvas interaction cost and recovery", () => {
 
 describe("buildCodeGraphModel layout space", () => {
   it("defaults to the fixed content space the canvas passes", async () => {
-    const graph = await import("../codeintel/graphPayload");
+    const graph = await import("../codeintel/codeMap");
     const payload = { nodes: [{ id: "a", name: "a" }, { id: "b", name: "b" }, { id: "c", name: "c" }], links: [{ source: "a", target: "b" }] };
     const fixed = graph.buildCodeGraphModel(payload, graph.CODE_GRAPH_LAYOUT_WIDTH, graph.CODE_GRAPH_LAYOUT_HEIGHT);
     expect(graph.buildCodeGraphModel(payload).nodes.map((n) => [n.x, n.y])).toEqual(fixed.nodes.map((n) => [n.x, n.y]));

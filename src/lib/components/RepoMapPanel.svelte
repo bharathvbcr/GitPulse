@@ -81,15 +81,16 @@
     roleSample,
     unwiredExclusionSummary,
   } from "../codeintel/repoMap";
-  import { buildAreaTree, summaryWithoutArea } from "../codeintel/areaTree";
   import {
+    buildAreaTree,
+    summaryWithoutArea,
     ancestorKeys,
     neighborRowKey,
     NO_KEYS,
     subsystemNodeId,
     treeKeyOutcome,
     visibleAreaRows,
-  } from "../codeintel/areaTreeNav";
+  } from "../codeintel/codeMap";
   import { tick } from "svelte";
   import { ChevronDown, ChevronRight, Map as MapIcon } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";

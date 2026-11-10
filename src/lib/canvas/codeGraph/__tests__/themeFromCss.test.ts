@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CODE_GRAPH_THEME } from "../CodeGraphRenderer";
+import { DEFAULT_CODE_GRAPH_THEME } from "../../../codeintel/codeMap";
 import { codeGraphThemeFromTokens } from "../themeFromCss";
 
 describe("codeGraphThemeFromTokens", () => {

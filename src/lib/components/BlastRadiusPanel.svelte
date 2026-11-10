@@ -22,7 +22,7 @@
   import { isCancelledReason, type ComposedBlastRadius } from "../codeintel/blastCompose";
   import { boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import { blastGlance, confidenceLabel } from "../codeintel/blastGlance";
-  import { nodeLabel } from "../codeintel/nodeLabel";
+  import { nodeLabel } from "../codeintel/codeMap";
   import { ChevronDown, ChevronRight, Loader2 } from "@lucide/svelte";
 
   let {

@@ -4,7 +4,7 @@
  * no tokens, so it can move into a standalone package unchanged.
  */
 
-import { DEFAULT_CODE_GRAPH_THEME, type CodeGraphTheme } from "./CodeGraphRenderer";
+import { DEFAULT_CODE_GRAPH_THEME, type CodeGraphTheme } from "../../codeintel/codeMap";
 
 /** Reads one custom property, e.g. `--c-text`; returns "" when it is unset. */
 export type TokenReader = (name: string) => string;

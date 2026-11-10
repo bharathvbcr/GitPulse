@@ -16,17 +16,12 @@
     paintCodeGraph,
     type CodeGraphGlobeFrame,
     type CodeGraphTheme,
-  } from "../canvas/codeGraph/CodeGraphRenderer";
-  import { codeGraphThemeFromElement } from "../canvas/codeGraph/themeFromCss";
-  import {
     buildCodeGraphModel,
     CODE_GRAPH_LAYOUT_HEIGHT,
     CODE_GRAPH_LAYOUT_WIDTH,
     graphLanguageLegend,
     truncationLegend,
     type CodeGraphModel,
-  } from "../codeintel/graphPayload";
-  import {
     clampPitch,
     layoutOnSphere,
     lerpRotation,
@@ -35,8 +30,14 @@
     rotationToFace,
     type GlobeView,
     type ProjectedPoint,
-  } from "../codeintel/globeLayout";
-  import { buildGraphIndex, filterGraphNodes, fitGraphView, graphNodeOpenPath, traceGraph, type TraceDirection } from "../codeintel/graphNavigation";
+    buildGraphIndex,
+    filterGraphNodes,
+    fitGraphView,
+    graphNodeOpenPath,
+    traceGraph,
+    type TraceDirection,
+  } from "../codeintel/codeMap";
+  import { codeGraphThemeFromElement } from "../canvas/codeGraph/themeFromCss";
   import type { GraphVizLoad } from "../codeintel/types";
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { easeOutCubic, motionDuration, prefersReducedMotion } from "../motion/easing";

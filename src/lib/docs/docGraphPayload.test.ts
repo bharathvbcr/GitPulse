@@ -5,8 +5,7 @@ import {
   docGraphToVizPayload,
 } from "./docGraphPayload";
 import type { DocGraph } from "./client";
-import { buildCodeGraphModel } from "../codeintel/graphPayload";
-import { buildGraphIndex, filterGraphNodes } from "../codeintel/graphNavigation";
+import { buildCodeGraphModel, buildGraphIndex, filterGraphNodes } from "../codeintel/codeMap";
 
 const sample: DocGraph = {
   nodes: [
