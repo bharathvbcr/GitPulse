@@ -24,25 +24,25 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-3.5">
-  <div class="flex items-center justify-between border-b border-border/50 pb-2.5">
+<div class="gp-card p-4 flex flex-col gap-3.5">
+  <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       <Clock size={15} class="text-accent shrink-0" />
-      <span class="text-xs font-semibold text-textPrimary uppercase tracking-wider">Commit Punch Card</span>
-      <span class="text-[11px] text-textMuted">(Day of Week × Hour of Day)</span>
+      <span class="text-xs font-semibold text-textPrimary">Commit punch card</span>
+      <span class="text-meta text-textMuted">(day of week by hour of day)</span>
     </div>
 
     <!-- After-hours share. Not a broken-streak treatment. -->
     <div
-      class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border {punch.afterHoursPercentage > 40
-        ? 'bg-amber-500/10 text-amber-500 border-amber-500/30'
-        : 'bg-surface text-textMuted border-border/60'}"
+      class="gp-chip"
+      data-kind="label"
+      data-tone={punch.afterHoursPercentage > 40 ? "warn" : "neutral"}
       title={scoped
         ? "Commits outside Mon–Fri 09:00–18:00 local time. Filtered to the selected author. Never sent off-device."
         : "Commits outside Mon–Fri 09:00–18:00 local time. Repository-wide — every author on every local and remote branch. Never sent off-device."}
     >
       <Moon size={12} class="shrink-0" />
-      <span>{punch.afterHoursPercentage}% After-Hours</span>
+      <span>{punch.afterHoursPercentage}% after hours</span>
     </div>
   </div>
 
@@ -50,7 +50,7 @@
   <div class="overflow-x-auto pb-1 select-none">
     <div class="inline-flex flex-col gap-1 min-w-[620px]">
       <!-- Hour header labels -->
-      <div class="flex text-[10px] text-textMuted h-4">
+      <div class="flex text-micro text-textMuted h-4">
         <div class="w-8 shrink-0"></div>
         <div class="flex-1 grid grid-cols-24 text-center">
           {#each Array(24) as _, h}
@@ -65,7 +65,7 @@
       <div class="flex flex-col gap-1.5">
         {#each dayNames as dayName, dayIdx}
           <div class="flex items-center gap-2">
-            <span class="w-8 text-[10px] font-medium text-textMuted text-right shrink-0">{dayName}</span>
+            <span class="w-8 text-micro font-medium text-textMuted text-right shrink-0">{dayName}</span>
             <div class="flex-1 grid grid-cols-24 gap-1 items-center h-5">
               {#each Array(24) as _, h}
                 {@const cell = punch.cells.find((c) => c.dayOfWeek === dayIdx && c.hour === h)}
@@ -82,7 +82,7 @@
                 >
                   {#if count > 0}
                     <div
-                      class="rounded-full bg-accent transition-all group-hover:scale-125 group-hover:ring-2 group-hover:ring-accent/40"
+                      class="rounded-full bg-accent transition-transform group-hover:scale-125 group-hover:ring-2 group-hover:ring-accent/40"
                       style="width: {radius}px; height: {radius}px; opacity: {0.3 + 0.7 * (count / punch.maxCount)};"
                     ></div>
                   {:else}
@@ -100,20 +100,21 @@
   </div>
 
   <!-- Footer Info & Privacy notice -->
-  <div class="flex items-center justify-between text-[11px] text-textMuted pt-1 border-t border-border/40">
+  <div class="gp-separator" aria-hidden="true"></div>
+  <div class="flex items-center justify-between text-meta text-textMuted">
     <div>
       {#if hoveredCell && hoveredCell.count > 0}
         <span class="font-medium text-textPrimary">{dayNames[hoveredCell.dayOfWeek]} at {formatHour(hoveredCell.hour)}</span>:
         <span class="text-accent font-medium">{hoveredCell.count} commit{hoveredCell.count === 1 ? '' : 's'}</span>
         {#if hoveredCell.churn > 0}
-          <span class="text-[10px] text-textMuted ml-1">({hoveredCell.churn.toLocaleString()} lines churned)</span>
+          <span class="text-micro text-textMuted ml-1">({hoveredCell.churn.toLocaleString()} lines churned)</span>
         {/if}
       {:else}
         <span>Dot size corresponds to commit frequency for each hour slot</span>
       {/if}
     </div>
 
-    <div class="flex items-center gap-1.5 text-[10px] text-textMuted">
+    <div class="flex items-center gap-1.5 text-micro text-textMuted">
       <ShieldCheck size={12} class="text-accent shrink-0" />
       <span>{scoped ? "Selected author, local time" : "All authors, local time"}; never leaves your machine</span>
     </div>

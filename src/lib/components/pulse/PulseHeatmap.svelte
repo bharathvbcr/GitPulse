@@ -3,7 +3,8 @@
   import type { HeatmapDay, PulseCommitSummary } from "../../pulse/types";
   import { repoStore } from "../../stores/repoStore";
   import { filterStore } from "../../stores/filterStore";
-  import { Activity, Flame, Hash } from "@lucide/svelte";
+  import SettingSegment from "../SettingSegment.svelte";
+  import { Activity } from "@lucide/svelte";
 
   let {
     commits = [],
@@ -50,9 +51,9 @@
       case 3:
         return "bg-accent/80 hover:ring-1 hover:ring-accent";
       case 4:
-        return "bg-accent hover:ring-1 hover:ring-white";
+        return "bg-accent hover:ring-1 hover:ring-onAccent";
       default:
-        return "bg-surface/90 hover:bg-border/60";
+        return "bg-surfaceHover hover:bg-border/60";
     }
   }
 
@@ -71,43 +72,30 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-3">
-  <div class="flex items-center justify-between border-b border-border/50 pb-2.5">
+<div class="gp-card p-4 flex flex-col gap-3">
+  <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       <Activity size={15} class="text-accent shrink-0" />
-      <span class="text-xs font-semibold text-textPrimary uppercase tracking-wider">Contribution Calendar</span>
-      <span class="text-[11px] text-textMuted">(Past 53 Weeks)</span>
+      <span class="text-xs font-semibold text-textPrimary">Contribution calendar</span>
+      <span class="text-meta text-textMuted">(Past 53 weeks)</span>
     </div>
 
-    <div class="flex items-center gap-1 bg-background/80 p-0.5 rounded-lg border border-border/60 text-[11px]">
-      <button
-        type="button"
-        onclick={() => (mode = "count")}
-        class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1.5 {mode === 'count'
-          ? 'bg-surface font-medium text-textPrimary shadow-xs'
-          : 'text-textMuted hover:text-textPrimary'}"
-      >
-        <Hash size={12} />
-        <span>Commits</span>
-      </button>
-      <button
-        type="button"
-        onclick={() => (mode = "churn")}
-        class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1.5 {mode === 'churn'
-          ? 'bg-surface font-medium text-textPrimary shadow-xs'
-          : 'text-textMuted hover:text-textPrimary'}"
-      >
-        <Flame size={12} />
-        <span>Churn (LOC)</span>
-      </button>
-    </div>
+    <SettingSegment
+      ariaLabel="Calendar measure"
+      options={[
+        { value: "count", label: "Commits" },
+        { value: "churn", label: "Lines changed" },
+      ]}
+      value={mode}
+      onselect={(next) => (mode = next)}
+    />
   </div>
 
   <!-- Heatmap Calendar Grid -->
   <div class="overflow-x-auto pb-1 select-none">
     <div class="inline-flex flex-col gap-1 min-w-[720px]">
       <!-- Month headers -->
-      <div class="flex text-[10px] text-textMuted h-4 relative">
+      <div class="flex text-micro text-textMuted h-4 relative">
         <div class="w-6 shrink-0"></div>
         <div class="flex-1 flex relative">
           {#each monthLabels as month}
@@ -124,7 +112,7 @@
       <!-- 7 rows x 53 columns -->
       <div class="flex gap-1">
         <!-- Day labels column -->
-        <div class="flex flex-col justify-between text-[9px] text-textMuted w-6 pt-0.5 pb-0.5 shrink-0">
+        <div class="flex flex-col justify-between text-micro text-textMuted w-6 pt-0.5 pb-0.5 shrink-0">
           <span class="h-2.5">Sun</span>
           <span class="h-2.5">Tue</span>
           <span class="h-2.5">Thu</span>
@@ -146,7 +134,7 @@
                     onkeydown={(e) => handleDayKey(day, e)}
                     onmouseenter={() => (hoveredDay = day)}
                     onmouseleave={() => (hoveredDay = null)}
-                    class="w-[10.5px] h-[10.5px] rounded-[2px] transition-all cursor-pointer {cellColor(day.level)}"
+                    class="w-[10.5px] h-[10.5px] rounded-xs transition-colors duration-(--gp-dur-instant) ease-(--gp-ease-effect) cursor-pointer {cellColor(day.level)}"
                     title="{day.date}: {day.count} commit{day.count === 1 ? '' : 's'} (+{day.additions} / -{day.deletions})"
                   ></div>
                 {:else}
@@ -161,32 +149,32 @@
   </div>
 
   <!-- Footer Info & Legend -->
-  <div class="flex items-center justify-between text-[11px] text-textMuted pt-1 border-t border-border/40">
+  <div class="flex items-center justify-between gap-3 text-meta text-textMuted pt-1">
     <div class="min-h-4 text-textPrimary">
       {#if hoveredDay}
         <span class="font-medium text-textPrimary">{hoveredDay.date}</span>:
         <span class="text-accent font-medium">{hoveredDay.count} commit{hoveredDay.count === 1 ? '' : 's'}</span>
         {#if hoveredDay.churn > 0}
-          <span class="text-[10px] text-textMuted ml-1">
-            (<span class="text-emerald-500 font-mono">+{hoveredDay.additions}</span> /
-            <span class="text-rose-500 font-mono">-{hoveredDay.deletions}</span>)
+          <span class="text-micro text-textMuted ml-1">
+            (<span class="text-ok font-mono">+{hoveredDay.additions}</span> /
+            <span class="text-danger font-mono">-{hoveredDay.deletions}</span>)
           </span>
         {/if}
         {#if hoveredDay.count > 0}
-          <span class="text-[10px] text-accent/80 ml-2 italic underline">Click to view in Graph</span>
+          <span class="text-micro text-accent ml-2">Click to view in the graph</span>
         {/if}
       {:else}
-        <span>Hover over a day for details • Click to filter Graph view</span>
+        <span>Hover a day for details. Click it to filter the graph.</span>
       {/if}
     </div>
 
-    <div class="flex items-center gap-1.5 text-[10px]">
+    <div class="flex items-center gap-1.5 text-micro">
       <span>Less</span>
-      <span class="w-2.5 h-2.5 rounded-[2px] bg-surface/90 border border-border/40"></span>
-      <span class="w-2.5 h-2.5 rounded-[2px] bg-accent/30"></span>
-      <span class="w-2.5 h-2.5 rounded-[2px] bg-accent/55"></span>
-      <span class="w-2.5 h-2.5 rounded-[2px] bg-accent/80"></span>
-      <span class="w-2.5 h-2.5 rounded-[2px] bg-accent"></span>
+      <span class="w-2.5 h-2.5 rounded-xs bg-surfaceHover border border-edgeSoft"></span>
+      <span class="w-2.5 h-2.5 rounded-xs bg-accent/30"></span>
+      <span class="w-2.5 h-2.5 rounded-xs bg-accent/55"></span>
+      <span class="w-2.5 h-2.5 rounded-xs bg-accent/80"></span>
+      <span class="w-2.5 h-2.5 rounded-xs bg-accent"></span>
       <span>More</span>
     </div>
   </div>

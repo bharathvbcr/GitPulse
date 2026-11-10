@@ -123,8 +123,8 @@ describe("PulseHeatmap click-to-filter", () => {
   });
 
   it("labels the 53-week calendar as 53 weeks", () => {
-    expect(heatmap).toContain("Past 53 Weeks");
-    expect(heatmap).not.toContain("Past 52 Weeks");
+    expect(heatmap).toMatch(/past 53 weeks/i);
+    expect(heatmap).not.toMatch(/past 52 weeks/i);
   });
 });
 

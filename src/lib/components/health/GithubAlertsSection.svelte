@@ -3,6 +3,7 @@
   import HealthTable from "./HealthTable.svelte";
   import HealthPreviewToggle from "./HealthPreviewToggle.svelte";
   import { healthSection } from "../../health/sections";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import type { SectionCount } from "../../health/counts";
   import type { HealthTone } from "../../health/summary";
   import type { CodeScanningReport, DependabotReport } from "../../health/types";
@@ -90,31 +91,34 @@
 </script>
 
 {#snippet partialNotice()}
-  <div
-    role="status"
-    data-testid="github-alerts-partial"
-    class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200"
-  >
-    Incomplete: the {missingTiers.join(", ")} severity
-    {missingTiers.length === 1 ? "tier" : "tiers"} of {noun} could not be fetched, so alerts
-    of {missingTiers.length === 1 ? "that severity" : "those severities"} may be missing.
-    Check again to retry.
+  <div role="status" data-testid="github-alerts-partial" class="gp-notice" data-tone="warn">
+    <div class="min-w-0 flex-1">
+      Incomplete: the {missingTiers.join(", ")} severity
+      {missingTiers.length === 1 ? "tier" : "tiers"} of {noun} could not be fetched, so alerts
+      of {missingTiers.length === 1 ? "that severity" : "those severities"} may be missing.
+      Check GitHub alerts again to fill the gap.
+    </div>
   </div>
 {/snippet}
 
 <HealthSection {id} count={empty ? null : count} {tone}>
   {#if !report}
-    <p class="text-textMuted">
-      Not checked. Use <span class="font-medium text-textSecondary">Check GitHub alerts</span>
-      above to fetch them — no result has been loaded for this repository, which is
-      not the same as there being none.
-    </p>
+    <!-- Not checked is not "none": the notice is the unknown tone, drawn
+         dashed, so it cannot be mistaken for a clean result. -->
+    <div role="status" class="gp-notice" data-tone="unknown">
+      <div class="min-w-0 flex-1">
+        Not checked. Use <span class="font-medium">Check GitHub alerts</span>
+        above to fetch them — no result has been loaded for this repository, which is
+        not the same as there being none.
+      </div>
+    </div>
   {:else if report.error}
-    <div
-      role="alert"
-      class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200"
-    >
-      Could not fetch {noun}: {report.error}
+    {@const failure = describeFailure({ verb: "fetch", object: noun }, report.error)}
+    <div role="alert" class="gp-notice" data-tone="warn">
+      <div class="min-w-0 flex-1">
+        <span class="font-medium">{failure.headline}</span>
+        {#if failure.detail}{failure.detail}{/if}
+      </div>
     </div>
     {#if !requestFailed && !report.cli_present && report.is_github_remote}
       <p class="text-textMuted">
@@ -123,11 +127,13 @@
       </p>
     {/if}
   {:else if !report.cli_present}
-    <p class="text-textMuted">
-      Install the <span class="font-mono">gh</span> CLI and run
-      <span class="font-mono">gh auth login</span> to fetch {noun} for
-      {report.slug || "this repository"}.
-    </p>
+    <div role="status" class="gp-notice" data-tone="unknown">
+      <div class="min-w-0 flex-1">
+        Install the <span class="font-mono">gh</span> CLI and run
+        <span class="font-mono">gh auth login</span> to fetch {noun} for
+        {report.slug || "this repository"}.
+      </div>
+    </div>
   {:else if empty}
     {#if missingTiers.length > 0}
       {@render partialNotice()}

@@ -23,6 +23,19 @@ describe("PulseHotspotMap component", () => {
     expect(source).toContain("missing coverage is not treated as 0%");
   });
 
+  it("states a failed coverage scan in the unknown tone", () => {
+    expect(source).toContain('class="gp-notice mt-1" data-tone="unknown"');
+    expect(source).toContain("Couldn't scan coverage.");
+  });
+
+  it("carries both numbers when filters narrow the ranked list", () => {
+    expect(source).toContain("Showing {filteredHotspots.length} of {allHotspots.length} ranked");
+  });
+
+  it("keeps the level filter a toggle: choosing the active level clears it", () => {
+    expect(source).toContain('selectedLevel = selectedLevel === next ? "all" : next');
+  });
+
   it("renders no percentage at all when a file has no coverage record", () => {
     expect(source).toContain("hotspot.coveragePercentage !== null");
     expect(source).toContain('hotspot.coverageStatus === "unscanned"');

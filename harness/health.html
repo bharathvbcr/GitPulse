@@ -236,7 +236,7 @@
         .find(node => (node.getAttribute("aria-label") || node.textContent.trim()).includes(name));
       const section = id => root.querySelector(`[data-health-section="${id}"]`);
       const scroller = () => root.querySelector(".overflow-auto");
-      const header = () => root.querySelector(".gp-section-edge");
+      const header = () => root.querySelector(".gp-header");
       const agentBar = () => root.querySelector('[aria-label="Send a health task to a coding agent"]');
       const rescan = async next => {
         mode = next;
@@ -348,11 +348,11 @@
             [...agentBar().querySelector('select[aria-label="Health agent task"]').options]
               .map(option => option.textContent.trim()).join(",")
               === "Fix dependencies,Improve coverage,Fix secrets,Optimize storage");
-          check("the bar has Run, Copy and Preview, and Fix with MANVI stays in the header", () =>
+          check("the bar has Run, Copy and Preview, and Fix with Manvi stays in the header", () =>
             !!agentBar().querySelector('button[aria-label^="Run "]')
               && !!agentBar().querySelector('button[aria-label="Copy health agent prompt"]')
               && !!agentBar().querySelector('button[aria-expanded]')
-              && has(header(), "Fix with MANVI"));
+              && has(header(), "Fix with Manvi"));
           check("the agent bar does not clip its controls", () =>
             agentBar().scrollWidth <= agentBar().clientWidth + 1);
 
@@ -430,7 +430,7 @@
             has(section("dependabot"), "No open Dependabot alerts"));
           githubMode = "unavailable";
           button("Check GitHub alerts").click();
-          await until(() => has(section("dependabot"), "Could not fetch"));
+          await until(() => has(section("dependabot"), "Couldn't fetch"));
           check("an unreachable feed names its error", () =>
             has(section("dependabot"), "gh: command not found"));
           check("an unreachable feed is not an all-clear", () =>
@@ -465,7 +465,7 @@
               previewRows(id) === 8 && has(previewToggle(id), label) && previewToggle(id).getAttribute("aria-expanded") === "false");
           }
           check("the issue list opens on its first 8 issues, with Show all beneath it", () =>
-            section("issues").querySelectorAll(".rounded-xl.border:not([data-health-preview-toggle])").length === 8
+            section("issues").querySelectorAll(".gp-notice").length === 8
               && has(previewToggle("issues"), "Show all 60 issues"));
           previewToggle("outdated").click();
           await tick();
@@ -572,7 +572,7 @@
             has(root, "did not run")
               && !has(root, "Every scan completed with no findings"));
           check("a missing code graph is named as missing", () =>
-            has(section("code-graph"), "No code graph for this repository"));
+            has(section("code-graph"), "No code map for this repository"));
 
           // ---- Stress: failure and recovery ----------------------------------
           mode = "failed";
@@ -589,7 +589,7 @@
             !!section("summary"));
           check("the failure banner is an alert that says the report is from the previous scan", () =>
             !!failureAlert()
-              && has(failureAlert(), "Scan failed: Fixture health scan failed")
+              && has(failureAlert(), "Couldn't scan this repository. Fixture health scan failed")
               && has(failureAlert(), "Showing results from the previous scan"));
           check("the failure banner offers Try again and Open Diagnostics", () =>
             [...failureAlert().querySelectorAll("button")].map(b => b.textContent.trim()).join("|")
@@ -599,7 +599,7 @@
           // A repository with no earlier report has nothing to keep, and must not
           // be shown another repository's findings.
           await repoStore.openRepo("/fixture/Fresh");
-          await until(() => !!failureAlert() && has(failureAlert(), "Scan failed"));
+          await until(() => !!failureAlert() && has(failureAlert(), "Couldn't scan this repository"));
           check("a failed first scan shows no report and does not claim a previous one", () =>
             !section("summary") && !has(failureAlert(), "previous scan"));
           await repoStore.openRepo("/fixture/GitPulse");

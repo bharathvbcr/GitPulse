@@ -2,7 +2,9 @@
   import { onMount } from "svelte";
   import HealthSection from "./HealthSection.svelte";
   import { createListenerTracker } from "../../dom/listenerTracker";
-  import { formatError } from "../../ui/formatError";
+  import { ShieldCheck } from "@lucide/svelte";
+  import EmptyState from "../EmptyState.svelte";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import {
     describeSender,
     loadTerminalIncidents,
@@ -22,6 +24,11 @@
   let loadError = $state<string | null>(null);
   let loaded = $state(false);
 
+  function failureLine(verb: string, object: string, cause: unknown): string {
+    const failure = describeFailure({ verb, object }, cause);
+    return failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
+  }
+
   onMount(() => {
     const listeners = createListenerTracker();
     // Live events that arrive while the first read is in flight must survive it.
@@ -30,14 +37,14 @@
     })
       .then((stop) => listeners.track(stop))
       .catch((cause) => {
-        loadError = `Live updates unavailable: ${formatError(cause)}`;
+        loadError = failureLine("watch", "terminal incidents", cause);
       });
     loadTerminalIncidents()
       .then((rows) => {
         incidents = rows.reduce((merged, row) => mergeIncident(merged, row), incidents);
       })
       .catch((cause) => {
-        loadError = `Could not read terminal incidents: ${formatError(cause)}`;
+        loadError = failureLine("read", "terminal incidents", cause);
       })
       .finally(() => {
         loaded = true;
@@ -48,12 +55,14 @@
 
 <HealthSection id="terminal-incidents">
   {#if loadError}
-    <p role="alert" class="text-[11px] text-amber-300">{loadError}</p>
+    <div role="alert" class="gp-notice" data-tone="unknown">
+      <div class="min-w-0 flex-1">{loadError}</div>
+    </div>
   {/if}
   {#if incidents.length > 0}
     <ul class="space-y-1.5">
       {#each incidents as incident (incident.id)}
-        <li class="rounded-xl border border-border/70 bg-surface px-3 py-2 text-[11px]">
+        <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-meta">
           <div class="flex items-baseline justify-between gap-3 flex-wrap">
             <span class="font-medium text-textPrimary">
               {incident.session_ids.length} sessions ended by
@@ -65,7 +74,7 @@
           </div>
           <div class="mt-0.5 text-textSecondary">
             Sender:
-            <span class="font-mono {incident.sender ? 'text-textPrimary' : 'text-amber-300'}"
+            <span class="font-mono {incident.sender ? 'text-textPrimary' : 'text-warn'}"
               >{describeSender(incident)}</span
             >
           </div>
@@ -76,8 +85,11 @@
       {/each}
     </ul>
   {:else if loaded && !loadError}
-    <p class="text-[11px] text-textMuted">
-      No terminal sessions have been killed from outside since GitPulse started.
-    </p>
+    <EmptyState
+      icon={ShieldCheck}
+      title="No terminal sessions ended from outside"
+      hint="Incidents are kept in memory, so this covers the time since GitPulse started."
+      compact
+    />
   {/if}
 </HealthSection>

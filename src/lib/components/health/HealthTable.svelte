@@ -51,7 +51,7 @@
      SEVER/ITY, PACKA/GE — while the column shrinks to fit. `nowrap` keeps
      each header on one line. It does not size the column; `table-fixed`
      does, so a long cell cannot shrink its neighbours down to that word. -->
-<div class="min-w-0 border border-border/70 rounded-2xl overflow-hidden shadow-card">
+<div class="min-w-0 border border-edge rounded-2xl overflow-hidden shadow-card">
   <!-- `fixed` so a column's width comes from the table and the header widths,
        not from the longest cell. Without it, one unbreakable package name's
        max-content takes the spare width and the fix column collapses until
@@ -62,7 +62,7 @@
        severity badge and the version in the middle of that row. -->
   <table class="w-full table-fixed text-left">
     <caption class="sr-only">{caption}</caption>
-    <thead class="bg-surface text-[10px] uppercase text-textMuted">
+    <thead class="gp-label bg-surface">
       <tr>
         {#each keyedList(columns, (column) => column.label) as { item: column, key } (key)}
           <th scope="col" class="whitespace-nowrap px-3 py-2 font-medium {column.width ?? ''}">
@@ -75,7 +75,7 @@
         {/each}
       </tr>
     </thead>
-    <tbody class="align-top [overflow-wrap:anywhere]">
+    <tbody class="align-top [overflow-wrap:anywhere] [&>tr:nth-child(even)]:bg-surface/50">
       {@render children()}
     </tbody>
   </table>

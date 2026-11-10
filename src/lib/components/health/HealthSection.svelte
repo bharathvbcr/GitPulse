@@ -6,7 +6,8 @@
     healthSectionHeadingId,
   } from "../../health/sections";
   import { formatSectionCount, isBounded, type SectionCount } from "../../health/counts";
-  import { toneChipClass, toneLabel } from "../../health/format";
+  import { toneLabel } from "../../health/format";
+  import { roleTone } from "./tone";
   import type { HealthTone } from "../../health/summary";
 
   /**
@@ -69,32 +70,21 @@
   >
     <span id={`${headingId}-desc`} class="sr-only">{spec.summary}</span>
     <div class="flex items-center justify-between gap-3 flex-wrap">
-      <h3
-        id={headingId}
-        class="flex items-baseline gap-2 text-[11px] font-bold uppercase tracking-wider text-textSecondary"
-      >
+      <h3 id={headingId} class="gp-label flex items-baseline gap-2">
         <span>{spec.heading}</span>
         {#if count}
           <!-- The count and its disclosure are one string from one owner, so
                a bounded section cannot print only what survived the bound. -->
-          <span
-            class="font-mono normal-case tracking-normal {bounded
-              ? 'text-amber-300'
-              : 'text-textMuted'}">({formatSectionCount(count)})</span
-          >
+          <span class="font-mono {bounded ? 'text-warn' : 'text-textMuted'}">({formatSectionCount(count)})</span>
         {/if}
         {#if tone}
-          <span
-            class="px-1.5 py-0.5 rounded-full border text-[9px] font-semibold normal-case tracking-normal {toneChipClass(
-              tone,
-            )}">{toneLabel(tone)}</span
-          >
+          <span class="gp-chip self-center" data-kind="label" data-tone={roleTone(tone)}>{toneLabel(tone)}</span>
         {/if}
       </h3>
       {@render actions?.()}
     </div>
     {#if caveat}
-      <p class="text-[11px] text-amber-300 leading-relaxed">{caveat}</p>
+      <p class="text-meta text-warn leading-relaxed">{caveat}</p>
     {/if}
     {@render children()}
   </section>

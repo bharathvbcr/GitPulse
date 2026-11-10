@@ -83,7 +83,7 @@ export async function runHealthChecks(ctx) {
 
     // ---- Remediation plan --------------------------------------------------------
     knobs.fixHandler = () => aiResult("1. Audit: `npm audit`\n2. Update: `npm update`");
-    button("Fix with MANVI").click();
+    button("Fix with Manvi").click();
     await until(() => !!section("plan") && has(section("plan"), "Run all steps"));
     check("the model is sent exactly the report that Copy report copies", () => aiCalls.length === 1 && aiCalls[0].report === copiedReport && aiCalls[0].repoPath === REPO);
     knobs.runHandler = (argv) => done({
@@ -92,7 +92,7 @@ export async function runHealthChecks(ctx) {
     });
     const stepJournal = journal("remediation-step").length;
     button("Run all steps").click();
-    await until(() => has(section("plan"), "Retry"));
+    await until(() => has(section("plan"), "Try again"));
     await wait(120);
     check("run all stops at the first failing step", () => runs.length === 1 && runs[0].args.join(" ") === "npm audit");
     check("a remediation step reaches the backend under the health kind with its own argv", () =>
@@ -121,7 +121,7 @@ export async function runHealthChecks(ctx) {
     check("the step that settled after the switch is still journaled", () => journal("remediation-step").length === staleJournal + 1);
     await rescan("findings");
 
-    button("Fix with MANVI").click();
+    button("Fix with Manvi").click();
     await until(() => !!section("plan") && has(section("plan"), "Rescan Health"));
     repoStore.setTerminalOpen(false);
     button("Terminal").click(); await tick();
@@ -168,7 +168,7 @@ export async function runHealthChecks(ctx) {
     document.execCommand = () => false;
     button("Copy health agent prompt").click(); await wait();
     check("a refused prompt copy says so and opens the preview to copy from", () =>
-      has(agentBar(), "Could not copy. Open Preview prompt and copy it from there.") && !!agentBar().querySelector('button[aria-expanded="true"]'));
+      has(agentBar(), "Couldn't copy the prompt. Open Preview prompt and copy it from there.") && !!agentBar().querySelector('button[aria-expanded="true"]'));
     document.execCommand = execBefore;
     setClipboard(async text => { copied.push(text); });
 
@@ -210,7 +210,7 @@ export async function runHealthChecks(ctx) {
     for (const id of ["dependabot", "code-scanning"]) {
       setGithub("throws");
       button("Check GitHub alerts").click();
-      await until(() => has(section(id), "Could not fetch"));
+      await until(() => has(section(id), "Couldn't fetch"));
       check(`${id}: a failed request is not told to install the CLI`, () => has(section(id), "Fixture IPC failure") && !has(section(id), "Install the gh CLI"));
       setGithub("unavailable");
       button("Check GitHub alerts").click();
@@ -218,7 +218,7 @@ export async function runHealthChecks(ctx) {
       check(`${id}: a refusal from a missing CLI is told to install it`, () => has(section(id), "Install the gh CLI"));
       setGithub("no-cli");
       button("Check GitHub alerts").click();
-      await until(() => has(section(id), "to fetch") && !has(section(id), "Could not fetch"));
+      await until(() => has(section(id), "to fetch") && !has(section(id), "Couldn't fetch"));
       check(`${id}: a missing CLI without an error says so for this slug`, () => has(section(id), "Install the gh CLI") && has(section(id), "owner/repo"));
     }
     setGithub("alerts");

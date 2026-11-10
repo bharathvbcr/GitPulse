@@ -42,7 +42,7 @@
 
 {#if stats.length > 0}
   <span
-    class="flex rounded-full overflow-hidden bg-background ring-1 ring-border/50 w-full"
+    class="flex rounded-full overflow-hidden bg-background ring-1 ring-edgeSoft w-full"
     style="height: {height}px"
     role="img"
     aria-label={description}

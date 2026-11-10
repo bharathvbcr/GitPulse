@@ -27,7 +27,8 @@
 
 <button
   type="button"
-  class="p-1 rounded-full hover:bg-surfaceHover text-textMuted hover:text-accent transition-colors focus-visible:outline-2 focus-visible:outline-accent"
+  class="gp-icon-btn"
+  data-size="sm"
   aria-label={label}
   title={label}
   onclick={() => onopen(url)}

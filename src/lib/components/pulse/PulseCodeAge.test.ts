@@ -22,4 +22,15 @@ describe("PulseCodeAge failure state", () => {
     expect(source).toMatch(/error\?: string \| null/);
     expect(source).toContain("{:else if error && !knowledge}");
   });
+
+  it("states a failed scan in the unknown tone and never as a measured distribution", () => {
+    expect(source).toContain('describeFailure({ verb: "read", object: "blame data" }, error)');
+    expect(source).toContain("No age distribution was measured.");
+    expect(source).toContain('class="gp-notice" data-tone="unknown"');
+  });
+
+  it("feeds the bar and the legend from one cohort list", () => {
+    expect(source).toContain("const cohorts = $derived(");
+    expect(source.match(/\{#each cohorts as cohort/g)?.length).toBe(2);
+  });
 });

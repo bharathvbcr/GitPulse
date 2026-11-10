@@ -86,7 +86,7 @@ describe("GithubAlertsSection — a failed fetch is not a missing CLI", () => {
       });
       expect(body).toContain('data-testid="github-alerts-partial"');
       expect(body).toContain("critical, high");
-      expect(body).not.toContain("Could not fetch");
+      expect(body).not.toContain("Couldn't fetch");
     });
 
     it("does not render an empty partial result as 'No open alerts'", () => {
@@ -127,7 +127,7 @@ describe("HealthSection", () => {
     expect(source("HealthSection.svelte")).toContain('tabindex="-1"');
   });
 
-  it("renders a bounded count with its shortfall, in amber", () => {
+  it("renders a bounded count with its shortfall, in the warn role", () => {
     const { body } = render(HealthSection, {
       props: {
         id: "issues",
@@ -136,7 +136,7 @@ describe("HealthSection", () => {
       },
     });
     expect(body).toContain("(12; showing 3)");
-    expect(body).toContain("text-amber-300");
+    expect(body).toContain("text-warn");
   });
 
   it("renders a complete count plainly", () => {

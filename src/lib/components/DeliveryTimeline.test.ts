@@ -172,7 +172,8 @@ describe("DeliveryTimeline collapsed listing", () => {
         sampleNoun: "runs",
       },
     });
-    expect(body).toContain("Could not read runs");
+    expect(body).toContain("Couldn't read runs.");
+    expect(body).toContain("This is not an absence of runs.");
     expect(body).not.toContain("Show all");
     expect(countAttr(body, "data-delivery-row=")).toBe(0);
   });
