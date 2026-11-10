@@ -330,6 +330,77 @@ fn paths_stdin_paths_cannot_name_exactly_are_checked_out_by_git_not_cloned() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_repository_with_a_post_checkout_hook_gets_it_run_by_plain_git() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = tempfile::TempDir::new().unwrap();
+    let main = sandbox.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git_in(&main, &["init", "-b", "main"]);
+    trust_repo(&main);
+    std::fs::write(main.join("a.txt"), "a\n").unwrap();
+    git_in(&main, &["add", "."]);
+    git_in(&main, &["commit", "-m", "initial"]);
+    set_mtime(&main.join("a.txt"));
+    let marker = sandbox.path().join("hook-ran");
+    let hook = main.join(".git/hooks/post-checkout");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho ran > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = crate::engine::git_cli::git_captured(&main, &["update-index", "--refresh"]).unwrap();
+
+    let lane = sandbox.path().join("lane");
+    add_worktree(
+        main.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("lane"),
+        None,
+        false,
+    )
+    .expect("add_worktree");
+
+    assert!(
+        marker.exists(),
+        "`git worktree add --no-checkout` skips post-checkout, so the clone path must not be taken"
+    );
+    assert_eq!(std::fs::read(lane.join("a.txt")).unwrap(), b"a\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_is_not_executable_does_not_stop_the_clone() {
+    let sandbox = tempfile::TempDir::new().unwrap();
+    let main = sandbox.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git_in(&main, &["init", "-b", "main"]);
+    trust_repo(&main);
+    std::fs::write(main.join("a.txt"), "a\n").unwrap();
+    git_in(&main, &["add", "."]);
+    git_in(&main, &["commit", "-m", "initial"]);
+    set_mtime(&main.join("a.txt"));
+    std::fs::write(main.join(".git/hooks/post-checkout"), "#!/bin/sh\nexit 1\n").unwrap();
+    let _ = crate::engine::git_cli::git_captured(&main, &["update-index", "--refresh"]).unwrap();
+
+    let lane = sandbox.path().join("lane");
+    add_worktree(
+        main.to_str().unwrap(),
+        lane.to_str().unwrap(),
+        Some("lane"),
+        None,
+        false,
+    )
+    .expect("add_worktree");
+    assert_eq!(
+        mtime(&lane.join("a.txt")),
+        old_time(),
+        "git skips a non-executable hook, so the clone path is still right"
+    );
+}
+
 #[test]
 fn conversion_decision_table() {
     let u = "unspecified";

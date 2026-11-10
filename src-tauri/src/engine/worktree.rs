@@ -3270,6 +3270,32 @@ fn paths_converted_on_checkout(
         .collect())
 }
 
+/// Whether `repo` has a `post-checkout` hook git would run: the file
+/// `git rev-parse --git-path hooks/post-checkout` names (which honours
+/// `core.hooksPath` and a linked worktree's shared hooks directory), if it is
+/// a regular file with an execute bit. `None` when git could not say, which
+/// callers treat as "has one".
+#[cfg(target_os = "macos")]
+fn post_checkout_hook_is_executable(repo: &Path) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let out = crate::engine::git_cli::git_captured(
+        repo,
+        &["rev-parse", "--git-path", "hooks/post-checkout"],
+    )
+    .ok()?;
+    if out.status_code != 0 {
+        return None;
+    }
+    let printed = String::from_utf8(out.stdout).ok()?;
+    let hook = repo.join(printed.trim_end_matches('\n'));
+    match std::fs::metadata(&hook) {
+        Ok(meta) => Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// Whether `git hash-object --stdin-paths` opens exactly the file `rel` names.
 /// It reads one path per line, so a path with a newline is two paths; it
 /// unquotes a line that starts with `"` (C-style), so `"x"` opens `x`; and it
@@ -3349,6 +3375,13 @@ fn try_add_worktree_cow_macos(
     use std::os::unix::fs::MetadataExt;
 
     if !repo.join(".git").exists() || (new_branch.is_none() && !detach) {
+        return Ok(None);
+    }
+    // `git worktree add --no-checkout` does not run `post-checkout`; the plain
+    // `git worktree add` does. A repository that has the hook (Git LFS installs
+    // one) must keep getting it run, and running it from here would be
+    // GitPulse executing repository code on its own, so it takes the plain path.
+    if post_checkout_hook_is_executable(repo) != Some(false) {
         return Ok(None);
     }
     let target = Path::new(target_path);
