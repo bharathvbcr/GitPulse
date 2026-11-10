@@ -85,7 +85,7 @@ describe("TaskRefine renders", () => {
     const body = shown({}, { ...task, locked_fields: ["acceptance_criteria"] });
     expect(body).toMatch(/data-testid="task-refine-part-acceptance_criteria"[^>]*disabled/);
     expect(body).not.toMatch(/data-testid="task-refine-part-acceptance_criteria"[^>]*checked/);
-    expect(body).toContain("locked");
+    expect(body).toContain("Locked on this task.");
     // Nothing is selectable, so there is nothing to apply.
     expect(body).toMatch(/data-testid="task-refine-apply"[^>]*disabled/);
   });

@@ -38,7 +38,7 @@ describe("a start that failed out of sight", () => {
     expect(row.failure).toBe(cause);
     expect(row.tone).toBe("error");
     expect(row.unstarted).toBe(false);
-    expect(attemptStage(row, NOW)).toEqual({ stage: "failed", label: "Failed to start", tone: "bad" });
+    expect(attemptStage(row, NOW)).toEqual({ stage: "failed", label: "Couldn't start the run", tone: "bad" });
     // The board's card says the same: it asks for the reader.
     expect(taskAgentSummaries([run({ id: "a" })], context({ notices: () => notice("a", "failed", cause) })).get("t1"))
       .toEqual({ working: 1, asking: 1, tone: "error" });

@@ -3996,7 +3996,7 @@ if (params.has("check")) {
       failGetTaskId = "task-1";
       rq("task-refine-apply").click(); await wait(() => rq("task-refine-message"));
       failGetTaskId = "";
-      check("an apply whose re-read fails is reported as applied, not as an error", /^Applied/.test(rq("task-refine-message").textContent) && /could not be re-read/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
+      check("an apply whose re-read fails is reported as applied, not as an error", /^Applied/.test(rq("task-refine-message").textContent) && /Couldn't re-read the task/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
       check("that apply wrote exactly once", applyCalls().length === callsBefore + sentSizes.length + 1);
       await closeSheet();
 

@@ -425,7 +425,7 @@
         const closeTab=[...document.querySelectorAll('button[title^="Close this session"]')][0];
         closeTab.click();await wait(()=>get(promptState));
         check("Closing a running task attempt's tab asks first and says it ends the attempt",
-          get(promptState).options.mode==="confirm"&&get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+          get(promptState).options.mode==="confirm"&&get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);
         check("Declining keeps the agent running and its tab open",report.kills===0&&document.querySelector('textarea[aria-label="Terminal input"]'));
         document.querySelector('[aria-label="All terminal sessions"]').click();
@@ -433,12 +433,12 @@
         check("The Sessions list names the task a session is working on",listed.textContent.includes("task attempt"));
         [...listed.querySelectorAll("button")].find(el=>el.textContent.trim()==="Close session").click();
         await wait(()=>get(promptState));
-        check("Closing it from the Sessions list asks the same question",get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+        check("Closing it from the Sessions list asks the same question",get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);
         check("Declining there stops nothing",report.kills===0);
         document.querySelector('[aria-label="All terminal sessions"]').click();await pause(50);
         button("Stop agent").click();await wait(()=>get(promptState));
-        check("Stop agent in the task's pane asks the same question first",get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+        check("Stop agent in the task's pane asks the same question first",get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);
         check("Declining in the pane stops nothing and says nothing was stopped",report.kills===0&&!pane().textContent.includes("was stopped"));
       }
@@ -744,9 +744,9 @@
         await wait(()=>preparations.length>preparedBefore&&row(lastPrepared())?.querySelector('[data-testid="agent-session-failed"]'));
         const refused=lastPrepared();
         check("A spawn the host refused is an error on the attempt's row, with its cause",
-          visible(row(refused).querySelector('[data-testid="agent-session-failed"]'))&&row(refused).textContent.includes("claude: command not found")&&stage(refused)==="Failed to start"&&row(refused).dataset.tone==="error");
+          visible(row(refused).querySelector('[data-testid="agent-session-failed"]'))&&row(refused).textContent.includes("claude: command not found")&&stage(refused)==="Couldn't start the run"&&row(refused).dataset.tone==="error");
         check("…the toast says it did not start, never that it started",
-          seen.slice(toastsBefore).some(t=>t.kind==="error"&&t.message.includes("did not start"))&&!seen.slice(toastsBefore).some(t=>t.kind==="success"));
+          seen.slice(toastsBefore).some(t=>t.kind==="error"&&t.message.includes("Couldn't start"))&&!seen.slice(toastsBefore).some(t=>t.kind==="success"));
         {const {attemptNotices}=await import("../src/lib/terminal/taskLaunches");
         check(`…and the form stays open for another try, rather than folding away an attempt that did not start${launchForm().hidden?` (notice=${JSON.stringify(read(attemptNotices).get(refused))} state=${runs.get(refused).state} stage=${stage(refused)} toggle=${formToggle().getAttribute("aria-expanded")})`:""}`,!launchForm().hidden);}
         refuseSpawn=null;

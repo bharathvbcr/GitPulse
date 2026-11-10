@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- Not in BROWSER_HARNESSES on purpose: it needs a real dcstore and Manvi, so run it with `node scripts/run-workbench-enhancement-checks.mjs`; it has no mocked transport for the registered runner. -->
 <html class="dark"><head><meta charset="utf-8" /><title>GitPulse workbench — disposable fixture</title><style>html,body{margin:0;height:100%}#app{height:100vh;display:flex;flex-direction:column}#fixture{padding:5px 12px;font:11px system-ui;background:#26354d;color:#dbe7f5}#errors{color:#ff8484}</style></head>
 <body><div id="app"><div id="fixture">Disposable test profile · Real Manvi storage · Browser transport adapter <span id="errors" role="status">Runtime errors: 0</span> <button id="lose-reply" type="button">Lose next acceptance reply</button> <span id="fault" role="status">No injected failure</span></div><div id="board" style="flex:1;display:flex;min-height:0"></div></div>
 <script type="module">

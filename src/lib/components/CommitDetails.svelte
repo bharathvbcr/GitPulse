@@ -27,7 +27,7 @@
   import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash, signatureLabel } from "../format";
   import { summarizeCommitFiles } from "../diff/commitFilesNotice";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure, type FailureCopy } from "../ui/copy/describeFailure";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
   // The canonical wire types, not local copies: both were declared here as
@@ -91,6 +91,12 @@
       ($repoStore.selectedDiff === null && !$repoStore.selectedDiffError),
   );
   let diffError = $derived($repoStore.selectedDiffError);
+  let detailsFailure = $derived(
+    detailsStatus === "error" ? describeFailure({ verb: "load", object: "commit details" }, detailsError) : null,
+  );
+  let diffFailure = $derived(
+    diffError ? describeFailure({ verb: "read", object: "this diff" }, diffError) : null,
+  );
 
   function retryDetails() {
     if (selectedCommit) void graphStore.selectCommit(selectedCommit);
@@ -135,7 +141,7 @@
   let explanation = $state<AiGeneration | null>(null);
   let explanationFor = $state<string | null>(null);
   let isExplaining = $state(false);
-  let explainError = $state<string | null>(null);
+  let explainFailure = $state<FailureCopy | null>(null);
 
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let explainGuard: AsyncGuard | null = null;
@@ -182,7 +188,7 @@
     const guard = createAsyncGuard();
     explainGuard = guard;
     isExplaining = true;
-    explainError = null;
+    explainFailure = null;
     explanation = null;
     try {
       const result = await harnessStore.explainCommit(path, id);
@@ -193,7 +199,7 @@
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       if (currentCommitId !== id || $repoStore.currentPath !== path) return;
-      explainError = formatError(err);
+      explainFailure = describeFailure({ verb: "explain", object: "this commit" }, err);
     } finally {
       if (guard.isLive()) isExplaining = false;
     }
@@ -212,7 +218,7 @@
       isExplaining = false;
       // The error belongs to the commit it failed on; left set it reads as
       // "this commit failed" under every commit clicked afterwards.
-      explainError = null;
+      explainFailure = null;
     });
   });
 
@@ -343,10 +349,10 @@
             <span class="font-mono text-danger">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
           {/if}
         </div>
-        {#if detailsStatus === "error"}
+        {#if detailsFailure}
           <div class="px-2 py-1">
             <div class="gp-notice" data-tone="danger" role="alert">
-              <span class="min-w-0 flex-1 break-words text-meta">Couldn't load commit details. {detailsError}</span>
+              <span class="min-w-0 flex-1 break-words text-meta">{detailsFailure.headline}{#if detailsFailure.detail} {detailsFailure.detail}{/if}</span>
               <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDetails}>Try again</button>
             </div>
           </div>
@@ -381,8 +387,8 @@
             {/if}
           </button>
 
-          {#if explainError}
-            <div class="mt-1.5 text-meta text-danger">Couldn't explain this commit. {explainError}</div>
+          {#if explainFailure}
+            <div class="mt-1.5 text-meta text-danger">{explainFailure.headline}{#if explainFailure.detail} {explainFailure.detail}{/if}</div>
           {/if}
 
           {#if explanation && explanationFor === currentCommitId}
@@ -453,10 +459,10 @@
           <div class="flex-1" aria-label="Reading the diff…">
             <Skeleton variant="code-lines" count={8} />
           </div>
-        {:else if diffError}
+        {:else if diffFailure}
           <div class="flex flex-1 items-center justify-center px-4 font-sans">
             <div class="gp-notice" data-tone="danger" role="alert">
-              <span class="min-w-0 flex-1 break-words text-meta">Couldn't read this diff. {diffError}</span>
+              <span class="min-w-0 flex-1 break-words text-meta">{diffFailure.headline}{#if diffFailure.detail} {diffFailure.detail}{/if}</span>
               <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDiff}>Try again</button>
             </div>
           </div>

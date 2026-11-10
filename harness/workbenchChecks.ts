@@ -61,7 +61,16 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", title);
   fill("Description", "textarea", description);
   fill("Acceptance criteria", "textarea", "Both repository checks remain available");
-  check("GitPulse").click();
+  // The repository picker is a popover portaled to <body>, so its rows are outside the editor.
+  const repoSummary = editor().querySelector<HTMLElement>('[data-testid="task-repo-summary"]');
+  if (!repoSummary) throw new Error("Missing repository picker trigger");
+  repoSummary.click();
+  await wait(() => Boolean(document.querySelector('[data-testid="task-repo-popup"]')));
+  const repoPopup = document.querySelector('[data-testid="task-repo-popup"]');
+  if (!repoPopup) throw new Error("Missing repository picker popup");
+  check("GitPulse", repoPopup).click();
+  repoSummary.click();
+  await wait(() => !document.querySelector('[data-testid="task-repo-popup"]'));
   await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "1");

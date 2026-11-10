@@ -1005,7 +1005,12 @@
   const statedFailure = $derived(catalogError || error);
   /** A read note's cause, or a pointer to the notice above when it says the same thing. */
   function noteCause(reason: string): string {
-    return reason === statedFailure ? "the same failure as above" : reason;
+    return reason === statedFailure ? "The same failure as above." : reason;
+  }
+  /** A read-note line: "Couldn't read <object>. <What the board does instead>. <Reason>." */
+  function readNote(object: string, reason: string, consequence: string): string {
+    const copy = describeFailure({ verb: "read", object }, noteCause(reason));
+    return [copy.headline, consequence, copy.detail].filter(Boolean).join(" ");
   }
   const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error || uncheckedCheckouts.length));
   $effect(() => {
@@ -2972,9 +2977,9 @@
       <ul class="read-notes gp-notice gp-notice-warn" aria-label="Board details not read" data-testid="board-read-notes">
         <!-- Cards carry no agent marks while this stands: an old reading would
              claim agents nobody checked. -->
-        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read verification verdicts, so cards show none: {noteCause(verdictError)}</span></li>{/if}
-        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read subtask progress, so cards show none: {noteCause(lineageError)}</span></li>{/if}
-        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read which agents are working on these tasks: {noteCause($boardAgents.error)}</span></li>{/if}
+        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("verification verdicts", verdictError, "Cards show none.")}</span></li>{/if}
+        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("subtask progress", lineageError, "Cards show none.")}</span></li>{/if}
+        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("which agents are working on these tasks", $boardAgents.error, "")}</span></li>{/if}
         <!-- A check that could not run is said, not shown as a healthy checkout:
              those rows and cards carry no mark either way. -->
         {#if uncheckedCheckouts.length}<li class="agents-unread" role="status" data-testid="checkout-unchecked"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't check {plural(uncheckedCheckouts.length, "checkout")}, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</span></li>{/if}

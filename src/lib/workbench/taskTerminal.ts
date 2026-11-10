@@ -42,6 +42,7 @@ import { focusTerminalSession } from "../terminal/sessionFocus";
 import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
 import { explainError, findConversation, launchManagedRun, WorkbenchError, type TaskRun } from "./client";
 import { resolveGitRoot } from "../desktop/nativeShell";
+import { describeFailure } from "../ui/copy/describeFailure";
 import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
 import { relativeStartDir } from "../terminal/tabs";
 import { agentPromptArgs } from "../terminal/launchRequests";
@@ -114,6 +115,12 @@ export async function startTaskTerminal(run: RunRef): Promise<AttemptStart> {
  * checkout may open in a moment. A refusal for capacity will not resolve by
  * waiting, so the request is withdrawn and the reason is the answer.
  */
+/** "Couldn't start <object>. <Reason>." — the headline is the house template, the reason is the host's own wording. */
+function startFailure(object: string, reason: unknown): string {
+  const copy = describeFailure({ verb: "start", object }, reason);
+  return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+}
+
 function afterOpen(run: Pick<TaskRun, "id">, root: string, opened: boolean, success: "opened" | "started"): AttemptStart {
   const refused = openRefusal(root);
   if (refused) {
@@ -539,7 +546,7 @@ async function startManaged(
     }
     return { ok: true, run: started };
   } catch (cause) {
-    const error = `Managed ${label} did not start: ${explainError(cause)} Start or recover managed launch retries this same attempt.`;
+    const error = `${startFailure(`managed ${label}`, explainError(cause))} Start or recover managed run retries this same run.`;
     noteAttempt(run.id, "failed", error, deps.now());
     deps.toast.error(error);
     return { ok: false, run, error };
@@ -649,7 +656,7 @@ function watch(run: TaskRun, label: string, showAction: ToastAction, deps: Prepa
       // Show terminal retries a start — except on a preparation that has
       // expired, which no start can claim.
       const retryable = run.state !== "prepared" || run.expires_at * 1000 > deps.now();
-      deps.toast.error(`${label} did not start: ${notice.text}`, retryable ? showAction : undefined);
+      deps.toast.error(startFailure(label, notice.text), retryable ? showAction : undefined);
     }
   });
   if (done) unsubscribe();

@@ -151,7 +151,7 @@ export function closeQuestion(
     return {
       title: `Close ${tabLabel}?`,
       message: agent.taskAttempt
-        ? `${agent.name} is still working on this task. Closing the tab stops it and ends this attempt; it cannot be restarted, only resumed as a new conversation.`
+        ? `${agent.name} is still working on this task. Closing the tab stops it and ends this run; it cannot be restarted, only resumed as a new conversation.`
         : `${agent.name} is still running in this tab. Closing it stops the agent.`,
     };
   }

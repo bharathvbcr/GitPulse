@@ -19,7 +19,7 @@ import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunche
 import { asksForReader as attentionAsks, type SessionActivity } from "../terminal/sessionActivity";
 import type { OpenRepoTab } from "../stores/repoStore";
 import { identityKey, pathSegments, type PathIdentityOptions } from "../repos/paths";
-import { runExpired, runHoldsCheckout } from "./taskHandoff";
+import { RUN_START_FAILED_LABEL, runExpired, runHoldsCheckout } from "./taskHandoff";
 import type { TaskRun } from "./client";
 
 /** One session in this window that belongs to an attempt. */
@@ -304,7 +304,7 @@ export interface AttemptStage {
 
 export function attemptStage(row: Pick<MonitoredAttempt, "run" | "view" | "tone" | "failure" | "unstarted" | "disconnected">, clock: number): AttemptStage {
   const { run } = row;
-  if (row.failure) return { stage: "failed", label: "Failed to start", tone: "bad" };
+  if (row.failure) return { stage: "failed", label: RUN_START_FAILED_LABEL, tone: "bad" };
   if (run.state === "prepared" && runExpired(run, clock)) return { stage: "expired", label: "Expired", tone: "done" };
   if (run.state === "unresolved") return { stage: "unresolved", label: "Unresolved", tone: "bad" };
   if (run.state === "failed") return { stage: "ended", label: "Failed", tone: "bad" };
