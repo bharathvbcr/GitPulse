@@ -55,6 +55,13 @@ describe("FirebasePanel", () => {
     expect(source).not.toContain("previewSlice(rollout");
   });
 
+  it("hands the rollout timeline the panel's own listing as its Rescan", () => {
+    // Behavior is proven in harness/firebase.html (one click, one more listing).
+    const timeline = source.slice(source.indexOf("<DeliveryTimeline"), source.indexOf("/>", source.indexOf("<DeliveryTimeline")));
+    expect(timeline).toContain("onRescan={() => void loadRollouts()}");
+    expect(source).toContain("onclick={() => void loadRollouts()}");
+  });
+
   it("names the project a rollout listing belongs to from the report", () => {
     // The backend name is rendered ("the listing names the backend it is of").
     expect(source).toContain("{rollouts.project_id}");

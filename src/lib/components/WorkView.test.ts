@@ -184,7 +184,8 @@ describe("WorkView", () => {
   it("offers MCP setup without sending the reader to a system they may not run", () => {
     expect(source).toContain("gitpulse:settings");
     expect(source).toContain("Connect an agent");
-    expect(source).toContain("gitpulse_insights");
+    expect(source).toContain("Agents read this same snapshot over MCP 2.0");
+    expect(source).not.toContain("gitpulse_insights");
   });
 
   it("offers named review and repository navigation actions", () => {

@@ -62,13 +62,22 @@ describe("rollout state vocabulary", () => {
     expect(isFailed({ kind: "cancelled" })).toBe(true);
   });
 
-  it("puts both light and dark shades on every verdict", () => {
+  it("colours every verdict with a status role, not a hand-picked shade", () => {
     // A bare `-400` is tuned for the dark theme and sits near 2:1 on the light
-    // theme's card — on exactly the labels a reader opened the panel to check.
-    for (const kind of ["succeeded", "failed", "cancelled", "queued", "progressing"] as const) {
-      const cls = rolloutStateClass({ kind });
-      expect(cls, `${kind} must name a light shade`).toMatch(/text-\w+-\d00\b/);
-      expect(cls, `${kind} must name a dark shade`).toContain("dark:text-");
+    // theme's card. The status roles carry a value per theme, so a verdict
+    // names exactly one role and no palette shade (which would bring back a
+    // single-theme colour).
+    const expected: [RolloutState, string][] = [
+      [{ kind: "succeeded" }, "text-ok"],
+      [{ kind: "failed" }, "text-danger"],
+      [{ kind: "cancelled" }, "text-danger"],
+      [{ kind: "queued" }, "text-warn"],
+      [{ kind: "progressing" }, "text-warn"],
+    ];
+    for (const [state, role] of expected) {
+      const cls = rolloutStateClass(state);
+      expect(cls, `${state.kind} must use its status role`).toBe(role);
+      expect(cls, `${state.kind} must not name a palette shade`).not.toMatch(/-\d00\b|dark:/);
     }
   });
 

@@ -531,23 +531,23 @@
 {#snippet qualification(walkIncomplete: string, what: string)}
   {@const folded = summarizeWalkIncomplete([walkIncomplete]) ?? walkIncomplete}
   {@const lead = firstClause(walkIncomplete)}
-  <div
-    class="mb-2 max-w-xl rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400"
-  >
-    <span class="font-medium">{what} is incomplete</span>
-    {#if lead}<span class="opacity-90"> — {lead}</span>{/if}
-    <details class="mt-0.5">
-      <summary class="cursor-pointer text-[10px] opacity-70 hover:opacity-100">
-        What the engine reported
-      </summary>
-      <p class="mt-1 font-mono text-[10px] leading-relaxed opacity-90">{folded}</p>
-    </details>
+  <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
+    <div class="min-w-0 flex-1">
+      <span class="font-medium">{what} is incomplete</span>
+      {#if lead}<span class="opacity-90"> — {lead}</span>{/if}
+      <details class="mt-0.5">
+        <summary class="cursor-pointer text-micro opacity-70 hover:opacity-100">
+          What the engine reported
+        </summary>
+        <p class="mt-1 font-mono text-micro leading-relaxed opacity-90">{folded}</p>
+      </details>
+    </div>
   </div>
 {/snippet}
 
 <section data-panel="firebase">
   <div class="flex items-center justify-between gap-3 mb-2">
-    <h3 class="text-[11px] uppercase tracking-wider text-textMuted flex items-center gap-1.5">
+    <h3 class="gp-label flex items-center gap-1.5">
       <Flame size={12} />
       Firebase App Hosting
     </h3>
@@ -559,7 +559,7 @@
   {#if statusError}
     <!-- Rose: the status read is local and free, so a failure here is a fault,
          not a configuration gap. -->
-    <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs">
+    <div class="gp-notice" data-tone="danger">
       Firebase status could not be read: {statusError}
     </div>
   {:else if status && !status.configured}
@@ -571,12 +571,12 @@
     />
   {:else if status}
     {#if status.firebaserc_error}
-      <div class="mb-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+      <div class="gp-notice mb-2" data-tone="warn">
         .firebaserc could not be read: {status.firebaserc_error}
       </div>
     {/if}
     {#if status.firebasejson_error}
-      <div class="mb-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+      <div class="gp-notice mb-2" data-tone="warn">
         firebase.json could not be read: {status.firebasejson_error}
       </div>
     {/if}
@@ -585,11 +585,11 @@
       <!-- Amber: a missing CLI is a configuration gap, not a fault. The reason
            distinguishes "not installed" from "installed where a windowed launch
            cannot see it", because those have different remedies. -->
-      <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+      <div class="gp-notice max-w-xl" data-tone="warn">
         {status.cli.reason ?? "The Firebase CLI is not available."}
       </div>
     {:else if status.projects.length === 0}
-      <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+      <div class="gp-notice max-w-xl" data-tone="warn">
         No project alias is configured in .firebaserc, so there is nothing to query.
       </div>
     {:else}
@@ -597,7 +597,7 @@
         <!-- `.firebaserc` is repository content, so its alias count is not
              ours to assume. A capped picker that looks complete would hide the
              very project the reader came to select. -->
-        <div class="mb-2 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] max-w-xl">
+        <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
           .firebaserc names more project aliases than are listed here. This is not complete
           coverage of the file.
         </div>
@@ -608,7 +608,7 @@
              this checkout is wired to deploy to them, and the backends listing
              below still answers. Said plainly so an empty listing is not read as
              a broken panel. -->
-        <div class="mb-2 text-[11px] text-textMuted max-w-xl">
+        <div class="mb-2 text-meta text-textMuted max-w-xl">
           firebase.json carries no <span class="font-mono">apphosting</span> key, so this
           checkout is not configured to deploy to App Hosting. Backends that already exist
           on the project are still listed below.
@@ -616,7 +616,7 @@
       {/if}
 
       <div class="flex flex-wrap items-end gap-2 mb-2">
-        <label class="flex flex-col gap-1 text-[11px] text-textMuted">
+        <label class="flex flex-col gap-1 text-meta text-textMuted">
           Project
           <select
             class="gp-select text-xs"
@@ -632,7 +632,7 @@
           </select>
         </label>
 
-        <label class="flex flex-col gap-1 text-[11px] text-textMuted">
+        <label class="flex flex-col gap-1 text-meta text-textMuted">
           Backend
           {#if knownBackends.length > 0}
             <select
@@ -661,7 +661,7 @@
         </label>
 
         <button
-          class="px-2.5 py-1.5 rounded-lg border border-border/70 bg-surface hover:bg-surfaceHover text-xs inline-flex items-center gap-1.5 disabled:opacity-50"
+          class="gp-btn" data-size="md"
           disabled={!selectedProjectId || backendsLoading}
           onclick={() => void loadBackends()}
         >
@@ -671,7 +671,7 @@
 
         {#if rolloutListing?.available}
           <button
-            class="px-2.5 py-1.5 rounded-lg border border-border/70 bg-surface hover:bg-surfaceHover text-xs inline-flex items-center gap-1.5 disabled:opacity-50"
+            class="gp-btn" data-size="md"
             disabled={!selectedProjectId || !selectedBackend || rolloutsLoading}
             onclick={() => void loadRollouts()}
           >
@@ -684,7 +684,7 @@
       <!-- Said before either button is pressed, not after. The CLI enables the
            App Hosting API when it is off, and that is a change to the user's
            Google Cloud project, not a read. -->
-      <p class="mb-3 text-[11px] text-textMuted max-w-xl">
+      <p class="mb-3 text-meta text-textMuted max-w-xl">
         Listing backends or rollouts runs the Firebase CLI as your signed-in Google account.
         If the App Hosting API is not enabled on
         <span class="font-mono">{selectedProjectId || "the project"}</span>,
@@ -695,17 +695,17 @@
         <!-- Amber, and never silence. Without this the panel would simply have
              no rollout button and no reason, which reads as a feature nobody
              built rather than one this CLI does not expose. -->
-        <div class="mb-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
           {rolloutListing.reason ?? "This Firebase CLI does not expose rollout listing."}
         </div>
       {/if}
 
       {#if backendsError}
-        <div class="mb-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
           Backend listing unavailable: {backendsError}
         </div>
       {:else if backends && !backends.checked}
-        <div class="mb-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
           Backend listing did not run: {backends.error ?? "no reason was reported"}
         </div>
       {:else if backends}
@@ -713,13 +713,13 @@
           {@render qualification(backends.walk_incomplete, "Backend listing")}
         {/if}
         {#if backends.backends.length === 0}
-          <div class="mb-2 text-[11px] text-textMuted">
+          <div class="mb-2 text-meta text-textMuted">
             {backendsBounded
               ? "No backends in the listing shown."
               : `No App Hosting backends exist on ${backends.project_id}.`}
           </div>
         {:else}
-          <div class="mb-2 text-[11px] text-textMuted">
+          <div class="mb-2 text-meta text-textMuted">
             {backends.backends.length}
             {backends.backends.length === 1 ? "backend" : "backends"} on
             <span class="font-mono">{backends.project_id}</span>{backends.truncated
@@ -730,22 +730,23 @@
       {/if}
 
       {#if rolloutsError}
-        <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
+        <div class="gp-notice max-w-xl" data-tone="warn">
           Rollout listing unavailable: {rolloutsError}
         </div>
       {:else if rollouts && !rollouts.checked}
         <!-- `checked` is what separates "we could not ask" from "we asked and
              this backend has never deployed". Only the second may render as an
              empty listing. -->
-        <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs max-w-xl">
-          Rollout listing did not run: {rollouts.error ?? "no reason was reported"}
+        <div class="gp-notice max-w-xl" data-tone="unknown">
+          <div class="min-w-0 flex-1">Rollout listing did not run: {rollouts.error ?? "no reason was reported"}</div>
+          <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={rolloutsLoading} onclick={() => void loadRollouts()}>Rescan</button>
         </div>
       {:else if rollouts}
         <!-- The listing names its own target rather than relying on the
              selectors above. Both are restored from one snapshot, but a
              rendering whose correctness depends on two things agreeing is one
              that eventually shows rows from one backend under another's name. -->
-        <div class="mb-1 text-[11px] text-textMuted">
+        <div class="mb-1 text-meta text-textMuted">
           Rollouts for <span class="font-mono">{rollouts.backend_id}</span> in
           <span class="font-mono">{rollouts.project_id}</span>
         </div>
@@ -760,7 +761,7 @@
             {#if live.commit}
               <span class="font-mono">{shortSha(live.commit.hash)}</span>
               {#if !live.commit.present_locally}
-                <span class="text-amber-700 dark:text-amber-400 text-[11px]">
+                <span class="text-warn text-meta">
                   (not in this checkout)
                 </span>
               {/if}
@@ -771,7 +772,7 @@
               <span class="text-textMuted">rollout {live.id}, no source commit reported</span>
             {/if}
             {#if bounded}
-              <span class="text-textMuted text-[11px]"> · within the rollouts shown</span>
+              <span class="text-textMuted text-meta"> · within the rollouts shown</span>
             {/if}
           </div>
         {/if}
@@ -806,19 +807,20 @@
               error={rollouts.error}
               sampleNoun="rollouts"
               live={liveState}
+              onRescan={() => void loadRollouts()}
             />
           </div>
           <div class="space-y-1">
             {#each keyedList(rollouts.rollouts, (r) => r.id) as { key, item } (key)}
-              <div class="flex items-baseline gap-2 text-xs py-1 border-b border-border/40 last:border-0">
+              <div class="flex items-baseline gap-2 text-xs py-1">
                 <span class={`font-medium ${rolloutStateClass(item.state)}`}>
                   {rolloutStateLabel(item.state)}
                 </span>
                 {#if item.commit}
-                  <span class="font-mono text-[11px]">{shortSha(item.commit.hash)}</span>
+                  <span class="font-mono text-meta">{shortSha(item.commit.hash)}</span>
                   {#if !item.commit.present_locally}
                     <span
-                      class="text-[10px] text-amber-700 dark:text-amber-400"
+                      class="text-micro text-warn"
                       title="This commit is not in the opened checkout — a force-push, a fork, or a shallow clone."
                     >
                       not local
@@ -829,20 +831,20 @@
                   {item.commit?.message ?? item.id}
                 </span>
                 {#if item.error}
-                  <span class="text-red-700 dark:text-red-400 text-[10px] truncate">{item.error}</span>
+                  <span class="text-danger text-micro truncate">{item.error}</span>
                 {/if}
               </div>
             {/each}
           </div>
           {#if rollouts.truncated}
-            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">
+            <div class="mt-2 text-warn text-meta">
               Showing {rollouts.rollouts.length} rollouts; more exist. This is not complete coverage.
             </div>
           {/if}
         {/if}
 
         {#if fetchedAt}
-          <div class="mt-2 text-[10px] text-textMuted">
+          <div class="mt-2 text-micro text-textMuted">
             Checked {new Date(fetchedAt).toLocaleTimeString()}
           </div>
         {/if}
@@ -853,13 +855,13 @@
              visually last and behind two steps: App Hosting has no rollback
              verb, so this cannot be undone from GitPulse, and it is not
              idempotent — a second click is a second deployment. -->
-        <div class="mt-3 pt-3 border-t border-border/50">
-          <h4 class="text-[11px] uppercase tracking-wider text-textMuted mb-2 flex items-center gap-1.5">
+        <div class="mt-5">
+          <h4 class="gp-label mb-2 flex items-center gap-1.5">
             <Rocket size={12} />
             Deploy a commit
           </h4>
           <div class="flex flex-wrap items-end gap-2">
-            <label class="flex flex-col gap-1 text-[11px] text-textMuted">
+            <label class="flex flex-col gap-1 text-meta text-textMuted">
               Commit
               <input
                 class="gp-field text-xs font-mono w-[26rem] max-w-full"
@@ -874,7 +876,7 @@
             </label>
             {#if !deployArmed}
               <button
-                class="px-2.5 py-1.5 rounded-lg border border-border/70 bg-surface hover:bg-surfaceHover text-xs disabled:opacity-50"
+                class="gp-btn" data-size="md"
                 disabled={Boolean(deployProblem) || deployRunning}
                 onclick={() => {
                   deployError = null;
@@ -886,14 +888,14 @@
               </button>
             {:else}
               <button
-                class="px-2.5 py-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300 hover:bg-rose-500/20 text-xs disabled:opacity-50"
+                class="gp-btn" data-variant="danger" data-size="md"
                 disabled={deployRunning}
                 onclick={() => void deploy()}
               >
                 Deploy {shortSha(deploySha.trim())} to {selectedBackend}
               </button>
               <button
-                class="px-2.5 py-1.5 rounded-lg border border-border/70 bg-surface hover:bg-surfaceHover text-xs"
+                class="gp-btn" data-size="md"
                 onclick={() => disarmDeploy()}
               >
                 Cancel
@@ -904,46 +906,50 @@
           {#if deployProblem && deploySha.trim().length > 0}
             <!-- The reason, not just a disabled button: an unexplained refusal
                  is the kind people work around by pasting something else. -->
-            <p class="mt-2 text-[11px] text-amber-700 dark:text-amber-400 max-w-xl">
+            <p class="mt-2 text-meta text-warn max-w-xl">
               {deployProblem}
             </p>
           {/if}
 
           {#if deployArmed}
-            <div class="mt-2 p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-[11px] max-w-xl">
-              This starts a build of <span class="font-mono">{shortSha(deploySha.trim())}</span>
-              and moves production traffic on
-              <span class="font-mono">{selectedBackend}</span> in
-              <span class="font-mono">{selectedProjectId}</span> to it. App Hosting has no
-              rollback command, so GitPulse cannot undo this — reverting means deploying an
-              earlier commit. The commit must exist in the backend's connected GitHub
-              repository, which is not necessarily this checkout.
+            <div class="gp-notice mt-2 max-w-xl text-meta" data-tone="danger">
+              <div class="min-w-0 flex-1">
+                This starts a build of <span class="font-mono">{shortSha(deploySha.trim())}</span>
+                and moves production traffic on
+                <span class="font-mono">{selectedBackend}</span> in
+                <span class="font-mono">{selectedProjectId}</span> to it. App Hosting has no
+                rollback command, so GitPulse cannot undo this — reverting means deploying an
+                earlier commit. The commit must exist in the backend's connected GitHub
+                repository, which is not necessarily this checkout.
+              </div>
             </div>
           {/if}
 
           {#if deployError}
-            <div class="mt-2 p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300 text-xs max-w-xl">
+            <div class="gp-notice mt-2 max-w-xl" data-tone="danger">
               Rollout was not created: {deployError}
             </div>
           {:else if deployOutcome}
-            <div class="mt-2 p-3 rounded-xl border border-green-500/30 bg-green-500/10 text-green-800 dark:text-green-300 text-xs max-w-xl">
-              Rollout started for <span class="font-mono">{shortSha(deployOutcome.git_commit)}</span>
-              on <span class="font-mono">{deployOutcome.backend_id}</span>.
-              {#if deployOutcome.unconfirmed}
-                <!-- A zero exit means the rollout began. Saying "it worked"
-                     would overclaim; saying "it failed" would invite a retry
-                     that deploys a second time. -->
-                <span class="block mt-1 text-amber-700 dark:text-amber-400">
-                  {deployOutcome.unconfirmed}
-                </span>
-              {/if}
+            <div class="gp-notice mt-2 max-w-xl" data-tone="ok">
+              <div class="min-w-0 flex-1">
+                Rollout started for <span class="font-mono">{shortSha(deployOutcome.git_commit)}</span>
+                on <span class="font-mono">{deployOutcome.backend_id}</span>.
+                {#if deployOutcome.unconfirmed}
+                  <!-- A zero exit means the rollout began. Saying "it worked"
+                       would overclaim; saying "it failed" would invite a retry
+                       that deploys a second time. -->
+                  <span class="block mt-1 text-warn">
+                    {deployOutcome.unconfirmed}
+                  </span>
+                {/if}
+              </div>
             </div>
           {/if}
         </div>
       {/if}
 
       {#if lastVerdict}
-        <div class="mt-1 text-[10px] text-textMuted">
+        <div class="mt-1 text-micro text-textMuted">
           Policy on {lastVerdictAction}: {verdictLabel(lastVerdict)}
         </div>
       {/if}

@@ -58,23 +58,23 @@ export function severityBadge(severity: DeadbranchSeverity): {
     case "fresh":
       return {
         label: "Fresh",
-        bgClass: "bg-emerald-500/10",
-        textClass: "text-emerald-400",
-        borderClass: "border-emerald-500/20",
+        bgClass: "bg-ok/10",
+        textClass: "text-ok",
+        borderClass: "border-ok/35",
       };
     case "moderate":
       return {
         label: "Moderate",
-        bgClass: "bg-amber-500/10",
-        textClass: "text-amber-400",
-        borderClass: "border-amber-500/20",
+        bgClass: "bg-warn/10",
+        textClass: "text-warn",
+        borderClass: "border-warn/35",
       };
     case "stale":
       return {
         label: "Stale",
-        bgClass: "bg-rose-500/10",
-        textClass: "text-rose-400",
-        borderClass: "border-rose-500/20",
+        bgClass: "bg-danger/10",
+        textClass: "text-danger",
+        borderClass: "border-danger/35",
       };
   }
 }

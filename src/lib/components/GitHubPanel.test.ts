@@ -57,7 +57,14 @@ describe("GitHubPanel confirmation and refresh contracts", () => {
     const row = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "github", "PullRequestDetail.svelte"), "utf8");
     expect(row).toContain("onChanged: (message: string) => void;");
     expect(row).not.toContain("let notice");
-    expect(row).toContain(">Retry</button>");
+    expect(row).toContain(">Try again</button>");
+  });
+
+  it("hands the run timeline the panel's own refresh as its Rescan, not a new fetch path", () => {
+    // Behavior is proven in harness/github-panel.html (one click, one context read).
+    const timeline = source.slice(source.indexOf("<DeliveryTimeline"), source.indexOf("/>", source.indexOf("<DeliveryTimeline")));
+    expect(timeline).toContain("onRescan={() => void loadAll()}");
+    expect(source).toContain('onclick={loadAll} class="gp-btn"');
   });
 
   it("keeps the last good context when a refresh fails, and disables Refresh while one is out", () => {

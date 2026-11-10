@@ -36,7 +36,7 @@
       let views = 0;
       /** The next action gh refuses, with gh's own words. */
       let refuseNext = null;
-      /** #10's first read fails, with gh's words; the read after Retry succeeds. */
+      /** #10's first read fails, with gh's words; the read after Try again succeeds. */
       let failView10 = true;
       mockIPCWithEvents((cmd, args) => {
         switch (cmd) {
@@ -155,11 +155,11 @@
           check("the row keeps no second copy of it", () => !open.textContent.includes("done merge") && !open.querySelector('[role="status"]'));
 
           // --- a detail that cannot be read can be read again -----------------
-          check("a failed detail read says why and offers Retry", () =>
-            pane(10).textContent.includes("Could not load #10: gh: HTTP 502") && !!button(pane(10), "Retry"));
-          button(pane(10), "Retry").click();
+          check("a failed detail read says why and offers Try again", () =>
+            pane(10).textContent.includes("Couldn't load #10. gh: HTTP 502") && !!button(pane(10), "Try again"));
+          button(pane(10), "Try again").click();
           await until(() => pane(10).textContent.includes("by ada"));
-          check("and Retry reads it again and draws it", () => !pane(10).textContent.includes("Could not load"));
+          check("and Try again reads it again and draws it", () => !pane(10).textContent.includes("Couldn't load"));
 
           // --- review --------------------------------------------------------
           button(open, "Approve…").click();

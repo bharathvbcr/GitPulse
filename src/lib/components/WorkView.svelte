@@ -87,15 +87,15 @@
    * not a chip that silently renders as the default.
    */
   const STATUS_TONE: Record<PolicyStatus, string> = {
-    // Each carries both shades: a single fixed one is legible in one theme
-    // only, and these chips are the exceptions the reader is here to notice.
+    // Status roles, not palette shades: the role token resolves per theme, and
+    // these chips are the exceptions the reader is here to notice.
     allowed: "text-textMuted bg-surfaceHover",
-    demoted: "text-amber-700 dark:text-amber-400 bg-amber-500/10",
-    granted: "text-sky-700 dark:text-sky-400 bg-sky-500/10",
-    widened: "text-amber-700 dark:text-amber-400 bg-amber-500/10",
-    degraded: "text-amber-700 dark:text-amber-400 bg-amber-500/10",
-    warned: "text-amber-700 dark:text-amber-400 bg-amber-500/10",
-    blocked: "text-rose-700 dark:text-rose-400 bg-rose-500/10",
+    demoted: "text-warn bg-warn/15",
+    granted: "text-info bg-info/15",
+    widened: "text-warn bg-warn/15",
+    degraded: "text-warn bg-warn/15",
+    warned: "text-warn bg-warn/15",
+    blocked: "text-danger bg-danger/15",
     unchecked: "text-textMuted bg-surfaceHover",
   };
 
@@ -269,8 +269,8 @@
   /** Tile chrome: pressed tiles read as selected rather than merely hovered. */
   function tileClass(target: WorkFacet): string {
     return facet === target
-      ? "border-accent/60 bg-accent/10 ring-1 ring-accent/30"
-      : "border-border/70 bg-surface hover:border-accent/40";
+      ? "border-accent bg-accent/10 ring-1 ring-accent/30"
+      : "border-edge bg-surface hover:border-edgeStrong";
   }
 
   // A repository switch must not leave the previous repository's narrowing
@@ -306,11 +306,11 @@
      cap (it used to centre in max-w-6xl, which on a wide window left a quarter
      of the pane blank on each side), and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
-<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
+<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-xs text-textPrimary">
   <div class="flex items-start justify-between gap-3 mb-3 w-full">
     <div class="min-w-0">
       <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
-      <p class="mt-1 text-textMuted text-[12px] leading-relaxed">
+      <p class="mt-1 text-textMuted text-xs leading-relaxed">
         {hasTasks
           ? "Your workspace, from tasks to pull requests."
           : "Your workspace, from local changes to pull requests."}
@@ -326,37 +326,37 @@
       <RefreshCw size={12} class={loading ? "animate-spin" : ""} />
       {loading ? "Refreshing" : "Refresh"}
     </button>
-    <span class="text-[10px] text-textMuted" aria-live="polite">
+    <span class="text-micro text-textMuted" aria-live="polite">
       {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{:else if loading}Loading workspace…{/if}
     </span>
     </div>
   </div>
   {#if refreshError || navigationError || $repoStore.error}
-    <p role="alert" class="mb-3 w-full text-amber-700 dark:text-amber-300">{refreshError || navigationError || $repoStore.error}</p>
+    <p role="alert" class="mb-3 w-full text-warn">{refreshError || navigationError || $repoStore.error}</p>
   {/if}
 
   <!-- Where the reader is standing. First, because every other row on this
        screen is somewhere else. -->
   {#if $repoStore.currentPath}
-    <section aria-label="Current repository" class="overview-repository mb-3 w-full rounded-2xl border border-border/70 bg-surface p-4 shadow-card">
+    <section aria-label="Current repository" class="overview-repository mb-3 w-full gp-card p-4">
       <div class="overview-repository-heading">
         <div class="flex items-center gap-3 min-w-0">
           <div class="rounded-xl bg-accent/10 p-2 text-accent shrink-0"><Layers size={22} /></div>
           <div class="min-w-0">
-            <p class="text-[10px] font-semibold uppercase tracking-widest text-textMuted">Current repository</p>
-            <h3 class="mt-1 text-[21px] font-semibold tracking-tight truncate" title={$repoStore.currentPath}>
+            <p class="gp-label">Current repository</p>
+            <h3 class="mt-1 text-lg font-semibold tracking-tight truncate" title={$repoStore.currentPath}>
               {$repoStore.currentPath.split(/[\\/]/).filter(Boolean).pop() || $repoStore.currentPath}
             </h3>
-            <p class="mt-1 truncate font-mono text-[11px] text-textMuted" title={$repoStore.currentPath}>{$repoStore.currentPath}</p>
+            <p class="mt-1 truncate font-mono text-meta text-textMuted" title={$repoStore.currentPath}>{$repoStore.currentPath}</p>
           </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
-            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "resolve")}>
+            <button type="button" class="gp-btn" data-variant="primary" onclick={() => repoStore.setActiveTab("work", "resolve")}>
               <GitMerge size={13} /> Open Resolve
             </button>
           {:else if here && here.staged + here.unstaged > 0}
-            <button type="button" class="gp-btn-primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
+            <button type="button" class="gp-btn" data-variant="primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
               <FileDiff size={13} /> Review changes <ChevronRight size={12} />
             </button>
           {/if}
@@ -370,57 +370,57 @@
       </div>
       {#if here}
       <div class="overview-branch flex flex-wrap items-center gap-x-3 gap-y-2 mt-3 rounded-xl bg-background/50 px-3 py-2.5">
-        <span class="flex items-center gap-1.5 font-medium text-[13px] min-w-0">
+        <span class="flex items-center gap-1.5 font-medium text-sm min-w-0">
           <GitBranch size={14} class="text-accent shrink-0" />
           <span class="truncate">{here.branch ?? "Detached HEAD"}</span>
-          <span class="text-[10px] bg-accent/10 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
+          <span class="text-micro bg-accent/10 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
         </span>
 
         <!-- A branch the stats pass has not reached yet says so. Rendering its
              pre-fetch zeroes would claim it is level with a remote nobody has
              asked about. -->
         {#if !here.branch}
-          <span class="text-[11px] text-textMuted">No tracking branch</span>
+          <span class="text-meta text-textMuted">No tracking branch</span>
         {:else if here.unmeasured}
-          <span class="text-[11px] text-textMuted font-mono">sync not measured yet</span>
+          <span class="text-meta text-textMuted font-mono">sync not measured yet</span>
         {:else if here.upstream === null}
-          <span class="text-[11px] text-textMuted font-mono" title="No tracking branch is configured">
+          <span class="text-meta text-textMuted font-mono" title="No tracking branch is configured">
             no upstream
           </span>
         {:else if here.upstream.gone}
-          <span class="gp-pill border-rose-500/30! bg-rose-500/10! text-rose-700! dark:text-rose-300! font-mono"
+          <span class="gp-chip font-mono" data-tone="danger"
             title="{here.upstream.name} no longer exists on the remote">
             upstream gone
           </span>
         {:else if here.upstream.ahead > 0 || here.upstream.behind > 0}
-          <span class="text-[11px] font-mono text-textMuted inline-flex items-center gap-1.5"
+          <span class="text-meta font-mono text-textMuted inline-flex items-center gap-1.5"
             title="Against {here.upstream.name}">
             {#if here.upstream.ahead > 0}
-              <span class="inline-flex items-center gap-0.5 text-emerald-600 dark:text-emerald-400"><ArrowUp size={11} />{here.upstream.ahead}</span>
+              <span class="inline-flex items-center gap-0.5 text-ok"><ArrowUp size={11} />{here.upstream.ahead}</span>
             {/if}
             {#if here.upstream.behind > 0}
-              <span class="inline-flex items-center gap-0.5 text-amber-600 dark:text-amber-400"><ArrowDown size={11} />{here.upstream.behind}</span>
+              <span class="inline-flex items-center gap-0.5 text-warn"><ArrowDown size={11} />{here.upstream.behind}</span>
             {/if}
           </span>
         {:else}
-          <span class="text-[11px] font-mono text-textMuted">in sync with {here.upstream.name}</span>
+          <span class="text-meta font-mono text-textMuted">in sync with {here.upstream.name}</span>
         {/if}
 
         {#if !$repoStore.statsPending && !here.unmeasured && here.behindBase > 0 && here.comparedTo && here.comparedTo !== here.branch}
-          <span class="text-[11px] font-mono text-amber-600 dark:text-amber-400"
+          <span class="text-meta font-mono text-warn"
             title="{here.behindBase} commit{here.behindBase === 1 ? '' : 's'} on {here.comparedTo} that this branch does not have">
             {here.behindBase} behind {here.comparedTo}
           </span>
         {/if}
 
-        <span class="ml-auto flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] font-mono">
+        <span class="ml-auto flex flex-wrap items-center gap-x-2.5 gap-y-1 text-meta font-mono">
           {#if $repoStore.error || $repoStore.isLoading}
             <span>Status {$repoStore.error ? "unavailable" : "loading"}</span>
           {:else}
           {#if here.conflicted > 0}
             <button
               type="button"
-              class="text-rose-600 dark:text-rose-400 hover:underline"
+              class="text-danger hover:underline"
               onclick={() => repoStore.setActiveTab("work", "resolve")}
               title="Open Resolve"
             >
@@ -428,10 +428,10 @@
             </button>
           {/if}
           {#if here.staged > 0}
-            <button type="button" class="text-emerald-600 dark:text-emerald-400 hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, true)} title="Preview staged files and modifications">{here.staged} staged</button>
+            <button type="button" class="text-ok hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, true)} title="Preview staged files and modifications">{here.staged} staged</button>
           {/if}
           {#if here.unstaged > 0}
-            <button type="button" class="text-amber-600 dark:text-amber-400 hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, false)} title="Preview unstaged files and modifications">{here.unstaged} unstaged</button>
+            <button type="button" class="text-warn hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, false)} title="Preview unstaged files and modifications">{here.unstaged} unstaged</button>
           {/if}
           {#if here.staged + here.unstaged + here.conflicted === 0}
             <span class="text-textMuted">working tree clean</span>
@@ -440,14 +440,14 @@
         </span>
       </div>
       {:else}
-        <p class="mt-4 text-[11px] text-textMuted">{$repoStore.isBare ? "Bare repository" : "No checked-out branch"}</p>
+        <p class="mt-4 text-meta text-textMuted">{$repoStore.isBare ? "Bare repository" : "No checked-out branch"}</p>
       {/if}
 
       <!-- The one thing here that cannot make progress on its own. -->
       {#if $repoStore.operation.operation}
         <button
           type="button"
-          class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
+          class="mt-2 flex w-full items-start gap-2 rounded-xl bg-warn/15 px-2.5 py-1.5 text-left text-meta text-warn hover:bg-warn/25"
           onclick={() => repoStore.setActiveTab("work", "resolve")}
           title="Open Resolve to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
@@ -455,7 +455,7 @@
           <span class="min-w-0">{headline($repoStore.operation.operation)}</span>
         </button>
       {:else if $repoStore.operation.probeFailed}
-        <p class="mt-2 text-[11px] text-amber-600 dark:text-amber-400">
+        <p class="mt-2 text-meta text-warn">
           Could not check for a parked merge or rebase here — this line is not “nothing is parked”.
         </p>
       {/if}
@@ -471,13 +471,13 @@
         type="button"
         aria-pressed={facet === "all"}
         onclick={() => (facet = "all")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 {tileClass('all')}"
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) {tileClass('all')}"
       >
-        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+        <div class="gp-label flex items-center gap-1">
           <Layers size={11} /> Worktrees
         </div>
         <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.worktrees : "—"}</div>
-        <div class="text-[10px] text-textMuted">
+        <div class="text-micro text-textMuted">
           {#if !worktreeListKnown}Worktree list unavailable{:else}
             {#if !projection?.sources.worktrees.ok}Partial data · {/if}{summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
               · {summary.unscannedDirty} unscanned{/if}
@@ -489,13 +489,13 @@
         aria-pressed={facet === "agents"}
         disabled={summary.agentSessions === 0}
         onclick={() => toggleFacet("agents")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('agents')}"
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('agents')}"
       >
-        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+        <div class="gp-label flex items-center gap-1">
           <Bot size={11} /> Agent worktrees
         </div>
         <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.agentSessions : "—"}</div>
-        <div class="text-[10px] text-textMuted truncate">
+        <div class="text-micro text-textMuted truncate">
           {!worktreeListKnown ? "Worktree list unavailable" : summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "No agent worktrees detected"}
         </div>
       </button>
@@ -504,37 +504,37 @@
         aria-pressed={facet === "blocked"}
         disabled={summary.blocked === 0}
         onclick={() => toggleFacet("blocked")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('blocked')}"
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('blocked')}"
       >
-        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+        <div class="gp-label flex items-center gap-1">
           <GitMerge size={11} /> Blocked
         </div>
-        <div class="overview-metric-value {summary.blocked > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-textPrimary'}">
+        <div class="overview-metric-value {summary.blocked > 0 ? 'text-warn' : 'text-textPrimary'}">
           {summary.blocked > 0 || (worktreeListKnown && summary.unscannedOperations === 0) ? summary.blocked : "—"}
         </div>
-        <div class="text-[10px] text-textMuted">{!worktreeListKnown ? "Operation status unavailable" : summary.unscannedOperations > 0 ? `${summary.unscannedOperations} worktrees not checked` : summary.blocked > 0 ? "Operations waiting for you" : "Parked merges, rebases & picks"}</div>
+        <div class="text-micro text-textMuted">{!worktreeListKnown ? "Operation status unavailable" : summary.unscannedOperations > 0 ? `${summary.unscannedOperations} worktrees not checked` : summary.blocked > 0 ? "Operations waiting for you" : "Parked merges, rebases & picks"}</div>
       </button>
       <button
         type="button"
         aria-pressed={facet === "pullRequests"}
         disabled={summary.pullRequests === 0}
         onclick={() => toggleFacet("pullRequests")}
-        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('pullRequests')}"
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-(--gp-dur-instant) disabled:cursor-default {tileClass('pullRequests')}"
       >
-        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+        <div class="gp-label flex items-center gap-1">
           <GitPullRequest size={11} /> Pull requests
         </div>
         <div class="overview-metric-value text-textPrimary">{projection?.sources.github.present && (projection.sources.github.ok || summary.pullRequests > 0) ? summary.pullRequests : "—"}</div>
-        <div class="text-[10px] text-textMuted">{!projection?.sources.github.present ? "GitHub not available" : !projection.sources.github.ok ? "Partial GitHub data" : "Across workspace branches"}</div>
+        <div class="text-micro text-textMuted">{!projection?.sources.github.present ? "GitHub not available" : !projection.sources.github.ok ? "Partial GitHub data" : "Across workspace branches"}</div>
       </button>
     </div>
 
     <div class="mb-3 w-full flex flex-wrap items-center justify-between gap-2">
-      <h3 class="flex items-center gap-2 text-[13px] font-semibold">
+      <h3 class="flex items-center gap-2 text-sm font-semibold">
         Work in flight
-        <span class="rounded-full bg-surfaceHover px-2 py-0.5 text-[10px] font-mono font-normal text-textMuted">{visibleRows.length}{#if projection && visibleRows.length !== projection.rows.length} / {projection.rows.length}{/if}</span>
+        <span class="rounded-full bg-surfaceHover px-2 py-0.5 text-micro font-mono font-normal text-textMuted">{visibleRows.length}{#if projection && visibleRows.length !== projection.rows.length} / {projection.rows.length}{/if}</span>
       </h3>
-      <span class="text-[11px] text-textMuted">Blocked work appears first</span>
+      <span class="text-meta text-textMuted">Blocked work appears first</span>
     </div>
     <div class="mb-3 w-full flex flex-wrap items-center gap-2">
       <label class="relative flex-1 min-w-52">
@@ -547,28 +547,28 @@
           bind:value={query}
         />
       </label>
-      <button type="button" class="inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-[11px] {tileClass('attention')}"
+      <button type="button" class="inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-meta {tileClass('attention')}"
         aria-pressed={facet === "attention"} onclick={() => toggleFacet("attention")}
         title="Parked operations, local changes, unscanned worktrees, failed CI or requested changes">
         <AlertTriangle size={12} /> Needs attention
       </button>
       <button
         type="button"
-        class="overview-dirty-filter inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-[11px] transition-colors {tileClass('dirty')}"
+        class="overview-dirty-filter inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-meta transition-colors {tileClass('dirty')}"
         aria-pressed={facet === "dirty"}
         onclick={() => toggleFacet("dirty")}
         title="Show worktrees with measured uncommitted changes"
       >
-        <FileDiff size={12} class="text-amber-600 dark:text-amber-400" />
+        <FileDiff size={12} class="text-warn" />
         Uncommitted changes
       </button>
       {#if projection && (facet !== "all" || query.trim() !== "")}
-        <span class="text-[11px] text-textMuted font-mono">
+        <span class="text-meta text-textMuted font-mono">
           {visibleRows.length} of {projection.rows.length}
         </span>
         <button
           type="button"
-          class="px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px]"
+          class="gp-btn" data-size="sm"
           onclick={() => {
             facet = "all";
             query = "";
@@ -579,9 +579,9 @@
       {/if}
       <button
         type="button"
-        class="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px]"
+        class="gp-btn" data-size="sm"
         onclick={openMcpSettings}
-        title="Agents read this same snapshot over MCP 2.0 (gitpulse_insights)"
+        title="Agents read this same snapshot over MCP 2.0"
       >
         <Plug size={12} class="text-accent" />
         Connect an agent
@@ -591,21 +591,22 @@
 
   {#if collisionError}
     <div
-      class="mb-3 w-full flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="gp-notice mb-3 w-full text-meta"
+      data-tone="unknown"
     >
-      <AlertTriangle size={14} class="shrink-0 mt-px" />
+      <AlertTriangle size={14} class="shrink-0 mt-px text-unknown" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
     </div>
   {/if}
   {#if collisions && collisions.shared_worktrees.length > 0}
     <div
-      class="mb-3 w-full rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full rounded-xl border border-warn/35 bg-warn/15 p-2.5 text-meta text-warn"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
         <span>Live agent sessions are sharing a worktree. Every dirty file there is open to all of them.</span>
       </div>
-      <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
+      <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-micro">
         {#each collisions.shared_worktrees as shared (shared.path)}
           <li>
             {shared.path}
@@ -624,7 +625,7 @@
   {/if}
   {#if collisions && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.failed_worktrees > 0 || collisions.truncated)}
     <div
-      class="mb-3 w-full rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 w-full rounded-xl border border-warn/35 bg-warn/15 p-2.5 text-meta text-warn"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
@@ -659,7 +660,7 @@
         <p class="mt-1">{collisions.scanned_worktrees} scanned · {collisions.failed_worktrees} failed · {collisions.unscanned_worktrees} unscanned{collisions.truncated ? " · results truncated" : ""}</p>
       {/if}
       {#if collisions.items.length > 0}
-        <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
+        <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-micro">
           {#each collisions.items.slice(0, 8) as item, i (`${item.path}#${i}`)}
             <li>
               {item.path}
@@ -680,9 +681,10 @@
        before they start reading it. -->
   {#if degraded}
     <div
-      class="mb-3 w-full flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="gp-notice mb-3 w-full text-meta"
+      data-tone="unknown"
     >
-      <AlertTriangle size={14} class="shrink-0 mt-px" />
+      <AlertTriangle size={14} class="shrink-0 mt-px text-unknown" />
       <span>{degraded}</span>
     </div>
   {/if}
@@ -730,7 +732,7 @@
         {@const changedWorktree = row.worktrees.find(binding => measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0)?.worktree}
         {@const activity = rowLastActivity(row, $repoStore.branches)}
         <div
-          class="overview-work-row rounded-2xl border border-border/70 bg-surface p-4 shadow-card"
+          class="overview-work-row gp-card p-4"
           class:opacity-80={row.kind === "unbound"}
           class:overview-work-row-blocked={row.operation !== null}
           data-work-row
@@ -741,7 +743,7 @@
                 {#if row.worktrees.length > 0}
                   <button
                     type="button"
-                    class="truncate text-left text-[13px] hover:text-accent"
+                    class="truncate text-left text-sm hover:text-accent"
                     title="Open {openPathFor(row)}"
                     onclick={() => void openWorktree(row)}
                   >
@@ -751,10 +753,10 @@
                   <span class="truncate">{rowTitle(row)}</span>
                 {/if}
                 {#if row.worktrees.some((binding) => binding.worktree.path === $repoStore.currentPath)}
-                  <span class="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent">Current worktree</span>
+                  <span class="rounded-full bg-accent/10 px-2 py-0.5 text-micro text-accent">Current worktree</span>
                 {/if}
                 {#if row.taskId}
-                  <span class="font-mono text-[10px] text-textMuted">{row.taskId}</span>
+                  <span class="font-mono text-micro text-textMuted">{row.taskId}</span>
                 {/if}
                 <!-- An agent worktree and a hand-made one want opposite
                      remedies — merge or resume, versus prune — so they are
@@ -762,20 +764,20 @@
                      the directory layout, not a hard-coded product. -->
                 {#each agentsOn(row) as kind (kind)}
                   <span
-                    class="inline-flex items-center gap-1 rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent"
+                    class="inline-flex items-center gap-1 rounded-full bg-accent/10 px-1.5 py-0.5 text-micro text-accent"
                     title={agentChipTitle(row, kind)}
                   >
                     <Bot size={10} />{kind}
                   </span>
                 {/each}
                 {#if row.worktrees.some((b) => b.worktree.is_main)}
-                  <span class="rounded-full bg-surfaceHover px-1.5 py-0.5 text-[10px] text-textMuted">
+                  <span class="rounded-full bg-surfaceHover px-1.5 py-0.5 text-micro text-textMuted">
                     main worktree
                   </span>
                 {/if}
                 {#if row.lease}
                   <span
-                    class="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400"
+                    class="rounded-full bg-info/15 px-1.5 py-0.5 text-micro text-info"
                     title="Leased by {row.lease.owner}{row.lease.agent
                       ? ` (${row.lease.agent})`
                       : ''}{row.lease.expires_at
@@ -787,11 +789,11 @@
                 {/if}
               </div>
               {#if row.kind === "worktree" && row.worktrees.length > 0}
-                <p class="mt-1.5 truncate font-mono text-[10px] text-textMuted" title={row.worktrees[0].worktree.path}>
+                <p class="mt-1.5 truncate font-mono text-micro text-textMuted" title={row.worktrees[0].worktree.path}>
                   {row.worktrees[0].worktree.path}
                 </p>
               {/if}
-              <div class="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-textMuted">
+              <div class="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-meta text-textMuted">
                 <!-- A worktree row IS one worktree; printing "1" beside every
                      one of them is noise that crowds out the counts that vary. -->
                 {#if row.kind !== "worktree"}
@@ -833,7 +835,7 @@
                      cap). Rendering that as 0 would report an unscanned
                      worktree as verified clean. -->
                 {#if dirtyCount(row) > 0}
-                  <button type="button" class="flex items-center gap-1 text-amber-700 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {changedWorktree?.path}"
+                  <button type="button" class="flex items-center gap-1 text-warn hover:underline" title="Preview uncommitted files in {changedWorktree?.path}"
                     onclick={() => changedWorktree && void repoStore.previewUncommitted(changedWorktree.path)}>
                     <FileDiff size={12} />
                     {dirty.files} uncommitted
@@ -849,13 +851,13 @@
                   <span class="text-textMuted">Changes not scanned</span>
                 {/if}
                 {#if row.worktrees.some(binding => binding.operationChecked === false)}
-                  <span class="text-amber-700 dark:text-amber-400">Operation not checked</span>
+                  <span class="text-warn">Operation not checked</span>
                 {/if}
                 {#if dirty.scanned < dirty.total && dirty.scanned > 0}
-                  <span class="text-amber-700 dark:text-amber-400">{dirty.scanned} of {dirty.total} worktrees scanned</span>
+                  <span class="text-warn">{dirty.scanned} of {dirty.total} worktrees scanned</span>
                 {/if}
                 {#if projection.sources.ledger.present}
-                  <span class="font-mono" title="Events attributed to this row within the latest 500 ledger records">
+                  <span class="font-mono" title="Events attributed to this row within the latest 500 recorded events">
                     {row.verdicts.events} recent events
                   </span>
                 {/if}
@@ -874,7 +876,7 @@
 
             <div class="flex flex-wrap items-center justify-end gap-1 shrink-0">
               {#each chips as [status, count] (status)}
-                <span class="rounded px-1.5 py-0.5 text-[10px] font-medium {STATUS_TONE[status]}">
+                <span class="rounded px-1.5 py-0.5 text-micro font-medium {STATUS_TONE[status]}">
                   {status} {count}
                 </span>
               {/each}
@@ -883,7 +885,7 @@
                    check that could not run reading as one that passed. -->
               {#if row.verdicts.unparsed > 0}
                 <span
-                  class="rounded bg-rose-500/10 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 dark:text-rose-400"
+                  class="rounded bg-danger/15 px-1.5 py-0.5 text-micro font-medium text-danger"
                   title="Verdicts this build could not read. Not counted as allowed."
                 >
                   unreadable {row.verdicts.unparsed}
@@ -898,7 +900,7 @@
           {#if row.operation}
             <button
               type="button"
-              class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
+              class="mt-2 flex w-full items-start gap-2 rounded-xl bg-warn/15 px-2.5 py-1.5 text-left text-meta text-warn hover:bg-warn/25"
               onclick={() => openWorktree(row)}
               title="Open this worktree to finish or abort the {kindTitle(row.operation.kind).toLowerCase()}"
             >
@@ -918,7 +920,7 @@
             <div class="mt-2 flex flex-wrap gap-2" aria-label="Latest observed workflow runs">
               {#each latestRuns(row) as run (run.id)}
                 {@const stale = isStaleRun(row, run)}
-                <button type="button" class="gp-btn text-[10px]!" class:opacity-50={stale} data-stale-run={stale ? "true" : undefined} onclick={() => void openGithub(run.url)}
+                <button type="button" class="gp-btn" data-size="sm" class:opacity-50={stale} data-stale-run={stale ? "true" : undefined} onclick={() => void openGithub(run.url)}
                   title={stale ? `Stale: workflow run ${run.id} ran on ${run.head_sha.slice(0, 7)}, not this worktree's current commit. Open on GitHub` : `Open workflow run ${run.id} on GitHub`}>
                   <Play size={11} /> {run.name || "Workflow"}: {run.status.toLowerCase() === "completed" ? run.conclusion || "conclusion unknown" : run.status || "status unknown"}{#if stale} (stale, {run.head_sha.slice(0, 7)}){/if}
                 </button>
@@ -926,14 +928,14 @@
             </div>
           {/if}
           {#if (row.kind !== "worktree" && row.worktrees.length > 0) || row.pullRequests.length > 0}
-            <div class="mt-2.5 grid gap-2 border-t border-border/50 pt-2.5 md:grid-cols-2">
+            <div class="mt-3 grid gap-2 md:grid-cols-2">
               {#if row.kind !== "worktree" && row.worktrees.length > 0}
                 <ul class="space-y-1">
                   {#each row.worktrees as binding, i (`${binding.worktree.path}#${i}`)}
                     <li class="flex items-center gap-2">
                       <button
                         type="button"
-                        class="flex w-full items-center gap-1.5 rounded font-mono text-[10px] text-textMuted hover:text-accent"
+                        class="flex w-full items-center gap-1.5 rounded font-mono text-micro text-textMuted hover:text-accent"
                         title="Open {binding.worktree.path}"
                         onclick={() => void openBinding(binding)}
                       >
@@ -944,7 +946,7 @@
                         {/if}
                       </button>
                       {#if measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0}
-                        <button type="button" class="shrink-0 text-[10px] text-amber-600 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {binding.worktree.path}"
+                        <button type="button" class="shrink-0 text-micro text-warn hover:underline" title="Preview uncommitted files in {binding.worktree.path}"
                           onclick={() => void repoStore.previewUncommitted(binding.worktree.path)}>{binding.worktree.dirty_files} dirty</button>
                       {/if}
                     </li>
@@ -954,11 +956,11 @@
               {#if row.pullRequests.length > 0}
                 <ul class="space-y-1">
                   {#each row.pullRequests as pr (pr.number)}
-                    <li class="flex items-center gap-1.5 text-[11px]">
+                    <li class="flex items-center gap-1.5 text-meta">
                       <GitPullRequest size={11} class="shrink-0 text-accent" />
                       <span class="min-w-0 flex-1">
                         <span class="block truncate" title={pr.title}>#{pr.number} {pr.title}</span>
-                        <span class="text-[10px] text-textMuted">{pr.is_draft ? "Draft · " : ""}CI {pr.ci_status || "unknown"} · {pr.review_decision ? pr.review_decision.toLowerCase().replaceAll("_", " ") : "Review not reported"}</span>
+                        <span class="text-micro text-textMuted">{pr.is_draft ? "Draft · " : ""}CI {pr.ci_status || "unknown"} · {pr.review_decision ? pr.review_decision.toLowerCase().replaceAll("_", " ") : "Review not reported"}</span>
                       </span>
                       <button
                         type="button"
@@ -988,7 +990,7 @@
     <div class="mt-4 w-full">
       <button
         type="button"
-        class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
+        class="flex w-full items-center gap-1.5 rounded-xl border border-edge px-3 py-2 text-meta font-medium text-textMuted hover:bg-surfaceHover"
         onclick={() => (showRepoDetail = !showRepoDetail)}
         aria-expanded={showRepoDetail}
       >
@@ -1008,7 +1010,7 @@
     <div class="mt-4 w-full">
       <button
         type="button"
-        class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
+        class="flex w-full items-center gap-1.5 rounded-xl border border-edge px-3 py-2 text-meta font-medium text-textMuted hover:bg-surfaceHover"
         onclick={() => (showStackDetail = !showStackDetail)}
         aria-expanded={showStackDetail}
       >
@@ -1065,7 +1067,7 @@
   }
 
   .overview-work-row-blocked {
-    border-color: rgb(245 158 11 / 0.3);
+    border-color: rgb(var(--c-warn) / 0.35);
   }
 
   .overview-row-heading > :first-child {

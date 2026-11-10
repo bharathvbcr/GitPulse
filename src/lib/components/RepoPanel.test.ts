@@ -81,7 +81,7 @@ describe("RepoPanel section headers on a failed read", () => {
     for (const name of ["remotes", "submodules"]) {
       const h = header(name);
       expect(h.indexOf(`${name}Error ?`)).toBeLessThan(h.indexOf(`${name}Loaded ?`));
-      expect(h).toContain("text-red-600 dark:text-red-400");
+      expect(h).toContain("text-danger");
     }
   });
 

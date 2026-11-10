@@ -199,20 +199,17 @@ describe("malformed input is judged, not trusted", () => {
 });
 
 describe("colour", () => {
-  it("puts both light and dark shades on every verdict", () => {
-    // A bare `-400` is tuned for the dark theme and sits near 2:1 on the light
-    // theme's card — on exactly the labels a reader opened the panel to check.
-    // The same guard `rolloutState` carries, because these render side by side.
-    for (const run of [
-      makeRun({ conclusion: "success" }),
-      makeRun({ conclusion: "failure" }),
-      makeRun({ status: "in_progress", conclusion: "" }),
-    ]) {
-      const cls = runStateClass(run);
-      expect(cls, `${run.status}/${run.conclusion} needs a light shade`).toMatch(
-        /text-\w+-\d00\b/,
-      );
-      expect(cls, `${run.status}/${run.conclusion} needs a dark shade`).toContain("dark:text-");
+  it("gives every verdict a status role, themed for both schemes", () => {
+    // A bare palette shade is tuned for one theme and sits near 2:1 on the
+    // other's card — on exactly the labels a reader opened the panel to check.
+    // The status roles are defined per theme, so no `dark:` pairing is needed.
+    const expected: Array<[WorkflowRunInfo, string]> = [
+      [makeRun({ conclusion: "success" }), "text-ok"],
+      [makeRun({ conclusion: "failure" }), "text-danger"],
+      [makeRun({ status: "in_progress", conclusion: "" }), "text-warn"],
+    ];
+    for (const [run, role] of expected) {
+      expect(runStateClass(run), `${run.status}/${run.conclusion}`).toBe(role);
     }
   });
 
