@@ -144,14 +144,11 @@ impl ReadScope {
         }
     }
 
-    /// Puts this request's flag in force on the current thread.
+    /// Puts this request's flag in force on the current thread. A thread the
+    /// command spawns takes it with [`current`] and [`enter`] (the free
+    /// functions), since the scope is thread-local.
     pub(crate) fn enter(&self) -> ScopeGuard {
         enter(self.cancel.as_ref())
-    }
-
-    /// The flag, to carry into a thread the command spawns.
-    pub(crate) fn handle(&self) -> Option<ReadCancel> {
-        self.cancel.clone()
     }
 }
 
@@ -205,6 +202,12 @@ impl super::ProcessObserver for OwnCancel<'_> {
 mod tests {
     use super::*;
 
+    /// The flag a scope puts in force, read the way a spawned walk reads it.
+    fn flag_of(scope: &ReadScope) -> Option<ReadCancel> {
+        let _entered = scope.enter();
+        current()
+    }
+
     #[test]
     fn an_unknown_finished_or_malformed_id_cancels_nothing() {
         assert!(!cancel("never-registered"));
@@ -212,7 +215,7 @@ mod tests {
         assert!(!cancel("has space"));
         assert!(!cancel(&"x".repeat(MAX_ID_LEN + 1)));
         let scope = ReadScope::open(Some("rc-test-finished"));
-        let flag = scope.handle().unwrap();
+        let flag = flag_of(&scope).unwrap();
         drop(scope);
         assert!(!cancel("rc-test-finished"));
         assert!(!flag.is_cancelled());
@@ -223,11 +226,11 @@ mod tests {
         let first = ReadScope::open(Some("rc-test-live"));
         let second = ReadScope::open(Some("rc-test-live"));
         assert!(
-            second.handle().is_none(),
+            flag_of(&second).is_none(),
             "a duplicate id must not share a flag"
         );
         assert!(cancel("rc-test-live"));
-        assert!(first.handle().unwrap().is_cancelled());
+        assert!(flag_of(&first).unwrap().is_cancelled());
         // The duplicate's drop must not remove the first's registration.
         drop(second);
         assert!(cancel("rc-test-live"));
