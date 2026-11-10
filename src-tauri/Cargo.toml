@@ -396,6 +396,16 @@ harness = false
 test = false
 
 [[bench]]
+name = "graph_window"
+harness = false
+test = false
+
+[[bench]]
+name = "graph_hit_path"
+harness = false
+test = false
+
+[[bench]]
 name = "alerts_worker_throughput"
 harness = false
 test = false

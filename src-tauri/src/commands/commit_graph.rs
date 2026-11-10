@@ -38,6 +38,18 @@ pub struct CommitGraphPayload {
     /// newest commit's chain was pinned instead.
     #[serde(default)]
     pub mainline_name: Option<String>,
+    /// Names the state this page was drawn from, for the client to hand back
+    /// on its next reload of the same view (see [`graph_token`]). `None`
+    /// whenever the load cannot vouch for it: a revision or paged read, a
+    /// degraded facet, or refs written too recently to tell apart.
+    #[serde(default)]
+    pub graph_token: Option<String>,
+    /// True when the client's token still names the repository's state: the
+    /// client keeps the page it holds, and `rows` and `refs` are left empty
+    /// rather than resent. `head_id`, `warnings`, `notices` and `graph_token`
+    /// are current as on any other answer.
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 /// What a graph load has to say about itself, in the two kinds that must not
@@ -259,6 +271,8 @@ pub fn assemble_commit_graph(
         notices: notes.notices,
         mainline_id,
         mainline_name,
+        graph_token: None,
+        unchanged: false,
     }
 }
 
@@ -268,6 +282,12 @@ pub fn assemble_commit_graph(
 /// one answer for both, so the graph cannot draw a lane it has no name for
 /// (see [`crate::graph::ref_scope`]). `None` means the named set: branches,
 /// remote-tracking branches, tags and HEAD.
+///
+/// `known_token` is the [`CommitGraphPayload::graph_token`] of the page the
+/// client already holds for this same view. When it still names the
+/// repository's state the answer is `unchanged`: no history walk, no lane
+/// solve, no rows on the wire. It only ever short-circuits — a page is always
+/// one lane solve over its whole window, never stitched from two.
 #[tauri::command(async)]
 pub async fn cmd_get_commit_graph(
     repo_path: String,
@@ -277,14 +297,172 @@ pub async fn cmd_get_commit_graph(
     skip: Option<usize>,
     ref_scope: Option<RefScope>,
     request_id: Option<String>,
+    known_token: Option<String>,
 ) -> Result<CommitGraphPayload, IpcError> {
     // Registered before the body is queued, so a cancel that arrives while
     // the walk waits for a pool thread still finds it. Only the history walk
     // (the long pole) is cancellable; the short probes beside it run on.
     let read = ReadScope::open(request_id.as_deref());
     off_thread(move || {
+        // In force on the pool thread; `commit_graph_page` carries it into the
+        // walk, whether the walk runs beside the probes or after them.
         let _cancellable = read.enter();
-        let walk_cancel = read.handle();
+        commit_graph_page(
+            repo_path,
+            max_commits,
+            query,
+            revision,
+            skip,
+            ref_scope,
+            known_token,
+        )
+    })
+    .await
+}
+
+/// A token names a graph page by three hashes and the second it was issued.
+///
+/// * **view**: the arguments the page was asked for (repository, window size,
+///   query, ref scope), so a token for one window cannot answer for another.
+/// * **stamp**: the settled fingerprint of the files that rewrite history
+///   (`shallow`, grafts, replace refs) or change how refs resolve (config,
+///   packed and reftable stores) and of every loose ref. It must be settled:
+///   within the filesystem's timestamp tick a write is indistinguishable from
+///   the state stamped.
+/// * **content**: the ref tips the page starts from (HEAD, decorations, default
+///   branch, notices), compared by content. A degraded facet (any warning) has
+///   none, so a probe that failed is retried on the next reload instead of
+///   being answered `unchanged` forever.
+///
+/// The first two are known before anything is read, which is what lets a
+/// request decide whether the token can still hold without waiting for the
+/// probes; see [`token_may_hold`].
+struct TokenParts<'a> {
+    view: &'a str,
+    stamp: &'a str,
+    content: &'a str,
+    issued: u64,
+}
+
+/// Hex digits per hash in a token.
+const HASH_HEX: usize = 16;
+
+fn split_token(token: &str) -> Option<TokenParts<'_>> {
+    let (hashes, issued) = token.split_once('-')?;
+    if hashes.len() != 3 * HASH_HEX || !hashes.is_ascii() {
+        return None;
+    }
+    Some(TokenParts {
+        view: &hashes[..HASH_HEX],
+        stamp: &hashes[HASH_HEX..2 * HASH_HEX],
+        content: &hashes[2 * HASH_HEX..],
+        issued: issued.parse().ok()?,
+    })
+}
+
+fn hex(hash: u64) -> String {
+    format!("{hash:016x}")
+}
+
+fn hash_of(parts: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parts.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The hash of the arguments a page is asked for.
+pub(super) fn view_key(
+    repo_path: &str,
+    max_commits: usize,
+    query: Option<&str>,
+    ref_scope: RefScope,
+) -> u64 {
+    hash_of((repo_path, max_commits, query, ref_scope == RefScope::All))
+}
+
+/// The hash of the ref tips a page starts from, or `None` when the page cannot
+/// be vouched for (any warning).
+fn content_key(
+    head_id: Option<&str>,
+    refs: &[RefDecoration],
+    default_branch: Option<&str>,
+    notes: &GraphNotes,
+) -> Option<u64> {
+    if !notes.warnings.is_empty() {
+        return None;
+    }
+    let refs = serde_json::to_vec(refs).ok()?;
+    Some(hash_of((head_id, &refs, default_branch, &notes.notices)))
+}
+
+fn issued_token(view: u64, stamp: u64, content: u64, issued: u64) -> String {
+    format!("{}{}{}-{issued}", hex(view), hex(stamp), hex(content))
+}
+
+/// Seconds since the Unix epoch on the clock the ref cache judges stamps by.
+fn issue_seconds() -> u64 {
+    crate::engine::ref_cache::wall_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// True while a token is younger than the ref cache's TTL. The stamp cannot
+/// see everything a graph is a function of (a file pulled in by `include.path`
+/// can switch off replace refs without touching any stamped file), which is
+/// why the ref cache bounds every answer by [`crate::engine::ref_cache::TTL`];
+/// a token carries the same bound. An issue time in the future (the clock
+/// stepped back) is not trusted. Judged on the clock a test can pin.
+fn token_fresh(issued: u64) -> bool {
+    issue_seconds()
+        .checked_sub(issued)
+        .is_some_and(|age| age < crate::engine::ref_cache::TTL.as_secs())
+}
+
+/// Whether `known` can still hold for this request, from what is known before
+/// any probe runs: the same view, the same stamp, not expired. A request whose
+/// token fails this is certain to be answered in full, so it starts its walk at
+/// once beside the probes, exactly as a request with no token does; only a
+/// token that passes waits for the probes to compare tip content. This is one
+/// comparison of a stamp already read, not a second read of anything.
+pub(super) fn token_may_hold(known: &str, view: u64, stamp: u64) -> bool {
+    split_token(known).is_some_and(|parts| {
+        parts.view == hex(view) && parts.stamp == hex(stamp) && token_fresh(parts.issued)
+    })
+}
+
+/// True when `known` names exactly this view, stamp and tip content and is
+/// still fresh.
+fn token_names(known: &str, view: u64, stamp: u64, content: u64) -> bool {
+    split_token(known).is_some_and(|parts| {
+        parts.view == hex(view)
+            && parts.stamp == hex(stamp)
+            && parts.content == hex(content)
+            && token_fresh(parts.issued)
+    })
+}
+
+/// The settled fingerprint of the files [`graph_token`] stands on, read now.
+pub(super) fn graph_stamp(repo_path: &str, ref_scope: RefScope) -> Option<u64> {
+    crate::engine::ref_cache::stamp(
+        Path::new(repo_path),
+        crate::graph::decoration_patterns(ref_scope),
+    )?
+    .settled_fingerprint()
+}
+
+/// [`cmd_get_commit_graph`] on the calling thread, so a test can pin the
+/// clock the stamps are judged by.
+pub(super) fn commit_graph_page(
+    repo_path: String,
+    max_commits: usize,
+    query: Option<String>,
+    revision: Option<String>,
+    skip: Option<usize>,
+    ref_scope: Option<RefScope>,
+    known_token: Option<String>,
+) -> Result<CommitGraphPayload, CommandError> {
+    {
         // One row over the cap: the extra row is the has_more probe and is
         // dropped before lanes are solved. This arithmetic and the reader's
         // page_count_limit clamp must stay in lockstep — if the clamp swallows
@@ -301,8 +479,6 @@ pub async fn cmd_get_commit_graph(
         // Two lists, not one: see [`GraphNotes`]. `warnings` is what someone
         // has to fix; `notices` is what this graph is honestly not drawing.
         let mut notes = GraphNotes::default();
-        let repo = repo_path.clone();
-        let rev = revision.clone();
         // Parsing is pure string work, so it happens BEFORE the walk: a `path:`
         // token has to reach git itself. Narrowing a full walk afterwards left
         // every survivor naming parents that had been filtered out, and the
@@ -328,24 +504,51 @@ pub async fn cmd_get_commit_graph(
         // the first page already carries.
         let probe_hidden =
             revision.is_none() && ref_scope == RefScope::Named && skip.unwrap_or(0) == 0;
+        // A token is only vouched for on the plain first page of a view: a
+        // named revision may start anywhere in the ref store, and a paged read
+        // is a different window. The stamp is read BEFORE anything is walked,
+        // so a ref that moves during this load makes the token it issues stale
+        // on arrival instead of naming a state newer than the rows.
+        let tokenable = revision.is_none() && skip.unwrap_or(0) == 0;
+        let issued = issue_seconds();
+        let stamp_before = if tokenable {
+            graph_stamp(&repo_path, ref_scope)
+        } else {
+            None
+        };
+        let view = view_key(&repo_path, max_commits, query.as_deref(), ref_scope);
+        // The probes run before the walk only for a token that can still hold
+        // (same view, same stamp, unexpired): then the likeliest answer is
+        // `unchanged` and a walk started beside the probes would be wasted. Any
+        // other request, including one whose token is already stale, starts the
+        // walk at once and overlaps it with the probes, as it always has, so a
+        // stale token costs one comparison and nothing more than no token.
+        let probe_first = known_token
+            .as_deref()
+            .zip(stamp_before)
+            .is_some_and(|(known, stamp)| token_may_hold(known, view, stamp));
         // A test's governor injection is thread-local, so the helper that walks
         // history takes the command's, as `off_thread` does for the pool thread.
         #[cfg(test)]
         let injected = crate::sysload::injected_governor_input();
+        // The request's cancel flag is thread-local and does not follow a
+        // spawn, so the walk puts it in force on whichever thread runs it.
+        let walk_cancel = crate::engine::git_cli::read_cancel::current();
+        let walk = || {
+            #[cfg(test)]
+            let _carried = injected.clone().map(crate::sysload::inject_governor);
+            let _cancellable = crate::engine::git_cli::read_cancel::enter(walk_cancel.as_ref());
+            GitReader::read_commit_history_paged(
+                &repo_path,
+                skip.unwrap_or(0),
+                fetch_limit,
+                revision.as_deref(),
+                path_filter.as_deref(),
+                ref_scope,
+            )
+        };
         let (history, head, refs, default_branch, hidden) = std::thread::scope(|scope| {
-            let history = scope.spawn(move || {
-                #[cfg(test)]
-                let _carried = injected.map(crate::sysload::inject_governor);
-                let _cancellable = crate::engine::git_cli::read_cancel::enter(walk_cancel.as_ref());
-                GitReader::read_commit_history_paged(
-                    &repo,
-                    skip.unwrap_or(0),
-                    fetch_limit,
-                    rev.as_deref(),
-                    path_filter.as_deref(),
-                    ref_scope,
-                )
-            });
+            let history = (!probe_first).then(|| scope.spawn(walk));
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
@@ -359,7 +562,7 @@ pub async fn cmd_get_commit_graph(
                     .transpose()
             });
             (
-                history.join(),
+                history.map(|walk| walk.join()),
                 head.join(),
                 refs.join(),
                 default_branch.join(),
@@ -465,15 +668,49 @@ pub async fn cmd_get_commit_graph(
             ),
         }
 
-        // The walk ran on its own thread; a refusal there comes back in its
+        // What this page is a function of, as it stands now. Compared with the
+        // client's token before any history is read, and issued with the page
+        // otherwise.
+        let current = tokenable
+            .then(|| {
+                let stamp = stamp_before?;
+                let content =
+                    content_key(head_id.as_deref(), &refs, default_branch.as_deref(), &notes)?;
+                Some((stamp, content))
+            })
+            .flatten();
+        if let (Some(known), Some((stamp, content))) = (known_token.as_deref(), current) {
+            if token_names(known, view, stamp, content) {
+                return Ok(CommitGraphPayload {
+                    rows: Vec::new(),
+                    head_id,
+                    refs: Vec::new(),
+                    has_more: false,
+                    warnings: notes.warnings,
+                    notices: notes.notices,
+                    mainline_id: None,
+                    mainline_name: None,
+                    // The token it came with, so its age keeps counting from
+                    // the load that really read the page.
+                    graph_token: Some(known.to_string()),
+                    unchanged: true,
+                });
+            }
+        }
+
+        // The walk runs on its own thread; a refusal there comes back in its
         // error with its kind, so a deferred history read is typed (and
         // retried) as it is when the walk runs inline.
+        let history = match history {
+            Some(history) => history,
+            None => std::thread::scope(|scope| scope.spawn(walk).join()),
+        };
         let history = match history {
             Ok(history) => history,
             Err(_) => Err("history walker panicked".into()),
         };
         let raw_commits = history?;
-        Ok(assemble_commit_graph(
+        let mut payload = assemble_commit_graph(
             raw_commits,
             max_commits,
             &filter,
@@ -481,9 +718,18 @@ pub async fn cmd_get_commit_graph(
             default_branch.as_deref(),
             head_id,
             notes,
-        ))
-    })
-    .await
+        );
+        // Vouched for only if no ref, config or history-rewriting file moved
+        // while the page was being drawn: the rows were read after the stamp
+        // and the decorations in the same window, so an unchanged stamp ties
+        // them to one state.
+        if tokenable && stamp_before.is_some() && graph_stamp(&repo_path, ref_scope) == stamp_before
+        {
+            payload.graph_token =
+                current.map(|(stamp, content)| issued_token(view, stamp, content, issued));
+        }
+        Ok(payload)
+    }
 }
 
 /// Rows to request from the history walker for one graph page: the user's cap

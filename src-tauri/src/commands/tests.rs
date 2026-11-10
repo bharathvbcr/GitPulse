@@ -218,7 +218,7 @@ fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_defer
     let root = dir.path().to_string_lossy().to_string();
     let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
     let error = tauri::async_runtime::block_on(cmd_get_commit_graph(
-        root, 100, None, None, None, None, None,
+        root, 100, None, None, None, None, None, None,
     ))
     .expect_err("the history walk is shed");
     assert_eq!(
@@ -825,6 +825,7 @@ fn an_empty_repository_graph_is_a_notice_not_a_fault() {
         None,
         None,
         None,
+        None,
     ))
     .expect("empty repository graph must load");
     assert!(payload.rows.is_empty(), "no commits to draw");
@@ -866,6 +867,7 @@ fn an_unreadable_head_in_a_repository_with_commits_is_a_warning_not_no_commits()
         None,
         None,
         None,
+        None,
     ))
     .expect("a degraded HEAD must not fail the load");
     assert!(
@@ -901,6 +903,7 @@ fn an_orphan_branch_in_a_repository_with_commits_is_still_unborn() {
         None,
         None,
         None,
+        None,
     ))
     .expect("orphan graph must load");
     assert!(
@@ -931,6 +934,8 @@ fn commit_graph_payload_round_trips_warnings() {
         notices: vec![notice.to_string()],
         mainline_id: Some("abc".to_string()),
         mainline_name: Some("main".to_string()),
+        graph_token: None,
+        unchanged: false,
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(

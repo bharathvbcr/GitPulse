@@ -38,7 +38,7 @@ use crate::engine::git_cli::{self, Incomplete};
 const RACY_WINDOW: Duration = Duration::from_secs(3);
 
 /// Upper bound on how long any answer is served, whatever its stamp says.
-const TTL: Duration = Duration::from_secs(60);
+pub(crate) const TTL: Duration = Duration::from_secs(60);
 
 /// Files and directories one stamp may cover. A repository with more loose
 /// refs than this is answered by git every time, as it was before.
@@ -308,6 +308,18 @@ impl Stamp {
 /// anything.
 pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
     RefStamp::read(repo, namespaces).map(Stamp::new)
+}
+
+impl Stamp {
+    /// A hash of the state this stamp describes, for a caller that carries it
+    /// to a later ask, or `None` while a write inside the same timestamp tick
+    /// could still be indistinguishable from it. A caller that only keeps this
+    /// value cannot tell two states apart that the stamp could not, so an
+    /// unsettled stamp yields nothing to keep, as it yields nothing to store.
+    /// A hash is not an identity: use it to short-circuit, never to prove.
+    pub(crate) fn settled_fingerprint(&self) -> Option<u64> {
+        self.0.settled(wall_now()).then(|| self.0.fingerprint())
+    }
 }
 
 #[derive(Default)]

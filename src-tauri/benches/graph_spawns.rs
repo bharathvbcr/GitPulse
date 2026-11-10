@@ -24,10 +24,8 @@
 
 mod common;
 
-use common::fixture::{count_git_processes, git, trust_repo};
+use common::fixture::{build_chain, count_git_processes, git};
 use common::{interleave, Case, Report, Sample};
-use gitpulse_lib::procguard::LockedSpawn;
-use std::io::Write;
 use std::path::Path;
 
 const GRAPH_COMMITS: usize = 6_000;
@@ -36,65 +34,11 @@ const STACK_BRANCHES: usize = 20;
 /// The frontend's `DEFAULT_MAX_COMMITS`.
 const DEFAULT_PAGE: usize = 5_000;
 
-/// A repository whose `main` is a linear chain of `commits` empty commits,
-/// plus `branches` named `b00`... each pointing at the `main` commit
-/// `100 + 10 * i` from the root.
-fn build_chain(root: &Path, commits: usize, branches: usize) -> String {
-    std::fs::create_dir_all(root).expect("create fixture root");
-    git(root, &["init", "-q", "-b", "main"]);
-    git(root, &["config", "user.name", "Bench"]);
-    git(root, &["config", "user.email", "bench@example.com"]);
-    let mut stream = String::new();
-    for n in 0..commits {
-        stream.push_str("commit refs/heads/main\n");
-        stream.push_str(&format!("mark :{}\n", n + 1));
-        let message = format!("feat: change {n}\n");
-        stream.push_str(&format!(
-            "committer Bench <bench@example.com> {} +0000\n",
-            1_700_000_000 + n
-        ));
-        stream.push_str(&format!("data {}\n{message}", message.len()));
-        if n > 0 {
-            stream.push_str(&format!("from :{n}\n"));
-        }
-        stream.push('\n');
-    }
-    for i in 0..branches {
-        stream.push_str(&format!(
-            "reset refs/heads/b{i:02}\nfrom :{}\n\n",
-            100 + 10 * i
-        ));
-    }
-    let mut child = std::process::Command::new("git")
-        .args(["fast-import", "--quiet"])
-        .current_dir(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn_locked()
-        .expect("spawn git fast-import");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stream.as_bytes())
-        .expect("feed fast-import");
-    let out = child.wait_with_output().expect("wait for fast-import");
-    assert!(
-        out.status.success(),
-        "fast-import failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    git(root, &["reset", "-q", "--hard", "main"]);
-    trust_repo(root);
-    root.to_str().expect("utf-8").to_string()
-}
-
 fn graph_page(path: &str) -> (u64, bool) {
     let payload = tauri::async_runtime::block_on(gitpulse_lib::commands::cmd_get_commit_graph(
         path.to_string(),
         DEFAULT_PAGE,
+        None,
         None,
         None,
         None,
