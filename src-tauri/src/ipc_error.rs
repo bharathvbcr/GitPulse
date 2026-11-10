@@ -75,12 +75,16 @@ pub enum IpcErrorKind {
     /// sent; `detail` names the runtime, host, port, base URL and model the
     /// frontend asks the user to confirm.
     AiEndpointUnconfirmed,
+    /// A read was stopped because every caller waiting on it had gone
+    /// (`git_cli::read_cancel`), or was cancelled while it queued. Nobody is
+    /// waiting for the answer, so the frontend never shows it as a fault.
+    ReadCancelled,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -89,6 +93,7 @@ impl IpcErrorKind {
         Self::LedgerNotInitialised,
         Self::LedgerFailed,
         Self::AiEndpointUnconfirmed,
+        Self::ReadCancelled,
     ];
 }
 

@@ -325,11 +325,12 @@ describe("annotated but unregistered commands", () => {
     // (cmd_browser_open, cmd_browser_set_bounds, cmd_browser_set_visible,
     // cmd_browser_navigate, cmd_browser_go, cmd_browser_close), and 312 with
     // cmd_get_accessibility_display (the system Reduce Transparency setting,
-    // which WKWebView cannot read);
+    // which WKWebView cannot read), and 313 with cmd_cancel_read (a read whose
+    // callers have all gone is stopped);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(312);
+    expect(found.size).toBe(313);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

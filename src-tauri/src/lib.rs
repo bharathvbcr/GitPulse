@@ -397,6 +397,7 @@ pub fn run() {
             cmd_branch_stats,
             cmd_get_status,
             cmd_get_commit_graph,
+            cmd_cancel_read,
             cmd_get_file_diff,
             cmd_get_commit_diff,
             cmd_get_commit_file_diff,

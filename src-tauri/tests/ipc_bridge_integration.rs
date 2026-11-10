@@ -45,6 +45,7 @@ fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime
             gitpulse_lib::commands::cmd_stash_show,
             gitpulse_lib::commands::cmd_stash_save,
             gitpulse_lib::commands::cmd_get_commit_graph,
+            gitpulse_lib::commands::cmd_cancel_read,
             gitpulse_lib::commands::cmd_branch_stats,
             gitpulse_lib::commands::cmd_get_file_diff,
             gitpulse_lib::commands::cmd_get_file_content,
@@ -396,6 +397,33 @@ fn optional_arguments_may_be_omitted_entirely_by_the_caller() {
     )
     .expect("the graph loads without the optional arguments");
     assert!(value.get("rows").is_some(), "payload: {value}");
+}
+
+#[test]
+fn a_cancel_for_a_read_that_is_not_running_answers_false_not_an_error() {
+    // The frontend sends a cancel without knowing whether the read has
+    // finished: an unknown or finished id must be a harmless no-op.
+    let value = invoke("cmd_cancel_read", json!({ "requestId": "no-such-read" }))
+        .expect("a cancel that lost the race is not a failure");
+    assert_eq!(value, json!(false));
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_get_commit_graph",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "maxCommits": 50,
+            "requestId": "rc-bridge-1"
+        }),
+    )
+    .expect("a read that names a request id still answers");
+    assert!(value.get("rows").is_some(), "payload: {value}");
+    let value = invoke("cmd_cancel_read", json!({ "requestId": "rc-bridge-1" }))
+        .expect("cancelling a finished read is not a failure");
+    assert_eq!(
+        value,
+        json!(false),
+        "a finished read is no longer registered"
+    );
 }
 
 #[test]
