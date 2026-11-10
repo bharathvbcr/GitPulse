@@ -120,6 +120,12 @@ describe("Sidebar mode", () => {
     expect(source).toContain("aria-pressed={overlay}");
   });
 
+  it("closes the floating panel on an outside pointerdown, through the popover owner and the portal-aware selector", () => {
+    expect(source).toContain("use:popover={panelDismissOptions}");
+    expect(source).toContain('floatingPanelDismiss("[data-sidebar-panel]")');
+    expect(source).toContain("if (overlay && !collapsed) layoutStore.toggleCollapsed();");
+  });
+
   it("lets Escape close a floating panel only when the key was not taken inside it", () => {
     expect(source).toContain("event.defaultPrevented");
     expect(source).toContain('closest("[data-sidebar-panel]")');

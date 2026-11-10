@@ -97,6 +97,8 @@
   import { onDestroy } from "svelte";
   import { DURATION_MS, motionExitMs, motionMs } from "../motion/tokens";
   import { panelModes } from "../ui/panelMode";
+  import { floatingPanelDismiss } from "../ui/panelDismiss";
+  import { popover, type PopoverOptions } from "../ui/popover";
   import { springEasing } from "../ui/transitions";
 
   /* --- Mode, collapse and the slide ------------------------------------------ */
@@ -132,6 +134,18 @@
     if (!(target instanceof Element) || !target.closest("[data-sidebar-panel]")) return;
     layoutStore.toggleCollapsed();
   }
+
+  /*
+   * A pointerdown outside the floating panel closes it. Menus the panel opened
+   * are portaled to <body>, so "inside" is a selector over the panel and every
+   * floating layer (ui/panelDismiss.ts), judged by the popover owner.
+   */
+  const panelDismissOptions: PopoverOptions = {
+    dismiss: floatingPanelDismiss("[data-sidebar-panel]"),
+    onDismiss: () => {
+      if (overlay && !collapsed) layoutStore.toggleCollapsed();
+    },
+  };
 
   const slideEase = springEasing("spatial");
 
@@ -811,6 +825,7 @@
       style="position:absolute; top:0; bottom:0; left:0; width:{$layoutStore.width}px; z-index:{LAYERS.STICKY}"
       data-sidebar-mode="overlay"
       data-sidebar-panel
+      use:popover={panelDismissOptions}
       in:panelIn
       out:panelOut
     >

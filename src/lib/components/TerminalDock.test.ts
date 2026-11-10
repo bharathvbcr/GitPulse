@@ -122,6 +122,12 @@ describe("TerminalDock modes", () => {
     expect(source).toContain("{#if mounted}");
   });
 
+  it("dismisses on an outside pointerdown only while floating and open, with its status-bar trigger inside", () => {
+    expect(source).toContain("use:popover={dockDismissOptions}");
+    expect(source).toContain('pointer: overlay && open && !leaving ? "pointerdown" : "none"');
+    expect(source).toContain('floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]")');
+  });
+
   it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
     expect(source).toContain('onToggleDockMode: () => panelModes.toggle("dock")');
     expect(source).toContain('aria-label="Resize the terminal dock"');

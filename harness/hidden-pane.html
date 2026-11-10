@@ -182,6 +182,31 @@
     await until(() => !panel(), "Escape closes the floating panel");
     check("Escape inside the floating panel closes it", () => !panel() && full());
 
+    // ---- outside-click dismiss, portal-aware ----------------------------------
+    const down = (el) => el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+    const portaledMenu = () => {
+      const menu = document.createElement("div");
+      menu.className = "gp-menu";
+      menu.setAttribute("role", "menu");
+      menu.innerHTML = '<button class="gp-menu-item" type="button">Item</button>';
+      document.body.appendChild(menu);
+      return menu;
+    };
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "panel for the dismiss checks");
+    down(panel().querySelector("button"));
+    await settle();
+    check("a pointerdown inside the floating sidebar leaves it open", () => !!panel());
+    const sideMenu = portaledMenu();
+    check("the menu sits outside the panel's subtree, under <body>", () => !panel().contains(sideMenu) && sideMenu.parentElement === document.body);
+    down(sideMenu.querySelector("button"));
+    await settle();
+    check("a pointerdown in a portaled menu does not close the sidebar", () => !!panel());
+    sideMenu.remove();
+    down($("[data-row]"));
+    await until(() => !panel(), "outside pointerdown closes the sidebar");
+    check("a pointerdown outside closes the floating sidebar and the list stays full", () => !panel() && !rail().hasAttribute("inert") && full());
+
     for (let i = 0; i < 20; i += 1) {
       clickBtn(panel() ? "[data-sidebar-panel] button[aria-label='Collapse sidebar']" : '[data-sidebar-rail] button[aria-label="Expand sidebar"]');
       await frame();
@@ -227,6 +252,9 @@
     await fullEventually("docked dock open");
     check("a docked dock takes its own row and the list shrinks to fit", () => dock().dataset.dockMode === "docked" && scroller().clientHeight < listHeight - 50);
     check("the shrunken list still draws full rows", full);
+    down($("[data-row]"));
+    await settle();
+    check("a docked dock ignores a pointerdown elsewhere: it owns its row", dockShown);
     host.setDockOpen(false);
     await until(() => !dockShown(), "docked dock hides");
     await fullEventually("after the docked dock closes");
@@ -262,6 +290,21 @@
     await settle();
     check("a 15-toggle storm ends hidden with a full list", () => !dockShown() && full());
 
+    host.setDockOpen(true);
+    await until(dockShown, "overlay dock for the dismiss checks");
+    await until(() => dock().getAnimations().every((animation) => animation.playState === "finished"), "slide-in finishes");
+    down(dock().querySelector("[data-panel-stub]"));
+    await settle();
+    check("a pointerdown inside the floating dock leaves it open", dockShown);
+    const dockMenu = portaledMenu();
+    down(dockMenu.querySelector("button"));
+    await settle();
+    check("a pointerdown in a portaled menu does not close the dock", dockShown);
+    dockMenu.remove();
+    down($("[data-row]"));
+    await until(() => !dockShown(), "outside pointerdown closes the dock");
+    check("a pointerdown outside closes the floating dock and the list stays full", () => !dockShown() && full());
+
     // ---- both overlays at once ----------------------------------------------
     panelModes.set("sidebar", "overlay");
     await settle();
@@ -294,13 +337,42 @@
     delete document.documentElement.dataset.motion;
     panelModes.set("sidebar", "docked"); panelModes.set("dock", "docked");
 
+    // ---- the sidebar's tonal step from the workspace, both themes -------------
+    // Read from the computed styles, as the merge check did. Each fill is
+    // composited over the same backdrop (the theme's --c-bg), so the numbers
+    // are what a reader sees rather than two raw rgba() strings.
+    const parseColor = (value) => {
+      const m = /rgba?\(([^)]+)\)/.exec(value) ?? /color\(srgb ([^)]+)\)/.exec(value);
+      const parts = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+      const scale = value.startsWith("color(") ? 255 : 1;
+      return { rgb: parts.slice(0, 3).map((v) => v * scale), a: parts[3] ?? 1 };
+    };
+    const over = (fill, backdrop) => fill.rgb.map((c, i) => c * fill.a + backdrop[i] * (1 - fill.a));
+    const steps = {};
+    for (const theme of ["dark", "light"]) {
+      document.documentElement.classList.toggle("light", theme === "light");
+      document.documentElement.classList.toggle("dark", theme === "dark");
+      await settle();
+      const backdrop = getComputedStyle(document.documentElement).getPropertyValue("--c-bg").trim().split(/\s+/).map(Number);
+      const side = getComputedStyle(sidebar()).backgroundColor;
+      const plate = getComputedStyle(pane()).backgroundColor;
+      const a = over(parseColor(side), backdrop), b = over(parseColor(plate), backdrop);
+      const step = Math.max(...a.map((c, i) => Math.abs(c - b[i])));
+      steps[theme] = { sidebar: side, workspace: plate, composited: [a.map(Math.round), b.map(Math.round)], step: Math.round(step * 10) / 10 };
+    }
+    document.documentElement.classList.remove("light");
+    document.documentElement.classList.add("dark");
+    window.__sidebarStep = steps;
+    check(`the sidebar steps off the workspace in dark (${steps.dark.step} levels)`, () => steps.dark.step >= 5);
+    check(`and in light, at dark's strength (${steps.light.step} levels)`, () => steps.light.step >= 5 && steps.light.step >= steps.dark.step * 0.8);
+
     check("no runtime errors", () => errors.length === 0);
     document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
   }
 
   if (params.has("shot")) { await shot(); } else
   try { await run(); } catch (error) { document.getElementById("result").textContent = stopped(error); }
-  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ checks: results.length, unexpected: [...new Set(unexpected)].length }) }));
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ checks: results.length, sidebarStep: window.__sidebarStep, unexpected: [...new Set(unexpected)].length }) }));
   if (!params.has("shot") && params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
 </script>
 </body>

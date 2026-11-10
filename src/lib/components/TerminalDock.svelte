@@ -22,6 +22,8 @@
   import { motionExitMs } from "../motion/tokens";
   import { panelModes } from "../ui/panelMode";
   import { LAYERS } from "../ui/layers";
+  import { floatingPanelDismiss } from "../ui/panelDismiss";
+  import { popover, type PopoverOptions } from "../ui/popover";
 
   /**
    * The terminal, docked beneath the active view.
@@ -149,6 +151,21 @@
     });
   });
 
+  /*
+   * A floating dock closes on a pointerdown outside it. Only while it floats
+   * and is open: docked, it owns a row and a click elsewhere is no reason to
+   * hide a running shell. Menus the panel opened are portaled to <body>, and
+   * the status bar's terminal pill is the dock's own trigger, so both count as
+   * inside (ui/panelDismiss.ts); the popover owner does the judging.
+   */
+  const dockDismissOptions = $derived<PopoverOptions>({
+    dismiss: {
+      ...floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]"),
+      pointer: overlay && open && !leaving ? "pointerdown" : "none",
+    },
+    onDismiss: () => onClose(),
+  });
+
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
   /** Height of the column the dock shares with the view, for the ceiling. */
@@ -251,6 +268,7 @@
   <!-- Hidden, never unmounted: display:none pauses rendering, not the shell. -->
   <div
     bind:this={host}
+    use:popover={dockDismissOptions}
     class="gp-dock-motion flex flex-col bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
     class:hidden={!open && !leaving}
     style="height: {height}px;{overlay ? ` z-index: ${LAYERS.STICKY}; --gp-dock-exit-ms: ${exitMs}ms;` : ''}"
