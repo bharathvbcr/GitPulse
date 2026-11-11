@@ -1,10 +1,10 @@
 /**
  * The palette's search modes and the prefixes that pick them.
  *
- * Its own module, with no imports, because the view bar's search field reads
- * it on every keystroke to tell a page search from a palette query, and the
- * view bar is in the entry chunk while the palette (and its model's ranking
- * helpers) loads on demand. `model.ts` re-exports all of it: one owner.
+ * Its own module, with no imports, because the view bar's search field caps
+ * its input with `MAX_QUERY_LENGTH`, and the view bar is in the entry chunk
+ * while the palette (and its model's ranking helpers) loads on demand.
+ * `model.ts` re-exports all of it: one owner.
  */
 
 export type PaletteMode = "commands" | "files" | "repositories" | "commits" | "branches" | "symbols" | "workspace" | "help";
@@ -38,10 +38,4 @@ export function parsePaletteQuery(query: string) {
   const semantic = mode === "workspace" && text.endsWith("~");
   if (semantic) text = text.slice(0, -1).trim();
   return { mode, text, semantic };
-}
-
-/** True when `query` names a palette mode by its prefix (">", "/", "@", ...). */
-export function hasPalettePrefix(query: string): boolean {
-  const trimmed = query.trimStart();
-  return PALETTE_MODES.some((entry) => trimmed.startsWith(entry.prefix));
 }

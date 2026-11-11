@@ -51,7 +51,7 @@
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import type { FileBlob } from "../files/types";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { currentHeadTip } from "../stores/headTip";
@@ -556,7 +556,10 @@
     searchIndex = 0;
   }
 
-  $effect(() => {
+  // The scope is fixed for the life of the pane, so the find registers once,
+  // on mount. Not an $effect: its getters and setters read and write this
+  // pane's search state, which an effect would then depend on.
+  onMount(() => {
     if (!searchScope) return;
     return registerPageSearch(searchScope, {
       kind: "find",

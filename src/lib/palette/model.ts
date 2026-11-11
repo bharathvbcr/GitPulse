@@ -3,7 +3,7 @@ import { fuzzyMatch } from "../branches/groupBranches";
 import { isRecord } from "../record";
 import { MAX_QUERY_LENGTH } from "./modes";
 
-export { MAX_QUERY_LENGTH, PALETTE_MODES, parsePaletteQuery, hasPalettePrefix, type PaletteMode } from "./modes";
+export { MAX_QUERY_LENGTH, PALETTE_MODES, parsePaletteQuery, type PaletteMode } from "./modes";
 
 export interface PaletteItem {
   id: string;

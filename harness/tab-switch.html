@@ -954,14 +954,42 @@
               if ($$("[data-page-search]").length === 1 && width >= 160 && row2.scrollWidth <= row2.clientWidth + 1) return true;
               throw new Error(`fields ${$$("[data-page-search]").length}, field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
             });
+            // The field's 160px floor has to come out of free width, not out of the
+            // view switcher: at the default 1280px window and at 1400px, every view's
+            // switcher shows in full beside it (the switcher scrolls rather than
+            // overflowing the row, so the row's own width cannot show a squeeze).
+            {
+              const switcherScroller = $("[data-viewbar-controls] .gp-header-scroll", row2);
+              const squeezed = [];
+              const measured = [];
+              for (const width of [1400, 1280]) {
+                row2.style.maxWidth = width + "px";
+                // Insights is left out: its reports have no fixtures on this page.
+                for (const view of ["work", "code", "history"]) {
+                  repoStore.setActiveTab(view);
+                  await settle();
+                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}`;
+                  measured.push(row);
+                  if (switcherScroller.scrollWidth > switcherScroller.clientWidth + 1) squeezed.push(row);
+                }
+              }
+              row2.style.maxWidth = "";
+              repoStore.setActiveTab(viewBefore);
+              await settle();
+              check("search: at 1400 and 1280px every view's switcher shows in full beside the field, with the Agents pill and the uncommitted chip in the row", () => {
+                const chips = !!$('[data-testid="viewbar-agents"]', row2) && !!$('[data-testid="viewbar-uncommitted"]', row2);
+                if (!squeezed.length && chips) return true;
+                throw new Error(`agents+uncommitted present ${chips}; squeezed: ${squeezed.join("; ") || "none"}; all: ${measured.join("; ")}`);
+              });
+            }
             // 900px is the window's minimum (tauri.conf.json). Row 2 spans the window,
             // so a 900px row is the narrowest it gets: the switcher scrolls, the field
             // keeps its floor, and nothing spills out of the row.
             row2.style.maxWidth = "900px";
             await settle();
-            check("search: at the 900px minimum window row 2 still fits, the field keeps its 160px floor and the switcher scrolls instead", () => {
+            check("search: at the 900px minimum window row 2 still fits, the field keeps its 96px floor and the switcher scrolls instead", () => {
               const width = field()?.getBoundingClientRect().width ?? -1;
-              if (width >= 159.5 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              if (width >= 95.5 && row2.scrollWidth <= row2.clientWidth + 1) return true;
               throw new Error(`field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
             });
             row2.style.maxWidth = "";
@@ -1000,6 +1028,11 @@
             // global focus ring on the input inside it.
             const pillEdge = getComputedStyle(field()).borderTopColor;
             fieldInput().focus();
+            // A palette prefix is ordinary text where the page has a search: `#123`
+            // filters commits for an issue reference instead of opening the palette.
+            await typeInField("#123");
+            check("search: on the graph a query starting with a palette prefix is the commit filter, literally", () =>
+              field().dataset.pageSearch === "filter" && get(filterStore).searchQuery === "#123" && !$("[data-page-palette]"));
             await typeInField("fix");
             check("search: typing in it draws no ring or accent edge on the input or its pill", () => {
               const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);

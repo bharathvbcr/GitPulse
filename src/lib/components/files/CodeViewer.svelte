@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { hostPlatform } from "../../stores/platformStore";
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
@@ -242,8 +242,9 @@
   }
 
   // A file opened as a page's own pane finds through the view bar's field;
-  // anywhere else (a stash preview) the toolbar Find above stays.
-  $effect(() => {
+  // anywhere else (a stash preview) the toolbar Find above stays. Registered
+  // once on mount, as in DiffViewer: the scope is fixed for the viewer's life.
+  onMount(() => {
     if (!searchScope) return;
     return registerPageSearch(searchScope, {
       kind: "find",

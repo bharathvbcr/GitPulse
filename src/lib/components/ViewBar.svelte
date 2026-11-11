@@ -176,7 +176,9 @@
     <!-- The one search field, for whatever page is on screen
          (search/pageSearch.svelte.ts). It takes three shares of the free
          width to the drag spacer's one; the spacer keeps a 48px floor so the
-         window can always be grabbed. -->
+         window can always be grabbed. Its own floor is 160px from a 1400px
+         row and 96px below that: at the default 1280px window Work's switcher
+         needs the difference, and the switcher wins it. -->
     <PageSearch />
 
     <div class="h-full min-w-12 flex-1" data-tauri-drag-region></div>

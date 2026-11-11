@@ -8,11 +8,17 @@
    *   when the field loses focus; the branch chip sits inside it).
    * - In a diff or a file it finds: a count, case and pattern toggles,
    *   previous and next; Enter steps, Shift+Enter steps back.
-   * - Typed with a palette prefix (">" commands, "/" files, "@" branches,
-   *   "#" commits, ":" symbols, "%" repositories, "?" help), or anywhere on
-   *   a page with nothing of its own to search, it is the command palette for
-   *   this repository: results drop down under the field from the palette's
-   *   own engine, loaded the first time they are needed.
+   * - On a page with nothing of its own to search it is the command palette
+   *   for this repository, prefixes and all (">" commands, "/" files, "@"
+   *   branches, "#" commits, ":" symbols, "%" repositories, "?" help): results
+   *   drop down under the field from the palette's own engine, loaded the
+   *   first time they are needed.
+   *
+   * Where the page has a search, what is typed is that search, literally:
+   * `#include`, `// TODO`, `@param` or `:root` in a file, `#123` in the commit
+   * filter. A prefix that switched to the palette there took those away, and
+   * the viewers have no Find of their own to fall back on. ⌘K opens the
+   * palette from every page.
    *
    * Each page keeps its own query, so a diff's find text never becomes the
    * commit filter on a section switch. Focus never repaints the pill; the
@@ -21,11 +27,13 @@
   import { onMount } from "svelte";
   import { ChevronDown, ChevronUp, Search, X } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
+  import { toastStore } from "../stores/toastStore";
+  import { diagnostics } from "../diagnostics/diagnostics";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { activeSectionFor } from "../views/viewRegistry";
   import { FOCUS_PAGE_SEARCH_EVENT } from "../views/commitFilter";
-  import { hasPalettePrefix, MAX_QUERY_LENGTH } from "../palette/modes";
+  import { MAX_QUERY_LENGTH } from "../palette/modes";
   import { pageScope, pageSearchFor, standingFilterFor } from "../search/pageSearch.svelte";
 
   const REPOSITORY_PLACEHOLDER = "Search this repository: commands, / files, @ branches, # commits";
@@ -33,48 +41,52 @@
   let input: HTMLInputElement | undefined = $state();
   let pill: HTMLDivElement | undefined = $state();
   let focused = $state(false);
-  /** The palette's own text: kept apart from the page's query. */
+  /** The palette's text, on a page with no search of its own. */
   let paletteText = $state("");
   let activeOption = $state<string | undefined>(undefined);
 
   const scope = $derived(pageScope($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections)));
   const provider = $derived(pageSearchFor(scope));
-  const inPalette = $derived(!provider || paletteText !== "");
+  const inPalette = $derived(!provider);
   const value = $derived(inPalette ? paletteText : (provider?.query() ?? ""));
   const cardOpen = $derived(focused && inPalette);
   const find = $derived(provider?.kind === "find" && !inPalette ? provider : null);
   const filter = $derived(provider?.kind === "filter" && !inPalette ? provider : null);
   /** History's commit filter also narrows its Diff section: shown there, not hidden. */
   const standing = $derived(
-    provider?.kind !== "filter" && paletteText === "" ? standingFilterFor($repoStore.activeTab) : null,
+    provider?.kind !== "filter" ? standingFilterFor($repoStore.activeTab) : null,
   );
   const chip = $derived(filter?.chip?.() ?? standing);
   const label = $derived(inPalette ? "Search this repository" : (provider?.label ?? "Search this repository"));
 
   // The palette's chunk loads the first time the card has to open: the view
   // bar is in the entry chunk, the palette is not.
+  // `requested` is a plain flag, not state: the effect must not read the
+  // component it writes, or it would depend on its own result.
   let Palette = $state<(typeof import("./CommandPalette.svelte"))["default"] | null>(null);
-  let loading = false;
+  let requested = false;
   $effect(() => {
-    if (!cardOpen || Palette || loading) return;
-    loading = true;
-    void import("./CommandPalette.svelte")
-      .then((module) => {
+    if (!cardOpen || requested) return;
+    requested = true;
+    import("./CommandPalette.svelte").then(
+      (module) => {
         Palette = module.default;
-      })
-      .finally(() => {
-        loading = false;
-      });
+      },
+      (error: unknown) => {
+        // Said, as a lazy mount says it; the next time the card opens retries.
+        requested = false;
+        diagnostics.error("page-search:palette", error);
+        toastStore.error(
+          "Repository search couldn't be loaded. It ships as its own chunk, so this means the install is incomplete — reopening the window retries it.",
+        );
+      },
+    );
   });
 
   function oninput(event: Event & { currentTarget: HTMLInputElement }) {
     const next = event.currentTarget.value;
-    if (!provider || hasPalettePrefix(next)) {
-      paletteText = next;
-      return;
-    }
-    paletteText = "";
-    provider.setQuery(next);
+    if (provider) provider.setQuery(next);
+    else paletteText = next;
   }
 
   function clear() {
@@ -116,7 +128,7 @@
   bind:this={pill}
   role="search"
   aria-label={label}
-  class="flex h-7 min-w-40 max-w-4xl flex-[3] items-center gap-0.5 rounded-full border border-edgeStrong bg-background pl-2.5 pr-0.5 text-xs"
+  class="flex h-7 min-w-24 @min-[1400px]:min-w-40 max-w-4xl flex-[3] items-center gap-0.5 rounded-full border border-edgeStrong bg-background pl-2.5 pr-0.5 text-xs"
   data-page-search={inPalette ? "palette" : provider?.kind}
 >
   <Search size={13} class="shrink-0 text-textMuted" aria-hidden="true" />

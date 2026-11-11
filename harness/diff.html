@@ -227,6 +227,11 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
   check("Enter in the field steps the diff to its next match",()=>/^2 of /.test(status()));
   key(input(),{key:"Enter",shiftKey:true});await tick();
   check("Shift+Enter steps back",()=>/^1 of /.test(status()));
+  // A palette prefix is ordinary text here: a find for `#include` or `// TODO`
+  // must stay a find, with no palette results over the diff.
+  input().value="#two";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>status()==="no matches","literal prefixed query");
+  check("a query starting with a palette prefix stays the diff's find, searched literally",()=>pill().dataset.pageSearch==="find"&&input().value==="#two"&&status()==="no matches"&&!document.querySelector("[data-page-palette]"));
   input().value="TWO";input().dispatchEvent(new Event("input",{bubbles:true}));
   await until(()=>/ of /.test(status()),"case-insensitive match");
   bar.querySelector('[title="Match case"]').click();
