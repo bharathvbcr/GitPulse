@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "../Checkbox.svelte";
   /**
    * Opens a pull request from the current branch with `gh pr create`.
    *
@@ -71,7 +72,7 @@
     <input class="gp-field w-full" placeholder="Title" aria-label="Pull request title" bind:value={title} disabled={busy} />
     <textarea class="gp-field-multi w-full min-h-20 font-sans" placeholder="Description" aria-label="Pull request description" bind:value={body} disabled={busy}></textarea>
     <div class="flex items-center gap-3">
-      <label class="flex items-center gap-1.5 text-meta text-textMuted"><input type="checkbox" class="gp-check" bind:checked={draft} disabled={busy} /> draft</label>
+      <label class="flex items-center gap-1.5 text-meta text-textMuted"><Checkbox ariaLabel="Draft" checked={draft} disabled={busy} onchange={(next) => (draft = next)} /> draft</label>
       <span class="flex-1"></span>
       <button type="button" class="gp-btn" data-size="sm" onclick={onCancel} disabled={busy}>Cancel</button>
       <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={!ready || busy}>Open pull request…</button>

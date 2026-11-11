@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "./Checkbox.svelte";
   import { invoke } from "../ipc/invoke";
   import { hostPlatform } from "../stores/platformStore";
   import { closedAppSchedulingReason } from "../ui/platformCopy";
@@ -118,9 +119,9 @@
       <label>Maximum directories <input aria-label="Maximum cleanup directories" class="gp-field ml-1 w-16" type="number" min="1" max="100" bind:value={draft.max_targets} oninput={edited} /></label>
     </div>
     <div class="gp-card p-3 space-y-2">
-      <label class="flex items-center gap-2"><input type="checkbox" class="gp-check" aria-label="Enable scheduled cleanup" bind:checked={draft.enabled} onchange={edited} disabled={!cleaner.supported} /><Clock size={13} />Automatically remove eligible output on schedule</label>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Enable scheduled cleanup" checked={draft.enabled} disabled={!cleaner.supported} onchange={(next) => { if (draft) { draft.enabled = next; edited(); } }} /><Clock size={13} />Automatically remove eligible output on schedule</label>
       <label>Repeat every <select aria-label="Cleanup interval" class="gp-select mx-1" bind:value={draft.interval_hours} onchange={() => { if (draft) draft.next_run_at = 0; edited(); }}><option value={24}>day</option><option value={168}>week</option><option value={720}>30 days</option></select></label>
-      <label class="flex items-center gap-2"><input type="checkbox" class="gp-check" aria-label="Run cleanup when GitPulse is closed" bind:checked={draft.run_when_closed} onchange={edited} disabled={!cleaner.background_supported} />Also run when GitPulse is closed</label>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Run cleanup when GitPulse is closed" checked={draft.run_when_closed} disabled={!cleaner.background_supported} onchange={(next) => { if (draft) { draft.run_when_closed = next; edited(); } }} />Also run when GitPulse is closed</label>
       <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
       <p class="text-textMuted">Next scheduled run: {cleaner.config.enabled ? new Date(cleaner.config.next_run_at * 1000).toLocaleString() : "Off"}</p>
     </div>

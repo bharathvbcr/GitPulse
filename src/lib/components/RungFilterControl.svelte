@@ -47,7 +47,8 @@
   >
     <span class="shrink-0">Min confidence</span>
     <select
-      class="rounded border border-edge bg-background px-1 py-0.5 font-mono text-micro text-textPrimary"
+      class="gp-select font-mono"
+      data-size="sm"
       bind:value={minRung}
       aria-label="Minimum confidence for impact results"
     >

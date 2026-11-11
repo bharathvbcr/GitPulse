@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "./Checkbox.svelte";
   import { onMount } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { RefreshCw, ShieldCheck, FolderTree, Clock, X, GitBranch, Trash2 } from "@lucide/svelte";
@@ -156,7 +157,7 @@
       </select>
       <span class="text-textMuted">{retention.source === "default" ? "Inherited from your hygiene default." : `Only this repository. The default stays ${defaults.retentionDays} days.`}</span>
     </label>
-    <label class="flex items-center gap-2"><input type="checkbox" class="gp-check" aria-label="Review shared caches weekly" bind:checked={defaults.reviewSharedCaches} onchange={persistDefaults} />Review shared caches weekly while a Storage page is open</label>
+    <label class="flex items-center gap-2"><Checkbox ariaLabel="Review shared caches weekly" checked={defaults.reviewSharedCaches} onchange={(next) => { defaults.reviewSharedCaches = next; persistDefaults(); }} />Review shared caches weekly while a Storage page is open</label>
     <p class="text-textMuted">Shared caches belong to the host, not to one repository, so this switch and its weekly timer are shared by every repository — reviewing once covers them all. Change the inherited default, roots and scheduled cleanup in the repository hygiene section of Settings.</p>
   </div>
   <div class="rounded-xl p-3 text-xs bg-surface/50 flex items-center justify-between gap-4">

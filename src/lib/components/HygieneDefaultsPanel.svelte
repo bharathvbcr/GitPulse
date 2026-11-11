@@ -60,7 +60,7 @@
     <Clock size={12} /> Default retention · keep output modified within
     <select
       aria-label="Default retention for every repository"
-      class="rounded border border-border bg-surface px-2 py-1"
+      class="gp-select"
       value={defaults.retentionDays}
       onchange={(event) =>
         commit({ ...defaults, retentionDays: Number(event.currentTarget.value) })}

@@ -89,7 +89,8 @@
     <label class="flex items-center gap-2 text-meta">
       <span class="text-textMuted">Model</span>
       <select
-        class="bg-background border border-border rounded px-1.5 py-0.5"
+        class="gp-select"
+        data-size="sm"
         value={choice.model}
         disabled={working}
         onchange={(event) => useClaude((event.currentTarget as HTMLSelectElement).value)}

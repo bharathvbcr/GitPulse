@@ -482,7 +482,7 @@
         {/each}
         {#if recoveryDraft}
           <p>These choices belong to an earlier source or operation. Compare them with the current file before copying a custom replacement.</p>
-          <select aria-label="Retained source version" bind:value={recoveryVersion}>{#each recoveryVersions as version, index}<option value={index}>Version {index + 1} · {version.snapshot.revision.slice(0, 12)}</option>{/each}</select>
+          <select class="gp-select" aria-label="Retained source version" bind:value={recoveryVersion}>{#each recoveryVersions as version, index}<option value={index}>Version {index + 1} · {version.snapshot.revision.slice(0, 12)}</option>{/each}</select>
           {#if recoveryText.length > 250_000}<p role="status">Showing 250,000 of {recoveryText.length.toLocaleString()} characters. Copy this version for the complete recovery.</p>{/if}
           <pre class="source-code">{recoveryText.slice(0, 250_000)}</pre>
           <button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => copyRecovery(recoveryVersions[recoveryVersion])}>Copy recovery version</button>
@@ -528,7 +528,7 @@
       <main class="editor-main">
         <div class="file-toolbar">
           <div class="file-title"><FileCode2 size={15} /><span title={selectedFile ?? ""}>{selectedFile}</span></div>
-          <select class="mobile-file-select" aria-label="Conflicted file" bind:value={selectedFile} disabled={isSaving}>
+          <select class="gp-select mobile-file-select" aria-label="Conflicted file" bind:value={selectedFile} disabled={isSaving}>
             {#each conflictedFiles as file (file.path)}<option value={file.path}>{file.path}</option>{/each}
           </select>
           <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving || isLoading} onclick={() => retryRevision += 1} title="Re-read and compare the source; retains previous drafts">Refresh source</button>
@@ -740,7 +740,7 @@
   @container (max-width: 760px) {
     .file-rail { display: none; }
     .file-title { display: none; }
-    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; padding: 7px 24px 7px 9px; border: 1px solid var(--gp-edge); border-radius: 7px; background-color: var(--mac-fill-surface, rgb(var(--c-surface))); font-size: var(--text-meta); }
+    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; }
     .page-heading { padding: 14px; }
     .heading-copy p { display: none; }
     .heading-icon { width: 30px; height: 30px; }

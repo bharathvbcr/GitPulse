@@ -21,6 +21,7 @@ const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "ConflictEditor.svelte"),
   "utf8",
 );
+const appCss = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "app.css"), "utf8");
 
 function openingTagContaining(tagName: string, marker: string): string {
   const markerIndex = source.indexOf(marker);
@@ -345,9 +346,12 @@ describe("ConflictEditor materials", () => {
     expect(menu).toBeDefined();
     expect(menu).not.toMatch(/(?:^|;)\s*background(?:-color)?:\s*rgb\(\s*var\(--c-/);
     expect(source).toMatch(/textarea \{[^}]*background:\s*var\(--mac-fill-bg,\s*rgb\(var\(--c-bg\)\)\)/);
-    expect(source).toMatch(
-      /\.mobile-file-select \{[^}]*background-color:\s*var\(--mac-fill-surface,\s*rgb\(var\(--c-surface\)\)\)/,
-    );
+    // The mobile file picker is the shared select, which takes the macOS glass
+    // fill from its owner in app.css rather than an opaque scoped background.
+    expect(source).toContain('class="gp-select mobile-file-select"');
+    const picker = source.match(/\.mobile-file-select \{([^}]*)\}/g)?.join(" ") ?? "";
+    expect(picker).not.toMatch(/background(?:-color)?:/);
+    expect(appCss).toMatch(/html\.macos :where\([^)]*\.gp-select[^)]*\) \{\s*background-color: var\(--mac-fill-bg\);/);
   });
 });
 

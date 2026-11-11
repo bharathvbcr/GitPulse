@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "./Checkbox.svelte";
   import { invoke } from "../ipc/invoke";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { guardedDismiss } from "./modalGuard";
@@ -179,7 +180,7 @@
               {#if depth === "invalid"}<p class="mt-1 text-micro text-warn">Enter a whole number from 1 to {MAX_CLONE_DEPTH.toLocaleString()}, or leave empty for full history.</p>
               {:else if depth !== null}<p class="mt-1 text-micro text-textMuted">Shallow clone: only the last {depth} {depth === 1 ? "commit" : "commits"}.</p>{/if}
             </div>
-            <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={recurseSubmodules} disabled={isCloning} />Also clone submodules</label>
+            <label class="inline-flex items-center gap-1.5"><Checkbox ariaLabel="Also clone submodules" checked={recurseSubmodules} disabled={isCloning} onchange={(next) => (recurseSubmodules = next)} />Also clone submodules</label>
           </div>
         </details>
 

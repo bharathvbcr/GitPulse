@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "../Checkbox.svelte";
   /**
    * One pull request, read with `gh pr view`, and the things a reader does
    * to it from here: open it in a new worktree, check it out in place,
@@ -226,7 +227,7 @@
           </select>
         </label>
         <label class="flex items-center gap-1.5 text-meta text-textMuted">
-          <input type="checkbox" class="gp-check" bind:checked={deleteBranch} disabled={busy || locked} />
+          <Checkbox ariaLabel="Delete branch" checked={deleteBranch} disabled={busy || locked} onchange={(next) => (deleteBranch = next)} />
           delete branch
         </label>
         <button

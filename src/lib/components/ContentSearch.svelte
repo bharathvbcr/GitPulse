@@ -19,6 +19,7 @@
 </script>
 
 <script lang="ts">
+  import Checkbox from "./Checkbox.svelte";
   /**
    * Repository-wide content search, in Explorer's side column (Code →
    * Explorer → Search). A hit opens in the editor beside these results.
@@ -192,8 +193,8 @@
       {/if}
     </div>
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">
-      <label class="flex items-center gap-1 text-meta text-textMuted"><input type="checkbox" checked={!fixedStrings} onchange={(e) => (fixedStrings = !e.currentTarget.checked)} /> regex</label>
-      <label class="flex items-center gap-1 text-meta text-textMuted"><input type="checkbox" checked={!ignoreCase} onchange={(e) => (ignoreCase = !e.currentTarget.checked)} /> match case</label>
+      <label class="flex items-center gap-1 text-meta text-textMuted"><Checkbox ariaLabel="Regex" checked={!fixedStrings} onchange={(next) => (fixedStrings = !next)} /> regex</label>
+      <label class="flex items-center gap-1 text-meta text-textMuted"><Checkbox ariaLabel="Match case" checked={!ignoreCase} onchange={(next) => (ignoreCase = !next)} /> match case</label>
     </div>
   </form>
 
