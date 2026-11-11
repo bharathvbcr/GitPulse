@@ -3509,19 +3509,15 @@ pub(crate) mod tests {
     /// point, but it means these fixtures have to be repositories to reach the
     /// behaviour under test. `git init` rather than a hand-made `.git`
     /// directory: the gate is the real one, so the fixture is too.
+    ///
+    /// Through `git_in`, which pins git's environment: a raw spawn inherited
+    /// a neighbour test's scoped `GIT_WORK_TREE` and `git init` refused it
+    /// ("not allowed without specifying GIT_DIR"), failing whichever
+    /// `affected_tests*` test happened to overlap that neighbour.
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let output = std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .output_locked()
-            .expect("spawn git init");
-        assert!(
-            output.status.success(),
-            "git init failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        crate::test_support::trust_repo(dir.path());
+        // `git_in` trusts the repository it initialises.
+        crate::test_support::git_in(dir.path(), &["init", "-b", "main"]);
         dir
     }
 
@@ -3914,6 +3910,26 @@ pub(crate) mod tests {
     /// `GIT_WORK_TREE` (the hermetic `git_in` contract). `commit_and_stamp_head`
     /// spawns git without `pin_git`, so it reads the neighbour's work tree and
     /// `git add src` stages nothing of the fixture's.
+    /// ADV: the `git_repo` fixture must not follow a neighbour test's scoped
+    /// `GIT_WORK_TREE` either. With the variable set and no `GIT_DIR`, a raw
+    /// `git init` fails outright.
+    #[test]
+    fn adv_git_repo_fixture_does_not_follow_a_neighbours_work_tree() {
+        use crate::test_support::env::{bind_env, env_serial};
+        let serial = env_serial();
+        let neighbour = tempfile::tempdir().unwrap();
+        let _env = bind_env(&serial).set("GIT_WORK_TREE", neighbour.path());
+        let repo = git_repo();
+        assert!(
+            repo.path().join(".git").is_dir(),
+            "the fixture is its own repository"
+        );
+        assert!(
+            !neighbour.path().join(".git").exists(),
+            "nothing was initialised in the neighbour's work tree"
+        );
+    }
+
     #[test]
     fn adv_commit_and_stamp_head_does_not_follow_a_neighbours_work_tree() {
         use crate::test_support::env::{bind_env, env_serial};
