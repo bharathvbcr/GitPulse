@@ -2538,6 +2538,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const index = jumpTargetIndex(digit, stops.length);
       if (index !== null) await store.activateTab(stops[index]);
     },
+    // How many stops the strip draws right now: what `activateTabByDigit`
+    // resolves against, and so what the native menu enables its digit items
+    // from. Open tabs are not stops (a folded worktree stack is one).
+    jumpStopCount: (): number => activationStops(drawnLayout()).length,
     // Moves step through the strip as drawn (see repos/stripNav.ts): a folded
     // worktree stack moves with every checkout in it, a group's tab stays in
     // its group, and a step never swaps with a tab the reader cannot see. The

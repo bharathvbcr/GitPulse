@@ -264,17 +264,33 @@ describe("repository-tab digit items", () => {
     ...loaded(),
     openTabs: Array.from({ length: count }, (_, i) => tab(i + 1)),
   });
+  /** The projection for `count` open tabs drawn as `stops` stops on the strip. */
+  const withStops = (count: number, stops: number) =>
+    buildMenuState(withTabs(count), prefs(), "system", {}, false, undefined, undefined, 0, stops);
 
-  it("enables digit n only when an nth tab is open, and the ninth for any open tab", () => {
-    const three = model(withTabs(3));
+  it("enables digit n only when an nth stop is drawn, and the ninth for any stop", () => {
+    const three = withStops(3, 3);
     for (let digit = 1; digit <= 3; digit += 1) expect(menuActionEnabled(three, `repo-tab-${digit}`), `digit ${digit}`).toBe(true);
     for (let digit = 4; digit <= 8; digit += 1) expect(menuActionEnabled(three, `repo-tab-${digit}`), `digit ${digit}`).toBe(false);
-    // Nine selects the LAST tab, so it needs one tab, not nine.
+    // Nine selects the LAST stop, so it needs one stop, not nine.
     expect(menuActionEnabled(three, "repo-tab-9")).toBe(true);
-    const none = model(withTabs(0));
+    const none = withStops(0, 0);
     for (let digit = 1; digit <= 9; digit += 1) expect(menuActionEnabled(none, `repo-tab-${digit}`)).toBe(false);
-    const twelve = model(withTabs(12));
+    const twelve = withStops(12, 12);
     for (let digit = 1; digit <= 9; digit += 1) expect(menuActionEnabled(twelve, `repo-tab-${digit}`)).toBe(true);
+  });
+
+  it("counts stops, not open tabs: three tabs folding to two stops leave digit 3 off", () => {
+    const folded = withStops(3, 2);
+    expect(menuActionEnabled(folded, "repo-tab-1")).toBe(true);
+    expect(menuActionEnabled(folded, "repo-tab-2")).toBe(true);
+    expect(menuActionEnabled(folded, "repo-tab-3")).toBe(false);
+    expect(menuActionEnabled(folded, "repo-tab-9")).toBe(true);
+  });
+
+  it("disables every digit when the stop count is not given, rather than guessing", () => {
+    const unknown = model(withTabs(5));
+    for (let digit = 1; digit <= 9; digit += 1) expect(menuActionEnabled(unknown, `repo-tab-${digit}`)).toBe(false);
   });
 
   it("is held while a prompt is open and runs in any repository, like next and previous tab", () => {
@@ -282,7 +298,7 @@ describe("repository-tab digit items", () => {
       expect(blockedWhilePrompting(`repo-tab-${digit}`)).toBe(true);
     }
     const repo = withTabs(3);
-    const state = model(repo);
+    const state = withStops(3, 3);
     // Workspace-wide: the payload's repository need not be the active one.
     expect(canDispatchMenuEvent({ id: "repo-tab-2", repo_path: "/elsewhere" }, state, repo)).toBe(true);
     expect(canDispatchMenuEvent({ id: "repo-tab-5", repo_path: "/r/1" }, state, repo)).toBe(false);

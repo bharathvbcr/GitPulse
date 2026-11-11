@@ -4,6 +4,7 @@ import type { ThemePreference } from "../stores/themeStore";
 import { REGISTERED_VIEWS, resolveSection } from "../views/viewRegistry";
 import { actionLabel, blocksOtherMutations, headline } from "../repos/operation";
 import type { NativeEvent } from "./nativeActions";
+import { jumpTargetIndex } from "../repos/stripNav";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { asksForReader, type SessionActivity } from "../terminal/sessionActivity";
 import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES, REPO_TAB_JUMP_IDS } from "./menuContract";
@@ -189,6 +190,10 @@ export function buildMenuState(
   // `u32` outright and state.rs refuses one past its ceiling, and either
   // refusal freezes the menu bar, the tray and the popover together.
   agentsWaiting = 0,
+  // Stops the repository strip draws (`repoStore.jumpStopCount()`). Defaulted
+  // to none, which disables the digit items: an unknown count must not enable
+  // an item that may do nothing.
+  jumpStops = 0,
 ): MenuState {
   const enabled = new Set(GLOBAL_ACTIONS);
   const checked = new Set([`theme-${theme}`]);
@@ -219,11 +224,11 @@ export function buildMenuState(
   allow("next-repo-tab", repo.openTabs.length > 1);
   allow("prev-repo-tab", repo.openTabs.length > 1);
   allow("reopen-repo-tab", repo.lastClosed.length > 0);
-  // ⌘n needs an nth tab; ⌘9 only needs one, because it selects the last. The
-  // count is open tabs, not strip stops: a folded worktree stack draws one stop
-  // for several tabs, so an item can be enabled while its stop is absent, and
-  // `activateTabByDigit` then does nothing, as ⌘5 does in a browser with four.
-  REPO_TAB_JUMP_IDS.forEach((id, index) => allow(id, repo.openTabs.length >= (index === 8 ? 1 : index + 1)));
+  // An item is enabled exactly when its digit reaches a stop, asked of the same
+  // `jumpTargetIndex` the jump itself resolves with: ⌘n needs an nth stop and
+  // ⌘9 needs any, because it selects the last. `jumpStops` counts stops as the
+  // strip draws them (a folded worktree stack is one), never open tabs.
+  REPO_TAB_JUMP_IDS.forEach((id, index) => allow(id, jumpTargetIndex(index + 1, jumpStops) !== null));
   for (const id of ["copy-repo-path", "reveal-repo", "terminal-dock", "focus-filter"]) allow(id, hasRepo);
   allow("copy-branch", loaded && !!repo.currentBranch);
   allow("copy-commit", loaded);
