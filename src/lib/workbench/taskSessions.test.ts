@@ -5,6 +5,7 @@ import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
 import type { TaskRun } from "./client";
+import { TASK_TERMINAL_STARTING } from "../terminal/sessionMessages";
 
 const close = async () => {};
 const record = (fields: Partial<TerminalSessionRecord> & { key: string }): TerminalSessionRecord =>
@@ -31,8 +32,8 @@ describe("attemptTerminalView", () => {
   });
 
   it("shows any other status as the message it is, bounded", () => {
-    const [pending] = attemptTerminalView("a", [record({ key: "t", taskRunId: "a", status: "Task terminal launch is still pending." })], [], false).sessions;
-    expect(pending).toMatchObject({ phase: "problem", label: "Task terminal launch is still pending." });
+    const [pending] = attemptTerminalView("a", [record({ key: "t", taskRunId: "a", status: TASK_TERMINAL_STARTING })], [], false).sessions;
+    expect(pending).toMatchObject({ phase: "problem", label: TASK_TERMINAL_STARTING });
     const [long] = attemptTerminalView("a", [record({ key: "t", taskRunId: "a", status: "e".repeat(5000) })], [], false).sessions;
     expect(long.label.length).toBeLessThanOrEqual(160);
     const [blank] = attemptTerminalView("a", [record({ key: "t", taskRunId: "a", status: "  " })], [], false).sessions;

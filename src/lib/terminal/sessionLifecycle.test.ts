@@ -5,6 +5,7 @@ import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 import { CONTEXT_READ_MS, KILL_HARD_MS } from "./inputQueue";
+import { TASK_TERMINAL_STARTING } from "./sessionMessages";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -147,7 +148,7 @@ describe("terminal lifecycle races", () => {
       const started = f.owner.start(); await flush();
       await vi.advanceTimersByTimeAsync(15000);
       expect(get(f.registry)).toHaveLength(1);
-      expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("still pending"));
+      expect(f.hooks.state).toHaveBeenLastCalledWith("error", TASK_TERMINAL_STARTING);
       pending.resolve({ id: "late", shell: "codex", cwd: "/repo" }); await started;
       expect(f.transport.kill).not.toHaveBeenCalled();
       expect(f.owner.isCurrent("late")).toBe(true);
