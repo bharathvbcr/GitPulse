@@ -167,3 +167,8 @@ required-features = ["parse"]
 [[test]]
 name = "v29_size_and_hot_path"
 required-features = ["parse"]
+
+# Staged-lock attack tests build a real Store.
+[[test]]
+name = "atk_s_r4_staged_lock"
+required-features = ["parse"]

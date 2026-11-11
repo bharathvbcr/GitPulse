@@ -126,12 +126,33 @@ pub fn remove_staged_writer_lock(staged: &Path) -> Result<()> {
             staged.display()
         );
     }
-    let lock = crate::Store::writer_lock_path(staged);
-    match std::fs::symlink_metadata(&lock) {
+    // A staged name that is itself a symlink is refused outright.
+    match std::fs::symlink_metadata(staged) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            bail!("refusing to remove {}: it is a symlink", lock.display())
+            bail!(
+                "refusing to remove the writer lock of {}: the staged path is a symlink",
+                staged.display()
+            )
         }
-        Ok(_) => remove_file_if_present(&lock),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", staged.display()))
+        }
+    }
+    // The lock is `<staged name>.writer.lock` beside the staged file, derived
+    // from the spelled name and never canonicalised: `writer_lock_path`
+    // resolves symlinks, so a staged name swapped for a symlink after the check
+    // above would resolve to the lock of whatever it points at. The name is
+    // this process's alone, so only that spelled lock can be the staged build's.
+    let name = name.unwrap_or_default();
+    let lock = staged.with_file_name(format!("{name}.writer.lock"));
+    match std::fs::symlink_metadata(&lock) {
+        Ok(meta) if meta.file_type().is_file() => remove_file_if_present(&lock),
+        Ok(_) => bail!(
+            "refusing to remove {}: it is not a regular file",
+            lock.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("cannot inspect {}", lock.display())),
     }
@@ -1173,6 +1194,21 @@ mod tests {
             );
             assert!(std::fs::symlink_metadata(&lock).is_ok());
             assert!(target.exists());
+
+            // A staged name that is a symlink to a shared store would resolve
+            // to that store's lock.
+            std::fs::remove_file(&lock).unwrap();
+            // `shared` must exist: `writer_lock_path` canonicalises, and a
+            // dangling link would fall back to the literal path and hide the
+            // hazard.
+            std::fs::write(&shared, b"x").unwrap();
+            let linked = tmp.join(format!("link.sqlite.seed-{}", std::process::id()));
+            std::os::unix::fs::symlink(&shared, &linked).unwrap();
+            assert!(remove_staged_writer_lock(&linked).is_err());
+            assert!(
+                shared_lock.exists(),
+                "a symlinked staged path unlinks nothing"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

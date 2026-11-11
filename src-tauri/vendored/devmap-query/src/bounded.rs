@@ -19,7 +19,7 @@ pub const MAX_REASON_COMPONENT_BYTES: usize = 4096;
 pub fn bounded_text(text: &str, max_bytes: usize) -> String {
     let mut escaped = String::with_capacity(text.len().min(max_bytes + 8));
     for ch in text.chars() {
-        if ch.is_control() {
+        if ch.is_control() || is_bidi_format(ch) {
             escaped.extend(ch.escape_default());
         } else {
             escaped.push(ch);
@@ -35,6 +35,12 @@ pub fn bounded_text(text: &str, max_bytes: usize) -> String {
     let omitted = escaped.len() - cut;
     escaped.truncate(cut);
     format!("{escaped}…[{omitted} bytes]")
+}
+
+/// Bidirectional formatting characters (marks, embeddings, overrides, isolates):
+/// not `is_control`, but able to reorder the text around them on a terminal.
+fn is_bidi_format(ch: char) -> bool {
+    matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// A component reason made safe to put in a status sentence; see
@@ -55,5 +61,33 @@ mod tests {
         assert!(cut.ends_with("bytes]") && cut.contains("…["), "{cut}");
         assert!(cut.len() < 256 + 16);
         assert_eq!(bounded_text("short", 256), "short");
+    }
+
+    #[test]
+    fn every_bidi_control_is_escaped() {
+        let controls = [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}',
+        ];
+        for ch in controls {
+            let out = bounded_text(&format!("a{ch}b"), 64);
+            assert_eq!(out, format!("a{}b", ch.escape_default()), "U+{:04X}", ch as u32);
+            assert!(!out.contains(ch), "U+{:04X} survived", ch as u32);
+        }
+    }
+
+    #[test]
+    fn rtl_letters_pass_through_unchanged() {
+        for text in ["שלום עולם", "مرحبا بالعالم", "a שלום b مرحبا"] {
+            assert_eq!(bounded_text(text, 256), text);
+        }
+    }
+
+    #[test]
+    fn bidi_overrides_are_escaped() {
+        assert_eq!(
+            bounded_text("a\u{202e}b\u{2066}", 64),
+            "a\\u{202e}b\\u{2066}"
+        );
     }
 }

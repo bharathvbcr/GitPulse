@@ -835,6 +835,29 @@ export function createMapView(options: MapViewOptions): MapViewHandle {
     schedulePaint();
   }
 
+  // ---- test surface --------------------------------------------------------
+  // Read-only: a function a browser test calls on the canvas to ask where the
+  // camera is and where each shown node landed on screen, so `page_probe.cjs`
+  // can assert fit, filtering and the globe against real geometry rather than
+  // pixels. It changes no state, draws nothing and has no UI.
+  Object.defineProperty(canvas, "cmProbe", {
+    value: () => {
+      const globe = globeFrame();
+      const nodes = model.nodes.flatMap((node, i) => {
+        if (!visibleIds.has(node.id)) return [];
+        const at = globe ? globe.projection[i] : null;
+        return [{
+          id: node.id,
+          x: at ? at.x : node.x * scale + panX,
+          y: at ? at.y : node.y * scale + panY,
+          r: node.radius * (at ? 1 : scale),
+          front: at ? at.front : true,
+        }];
+      });
+      return { globe: globe !== null, width, height, scale, panX, panY, yaw, pitch, zoom: globeZoom, flatZoomMin: FLAT_ZOOM_MIN, flatZoomMax: FLAT_ZOOM_MAX, nodes };
+    },
+  });
+
   // ---- lifecycle -----------------------------------------------------------
   const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => measure()) : null;
   resizeObserver?.observe(stage);

@@ -217,14 +217,7 @@ impl StackLease {
     }
 
     pub fn read_from(path: &Path) -> Result<Self> {
-        let raw = fs::read(path).with_context(|| {
-            format!(
-                "cannot read stack lease {}; {}",
-                path.display(),
-                restack_hint(path)
-            )
-        })?;
-        parse_lease(&raw, path)
+        parse_lease(&read_lease_bytes(path)?, path)
     }
 }
 
@@ -248,13 +241,17 @@ fn restack_hint(lease_path: &Path) -> String {
 
 /// Parse a lease, refusing another format by name before looking at its fields.
 fn parse_lease(raw: &[u8], path: &Path) -> Result<StackLease> {
-    let value: serde_json::Value = serde_json::from_slice(raw).with_context(|| {
-        format!(
-            "invalid stack lease {}; {}",
+    // serde's messages quote the offending value or field name, which is the
+    // file's own text: bounded and escaped like every other lease echo.
+    let invalid = |err: serde_json::Error| {
+        anyhow::anyhow!(
+            "invalid stack lease {}: {}; {}",
             path.display(),
+            lease_text(&err.to_string()),
             restack_hint(path)
         )
-    })?;
+    };
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(invalid)?;
     let version = value.get("format_version").and_then(serde_json::Value::as_u64);
     if version != Some(u64::from(STACK_FORMAT_VERSION)) {
         bail!(
@@ -265,13 +262,7 @@ fn parse_lease(raw: &[u8], path: &Path) -> Result<StackLease> {
             restack_hint(path)
         );
     }
-    serde_json::from_value(value).with_context(|| {
-        format!(
-            "invalid stack lease {}; {}",
-            path.display(),
-            restack_hint(path)
-        )
-    })
+    serde_json::from_value(value).map_err(invalid)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcBasesReport {
@@ -793,6 +784,53 @@ fn verify_base_dir(base_dir: &Path, expected: &BaseKey) -> Result<BaseManifest> 
     Ok(manifest)
 }
 
+/// What a store's latest generation row holds, read from the store itself
+/// (never through a caller's root override): what [`check_lease_matches_base`]
+/// compares a lease's claims with. Provision-time admission
+/// ([`check_store_holds_key`]) reads the store's own accessors instead.
+struct StoredIdentity {
+    generation: Option<u32>,
+    head: Option<String>,
+    root: Option<String>,
+}
+
+impl StoredIdentity {
+    fn read(store: &Store) -> Result<Self> {
+        Ok(Self {
+            generation: store.latest_generation_id()?,
+            head: store.latest_generation_head_sha()?,
+            root: store.stored_latest_generation_repo_root()?,
+        })
+    }
+}
+
+/// Whether two spellings name one root, without needing either to exist. Used
+/// only by [`check_lease_matches_base`]; provision-time admission keeps its own
+/// stricter comparison in [`check_store_holds_key`]:
+/// the longest existing ancestor of each is canonicalized (`/tmp` and
+/// `/private/tmp` are one directory) and the rest kept as written. A donor
+/// that was moved or deleted after provision still has one spelling.
+fn same_root(a: &Path, b: &Path) -> bool {
+    canonicalize_existing_prefix(a) == canonicalize_existing_prefix(b)
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut head = path;
+    loop {
+        if let Ok(canon) = head.canonicalize() {
+            return tail.iter().rev().fold(canon, |acc, part| acc.join(part));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                head = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Refuse a store whose latest generation, `HEAD`, root or creation epoch is not `key`'s.
 fn check_store_holds_key(store: &Store, key: &BaseKey, what: &str) -> Result<()> {
     let root = store.latest_generation_repo_root()?;
@@ -820,6 +858,126 @@ fn check_store_holds_key(store: &Store, key: &BaseKey, what: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// Refuse a lease whose claims about its base disagree with the base's own
+/// latest generation row: `generation_id`, `head_sha` and `source_repo_root`.
+/// `check_identity` pins the file's stat tuple to the lease, but the lease is
+/// plain JSON; without this a lease can say one thing while the store it admits
+/// holds another, and `status` and every answer would carry the lease's word.
+/// (The lease has no epoch, so unlike [`check_store_holds_key`] it checks none.)
+///
+/// One `SELECT` per field on the open connection: no git, no file hashing.
+///
+/// What is and is not verified about the base's sha256 (read from the code, not
+/// assumed): it is computed at publish (`publish_base_snapshot`), re-checked
+/// when a cache entry is reused (`verify_base_dir`) and again on the lane's own
+/// clone at admission (`admit_published_base`), before the lease is written.
+/// After that the lane's file is held to the lease only by its stat tuple
+/// (`check_identity`), at open and at `materialize_seeded_store`, which
+/// re-hashes the CSR sidecar (`verify_csr_content`) but not the base. Ruling
+/// ft-3abcc3b9 (c), 2026-11-10: the stat identity pins the base bytes;
+/// `base.sha256` is recorded at admission and advisory after it, so open does
+/// not recompute it (it cannot inside the hook's 400 ms budget). Drop the field
+/// at the next STACK_FORMAT_VERSION bump; do not bump for it alone. Agreement
+/// between lease and store is consistency, not authentication: whoever can
+/// rewrite both the lease and a sealed store can still present a store of
+/// their choosing.
+///
+/// The root is compared by [`same_root`], which does not need the donor's path
+/// to exist: the lane's base is its own clone and must open after the donor is
+/// moved or deleted. Provision always writes a canonical absolute root, so a
+/// lease root that is relative (no leading `/`, or a leading `.`) or has a `..`
+/// component is refused before the comparison: `canonicalize` would resolve it
+/// against the process's cwd. A non-leading `.` (`<root>/.`) is not refused:
+/// `Path::components` normalises it away, so it resolves to the same root.
+///
+/// Every lease value this echoes goes through [`lease_text`].
+fn check_lease_matches_base(store: &Store, lease: &StackLease, lease_path: &Path) -> Result<()> {
+    let held = StoredIdentity::read(store)?;
+    let mismatch = |field: &str, lease_says: &str, store_holds: String| {
+        anyhow::anyhow!(
+            "the stack lease does not match the lane's base snapshot: lease {field} is {} \
+             but the base holds {}; {}",
+            lease_text(lease_says),
+            lease_text(&store_holds),
+            restack_hint(lease_path)
+        )
+    };
+    if held.generation != Some(lease.generation_id) {
+        return Err(mismatch(
+            "generation_id",
+            &lease.generation_id.to_string(),
+            format!("{:?}", held.generation),
+        ));
+    }
+    if held.head.as_deref() != Some(lease.head_sha.as_str()) {
+        return Err(mismatch(
+            "head_sha",
+            &lease.head_sha,
+            format!("{:?}", held.head),
+        ));
+    }
+    let claimed = Path::new(&lease.source_repo_root);
+    let not_canonical_shape = !claimed.is_absolute()
+        || claimed.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        });
+    let root_matches = !not_canonical_shape
+        && held
+            .root
+            .as_deref()
+            .is_some_and(|stored| same_root(Path::new(stored), claimed));
+    if !root_matches {
+        return Err(mismatch(
+            "source_repo_root",
+            &lease.source_repo_root,
+            format!("{:?}", held.root),
+        ));
+    }
+    Ok(())
+}
+
+/// Longest lease value an error repeats, in bytes, before [`lease_text`] cuts it.
+const LEASE_ECHO_BYTES: usize = 200;
+
+/// A lease value made safe to put in an error: control and bidi characters
+/// escaped, cut at [`LEASE_ECHO_BYTES`] with a marker naming the cut. The lease
+/// is a plain file anyone with write access to the worktree can rewrite.
+fn lease_text(text: &str) -> String {
+    crate::bounded_text(text, LEASE_ECHO_BYTES)
+}
+
+/// The most a lease may weigh. A real lease is under a kilobyte (two paths, a
+/// sha, three file records); anything past this is refused unread, with the
+/// restack hint, like an oversized base manifest.
+const MAX_LEASE_BYTES: u64 = 64 * 1024;
+
+/// Read the lease file, never more than [`MAX_LEASE_BYTES`] of it.
+fn read_lease_bytes(lease_path: &Path) -> Result<Vec<u8>> {
+    let unreadable = || {
+        format!(
+            "cannot read stack lease {}; {}",
+            lease_path.display(),
+            restack_hint(lease_path)
+        )
+    };
+    let file = fs::File::open(lease_path).with_context(unreadable)?;
+    let mut raw = Vec::new();
+    file.take(MAX_LEASE_BYTES + 1)
+        .read_to_end(&mut raw)
+        .with_context(unreadable)?;
+    if raw.len() as u64 > MAX_LEASE_BYTES {
+        bail!(
+            "stack lease {} is larger than {MAX_LEASE_BYTES} bytes; refusing to read it; {}",
+            lease_path.display(),
+            restack_hint(lease_path)
+        );
+    }
+    Ok(raw)
 }
 
 /// A base admitted into a lane: the files are the lane's own clones.
@@ -1140,7 +1298,8 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(feature = "parse")]
+    // Asked the same way with or without the parsing frontend: the comparison
+    // is a scan and a manifest pass, and neither reaches a grammar.
     match store.latest_generation_matches_working_tree() {
         Ok(true) => Ok(()),
         Ok(false) => bail!(
@@ -1152,11 +1311,6 @@ fn assert_donor_is_head_tree(source: &Path, store: &Store, generation_head: &str
             source.display()
         ),
     }
-    #[cfg(not(feature = "parse"))]
-    bail!(
-        "this build cannot confirm donor {}'s index matches its working tree (parse feature off); {remedy}",
-        source.display()
-    )
 }
 
 /// Provision a Glean-style stacked worktree lane at `worktree_root` backed by
@@ -1426,9 +1580,7 @@ struct LaneBase {
 fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result<LaneBase> {
     let lease_path = stack_lease_path(wt_canon);
     let hint = restack_hint(&lease_path);
-    let raw_lease = fs::read(&lease_path)
-        .with_context(|| format!("cannot read stack lease {}; {hint}", lease_path.display()))?;
-    let lease = parse_lease(&raw_lease, &lease_path)?;
+    let lease = parse_lease(&read_lease_bytes(&lease_path)?, &lease_path)?;
 
     // The lease must belong to the lane being opened: one copied in from
     // another lane or repository records another root.
@@ -1437,7 +1589,7 @@ fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result
         bail!(
             "stack lease in {} was issued for {} (refusing a lease that belongs to another lane); {hint}",
             wt_canon.display(),
-            lease.worktree_root
+            lease_text(&lease.worktree_root)
         );
     }
 
@@ -1459,6 +1611,7 @@ fn open_lane_base(wt_canon: &Path, repo_root_override: Option<String>) -> Result
                 base_sqlite_path.display()
             )
         })?;
+    check_lease_matches_base(&base, &lease, &lease_path)?;
     Ok(LaneBase {
         lease,
         lease_path,
@@ -1480,7 +1633,13 @@ pub fn open_lane_base_store(base_sqlite: &Path) -> Result<Store> {
     let lease = StackLease::read_from(&lease_path)?;
     let wt_canon = Path::new(&lease.worktree_root)
         .canonicalize()
-        .with_context(|| format!("cannot canonicalize {}; {}", lease.worktree_root, restack_hint(&lease_path)))?;
+        .with_context(|| {
+            format!(
+                "cannot canonicalize {}; {}",
+                lease_text(&lease.worktree_root),
+                restack_hint(&lease_path)
+            )
+        })?;
     if stack_lease_path(&wt_canon) != lease_path {
         bail!(
             "{} is not the lane's own base for lease {}; {}",
@@ -5352,6 +5511,138 @@ mod tests {
         assert!(format!("{err:#}").contains("invalid stack lease"), "{err:#}");
     }
 
+    /// Rewrite one top-level lease field and nothing else the base's stat
+    /// identity covers: the lease file is not part of that identity.
+    #[cfg(all(feature = "parse", unix))]
+    fn tamper_lease_field(lane: &Path, field: &str, value: serde_json::Value) {
+        let lease_path = stack_lease_path(lane.canonicalize().unwrap());
+        let mut lease: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+        lease[field] = value;
+        fs::write(&lease_path, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+    }
+
+    /// A lease whose claim about the lane's base disagrees with what the base
+    /// holds is refused at open, by field, with the recovery, through both
+    /// readers of a lane's base (the CLI/hook store and the MCP engine's).
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_lease_that_disagrees_with_its_base_is_refused_at_open_naming_the_field() {
+        let root = temp_repo_dir("lease-claims");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let base_sqlite = lease.base_sqlite_path();
+        let honest = fs::read(stack_lease_path(lane.canonicalize().unwrap())).unwrap();
+        StackedStore::open(&lane).expect("fixture: the honest lease opens");
+        open_lane_base_store(&base_sqlite).expect("fixture: the honest lease opens for MCP");
+
+        let forged_head = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            ("generation_id", serde_json::json!(lease.generation_id + 41)),
+            ("head_sha", serde_json::json!(forged_head)),
+            (
+                "source_repo_root",
+                serde_json::json!("/nonexistent/some/other/repo"),
+            ),
+            // The root the store is opened with (the lane's own) must not stand in for the stored row.
+            (
+                "source_repo_root",
+                serde_json::json!(lane.canonicalize().unwrap().to_string_lossy()),
+            ),
+        ];
+        // Every (case, reader) pair is tried and the failures reported together,
+        // so one run shows which fields and readers are unguarded.
+        let mut unguarded = Vec::new();
+        for (field, forged) in cases {
+            fs::write(stack_lease_path(lane.canonicalize().unwrap()), &honest).unwrap();
+            tamper_lease_field(&lane, field, forged.clone());
+            let refusals = [
+                ("StackedStore::open", StackedStore::open(&lane).map(drop)),
+                (
+                    "open_lane_base_store",
+                    open_lane_base_store(&base_sqlite).map(drop),
+                ),
+            ];
+            for (reader, outcome) in refusals {
+                match outcome {
+                    Ok(()) => unguarded.push(format!("{reader} accepted lease {field} = {forged}")),
+                    Err(e) => {
+                        let text = format!("{e:#}");
+                        if !text.contains(&format!("lease {field}")) {
+                            unguarded.push(format!("{reader} did not name {field}: {text}"));
+                        }
+                        if !text.contains("devmap seed --stacked") {
+                            unguarded.push(format!("{reader} did not name the recovery: {text}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            unguarded.is_empty(),
+            "lease claims that were not refused: {unguarded:#?}"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// The donor may be moved or deleted after provision: the lane's base is its
+    /// own clone, and the lease's root check must not need the donor's path.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_lane_still_opens_after_its_donor_checkout_is_moved() {
+        let root = temp_repo_dir("lease-donor-moved");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        fs::rename(&anchor, root.join("anchor-moved")).unwrap();
+        assert!(
+            !anchor.exists(),
+            "fixture: the donor is gone from its old path"
+        );
+        StackedStore::open(&lane).expect("a lane opens without its donor");
+        let wt = lane.canonicalize().unwrap();
+        let lease = StackLease::read_from(&stack_lease_path(&wt)).unwrap();
+        open_lane_base_store(&lease.base_sqlite_path())
+            .expect("the MCP reader opens without the donor");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A base with no generation row holds nothing for the lease to claim: refused,
+    /// not passed and not a panic. The lease's own stat identity is re-recorded so
+    /// that only the claim check can refuse it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_base_with_no_generation_row_is_refused_at_open() {
+        let root = temp_repo_dir("lease-empty-base");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let sqlite = lease.base_sqlite_path();
+        let empty = root.join("empty.sqlite");
+        drop(Store::open(&empty).unwrap());
+        set_file_writable(&sqlite).unwrap();
+        fs::remove_file(&sqlite).unwrap();
+        fs::copy(&empty, &sqlite).unwrap();
+        set_file_readonly(&sqlite).unwrap();
+        let file = File::open(&sqlite).unwrap();
+        let record = file_record(&file, sha256_file_hex(&sqlite).unwrap()).unwrap();
+        tamper_lease_field(&lane, "base", serde_json::to_value(&record).unwrap());
+        let err = match StackedStore::open(&lane) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("a base with no generation row was opened"),
+        };
+        assert!(
+            err.contains("lease generation_id is") && err.contains("the base holds None"),
+            "the claim check must be what refuses an empty base: {err}"
+        );
+        assert!(err.contains("devmap seed --stacked"), "{err}");
+        let _ = remove_readonly_tree(&root);
+    }
+
     /// 6: a legacy manifest in the cache is replaced at once; provision does not
     /// refuse the same entry again and again.
     #[cfg(all(feature = "parse", unix))]
@@ -7476,5 +7767,478 @@ mod tests {
         if let Some(root) = root {
             let _ = remove_readonly_tree(&root);
         }
+    }
+
+    // ===== ATTACK TESTS (adversarial round 1, lane B ft-178dcf14). Each asserts the
+    // CORRECT behaviour; a failure on 62d12f35 is a finding. =====
+
+    /// A donor key naming `root_spelling`, taken from the donor's own store.
+    #[cfg(all(feature = "parse", unix))]
+    fn atk_key_for(store: &Store, root_spelling: &str) -> BaseKey {
+        BaseKey {
+            generation_id: store.latest_generation_id().unwrap().unwrap(),
+            head_sha: store.latest_generation_head_sha().unwrap().unwrap(),
+            source_repo_root: root_spelling.to_string(),
+            epoch: store.pending_watermark().unwrap().epoch().to_string(),
+        }
+    }
+
+    /// FINDING B-W1 (widening): on c2348467 `check_store_holds_key` accepted only a
+    /// key whose root EQUALS the canonical stored root. A key spelled through a
+    /// symlink alias of the donor was refused; `same_root` now accepts it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_w1_key_root_through_a_symlink_alias_was_refused_before_and_must_stay_refused() {
+        let root = temp_repo_dir("atk-w1-alias");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let store = Store::open(&store_path(&anchor)).unwrap();
+        let canon = anchor.canonicalize().unwrap();
+        check_store_holds_key(
+            &store,
+            &atk_key_for(&store, &canon.to_string_lossy()),
+            "control",
+        )
+        .expect("control: the canonical spelling is accepted");
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&canon, &alias).unwrap();
+        let res = check_store_holds_key(
+            &store,
+            &atk_key_for(&store, &alias.to_string_lossy()),
+            "alias key",
+        );
+        assert!(res.is_err(), "c2348467 refused a key root that is not the canonical stored root; 62d12f35 accepts the alias");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// FINDING B-W2 (widening): on c2348467 a stored root that no longer exists
+    /// could never match (`canonicalize` failed => refused). It now matches a key
+    /// spelled identically.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_w2_nonexistent_stored_root_was_refused_before_and_must_stay_refused() {
+        let root = temp_repo_dir("atk-w2-gone");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let moved = root.join("anchor-moved");
+        fs::rename(&anchor, &moved).unwrap();
+        let store = Store::open(&store_path(&moved)).unwrap();
+        let stored = store
+            .stored_latest_generation_repo_root()
+            .unwrap()
+            .expect("a stored root");
+        assert!(
+            !Path::new(&stored).exists(),
+            "fixture: the stored root is gone: {stored}"
+        );
+        let res = check_store_holds_key(&store, &atk_key_for(&store, &stored), "moved donor");
+        assert!(
+            res.is_err(),
+            "c2348467 refused a store whose recorded root canonicalizes to nothing"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Provision-time admission compares the key with the root the caller's
+    /// store reports (`latest_generation_repo_root`, which honours a
+    /// `repo_root_override`), as c2348467 did: a store opened under an override
+    /// that differs from its stored root is not the donor the key names.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn check_store_holds_key_refuses_a_store_opened_under_a_different_root_override() {
+        let root = temp_repo_dir("cshk-override");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        let base_sqlite = stack_dir(&lane.canonicalize().unwrap()).join(BASE_SQLITE);
+
+        let plain = Store::open_immutable_snapshot(&base_sqlite, None).unwrap();
+        let stored = plain
+            .stored_latest_generation_repo_root()
+            .unwrap()
+            .expect("a stored root");
+        let canon = Path::new(&stored).canonicalize().unwrap();
+        let key = atk_key_for(&plain, &canon.to_string_lossy());
+        check_store_holds_key(&plain, &key, "control")
+            .expect("control: no override, the stored root is the key's");
+
+        let overridden = Store::open_immutable_snapshot(
+            &base_sqlite,
+            Some(root.join("elsewhere").to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            overridden.stored_latest_generation_repo_root().unwrap(),
+            Some(stored),
+            "fixture: the stored root is unchanged by the override"
+        );
+        let res = check_store_holds_key(&overridden, &key, "overridden base");
+        assert!(
+            res.is_err(),
+            "a store opened under a different root override must not hold a key for its stored root"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// FINDING B-R1 (false accept): a RELATIVE lease root is canonicalized against
+    /// the process cwd, so a lease saying `../../../..<abs path>` is accepted as the
+    /// stored absolute root.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_r1_a_relative_lease_root_is_not_the_stored_absolute_root() {
+        let root = temp_repo_dir("atk-r1-rel");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let rel = format!(
+            "{}{}",
+            "../".repeat(64),
+            lease.source_repo_root.trim_start_matches('/')
+        );
+        tamper_lease_field(&lane, "source_repo_root", serde_json::json!(rel));
+        let opened = StackedStore::open(&lane).map(drop);
+        let mcp = open_lane_base_store(&lease.base_sqlite_path()).map(drop);
+        assert!(
+            opened.is_err(),
+            "StackedStore::open accepted relative root {rel}"
+        );
+        assert!(
+            mcp.is_err(),
+            "open_lane_base_store accepted relative root {rel}"
+        );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Spelling table for `same_root` (B-S1..). Prints every verdict (--nocapture)
+    /// and asserts the ones with one defensible answer.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_s1_same_root_spelling_table() {
+        let root = temp_repo_dir("atk-s1");
+        let a = root.join("repo").canonicalize().unwrap_or_else(|_| {
+            fs::create_dir_all(root.join("repo")).unwrap();
+            root.join("repo").canonicalize().unwrap()
+        });
+        fs::create_dir_all(root.join("repoc")).unwrap();
+        let s = a.to_string_lossy().into_owned();
+        let gone = format!("{s}/gone");
+        let upper = s.to_uppercase();
+        let swapped: String = s
+            .chars()
+            .map(|c| {
+                if c.is_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        // (spelling, stored, should_match)
+        let cases: Vec<(String, String, bool)> = vec![
+            (format!("{s}c"), s.clone(), false),
+            (format!("{s}/"), s.clone(), true),
+            (format!("{s}/."), s.clone(), true),
+            (format!("{s}//"), s.clone(), true),
+            (format!("{s}\0"), s.clone(), false),
+            (format!("{s}\n"), s.clone(), false),
+            (String::new(), s.clone(), false),
+            (".".to_string(), s.clone(), false),
+            (format!("{s}/gone/.."), s.clone(), false),
+            (format!("{gone}x"), gone.clone(), false),
+            (format!("{gone}/"), gone.clone(), true),
+        ];
+        let mut bad = Vec::new();
+        for (lease, stored, want) in &cases {
+            let got = same_root(Path::new(stored), Path::new(lease));
+            eprintln!("same_root(stored={stored:?}, lease={lease:?}) = {got} (want {want})");
+            if got != *want {
+                bad.push(format!(
+                    "stored={stored:?} lease={lease:?} got {got} want {want}"
+                ));
+            }
+        }
+        eprintln!(
+            "INFO upper-case: {}",
+            same_root(Path::new(&s), Path::new(&upper))
+        );
+        eprintln!(
+            "INFO swapped-case: {}",
+            same_root(Path::new(&s), Path::new(&swapped))
+        );
+        eprintln!(
+            "INFO nonexistent-tail case variant: {}",
+            same_root(Path::new(&gone), Path::new(&format!("{swapped}/gone")))
+        );
+        assert!(bad.is_empty(), "same_root verdicts: {bad:#?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// FINDING B-N1: a base whose latest generation recorded a NULL or empty root
+    /// must be refused, not passed and not a panic.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_n1_null_or_empty_stored_root_is_refused() {
+        for (tag, sql) in [
+            ("null", "UPDATE generations SET repo_root = NULL"),
+            ("empty", "UPDATE generations SET repo_root = ''"),
+        ] {
+            let root = temp_repo_dir(&format!("atk-n1-{tag}"));
+            let anchor = root.join("anchor");
+            seed_indexed_git_repo(&anchor);
+            let lane = add_lane(&anchor, &root, "lane");
+            let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+            let db = store_path(&anchor);
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                // pending_state / seed_rebind may also carry a root; clear both so the row decides.
+                let _ = conn.execute("DELETE FROM seed_rebind", []);
+                let n = conn.execute(sql, []);
+                eprintln!("{tag}: update -> {n:?}");
+            }
+            let store = Store::open(&db).unwrap();
+            eprintln!(
+                "{tag}: stored root = {:?}",
+                store.stored_latest_generation_repo_root()
+            );
+            let lease_path = stack_lease_path(lane.canonicalize().unwrap());
+            let res = check_lease_matches_base(&store, &lease, &lease_path);
+            assert!(
+                res.is_err(),
+                "{tag}: a base with no recorded root passed the claim check"
+            );
+            let _ = remove_readonly_tree(&root);
+        }
+    }
+
+    /// FINDING B-E1: hostile lease values are echoed into the error text unbounded
+    /// and unescaped (ANSI escape, newline, 1 MB).
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn attack_e1_hostile_lease_values_are_bounded_and_escaped_in_errors() {
+        let root = temp_repo_dir("atk-e1");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let honest = fs::read(stack_lease_path(lane.canonicalize().unwrap())).unwrap();
+        // A few KiB: well under the 64 KiB lease cap, so the claim check (not the
+        // size cap) refuses the lease and echoes the value through `bounded_text`.
+        let hostile = format!(
+            "\x1b[2J\x1b]0;pwned\x07\u{202e}\nFAKE LINE: all good{}",
+            "A".repeat(4 * 1024)
+        );
+        let mut bad = Vec::new();
+        for field in ["source_repo_root", "head_sha"] {
+            fs::write(stack_lease_path(lane.canonicalize().unwrap()), &honest).unwrap();
+            tamper_lease_field(&lane, field, serde_json::json!(hostile));
+            for (reader, res) in [
+                ("StackedStore::open", StackedStore::open(&lane).map(drop)),
+                (
+                    "open_lane_base_store",
+                    open_lane_base_store(&lease.base_sqlite_path()).map(drop),
+                ),
+            ] {
+                let text = format!("{:#}", res.expect_err("must refuse"));
+                if text.len() > 16 * 1024 {
+                    bad.push(format!("{reader}/{field}: error is {} bytes", text.len()));
+                }
+                if text.contains('\x1b') {
+                    bad.push(format!("{reader}/{field}: raw ESC in error"));
+                }
+                if text.contains('\u{202e}') || !text.contains("\\u{202e}") {
+                    bad.push(format!("{reader}/{field}: bidi control not escaped"));
+                }
+                if !text.contains("…[") || !text.contains("bytes]") {
+                    bad.push(format!("{reader}/{field}: no cut marker, value not bounded"));
+                }
+                if text.contains("\nFAKE LINE") {
+                    bad.push(format!(
+                        "{reader}/{field}: raw newline lets the value forge a line"
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A lease past the size cap is refused unread, naming the recovery, by both
+    /// readers of the lease file; the padding is JSON whitespace, so an
+    /// unbounded read would have parsed it and opened the lane.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_lease_over_the_size_cap_is_refused_unread_with_the_recovery() {
+        let root = temp_repo_dir("lease-cap");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let lease_path = stack_lease_path(lane.canonicalize().unwrap());
+        let mut bytes = fs::read(&lease_path).unwrap();
+        bytes.extend(std::iter::repeat_n(b' ', MAX_LEASE_BYTES as usize));
+        fs::write(&lease_path, &bytes).unwrap();
+        let mut unguarded = Vec::new();
+        for (reader, res) in [
+            ("StackedStore::open", StackedStore::open(&lane).map(drop)),
+            (
+                "open_lane_base_store",
+                open_lane_base_store(&lease.base_sqlite_path()).map(drop),
+            ),
+            (
+                "StackLease::read_from",
+                StackLease::read_from(&lease_path).map(drop),
+            ),
+        ] {
+            match res {
+                Ok(()) => unguarded.push(format!("{reader} read an oversized lease")),
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if !text.contains("larger than") || !text.contains("devmap seed --stacked") {
+                        unguarded.push(format!("{reader}: {text}"));
+                    }
+                }
+            }
+        }
+        assert!(unguarded.is_empty(), "{unguarded:#?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A lease root with a `..` component, a leading `.` or no leading `/` is
+    /// refused even when it resolves to the stored root: provision only writes canonical
+    /// absolute roots.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_lease_root_with_parent_or_relative_components_is_refused_even_when_it_resolves() {
+        let root = temp_repo_dir("lease-root-shape");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let honest = fs::read(stack_lease_path(lane.canonicalize().unwrap())).unwrap();
+        let canon = lease.source_repo_root.clone();
+        let parent = Path::new(&canon)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let name = Path::new(&canon)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cases = [
+            format!(
+                "{parent}/../{}/{name}",
+                Path::new(&parent).file_name().unwrap().to_string_lossy()
+            ),
+            format!("{canon}/../{name}"),
+            format!("./{}", canon.trim_start_matches('/')),
+        ];
+        let mut unguarded = Vec::new();
+        for forged in cases {
+            fs::write(stack_lease_path(lane.canonicalize().unwrap()), &honest).unwrap();
+            tamper_lease_field(&lane, "source_repo_root", serde_json::json!(forged));
+            match StackedStore::open(&lane) {
+                Ok(_) => unguarded.push(format!("accepted {forged}")),
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if !text.contains("lease source_repo_root")
+                        || !text.contains("devmap seed --stacked")
+                    {
+                        unguarded.push(format!("{forged}: {text}"));
+                    }
+                }
+            }
+        }
+        assert!(unguarded.is_empty(), "{unguarded:#?}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Bidi overrides in a lease value are escaped in the refusal, not echoed.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn bidi_characters_in_a_lease_value_are_escaped_in_the_refusal() {
+        let root = temp_repo_dir("lease-bidi");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        tamper_lease_field(
+            &lane,
+            "head_sha",
+            serde_json::json!("abc\u{202e}def\u{2066}"),
+        );
+        let text = format!(
+            "{:#}",
+            StackedStore::open(&lane)
+                .map(drop)
+                .expect_err("must refuse")
+        );
+        assert!(
+            !text.contains('\u{202e}') && !text.contains('\u{2066}'),
+            "raw bidi in: {text}"
+        );
+        assert!(text.contains("\\u{202e}"), "{text}");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// Ruling ft-3abcc3b9 (c), 2026-11-10: the stat identity pins the base bytes;
+    /// `base.sha256` is recorded at admission and advisory after it. Drop the field
+    /// at the next STACK_FORMAT_VERSION bump; do not bump for it alone.
+    ///
+    /// So a lease whose recorded sha256 is not the base's hash still opens, through
+    /// both readers, while a stat-identity tamper of the base is still refused.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_lease_only_base_sha256_mismatch_opens_because_stat_identity_is_the_anchor() {
+        let root = temp_repo_dir("atk2-sha");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let mut refused = Vec::new();
+        for forged in [
+            serde_json::json!("ab".repeat(32)),
+            serde_json::json!(""),
+            serde_json::json!("zz"),
+        ] {
+            let honest = serde_json::to_value(&lease.base).unwrap();
+            let mut rec = honest.clone();
+            rec["sha256"] = forged.clone();
+            tamper_lease_field(&lane, "base", rec);
+            if let Err(e) = StackedStore::open(&lane) {
+                refused.push(format!("StackedStore::open refused base.sha256 = {forged}: {e:#}"));
+            }
+            if let Err(e) = open_lane_base_store(&lease.base_sqlite_path()) {
+                refused.push(format!("open_lane_base_store refused base.sha256 = {forged}: {e:#}"));
+            }
+            tamper_lease_field(&lane, "base", honest);
+        }
+        assert!(refused.is_empty(), "{refused:#?}");
+
+        // The anchor: with the honest lease restored, a change to the base's stat
+        // identity (the same edit as `open_refuses_an_in_place_edit_that_moves_mtime`)
+        // is refused by both readers.
+        StackedStore::open(&lane).expect("the honest lease opens");
+        let base_dir = lease.base_dir();
+        let base_sqlite = base_dir.join("base.sqlite");
+        make_tree_writable(&base_dir);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut bytes = fs::read(&base_sqlite).unwrap();
+        let at = bytes.windows(6).position(|w| w == b"Helper").unwrap();
+        bytes[at] = b'X';
+        fs::write(&base_sqlite, &bytes).unwrap();
+        set_file_readonly(&base_sqlite).unwrap();
+        assert!(
+            StackedStore::open(&lane).is_err(),
+            "a stat-identity tamper must still be refused by StackedStore::open"
+        );
+        assert!(
+            open_lane_base_store(&lease.base_sqlite_path()).is_err(),
+            "a stat-identity tamper must still be refused by open_lane_base_store"
+        );
+        let _ = remove_readonly_tree(&root);
     }
 }
