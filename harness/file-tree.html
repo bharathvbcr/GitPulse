@@ -76,6 +76,10 @@ const Panel = (await import("../src/lib/components/files/FileTreePanel.svelte"))
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
 const until = async (test, label) => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Timed out: " + label); };
+// Waits, bounded, without throwing: a popover now leaves with a 70 ms exit
+// (popoverExit), so "is it gone?" is asked after the exit, and a menu that
+// never leaves still reaches its check as a failure rather than a crash.
+const settle = async (test, ms = 2000) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await wait(); };
 const host = document.getElementById("host");
 const tree = () => host.querySelector('[role="tree"]');
 const items = () => [...host.querySelectorAll('[role="treeitem"]')];
@@ -168,10 +172,12 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await press(menu(), "ArrowDown");
   check("ArrowDown moves to the next action", () => document.activeElement === menuItems()[1]);
   await press(menu(), "Escape");
+  await settle(() => !menu());
   check("Escape closes it and puts focus back on the tree", () => !menu() && (document.activeElement === tree() || tree().contains(document.activeElement)));
   await press(tree(), "F10", { shiftKey: true });
   check("Shift+F10 opens it too", () => Boolean(menu()));
   await press(menu(), "Escape");
+  await settle(() => !menu());
 
   // --- delete asks first, and says what cannot be undone -------------------
   await press(tree(), "Home");
