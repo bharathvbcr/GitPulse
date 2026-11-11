@@ -19,6 +19,11 @@
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { observeResize } from "../dom/observeResize";
+  import { motionExitMs } from "../motion/tokens";
+  import { panelModes } from "../ui/panelMode";
+  import { LAYERS } from "../ui/layers";
+  import { floatingPanelDismiss } from "../ui/panelDismiss";
+  import { popover, type PopoverOptions } from "../ui/popover";
 
   /**
    * The terminal, docked beneath the active view.
@@ -106,6 +111,60 @@
   function goToSession(session: TerminalSessionRecord) {
     return focusTerminalSession(session);
   }
+
+  /*
+   * Docked or overlay (panelMode.ts). Docked, the dock owns a row under the
+   * view and settles in once. Overlay, it floats over the bottom of the view
+   * and slides on transform; the view keeps the full column. The dock is
+   * never unmounted: hiding is display:none, so an overlay holds the element
+   * for its exit and only then hides it.
+   */
+  let overlay = $derived($panelModes.dock === "overlay");
+  let leaving = $state(false);
+  let leaveTimer: ReturnType<typeof setTimeout> | null = null;
+  // svelte-ignore state_referenced_locally
+  // Justified: the previous value of `open` is only ever compared, never
+  // rendered, so capturing the initial one is the intent.
+  let wasOpen = open;
+  // Read when the dock closes, not memoized: the reduced-motion preference is
+  // not reactive state, and a stale 70 would hold an exit the reader refused.
+  let exitMs = $state(motionExitMs("slow"));
+  const phase = $derived(leaving ? "slide-out" : overlay ? "slide-in" : "in");
+
+  $effect(() => {
+    const isOpen = open;
+    untrack(() => {
+      if (isOpen === wasOpen) return;
+      wasOpen = isOpen;
+      if (leaveTimer) clearTimeout(leaveTimer);
+      leaveTimer = null;
+      exitMs = motionExitMs("slow");
+      if (isOpen || !overlay || exitMs === 0) {
+        leaving = false;
+        return;
+      }
+      leaving = true;
+      leaveTimer = setTimeout(() => {
+        leaving = false;
+        leaveTimer = null;
+      }, exitMs);
+    });
+  });
+
+  /*
+   * A floating dock closes on a pointerdown outside it. Only while it floats
+   * and is open: docked, it owns a row and a click elsewhere is no reason to
+   * hide a running shell. Menus the panel opened are portaled to <body>, and
+   * the status bar's terminal pill is the dock's own trigger, so both count as
+   * inside (ui/panelDismiss.ts); the popover owner does the judging.
+   */
+  const dockDismissOptions = $derived<PopoverOptions>({
+    dismiss: {
+      ...floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]"),
+      pointer: overlay && open && !leaving ? "pointerdown" : "none",
+    },
+    onDismiss: () => onClose(),
+  });
 
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
@@ -198,6 +257,7 @@
   }
 
   onDestroy(() => {
+    if (leaveTimer) clearTimeout(leaveTimer);
     // A dock torn down mid-drag still keeps the height the reader chose.
     commitDragHeight();
     dragging = false;
@@ -208,10 +268,13 @@
   <!-- Hidden, never unmounted: display:none pauses rendering, not the shell. -->
   <div
     bind:this={host}
-    class="shrink-0 flex flex-col border-t border-border gp-section-edge bg-background"
-    class:hidden={!open}
-    style="height: {height}px"
+    use:popover={dockDismissOptions}
+    class="gp-dock-motion flex flex-col bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
+    class:hidden={!open && !leaving}
+    style="height: {height}px;{overlay ? ` z-index: ${LAYERS.STICKY}; --gp-dock-exit-ms: ${exitMs}ms;` : ''}"
     data-terminal-dock
+    data-dock-mode={overlay ? "overlay" : "docked"}
+    data-phase={phase}
   >
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -237,9 +300,9 @@
     ></div>
 
     {#if hostedTabs.length === 0}
-    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/60 select-none">
+    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 bg-surface/60 select-none">
       <SquareTerminal size={12} class="text-accent shrink-0" />
-      <span class="text-[11px] font-medium text-textPrimary">Terminal</span>
+      <span class="text-meta font-medium text-textPrimary">Terminal</span>
       <div class="flex-1"></div>
       <button
         type="button"
@@ -271,6 +334,8 @@
               onClose,
               expanded,
               onToggleExpanded: () => (expanded = !expanded),
+              dockMode: overlay ? "overlay" : "docked",
+              onToggleDockMode: () => panelModes.toggle("dock"),
               onGoToSession: goToSession,
               checkouts: $repoStore.openTabs,
             }}

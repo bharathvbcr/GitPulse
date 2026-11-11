@@ -32,6 +32,7 @@
   } from "../../files/fileStatus";
   import { formatPathParts } from "../../files/formatPath";
   import LanguageLogo from "../LanguageLogo.svelte";
+  import Skeleton from "../Skeleton.svelte";
 
   interface FileCommit {
     id: string;
@@ -464,7 +465,10 @@
           </div>
 
           {#if isLoadingCommits}
-            <div class="p-3 text-center text-textMuted text-xs">Loading file history…</div>
+            <div class="p-1">
+              <Skeleton variant="text" count={3} />
+              <span class="sr-only">Loading file history…</span>
+            </div>
           {:else if recentCommits.length === 0}
             <div class="p-3 rounded-xl border border-edgeSoft bg-surface/30 text-center text-textMuted text-meta">
               No prior commits recorded for this path

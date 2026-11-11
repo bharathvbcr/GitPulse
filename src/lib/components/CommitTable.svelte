@@ -900,7 +900,7 @@
       role="status"
       aria-label="Loading commits"
     >
-      <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
+      <div class="h-full w-1/3 bg-accent gp-indeterminate"></div>
     </div>
   {/if}
   {#if $graphStore.error && !$graphStore.isLoading}

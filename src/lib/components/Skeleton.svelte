@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { motionExitMs } from "../motion/tokens";
+  import { startSkeletonGate, type SkeletonGate } from "../ui/skeletonGate";
+
   let {
     variant = "text",
     count = 1,
@@ -6,6 +9,7 @@
     height = "",
     class: extraClass = "",
     animated = true,
+    hold = true,
   }: {
     variant?: "text" | "rect" | "circle" | "card" | "tree-row" | "code-lines";
     count?: number;
@@ -13,16 +17,49 @@
     height?: string;
     class?: string;
     animated?: boolean;
+    /** Keep a shown skeleton for the 400 ms minimum, then leave in 70 ms. False: leave at once. */
+    hold?: boolean;
   } = $props();
 
   const items = $derived(Array.from({ length: Math.max(1, count) }, (_, i) => i));
+
+  /*
+   * A load that finishes inside 300 ms never shows the placeholder, and one
+   * that did appear stays 400 ms (DESIGN_LANGUAGE §8.4). The box is always
+   * laid out, only transparent until the delay passes, so nothing jumps when
+   * it appears. The hold is the outro: it waits out whatever is left of the
+   * 400 ms, then leaves in the 70 ms exit.
+   */
+  let shown = $state(false);
+  let gate: SkeletonGate | null = null;
+
+  $effect(() => {
+    gate = startSkeletonGate(() => {
+      shown = true;
+    });
+    return () => gate?.cancel();
+  });
+
+  function holdThenLeave(_node: Element) {
+    // A caller that swaps the skeleton for content in the same box (LazyView)
+    // opts out of the outro: a skeleton still in flow while its replacement
+    // mounts would split the box between them.
+    if (!hold) return { duration: 0 };
+    return {
+      delay: gate?.holdRemainingMs() ?? 0,
+      duration: motionExitMs("fast"),
+      css: (t: number) => `opacity: ${t}`,
+    };
+  }
 </script>
 
 <div
-  class="flex flex-col gap-2 w-full {extraClass}"
+  class="flex flex-col gap-2 w-full {shown ? '' : 'opacity-0'} {extraClass}"
   role="status"
   aria-label="Loading content"
   aria-busy="true"
+  data-skeleton-shown={shown}
+  out:holdThenLeave|global
 >
   {#each items as i (i)}
     {#if variant === "circle"}

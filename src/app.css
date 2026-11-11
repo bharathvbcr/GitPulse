@@ -544,6 +544,15 @@
   transition-timing-function: var(--gp-ease-effect);
 }
 
+@utility gp-indeterminate {
+  /* The indeterminate progress strip's mover: a bar that sweeps across its
+     track while a long load runs (the commit graph's loading strip). It
+     animates transform only, through `@keyframes gp-slide`. Both reduced-motion
+     lists below stop it; the bar then rests at the start of the track, which
+     still reads as "working" without moving. */
+  animation: gp-slide 1.2s ease-in-out infinite;
+}
+
 @utility gp-notice {
   /* A rounded note card under a surface header: what could not be read or
      needs doing. The tone utilities below tint it; the layout inside is the
@@ -1807,6 +1816,18 @@ html.macos .gp-sidebar {
   border-radius: var(--gp-pane-radius);
 }
 
+/* The sidebar's tonal step from the workspace. Dark has one already: glass
+   fill from --c-surface (20 26 41 at .4) against the plate's --c-bg (11 14 23
+   at .46). Light filled both with white (.58 against .6), so the only thing
+   separating them was the pane outline. The light sidebar takes
+   --c-surface-hover at the plate's own alpha instead, a step of about 11
+   levels against white, the same strength as dark's. Reduced transparency
+   and the material slider keep winning: the slider term is the same one the
+   fill uses, and the opaque blocks below sit later in the cascade. */
+html.macos.light .gp-sidebar {
+  background-color: rgb(var(--c-surface-hover) / calc(0.6 + 0.4 * var(--gp-material, 0)));
+}
+
 html.macos :is(.gp-menu, .gp-card.shadow-float) {
   box-shadow:
     inset 0 1px 0 var(--mac-glass-sheen),
@@ -2165,7 +2186,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
 @media (prefers-reduced-motion: reduce) {
   /* Spinners keep their glyph (static, visible) so activity indication
      survives; only the rotation/pulse motion is removed. */
-  html :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
+  html :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion, .gp-indeterminate, .animate-pulse, .animate-spin) {
     animation: none !important;
   }
 
@@ -2178,7 +2199,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
   }
 }
 
-html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
+html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion, .gp-indeterminate, .animate-pulse, .animate-spin) {
   animation: none !important;
 }
 
@@ -2218,6 +2239,64 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-success,
   to {
     opacity: 1;
     transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/*
+ * The terminal dock's slide (DESIGN_LANGUAGE §8.5). One class, three phases
+ * through `data-phase`, so the reduced-motion lists name a single selector:
+ *
+ *   in          docked: the dock has just been shown; it settles up 8 px and
+ *               fades in once. The layout itself does not animate.
+ *   slide-in    overlay: it rises from the bottom edge of the column.
+ *   slide-out   overlay: it leaves in an exit, opacity and transform only.
+ *               The host holds the element for the exit, then hides it.
+ *
+ * transform and opacity only. `--gp-dock-exit-ms` is set by the host from the
+ * exit token (EXIT_MS.slow), so no duration literal lives in a component.
+ */
+@keyframes gp-dock-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes gp-dock-slide-in {
+  from {
+    transform: translate3d(0, 100%, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes gp-dock-slide-out {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, 24px, 0);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="in"] {
+    animation: gp-dock-in var(--gp-dur-base) var(--gp-ease-spatial) both;
+  }
+
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-in"] {
+    animation: gp-dock-slide-in var(--gp-dur-slow) var(--gp-ease-spatial) backwards;
+  }
+
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-out"] {
+    animation: gp-dock-slide-out var(--gp-dock-exit-ms, 70ms) var(--gp-ease-exit) both;
   }
 }
 

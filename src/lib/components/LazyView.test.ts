@@ -51,6 +51,22 @@ describe("LazyView pending and failed states", () => {
     expect(effect.slice(0, effect.indexOf("loader().then"))).toContain("void attempt;");
   });
 
+  it("hands a freshly loaded view in on the base token, transform and opacity only", () => {
+    expect(source).toContain('motionMs("base")');
+    expect(source).toContain("in:viewEnter");
+    const enter = source.slice(source.indexOf("function viewEnter("), source.indexOf("let { load, name"));
+    expect(enter).toContain("opacity: ${t}");
+    expect(enter).toContain("translate3d(0,");
+    expect(enter).not.toMatch(/\b(width|height|margin|top|left)\s*:/);
+    // A cached view mounts plainly: a tab revisit never replays the hand-off.
+    expect(source).toContain("{#if view && handedOff}");
+    expect(source).toContain("{:else if view}");
+  });
+
+  it("swaps the skeleton for the view without an outro that would split the box", () => {
+    expect(source.match(/hold=\{false\}/g)?.length).toBe(3);
+  });
+
   it("spreads optional props onto the resolved view, the same seam LazyMount uses", () => {
     // TerminalDock binds each host to a repository path this way. Callers
     // that have no extra inputs pass nothing; an empty spread is <View />.

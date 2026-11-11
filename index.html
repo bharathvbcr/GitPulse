@@ -50,8 +50,71 @@
     }
     </script>
     <title>GitPulse: Local-First Git Desktop Workspace &amp; Code Intelligence</title>
+    <!-- Boot plate (DESIGN_LANGUAGE §8.4, §12). Critical CSS, inline on purpose:
+         it paints before app.css and before any script runs, so a cold start is
+         never an empty window. Its colors are the two surface tokens (--c-bg in
+         app.css, dark and light); theme-boot.js has already put the resolved
+         class on <html>. Splash.svelte hands it off in 480 ms once the shell is
+         up, and theme-boot.js removes it after a few seconds regardless, so it
+         can never trap the window. It takes no pointer events. -->
+    <style id="gp-boot-css">
+      #gp-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgb(11 14 23);
+        pointer-events: none;
+        opacity: 1;
+        transition: opacity 0ms linear;
+      }
+      html.light #gp-boot {
+        background: rgb(243 244 250);
+      }
+      #gp-boot svg {
+        width: 64px;
+        height: 64px;
+      }
+      #gp-boot[data-leaving] {
+        opacity: 0;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #gp-boot {
+          transition: none !important;
+        }
+      }
+    </style>
+    <noscript>
+      <style>
+        #gp-boot {
+          display: none;
+        }
+      </style>
+    </noscript>
   </head>
   <body class="bg-background text-textPrimary overflow-hidden select-none font-sans antialiased">
+    <div id="gp-boot" aria-hidden="true">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+        <defs>
+          <linearGradient id="gp-boot-stroke" x1="3" y1="27" x2="29" y2="6" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#22d3ee" />
+            <stop offset="52%" stop-color="#58a6ff" />
+            <stop offset="100%" stop-color="#a371f7" />
+          </linearGradient>
+          <linearGradient id="gp-boot-branch" x1="19" y1="22" x2="30" y2="8" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#6ea8ff" />
+            <stop offset="100%" stop-color="#a371f7" />
+          </linearGradient>
+        </defs>
+        <g transform="translate(4.6 4.3) scale(0.71)">
+          <path d="M20.8 20.4C24.6 20.4 24.8 12.8 27.4 10.4" stroke="url(#gp-boot-branch)" stroke-width="3.2" stroke-linecap="round" />
+          <path d="M3.6 20.4H9.2L12.6 9.6L16.4 26.4L19.2 20.4H20.8" stroke="url(#gp-boot-stroke)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="28" cy="9.4" r="3.6" fill="url(#gp-boot-branch)" />
+        </g>
+      </svg>
+    </div>
     <div id="app"></div>
     <noscript>
       <main style="max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; font-family: system-ui, sans-serif; line-height: 1.5">

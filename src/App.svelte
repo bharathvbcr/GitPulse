@@ -78,6 +78,7 @@
   import LazyView from "./lib/components/LazyView.svelte";
   import LazyMount from "./lib/components/LazyMount.svelte";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
+  import Splash from "./lib/components/Splash.svelte";
 
   // Views the app does not need to start. Each becomes its own chunk, so
   // opening a repository no longer parses the coverage, health, storage,
@@ -1203,7 +1204,7 @@
       </div>
     </div>
   {:else}
-      <div class="flex-1 flex overflow-hidden">
+      <div class="flex-1 flex overflow-hidden relative">
         <svelte:boundary failed={sidebarFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
           <Sidebar />
         </svelte:boundary>
@@ -1390,4 +1391,5 @@
       <LazyMount load={loadDiagnosticsModal} name="Diagnostics" props={{ isOpen: isDiagnosticsOpen, onClose: () => (isDiagnosticsOpen = false) }} />
     {/if}
   </svelte:boundary>
+  <Splash />
 </div>

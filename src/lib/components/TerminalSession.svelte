@@ -1697,22 +1697,22 @@
        visible row below is hidden from assistive technology to match. -->
   <span class="sr-only" role="status" aria-live="polite" data-terminal-announcer>{statusAnnouncement}</span>
   {#if warning}
-    <div role="status" class="shrink-0 flex gap-2 items-center text-[11px] text-amber-300 px-3 py-1 border-b border-border/60">
+    <div role="status" class="shrink-0 flex gap-2 items-center text-meta text-warn px-3 py-1">
       <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
       <button type="button" aria-label="Dismiss terminal message" class="gp-icon-btn" onclick={() => (warning = null)}><X size={12} /></button>
     </div>
   {/if}
   {#if slowInput}
-    <div role="status" class="shrink-0 text-[11px] text-amber-300 px-3 py-1 border-b border-border/60 truncate" title={slowInput}>{slowInput}</div>
+    <div role="status" class="shrink-0 text-meta text-warn px-3 py-1 truncate" title={slowInput}>{slowInput}</div>
   {/if}
   {#if findOpen}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <!-- Justified: Enter/Escape bubble from the input and search buttons, retaining their ordinary focus order. -->
-    <div class="flex items-center gap-1.5 px-3 h-9 shrink-0 bg-surface border-b border-border/60" role="search" aria-label="Find in terminal" onkeydown={handleFindKey}>
+    <div class="flex items-center gap-1.5 px-3 h-9 shrink-0 bg-surface" role="search" aria-label="Find in terminal" onkeydown={handleFindKey}>
       <Search size={13} class="text-textMuted shrink-0" />
       <input bind:this={findInput} bind:value={query} maxlength={SEARCH_QUERY_LIMIT} aria-label="Find in terminal output" placeholder="Find in terminal…" class="min-w-0 w-48 flex-1 bg-transparent text-textPrimary text-xs outline-none" />
-      <span role="status" class="text-[10px] text-textMuted whitespace-nowrap tabular-nums">{query ? terminalSearchSummary(resultIndex, resultCount) : ""}</span>
-      <button type="button" class="gp-icon-btn text-[11px]!" class:text-accent={caseSensitive} aria-label="Match case" aria-pressed={caseSensitive} title="Match case" onclick={() => (caseSensitive = !caseSensitive)}>Aa</button>
+      <span role="status" class="text-micro text-textMuted whitespace-nowrap tabular-nums">{query ? terminalSearchSummary(resultIndex, resultCount) : ""}</span>
+      <button type="button" class="gp-icon-btn text-meta!" class:text-accent={caseSensitive} aria-label="Match case" aria-pressed={caseSensitive} title="Match case" onclick={() => (caseSensitive = !caseSensitive)}>Aa</button>
       <button type="button" class="gp-icon-btn" aria-label="Previous match" title="Previous match (Shift+Enter)" disabled={!query} onclick={() => runFind(true)}><ChevronUp size={13} /></button>
       <button type="button" class="gp-icon-btn" aria-label="Next match" title="Next match (Enter)" disabled={!query} onclick={() => runFind()}><ChevronDown size={13} /></button>
       <button type="button" class="gp-icon-btn" aria-label="Close find" title="Close find (Esc)" onclick={closeFind}><X size={13} /></button>
@@ -1730,7 +1730,7 @@
       data-renderer={renderer}
     ></div>
     {#if scrolledBack}
-      <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
+      <button type="button" class="gp-btn absolute bottom-3 right-5 text-meta! shadow-lg" data-size="sm" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
     {/if}
     {#if awaitingAcknowledgement}
       <!-- Covers the grid rather than sitting beside it: nothing has spawned,
@@ -1743,11 +1743,11 @@
         aria-labelledby="gp-bypass-title-{tabId}"
         aria-describedby="gp-bypass-body-{tabId}"
       >
-        <AlertTriangle size={18} class="text-amber-500 shrink-0" aria-hidden="true" />
+        <AlertTriangle size={18} class="text-warn shrink-0" aria-hidden="true" />
         <span id="gp-bypass-title-{tabId}" class="text-textPrimary text-xs font-medium">
           Start {launcherLabel(launcher)} with no permission checks?
         </span>
-        <p id="gp-bypass-body-{tabId}" class="text-textMuted text-[11px] leading-snug max-w-sm">
+        <p id="gp-bypass-body-{tabId}" class="text-textMuted text-meta leading-snug max-w-sm">
           Your saved default for {launcherLabel(launcher)} is
           <span class="text-textPrimary">{PERMISSION_LABELS.bypass.label}</span>. This session will
           run without permission prompts and without a sandbox, in
@@ -1757,7 +1757,8 @@
         <div class="flex items-center gap-2 mt-1">
           <button
             type="button"
-            class="gp-btn py-1! text-[11px]!"
+            class="gp-btn"
+            data-size="sm"
             data-testid="bypass-acknowledge"
             onclick={acknowledgeBypass}
           >
@@ -1765,7 +1766,8 @@
           </button>
           <button
             type="button"
-            class="gp-btn py-1! text-[11px]!"
+            class="gp-btn"
+            data-size="sm"
             data-testid="bypass-decline"
             bind:this={declineButton}
             onclick={declineBypass}
@@ -1784,54 +1786,54 @@
          the height go (inline style beats h-8); every other row stays fixed. -->
     <div
       data-terminal-status
-      class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8"
+      class="shrink-0 min-w-0 bg-surface/60 flex items-center gap-2 px-4 h-8"
       style:height={error && !spawning ? "auto" : undefined}
       style:min-height={error && !spawning ? "2rem" : undefined}
       style:padding-block={error && !spawning ? "0.25rem" : undefined}
     >
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
-        <span aria-hidden="true" class="text-textMuted text-[11px]">{startingLabel}</span>
+        <span aria-hidden="true" class="text-textMuted text-meta">{startingLabel}</span>
       {:else if error}
-        <AlertCircle size={13} class="text-rose-400 shrink-0" />
-        <span role="alert" class="text-rose-300 flex-1 min-w-0 break-words whitespace-pre-wrap max-h-24 overflow-y-auto text-[11px]">{error}</span>
-        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
-          <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
+        <AlertCircle size={13} class="text-danger shrink-0" />
+        <span role="alert" class="text-danger flex-1 min-w-0 break-words whitespace-pre-wrap max-h-24 overflow-y-auto text-meta">{error}</span>
+        <button type="button" class="gp-btn" data-size="sm" onclick={restart}>
+          <RotateCw size={12} /> {taskRunId ? "Reconnect run" : "Try again"}
         </button>
       {:else if exited}
-        <span aria-hidden="true" class="text-textMuted flex-1 text-[11px]">{endedLabel}</span>
+        <span aria-hidden="true" class="text-textMuted flex-1 text-meta">{endedLabel}</span>
         {#if linkedRunId}
-          <!-- The task details are where a new attempt starts, so the way
+          <!-- The task details are where a new run starts, so the way
                there is here rather than only named in a tooltip. -->
-          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
+          <button type="button" class="gp-btn" data-size="sm" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
             Open task
           </button>
         {/if}
         {#if transcriptNote}
-          <span class="text-textMuted text-[11px]" data-testid="terminal-resume-unavailable">{transcriptNote}</span>
+          <span class="text-textMuted text-meta" data-testid="terminal-resume-unavailable">{transcriptNote}</span>
         {/if}
         {#if resumeOffer}
-          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title={launcher === "agy" ? (resumeOffer === AGY_CONTINUE_SENTINEL ? "Relaunch Antigravity's latest conversation in this workspace with --continue" : "Relaunch this Antigravity conversation with --conversation, in the same directory and permission mode") : "Relaunch this Claude Code conversation with --resume, in the same directory and permission mode"}>
+          <button type="button" class="gp-btn" data-size="sm" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title={launcher === "agy" ? (resumeOffer === AGY_CONTINUE_SENTINEL ? "Resume Antigravity's latest conversation in this workspace with --continue" : "Resume this Antigravity conversation with --conversation, in the same directory and permission mode") : "Resume this Claude Code conversation with --resume, in the same directory and permission mode"}>
             <RotateCw size={12} /> Resume
           </button>
         {/if}
-        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>
+        <button type="button" class="gp-btn" data-size="sm" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Start a new run from the task details." : "Restart this terminal"}>
           <RotateCw size={12} /> Restart
         </button>
       {:else if hoveredLink}
         <!-- Same row, so revealing a link target never resizes the grid. -->
         <ExternalLink size={11} class="text-accent shrink-0" aria-hidden="true" />
-        <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
+        <span class="text-micro text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
-        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
+        <span class="w-1.5 h-1.5 rounded-full bg-ok shrink-0" aria-hidden="true"></span>
+        <span class="text-micro text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
       {/if}
       {#if renderer === "reset" || renderer === "lost"}
         <!-- A lost WebGL context is not blank (the DOM renderer is already
              drawing the same rows), but it is slower; say why. -->
         <span
           data-terminal-gpu-note
-          class="ml-auto shrink-0 text-[10px] text-amber-300 whitespace-nowrap"
+          class="ml-auto shrink-0 text-micro text-warn whitespace-nowrap"
           title={renderer === "reset"
             ? "The graphics context was lost, for example by a GPU reset or waking from sleep. This terminal draws without the GPU and will try again."
             : "This terminal draws without the GPU: its graphics context was lost repeatedly or could not be created. Reopening the tab tries again."}
@@ -1840,7 +1842,7 @@
       <div class="{renderer === 'reset' || renderer === 'lost' ? '' : 'ml-auto '}flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 
         <button type="button" class="gp-icon-btn p-0.5!" aria-label="Decrease terminal text size" title="Smaller text ({platformChord('⌘−', 'Ctrl+Shift+−', $hostPlatform.os)})" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
-        <button type="button" class="text-[10px] text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size ({platformChord('⌘0', 'Ctrl+Shift+0', $hostPlatform.os)})" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>
+        <button type="button" class="text-micro text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size ({platformChord('⌘0', 'Ctrl+Shift+0', $hostPlatform.os)})" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>
         <button type="button" class="gp-icon-btn p-0.5!" aria-label="Increase terminal text size" title="Larger text ({platformChord('⌘+', 'Ctrl+Shift++', $hostPlatform.os)})" disabled={fontSize >= TERMINAL_FONT_MAX} onclick={() => setFontSize(fontSize + 1)}><Plus size={12} /></button>
       </div>
     </div>

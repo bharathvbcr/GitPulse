@@ -38,7 +38,28 @@
 </script>
 
 <script lang="ts">
+  import { motionMs } from "../motion/tokens";
+  import { springEasing } from "../ui/transitions";
   import Skeleton from "./Skeleton.svelte";
+
+  /** How far a freshly loaded view rises into place (px). */
+  const VIEW_RISE_PX = 6;
+  const spatial = springEasing("spatial");
+
+  /*
+   * Skeleton to content hand-off. The skeleton leaves in its own 70 ms exit
+   * (Skeleton.svelte); the view then enters on the `base` token with a small
+   * rise. transform and opacity only, and `motionMs` is 0 under reduced
+   * motion, so the hand-off becomes a cut. Svelte's css form compiles this to a
+   * keyframe animation, so it runs off the main thread.
+   */
+  function viewEnter(_node: Element) {
+    return {
+      duration: motionMs("base"),
+      easing: spatial,
+      css: (t: number, u: number) => `opacity: ${t}; transform: translate3d(0, ${u * VIEW_RISE_PX}px, 0)`,
+    };
+  }
 
   interface Props {
     load: ViewLoader;
@@ -59,6 +80,12 @@
   let { load, name, props = {} }: Props = $props();
 
   let view = $derived(resolved.get(load));
+  /**
+   * True once this instance has waited for a chunk. A view that was already
+   * cached mounts plainly, with no wrapper and no entrance, so a tab revisit
+   * never replays the hand-off.
+   */
+  let handedOff = $state(false);
   let failure = $state<string | null>(null);
   /** Bumped by Retry to re-run the load effect for the same loader. */
   let attempt = $state(0);
@@ -75,6 +102,7 @@
     failure = null;
     loader().then(
       (module) => {
+        handedOff = true;
         resolved.set(loader, module.default);
       },
       (error: unknown) => {
@@ -88,7 +116,12 @@
   });
 </script>
 
-{#if view}
+{#if view && handedOff}
+  {@const View = view}
+  <div class="flex-1 flex flex-col min-h-0 min-w-0" in:viewEnter data-lazy-view-handoff>
+    <View {...props} />
+  </div>
+{:else if view}
   {@const View = view}
   <View {...props} />
 {:else if failure}
@@ -119,8 +152,8 @@
     aria-busy="true"
     aria-label="Loading {name}"
   >
-    <Skeleton variant="text" width="35%" height="1rem" />
-    <Skeleton variant="card" />
-    <Skeleton variant="text" count={4} />
+    <Skeleton variant="text" width="35%" height="1rem" hold={false} />
+    <Skeleton variant="card" hold={false} />
+    <Skeleton variant="text" count={4} hold={false} />
   </div>
 {/if}
