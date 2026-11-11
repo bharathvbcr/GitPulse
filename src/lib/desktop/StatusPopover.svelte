@@ -269,6 +269,9 @@
     --gp-edge:var(--line);
     --brand-gradient:linear-gradient(rgb(var(--action)), rgb(var(--action)));
     --shadow-glow:0 1px 2px rgb(var(--c-pop-shadow) / .07);
+    /* app.css's preflight puts line-height:1.5 on html; this window was laid out
+       at the browser default, and the native window is sized to its content. */
+    line-height:normal;
     padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:12px; -webkit-font-smoothing:antialiased;
   }
   .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
