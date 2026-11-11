@@ -865,7 +865,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      metrics. A removable chip holds a `gp-icon-btn` `data-size="sm"` for its
      ×. `gp-pill` is the retiring twin; new code writes this. */
   @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border px-2 py-0 text-meta leading-none;
-  /* One size, 20px (§8), whether or not data-kind is set. */
+  /* 20px standalone (§8), whether or not data-kind is set; data-size="inline" below drops the floor for a tag inside a text line. */
   min-height: 20px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color;
