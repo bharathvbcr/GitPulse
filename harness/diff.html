@@ -160,6 +160,8 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
   return Boolean(status)&&Boolean(preview.querySelector('[aria-busy="true"]'));
  });
  await pending;await until(()=>text().includes("new two"),"rows after read");
+ // The loading skeleton leaves through an outro that ends on a later frame; wait it out (bounded by `until`) before asserting the mark is gone.
+ await until(()=>!preview.querySelector('[aria-busy="true"]'),"busy mark gone");
  check("and the rows arrive once it is read, with the busy mark gone",()=>!preview.querySelector('[aria-busy="true"]')&&text().includes("old forty"));
  delayMs=0;
  // --- identity and rows ---------------------------------------------------

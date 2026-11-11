@@ -276,6 +276,8 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(() => host.querySelector("[data-search-match]"), "a compact search hit is listed");
   host.querySelector("[data-search-match]").click(); await tick();
   await until(() => editorShown(), "the editor comes forward");
+  // The column leaves through the panel slide outro, which ends on a later frame.
+  await until(() => !rail(), "the search column has left");
   check("a hit in the selected file brings the editor forward on a compact layout", () => editorShown() && !rail());
   host.style.width = ""; await wait(120);
   lens.resetExplorerLens();
