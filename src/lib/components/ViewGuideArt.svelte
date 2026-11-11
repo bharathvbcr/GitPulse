@@ -17,6 +17,7 @@
 </script>
 
 <svg
+  data-view-guide-art
   viewBox="0 0 256 96"
   class="h-[76px] w-full"
   role="img"

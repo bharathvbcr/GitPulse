@@ -496,8 +496,9 @@
           // The view-tab guide tooltip draws its schematic from a lazily loaded chunk.
           const guideTab = $("[data-tip-guide]");
           guideTab?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-          await sleepUntil(() => !!$('[role="tooltip"] svg'), 5000);
-          check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$('[role="tooltip"] svg') && $$('[role="tooltip"] svg *').length > 3);
+          const GUIDE_ART = '[role="tooltip"] [data-view-guide-art]';
+          await sleepUntil(() => !!$(GUIDE_ART), 5000);
+          check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$(GUIDE_ART) && $$(`${GUIDE_ART} *`).length > 3);
           guideTab?.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
 
           // ---- 4. an answer in flight for the repository left does not land -----
