@@ -63,6 +63,15 @@ describe("LazyView pending and failed states", () => {
     expect(source).toContain("{:else if view}");
   });
 
+  it("does not hand off, and so remount, an instance whose sibling already resolved the view", () => {
+    // Pinned from the agent-capacity harness: the dock mounts one panel per
+    // repository tab, all awaiting one loader. A late sibling flipping to the
+    // wrapper branch remounted its terminal panel and opened an extra shell.
+    const landed = source.slice(source.indexOf("(module) => {"), source.indexOf("(error: unknown)"));
+    expect(landed.indexOf("if (resolved.has(loader)) return;")).toBeGreaterThan(-1);
+    expect(landed.indexOf("if (resolved.has(loader)) return;")).toBeLessThan(landed.indexOf("handedOff = true;"));
+  });
+
   it("swaps the skeleton for the view without an outro that would split the box", () => {
     expect(source.match(/hold=\{false\}/g)?.length).toBe(3);
   });

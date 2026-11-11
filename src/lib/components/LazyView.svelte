@@ -102,6 +102,12 @@
     failure = null;
     loader().then(
       (module) => {
+        // Several instances of one loader (the dock's panel per tab) all start
+        // before any chunk lands. The first to land hands off; a sibling that
+        // finds the view already resolved is mounted plainly, and flipping it
+        // to the wrapper branch now would remount the view, which a terminal
+        // panel answers by opening another shell.
+        if (resolved.has(loader)) return;
         handedOff = true;
         resolved.set(loader, module.default);
       },
