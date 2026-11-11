@@ -10,6 +10,7 @@ import { ACCENTS } from "../ui/accents";
 import { TAB_WIDTHS } from "../ui/codeDisplay";
 import { VIEW_TABS } from "../repos/persist";
 import { viewNavItemFor } from "../views/viewNav";
+import { resetHostPlatformForTests } from "../stores/platformStore";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "SettingsModal.svelte"),
@@ -568,5 +569,82 @@ describe("SettingsModal diff and code panel", () => {
       expect(diff, `missing tab width ${width}`).toContain(`>${width}`);
     }
     expect(prose(diff)).toContain("Display only");
+  });
+});
+
+describe("SettingsModal native rendering switches", () => {
+  const MAC = {
+    os: "macos",
+    dock_hiding: true,
+    browser_sessions: true,
+    native_material: true,
+    liquid_glass: true,
+    high_refresh: true,
+  } as const;
+
+  /** The opening tag of one setting row, so the assertion reads that row and not a neighbour. */
+  function rowTag(body: string, id: string): string {
+    const start = body.indexOf(`data-setting="${id}"`);
+    expect(start, `no row for ${id}`).toBeGreaterThan(-1);
+    const open = body.lastIndexOf("<", start);
+    return body.slice(open, body.indexOf(">", start) + 1);
+  }
+
+  const isHidden = (tag: string) => /\shidden(\s|=|>|$)/.test(tag);
+
+  it.each([
+    ["native-glass", "Use the Liquid Glass window material"],
+    ["high-refresh", "Render the interface above 60 Hz"],
+  ])("shows %s on a host that has the code, switched off", (id, label) => {
+    resetHostPlatformForTests({ ...MAC });
+    const body = open();
+    expect(isHidden(rowTag(body, id))).toBe(false);
+    const at = body.indexOf(`aria-label="${label}"`);
+    expect(at, `no switch named "${label}"`).toBeGreaterThan(-1);
+    const tag = body.slice(body.lastIndexOf("<", at), body.indexOf(">", at) + 1);
+    expect(tag).toContain('aria-checked="false"');
+  });
+
+  it("hides each switch by its own capability, not by the OS name", () => {
+    resetHostPlatformForTests({ ...MAC, liquid_glass: false });
+    let body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(true);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(false);
+
+    resetHostPlatformForTests({ ...MAC, high_refresh: false });
+    body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(false);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(true);
+  });
+
+  it("hides both on a host without them, whatever the user agent says", () => {
+    resetHostPlatformForTests({ ...MAC, os: "windows", liquid_glass: false, high_refresh: false, native_material: false });
+    const body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(true);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(true);
+  });
+
+  it("says each is off until turned on, and names the private WebKit switch behind 120 Hz", () => {
+    const rows = prose(appearanceSource);
+    resetHostPlatformForTests({ ...MAC });
+    expect(open()).toContain("Needs macOS 26 or later");
+    // Liquid Glass is public AppKit (NSGlassEffectView); only the frame-rate
+    // switch is private, and the copy must not claim otherwise for either.
+    expect(rows).toContain("private WebKit switch");
+    expect(rows).not.toContain("private macOS window API");
+    expect(rows.match(/stays off unless you turn it on/g)).toHaveLength(2);
+  });
+
+  it("never draws a refusal as in effect", () => {
+    // Three states and no fourth: pending, in effect, refused with a reason.
+    const rows = prose(appearanceSource);
+    expect(rows).toContain('data-native-outcome="pending"');
+    expect(rows).toContain('data-native-outcome="active"');
+    expect(rows).toContain('data-native-outcome="refused"');
+    expect(rows).toContain('data-native-outcome="restart"');
+    // The refusal branch is tested first, so a restart note never hides it.
+    expect(rows.indexOf("{#if asked && answer !== null && !answer.active}")).toBeGreaterThan(-1);
+    expect(rows.indexOf("{#if asked && answer !== null && !answer.active}")).toBeLessThan(rows.indexOf("{:else if restartNote !== null}"));
+    expect(rows).toContain("{#if answer === null}");
   });
 });

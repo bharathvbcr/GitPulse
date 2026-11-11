@@ -24,6 +24,7 @@
   import { interfaceStore } from "../src/lib/stores/interfaceStore";
   import { themeStore } from "../src/lib/stores/themeStore";
   import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
+  import { publishNativeRenderingStatus, setNativeRenderingBoot } from "../src/lib/desktop/nativeRendering";
   import { applyTransparency, TRANSPARENCY_ATTRIBUTE } from "../src/lib/ui/transparencyPreference";
   import { validateTheme } from "../src/lib/ui/appearance/themeSchema";
   import { get } from "svelte/store";
@@ -86,7 +87,7 @@
 
   async function run() {
     themeStore.setTheme("dark");
-    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true });
+    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true, liquid_glass: true, high_refresh: true });
     mount(AppearanceHost, { target: document.getElementById("app") });
     await settle();
     const page = $("[data-appearance-settings]");
@@ -232,11 +233,62 @@
     await press($("[data-theme-file]"), "Remove");
     check("removing the theme returns the shipped palette", () => !root.style.getPropertyValue("--c-bg") && !$("[data-theme-active]"));
 
+    // --- native rendering switches (Liquid Glass, 120 Hz) --------------------
+    const glassRow = () => $('[data-setting="native-glass"]');
+    const refreshRow = () => $('[data-setting="high-refresh"]');
+    const outcomeOf = (row) => row.querySelector("[data-native-outcome]")?.getAttribute("data-native-outcome") ?? "none";
+    const flip = async (row) => { row.querySelector('[role="switch"]').click(); await settle(); };
+    check("Liquid Glass is a Material row and 120 Hz a Motion row, both visible on a Mac that has them", () =>
+      glassRow().closest('[data-group="material"]') && refreshRow().closest('[data-group="motion"]') && !glassRow().hidden && !refreshRow().hidden);
+    check("both switches start off and draw no outcome", () => {
+      const p = get(interfaceStore);
+      return !p.nativeGlass && !p.highRefresh && outcomeOf(glassRow()) === "none" && outcomeOf(refreshRow()) === "none"
+        && glassRow().querySelector('[role="switch"]').getAttribute("aria-checked") === "false";
+    });
+    await flip(glassRow());
+    check("turning Liquid Glass on stores the request and reads Applying until the window answers", () => get(interfaceStore).nativeGlass === true && outcomeOf(glassRow()) === "pending");
+    publishNativeRenderingStatus({ liquid_glass: { requested: true, active: true, reason: null }, high_refresh: { requested: false, active: false, reason: null } });
+    await settle();
+    check("an observed glass view reads In effect", () => outcomeOf(glassRow()) === "active" && glassRow().textContent.includes("In effect."));
+    publishNativeRenderingStatus({ liquid_glass: { requested: true, active: false, reason: "Liquid Glass needs macOS 26 or later. This Mac is older, so the window keeps its standard material." }, high_refresh: { requested: false, active: false, reason: null } });
+    await settle();
+    check("a refusal is drawn as not in effect, with its reason, never as on", () => {
+      const note = glassRow().querySelector('[data-native-outcome="refused"]');
+      return note && note.getAttribute("data-tone") === "warn" && note.textContent.includes("Not in effect.") && note.textContent.includes("macOS 26") && !glassRow().textContent.includes("In effect.");
+    });
+    publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: false, active: false, reason: null } });
+    await settle();
+    check("an answer to an older request does not count: pending again until the window answers the current one", () => outcomeOf(glassRow()) === "pending");
+    await flip(glassRow());
+    check("turning it off clears the outcome", () => !get(interfaceStore).nativeGlass && outcomeOf(glassRow()) === "none");
+    await flip(refreshRow());
+    publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: true, active: false, reason: "Frame pacing is unchanged: this WebKit has no such frame-rate feature." } });
+    await settle();
+    check("the 120 Hz row draws its own refusal and leaves the glass row alone", () => outcomeOf(refreshRow()) === "refused" && outcomeOf(glassRow()) === "none");
+    await flip(refreshRow());
+    // WebKit fixes the frame rate when the page starts: a 120 Hz change after launch waits for the next one.
+    setNativeRenderingBoot({ liquidGlass: false, highRefresh: false });
+    await flip(refreshRow());
+    publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: true, active: true, reason: null } });
+    await settle();
+    check("turning 120 Hz on after launch says it waits for the next launch, not In effect", () => outcomeOf(refreshRow()) === "restart" && refreshRow().textContent.includes("next time GitPulse starts") && !refreshRow().textContent.includes("In effect."));
+    publishNativeRenderingStatus({ liquid_glass: { requested: false, active: false, reason: null }, high_refresh: { requested: true, active: false, reason: "Frame pacing is unchanged: stuck." } });
+    await settle();
+    check("a refusal still wins over the restart note", () => outcomeOf(refreshRow()) === "refused");
+    await flip(refreshRow());
+    check("turning it back off after launch says it returns to 60 Hz on the next launch only if the launch had it on", () => outcomeOf(refreshRow()) === "none");
+    setNativeRenderingBoot({ liquidGlass: false, highRefresh: true });
+    await settle();
+    check("a launch that had 120 Hz on, now off, says it returns to 60 Hz next launch", () => outcomeOf(refreshRow()) === "restart" && refreshRow().textContent.includes("60 Hz"));
+    setNativeRenderingBoot(null);
+    publishNativeRenderingStatus(null);
+    check("the switch stays reachable by its accessible name", () => $('[aria-label="Use the Liquid Glass window material"]') && $('[aria-label="Render the interface above 60 Hz"]'));
+
     // --- reset, gating -------------------------------------------------------
     await press(page, "Reset appearance");
     check("Reset appearance restores every default", () => { const p = get(interfaceStore); return p.density === "comfortable" && p.radiusScale === 1 && p.floatBlur === 34 && p.fieldLevel === "vivid" && p.customAccent === "" && !p.reduceTransparency && p.customTheme === null; });
     check("and leaves the document clean", () => root.style.getPropertyValue("--gp-material") === "" && !root.hasAttribute("data-float-blur") && !root.hasAttribute("data-radius-scale"));
-    resetHostPlatformForTests({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false });
+    resetHostPlatformForTests({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false, liquid_glass: false, high_refresh: false });
     interfaceStore.setFloatBlur(0); interfaceStore.setMaterialIntensity("dark", 1); await settle();
     check("without the capability the Material group explains itself instead of showing dead sliders", () => $("[data-material-unavailable]") && !$("[data-group='material']").hidden);
     check("and writes no glass token even when a stored value exists", () => !root.hasAttribute("data-float-blur") && !root.style.getPropertyValue("--gp-material"));
@@ -252,7 +304,7 @@
     const desktop = params.get("desktop") ?? "grey";
     document.body.style.background = { white: "#fff", black: "#000", grey: "linear-gradient(135deg,#6b7a99,#c9b79c 55%,#8aa0a8)" }[desktop] ?? "#888";
     themeStore.setTheme(params.get("shot") === "light" ? "light" : "dark");
-    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true });
+    resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true, liquid_glass: true, high_refresh: true });
     mount(AppearanceHost, { target: document.getElementById("app") });
     await settle();
     document.getElementById("result").textContent = "";

@@ -6,6 +6,7 @@ import {
   desktopNotificationsSupported,
   fileManagerName,
   launchAtLoginMechanism,
+  liquidGlassRequirement,
   notificationPermissionHint,
   notificationUnavailableReason,
   osDisplayName,
@@ -302,5 +303,15 @@ describe("repository access guidance", () => {
     ["unknown", "does not verify access"],
   ] as const)("describes %s recovery without claiming access", (os, expected) => {
     expect(repositoryAccessGuidance(os)).toContain(expected);
+  });
+});
+
+describe("Liquid Glass requirement", () => {
+  it("names the macOS version on macOS and never claims it elsewhere", () => {
+    expect(liquidGlassRequirement("macos")).toContain("macOS 26");
+    for (const os of ["windows", "linux", "unknown"] as const) {
+      expect(liquidGlassRequirement(os)).not.toContain("macOS");
+      expect(liquidGlassRequirement(os)).toMatch(/^Not available on /);
+    }
   });
 });

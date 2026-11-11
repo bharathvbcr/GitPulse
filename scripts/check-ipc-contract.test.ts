@@ -328,8 +328,9 @@ describe("annotated but unregistered commands", () => {
     // which WKWebView cannot read);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
-    // agree.
-    expect(found.size).toBe(312);
+    // agree. 313 with cmd_native_rendering_apply (Liquid Glass and the 120 Hz
+    // switch).
+    expect(found.size).toBe(313);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

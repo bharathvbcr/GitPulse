@@ -98,6 +98,17 @@ export interface InterfacePrefs extends AppearancePrefs {
    * less motion cannot be overridden from in here.
    */
   reduceMotion: boolean;
+  /**
+   * Ask macOS 26+ for its Liquid Glass window material in place of the standard
+   * one. Off by default. `true` is a request, not a fact: the backend answers
+   * with what is in effect and why not (`desktop/nativeRendering.ts`).
+   */
+  nativeGlass: boolean;
+  /**
+   * Ask WebKit to render above 60 Hz on the main webview. Off by default; a
+   * request like `nativeGlass`, and a no-op on a 60 Hz display.
+   */
+  highRefresh: boolean;
   /** Whether commit times read as "3d ago" or as a `YYYY-MM-DD` date. */
   timestampStyle: TimestampStyle;
   /**
@@ -411,6 +422,8 @@ const DEFAULTS: InterfacePrefs = {
   ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
   reduceMotion: false,
+  nativeGlass: false,
+  highRefresh: false,
   timestampStyle: "relative",
   branchRowLayout: DEFAULT_BRANCH_ROW_LAYOUT,
   branchRowLayoutRev: BRANCH_ROW_LAYOUT_REV,
@@ -554,6 +567,10 @@ function readPrefs(): InterfacePrefs {
       }),
       accent: isAccentId(parsed.accent) ? parsed.accent : DEFAULTS.accent,
       reduceMotion: bool(parsed.reduceMotion, DEFAULTS.reduceMotion),
+      // Strictly `true`: a stored value this build cannot read must not turn a
+      // private-API switch on.
+      nativeGlass: parsed.nativeGlass === true,
+      highRefresh: parsed.highRefresh === true,
       timestampStyle: isTimestampStyle(parsed.timestampStyle)
         ? parsed.timestampStyle
         : DEFAULTS.timestampStyle,
@@ -765,8 +782,10 @@ function createInterfaceStore() {
     patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
     /** Puts every Appearance preference back without touching the rest. */
     resetAppearance: () =>
-      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT }),
+      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT, nativeGlass: false, highRefresh: false }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
+    setNativeGlass: (on: boolean) => patch({ nativeGlass: on }),
+    setHighRefresh: (on: boolean) => patch({ highRefresh: on }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),
     setBranchRowLayout: (layout: BranchRowLayout) => patch({ branchRowLayout: layout }),
     setDiffLayout: (layout: DiffLayout) => patch({ diffLayout: layout }),

@@ -215,6 +215,7 @@
     "allow-cmd-mcp-info",
     "allow-cmd-merge-branch",
     "allow-cmd-move-path",
+    "allow-cmd-native-rendering-apply",
     "allow-cmd-note-tab-activated",
     "allow-cmd-onboarding-clone-source",
     "allow-cmd-open-worktree-path",

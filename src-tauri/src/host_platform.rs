@@ -36,6 +36,15 @@ pub struct HostPlatform {
     /// window, so material intensity, float blur, the background field and
     /// the transparency preference would be dead knobs there.
     pub native_material: bool,
+    /// Whether this binary can apply macOS Liquid Glass to the window. See
+    /// [`crate::native_rendering::LIQUID_GLASS`]. Compile-time only, like the
+    /// rest of this struct: the macOS *version* is a runtime fact, reported by
+    /// the command that applies it (`cmd_native_rendering_apply`).
+    pub liquid_glass: bool,
+    /// Whether this binary can lift the webview's 60 Hz frame-rate cap. See
+    /// [`crate::native_rendering::HIGH_REFRESH`]. Whether WebKit still has the
+    /// switch is likewise answered when it is applied, with the reason.
+    pub high_refresh: bool,
 }
 
 impl HostPlatform {
@@ -45,6 +54,8 @@ impl HostPlatform {
             dock_hiding: crate::desktop::DOCK_HIDING,
             browser_sessions: crate::browser::SUPPORTED,
             native_material: crate::desktop::NATIVE_MATERIAL,
+            liquid_glass: crate::native_rendering::LIQUID_GLASS,
+            high_refresh: crate::native_rendering::HIGH_REFRESH,
         }
     }
 }
@@ -101,6 +112,15 @@ mod tests {
         );
     }
 
+    /// The two native-rendering switches are advertised exactly where their
+    /// macOS-only code is compiled.
+    #[test]
+    fn native_rendering_switches_track_the_macos_code_paths() {
+        let platform = HostPlatform::detect();
+        assert_eq!(platform.liquid_glass, cfg!(target_os = "macos"));
+        assert_eq!(platform.high_refresh, cfg!(target_os = "macos"));
+    }
+
     /// The wire shape the frontend parses. Renaming a field silently turns the
     /// gate it feeds into `undefined`, which is falsy — a feature would vanish
     /// on every platform rather than fail loudly.
@@ -121,6 +141,14 @@ mod tests {
             object.contains_key("native_material"),
             "missing native_material: {json}"
         );
-        assert_eq!(object.len(), 4, "unexpected extra fields: {json}");
+        assert!(
+            object.contains_key("liquid_glass"),
+            "missing liquid_glass: {json}"
+        );
+        assert!(
+            object.contains_key("high_refresh"),
+            "missing high_refresh: {json}"
+        );
+        assert_eq!(object.len(), 6, "unexpected extra fields: {json}");
     }
 }

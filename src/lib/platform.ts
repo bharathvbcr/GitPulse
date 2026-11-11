@@ -58,6 +58,8 @@ export interface HostPlatform {
   readonly dock_hiding: boolean;
   readonly browser_sessions: boolean;
   readonly native_material: boolean;
+  readonly liquid_glass: boolean;
+  readonly high_refresh: boolean;
 }
 
 /** The same facts with `os` narrowed to a host this app knows how to address. */
@@ -69,6 +71,10 @@ export interface HostProfile {
   readonly browser_sessions: boolean;
   /** Whether the window sits on a native translucent material the glass settings tune. */
   readonly native_material: boolean;
+  /** Whether this build can apply macOS Liquid Glass; the macOS version is answered when it is applied. */
+  readonly liquid_glass: boolean;
+  /** Whether this build can lift the webview's 60 Hz frame-rate cap; WebKit's answer comes when it is applied. */
+  readonly high_refresh: boolean;
 }
 
 export function isHostOS(value: unknown): value is HostOS {
@@ -105,7 +111,14 @@ export function hostOSFromUserAgent(
  * capability claimed and is refined once `cmd_host_platform` answers.
  */
 export function fallbackHostPlatform(): HostProfile {
-  return { os: hostOSFromUserAgent(), dock_hiding: false, browser_sessions: false, native_material: false };
+  return {
+    os: hostOSFromUserAgent(),
+    dock_hiding: false,
+    browser_sessions: false,
+    native_material: false,
+    liquid_glass: false,
+    high_refresh: false,
+  };
 }
 
 /** Parses the `cmd_host_platform` envelope, falling back on anything unexpected. */
@@ -121,5 +134,7 @@ export function parseHostPlatform(value: unknown): HostProfile {
     dock_hiding: raw.dock_hiding === true,
     browser_sessions: raw.browser_sessions === true,
     native_material: raw.native_material === true,
+    liquid_glass: raw.liquid_glass === true,
+    high_refresh: raw.high_refresh === true,
   };
 }

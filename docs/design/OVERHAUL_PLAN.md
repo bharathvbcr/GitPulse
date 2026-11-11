@@ -113,7 +113,7 @@ Sub-panels inside each section were not enumerated. A lane that touches a sectio
   - No ancestor of a float may create a backdrop root.
   - Springs are baked into `linear()` easing curves. WebKit has supported `linear()`, `@starting-style` and `allow-discrete` since Safari 17.4–17.5.
 - **Native glass is free.** The window's desktop blur is `NSVisualEffectView`, which the window server composites at no per-frame cost to the app.
-  - macOS 26+ adds `NSGlassEffectView`, exposed by `tauri-apps/window-vibrancy` `apply_liquid_glass`, which is private API.
+  - macOS 26+ adds `NSGlassEffectView`, exposed by `tauri-apps/window-vibrancy` `apply_liquid_glass`. It is public AppKit API (in the macOS 26 SDK headers), not private; the app already builds with Tauri's `macos-private-api` for the transparent window. Built in Wave 4 lane G; see docs/MACOS_APPEARANCE.md.
   - This becomes an off-by-default flag, decided only after a frame-time measurement (Wave 4).
 - **Frame rate (measured by Wave 0 lane M, `harness/frame-rate.html`, 2026-11-09).** The "uncapped on macOS 26+" claim does not hold here.
   - **Capped at 60 Hz [verified].** On macOS 27.2 with a 120 Hz built-in display, WKWebView delivers a 60.0 Hz mean `requestAnimationFrame` cadence. That holds in the harness runner and in a visible, opaque, frontmost window.
@@ -134,7 +134,7 @@ These four change what gets built. Each has a recommendation.
    - Ship now with the veil forced to ≥ 0.7.
    - Or defer until contrast over arbitrary images is measured.
    - *Recommended:* defer. The recolorable hue field (hue + intensity, off / subtle / vivid) delivers the same feel at zero contrast risk.
-3. **Native Liquid Glass (macOS 26+, private API):**
+3. **Native Liquid Glass (macOS 26+, public AppKit `NSGlassEffectView`):**
    - Build it behind a flag.
    - Or stay on `underWindowBackground` only.
    - *Recommended:* build the flag, ship it off, and decide after the Wave 4 measurement.

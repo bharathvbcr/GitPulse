@@ -11,7 +11,7 @@ import type { HostOS } from "../platform";
  * documented keys that do not exist there.
  */
 function bodyFor(os: HostOS): string {
-  resetHostPlatformForTests({ os, dock_hiding: os === "macos", browser_sessions: os === "macos", native_material: os === "macos" });
+  resetHostPlatformForTests({ os, dock_hiding: os === "macos", browser_sessions: os === "macos", native_material: os === "macos", liquid_glass: os === "macos", high_refresh: os === "macos" });
   return render(ShortcutsModal, { props: { isOpen: true } }).body;
 }
 

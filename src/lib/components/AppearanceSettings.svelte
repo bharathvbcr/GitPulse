@@ -3,6 +3,7 @@
   import { themeStore, type ThemePreference } from "../stores/themeStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hostPlatform } from "../stores/platformStore";
+  import { nativeRenderingBoot, nativeRenderingStatus, type FlagStatus } from "../desktop/nativeRendering";
   import { ACCENTS, accentSwatch } from "../ui/accents";
   import { parseHex } from "../ui/color/oklch";
   import {
@@ -15,7 +16,7 @@
   } from "../ui/appearance/apply";
   import type { Density } from "../ui/appearance/density";
   import { isFamilyInstalled, normalizeFamily } from "../ui/appearance/fonts";
-  import { shortcutTextLabel } from "../ui/platformCopy";
+  import { liquidGlassRequirement, shortcutTextLabel } from "../ui/platformCopy";
   import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
   import type { BranchRowLayout } from "../sidebar/metrics";
   import SettingToggle from "./SettingToggle.svelte";
@@ -124,6 +125,29 @@
   const theme = $derived($themeStore);
   const nativeMaterial = $derived($hostPlatform.native_material);
 
+  // The two native switches. What the reader asked for is `prefs`; what is in
+  // effect is the backend's last answer, and an answer to an older request does
+  // not count (it would draw "in effect" for a switch just flipped).
+  const glassAnswer = $derived(
+    $nativeRenderingStatus && $nativeRenderingStatus.liquid_glass.requested === prefs.nativeGlass
+      ? $nativeRenderingStatus.liquid_glass
+      : null,
+  );
+  // WebKit fixes the page's frame rate when the page starts, so a 120 Hz change
+  // made after launch is saved but waits for the next launch.
+  const refreshRestart = $derived(
+    $nativeRenderingBoot !== null && $nativeRenderingBoot.highRefresh !== prefs.highRefresh
+      ? prefs.highRefresh
+        ? "Saved. Takes effect the next time GitPulse starts."
+        : "Saved. The interface returns to 60 Hz the next time GitPulse starts."
+      : null,
+  );
+  const refreshAnswer = $derived(
+    $nativeRenderingStatus && $nativeRenderingStatus.high_refresh.requested === prefs.highRefresh
+      ? $nativeRenderingStatus.high_refresh
+      : null,
+  );
+
   // --- accent -----------------------------------------------------------------
   const accent = $derived(resolveAccent(prefs, theme));
   // An imported theme brings its own accent; with the default preset still
@@ -203,6 +227,27 @@
   const intensity = $derived(Math.max(prefs.materialIntensity[theme], floor));
   const transparencyChoice = $derived(prefs.reduceTransparency ? "reduced" : "auto");
 </script>
+
+<!--
+  What a native switch is doing. Three states and no fourth: asked and not yet
+  answered, answered and in effect, answered and refused with a reason. A
+  refusal is never drawn as in effect, and is also recorded in Diagnostics.
+-->
+{#snippet outcome(asked: boolean, answer: FlagStatus | null, setting: string, restartNote: string | null)}
+  {#if asked && answer !== null && !answer.active}
+    <div class="gp-notice" data-tone="warn" role="status" data-native-outcome="refused" data-native-for={setting}>
+      <div class="min-w-0 flex-1">Not in effect. {answer.reason ?? "The window gave no reason."} Diagnostics has the same note.</div>
+    </div>
+  {:else if restartNote !== null}
+    <p class="text-micro text-textMuted" data-native-outcome="restart" data-native-for={setting}>{restartNote}</p>
+  {:else if asked}
+    {#if answer === null}
+      <p class="text-micro text-textMuted" data-native-outcome="pending" data-native-for={setting}>Applying…</p>
+    {:else}
+      <p class="text-micro text-ok" data-native-outcome="active" data-native-for={setting}>In effect.</p>
+    {/if}
+  {/if}
+{/snippet}
 
 {#snippet fontRow(kind: FontKind, label: string, placeholder: string, ok: boolean | null, chosen: string)}
         <label class="flex items-center gap-2 text-meta">
@@ -438,7 +483,7 @@
   <section
     class="flex flex-col gap-3"
     hidden={nativeMaterial
-      ? !any(["material-intensity", "float-blur", "background-field", "transparency"])
+      ? !any(["material-intensity", "float-blur", "background-field", "transparency", "native-glass"])
       : filtering}
     data-group="material"
   >
@@ -525,10 +570,21 @@
         the system already asks for less transparency, GitPulse honors that.
       </p>
     </div>
+
+    <div data-setting="native-glass" hidden={!shown("native-glass")} class="flex flex-col gap-1.5">
+      <SettingToggle
+        label="Liquid Glass window"
+        description="Draws the window on Apple's Liquid Glass material instead of the standard one. {liquidGlassRequirement($hostPlatform.os)} It stays off unless you turn it on."
+        ariaLabel="Use the Liquid Glass window material"
+        checked={prefs.nativeGlass}
+        onchange={(next) => interfaceStore.setNativeGlass(next)}
+      />
+      {@render outcome(prefs.nativeGlass, glassAnswer, "native-glass", null)}
+    </div>
   </section>
 
   <!-- Motion -->
-  <section class="flex flex-col gap-3" hidden={!any(["motion"])} data-group="motion">
+  <section class="flex flex-col gap-3" hidden={!any(["motion", "high-refresh"])} data-group="motion">
     <h3 class="gp-label">Motion</h3>
     <div data-setting="motion" hidden={!shown("motion")}>
       <SettingToggle
@@ -542,6 +598,16 @@
         Leaving this off follows the system setting. It can only add reduction: if the operating system already asks
         for less motion, GitPulse honors that whatever this says.
       </p>
+    </div>
+    <div data-setting="high-refresh" hidden={!shown("high-refresh")} class="flex flex-col gap-1.5">
+      <SettingToggle
+        label="120 Hz rendering"
+        description="Lets the interface draw more than 60 frames a second on a display that supports it. Uses a private WebKit switch that a system update can remove, and it stays off unless you turn it on. A change takes effect the next time GitPulse starts."
+        ariaLabel="Render the interface above 60 Hz"
+        checked={prefs.highRefresh}
+        onchange={(next) => interfaceStore.setHighRefresh(next)}
+      />
+      {@render outcome(prefs.highRefresh, refreshAnswer, "high-refresh", refreshRestart)}
     </div>
   </section>
 

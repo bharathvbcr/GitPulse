@@ -165,6 +165,18 @@ export function launchAtLoginMechanism(os: HostOS): string {
   }
 }
 
+/**
+ * What the Liquid Glass window switch needs and what it does when that is not
+ * there. The row is shown only where the build has the code (macOS); the
+ * version requirement is a runtime fact, so this says it rather than hiding the
+ * row, and the answer to a refused request names the same version.
+ */
+export function liquidGlassRequirement(os: HostOS): string {
+  return os === "macos"
+    ? "Needs macOS 26 or later; on an older version the window keeps its standard material."
+    : `Not available on ${osDisplayName(os)}; the window keeps its standard material.`;
+}
+
 /** The OS as a reader would name it. */
 export function osDisplayName(os: HostOS): string {
   switch (os) {
