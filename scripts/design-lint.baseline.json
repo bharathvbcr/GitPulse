@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "b35a8a8a509ec608fa6711d89dbef686bce2dcd8",
+  "commit": "aa588aea659943eb5837cb50364890d6f74bab39",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
@@ -20,11 +20,10 @@
     },
     "4": {
       "name": "color-literals",
-      "total": 82,
+      "total": 17,
       "files": {
         "src/lib/components/Logo.svelte": 8,
-        "src/lib/components/files/MarkDevLogo.svelte": 9,
-        "src/lib/desktop/StatusPopover.svelte": 65
+        "src/lib/components/files/MarkDevLogo.svelte": 9
       }
     },
     "5": {
@@ -59,17 +58,13 @@
     },
     "11": {
       "name": "backdrop-blur",
-      "total": 2,
-      "files": {
-        "src/lib/desktop/StatusPopover.svelte": 2
-      }
+      "total": 0,
+      "files": {}
     },
     "12": {
       "name": "widget-dialects",
-      "total": 29,
-      "files": {
-        "src/lib/desktop/StatusPopover.svelte": 29
-      }
+      "total": 0,
+      "files": {}
     },
     "13": {
       "name": "ascii-ellipsis",
