@@ -442,9 +442,9 @@
         <p class="text-meta text-danger">{remotesError}</p>
       {:else if remotes.length === 0}
         {#if remotesLoaded}
-          <EmptyState icon={Cloud} title="No remotes" hint="Add a remote to fetch from and push to." compact />
+          <EmptyState icon={Cloud} title="Nothing to fetch from or push to" hint="Add a remote to sync this repository." compact />
         {:else}
-          <Skeleton variant="rect" height="3rem" />
+          <Skeleton variant="rect" height="8rem" />
         {/if}
       {:else}
         <ul class="space-y-2">
@@ -685,9 +685,9 @@
         <p class="text-meta text-danger">{submodulesError}</p>
       {:else if submodules.length === 0}
         {#if submodulesLoaded}
-          <EmptyState icon={Package} title="No submodules" hint="Nothing is embedded in this repository." compact />
+          <p class="text-meta text-textMuted">Nothing is embedded in this repository.</p>
         {:else}
-          <Skeleton variant="rect" height="3rem" />
+          <Skeleton variant="text" width="40%" height="0.875rem" />
         {/if}
       {:else}
         <ul class="space-y-2">
