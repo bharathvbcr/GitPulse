@@ -133,6 +133,52 @@ describe("CommitComposer", () => {
     expect((footer.match(/whitespace-nowrap/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
+  it("merges Ask agent into one full-width commit split button", () => {
+    // The composer used to draw a separate "Ask agent" pill beside Commit,
+    // which wrapped the footer onto a second row at sidebar width. One split
+    // control now holds Commit and an icon-only sparkle that opens the same
+    // dialog; the words are the sparkle's accessible name, not a second label.
+    const { body } = render(CommitComposer);
+    expect(body).not.toMatch(/>\s*Ask agent\s*</);
+
+    const splitAt = body.indexOf("data-commit-split");
+    const menuAt = body.indexOf("data-agent-commit-menu");
+    const sparkAt = body.indexOf('aria-label="Ask agent"');
+    expect(splitAt).toBeGreaterThan(-1);
+    expect(menuAt).toBeGreaterThan(splitAt);
+    expect(sparkAt).toBeGreaterThan(menuAt);
+
+    // As wide as the message box, not a shrink-wrapped inline group.
+    const groupTag = body.slice(body.lastIndexOf("<div", splitAt), body.indexOf(">", splitAt) + 1);
+    expect(groupTag).toContain("w-full");
+    expect(groupTag).toContain('role="group"');
+    expect(groupTag).not.toContain("inline-flex");
+    expect(body.match(/<textarea\b[^>]*>/)?.[0] ?? "").toContain("w-full");
+
+    const split = body.slice(splitAt, sparkAt);
+    expect(split).toContain("data-commit-split-divider");
+    const commitButton = split.match(/<button\b[^>]*>[\s\S]*?Commit \(0\)[\s\S]*?<\/button>/)?.[0] ?? "";
+    expect(commitButton).toContain("flex-1");
+    expect(commitButton).toContain("justify-center");
+    expect(commitButton).not.toContain("shrink-0");
+    expect(commitButton).toContain("disabled");
+    // A clean tree says why Commit is off, in the agent menu's own words.
+    expect(commitButton).toContain("No uncommitted changes to commit.");
+
+    const sparkleButton = body.slice(
+      body.lastIndexOf("<button", sparkAt),
+      body.indexOf("</button>", sparkAt) + "</button>".length,
+    );
+    expect(sparkleButton).toContain('aria-haspopup="dialog"');
+    expect(sparkleButton).toContain("disabled");
+    expect(sparkleButton).toContain("<svg");
+
+    const footer = source.slice(source.indexOf("<!-- The two toggles"));
+    expect(footer).toContain("void handleCommit()");
+    expect(footer).toMatch(/<AgentCommitMenu segment\b/);
+    expect(footer).not.toContain("compact={true}");
+  });
+
   it("writes a commit message without waiting for a loopback model", () => {
     // The patch is classified in the app. A missing model server is not a
     // reason to leave the composer blank, and Apple Intelligence is only the

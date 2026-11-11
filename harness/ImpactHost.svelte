@@ -120,12 +120,10 @@
         {/each}
       </ul>
 
-      <!-- CommitComposer's footer row, same classes. "Include unstaged" used
+      <!-- CommitComposer's footer, same classes: the toggles' row, then the
+           full-width Commit | Ask agent split pill. "Include unstaged" used
            to break across two lines inside its own label at sidebar width. -->
-      <div
-        data-impact-commit-footer
-        class="mt-2 flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5"
-      >
+      <div data-impact-commit-footer class="mt-2 flex flex-col gap-1.5">
         <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
           <label
             data-impact-toggle
@@ -142,7 +140,20 @@
             <span>Include unstaged</span>
           </label>
         </div>
-        <button class="gp-btn-primary shrink-0 whitespace-nowrap">Commit (2)</button>
+        <div class="flex w-full min-w-0 items-stretch overflow-hidden rounded-full">
+          <button
+            type="button"
+            class="gp-btn min-w-0 flex-1 justify-center rounded-none shadow-none whitespace-nowrap"
+            data-variant="primary">Commit (2)</button
+          >
+          <span class="w-px shrink-0 self-stretch bg-white/40" aria-hidden="true"></span>
+          <button
+            type="button"
+            class="gp-btn rounded-none px-2.5 shadow-none"
+            data-variant="primary"
+            aria-label="Ask agent">✦</button
+          >
+        </div>
       </div>
     </div>
   </div>

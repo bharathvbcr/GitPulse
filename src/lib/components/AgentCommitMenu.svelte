@@ -42,10 +42,16 @@
   let {
     compact = false,
     iconOnly = false,
+    segment = false,
     align = "left",
     direction = "down",
   }: {
     compact?: boolean;
+    /**
+     * Icon-only trailing segment of a split button. The parent draws the pill
+     * and the divider; this trigger only opens the dialog.
+     */
+    segment?: boolean;
     /**
      * Icon only, for the 44 px rail: the label moves to `aria-label` and the
      * tooltip, so nothing can spill past the column. Applies to `compact`.
@@ -333,8 +339,27 @@
   }
 </script>
 
-<div class="relative inline-flex items-center" data-agent-commit-menu={uid}>
-  {#if compact}
+<div
+  class="relative inline-flex {segment ? 'items-stretch self-stretch' : 'items-center'}"
+  data-agent-commit-menu={uid}
+>
+  {#if segment}
+    <button
+      bind:this={triggerEl}
+      type="button"
+      onclick={toggle}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      aria-controls={open ? panelId : undefined}
+      aria-label="Ask agent"
+      disabled={Boolean(disabledReason)}
+      title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
+      class="gp-btn h-full rounded-none px-2.5 shadow-none"
+      data-variant="primary"
+    >
+      <Sparkles size={12} class="shrink-0" />
+    </button>
+  {:else if compact}
     <button
       bind:this={triggerEl}
       type="button"

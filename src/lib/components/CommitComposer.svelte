@@ -10,6 +10,7 @@
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "@lucide/svelte";
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
+  import { AGENT_COMMIT_CLEAN } from "../commit/agentCommit";
   import Checkbox from "./Checkbox.svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
@@ -74,10 +75,18 @@
 
   let quickCommit = $derived(includeUnstaged && !isAmending);
   let commitCount = $derived(quickCommit ? dirtyCount : stagedFiles.length);
+  let nothingToCommit = $derived(
+    quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending,
+  );
   let commitDisabled = $derived(
-    !commitMessage.trim() ||
-      conflictedCount > 0 ||
-      (quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending),
+    !commitMessage.trim() || conflictedCount > 0 || nothingToCommit,
+  );
+  let commitTitle = $derived(
+    nothingToCommit
+      ? AGENT_COMMIT_CLEAN
+      : quickCommit
+        ? `Stage all changes and commit (${shortcutTextLabel("⌘⇧↵", $hostPlatform.os)})`
+        : `Commit staged files (${shortcutTextLabel("⌘↵", $hostPlatform.os)})`,
   );
 
   // A1: one preview batch for staged paths — DiffFileRail reads the same store.
@@ -482,11 +491,11 @@
     </div>
   {/if}
 
-  <!-- The two toggles keep their own text on one line and the ROW wraps when
-       the sidebar is too narrow for all three controls. Without this, "Include
-       unstaged" broke across two lines inside its own label and dragged the
-       commit button's row height with it. -->
-  <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+  <!-- The two toggles keep their own text on one line and their row wraps
+       when the sidebar is too narrow. Commit and Ask agent are one split pill
+       as wide as the message box: Commit takes the width, the sparkle stays a
+       fixed icon segment that opens the same agent dialog. -->
+  <div class="flex flex-col gap-1.5">
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
       <span class="shrink-0 whitespace-nowrap">
         <Checkbox
@@ -508,21 +517,35 @@
         />
       </span>
     </div>
-    <div class="flex items-center gap-1.5 shrink-0">
-      <AgentCommitMenu compact={true} align="right" direction="up" />
+    <div
+      role="group"
+      aria-label="Commit"
+      data-commit-split
+      class="flex w-full min-w-0 items-stretch overflow-hidden rounded-full {commitDisabled
+        ? ''
+        : 'shadow-[var(--shadow-glow)]'}"
+    >
       <button
         type="button"
         onclick={() => void handleCommit()}
         disabled={commitDisabled}
-        title={quickCommit
-          ? `Stage all changes and commit (${shortcutTextLabel("⌘⇧↵", $hostPlatform.os)})`
-          : `Commit staged files (${shortcutTextLabel("⌘↵", $hostPlatform.os)})`}
-        class="gp-btn shrink-0 whitespace-nowrap"
+        title={commitTitle}
+        class="gp-btn min-w-0 flex-1 justify-center rounded-none shadow-none whitespace-nowrap"
         data-variant="primary"
       >
         <Send size={12} />
         <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
       </button>
+      <!-- Dims with Commit: a full-strength rule across a disabled pill read
+           as a live seam. -->
+      <span
+        data-commit-split-divider
+        class="w-px shrink-0 self-stretch bg-white/40 {commitDisabled ? 'opacity-40' : ''}"
+        aria-hidden="true"
+      ></span>
+      <div class="flex shrink-0 self-stretch">
+        <AgentCommitMenu segment align="right" direction="up" />
+      </div>
     </div>
   </div>
 </div>
