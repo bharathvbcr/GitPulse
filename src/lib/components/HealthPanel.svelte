@@ -1335,10 +1335,10 @@
     {#if loading && !report}
       <div class="space-y-4 {HEALTH_CONTENT_WIDTH}">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <Skeleton variant="card" count={3} />
+          <Skeleton variant="card" count={3} hold={false} />
         </div>
         <div class="space-y-2 pt-2">
-          <Skeleton variant="text" count={4} height="2rem" />
+          <Skeleton variant="text" count={4} height="2rem" hold={false} />
         </div>
       </div>
       {@render secretsSection()}
@@ -1410,7 +1410,7 @@
             {#if fixing && !plan}
               <div class="space-y-2 py-2">
                 <p class="text-textMuted">Sending the health report to the local model…</p>
-                <Skeleton variant="text" count={3} height="1.25rem" />
+                <Skeleton variant="text" count={3} height="1.25rem" hold={false} />
               </div>
             {:else if plan}
               <p class="text-meta text-textMuted font-mono truncate">

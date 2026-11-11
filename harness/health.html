@@ -264,6 +264,10 @@
         };
         try {
           await until(() => !!section("summary"));
+          // The loading skeleton leaves through an outro (Skeleton.svelte), which
+          // the runtime finishes on a later animation frame, not synchronously.
+          // Geometry is judged once it has left, as it is in a painted window.
+          await until(() => !root.querySelector("[data-skeleton-shown]"));
 
           // ---- Information architecture -------------------------------------
           // The complaint this panel was rewritten for: the verdict was nowhere
@@ -600,6 +604,10 @@
           // be shown another repository's findings.
           await repoStore.openRepo("/fixture/Fresh");
           await until(() => !!failureAlert() && has(failureAlert(), "Couldn't scan this repository"));
+          // The previous repository's report leaves through the panel outro, which
+          // ends on a later frame. The deadline in `until` still fails a report
+          // that never leaves; only the frame it takes to go is waited out.
+          await until(() => !section("summary"));
           check("a failed first scan shows no report and does not claim a previous one", () =>
             !section("summary") && !has(failureAlert(), "previous scan"));
           await repoStore.openRepo("/fixture/GitPulse");
