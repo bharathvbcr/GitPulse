@@ -40,7 +40,10 @@
       const opened = [];
       /** Every browser session command, for the localhost-link check. */
       const browserCalls = [];
-      const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [] };
+      // `skipped` names every check an engine does not run, so a count that
+      // differs between Chromium and WebKit is explained in the verdict's
+      // diagnostics rather than by a silently missing row.
+      const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [], skipped: [] };
       /** Every `cmd_terminal_resize`: which session was told which grid, in order. */
       const resizeLog = [];
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
@@ -639,6 +642,8 @@
             // is what holds in both.
             if (!/AppleWebKit/.test(navigator.userAgent) || /Chrome\//.test(navigator.userAgent)) {
               check("the page's oldest context survived (Chromium counts only live contexts)", () => !sentinel.isContextLost());
+            } else {
+              report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
             check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => el.querySelector("canvas")).length === 1);
             gpuPolicy.hideGraceMs = 400;
@@ -1935,7 +1940,7 @@
         const sync = fit.length && fit.every((row) => row.pass) ? await runSync() : { results: [], numbers: {} };
         const bypass = sync.results.length && sync.results.every((row) => row.pass) ? await runBypass() : [];
         const results = [...checks, ...stress, ...fit, ...sync.results, ...bypass];
-        const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}`;
+        const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}; skipped in this engine ${JSON.stringify(report.skipped)}`;
         document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors, diagnostics }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }
