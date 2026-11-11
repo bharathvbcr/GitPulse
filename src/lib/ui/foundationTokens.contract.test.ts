@@ -131,8 +131,8 @@ describe("shape, space, density and edge tokens", () => {
     expect(themeBlock.get("--color-edgeStrong")).toBe("var(--gp-edge-strong)");
   });
 
-  it("defines the six-step type scale: micro and meta are new, sm and base move from 14 and 16 to 13 and 15, xs stays Tailwind's", () => {
-    const themeBlock = declarations(blockOf("@theme {"));
+  it("defines the six-step type scale: micro and meta are new, sm and base move from 14 and 16 to 13 and 15, xs stays 12px, all static so var(--text-*) always resolves", () => {
+    const themeBlock = declarations(blockOf("@theme static"));
     expect(themeBlock.get("--text-micro")).toBe("0.625rem");
     expect(themeBlock.get("--text-meta")).toBe("0.6875rem");
     expect(themeBlock.get("--text-micro--line-height")).toBe("1.3");
@@ -143,7 +143,8 @@ describe("shape, space, density and edge tokens", () => {
     expect(themeBlock.get("--text-base--line-height")).toBe("1.3");
     expect(themeBlock.get("--text-lg")).toBe("1.125rem");
     expect(themeBlock.get("--text-lg--line-height")).toBe("1.25");
-    expect(themeBlock.has("--text-xs"), "text-xs is the body size and stays Tailwind's 12px").toBe(false);
+    expect(themeBlock.get("--text-xs")).toBe("0.75rem");
+    expect(themeBlock.get("--text-xs--line-height")).toBe("calc(1 / 0.75)");
   });
 });
 

@@ -42,7 +42,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 
 | # | Never | Instead |
 |---|---|---|
-| 1 | `text-[9px]`, `text-[10px]`, `text-[11px]`, any `text-[Npx]` | `text-micro` (10), `text-meta` (11), `text-xs` (12, body), `text-sm` (13), `text-base` (15), `text-lg` (18) |
+| 1 | `text-[9px]`, `text-[10px]`, `text-[11px]`, any `text-[Npx]` | `text-micro` (10), `text-meta` (11), `text-xs` (12, body), `text-sm` (13), `text-base` (15), `text-lg` (18), `text-display` (24, metric numerals only) |
 | 2 | `font-bold`, `font-weight: 650`, `uppercase` + `tracking-*` labels | `font-normal`/`font-medium`/`font-semibold` only. Section labels use `gp-label` (sentence case, `text-meta font-medium`, muted) |
 | 3 | Tailwind palette colors (`text-amber-400`, `bg-rose-500/20`, `border-emerald-…`, `zinc`, `slate`…) and new `dark:` color pairs | Role tokens: `text-ok`/`warn`/`danger`/`info`/`unknown`, `bg-warn/15`, `text-accent`, `text-textMuted`, `text-faint` |
 | 4 | `#hex` or `rgb(12 34 56)` literals in `.svelte` | A `--c-*` token. The only exceptions are the xterm and canvas adapters, which convert tokens at their boundary |

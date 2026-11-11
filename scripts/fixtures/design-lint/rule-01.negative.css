@@ -2,12 +2,16 @@
 @theme {
   --text-micro: 10px;
   --text-meta: 11px;
+  --text-sm: 0.8125rem;
 }
 :root {
   --gp-font-ui: 13px;
 }
 .gp-note {
   font-size: var(--text-meta);
+}
+.gp-inherit {
+  font-size: inherit;
 }
 .gp-chip {
   @apply text-micro font-medium;

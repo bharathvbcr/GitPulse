@@ -1165,7 +1165,7 @@
         <Logo size={68} variant="badge" animated />
 
         <div>
-          <h1 class="text-xl font-semibold text-textPrimary">Welcome to GitPulse</h1>
+          <h1 class="text-lg font-semibold text-textPrimary">Welcome to GitPulse</h1>
           <p class="text-xs text-textMuted mt-1">High-performance, native Git client built with Rust & Svelte</p>
         </div>
 

@@ -137,6 +137,7 @@ Scale (6 steps, rem so `uiFontScale`/webview zoom carries it). Naming constraint
 | `text-sm` | 0.8125 | 13 | 1.45 | panel headers, emphasised rows | redefined 14→13 (42 sites) |
 | `text-base` | 0.9375 | 15 | 1.3 | surface titles (today's `gp-surface-title` 15px [verified app.css:290]) | redefined 16→15 (15 sites) |
 | `text-lg` | 1.125 | 18 | 1.25 | dialog titles, splash, empty-state title | redefined 18→18 (0 sites); `text-xl`/`text-2xl` (12 sites) codemod to this and are then banned |
+| `text-display` | 1.5 | 24 | 1.1 | metric numerals only: a count on a card, a stat. Not for headings or prose | new; `--text-display` for a component `<style>`, `text-display` in markup |
 
 The `@theme` override of `--text-sm/base/lg` and the codemod land in **the same step** (§13 step 4), never in the tokens-first step, because redefining a utility already in use is a component change. `text-[9px]`/`[10px]`/`[11px]` become lint failures with the one-to-one codemod (9→micro, 10→micro, 11→meta). Weights: **3** — `font-normal` 400, `font-medium` 500, `font-semibold` 600; `font-bold` and `font-weight: 650` literals are retired (650 → 600). Label style: **sentence case, `text-xs font-medium text-textMuted`, no uppercase, no tracking**; the 184 uppercase+tracking lines become plain section labels (a `gp-label` utility owns the style so it can be changed once). Monospace: only for code, paths, hashes, refs, keycaps and the terminal; never for numbers in prose. Line heights are fixed per step above; `leading-*` utilities are not used on text (lint).
 

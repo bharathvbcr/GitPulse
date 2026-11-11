@@ -35,7 +35,7 @@ function hits(rule: number, name: string, as?: string): Violation[] {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** rule -> [positive count, svelte negative file exists] */
-const SVELTE_RULES: Record<number, number> = { 1: 4, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10, 16: 3 };
+const SVELTE_RULES: Record<number, number> = { 1: 6, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10, 16: 3 };
 
 describe("design-lint rules: one positive and one negative fixture each", () => {
   for (const [rule, expected] of Object.entries(SVELTE_RULES)) {
@@ -130,13 +130,13 @@ describe("design-lint rules: one positive and one negative fixture each", () => 
 describe("design-lint widened scopes: <style> blocks, stylesheets and .ts strings", () => {
   const messages = (rule: number, name: string, as?: string) => hits(rule, name, as).map((v) => v.message.split(": ")[0]);
 
-  it("rule 1 reads font-size: Npx and @apply text-[Npx] in a <style> block, and not a token, rem or a comment", () => {
-    expect(messages(1, "rule-01-style.positive.svelte")).toEqual(["font-size", "font-size", "text-[10px]"]);
+  it("rule 1 reads a literal font-size (px, rem, em, %, keyword) and @apply text-[Npx] in a <style> block, and not a token, inherit, calc() or a comment", () => {
+    expect(messages(1, "rule-01-style.positive.svelte")).toEqual(["font-size", "font-size", "font-size", "font-size", "font-size", "font-size", "text-[10px]"]);
     expect(hits(1, "rule-01-style.negative.svelte")).toEqual([]);
   });
 
   it("rule 1 reads a stylesheet, and exempts the token definitions in @theme and :root", () => {
-    expect(messages(1, "rule-01.positive.css")).toEqual(["font-size", "text-[10px]", "font-size"]);
+    expect(messages(1, "rule-01.positive.css")).toEqual(["font-size", "text-[10px]", "font-size", "font-size", "font-size", "font-size"]);
     expect(hits(1, "rule-01.negative.css")).toEqual([]);
   });
 

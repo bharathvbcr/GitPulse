@@ -54,21 +54,6 @@
   --color-edge: var(--gp-edge);
   --color-edgeStrong: var(--gp-edge-strong);
 
-  /* The type scale (design language §6): 10 / 11 / 12 / 13 / 15 / 18. `text-xs`
-     (12px) stays Tailwind's: it is already the body size. `text-sm` and
-     `text-base` are redefined from Tailwind's 14 and 16 to 13 and 15, with the
-     line height that goes with each step, so a utility never carries its own. */
-  --text-micro: 0.625rem;
-  --text-micro--line-height: 1.3;
-  --text-meta: 0.6875rem;
-  --text-meta--line-height: 1.4;
-  --text-sm: 0.8125rem;
-  --text-sm--line-height: 1.45;
-  --text-base: 0.9375rem;
-  --text-base--line-height: 1.3;
-  --text-lg: 1.125rem;
-  --text-lg--line-height: 1.25;
-
   /* Type (§6, §11). `--gp-font-ui` / `--gp-font-mono` are inline inputs written
      by Settings -> Appearance (local family names, already followed by the
      fallback stack). Unset, these are Tailwind's own default stacks, so a fresh
@@ -80,6 +65,29 @@
 /* Static: these are plain vocabulary, not utilities, so Tailwind must emit them
    whether or not a class in the sources names them. */
 @theme static {
+  /* The type scale (design language §6): 10 / 11 / 12 / 13 / 15 / 18, each with its
+     line height, so a utility never carries its own. Static, because a component
+     `<style>` reads them as a `var()` of the step and Tailwind would otherwise emit
+     only the steps a utility class happens to use (`text-lg` has no users).
+     `xs` keeps Tailwind's 12px and its 1.333 line height, the body size every
+     `text-xs` surface is laid out against; `sm` and `base` move from 14 and 16 to
+     13 and 15. */
+  --text-micro: 0.625rem;
+  --text-micro--line-height: 1.3;
+  --text-meta: 0.6875rem;
+  --text-meta--line-height: 1.4;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: calc(1 / 0.75);
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.45;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.3;
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.25;
+  /* Metric numerals only (a count on a card, a stat): the one step above `lg`. */
+  --text-display: 1.5rem;
+  --text-display--line-height: 1.1;
+
   /* Shape (§5). 4px grid; `full` is the pill. `pane` aliases the macOS pane
      radius that already exists, so a Windows or Linux build gets the same 14. */
   --gp-r-xs: 4px;
@@ -1211,7 +1219,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     color: rgb(var(--c-text));
     /* 0.75rem is the previous 12px at the default root size, now derived from
        the root so it scales with everything else instead of separately. */
-    font-size: 0.75rem;
+    font-size: var(--text-xs);
   }
 
   /* `hidden` has to actually hide.
@@ -2320,23 +2328,23 @@ html.light .gp-markdown {
   scroll-margin-top: 12px;
 }
 .gp-markdown h1 {
-  font-size: 1.75em;
+  font-size: var(--text-display);
   padding-bottom: 0.3em;
   border-bottom: 1px solid rgb(var(--c-border) / 0.65);
 }
 .gp-markdown h2 {
-  font-size: 1.4em;
+  font-size: var(--text-lg);
   padding-bottom: 0.25em;
   border-bottom: 1px solid rgb(var(--c-border) / 0.35);
 }
 .gp-markdown h3 {
-  font-size: 1.18em;
+  font-size: var(--text-base);
 }
 .gp-markdown h4 {
-  font-size: 1em;
+  font-size: inherit;
 }
 .gp-markdown :is(h5, h6) {
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .anchor {
@@ -2425,7 +2433,7 @@ html.light .gp-markdown {
 }
 .gp-markdown :is(code, pre, kbd, samp) {
   font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
-  font-size: 0.88em;
+  font-size: var(--text-meta);
 }
 .gp-markdown :not(pre) > code {
   padding: 0.12em 0.38em;
@@ -2516,7 +2524,7 @@ html.light .gp-markdown {
   border: 1px dashed rgb(var(--c-border));
   border-radius: 5px;
   color: rgb(var(--c-text-muted));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   cursor: pointer;
 }
 .gp-markdown .gp-md-withheld-picture {
@@ -2534,18 +2542,18 @@ html.light .gp-markdown {
   border: 1px dashed rgb(var(--c-border));
   border-radius: 5px;
   color: rgb(var(--c-text-muted));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
 }
 .gp-markdown .tag {
   padding: 0.05em 0.45em;
   border-radius: 999px;
   background: rgb(var(--c-accent) / 0.14);
   color: rgb(var(--c-accent));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
 }
 .gp-markdown .math-source {
   font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .math-display {
@@ -2556,14 +2564,14 @@ html.light .gp-markdown {
   white-space: pre;
 }
 .gp-markdown sup {
-  font-size: 0.75em;
+  font-size: var(--text-micro);
   vertical-align: super;
   line-height: 0;
 }
 .gp-markdown .footnote-definition {
   display: flex;
   gap: 0.5em;
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .footnote-definition > p {
@@ -2617,7 +2625,7 @@ html.light .gp-markdown {
 }
 .gp-markdown.gp-markdown-compact :is(h1, h2, h3, h4, h5, h6) {
   margin: 0.8em 0 0.35em;
-  font-size: 1.05em;
+  font-size: inherit;
   border: 0;
   padding: 0;
 }

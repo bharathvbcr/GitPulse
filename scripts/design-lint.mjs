@@ -53,10 +53,10 @@
  *     `*Class`-named props, and string literals in scripts.
  *
  * RULES (matcher, then what it deliberately does not see)
- *   1  type scale: token `text-[Npx]` (also in a `@apply` and in a `.ts` string) and a
- *      `font-size: Npx` declaration in `<style>`, `style=` or a stylesheet. Not
- *      `text-[var(--x)]`, `text-[length:...]`, rem/em sizes (only the px form is a literal pixel
- *      size) or the `font` shorthand.
+ *   1  type scale: token `text-[Npx]` (also in a `@apply` and in a `.ts` string) and a literal
+ *      `font-size` (px, rem, em, %, pt or a size keyword) in `<style>`, `style=` or a
+ *      stylesheet. Not `text-[var(--x)]`, `text-[length:...]`, `var(--text-*)`, `inherit`,
+ *      `calc()`, a token definition (`--text-sm: 0.8125rem`) or the `font` shorthand.
  *   2  weight and case: tokens `font-thin|extralight|light|bold|extrabold|black`;
  *      `font-weight:` other than 400/500/600/normal/inherit/var(); a class
  *      source holding `uppercase` and `tracking-*` together; a CSS rule with
@@ -1318,21 +1318,28 @@ function applyAnimates(applied) {
 // The registry. Rule 14 (banned copy terms) is one more entry here.
 // ---------------------------------------------------------------------------
 
+/**
+ * A `font-size` value that is a literal size: a number with a length unit (px, rem, em, %, pt, ...)
+ * or an absolute/relative size keyword. `var(--text-*)`, `inherit`, `calc()` and the like are not.
+ */
+const FONT_SIZE_LITERAL = /^(?:\d*\.?\d+(?:px|rem|em|%|pt|pc|ex|ch|vw|vh|vmin|vmax|cm|mm|in)|xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|smaller|larger)(?:\s*!important)?$/i;
+
 /** @type {Rule[]} */
 export const RULES = [
   {
     id: 1,
     name: "type-scale",
-    summary: "text-[Npx] and font-size: Npx literal font sizes",
+    summary: "text-[Npx], text-xl and up, and literal font-size (px, rem, em, %, keyword)",
     svelte: true,
     ts: true,
     css: true,
     run(m, report) {
       eachToken(m, (t) => {
         if (/^text-\[\d+(?:\.\d+)?px\]$/.test(t.util)) report(t.start, `${t.util}: use text-micro, text-meta, text-xs, text-sm, text-base or text-lg`);
+        if (/^text-(?:[2-9])?xl$/.test(t.util)) report(t.start, `${t.util}: not on the scale; use text-lg, or text-display for a metric numeral`);
       });
       for (const d of m.decls) {
-        if (d.prop === "font-size" && /^\d+(?:\.\d+)?px(?:\s*!important)?$/.test(d.value)) report(d.start, `font-size: ${d.value}: use the type scale (text-micro, text-meta, text-xs, text-sm, text-base, text-lg)`);
+        if (d.prop === "font-size" && FONT_SIZE_LITERAL.test(d.value.trim())) report(d.start, `font-size: ${d.value}: use var(--text-micro|meta|xs|sm|base|lg|display), or inherit`);
       }
     },
   },
