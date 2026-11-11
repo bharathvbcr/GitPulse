@@ -1,6 +1,7 @@
 import type { PrAction, PullRequestDetail } from "./types";
 import { shortHash } from "../format";
 import { invoke } from "../ipc/invoke";
+import { invalidateGitHubContext } from "../ipc/githubContext";
 import { askConfirm } from "../stores/modalStore";
 import { harnessStore, verdictLabel, type Guarded, type PolicyVerdict } from "../stores/harnessStore";
 import { worktreeSetupNotices, type WorktreeCreated } from "../branches/types";
@@ -107,6 +108,11 @@ export async function confirmAndRunPrAction(
   } catch (error) {
     harnessStore.recordAction({ repoPath, kind: `pr-${action.kind}`, label, ok: false });
     throw error;
+  } finally {
+    // Merged, closed or created: every reader of the shared GitHub context
+    // (Work, the GitHub panel, the MANVI panel) must see it, not a read taken
+    // before the action.
+    invalidateGitHubContext(repoPath);
   }
 }
 

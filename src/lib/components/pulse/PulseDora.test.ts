@@ -55,13 +55,14 @@ describe("PulseDora component", () => {
     // guess. A stale label on a number is worse than none, because it is
     // believed.
     expect(source).toContain("dora.is_cfr_approximation ?");
-    const pill = source.indexOf("Change Failure Rate");
+    const pill = source.indexOf("Change failure rate");
+    expect(pill, "the tile label must exist, or the search below proves nothing").toBeGreaterThan(-1);
     const literal = source.indexOf(">\n            Heuristic\n", pill);
     expect(literal, "the hard-coded pill must be gone").toBe(-1);
   });
 
   it("declines to invent a restore time when there were no samples", () => {
-    expect(source).toContain("Could not estimate from commit patterns");
+    expect(source).toContain("Couldn't estimate from commit patterns");
     expect(source).toMatch(/is_mttr_approximation && dora\.mttr_hours <= 0/);
   });
 
@@ -77,6 +78,34 @@ describe("PulseDora failure state", () => {
     expect(source).toMatch(/error\?: string \| null/);
     expect(source).toContain("{:else if error && !dora}");
     expect(source).toContain("not a delivery frequency of zero");
+  });
+
+  it("states the failure in the unknown tone with the template headline, not a red line", () => {
+    expect(source).toContain('describeFailure({ verb: "scan", object: "release tags" }, error)');
+    expect(source).toContain('class="gp-notice" data-tone="unknown"');
+  });
+
+  it("renders the failure headline and reason without a delivery figure", () => {
+    const rendered = render(PulseDora, { props: { dora: null, error: "git exited with status 128" } }).body;
+    expect(rendered).toContain("Couldn't scan release tags.");
+    expect(rendered).toContain("git exited with status 128");
+    expect(rendered).toContain("not a delivery frequency of zero");
+    expect(rendered).not.toContain("/ week");
+  });
+});
+
+describe("PulseDora rating chips", () => {
+  it("gives a rating it cannot read the unknown tone, never the worst tier", () => {
+    const rendered = body({ deploy_rating: "Superb" });
+    expect(rendered).toContain('data-tone="unknown"');
+    expect(rendered).toContain("Superb");
+  });
+
+  it("maps the four published ratings onto status roles", () => {
+    expect(body({ deploy_rating: "Elite" })).toContain('data-tone="ok"');
+    expect(body({ deploy_rating: "High", lead_time_rating: "High" })).toContain('data-tone="info"');
+    expect(body({ deploy_rating: "Medium", lead_time_rating: "Medium" })).toContain('data-tone="warn"');
+    expect(body({ deploy_rating: "Low", lead_time_rating: "Low" })).toContain('data-tone="danger"');
   });
 });
 

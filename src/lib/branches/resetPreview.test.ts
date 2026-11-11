@@ -61,4 +61,11 @@ describe("describeResetPreview", () => {
     expect(message).toContain("would gain 2 commits");
     expect(message).toContain("only HEAD");
   });
+
+  it("omits the label when the commit has none", () => {
+    const { message } = describeResetPreview(
+      { head: "a".repeat(40), target: "b".repeat(40), branch: "main", leaving: [], leaving_total: 0, unreachable_total: 0, gaining_total: 0 } as never,
+    );
+    expect(message.split("\n")[0]).toBe(`Move branch "main" from aaaaaaa to bbbbbbb.`);
+  });
 });

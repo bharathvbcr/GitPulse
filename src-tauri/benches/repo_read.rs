@@ -18,11 +18,14 @@
 //! work and not the production gate's 8-spawns-per-second refill.
 
 mod common;
+#[path = "repo_read/numstat_paired.rs"]
+mod numstat_paired;
 
-use common::fixture::{build_repo, count_git_processes, dirty_files, Repo, Spec};
+use common::fixture::{build_repo, count_git_processes, dirty_files, git, trust_repo, Repo, Spec};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
 use gitpulse_lib::engine::git_reader::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 
 struct Shape {
     label: &'static str,
@@ -110,6 +113,202 @@ fn main() {
             })
         })
         .collect();
+
+    // `GITPULSE_BENCH_ONLY=<substring>` runs only the rows whose name contains
+    // it (and the numstat pairs when it names "50k files"), so one measurement
+    // does not pay for every other row; `GITPULSE_BENCH_ROUNDS` sets n.
+    let only = std::env::var("GITPULSE_BENCH_ONLY").ok();
+    let rounds = std::env::var("GITPULSE_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| report.opts.samples(15));
+    if only
+        .as_deref()
+        .is_none_or(|only| only.contains("50k files"))
+    {
+        numstat_paired::run(&mut report, &temp.path().join("numstat"), rounds);
+    }
+
+    // Blame (F-4): the old read was `git blame --line-porcelain`, which repeats a
+    // commit's metadata for every line; the shipped one is `--porcelain` plus
+    // the parse. The old arm is the old git read ALONE (bytes, no parse: the
+    // old parser is test-only), so the shipped arm carries the parse on top and
+    // a win for it is conservative. 20,000 lines edited by 40 commits.
+    let blame_dir = temp.path().join("blame");
+    std::fs::create_dir_all(&blame_dir).expect("blame dir");
+    git(&blame_dir, &["init", "-q", "-b", "main"]);
+    git(&blame_dir, &["config", "commit.gpgsign", "false"]);
+    let mut blame_lines: Vec<String> = (0..20_000)
+        .map(|n| format!("line {n:06}: let value_{n} = {};\n", n * 7))
+        .collect();
+    for commit in 0..=40usize {
+        for n in (commit..blame_lines.len()).step_by(500) {
+            blame_lines[n] = format!("line {n:06}: let value_{n} = {}; // rev {commit}\n", n * 7);
+        }
+        std::fs::write(blame_dir.join("big.txt"), blame_lines.concat()).expect("write blame file");
+        git(&blame_dir, &["add", "big.txt"]);
+        git(
+            &blame_dir,
+            &["commit", "-q", "-m", &format!("feat: revision {commit}")],
+        );
+    }
+    trust_repo(&blame_dir);
+    let blame_old = {
+        let dir = blame_dir.clone();
+        move || {
+            gitpulse_lib::engine::git_cli::git_text_capped(
+                &dir,
+                &["blame", "--line-porcelain", "--", "big.txt"],
+                64 << 20,
+            )
+            .expect("line-porcelain blame")
+        }
+    };
+    let blame_new_bytes = gitpulse_lib::engine::git_cli::git_text_capped(
+        &blame_dir,
+        &["blame", "--porcelain", "--", "big.txt"],
+        64 << 20,
+    )
+    .expect("porcelain blame")
+    .0
+    .len() as u64;
+    let blame_old_bytes = blame_old().0.len() as u64;
+    let blame_path = blame_dir.to_str().expect("utf-8").to_string();
+    assert_eq!(
+        GitReader::get_file_blame(&blame_path, "big.txt", None)
+            .expect("blame")
+            .len(),
+        20_000
+    );
+    cases.push(Case::new(
+        "blame 20k lines x 41 commits, git --line-porcelain read only (old format, no parse)",
+        move || {
+            let (text, _) = blame_old();
+            std::hint::black_box(&text);
+            Sample::default().counter("bytes", blame_old_bytes)
+        },
+    ));
+    cases.push(Case::new(
+        "blame 20k lines x 41 commits, get_file_blame (--porcelain read and parse)",
+        move || {
+            let lines = GitReader::get_file_blame(&blame_path, "big.txt", None).expect("blame");
+            std::hint::black_box(&lines);
+            Sample::default()
+                .counter("lines", lines.len() as u64)
+                .counter("bytes", blame_new_bytes)
+        },
+    ));
+    report.note(
+        "blame: one 20,000-line file rewritten at 40 lines in 500 by each of 41 commits; the old \
+         arm is `git blame --line-porcelain` read alone, the shipped arm is `get_file_blame` \
+         (`--porcelain`, read and parse); `bytes` is what git printed in each format"
+            .to_string(),
+    );
+
+    // History window (F-1): a cold 20,001-row window is four 5,000-row chunks.
+    // The old read was one `git log --skip=k*5000` walk per chunk (each walks
+    // every commit before its skip); the shipped read is one walk cut into the
+    // same chunks. Old arm: those four walks, bytes only. Shipped arm:
+    // `read_commit_history_paged`, parsed, against a branch no earlier sample
+    // has read, so the ref cache is cold for every sample.
+    let history_dir = temp.path().join("history");
+    std::fs::create_dir_all(&history_dir).expect("history dir");
+    git(&history_dir, &["init", "-q", "-b", "main"]);
+    trust_repo(&history_dir);
+    let mut stream = String::new();
+    for n in 1..=20_001usize {
+        let message = format!("commit {n}");
+        stream.push_str(&format!(
+            "commit refs/heads/main\nmark :{n}\ncommitter Bench <bench@example.com> {} +0000\ndata {}\n{message}\n",
+            1_767_225_600 + n,
+            message.len()
+        ));
+        if n > 1 {
+            stream.push_str(&format!("from :{}\n", n - 1));
+        }
+        stream.push_str("M 100644 inline f.txt\ndata 2\nx\n\n");
+    }
+    {
+        use gitpulse_lib::procguard::LockedSpawn;
+        use std::io::Write;
+        let mut import = std::process::Command::new("git");
+        import
+            .args(["fast-import", "--quiet"])
+            .current_dir(&history_dir)
+            .stdin(std::process::Stdio::piped());
+        let mut child = import.spawn_locked().expect("spawn fast-import");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stream.as_bytes())
+            .expect("feed fast-import");
+        assert!(child.wait().expect("fast-import").success());
+    }
+    // One cold revision per warmup and sample, all at the same tip.
+    let revisions = 64usize;
+    for n in 0..revisions {
+        git(&history_dir, &["branch", &format!("cold{n}"), "main"]);
+    }
+    let history_path = history_dir.to_str().expect("utf-8").to_string();
+    let next_revision = std::sync::atomic::AtomicUsize::new(0);
+    let old_dir = history_dir.clone();
+    cases.push(Case::new(
+        "history window 20k, four git log --skip walks (old read, bytes only)",
+        move || {
+            let revision = format!(
+                "cold{}",
+                next_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % revisions
+            );
+            let mut bytes = 0u64;
+            for chunk in 0..4usize {
+                let skip = format!("--skip={}", chunk * 5_000);
+                let (text, _) = gitpulse_lib::engine::git_cli::git_text_capped(
+                    &old_dir,
+                    &[
+                        "log",
+                        "-n5001",
+                        skip.as_str(),
+                        "--topo-order",
+                        "--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00",
+                        revision.as_str(),
+                    ],
+                    64 << 20,
+                )
+                .expect("log chunk");
+                bytes += text.len() as u64;
+            }
+            Sample::default().counter("bytes", bytes)
+        },
+    ));
+    let next_revision = std::sync::atomic::AtomicUsize::new(0);
+    cases.push(Case::new(
+        "history window 20k, read_commit_history_paged cold (one walk, parsed)",
+        move || {
+            let revision = format!(
+                "cold{}",
+                next_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % revisions
+            );
+            let rows = GitReader::read_commit_history_paged(
+                &history_path,
+                0,
+                20_001,
+                Some(&revision),
+                None,
+                gitpulse_lib::graph::RefScope::Named,
+            )
+            .expect("history window");
+            std::hint::black_box(&rows);
+            Sample::default().counter("rows", rows.len() as u64)
+        },
+    ));
+    report.note(
+        "history: 20,001 commits made with fast-import, a cold 20,001-row window; the shipped \
+         arm reads a branch no earlier sample read (64 of them, warmup and samples included), so \
+         the ref cache is cold; the old arm is the four `--skip` walks the old chunk loop spawned, \
+         read alone"
+            .to_string(),
+    );
 
     // Opening a file and saving it are the two reads of a file's bytes the
     // editor pays for, and both now also hash those bytes (the base token a
@@ -257,9 +456,49 @@ fn main() {
          detail_json, and a transcript edit (object path plus 4-field detail_json)"
     ));
 
-    let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
+    if let Some(only) = &only {
+        cases.retain(|case| case.name.contains(only.as_str()));
+    }
+    let rows = interleave(cases, rounds, report.opts.warmup(2));
     report.extend(rows);
     report.finish();
+}
+
+/// CPU time (user + system) of the child processes this process has reaped,
+/// as a delta from [`ChildCpu::start`]. `RUSAGE_CHILDREN` accumulates every
+/// waited-for child, so the delta around a call is what the git children that
+/// call started and waited for used; the cases run one at a time.
+struct ChildCpu(f64);
+
+impl ChildCpu {
+    fn now_ms() -> f64 {
+        // SAFETY: `usage` is a valid, writable `rusage` for the call to fill.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let status = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+        assert_eq!(status, 0, "getrusage(RUSAGE_CHILDREN) failed");
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1_000.0 + t.tv_usec as f64 / 1_000.0;
+        ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    fn start() -> Self {
+        Self(Self::now_ms())
+    }
+
+    fn spent_ms(&self) -> f64 {
+        Self::now_ms() - self.0
+    }
+}
+
+/// Stdout of `git <args>` in `dir`; a failed git aborts the bench.
+fn git_bytes(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output_locked()
+        .expect("spawn git");
+    assert!(output.status.success(), "git {args:?} failed");
+    output.stdout
 }
 
 const REDACT_ROUNDS: usize = 2_000;

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 112 contracts over
- * 284 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 113 contracts over
+ * 285 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -297,6 +297,7 @@ export const CONTRACTS = Object.freeze([
   // Events are a second wire surface: emitted payloads, not command returns.
   { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload", "RepoChange"] },
   { label: "native-menu-state", rustPath: rust("desktop", "state.rs"), tsPath: ts("desktop", "menuState.ts"), structs: ["MenuState", "MenuLabel", "MenuRepository", "StatusCard"] },
+  { label: "accessibility-display", rustPath: rust("desktop", "accessibility.rs"), tsPath: ts("ui", "transparencyPreference.ts"), structs: ["AccessibilityDisplay"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
   // Regression suspects. A named row rather than an entry on the unchecked

@@ -174,6 +174,30 @@
         return out;
       };
       window.__gpAgentDefaults = () => agentDefaults;
+      // Manvi connected, one reachable local server, and a sweep that finds it.
+      const harnessStatus = {
+        available: true, binary: "/usr/local/bin/manvi", protocol: 3, posture: "enforce",
+        ops: ["commit", "push", "merge"], error: "", error_code: "",
+      };
+      const aiStatus = {
+        harness: harnessStatus,
+        endpoints: [{ base_url: "http://127.0.0.1:11434", models: ["llama3.2:3b"], reachable: true, detail: "" }],
+        selected: { base_url: "http://127.0.0.1:11434", model: "llama3.2:3b" },
+        model_info: null, model_detail: "", ready: true, detail: "",
+      };
+      const scanResult = {
+        servers: [{
+          base_url: "http://127.0.0.1:11434", runtime: "ollama", version: "0.9.0",
+          models: [{
+            id: "qwen3:8b", context_window: 32768, context_window_source: "server", implausible_window: 0,
+            capabilities_known: true, supports_tools: true, supports_reasoning: true,
+            supports_vision: false, supports_completion: true,
+          }],
+        }],
+        scanned: 4, capabilities: true,
+      };
+      window.__gpScan = "ok";
+      localStorage.removeItem("gitpulse_ai_model");
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "cmd_agent_defaults") return agentView();
@@ -223,10 +247,33 @@
             ];
           }
           if (cmd === "cmd_devmap_integration_preview") return plan("claude", 1, 1);
+          // Manvi's policy gate and the local model servers (Agents → Manvi policy,
+          // Local model servers). `__gpScan` switches the sweep: "ok" or "throw".
+          if (cmd === "cmd_harness_status" || cmd === "cmd_harness_reconnect") return harnessStatus;
+          if (cmd === "cmd_ai_status") {
+            const pinned = args?.model ? { base_url: args.baseUrl, model: args.model } : null;
+            return { ...aiStatus, selected: pinned ?? aiStatus.selected };
+          }
+          if (cmd === "cmd_local_scan") {
+            if (window.__gpScan === "throw") throw "the sweep could not start";
+            return scanResult;
+          }
+          if (cmd === "cmd_claude_key_status") return false;
+          // Lappi reloads each time the Agents panel becomes active, so a null
+          // answer here crashes the modal on the second visit.
+          if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true };
+          if (cmd === "cmd_host_load_status") return hostLoadStatus;
+          if (cmd === "cmd_lappi_settings") {
+            return {
+              settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
+              collect_forced_off: false, socket: null, store: null, transport_supported: false,
+            };
+          }
           return null;
         },
       };
 
+      const hostLoadStatus = (await import("./hostLoadFixture")).hostLoadStatusFixture();
       const { mount } = await import("svelte");
       const SettingsHost = (await import("./SettingsHost.svelte")).default;
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
@@ -252,8 +299,157 @@
 
       mount(SettingsHost, { target: document.getElementById("app") });
 
-      window.__gp = { interfaceStore, themeStore };
+      const { harnessStore } = await import("../src/lib/stores/harnessStore");
+      const { requestManviFocus, manviFocusRequest } = await import("../src/lib/ui/manviFocus");
+      const { get } = await import("svelte/store");
+      window.__gp = { interfaceStore, themeStore, harnessStore };
       document.title = "gp-settings ready";
+
+      // `?check=1` (the browser regression runner) drives the page and posts a
+      // verdict; opened by hand the page just stays up for a person to use.
+      const params = new URL(location.href).searchParams;
+      if (params.get("check")) {
+        const results = [];
+        const crashes = [];
+        window.addEventListener("error", (e) => crashes.push(e.message));
+        window.addEventListener("unhandledrejection", (e) => crashes.push(String(e.reason)));
+        const check = (name, pass) => results.push({ name, pass: Boolean(pass) });
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+        const until = async (test, ms = 3000) => {
+          for (let waited = 0; waited < ms; waited += 25) {
+            if (test()) return true;
+            await wait(25);
+          }
+          return Boolean(test());
+        };
+        const finish = () => {
+          const result = { results, passed: results.filter((r) => r.pass).length, total: results.length, crashes };
+          document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify(result)));
+          const path = params.get("report");
+          if (path?.startsWith("/__gp_result/")) {
+            fetch(path, { method: "POST", body: document.documentElement.outerHTML }).catch((e) => console.error(e));
+          }
+        };
+        const deadline = setTimeout(() => {
+          check("harness deadline", false);
+          finish();
+        }, 45000);
+        const panel = (id) => document.getElementById(`settings-panel-${id}`);
+        const tab = (id) => document.getElementById(`settings-tab-${id}`);
+        const row = (id) => document.querySelector(`[data-setting="${id}"]`);
+        const shownRow = (id) => {
+          const el = row(id);
+          return Boolean(el) && getComputedStyle(el).display !== "none";
+        };
+        const search = () => document.querySelector('[aria-label="Search settings"]');
+        const typeSearch = async (text) => {
+          const input = search();
+          input.value = text;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          await wait(60);
+        };
+        const open = async (next) => {
+          window.__gpSetOpen(next);
+          await wait(next ? 120 : 360);
+        };
+        const heading = (scope, text) =>
+          [...scope.querySelectorAll("h3")].some((h) => h.textContent.trim() === text);
+        const inView = (el) => {
+          const box = el.getBoundingClientRect();
+          return box.top >= -1 && box.top < window.innerHeight - 40;
+        };
+
+        try {
+          await until(() => document.querySelector('[role="dialog"]'));
+          await harnessStore.refresh();
+          check("the settings dialog opens", document.querySelector('[role="dialog"]'));
+          check("the rail lists nine categories", document.querySelectorAll('[id^="settings-tab-"]').length === 9);
+          check("Appearance is the panel shown first", !panel("appearance").hidden && panel("agents").hidden);
+
+          tab("agents").click();
+          await wait(60);
+          check("selecting Agents shows its panel and hides Appearance", !panel("agents").hidden && panel("appearance").hidden);
+          const agents = panel("agents");
+          check("Agents carries a Manvi policy card", heading(agents, "Manvi policy"));
+          check("Agents carries a Capability boundary card", heading(agents, "Capability boundary"));
+          check("Agents carries a Local model servers card", heading(agents, "Local model servers"));
+          check("no card is called Harness & AI", !/Harness & AI|MANVI harness/.test(agents.textContent));
+          check("the policy card reports the live connection", agents.textContent.includes("Connected · protocol 3, mode enforce"));
+          check("the policy card lists the operations the gate covers", ["commit", "push", "merge"].every((op) => agents.textContent.includes(op)));
+          check("the scoped runner reads as guarded while connected", agents.textContent.includes("Scoped action runner") && agents.textContent.includes("Guarded"));
+          check("the interactive shell is marked user only", agents.textContent.includes("Interactive shell") && agents.textContent.includes("User only"));
+          const externalHeadings = [...agents.querySelectorAll("h4")].filter((h) => h.textContent.trim() === "External CLIs");
+          check("External CLIs renders exactly once", externalHeadings.length === 1);
+          check("the model card lists the resolved local endpoint", document.getElementById("manvi-section-model").textContent.includes("llama3.2:3b"));
+          check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1);
+
+          // Scan and pick.
+          const scanButton = [...document.querySelectorAll("#manvi-section-model button")].find((b) => b.textContent.includes("Scan local servers"));
+          scanButton.click();
+          check("a sweep lists the server it found with its runtime", await until(() => document.getElementById("manvi-section-model").textContent.includes("qwen3:8b") && document.getElementById("manvi-section-model").textContent.includes("ollama")));
+          const found = [...document.querySelectorAll("#manvi-section-model button.gp-row")].find((b) => b.textContent.includes("qwen3:8b"));
+          found.click();
+          check("picking a scanned model marks it selected", await until(() => [...document.querySelectorAll("#manvi-section-model button.gp-row")].find((b) => b.textContent.includes("qwen3:8b"))?.getAttribute("data-selected") === "true"));
+          check("a pinned model offers to hand the choice back to discovery", await until(() => document.getElementById("manvi-section-model").textContent.includes("Clear the pinned model")));
+          window.__gpScan = "throw";
+          scanButton.click();
+          check("a failed sweep says it is not a list of what is running", await until(() => document.getElementById("manvi-section-model").textContent.includes("This is not a list of what is running.")));
+          window.__gpScan = "ok";
+
+          // Search finds the new rows by the words a reader would use.
+          await typeSearch("model servers");
+          check("searching 'model servers' keeps the model card", shownRow("local-model-servers"));
+          await typeSearch("anthropic");
+          check("a word only the model card carries narrows to it", shownRow("local-model-servers") && !shownRow("manvi-policy"));
+          await typeSearch("capability");
+          check("searching 'capability' finds the policy card", shownRow("manvi-policy") && !shownRow("local-model-servers"));
+          await typeSearch("manvi");
+          check("searching 'manvi' finds both Manvi cards", shownRow("manvi-policy") && shownRow("local-model-servers"));
+          await typeSearch("policy");
+          check("searching 'policy' finds the policy card", shownRow("manvi-policy"));
+          await typeSearch("");
+
+          // Deep links: from another section with a search hiding the card.
+          tab("appearance").click();
+          await typeSearch("dock");
+          requestManviFocus("model");
+          await wait(500);
+          check("a deep link clears a search that would hide its card", search().value === "");
+          check("a deep link opens Settings → Agents", !panel("agents").hidden && panel("appearance").hidden);
+          const model = document.getElementById("manvi-section-model");
+          check("the linked card takes focus", document.activeElement === model);
+          check("the linked card is scrolled into view", inView(model));
+          check("the linked card wears the focus flash", model.classList.contains("gp-focus-flash"));
+          check("the request is consumed so it cannot fire twice", get(manviFocusRequest) === null);
+          await wait(1500);
+          check("the flash clears by itself", !model.classList.contains("gp-focus-flash"));
+
+          // A second request while the dialog is already open.
+          tab("appearance").click();
+          await wait(60);
+          requestManviFocus("harness");
+          await wait(500);
+          const harnessCard = document.getElementById("manvi-section-harness");
+          check("a request arriving while open lands on the policy card", !panel("agents").hidden && document.activeElement === harnessCard && inView(harnessCard));
+          check("only one card flashes at a time", document.querySelectorAll(".gp-focus-flash").length === 1);
+
+          // A request made before the dialog is open waits for it.
+          await open(false);
+          requestManviFocus("model");
+          check("a request while closed stays pending", get(manviFocusRequest) === "model");
+          await open(true);
+          await wait(500);
+          check("opening with a pending request lands on its card", !panel("agents").hidden && document.activeElement === document.getElementById("manvi-section-model"));
+          await open(false);
+          check("closing clears the flash", document.querySelectorAll(".gp-focus-flash").length === 0);
+          check("no script errors while driving the page", crashes.length === 0);
+        } catch (error) {
+          check(`harness crashed: ${error?.message ?? error}`, false);
+        } finally {
+          clearTimeout(deadline);
+          finish();
+        }
+      }
     </script>
   </body>
 </html>

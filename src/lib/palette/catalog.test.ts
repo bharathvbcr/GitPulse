@@ -12,6 +12,8 @@ import { promptQuickCommit } from "../commit/quickCommit";
 import { LAUNCHERS } from "../terminal/tabs";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { explorerLens, resetExplorerLens } from "../files/explorerLens";
+import { takeManviFocus } from "../ui/manviFocus";
+import { harnessStore } from "../stores/harnessStore";
 
 vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
@@ -96,6 +98,62 @@ describe("command catalog and context", () => {
     await sections[0]?.action();
     expect(navigate).toHaveBeenLastCalledWith("insights", "health");
   });
+  it("keeps a door to the conflicts now that Resolve leads Overview", async () => {
+    // Resolve had its own command, then a section of Policy. Folding both
+    // into Overview must not leave a reader typing "resolve" or "conflicts"
+    // with nothing that lands on the conflict editor.
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.some(command => command.id === "work:resolve")).toBe(false);
+    expect(commands.some(command => command.id === "work:policy")).toBe(false);
+    for (const query of ["resolve", "resolve conflicts", "conflicts"]) {
+      const top = rankItems(commands.filter(command => command.category === "Views"), query)[0];
+      expect(top?.id, query).toBe("work:conflicts");
+    }
+    await commands.find(command => command.id === "work:conflicts")?.action();
+    expect(navigate).toHaveBeenLastCalledWith("work", "overview");
+  });
+
+  it("does not offer Policy activity when Overview would not render it", () => {
+    // Manvi absent and nothing journaled: Overview hides the card, so a door
+    // to it would land on nothing. Disabled with the reason instead.
+    const absent = { harness: { available: false, error: "", error_code: "not_installed" }, actions: [], error: null };
+    vi.spyOn(harnessStore, "subscribe").mockImplementation((run) => {
+      (run as (value: unknown) => void)(absent);
+      return () => {};
+    });
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.find(command => command.id === "manvi:activity")?.disabledReason)
+      .toBe("Manvi is not installed and nothing has been recorded.");
+    // Settings opens without a repository or Manvi, so its cards stay offered.
+    expect(commands.find(command => command.id === "manvi:harness")?.disabledReason).toBeUndefined();
+    expect(commands.find(command => command.id === "manvi:cleanup")?.disabledReason).toBeUndefined();
+  });
+
+  it("keeps a door to every card Policy held, landing where the catalog says", async () => {
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    try {
+      const commands = buildCommands(ready(), () => {});
+      const views = commands.filter(command => command.category === "Views");
+      expect(rankItems(views, "policy")[0]?.id).toMatch(/^manvi:/);
+      expect(rankItems(views, "branch cleanup")[0]?.id).toBe("manvi:cleanup");
+      expect(rankItems(views, "model servers")[0]?.id).toBe("manvi:model");
+      await commands.find(command => command.id === "manvi:cleanup")?.action();
+      expect(navigate).toHaveBeenLastCalledWith("work", "overview");
+      expect(takeManviFocus()).toBe("cleanup");
+      navigate.mockClear();
+      await commands.find(command => command.id === "manvi:harness")?.action();
+      expect(navigate).not.toHaveBeenCalled();
+      expect(dispatchEvent).toHaveBeenCalledTimes(1);
+      expect(dispatchEvent.mock.lastCall?.[0].type).toBe("gitpulse:settings");
+      expect(takeManviFocus()).toBe("harness");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
     const commands = buildCommands(ready(), () => {});
@@ -129,7 +187,7 @@ describe("command catalog and context", () => {
     expect(repoUnavailable(snapshot({ currentPath: "/repo", isLoading: true }))).toContain("loading");
     expect(worktreeUnavailable({ ...ready(), isBare: true })).toContain("bare repository");
     expect(worktreeUnavailable({ ...ready(), operation: { operation: null, probeFailed: true } })).toContain("unavailable");
-    expect(worktreeUnavailable({ ...ready(), operation: { probeFailed: false, operation: { kind: "Merge", current_step: null, total_steps: null, head_ref: null, incoming_ref: null, conflicted_paths: [], conflicted_total: 0, available: [] } } })).toContain("Resolve");
+    expect(worktreeUnavailable({ ...ready(), operation: { probeFailed: false, operation: { kind: "Merge", current_step: null, total_steps: null, head_ref: null, incoming_ref: null, conflicted_paths: [], conflicted_total: 0, available: [] } } })).toContain("Work → Overview");
     expect(worktreeUnavailable({ ...ready(), statuses: [{ path: "a", status_code: "UU", is_staged: false, is_conflicted: true, additions: 0, deletions: 0 }] })).toContain("conflicted");
   });
   it("does not silently offer stash or commit operations on an empty tree", () => {

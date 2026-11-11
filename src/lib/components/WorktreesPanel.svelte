@@ -1,3 +1,14 @@
+<script module lang="ts">
+  import type { ViewLoader } from "./LazyView.svelte";
+  /**
+   * The branch-name helper beside the new-branch field loads as its own chunk:
+   * it is a convenience inside a panel, and imported eagerly it was one of the
+   * modules that took `main` over the 640 KB production limit. Module scope,
+   * because LazyView keys its cache on the loader's identity.
+   */
+  const loadBranchNameSuggestion: ViewLoader = () => import("./BranchNameSuggestion.svelte");
+</script>
+
 <script lang="ts">
   import { untrack } from "svelte";
   import { worktreeSetupNotices, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
@@ -26,6 +37,7 @@
     RefreshCw,
   } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
+  import LazyView from "./LazyView.svelte";
   import { agentKind, agentKindLabel, agentSessionSlug, isAgentWorktree, isGitPulseLane } from "../work/agentWorktree";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { trustExtended } from "../repos/trustExtension";
@@ -722,6 +734,11 @@
           class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
       </div>
+      <LazyView
+        load={loadBranchNameSuggestion}
+        name="branch name suggestions"
+        props={{ onUse: (name: string) => (newBranch = name) }}
+      />
       <input
         bind:value={sparsePathsInput}
         placeholder="sparse paths, comma-separated (optional, e.g. src/auth)"

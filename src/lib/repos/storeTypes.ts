@@ -358,6 +358,10 @@ export interface RepoState {
   currentBranch: string | null;
   defaultBranch: string | null;
   statuses: FileStatus[];
+  /** Conflicted files among `statuses`; counted once per statuses array, in the projection. */
+  conflictedCount: number;
+  /** Staged files among `statuses`; counted once per statuses array, in the projection. */
+  stagedCount: number;
   selectedCommitId: string | null;
   /** See the session field: the comparison's base while selectionKind is "compare". */
   selectedCompareBase: string | null;

@@ -15,10 +15,33 @@
    * parent update).
    */
   const loadStack: ViewLoader = () => import("./CodeStackViewer.svelte");
+
+  /**
+   * Overview's two collapsed disclosures, branch and tag cleanup and Policy
+   * activity, load as chunks of their own. Imported eagerly they put ~48 KB in
+   * the entry chunk and took `main` over the 640 KB production limit
+   * (vite.config.ts). Both are bound (`bind:open`), which LazyView's props seam
+   * cannot carry, so each is awaited in the template from a memoised loader:
+   * one import per session, not one per render.
+   */
+  // A failed import clears its memo, so Retry (or the next deep link) asks again
+  // instead of replaying the same rejection for the rest of the session.
+  let cleanupModule: Promise<typeof import("./BranchTagCleanup.svelte")> | null = null;
+  const loadBranchTagCleanup = () =>
+    (cleanupModule ??= import("./BranchTagCleanup.svelte").catch((error: unknown) => {
+      cleanupModule = null;
+      throw error;
+    }));
+  let activityModule: Promise<typeof import("./PolicyActivity.svelte")> | null = null;
+  const loadPolicyActivity = () =>
+    (activityModule ??= import("./PolicyActivity.svelte").catch((error: unknown) => {
+      activityModule = null;
+      throw error;
+    }));
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { openExternal } from "../desktop/openExternal";
   import {
@@ -69,7 +92,17 @@
     type WorkFacet,
   } from "../work/focus";
   import { timestampFormat } from "../ui/timestampFormat";
-  import type { PolicyStatus } from "../stores/harnessStore";
+  import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
+  import { policyActivityVisible } from "../harness/policyActivityVisible";
+  import { openConflicts } from "../ui/workConflicts";
+  import {
+    MANVI_FOCUS_TARGETS,
+    manviFocusRequest,
+    manviSectionId,
+    takeManviFocusFor,
+    type ManviFocusId,
+  } from "../ui/manviFocus";
+  import { toastStore } from "../stores/toastStore";
 
   let projection = $state<WorkProjection | null>(null);
   let collisions = $state<CollisionRisk | null>(null);
@@ -99,7 +132,7 @@
     unchecked: "text-textMuted bg-surfaceHover",
   };
 
-  function refresh(repo: string): void {
+  function refresh(repo: string, force = false): void {
     const epoch = ++refreshEpoch;
     loading = true;
     refreshError = null;
@@ -121,7 +154,7 @@
         refreshError = error;
         loading = false;
       },
-    });
+    }, { force });
   }
 
   // A repo switch hydrates from cache so the last join is on screen
@@ -167,6 +200,20 @@
 
   const hasTasks = $derived(projection?.sources.tasks.present === true);
 
+  /**
+   * Brings the conflict editor on screen.
+   *
+   * The editor leads this same section (`WorkOverviewPane`) while a merge needs
+   * a person, so "Resolve" is two steps: make sure Overview is the section
+   * showing, then scroll the editor to the top of the pane. From another
+   * section the switch mounts the pane, which starts at the editor; from
+   * Overview itself the reader may be scrolled down among the rows, and doing
+   * nothing would read as a dead button.
+   */
+  function showConflicts(): void {
+    openConflicts();
+  }
+
   function reviewChanges(): void {
     void repoStore.previewUncommitted();
   }
@@ -176,7 +223,7 @@
    *
    * This is what makes the screen a workspace rather than a report: the whole
    * point of showing that a worktree is stuck mid-rebase is being one click
-   * from the Resolve view that unsticks it. Rows with several worktrees open
+   * from the conflict editor that unsticks it. Rows with several worktrees open
    * the first — the one the row is keyed on in worktree mode.
    */
   async function openWorktree(row: WorkRow): Promise<void> {
@@ -190,7 +237,7 @@
     try {
       const opened = await repoStore.openRepo(path, {
         onReady: () => {
-          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) repoStore.setActiveTab("work", "resolve");
+          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) showConflicts();
           else reviewChanges();
         },
       });
@@ -299,6 +346,124 @@
    */
   let showRepoDetail = $state(false);
   let showStackDetail = $state(false);
+  // Opened by the reader or by a deep link, never on their own: these cards
+  // answer questions about the repository rather than work in flight, so they
+  // must not push the rows down.
+  let showCleanup = $state(false);
+  /** Bumped by Retry: re-runs a disclosure's import after a failed chunk load. */
+  let cleanupAttempt = $state(0);
+  let activityAttempt = $state(0);
+  let showActivity = $state(false);
+
+  const showPolicyActivity = $derived(
+    policyActivityVisible($harnessStore.harness, $harnessStore.actions.length, $harnessStore.error),
+  );
+
+  /* --- deep links ---------------------------------------------------------- */
+
+  /**
+   * A deep link from elsewhere in the app (the header chips, the storage
+   * panel) names a card, not just this view. Expanding the disclosure is only
+   * half the answer: the card still has to be brought on screen and marked, or
+   * the reader lands mid-page with no idea which card answered their click.
+   */
+  let flashTimer: number | null = null;
+  let flashed: HTMLElement | null = null;
+  let realignTimers: number[] = [];
+
+  function clearFlash() {
+    if (flashTimer !== null) {
+      window.clearTimeout(flashTimer);
+      flashTimer = null;
+    }
+    // The marked section belongs to a child component, so the class is
+    // applied to the node rather than bound in one component's markup.
+    flashed?.classList.remove("gp-focus-flash");
+    flashed = null;
+  }
+
+  function clearRealign() {
+    for (const timer of realignTimers) window.clearTimeout(timer);
+    realignTimers = [];
+  }
+
+  /**
+   * Cards above the target keep settling for a moment after the view mounts —
+   * the rows resolve, a grant list arrives — and every height change slides
+   * the section the reader was sent to, typically far enough to push its
+   * heading off the top. Two bounded re-alignments cover the settle; a scroll
+   * gesture cancels them, because yanking a reader back is worse than drift.
+   */
+  const REALIGN_DELAYS_MS = [0, 250];
+
+  function keepAligned(section: HTMLElement) {
+    clearRealign();
+    for (const delay of REALIGN_DELAYS_MS) {
+      realignTimers.push(
+        window.setTimeout(() => section.scrollIntoView({ block: "start" }), delay),
+      );
+    }
+    for (const event of ["wheel", "touchstart", "keydown"] as const) {
+      window.addEventListener(event, clearRealign, { once: true, passive: true });
+    }
+  }
+
+  async function revealFocus(id: ManviFocusId) {
+    // The disclosure that holds the card is opened here, before looking for it.
+    if (id === "cleanup") showCleanup = true;
+    else if (id === "activity") showActivity = true;
+    // Both disclosures arrive in chunks of their own: wait for the one asked
+    // for, or the lookup below runs before its section exists and reports a
+    // card that is merely still loading as absent. A failed load is shown in
+    // place by its {:catch} notice, so it is not reported here as well.
+    try {
+      if (id === "cleanup") await loadBranchTagCleanup();
+      else if (id === "activity" && showPolicyActivity) await loadPolicyActivity();
+    } catch {
+      return;
+    }
+    await tick();
+    await tick();
+    const section = document.getElementById(manviSectionId(id));
+    if (!section) {
+      // The card is not offered here (Policy activity with Manvi absent and
+      // nothing recorded). The request was taken, so it cannot fire later;
+      // say why nothing opened rather than leaving a dead click.
+      toastStore.info(`${MANVI_FOCUS_TARGETS[id].label} has nothing to show: Manvi is not installed and nothing has been recorded.`);
+      return;
+    }
+    // Instant, like every other scroll-into-view in the app: a deep link should
+    // land deterministically, and a smooth 2000px glide is both a lot of motion
+    // and, in a webview that is not compositing, no scroll at all.
+    section.scrollIntoView({ block: "start" });
+    keepAligned(section);
+    // Sections carry tabindex="-1": keyboard and screen-reader users land on
+    // the same card the scroll brought into view, not back at the page top.
+    section.focus({ preventScroll: true });
+    clearFlash();
+    section.classList.add("gp-focus-flash");
+    flashed = section;
+    flashTimer = window.setTimeout(() => clearFlash(), 1600);
+  }
+
+  // Runs on mount (the view mounts lazily, after the click) and again whenever
+  // a request arrives while the view is already open. Only requests whose card
+  // lives here are taken; Settings' are left for Settings.
+  $effect(() => {
+    if (!$manviFocusRequest) return;
+    const requested = takeManviFocusFor("view");
+    if (requested) void revealFocus(requested);
+  });
+
+  $effect(() => {
+    return () => {
+      clearFlash();
+      clearRealign();
+      for (const event of ["wheel", "touchstart", "keydown"] as const) {
+        window.removeEventListener(event, clearRealign);
+      }
+    };
+  });
 </script>
 
 <!-- A scroller that is a column: every band below is `w-full`, so the content
@@ -306,7 +471,7 @@
      cap (it used to centre in max-w-6xl, which on a wide window left a quarter
      of the pane blank on each side), and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
-<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
+<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto font-sans text-[12px] text-textPrimary">
   <div class="flex items-start justify-between gap-3 mb-3 w-full">
     <div class="min-w-0">
       <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
@@ -321,7 +486,7 @@
       type="button"
       class="gp-btn shrink-0 mt-1"
       disabled={loading || !$repoStore.currentPath}
-      onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}
+      onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath, true)}
     >
       <RefreshCw size={12} class={loading ? "animate-spin" : ""} />
       {loading ? "Refreshing" : "Refresh"}
@@ -352,8 +517,8 @@
         </div>
         <div class="flex flex-wrap items-center gap-2">
           {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
-            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "resolve")}>
-              <GitMerge size={13} /> Open Resolve
+            <button type="button" class="gp-btn-primary" onclick={showConflicts}>
+              <GitMerge size={13} /> Resolve conflicts
             </button>
           {:else if here && here.staged + here.unstaged > 0}
             <button type="button" class="gp-btn-primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
@@ -421,8 +586,8 @@
             <button
               type="button"
               class="text-rose-600 dark:text-rose-400 hover:underline"
-              onclick={() => repoStore.setActiveTab("work", "resolve")}
-              title="Open Resolve"
+              onclick={showConflicts}
+              title="Open the conflict editor"
             >
               {here.conflicted} conflicted
             </button>
@@ -448,8 +613,8 @@
         <button
           type="button"
           class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
-          onclick={() => repoStore.setActiveTab("work", "resolve")}
-          title="Open Resolve to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
+          onclick={showConflicts}
+          title="Open the conflict editor to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
           <GitMerge size={12} class="mt-px shrink-0" />
           <span class="min-w-0">{headline($repoStore.operation.operation)}</span>
@@ -1024,13 +1189,39 @@
         </div>
       {/if}
     </div>
+
+    {#key cleanupAttempt}
+      {#await loadBranchTagCleanup() then { default: BranchTagCleanup }}
+        <BranchTagCleanup bind:open={showCleanup} />
+      {:catch error}
+        <p class="gp-notice flex items-center gap-2" data-tone="danger" role="alert">
+          <span class="min-w-0 flex-1">Could not load branch and tag cleanup: {String(error)}</span>
+          <button type="button" class="gp-btn" onclick={() => cleanupAttempt++}>Retry</button>
+        </p>
+      {/await}
+    {/key}
+    {#if showPolicyActivity}
+      {#key activityAttempt}
+        {#await loadPolicyActivity() then { default: PolicyActivity }}
+          <PolicyActivity bind:open={showActivity} />
+        {:catch error}
+          <p class="gp-notice flex items-center gap-2" data-tone="danger" role="alert">
+            <span class="min-w-0 flex-1">Could not load Policy activity: {String(error)}</span>
+            <button type="button" class="gp-btn" onclick={() => activityAttempt++}>Retry</button>
+          </p>
+        {/await}
+      {/key}
+    {/if}
   {/if}
 </div>
 
 <style>
   .work-overview {
     container-type: inline-size;
-    padding: clamp(16px, 1.6vw, 24px);
+    /* Block padding is a band of pane background under the section tabs and
+       again under the last block. Inline padding stays. */
+    padding-inline: clamp(16px, 1.6vw, 24px);
+    padding-block: 0;
   }
 
   .overview-repository {

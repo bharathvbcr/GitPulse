@@ -31,7 +31,8 @@
 {#if overflowsPreview(total, HEALTH_PREVIEW_ROWS)}
   <button
     type="button"
-    class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+    class="gp-btn w-full"
+    data-size="sm"
     aria-expanded={expanded}
     data-health-preview-toggle
     onclick={() => (expanded = !expanded)}

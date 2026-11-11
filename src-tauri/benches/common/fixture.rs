@@ -256,6 +256,63 @@ pub fn git_process_profile<T>(warm: impl FnOnce(), body: impl FnOnce() -> T) -> 
     (result, procs)
 }
 
+/// A repository whose `main` is a linear chain of `commits` empty commits,
+/// plus `branches` named `b00`... each pointing at the `main` commit
+/// `100 + 10 * i` from the root. Built with `git fast-import`, so 100,000
+/// commits cost seconds. Trusted, and returned as a UTF-8 path.
+pub fn build_chain(root: &Path, commits: usize, branches: usize) -> String {
+    use std::io::Write;
+    std::fs::create_dir_all(root).expect("create fixture root");
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.name", "Bench"]);
+    git(root, &["config", "user.email", "bench@example.com"]);
+    let mut stream = String::new();
+    for n in 0..commits {
+        stream.push_str("commit refs/heads/main\n");
+        stream.push_str(&format!("mark :{}\n", n + 1));
+        let message = format!("feat: change {n}\n");
+        stream.push_str(&format!(
+            "committer Bench <bench@example.com> {} +0000\n",
+            1_700_000_000 + n
+        ));
+        stream.push_str(&format!("data {}\n{message}", message.len()));
+        if n > 0 {
+            stream.push_str(&format!("from :{n}\n"));
+        }
+        stream.push('\n');
+    }
+    for i in 0..branches {
+        stream.push_str(&format!(
+            "reset refs/heads/b{i:02}\nfrom :{}\n\n",
+            100 + 10 * i
+        ));
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git fast-import");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stream.as_bytes())
+        .expect("feed fast-import");
+    let out = child.wait_with_output().expect("wait for fast-import");
+    assert!(
+        out.status.success(),
+        "fast-import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(root, &["reset", "-q", "--hard", "main"]);
+    trust_repo(root);
+    root.to_str().expect("utf-8").to_string()
+}
+
 /// The shape of an argv: the subcommand and its flags, with the `-c k=v` pairs
 /// the app puts first, the binary path and every positional (ref, path, oid)
 /// dropped, so two calls that differ only in what they name are one shape.

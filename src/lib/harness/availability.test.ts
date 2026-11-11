@@ -55,8 +55,10 @@ describe("harness permission availability", () => {
   it("routes every MANVI status surface through the same permission truth", () => {
     const components = [
       "../components/HarnessBadge.svelte",
-      "../components/ManviHarnessPane.svelte",
-      "../components/ManviOpsPanel.svelte",
+      "../components/ManviConnection.svelte",
+      // Whether Overview offers Policy activity is decided here, for WorkView and the
+      // palette (its own module, so neither pulls policyPresentation into the entry chunk).
+      "./policyActivityVisible.ts",
     ].map((path) => readFileSync(new URL(path, import.meta.url), "utf8"));
 
     for (const source of components) {

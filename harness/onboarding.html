@@ -35,6 +35,14 @@
       openTools: () => tools++,
     }});
     await settle();
+    // The gate loads the tour's component as its own chunk once the store says
+    // open; the first fetch can outlast `settle`. Wait for the dialog while the
+    // store says it is open (a gate that never mounts it still fails, by deadline).
+    const deadline = Date.now() + 8000;
+    while (get(tour).open && !document.querySelector('[aria-labelledby="product-tour-title"]') && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 40));
+    }
+    await tick();
   };
   resetHostPlatformForTests({ os: "macos", dock_hiding: true });
   if (params.get("theme") === "light") document.documentElement.classList.add("light");

@@ -56,7 +56,6 @@ const DEFERRED_VIEWS = [
   "TerminalPanel",
   "CodeStackViewer",
   "GitHubPanel",
-  "ManviOpsPanel",
   "ReflogViewer",
   "ConflictEditor",
   "PulseView",
@@ -100,8 +99,14 @@ describe("App view code splitting", () => {
       join(dirname(fileURLToPath(import.meta.url)), "lib/components/WorkspaceView.svelte"),
       "utf8",
     );
-    expect(host).toMatch(/import\s+WorkView\s+from/);
-    expect(host).toContain("<WorkView />");
+    expect(host).toMatch(/import\s+WorkOverviewPane\s+from/);
+    expect(host).toContain("<WorkOverviewPane");
+    const pane = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "lib/components/WorkOverviewPane.svelte"),
+      "utf8",
+    );
+    expect(pane).toMatch(/import\s+WorkView\s+from/);
+    expect(pane).toContain("<WorkView />");
   });
 
   /**

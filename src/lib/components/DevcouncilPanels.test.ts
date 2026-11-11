@@ -99,7 +99,9 @@ describe("AgentIntegrationPanel", () => {
 
 describe("Settings → Agents", () => {
   it("mounts both panels beside the managed-tool installer", () => {
-    expect(settings).toContain("<ExternalToolsPanel />");
+    // The installer reconnects Manvi after a Manvi install, as the retired
+    // Policy pane's compact copy of it did.
+    expect(settings).toMatch(/<ExternalToolsPanel onInstalled=\{\(tool\) => \{ if \(tool === "manvi"\) void harnessStore\.reconnect\(\); \}\} \/>/);
     expect(settings).toContain("<DevcouncilSuitePanel");
     expect(settings).toContain("<AgentIntegrationPanel");
   });

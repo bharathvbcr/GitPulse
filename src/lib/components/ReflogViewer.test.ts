@@ -30,36 +30,32 @@ describe("ReflogViewer interaction contract", () => {
     expect(row).not.toContain('<tr\n                aria-label=');
   });
 
-  it("creates a branch at an entry's commit through the guarded store action", () => {
-    expect(source).toContain("onclick={() => branchHere(entry)}");
-    expect(source).toContain("repoStore.createBranch(trimmed, entry.commit_id, target)");
+  it("leaves branch-here and reset-here to the details pane below", () => {
+    // They lived on every row here and again in the graph's row menu. The
+    // details pane sits under every Graph list and acts on whichever commit it
+    // describes, through branches/commitActions.ts (tested there).
+    expect(source).not.toContain("branchHere(");
+    expect(source).not.toContain("resetHere(");
+    expect(source).not.toContain("cmd_reset_preview");
+    expect(source).not.toContain("repoStore.createBranch(");
+    expect(source).not.toContain("repoStore.resetTo(");
+    // The selector still reaches the prompts, as the label of the selection.
+    expect(functionBody(source, "inspectEntry")).toContain("label: entry.selector");
+    const details = readFileSync(new URL("./CommitDetails.svelte", import.meta.url), "utf8");
+    expect(details).toContain("createBranchAt(selectedCommit.id, actionLabel)");
+    expect(details).toContain("resetKeepTo(selectedCommit.id, actionLabel)");
+    const row = readFileSync(new URL("./CommitRow.svelte", import.meta.url), "utf8");
+    expect(row).toContain("await createBranchAt(row.id)");
+    expect(row).toContain("await resetKeepTo(row.id)");
+    expect(row).not.toContain("askText(");
   });
 
-  it("names its repository before any prompt and reports a failure it alone can see", () => {
-    const branch = functionBody(source, "branchHere");
-    expect(branch.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
-    expect(branch.indexOf("repoStore.captureTarget()")).toBeLessThan(branch.indexOf("await askText("));
-    expect(branch).toContain("reportFailure(outcome,");
-    const reset = functionBody(source, "resetHere");
-    expect(reset.indexOf("repoStore.captureTarget()")).toBeGreaterThan(-1);
-    expect(reset.indexOf("repoStore.captureTarget()")).toBeLessThan(reset.indexOf("cmd_reset_preview"));
-    expect(reset).toContain("reportFailure(outcome,");
-    // The preview belongs to the repository it was read from.
-    expect(reset).toContain("if (repo !== $repoStore.currentPath) return;");
-  });
-
-  it("previews, confirms, and resets with --keep to the oid it previewed", () => {
-    const reset = source.slice(source.indexOf("async function resetHere"), source.indexOf("$effect(() => {"));
-    // Read before asking, ask before acting, act on what was read.
-    expect(reset.indexOf('invoke<ResetPreview>("cmd_reset_preview"')).toBeGreaterThan(-1);
-    expect(reset.indexOf("await askConfirm(")).toBeGreaterThan(reset.indexOf("cmd_reset_preview"));
-    expect(reset.indexOf('repoStore.resetTo("keep", preview.target, target)')).toBeGreaterThan(
-      reset.indexOf("await askConfirm("),
-    );
-    expect(reset).toContain("if (!confirmed) return;");
-    expect(reset).toContain("destructive: preview.leaving_total > 0");
-    expect(reset).not.toContain('resetTo("hard"');
-    expect(source).toContain("onclick={() => resetHere(entry)}");
+  it("reloads when HEAD moves in the same repository", () => {
+    // A reset from the details pane (or a commit made in the terminal) adds an
+    // entry; the list used to reload only on its own row actions.
+    expect(source).toContain("const head = $graphStore.headId;");
+    // Not on the graph's first head after a cold mount: that is a load, not a move.
+    expect(source).toContain("if (prev && prev.repo === repo && prev.head && head && prev.head !== head) void load();");
   });
 
   it("discloses when the 200-entry request ceiling may hide older history", () => {

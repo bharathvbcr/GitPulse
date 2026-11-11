@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { VIEW_TABS, type ViewTab } from "../repos/persist";
 import { REGISTERED_VIEWS, VIEW_REGISTRY, viewTabForMenuId } from "./viewRegistry";
+import { MANVI_FOCUS_LIST } from "../ui/manviFocus";
+import { SETTINGS_SECTIONS } from "../ui/settingsSections";
 
 describe("viewRegistry", () => {
   it("registers exactly the persisted view tabs, in both directions", () => {
@@ -36,14 +38,22 @@ describe("viewRegistry", () => {
   });
 
   it("keeps MANVI reachable (regression: it once existed but was missing from consumers)", () => {
-    // MANVI was its own tab, and the original regression was that it existed
-    // without any consumer listing it. It is a section of Work now, so the
-    // same regression would read as "the section exists but has no door" —
-    // hence the palette label is asserted, not just the section's presence.
-    const policy = VIEW_REGISTRY.work.sections?.find((section) => section.id === "policy");
-    expect(policy).toBeDefined();
-    expect(policy?.label).toBe("Policy");
-    expect(policy?.paletteCommand).toContain("MANVI");
+    // MANVI was its own tab, then Work's Policy section, and the original
+    // regression was that it existed without any consumer listing it. Its
+    // cards now live on the surfaces that own their subject, so the same
+    // regression would read as "a card exists but nothing navigates to it":
+    // every focus target must land on a live section or the Settings dialog.
+    const work = VIEW_REGISTRY.work.sections?.map((section) => section.id) ?? [];
+    expect(work).toEqual(["overview", "remote", "tasks"]);
+    for (const target of MANVI_FOCUS_LIST) {
+      const destination = target.destination;
+      if (destination.kind === "view") {
+        expect(VIEW_REGISTRY[destination.tab].sections?.map((s) => s.id), target.id)
+          .toContain(destination.section);
+      } else {
+        expect(SETTINGS_SECTIONS.map((s) => s.id), target.id).toContain(destination.section);
+      }
+    }
   });
 
   it("resolves every registered tab from its native menu id and nothing else", () => {

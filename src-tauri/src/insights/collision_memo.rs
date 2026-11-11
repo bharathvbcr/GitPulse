@@ -232,9 +232,7 @@ impl CollisionMemo {
         focus: &str,
         observation: &live_sessions::Observation,
     ) -> MemoizedCollision {
-        let key = std::fs::canonicalize(repo_path)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| repo_path.to_string());
+        let key = memo_key(repo_path);
         let oldest = AtomicU64::new(0);
         let (mut risk, list_age) = self.assemble(&key, repo_path, focus, observation, &oldest, &[]);
 
@@ -286,6 +284,35 @@ impl CollisionMemo {
         }
     }
 
+    /// The worktree listing of `repo_path` (`key` is its canonical path) and
+    /// its age: from memory while younger than the TTL, else read now. The
+    /// one owner of the listing memo, for the collision scan and the insights
+    /// facets alike. A memory hit skips the listing's own trust check, so a
+    /// caller that answers a peer validates the repository first.
+    pub(super) fn listing(
+        &self,
+        key: &str,
+        repo_path: &str,
+    ) -> (Result<Vec<WorktreeInfo>, CommandError>, Duration) {
+        let ttl = self.ttl;
+        self.lists.get_or_fill_retaining(
+            key,
+            ttl,
+            || worktree::list_worktrees_lite(repo_path),
+            |list| {
+                list.iter().any(|wt| {
+                    worktree::status_age(std::path::Path::new(&wt.path))
+                        .is_some_and(|age| age < ttl)
+                })
+            },
+        )
+    }
+
+    /// Throws the kept listing of `key` away.
+    pub(super) fn forget_listing(&self, key: &str) {
+        self.lists.forget(key);
+    }
+
     fn assemble(
         &self,
         key: &str,
@@ -296,17 +323,7 @@ impl CollisionMemo {
         refresh: &[String],
     ) -> (CollisionRisk, Duration) {
         let ttl = self.ttl;
-        let (listed, list_age) = self.lists.get_or_fill_retaining(
-            key,
-            ttl,
-            || worktree::list_worktrees_lite(repo_path),
-            |list| {
-                list.iter().any(|wt| {
-                    worktree::status_age(std::path::Path::new(&wt.path))
-                        .is_some_and(|age| age < ttl)
-                })
-            },
-        );
+        let (listed, list_age) = self.listing(key, repo_path);
         oldest.fetch_max(list_age.as_millis() as u64, Ordering::Relaxed);
         let list = match listed {
             Ok(list) => list,
@@ -343,7 +360,14 @@ impl CollisionMemo {
     }
 }
 
-fn shared() -> &'static CollisionMemo {
+/// The key a repository's memory is kept under: its canonical path.
+pub(super) fn memo_key(repo_path: &str) -> String {
+    std::fs::canonicalize(repo_path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| repo_path.to_string())
+}
+
+pub(super) fn shared() -> &'static CollisionMemo {
     static MEMO: OnceLock<CollisionMemo> = OnceLock::new();
     MEMO.get_or_init(|| CollisionMemo::new(TTL))
 }

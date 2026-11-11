@@ -139,8 +139,8 @@
       reset();
       scenario = { ...scenario, route: "mailbox", previewFails: true };
       type(row, "Try once more");
-      await wait(() => calls.previews.length === 1 && route(row).textContent.includes("Could not check"), "the failed preview");
-      check("A route that could not be asked for is not offered: Confirm stays off and the panel says nothing can be sent", () => confirmBtn(row).disabled && route(row).textContent.includes("nothing can be sent"));
+      await wait(() => calls.previews.length === 1 && route(row).textContent.includes("Couldn't check"), "the failed preview");
+      check("A route that could not be asked for is not offered: Confirm stays off and the panel says Nothing can be sent", () => confirmBtn(row).disabled && route(row).textContent.includes("Nothing can be sent"));
       scenario = { ...scenario, previewFails: false };
 
       // ---- the attempt changed between the preview and the send -----------------
@@ -150,7 +150,7 @@
       await wait(() => calls.previews.length === 1 && settled(row)(), "the preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the refusal");
-      check("A refused route change says this press sent nothing", () => q(row(), "send-to-agent-outcome").textContent.includes("This press sent nothing") && q(row(), "send-to-agent-outcome").dataset.tone === "error");
+      check("A refused route change says this press sent nothing", () => q(row(), "send-to-agent-outcome").textContent.includes("This press sent nothing") && q(row(), "send-to-agent-outcome").dataset.outcomeTone === "error");
       await wait(() => calls.previews.length === 2, "the route to be asked again");
       check("…and asks again instead of sending anywhere else", () => calls.previews.length === 2 && calls.sends.length === 1 && get(taskTerminalRequests).length === 0);
 
@@ -163,10 +163,10 @@
       check("A managed run's button names the managed route", () => route(row).dataset.route === "managed" && confirmBtn(row).textContent.trim() === "Send as the next turn");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the refusal");
-      check("A refusal that can be retried says it was not sent and that sending again can help", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("a turn is still in flight") && o.textContent.includes("you can send again"); });
+      check("A refusal that can be retried says it was not sent and that sending again can help", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.outcomeTone === "error" && o.textContent.includes("a turn is still in flight") && o.textContent.includes("you can send again"); });
       check("…and Confirm is still available", () => !confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Send as the next turn");
       confirmBtn(row).click();
-      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.tone === "note", "the retry");
+      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.outcomeTone === "note", "the retry");
       check("The retry carries the same request id, so it cannot send twice", () => calls.sends[1].request_id === calls.sends[0].request_id && calls.sends[1].text === calls.sends[0].text);
       check("A delivered follow-up says delivered", () => q(row(), "send-to-agent-outcome").textContent.includes("Delivered"));
 
@@ -179,11 +179,11 @@
       await wait(() => calls.previews.length === 1 && settled(row)(), "the pending-scenario preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the pending answer");
-      check("A pending outcome is not called 'nothing was sent': it may have been written", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("may have") && !/nothing was sent/i.test(o.textContent); });
+      check("A pending outcome is not called 'nothing was sent': it may have been written", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.outcomeTone === "error" && o.textContent.includes("may have") && !/nothing was sent/i.test(o.textContent); });
       check("Confirm stays armed and says it asks again about the same message", () => !confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Ask again (same message)");
       check("The note editor warns that editing starts a new message", () => { const w = q(row(), "send-to-agent-edit-warning"); return !!w && w.textContent.includes("Editing the note starts a new message"); });
       confirmBtn(row).click();
-      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.tone === "note", "the settled answer");
+      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.outcomeTone === "note", "the settled answer");
       check("Asking again reuses the request id and the text, so it cannot send twice", () => calls.sends[1].request_id === calls.sends[0].request_id && calls.sends[1].text === calls.sends[0].text);
       check("Once the same message is settled the warning goes away and the button says Sent", () => !q(row(), "send-to-agent-edit-warning") && confirmBtn(row).textContent.trim() === "Sent" && confirmBtn(row).disabled);
 
@@ -194,7 +194,7 @@
       await wait(() => calls.previews.length === 1 && settled(row)(), "the unresolved-scenario preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the unresolved answer");
-      check("An unresolved delivery is not called 'nothing was sent', and says it will not be resent", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("will not be sent again") && !/nothing was sent/i.test(o.textContent); });
+      check("An unresolved delivery is not called 'nothing was sent', and says it will not be resent", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.outcomeTone === "error" && o.textContent.includes("will not be sent again") && !/nothing was sent/i.test(o.textContent); });
       check("Confirm closes for that message without saying Sent, and the editor warns", () => confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Not sent again" && !!q(row(), "send-to-agent-edit-warning"));
       const unresolvedId = calls.sends[0].request_id;
       type(row, "A different note after the unresolved one");
@@ -213,7 +213,7 @@
       await wait(() => calls.previews.length === 1 && settled(row)(), "the timed-out-scenario preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the timed-out answer");
-      check("A managed send that errors is 'not confirmed sent', not 'nothing was sent'", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("Not confirmed sent") && !o.textContent.includes("Nothing was sent"); });
+      check("A managed send that errors is 'not confirmed sent', not 'nothing was sent'", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.outcomeTone === "error" && o.textContent.includes("Couldn't confirm the send") && !o.textContent.includes("Nothing was sent"); });
       check("…and the note editor warns that an edit is sent in addition, because the follow-up may have been written", () => { const w = q(row(), "send-to-agent-edit-warning"); return !!w && w.textContent.includes("sent in addition"); });
       check("…while Confirm stays armed for the same request id", () => !confirmBtn(row).disabled && calls.sends.length === 1);
       type(row, "An edit after the timed-out follow-up");
@@ -230,7 +230,7 @@
       await wait(() => calls.previews.length === 1 && settled(row)(), "the failing-mailbox preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the failing-mailbox answer");
-      check("A failed mailbox send is 'not confirmed sent' but raises no may-have-been-delivered warning", () => q(row(), "send-to-agent-outcome").textContent.includes("Not confirmed sent") && !q(row(), "send-to-agent-edit-warning"));
+      check("A failed mailbox send is 'not confirmed sent' but raises no may-have-been-delivered warning", () => q(row(), "send-to-agent-outcome").textContent.includes("Couldn't confirm the send") && !q(row(), "send-to-agent-edit-warning"));
 
       // ---- a Manvi that cannot take follow-ups -----------------------------------
       reset();
@@ -258,7 +258,7 @@
       type(card, "A second, different message.");
       await wait(() => calls.previews.length === 2 && settled(card)(), "the second resume preview");
       confirmBtn(card).click();
-      await wait(() => calls.sends.length === 2 && q(card(), "send-to-agent-outcome")?.dataset.tone === "error", "the second resume to be refused");
+      await wait(() => calls.sends.length === 2 && q(card(), "send-to-agent-outcome")?.dataset.outcomeTone === "error", "the second resume to be refused");
       check("A second message for a conversation already waiting to open is refused, not dropped into it", () => q(card(), "send-to-agent-outcome").textContent.includes("already waiting") && get(taskTerminalRequests).length === 1 && get(taskTerminalRequests)[0].resume.prompt === "Please rerun the failing job.");
 
       // ---- layout and accessibility ---------------------------------------------

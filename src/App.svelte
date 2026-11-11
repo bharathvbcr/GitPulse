@@ -29,6 +29,7 @@
   import { createPaneCrashReporter } from "./lib/diagnostics/paneCrash";
   import { activity } from "./lib/diagnostics/activity";
   import { get } from "svelte/store";
+  import { requestConflictsFocus } from "./lib/ui/workConflicts";
   import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
     subscribeNativeShell,
@@ -63,7 +64,8 @@
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
+  // The gate loads the tour's component only while the tour is open.
+  import ProductTour from "./lib/components/onboarding/ProductTourGate.svelte";
   import {
     dismissFirstRun,
     onboardingStore,
@@ -98,10 +100,8 @@
   const loadTerminalPanel = () => import("./lib/components/TerminalPanel.svelte");
   const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
   const loadGitHubPanel = () => import("./lib/components/GitHubPanel.svelte");
-  const loadManviOpsPanel = () => import("./lib/components/ManviOpsPanel.svelte");
   const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
-  const loadRegressionSuspectsPanel = () =>
-    import("./lib/components/RegressionSuspectsPanel.svelte");
+  const loadSuspectsList = () => import("./lib/components/SuspectsList.svelte");
   const loadRepoMapPanel = () => import("./lib/components/RepoMapPanel.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
@@ -161,6 +161,7 @@
   import { applyAccent } from "./lib/ui/accents";
   import { applyTabWidth } from "./lib/ui/codeDisplay";
   import { applyReduceMotion } from "./lib/motion/motionPreference";
+  import { installTransparencyPreference } from "./lib/ui/transparencyPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
@@ -301,7 +302,7 @@
     }, DROP_HIDE_GRACE_MS);
   }
 
-  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+  let conflictedCount = $derived($repoStore.conflictedCount);
 
   /** Total occurrences across recorded errors, for the header badge. */
   let diagnosticErrorCount = $derived(
@@ -724,6 +725,14 @@
           return;
         }
         interfaceStore.setGlobalSurface("repository");
+        // The tray, the status popover's Conflicts card and its `3` key all
+        // send Overview while a merge is stopped; Overview leads with the
+        // editor then, so land on it rather than wherever the rows were left.
+        const operation = $repoStore.operation;
+        if (tab === "work" && section === "overview" &&
+          (operation.operation !== null || operation.probeFailed || get(repoStore.conflictedCount) > 0)) {
+          requestConflictsFocus();
+        }
         repoStore.setActiveTab(tab, section);
       },
       shortcuts: openShortcuts,
@@ -1003,6 +1012,7 @@
     applyAccent($interfaceStore.accent, $themeStore);
   });
 
+  void installTransparencyPreference();
   $effect(() => {
     applyReduceMotion($interfaceStore.reduceMotion);
   });
@@ -1220,7 +1230,6 @@
                   loadConflict={loadConflictEditor}
                   loadGitHub={loadGitHubPanel}
                   loadStack={loadCodeStackViewer}
-                  loadManvi={loadManviOpsPanel}
                 />
               {:else if $repoStore.activeTab === "code"}
                 <LazyView
@@ -1232,7 +1241,7 @@
                 <LazyView
                   load={loadHistoryView}
                   name="History"
-                  props={{ loadReflog: loadReflogViewer, loadSuspects: loadRegressionSuspectsPanel }}
+                  props={{ loadReflog: loadReflogViewer, loadSuspects: loadSuspectsList }}
                 />
               {:else if $repoStore.activeTab === "insights"}
                 <InsightsView
@@ -1330,7 +1339,7 @@
          than unmounted for the same reason the terminal is. -->
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
-        <LazyView load={loadFleetView} name="the Fleet dashboard" />
+        <LazyView load={loadFleetView} name="the Fleet dashboard" props={{ active: fleetOpen }} />
       </div>
     </svelte:boundary>
   {/if}

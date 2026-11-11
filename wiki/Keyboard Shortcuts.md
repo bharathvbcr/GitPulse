@@ -28,7 +28,7 @@ macOS listed first; Windows / Linux in the second column.
 | Fleet | `⌘⇧F` | `Ctrl+Shift+F` |
 | Terminal dock | `⌃\`` | `Ctrl+\`` |
 
-Sections (Work: Overview/Resolve/Remote/Policy/Tasks; Code: Explorer/Blame/Map; History: Graph/Diff/Suspects; Insights: Pulse/Coverage/Health/Storage) are switched with `⌥` + the section's digit while that view is active, or by name in the command palette.
+Sections (Work: Overview/Remote/Tasks; Code: Explorer/Map; History: Graph/Diff; Insights: Pulse/Coverage/Health/Storage) are switched with `⌥` + the section's digit while that view is active, or by name in the command palette.
 
 ## Fleet (focus in the grid, not in a text field)
 

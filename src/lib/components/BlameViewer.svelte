@@ -5,7 +5,8 @@
   import { rowHeight } from "../ui/density";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
-  import { CornerLeftUp, FileCode, Search, Undo2, X } from "@lucide/svelte";
+  import { Bug, CornerLeftUp, FileCode, Search, Undo2, X } from "@lucide/svelte";
+  import { openSuspectsFor } from "../codeintel/openSuspects";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
@@ -405,6 +406,19 @@
       <span data-blame-path class="truncate font-mono text-xs text-textPrimary" title={filePath || undefined}>
         {filePath || "No file selected"}
       </span>
+      {#if filePath}
+        <!-- Blame says who last touched each line; Suspects asks which recent
+             commit could have broken this file, by what the call graph reaches. -->
+        <button
+          type="button"
+          data-blame-suspects
+          onclick={() => openSuspectsFor(filePath)}
+          class="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md font-sans text-meta text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          title="Find suspects for this file: which commit since the last known good could have broken it, ranked by what the call graph reaches"
+        >
+          <Bug size={12} /> Suspects
+        </button>
+      {/if}
       {#if atRevision}
         <span
           data-blame-revision

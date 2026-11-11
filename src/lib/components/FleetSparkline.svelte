@@ -84,7 +84,7 @@
   >
     {#each heights as fraction, index (index)}
       <span
-        class="rounded-t-[1px] {bars[index] > 0 ? 'bg-accent' : 'bg-border/60'}"
+        class="rounded-t-(--gp-r-xs) {bars[index] > 0 ? 'bg-accent' : 'bg-edgeSoft'}"
         style="width: {barWidth}px; height: {Math.max(1, Math.round(fraction * height))}px"
       ></span>
     {/each}

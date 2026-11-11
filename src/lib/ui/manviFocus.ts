@@ -1,101 +1,94 @@
 import { get, writable } from "svelte/store";
 
 /**
- * The MANVI view's two panes, and where a deep link into it lands.
+ * Where a Manvi deep link lands.
  *
- * The view is one tab with two panes and several stacked sections, so
- * "open MANVI" is not an answer to "show me this model" — it drops the reader
- * on the Ops pane with the subject of their click somewhere below the fold on
- * the other pane. Every control that navigates there names a target here
- * instead, and the pane switch, the section anchor, the tooltip copy and the
- * contract test all derive from this one catalog: adding a target means adding
- * an entry and its anchor, and a target without an anchor fails the test
- * rather than silently landing at the top.
+ * Manvi used to be one Work section with two panes. Its cards now live with
+ * the subject they act on: configuration in Settings → Agents, branch and tag
+ * cleanup and the policy journal as collapsed disclosures on Work → Overview,
+ * issues, releases and outgoing commits on Work → Remote. A control that says
+ * "open Manvi" therefore has to name a card, not a page — the reader's subject
+ * is one card among several wherever it landed.
+ *
+ * Every control that navigates names a target here, and the destination, the
+ * anchor, the tooltip copy and the contract test all derive from this one
+ * catalog: adding a target means adding an entry and its anchor, and a target
+ * without an anchor fails the test rather than silently landing at the top.
  */
-export const MANVI_PANE_IDS = ["ops", "harness"] as const;
-export type ManviPane = (typeof MANVI_PANE_IDS)[number];
-
-export interface ManviPaneRegistration {
-  readonly id: ManviPane;
-  /** Segmented-control label, and the middle term of every deep-link tooltip. */
-  readonly label: string;
-  /** One line under the view heading saying what the pane covers. */
-  readonly summary: string;
-}
-
-export const MANVI_PANES: Readonly<Record<ManviPane, ManviPaneRegistration>> = {
-  ops: {
-    id: "ops",
-    label: "Ops",
-    summary:
-      "Guarded repository operations, release readiness, and issue monitoring in one place.",
-  },
-  harness: {
-    id: "harness",
-    label: "Harness & AI",
-    summary:
-      "Harness connection, local model servers, branch naming, and the agent activity journal.",
-  },
-};
-
-/** Registrations in segmented-control order. */
-export const MANVI_PANE_LIST: readonly ManviPaneRegistration[] =
-  Object.values(MANVI_PANES);
-
-export const MANVI_FOCUS_IDS = [
-  "harness",
-  "model",
-  "activity",
-  "cleanup",
-] as const;
+export const MANVI_FOCUS_IDS = ["harness", "model", "activity", "cleanup"] as const;
 export type ManviFocusId = (typeof MANVI_FOCUS_IDS)[number];
+
+/**
+ * The surface that renders a target's card. Settings is a dialog, not a view,
+ * so the two kinds are navigated differently and consumed by different
+ * components; `takeManviFocusFor` is how each consumer takes only its own.
+ */
+export type ManviFocusDestination =
+  | { readonly kind: "settings"; readonly section: "agents"; readonly label: "Settings → Agents" }
+  | {
+      readonly kind: "view";
+      readonly tab: "work";
+      readonly section: "overview";
+      readonly label: "Work → Overview";
+    };
+
+export type ManviFocusKind = ManviFocusDestination["kind"];
+
+const SETTINGS_AGENTS: ManviFocusDestination = {
+  kind: "settings",
+  section: "agents",
+  label: "Settings → Agents",
+};
+const WORK_OVERVIEW: ManviFocusDestination = {
+  kind: "view",
+  tab: "work",
+  section: "overview",
+  label: "Work → Overview",
+};
 
 export interface ManviFocusTarget {
   readonly id: ManviFocusId;
-  /** Pane that owns the section. */
-  readonly pane: ManviPane;
-  /** The section's heading, so a tooltip can promise exactly where it lands. */
+  readonly destination: ManviFocusDestination;
+  /** The card's heading, so a tooltip can promise exactly where it lands. */
   readonly label: string;
 }
 
-export const MANVI_FOCUS_TARGETS: Readonly<
-  Record<ManviFocusId, ManviFocusTarget>
-> = {
-  harness: { id: "harness", pane: "harness", label: "MANVI harness" },
-  model: { id: "model", pane: "harness", label: "Local model servers" },
-  activity: { id: "activity", pane: "harness", label: "Agent activity" },
-  cleanup: { id: "cleanup", pane: "ops", label: "Branch cleanup" },
+export const MANVI_FOCUS_TARGETS: Readonly<Record<ManviFocusId, ManviFocusTarget>> = {
+  harness: { id: "harness", destination: SETTINGS_AGENTS, label: "Manvi policy" },
+  model: { id: "model", destination: SETTINGS_AGENTS, label: "Local model servers" },
+  activity: { id: "activity", destination: WORK_OVERVIEW, label: "Policy activity" },
+  cleanup: { id: "cleanup", destination: WORK_OVERVIEW, label: "Branch and tag cleanup" },
 };
 
 /** Targets in declaration order. */
-export const MANVI_FOCUS_LIST: readonly ManviFocusTarget[] =
-  Object.values(MANVI_FOCUS_TARGETS);
+export const MANVI_FOCUS_LIST: readonly ManviFocusTarget[] = Object.values(MANVI_FOCUS_TARGETS);
 
 /**
- * DOM id of a target's section. Derived rather than written twice, so the
- * anchor a link scrolls to and the anchor a section declares cannot drift.
+ * DOM id of a target's card. Derived rather than written twice, so the anchor
+ * a link scrolls to and the anchor a card declares cannot drift.
  */
 export function manviSectionId(id: ManviFocusId): string {
   return `manvi-section-${id}`;
 }
 
 /**
- * The tooltip line a deep-linking control appends. Naming the pane and section
- * is the point: two chips that both said "open the MANVI view" were telling
- * the truth and still left the reader hunting.
+ * The tooltip line a deep-linking control appends. Naming the surface and the
+ * card is the point: chips that said "open the Manvi view" were telling the
+ * truth and still left the reader hunting.
  */
 export function manviFocusHint(id: ManviFocusId): string {
   const target = MANVI_FOCUS_TARGETS[id];
-  return `Opens MANVI → ${MANVI_PANES[target.pane].label} → ${target.label}.`;
+  return `Opens ${target.destination.label} → ${target.label}.`;
 }
 
 /**
  * One pending deep link, handed from the control that was clicked to the
- * MANVI view, which mounts lazily and therefore cannot be called directly.
+ * surface that renders the card, which mounts lazily and therefore cannot be
+ * called directly.
  */
 const pendingFocus = writable<ManviFocusId | null>(null);
 
-/** Read-only view for the pane that consumes requests. */
+/** Read-only view for the surfaces that consume requests. */
 export const manviFocusRequest = { subscribe: pendingFocus.subscribe };
 
 export function requestManviFocus(id: ManviFocusId): void {
@@ -104,11 +97,27 @@ export function requestManviFocus(id: ManviFocusId): void {
 
 /**
  * Takes the pending request and clears it. Clearing on read is what stops a
- * request from firing again the next time the view is opened for an unrelated
- * reason — a scroll jump nobody asked for reads as a bug, not a shortcut.
+ * request from firing again the next time the surface is opened for an
+ * unrelated reason — a scroll jump nobody asked for reads as a bug, not a
+ * shortcut.
  */
 export function takeManviFocus(): ManviFocusId | null {
   const requested = get(pendingFocus);
   if (requested !== null) pendingFocus.set(null);
+  return requested;
+}
+
+/**
+ * Takes the pending request only when its card lives on `kind`'s surface.
+ *
+ * Settings and Overview can both be mounted at once (the dialog opens over the
+ * view), and each subscribes to the same channel. A consumer that took every
+ * request would swallow the other's: Overview clearing a "model" request
+ * before Settings had mounted would leave Settings opening on Appearance.
+ */
+export function takeManviFocusFor(kind: ManviFocusKind): ManviFocusId | null {
+  const requested = get(pendingFocus);
+  if (requested === null || MANVI_FOCUS_TARGETS[requested].destination.kind !== kind) return null;
+  pendingFocus.set(null);
   return requested;
 }

@@ -64,10 +64,10 @@ describe("deltaTone", () => {
   it("treats down as good only where down is good", () => {
     // Fewer vulnerabilities is an improvement; less coverage is not. Reading
     // the sign alone would colour a coverage drop green.
-    expect(deltaTone(delta(-5), "lower")).toContain("emerald");
-    expect(deltaTone(delta(-5), "higher")).toContain("amber");
-    expect(deltaTone(delta(5), "higher")).toContain("emerald");
-    expect(deltaTone(delta(5), "lower")).toContain("amber");
+    expect(deltaTone(delta(-5), "lower")).toBe("text-ok");
+    expect(deltaTone(delta(-5), "higher")).toBe("text-warn");
+    expect(deltaTone(delta(5), "higher")).toBe("text-ok");
+    expect(deltaTone(delta(5), "lower")).toBe("text-warn");
   });
 
   it("stays neutral where neither direction is a verdict", () => {

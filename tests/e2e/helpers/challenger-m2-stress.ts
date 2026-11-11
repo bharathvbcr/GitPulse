@@ -9,13 +9,9 @@ import {
   type StashEntry,
 } from "../../../src/lib/stores/repoStore";
 import { memoryStorage } from "../../../src/lib/repos/persist";
-import {
-  CentralHeartbeatDispatcher,
-  type HeartbeatTick,
-} from "../../../src/lib/runtime/adaptiveTimer";
 
 console.log("==================================================================");
-console.log("STARTING EMPIRICAL CHALLENGER STRESS HARNESS (Features 6 & 8)");
+console.log("STARTING EMPIRICAL CHALLENGER STRESS HARNESS (Feature 6)");
 console.log("==================================================================");
 
 let totalAssertions = 0;
@@ -281,200 +277,16 @@ async function testHydrationFaultIsolation() {
   console.log("  ✓ Decoupled child process invocation counts strictly enforced (1:0:0).");
 }
 
-// ============================================================================
-// PART 2: STRESS TESTING CentralHeartbeatDispatcher UNDER HIGH LOAD & RAPID LIFECYCLES
-// ============================================================================
-console.log("\n--- [PART 2] Stress Testing CentralHeartbeatDispatcher ---");
-
-async function testDispatcherStress() {
-  const dispatcher = new CentralHeartbeatDispatcher();
-
-  // Test 1: 10,000 rapid subscriber lifecycle iterations
-  console.log("  Running 10,000 rapid subscriber lifecycle iterations (register, step, unsub)...");
-  const tStart = performance.now();
-  let baseTime = Date.now();
-  const unsubs: (() => void)[] = [];
-  let tickCount = 0;
-
-  for (let i = 0; i < 10000; i++) {
-    const unsub = dispatcher.subscribe(() => {
-      tickCount++;
-    }, 1000);
-    unsubs.push(unsub);
-
-    // Every 50 iterations, step virtual time and unsubscribe half of existing
-    if (i % 50 === 0) {
-      baseTime += 1000;
-      dispatcher.step(baseTime);
-      const half = unsubs.splice(0, 25);
-      for (const u of half) u();
-    }
-  }
-
-  // Cleanup all remaining
-  for (const u of unsubs) u();
-  assert(dispatcher.subscriberCount() === 0, `All subscribers cleaned up, count=${dispatcher.subscriberCount()}`);
-  const tElapsed = performance.now() - tStart;
-  console.log(`  ✓ 10,000 subscriber lifecycle iterations completed in ${tElapsed.toFixed(2)}ms (subscribers: 0, ticks: ${tickCount}).`);
-
-  // Test 2: 1,000 concurrent subscribers across 4 cadence intervals for 100s virtual time (1,000 steps)
-  console.log("  Running 1,000 concurrent subscribers over 100s virtual time (1,000 steps @ 100ms)...");
-  const s2 = new CentralHeartbeatDispatcher();
-  const intervals = [500, 1000, 2500, 10000];
-  const countsPerInterval = 250;
-  type SubStat = { interval: number; ticks: number; lastTickIndex: number };
-  const stats: SubStat[] = [];
-
-  for (const interval of intervals) {
-    for (let i = 0; i < countsPerInterval; i++) {
-      const stat: SubStat = { interval, ticks: 0, lastTickIndex: -1 };
-      stats.push(stat);
-      s2.subscribe((tick: HeartbeatTick) => {
-        stat.ticks++;
-        stat.lastTickIndex = tick.tickIndex;
-      }, interval);
-    }
-  }
-  assert(s2.subscriberCount() === 1000, "1,000 subscribers registered");
-
-  // Step virtual time across 100,000ms in 100ms increments
-  let simTime = Date.now();
-  let totalDispatched = 0;
-  for (let stepIdx = 0; stepIdx < 1000; stepIdx++) {
-    simTime += 100;
-    const d = s2.step(simTime);
-    totalDispatched += d;
-  }
-
-  // Verify tick math:
-  // 500ms: 100,000 / 500 = 200 ticks
-  // 1000ms: 100,000 / 1000 = 100 ticks
-  // 2500ms: 100,000 / 2500 = 40 ticks
-  // 10000ms: 100,000 / 10000 = 10 ticks
-  // Total callbacks = 250*200 + 250*100 + 250*40 + 250*10 = 50000 + 25000 + 10000 + 2500 = 87,500
-  for (const stat of stats) {
-    if (stat.interval === 500) assert(stat.ticks === 200, `500ms sub has 200 ticks, got ${stat.ticks}`);
-    if (stat.interval === 1000) assert(stat.ticks === 100, `1000ms sub has 100 ticks, got ${stat.ticks}`);
-    if (stat.interval === 2500) assert(stat.ticks === 40, `2500ms sub has 40 ticks, got ${stat.ticks}`);
-    if (stat.interval === 10000) assert(stat.ticks === 10, `10000ms sub has 10 ticks, got ${stat.ticks}`);
-  }
-  assert(totalDispatched === 87500, `Total callbacks dispatched must be 87,500, got ${totalDispatched}`);
-  s2.dispose();
-  assert(s2.subscriberCount() === 0, "s2 disposed cleanly");
-  console.log(`  ✓ 1,000 subscribers dispatched 87,500 callbacks with 100% mathematical accuracy.`);
-
-  // Test 3: Adversarial error storm (200 crashing subscribers + 800 healthy subscribers)
-  console.log("  Running adversarial error storm (200 throwing subscribers + 800 healthy subscribers)...");
-  const s3 = new CentralHeartbeatDispatcher();
-  let healthyTicks = 0;
-  let errorCount = 0;
-
-  for (let i = 0; i < 200; i++) {
-    s3.subscribe(() => {
-      errorCount++;
-      throw new Error(`Adversarial explosion from subscriber ${i}`);
-    }, 1000);
-  }
-  for (let i = 0; i < 800; i++) {
-    s3.subscribe(() => {
-      healthyTicks++;
-    }, 1000);
-  }
-
-  let stormTime = Date.now();
-  for (let step = 1; step <= 10; step++) {
-    stormTime += 1000;
-    let thrown = false;
-    try {
-      const dispatched = s3.step(stormTime);
-      assert(dispatched === 1000, `Step ${step}: all 1000 subscribers evaluated`);
-    } catch (e) {
-      thrown = true;
-    }
-    assert(!thrown, `Step ${step}: step() must not throw even when 200 subscribers throw`);
-  }
-
-  assert(healthyTicks === 8000, `All 800 healthy subscribers executed 10 times (got ${healthyTicks})`);
-  assert(errorCount === 2000, `All 200 failing subscribers attempted 10 times (got ${errorCount})`);
-  s3.dispose();
-  console.log("  ✓ Adversarial error storm fault isolation confirmed: 0 leaked exceptions, 8,000 healthy ticks preserved.");
-
-  // Test 4: Dynamic modification during callback execution (self-unsubscribing)
-  console.log("  Running self-unsubscribing dynamic lifecycle during callback...");
-  const s4 = new CentralHeartbeatDispatcher();
-  let selfUnsubCount = 0;
-  const unsubs4: (() => void)[] = [];
-  for (let i = 0; i < 100; i++) {
-    const unsub = s4.subscribe(() => {
-      selfUnsubCount++;
-      // Unsubscribe self during callback!
-      unsub();
-    }, 1000);
-    unsubs4.push(unsub);
-  }
-
-  assert(s4.subscriberCount() === 100, "100 subscribers before step");
-  let t4 = Date.now();
-  s4.step(t4 + 1000);
-  assert(selfUnsubCount === 100, `All 100 fired and self-unsubscribed (got ${selfUnsubCount})`);
-  assert(s4.subscriberCount() === 0, `Subscriber count is 0 after all self-unsubscribed (got ${s4.subscriberCount()})`);
-
-  // Next step should dispatch 0
-  const dNext = s4.step(t4 + 2000);
-  assert(dNext === 0, "No remaining subscribers dispatched");
-  s4.dispose();
-  console.log("  ✓ Self-unsubscribing dynamic lifecycle verified.");
-
-  // Test 5: Adaptive Throttling Determinism
-  console.log("  Testing adaptive throttling interval doubling determinism...");
-  const s5 = new CentralHeartbeatDispatcher();
-  let sub1k = 0;
-  let sub2k = 0;
-  s5.subscribe(() => sub1k++, 1000);
-  s5.subscribe(() => sub2k++, 2000);
-
-  let t5 = Date.now();
-  // Step 1: normal (1s elapsed)
-  s5.step(t5 + 1000);
-  assert(sub1k === 1 && sub2k === 0, "Normal step at 1s");
-
-  // Step 2: normal (2s elapsed)
-  s5.step(t5 + 2000);
-  assert(sub1k === 2 && sub2k === 1, "Normal step at 2s");
-
-  // Enable throttling: effective intervals become 2s (for 1k) and 4s (for 2k)
-  s5.setThrottled(true);
-
-  // Step at 3s: 1s elapsed since 2s -> neither fires under throttled mode
-  s5.step(t5 + 3000);
-  assert(sub1k === 2 && sub2k === 1, "Throttled step at 3s: neither fired");
-
-  // Step at 4s: 2s elapsed since 2s -> 1k fires (interval doubled to 2s), 2k still waiting (needs 4s)
-  s5.step(t5 + 4000);
-  assert(sub1k === 3 && sub2k === 1, "Throttled step at 4s: 1k fired, 2k waiting");
-
-  // Step at 6s: 4s elapsed since 2s -> both fire
-  s5.step(t5 + 6000);
-  assert(sub1k === 4 && sub2k === 2, "Throttled step at 6s: both fired");
-
-  // Disable throttling: recovery to 1x
-  s5.setThrottled(false);
-  s5.step(t5 + 7000);
-  assert(sub1k === 5, "Unthrottled recovery step at 7s: 1k fired after 1s");
-
-  s5.dispose();
-  console.log("  ✓ Adaptive throttling determinism verified.");
-}
-
 async function main() {
   await testHydrationFaultIsolation();
-  await testDispatcherStress();
   console.log("\n==================================================================");
   console.log(`ALL EMPIRICAL CHALLENGES PASSED CLEANLY (${totalAssertions} assertions verified)`);
   console.log("==================================================================");
 }
 
-main().catch((err) => {
+// The stores it builds keep their poll timers alive; without this the script
+// printed its verdict and then never exited.
+main().then(() => process.exit(0), (err) => {
   console.error("Fatal stress test failure:", err);
   process.exit(1);
 });

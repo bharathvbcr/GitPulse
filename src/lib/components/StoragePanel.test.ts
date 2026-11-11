@@ -40,7 +40,7 @@ describe("StoragePanel source contracts & async hygiene", () => {
     // The honesty rule: a refresh that failed, or a repository that changed
     // since the scan, keeps the numbers on screen but must label them.
     expect(source).toContain("describeStaleness(snap, Date.now())");
-    expect(source).toContain("out of date");
+    expect(source).toContain("Out of date");
   });
 
   it("coalesces scans into history and supports clearing per repo", () => {
@@ -74,22 +74,23 @@ describe("StoragePanel source contracts & async hygiene", () => {
   it("formats hygiene gaps and surfaces unignored / tracked issues", () => {
     expect(source).toContain("artifact.unignored");
     expect(source).toContain("artifact.tracked_files");
-    expect(source).toContain("not ignored");
+    expect(source).toContain("Not ignored");
     expect(source).toContain("committed");
   });
 
-  it("provides single-click navigation to MANVI for merged-branch cleanup", () => {
-    expect(source).toContain('repoStore.setActiveTab("work", "policy")');
-    expect(source).toContain("Clean up in MANVI");
+  it("provides single-click navigation to branch cleanup for merged branches", () => {
+    expect(source).toContain(`openManviFocus("cleanup")`);
+    expect(source).toContain(`manviFocusHint("cleanup")`);
+    expect(source).toContain("Clean up branches");
   });
 
   it("honestly flags truncated/budgeted scans instead of presenting as complete", () => {
     expect(source).toContain("report.scan.truncated");
-    expect(source).toContain("partial scan");
+    expect(source).toContain("Partial scan");
     expect(source).toContain("Scan hit a safety budget or skipped unreadable locations; totals are floors.");
     expect(source).toContain("report.scan.unreadable > 0");
     expect(source).toContain("report.scan.unaudited > 0");
-    expect(source).toContain("failed to read and are not counted");
+    expect(source).toContain("couldn't be read and are not counted");
   });
 });
 
@@ -115,5 +116,33 @@ describe("StoragePanel flicker contracts", () => {
 
   it("gates its loading placeholder on having no data yet", () => {
     expect(source).toContain("{#if loading && !report}");
+  });
+});
+
+describe("StoragePanel design-language contracts", () => {
+  it("headlines a failed scan with describeFailure, never the raw backend text", () => {
+    expect(source).toContain('describeFailure({ verb: "scan", object: "disk usage" }, errorMsg)');
+    expect(source).toContain("{failure.headline}");
+    expect(source).not.toMatch(/>\s*\{errorMsg\}\s*</);
+  });
+
+  it("shows a branch summary that could not run as an unknown notice, not as counts", () => {
+    // A failed summary is "couldn't check", offered with a Rescan, and must
+    // not fall through to the 0 / 0 / 0 row that reads as a clean repository.
+    expect(source).toContain('unknownState("branch weight", report.branches.error)');
+    expect(source).toContain('data-tone="unknown"');
+    expect(source).toContain("{unknown.actionLabel}");
+  });
+
+  it("says there is no report rather than inventing numbers when no repository is open", () => {
+    const { body } = render(StoragePanel);
+    expect(body).toContain("No storage report yet");
+    expect(body).not.toContain("0 B");
+  });
+
+  it("uses role tokens and the type scale, with no palette colors or pixel sizes", () => {
+    expect(source).not.toMatch(/\b(?:text|bg|border)-(?:amber|rose|sky|emerald)-\d/);
+    expect(source).not.toMatch(/text-\[\d+px\]/);
+    expect(source).not.toMatch(/\bborder-[tblr]\b/);
   });
 });

@@ -14,6 +14,16 @@ export interface DiffSelectionDeps {
   openEpoch(): number;
 }
 
+/**
+ * `send` with `signal` on every call it makes. The command stays the caller's
+ * literal (each spec writes its own, see {@link DiffSelectionSpec.read}); this
+ * only adds the way for the caller to leave.
+ */
+const signedBy =
+  (send: InvokeFn, signal: AbortSignal): InvokeFn =>
+  (cmd, args) =>
+    send(cmd, args, { signal });
+
 /** One diff the reader can ask for: which command reads it, and what it selects. */
 export interface DiffSelectionSpec {
   /**
@@ -55,6 +65,12 @@ export interface DiffSelectionSpec {
  */
 export function createDiffSelection(deps: DiffSelectionDeps) {
   const selectionGeneration = beginGeneration();
+  /**
+   * The signal of the selection now in flight. A newer selection (or a
+   * `supersede`) aborts it, which is what lets `invoke` tell the backend that
+   * the older read has no caller left and stop its git child.
+   */
+  let inFlight: AbortController | null = null;
 
   /**
    * Marks a diff fetch as in flight, but only when the target actually moves.
@@ -105,6 +121,8 @@ export function createDiffSelection(deps: DiffSelectionDeps) {
   return {
     /** Supersedes every in-flight selection, for callers that replace the selection themselves. */
     supersede(): number {
+      inFlight?.abort();
+      inFlight = null;
       return selectionGeneration.next();
     },
 
@@ -136,8 +154,21 @@ export function createDiffSelection(deps: DiffSelectionDeps) {
         spec.history === "always" || (spec.history === "unlessNavigated" && navigationEpoch === deps.openEpoch())
           ? { activeTab: "history" as const, viewSections: { ...current.viewSections, history: "diff" } }
           : {};
+      const controller = new AbortController();
+      const previous = inFlight;
+      inFlight = controller;
+      const signed = signedBy(deps.invoke, controller.signal);
       try {
-        const diff = await spec.read(deps.invoke, session.path, ignoreWhitespace);
+        let pending: Promise<DiffPayload>;
+        try {
+          pending = spec.read(signed, session.path, ignoreWhitespace);
+        } finally {
+          // After the newer read is issued, never before: a newer selection of
+          // the same diff joins the older read instead of starting its own,
+          // and the older one is stopped only if nobody else waits for it.
+          previous?.abort();
+        }
+        const diff = await pending;
         if (!selectionGeneration.isCurrent(token)) return;
         deps.applyToSession(session.id, generation, (current) => ({
           ...target,

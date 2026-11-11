@@ -57,6 +57,9 @@
   import EmptyState from "../EmptyState.svelte";
   import HealthSection from "./HealthSection.svelte";
   import HealthPreviewToggle from "./HealthPreviewToggle.svelte";
+  import HealthTable from "./HealthTable.svelte";
+  import Skeleton from "../Skeleton.svelte";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import { HEALTH_PREVIEW_ROWS } from "../../health/sections";
   import type { SectionCount } from "../../health/counts";
   import type { HealthTone } from "../../health/summary";
@@ -233,7 +236,7 @@
     } catch {
       // Fall through to the toast. A failed import must not reject the click.
     }
-    toastStore.error("Could not copy the secrets scan error");
+    toastStore.error(describeFailure({ verb: "copy", object: "the secrets scan error" }, "").headline);
   }
 
   async function reveal(path: string) {
@@ -242,27 +245,35 @@
     try {
       await revealInFileManager(repo, path);
     } catch (err) {
-      toastStore.error(`Could not reveal ${path}: ${formatError(err)}`);
+      const failure = describeFailure({ verb: "reveal", object: path }, err);
+      toastStore.error(failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline);
     }
   }
 
-  const toneClass = {
-    ok: "border-emerald-500/30 bg-emerald-500/10 text-emerald-100",
-    warn: "border-amber-500/30 bg-amber-500/10 text-amber-100",
-    danger: "border-rose-500/30 bg-rose-500/10 text-rose-100",
+  /** A location's tone (secrets/summary.ts vocabulary) as a `gp-chip` role. */
+  const chipTone = {
+    danger: "danger",
+    warn: "warn",
+    muted: "neutral",
   } as const;
 
-  const badgeClass = {
-    danger: "bg-rose-500/15 text-rose-200 border-rose-500/30",
-    warn: "bg-amber-500/15 text-amber-200 border-amber-500/30",
-    muted: "bg-surface/80 text-textMuted border-border/60",
-  } as const;
+  const SCAN_FAILED = describeFailure({ verb: "scan", object: "the working tree for secrets" }, "").headline;
+  const RESCAN_FAILED = describeFailure({ verb: "rescan", object: "the working tree for secrets" }, "").headline;
+
+  const FINDING_COLUMNS = Object.freeze([
+    { label: "Location", width: "w-28" },
+    { label: "File" },
+    { label: "Rule", width: "w-48" },
+    { label: "Confidence", width: "w-24" },
+    { label: "Actions", width: "w-10", hideLabel: true },
+  ]);
 </script>
 
 {#snippet copyErrorButton(text: string, label: string)}
   <button
     type="button"
-    class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
+    class="gp-btn shrink-0"
+    data-size="sm"
     title={label}
     aria-label={label}
     onclick={() => void copyFailure(text)}
@@ -281,12 +292,12 @@
   {#snippet actions()}
     <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
       {#if report}
-        <span class="text-[11px] text-textMuted" data-testid="secrets-meta">
-          {#if !report.ok}<span class="text-amber-300">Unavailable</span>{/if}
+        <span class="text-meta text-textMuted" data-testid="secrets-meta">
+          {#if !report.ok}<span class="text-warn">Unavailable</span>{/if}
           {#if scannedAgo}{report.ok ? "" : "· "}scanned {scannedAgo}{/if}
           {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
           {#if report.kingfisher_version_rejected}<span
-              class="text-amber-300"
+              class="text-warn"
               title="The scan output named a version that was refused as unsafe to display.">
               · scan-reported version refused</span
             >{/if}
@@ -295,7 +306,8 @@
       {#if onagent && $repoStore.currentPath}
         <button
           type="button"
-          class="gp-btn py-1! px-2.5! text-xs! inline-flex items-center gap-1.5"
+          class="gp-btn"
+          data-size="sm"
           title="Choose a coding agent for these findings in the agent bar above"
           onclick={() => onagent?.()}
         >
@@ -305,7 +317,8 @@
       {/if}
       <button
         type="button"
-        class="gp-btn py-1! px-2.5! text-xs! inline-flex items-center gap-1.5"
+        class="gp-btn"
+        data-size="sm"
         onclick={() => scan()}
         disabled={loading || !$repoStore.currentPath}
         aria-label="Rescan secrets"
@@ -324,28 +337,28 @@
   {#if !$repoStore.currentPath}
     <p class="text-textMuted">No repository open. Open one to scan its working tree with Kingfisher.</p>
   {:else if loading && !report}
-    <div class="flex items-center gap-2 text-textMuted text-xs px-1 py-3">
-      <LoaderCircle size={14} class="animate-spin" />
-      Scanning working tree…
+    <!-- A full Kingfisher scan outlasts a second, so the wait is a skeleton;
+         the spinner lives only inside the busy Rescan button above. -->
+    <div class="space-y-2">
+      <p class="text-textMuted">Scanning working tree…</p>
+      <Skeleton variant="text" count={3} height="1.5rem" />
     </div>
   {:else if errorMsg && !report}
-    <div
-      class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200 flex items-start gap-2"
-      role="alert"
-    >
-      <AlertTriangle size={14} class="shrink-0 mt-0.5" />
-      <span class="select-text min-w-0 flex-1">{errorMsg}</span>
+    <div class="gp-notice" data-tone="danger" role="alert">
+      <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+      <span class="select-text min-w-0 flex-1">
+        <span class="font-medium">{SCAN_FAILED}</span>
+        {errorMsg}
+      </span>
       {@render copyErrorButton(errorMsg ?? "", "Copy secrets scan error")}
     </div>
   {:else if report && headline}
     {#if errorMsg}
-      <div
-        class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200 flex items-start gap-2"
-        role="alert"
-      >
-        <AlertTriangle size={14} class="shrink-0 mt-0.5" />
+      <div class="gp-notice" data-tone="danger" role="alert">
+        <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
         <span class="select-text min-w-0 flex-1">
-          Rescan failed: {errorMsg}
+          <span class="font-medium">{RESCAN_FAILED}</span>
+          {errorMsg}
           {#if scannedAgo}Showing the scan from {scannedAgo}.{/if}
         </span>
         {@render copyErrorButton(errorMsg ?? "", "Copy rescan error")}
@@ -353,15 +366,15 @@
     {/if}
 
     <div
-      class="rounded-lg border px-3 py-2 text-xs flex items-start gap-2 {toneClass[headline.tone]}"
+      class="gp-notice"
       role={headline.tone === "ok" ? "status" : "alert"}
       data-testid="secrets-verdict"
       data-tone={headline.tone}
     >
       {#if headline.tone === "ok"}
-        <ShieldCheck size={14} class="shrink-0 mt-0.5" />
+        <ShieldCheck size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {:else}
-        <AlertTriangle size={14} class="shrink-0 mt-0.5" />
+        <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {/if}
       <div class="space-y-1 min-w-0 flex-1">
         <p class="font-medium">
@@ -372,7 +385,7 @@
         {#if headline.detail}<p class="opacity-80 select-text">{headline.detail}</p>{/if}
         {#if report.diagnostic}
           <pre
-            class="whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed select-text opacity-90"
+            class="whitespace-pre-wrap wrap-break-word font-mono text-micro leading-relaxed select-text opacity-90"
             data-testid="secrets-diagnostic">{report.diagnostic}</pre>
         {/if}
         {#if cappedNote}<p class="opacity-80">{cappedNote}</p>{/if}
@@ -386,9 +399,9 @@
       <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter findings by location">
         <button
           type="button"
-          class="text-[11px] px-2 py-0.5 rounded-full border {filter === 'all'
-            ? 'border-accent/60 text-textPrimary bg-accent/10'
-            : 'border-border/60 text-textMuted'}"
+          class="gp-chip cursor-pointer"
+          data-kind="label"
+          data-tone={filter === "all" ? "accent" : "neutral"}
           aria-pressed={filter === "all"}
           onclick={() => (filter = "all")}
         >
@@ -397,9 +410,9 @@
         {#each chips as chip (chip.location)}
           <button
             type="button"
-            class="text-[11px] px-2 py-0.5 rounded-full border {filter === chip.location
-              ? 'border-accent/60 text-textPrimary bg-accent/10'
-              : badgeClass[LOCATION_COPY[chip.location].tone]}"
+            class="gp-chip cursor-pointer"
+            data-kind="label"
+            data-tone={filter === chip.location ? "accent" : chipTone[LOCATION_COPY[chip.location].tone]}
             aria-pressed={filter === chip.location}
             title={LOCATION_COPY[chip.location].hint}
             onclick={() => (filter = filter === chip.location ? "all" : chip.location)}
@@ -409,68 +422,52 @@
         {/each}
       </div>
 
-      <div class="rounded-lg border border-border/60 overflow-hidden">
-        <table class="w-full text-xs table-fixed">
-          <caption class="sr-only">Secret findings in the working tree</caption>
-          <thead class="bg-surface/80 text-textMuted text-[10px] uppercase tracking-wide">
-            <tr>
-              <th class="text-left font-semibold px-3 py-2 w-28">Location</th>
-              <th class="text-left font-semibold px-3 py-2">File</th>
-              <th class="text-left font-semibold px-3 py-2 w-48">Rule</th>
-              <th class="text-left font-semibold px-3 py-2 w-20">Confidence</th>
-              <th class="px-2 py-2 w-10"><span class="sr-only">Actions</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each keyedList(previewRows, findingKey) as { item: finding, key } (key)}
-              {@const copy = LOCATION_COPY[finding.location]}
-              {@const sameValue = sizes.get(finding.secret_group) ?? 0}
-              <tr class="border-t border-border/40 align-top" data-location={finding.location}>
-                <td class="px-3 py-1.5">
-                  <span
-                    class="inline-block whitespace-nowrap rounded border px-1.5 py-px text-[10px] {badgeClass[copy.tone]}"
-                    title={copy.hint}>{copy.label}</span
-                  >
-                </td>
-                <td class="px-3 py-1.5 font-mono text-textPrimary break-all">
-                  <span title={finding.path}>{finding.path}</span>{#if finding.line !== null}<span
-                      class="text-textMuted">:{finding.line}</span
-                    >{/if}
-                  {#if sameValue > 1}
-                    <span
-                      class="ml-1 font-sans text-[10px] text-amber-300 whitespace-nowrap"
-                      title="Kingfisher matched the same value in {sameValue} shown locations; rotating it means fixing all of them."
-                      >same value ×{sameValue}</span
-                    >
-                  {/if}
-                </td>
-                <td class="px-3 py-1.5 min-w-0">
-                  <div class="text-textPrimary truncate" title={finding.rule_id}>
-                    {finding.rule_name || finding.rule_id}
-                  </div>
-                  {#if finding.rule_name}
-                    <div class="font-mono text-[10px] text-textMuted truncate">{finding.rule_id}</div>
-                  {/if}
-                </td>
-                <td class="px-3 py-1.5 text-textMuted capitalize">{finding.confidence || "—"}</td>
-                <td class="px-2 py-1.5 text-right">
-                  {#if finding.location !== "outside"}
-                    <button
-                      type="button"
-                      class="gp-icon-btn p-1 rounded hover:bg-surface"
-                      aria-label="Reveal {locationLabel(finding)} in file manager"
-                      title="Reveal in file manager"
-                      onclick={() => reveal(finding.path)}
-                    >
-                      <FolderSearch size={13} />
-                    </button>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+      <HealthTable caption="Secret findings in the working tree" columns={FINDING_COLUMNS}>
+        {#each keyedList(previewRows, findingKey) as { item: finding, key } (key)}
+          {@const copy = LOCATION_COPY[finding.location]}
+          {@const sameValue = sizes.get(finding.secret_group) ?? 0}
+          <tr data-location={finding.location}>
+            <td class="px-3 py-1.5">
+              <span class="gp-chip" data-kind="label" data-tone={chipTone[copy.tone]} title={copy.hint}>{copy.label}</span>
+            </td>
+            <td class="px-3 py-1.5 font-mono text-textPrimary break-all">
+              <span title={finding.path}>{finding.path}</span>{#if finding.line !== null}<span
+                  class="text-textMuted">:{finding.line}</span
+                >{/if}
+              {#if sameValue > 1}
+                <span
+                  class="ml-1 font-sans text-micro text-warn whitespace-nowrap"
+                  title="Kingfisher matched the same value in {sameValue} shown locations; rotating it means fixing all of them."
+                  >same value ×{sameValue}</span
+                >
+              {/if}
+            </td>
+            <td class="px-3 py-1.5 min-w-0">
+              <div class="text-textPrimary truncate" title={finding.rule_id}>
+                {finding.rule_name || finding.rule_id}
+              </div>
+              {#if finding.rule_name}
+                <div class="font-mono text-micro text-textMuted truncate">{finding.rule_id}</div>
+              {/if}
+            </td>
+            <td class="px-3 py-1.5 text-textMuted capitalize">{finding.confidence || "—"}</td>
+            <td class="px-2 py-1.5 text-right">
+              {#if finding.location !== "outside"}
+                <button
+                  type="button"
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  aria-label="Reveal {locationLabel(finding)} in file manager"
+                  title="Reveal in file manager"
+                  onclick={() => reveal(finding.path)}
+                >
+                  <FolderSearch size={13} />
+                </button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </HealthTable>
       <HealthPreviewToggle total={shownRows.length} noun="findings" bind:expanded />
     {:else if report.ok && headline.tone === "ok"}
       <EmptyState
@@ -482,7 +479,7 @@
     {/if}
 
     {#if report.kingfisher_present}
-      <details class="text-[11px] text-textMuted px-0.5" data-testid="secrets-scope">
+      <details class="text-meta text-textMuted px-0.5" data-testid="secrets-scope">
         <summary class="cursor-pointer select-none">What this scan covers</summary>
         <ul class="mt-1.5 space-y-0.5 list-disc pl-4">
           {#each scopeNotes(report) as note (note)}

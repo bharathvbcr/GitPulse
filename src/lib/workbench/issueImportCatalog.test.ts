@@ -35,16 +35,17 @@ describe("ft-038e6ba5 batch issue import with an unread task catalog", () => {
   });
 });
 
-describe("ManviOpsPanel keeps an unread catalog distinct from an empty one", () => {
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "components", "ManviOpsPanel.svelte"), "utf8");
+describe("IssueTaskActions keeps an unread catalog distinct from an empty one", () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "components", "IssueTaskActions.svelte"), "utf8");
   it("types the catalog as nullable and clears it on a failed read", () => {
     expect(source).toContain("let repoTasks = $state<TaskCard[] | null>(null);");
-    expect(source).toMatch(/catch \(err\) \{[^}]*repoTasks = null;\s*repoTasksError = formatError\(err\);/s);
+    expect(source).toMatch(/catch \(err\) \{[^}]*repoTasks = null;\s*repoTasksError = failure\("read", "the task list", err\);/s);
     expect(source).not.toMatch(/repoTasks = \[\];/);
   });
   it("gates single and batch import on a known catalog and offers a retry", () => {
     expect(source).toContain("repoTasks === null");
-    expect(source).toContain("Retry task list");
+    expect(source).toContain("onclick={() => loadRepoTasks()}");
+    expect(source).toContain("<span>Try again</span>");
     expect(source).toContain("Task import paused");
   });
 });

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { openConflicts } from "../ui/workConflicts";
   import { onMount, tick, untrack } from "svelte";
   import { AlertTriangle, ArrowRight, Check, Cloud, GitBranch, GitMerge, Search, X } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
@@ -31,7 +32,7 @@
   let tabStop = $derived(visible.some(branch => mergeRef(branch) === selectedRef) ? selectedRef : visible[0] ? mergeRef(visible[0]) : "");
   let blocked = $derived(mergeBlockedReason($repoStore, request));
   let selectionMissing = $derived(selectedRef !== "" && !source);
-  let conflicted = $derived($repoStore.operation.operation?.conflicted_total || $repoStore.statuses.filter(s => s.is_conflicted).length);
+  let conflicted = $derived($repoStore.operation.operation?.conflicted_total || $repoStore.conflictedCount);
 
   // Child bindings settle after actions; focus only once the input is mounted.
   onMount(() => { searchInput?.focus(); });
@@ -194,7 +195,7 @@
       </fieldset>
       {#if busy}<HookRunNotice />{/if}
       <div class="flex items-center justify-end gap-2 pt-1">
-        {#if conflicted && $repoStore.currentPath === request.repoPath}<button type="button" class="gp-btn" disabled={busy} onclick={() => { repoStore.setActiveTab("work", "resolve"); close(); }}>Resolve conflicts</button>{/if}
+        {#if conflicted && $repoStore.currentPath === request.repoPath}<button type="button" class="gp-btn" disabled={busy} onclick={() => { openConflicts(); close(); }}>Resolve conflicts</button>{/if}
         <button type="button" class="gp-btn" disabled={busy} onclick={close}>Cancel</button>
         <button type="button" class="gp-btn gp-btn-primary" disabled={busy || !!blocked || !source} onclick={() => void submit()}>{busy ? "Merging…" : "Merge branch"}</button>
       </div>

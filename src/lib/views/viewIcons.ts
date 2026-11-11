@@ -1,7 +1,6 @@
 import {
   Activity,
   Briefcase,
-  Bug,
   ChartNoAxesCombined,
   Cloud,
   CodeXml,
@@ -9,14 +8,12 @@ import {
   FolderTree,
   GitCommitHorizontal,
   GitGraph,
-  GitMerge,
   HardDrive,
   HeartPulse,
   LayoutDashboard,
   ListChecks,
   Network,
   Search,
-  ShieldCheck,
   TestTube,
 } from "@lucide/svelte";
 import type { ViewTab } from "../repos/persist";
@@ -43,9 +40,7 @@ export const VIEW_ICONS: Readonly<Record<ViewTab, ViewIcon>> = {
 export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, ViewIcon>>>> = {
   work: {
     overview: LayoutDashboard,
-    resolve: GitMerge,
     remote: Cloud,
-    policy: ShieldCheck,
     tasks: ListChecks,
   },
   code: {
@@ -55,7 +50,6 @@ export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, Vie
   history: {
     graph: GitGraph,
     diff: FileDiff,
-    suspects: Bug,
   },
   insights: {
     pulse: Activity,

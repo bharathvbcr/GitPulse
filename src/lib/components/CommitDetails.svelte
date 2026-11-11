@@ -19,7 +19,20 @@
     AlertTriangle,
     Copy,
     Check,
+    Bug,
+    GitBranchPlus,
+    RotateCcw,
   } from "@lucide/svelte";
+  import { createBranchAt, resetKeepTo } from "../branches/commitActions";
+  import { historySelectionLabel, labelFor } from "../views/historyList";
+  import {
+    suspectsQuery,
+    suspectMarks,
+    evidenceTone,
+    evidenceLabel,
+    evidenceTitle,
+    hopsLabel,
+  } from "../codeintel/suspectsQuery";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import MarkdownBody from "./MarkdownBody.svelte";
@@ -29,6 +42,7 @@
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { filterStore } from "../stores/filterStore";
   // The canonical wire types, not local copies: both were declared here as
   // well, and the CommitDetails one had silently fallen four fields behind.
   // `import type` is erased, so this pulls in no store at runtime.
@@ -63,6 +77,17 @@
   let offGraph = $derived(
     selectedCommit !== null && !$graphStore.rows.some((r) => r.id === selectedCommit.id),
   );
+  // Where Graph's Suspects list ranked this commit, whichever list it was
+  // selected from: the verdict travels with the commit, not with the list.
+  let suspect = $derived(
+    selectedCommit ? (suspectMarks($suspectsQuery, $currentRepoPath).get(selectedCommit.id) ?? null) : null,
+  );
+  let filterActive = $derived(
+    $filterStore.searchQuery.trim() !== "" || Boolean($filterStore.selectedBranch),
+  );
+  // What the list that selected this commit calls it (a reflog selector), for
+  // the branch-here and reset-here prompts.
+  let actionLabel = $derived(labelFor($historySelectionLabel, selectedCommit?.id));
   let readDetails = $derived(details !== null && details.id === selectedCommit?.id ? details : null);
   let headerSummary = $derived(
     offGraph && readDetails ? readDetails.summary : (selectedCommit?.summary ?? ""),
@@ -91,8 +116,18 @@
   );
   let diffError = $derived($repoStore.selectedDiffError);
 
+  /**
+   * "Find suspects since this commit": the commit on screen becomes the last
+   * known good and Graph switches to the Suspects list. Runs at once when a
+   * symptom is already named, otherwise puts the cursor in the symptom field.
+   */
+  function findSuspectsSince(commitId: string) {
+    repoStore.setHistoryList("suspects");
+    void suspectsQuery.seedSince($currentRepoPath, commitId);
+  }
+
   function retryDetails() {
-    if (selectedCommit) void graphStore.selectCommit(selectedCommit);
+    if (selectedCommit) void graphStore.retryDetails();
   }
 
   function retryDiff() {
@@ -296,10 +331,20 @@
         <div class="flex items-center gap-1.5 min-w-0 group/msg">
           <span class="text-xs font-medium text-textPrimary truncate select-text">{headerSummary}</span>
           {#if offGraph}
+            <!-- HEAD moves and Suspects keep their selection when a reload
+                 stops drawing it, so "not drawn" has two causes. A suspect is
+                 an ancestor of the indexed commit, and with a filter active
+                 the filter is the likelier one: those say "loaded". -->
+            {@const filtered = Boolean(suspect) || filterActive}
             <span
               class="shrink-0 rounded px-1.5 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-300"
-              title="The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there."
-            >Not in the graph</span>
+              title={filtered
+                ? "The loaded graph does not draw this commit: the commit filter or the page size leaves it out. It stays selected because it was chosen from HEAD's moves or Suspects."
+                : "The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there, or the page size leaves it out."}
+            >{filtered ? "Not in the loaded graph" : "Not in the graph"}</span>
+          {/if}
+          {#if suspect}
+            <span class="gp-chip shrink-0" data-tone="danger" title={suspect.title}>suspect #{suspect.rank}</span>
           {/if}
           <button
             type="button"
@@ -328,8 +373,57 @@
           {sig.text}
         </span>
         <FreshnessBadge freshness={provenance} />
+        <!-- What can be done to this commit, whichever list selected it. HEAD
+             moves used to carry these on every row; they are the same two
+             actions as the graph's row menu, from one owner. -->
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+          onclick={() => void createBranchAt(selectedCommit.id, actionLabel)}
+          title="Create a branch at this commit — the non-destructive way back to it"
+          aria-label="Create a branch at this commit"
+        >
+          <GitBranchPlus size={13} /> Branch
+        </button>
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-danger"
+          onclick={() => void resetKeepTo(selectedCommit.id, actionLabel)}
+          title="Reset the current branch here (keeps local changes)… — previews which commits would leave the branch first"
+          aria-label="Reset the current branch to this commit"
+        >
+          <RotateCcw size={13} /> Reset
+        </button>
+        <button
+          type="button"
+          class="flex items-center gap-1 rounded px-1 py-0.5 text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+          onclick={() => findSuspectsSince(selectedCommit.id)}
+          title="Find suspects since this commit: treat it as the last known good and rank the commits after it by what the call graph reaches from a symptom"
+        >
+          <Bug size={13} /> Suspects since
+        </button>
       </div>
     </div>
+
+    {#if suspect}
+      <!-- The Suspects verdict on this commit, under whichever list selected it.
+           Told apart from the header by its tint, not by a rule. -->
+      <div class="flex items-center gap-2 bg-danger/5 px-4 py-1 text-micro text-textSecondary min-w-0" aria-label="Suspect verdict">
+        <span
+          class="gp-chip shrink-0"
+          data-tone={evidenceTone(suspect.suspect.evidence)}
+          title={evidenceTitle(suspect.suspect.evidence)}
+        >{evidenceLabel(suspect.suspect.evidence)}</span>
+        <span class="shrink-0 font-mono tabular-nums text-textMuted" title="Call edges from the symptom to the nearest symbol this commit touched.">
+          {hopsLabel(suspect.suspect.nearest_distance)}
+        </span>
+        {#if suspect.suspect.touched.length > 0}
+          <span class="min-w-0 truncate font-mono" title={suspect.suspect.touched.map((t) => t.qualified_name).join("\n")}>
+            touched {suspect.suspect.touched.slice(0, 3).map((t) => t.qualified_name).join(", ")}{suspect.suspect.touched.length > 3 ? ` +${suspect.suspect.touched.length - 3} more` : ""}
+          </span>
+        {/if}
+      </div>
+    {/if}
 
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">

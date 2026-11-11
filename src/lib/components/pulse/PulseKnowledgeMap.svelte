@@ -1,6 +1,9 @@
 <script lang="ts">
   import type { KnowledgeReport } from "../../pulse/types";
   import PulseStaleNotice from "./PulseStaleNotice.svelte";
+  import EmptyState from "../EmptyState.svelte";
+  import Skeleton from "../Skeleton.svelte";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import { Users, AlertTriangle, ShieldCheck, FileWarning, RefreshCw } from "@lucide/svelte";
 
   let {
@@ -18,6 +21,9 @@
     measuredAt?: number | null;
     onRefresh?: () => void;
   } = $props();
+
+  /** Authors listed in the ownership breakdown; the rest are counted, not drawn. */
+  const AUTHORS_SHOWN = 8;
 
   /** Areas the sample never blamed: their authors are absent from every figure. */
   const unsampledAreas = $derived(
@@ -38,46 +44,55 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
+<div class="gp-card p-4 flex flex-col gap-4">
   <!-- Header -->
-  <div class="flex items-center justify-between border-b border-border/40 pb-3">
+  <div class="flex items-center justify-between gap-3">
     <div>
       <div class="flex items-center gap-2">
-        <Users size={18} class="text-indigo-400" />
-        <h3 class="text-sm font-semibold text-textPrimary">Knowledge Distribution & Bus Factor</h3>
+        <Users size={18} class="text-accent" />
+        <h3 class="text-sm font-semibold text-textPrimary">Knowledge distribution and bus factor</h3>
       </div>
       <p class="text-xs text-textMuted mt-0.5">
-        Line ownership and team concentration derived from git blame analysis.
+        Line ownership and team concentration, from git blame analysis.
       </p>
     </div>
 
     {#if onRefresh}
       <button
         type="button"
-        class="px-2.5 py-1 text-xs rounded-md bg-surface border border-border/70 text-textMuted hover:text-textPrimary flex items-center gap-1.5 transition-colors"
+        class="gp-btn shrink-0"
+        data-variant="secondary"
+        data-size="sm"
         disabled={loading}
         onclick={onRefresh}
       >
         <RefreshCw size={12} class={loading ? "animate-spin text-accent" : ""} />
-        <span>{loading ? "Analyzing..." : "Re-scan Blame"}</span>
+        <span>{loading ? "Scanning…" : "Rescan blame"}</span>
       </button>
     {/if}
   </div>
 
   {#if loading && !knowledge}
-    <div class="py-12 text-center text-textMuted text-xs flex flex-col items-center gap-2">
-      <RefreshCw size={20} class="animate-spin text-accent" />
-      <span>Running parallel blame scanner across repository files...</span>
+    <div class="flex flex-col gap-2 py-2">
+      <Skeleton variant="rect" count={3} height="4rem" />
+      <p class="gp-label text-center">Scanning blame across repository files…</p>
     </div>
   {:else if error && !knowledge}
-    <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
-      <span class="text-rose-400 font-medium">Blame scan failed — this is not a bus factor of zero.</span>
-      <span class="font-mono text-[11px] text-textMuted wrap-break-word max-w-lg">{error}</span>
+    {@const failure = describeFailure({ verb: "scan", object: "blame" }, error)}
+    <div class="gp-notice" data-tone="unknown" role="status">
+      <AlertTriangle size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
+      <div class="min-w-0 flex-1">
+        <p class="font-medium">{failure.headline} This is not a bus factor of zero.</p>
+        <p class="font-mono text-meta text-textMuted wrap-break-word mt-1">{error}</p>
+      </div>
     </div>
   {:else if !knowledge || knowledge.scanned_files === 0}
-    <div class="py-8 text-center text-textMuted text-xs">
-      No blame knowledge data available.
-    </div>
+    <EmptyState
+      compact
+      icon={Users}
+      title="No blame data yet"
+      hint="Rescan to read line ownership across the repository."
+    />
   {:else}
     <!-- Key Bus Factor & Scan Stat Row -->
     {#if error}
@@ -85,121 +100,120 @@
     {/if}
     <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
       <!-- Bus Factor Card -->
-      <div class="p-3 rounded-lg border border-border/60 bg-surface flex flex-col justify-between">
+      <div class="p-3 rounded-lg bg-background flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Bus Factor</span>
+          <span class="gp-label">Bus factor</span>
           {#if knowledge.bus_factor === 1}
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-500/10 text-red-400 border border-red-500/20">
-              Critical
-            </span>
+            <span class="gp-chip" data-kind="label" data-tone="danger">Critical</span>
           {:else if knowledge.bus_factor === 2}
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-              Moderate
-            </span>
+            <span class="gp-chip" data-kind="label" data-tone="warn">Moderate</span>
           {:else}
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              Healthy
-            </span>
+            <span class="gp-chip" data-kind="label" data-tone="ok">Healthy</span>
           {/if}
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-extrabold {knowledge.bus_factor === 1 ? 'text-red-400' : knowledge.bus_factor === 2 ? 'text-amber-400' : 'text-emerald-400'}">
+          <span class="text-3xl font-semibold {knowledge.bus_factor === 1 ? 'text-danger' : knowledge.bus_factor === 2 ? 'text-warn' : 'text-ok'}">
             {knowledge.bus_factor}
           </span>
           <span class="text-xs text-textMuted font-medium">key contributor{knowledge.bus_factor === 1 ? '' : 's'}</span>
         </div>
-        <p class="text-[11px] text-textMuted mt-1">
+        <p class="text-meta text-textMuted mt-1">
           {knowledge.bus_factor === 1
-            ? "1 contributor owns >= 50% of surviving code."
-            : `${knowledge.bus_factor} contributors hold >= 50% of surviving code.`}
+            ? "1 contributor owns at least 50% of surviving code."
+            : `${knowledge.bus_factor} contributors hold at least 50% of surviving code.`}
         </p>
       </div>
 
       <!-- Scanned Coverage -->
-      <div class="p-3 rounded-lg border border-border/60 bg-surface flex flex-col justify-between">
+      <div class="p-3 rounded-lg bg-background flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Scanned Files</span>
+          <span class="gp-label">Scanned files</span>
           <ShieldCheck size={14} class="text-accent" />
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">{knowledge.scanned_files}</span>
-          <span class="text-xs text-textMuted">/ {knowledge.candidate_files} candidate files</span>
+          <span class="text-3xl font-semibold text-textPrimary">{knowledge.scanned_files}</span>
+          <span class="text-xs text-textMuted">of {knowledge.candidate_files} candidate files</span>
         </div>
-        <p class="text-[11px] text-textMuted mt-1">
+        <p class="text-meta text-textMuted mt-1">
           {knowledge.scanned_lines.toLocaleString()} live lines analyzed in {knowledge.duration_ms}ms
         </p>
       </div>
 
       <!-- Orphaned Files Count -->
-      <div class="p-3 rounded-lg border border-border/60 bg-surface flex flex-col justify-between">
+      <div class="p-3 rounded-lg bg-background flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">
-          <span class="font-medium uppercase tracking-wider text-[10px]">Orphaned Code</span>
-          <AlertTriangle size={14} class={knowledge.orphaned_files.length > 0 ? "text-amber-400" : "text-emerald-400"} />
+          <span class="gp-label">Orphaned code</span>
+          <AlertTriangle size={14} class={knowledge.orphaned_files.length > 0 ? "text-warn" : "text-ok"} />
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-extrabold {knowledge.orphaned_files.length > 0 ? 'text-amber-400' : 'text-emerald-400'}">
+          <span class="text-3xl font-semibold {knowledge.orphaned_files.length > 0 ? 'text-warn' : 'text-ok'}">
             {knowledge.orphaned_files.length}
           </span>
           <span class="text-xs text-textMuted">stale files</span>
         </div>
-        <p class="text-[11px] text-textMuted mt-1">
-          Primary author inactive in repo for > 6 months
+        <p class="text-meta text-textMuted mt-1">
+          Primary author inactive in this repository for over 6 months
         </p>
       </div>
     </div>
 
     <!-- Team Authors Breakdown -->
     <div class="flex flex-col gap-2.5">
-      <h4 class="text-xs font-semibold uppercase tracking-wider text-textMuted">Primary Code Ownership</h4>
+      <h4 class="gp-label">Primary code ownership</h4>
       <div class="flex flex-col gap-2">
-        {#each knowledge.primary_authors.slice(0, 8) as author}
-          <div class="flex flex-col gap-1 p-2 rounded-lg bg-surface/60 border border-border/40">
+        {#each knowledge.primary_authors.slice(0, AUTHORS_SHOWN) as author}
+          <div class="flex flex-col gap-1 p-2 rounded-lg bg-background">
             <div class="flex items-center justify-between text-xs">
               <div class="flex items-center gap-2">
                 <span class="font-medium text-textPrimary">{author.author_name}</span>
-                <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{author.author_email}</span>
+                <span class="text-micro text-textMuted font-mono truncate max-w-xs">{author.author_email}</span>
               </div>
               <div class="flex items-center gap-2">
-                <span class="text-textMuted text-[11px]">{author.lines_owned.toLocaleString()} lines</span>
-                <span class="font-bold text-textPrimary text-xs">{author.percentage}%</span>
+                <span class="text-textMuted text-meta">{author.lines_owned.toLocaleString()} lines</span>
+                <span class="font-semibold text-textPrimary text-xs">{author.percentage}%</span>
               </div>
             </div>
             <!-- Progress Bar -->
-            <div class="w-full h-1.5 bg-surfaceMuted rounded-full overflow-hidden">
+            <div class="w-full h-1.5 bg-surfaceHover rounded-full overflow-hidden">
               <div
-                class="h-full bg-accent rounded-full transition-all duration-500"
+                class="h-full bg-accent rounded-full"
                 style="width: {Math.min(100, author.percentage)}%;"
               ></div>
             </div>
           </div>
         {/each}
       </div>
+      {#if knowledge.primary_authors.length > AUTHORS_SHOWN}
+        <p class="text-meta text-textMuted">
+          Showing {AUTHORS_SHOWN} of {knowledge.primary_authors.length} authors.
+        </p>
+      {/if}
     </div>
 
     <!-- Orphaned Files Table if present -->
     {#if knowledge.orphaned_files.length > 0}
       <div class="flex flex-col gap-2 mt-2">
-        <div class="flex items-center gap-1.5 text-amber-400 text-xs font-semibold">
+        <div class="flex items-center gap-1.5 text-warn text-xs font-semibold">
           <FileWarning size={14} />
-          <h4>Orphaned Code Alert (> 180 days inactive owner)</h4>
+          <h4>Orphaned code: owner inactive for over 180 days</h4>
         </div>
-        <div class="overflow-x-auto max-h-48 overflow-y-auto border border-amber-500/20 rounded-lg">
+        <div class="overflow-x-auto max-h-48 overflow-y-auto rounded-lg bg-background">
           <table class="w-full text-left text-xs border-collapse">
-            <thead class="bg-surfaceMuted text-textMuted uppercase text-[10px] tracking-wider sticky top-0">
-              <tr class="border-b border-border/50">
-                <th class="py-1.5 px-3">File Path</th>
-                <th class="py-1.5 px-3">Primary Author</th>
-                <th class="py-1.5 px-3">Live Lines</th>
-                <th class="py-1.5 px-3 text-right">Last Owner Commit</th>
+            <thead class="bg-surfaceHover text-textMuted text-meta font-medium sticky top-0">
+              <tr>
+                <th class="py-1.5 px-3 font-medium">File path</th>
+                <th class="py-1.5 px-3 font-medium">Primary author</th>
+                <th class="py-1.5 px-3 font-medium">Live lines</th>
+                <th class="py-1.5 px-3 font-medium text-right">Last owner commit</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-border/20">
+            <tbody>
               {#each knowledge.orphaned_files as file}
-                <tr class="hover:bg-surfaceMuted/30 font-mono text-[11px]">
+                <tr class="hover:bg-surfaceHover/50 font-mono text-meta">
                   <td class="py-1.5 px-3 truncate max-w-xs text-textPrimary" title={file.path}>{file.path}</td>
                   <td class="py-1.5 px-3 text-textMuted font-sans">{file.primary_author}</td>
                   <td class="py-1.5 px-3 text-textMuted">{file.lines_count.toLocaleString()}</td>
-                  <td class="py-1.5 px-3 text-right text-amber-400/90 font-sans">
+                  <td class="py-1.5 px-3 text-right text-warn font-sans">
                     {formatRelativeDays(file.last_commit_timestamp)}
                   </td>
                 </tr>
@@ -212,9 +226,9 @@
 
     <!-- Truncation / Honesty Note -->
     {#if knowledge.truncated}
-      <div class="text-[11px] text-textMuted/80 italic flex items-center gap-1.5 border-t border-border/30 pt-2">
-        <span>
-          * Sampled {knowledge.scanned_files} of {knowledge.candidate_files} files at HEAD, highest
+      <div class="gp-notice" data-tone="info" role="note">
+        <div class="min-w-0 flex-1 text-meta">
+          Sampled {knowledge.scanned_files} of {knowledge.candidate_files} files at HEAD, highest
           churn first in each of {knowledge.areas_total} areas.
           {#if unsampledAreas.length > 0}
             Not sampled: {unsampledAreas.join(", ")}{knowledge.areas_total > knowledge.areas.length
@@ -226,11 +240,11 @@
           {:else if knowledge.churn_window_capped}
             Churn covers only the newest commits; a file busy only before that ranks low.
           {/if}
-        </span>
+        </div>
       </div>
     {/if}
     {#if knowledge.submodules_skipped > 0}
-      <div class="text-[11px] text-textMuted/80 italic">
+      <div class="text-meta text-textMuted">
         {knowledge.submodules_skipped} submodule{knowledge.submodules_skipped === 1 ? "" : "s"} not blamed.
       </div>
     {/if}

@@ -2,7 +2,7 @@ import type { ResetPreview } from "./types";
 import { plural, shortHash } from "../format";
 
 /**
- * The confirmation a reflog reset shows, built from what the backend read.
+ * The confirmation a reset to a commit shows, built from what the backend read.
  *
  * Every commit leaving the branch is named up to the preview's cap, and the
  * remainder is counted rather than dropped, so a capped list never reads as
@@ -11,11 +11,12 @@ import { plural, shortHash } from "../format";
  */
 export function describeResetPreview(
   preview: ResetPreview,
-  selector: string,
+  /** What the commit is called where it was picked (a reflog selector); optional. */
+  selector?: string,
 ): { title: string; message: string } {
   const subject = preview.branch ? `branch "${preview.branch}"` : "detached HEAD";
   const lines = [
-    `Move ${subject} from ${shortHash(preview.head)} to ${shortHash(preview.target)} (${selector}).`,
+    `Move ${subject} from ${shortHash(preview.head)} to ${shortHash(preview.target)}${selector ? ` (${selector})` : ""}.`,
   ];
   if (preview.leaving_total === 0) {
     lines.push("No commits leave the branch.");

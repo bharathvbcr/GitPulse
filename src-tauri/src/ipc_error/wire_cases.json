@@ -32,5 +32,9 @@
   {
     "kind": "ai_endpoint_unconfirmed",
     "message": "Confirm where to send this: Ollama on 127.0.0.1:11434 serving m. Nothing has been sent."
+  },
+  {
+    "kind": "read_cancelled",
+    "message": "git read cancelled: its caller is gone"
   }
 ]

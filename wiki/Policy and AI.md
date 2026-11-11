@@ -27,7 +27,7 @@ flowchart TD
 | **Blocked** | Rejected; the UI explains why |
 | **Unchecked** | Harness missing or that rung could not run. Recorded as unchecked — **never reported as allowed** |
 
-Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI does not pretend the gate passed. Work → Policy shows posture and recent verdicts.
+Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI does not pretend the gate passed. Settings → Agents → Manvi policy shows posture; Work → Overview → Policy activity shows recent verdicts and grants.
 
 ## Local AI
 

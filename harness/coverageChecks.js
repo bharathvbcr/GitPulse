@@ -144,8 +144,8 @@ export async function runCoverageChecks(ctx) {
     captureClipboard();
     document.execCommand = originalExec;
 
-    // ---- MANVI analysis: the report it is sent, and the journal ------------
-    button("MANVI: analyze coverage with the local model").click(); await tick();
+    // ---- Manvi analysis: the report it is sent, and the journal ------------
+    button("Manvi: analyze coverage with the local model").click(); await tick();
     ok("the generate button is usable with no model server discovered",
       () => region().textContent.includes("No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.")
         && !byText("Generate AI report").disabled);
@@ -159,7 +159,7 @@ export async function runCoverageChecks(ctx) {
         && journal("coverage-report").at(-1).label === "AI coverage analysis");
     knobs.aiHandler = () => { throw new Error("Fixture model down"); };
     byText("Generate AI report").click();
-    await until(() => region().textContent.includes("Analysis failed"));
+    await until(() => region().textContent.includes("Couldn't analyze coverage."));
     ok("a failed analysis says why and is journaled as a failure",
       () => region().textContent.includes("Fixture model down") && journal("coverage-report").at(-1).ok === false);
     // The analysis settles after the user left: the journal still gets it.
@@ -172,8 +172,8 @@ export async function runCoverageChecks(ctx) {
     ok("an analysis that settles after a repository switch is still journaled",
       () => journal("coverage-report").length === beforeStale + 1 && journal("coverage-report").at(-1).ok === true);
 
-    // ---- MANVI plan steps --------------------------------------------------
-    button("MANVI: analyze coverage with the local model").click(); await tick();
+    // ---- Manvi plan steps --------------------------------------------------
+    button("Manvi: analyze coverage with the local model").click(); await tick();
     knobs.aiHandler = () => aiResult("1. Run the first: `npm run cov-one`\n2. Run the second: `npm run cov-two`");
     knobs.runHandler = (argv) => done({
       command: argv.join(" "),
@@ -187,7 +187,7 @@ export async function runCoverageChecks(ctx) {
     // Run all is the very first command action of this panel: it must start
     // from a fresh guard rather than require one left by an earlier action.
     byText("Run all").click();
-    await until(() => region().textContent.includes("Retry") && idle());
+    await until(() => region().textContent.includes("Try again") && idle());
     ok("run all stops at the first failing step", () => argvs().join("|") === "npm run cov-one", argvs);
     ok("a plan step reaches the backend under the read-only coverage kind with its own argv",
       () => runs[0].actionKind === "coverage" && JSON.stringify(runs[0].args) === JSON.stringify(["npm", "run", "cov-one"]));
@@ -229,9 +229,9 @@ export async function runCoverageChecks(ctx) {
     ok("a family whose toolchain is missing still offers the install-then-generate run",
       () => !!byText("Run JavaScript coverage") && flat(card("javascript")).includes("First installs: npm install"));
     ok("and offers no bare command chip that would skip the install",
-      () => ![...card("javascript").querySelectorAll("button")].some(node => node.title.startsWith("Run with MANVI:")));
+      () => ![...card("javascript").querySelectorAll("button")].some(node => node.title.startsWith("Run with Manvi:")));
     ok("a ready toolchain offers its commands as chips beside the family run",
-      () => [...card("go").querySelectorAll("button")].some(node => node.title === "Run with MANVI: go -C a test ./..."));
+      () => [...card("go").querySelectorAll("button")].some(node => node.title === "Run with Manvi: go -C a test ./..."));
     knobs.runHandler = scripted({ "npm run cov-b": { produces: "javascript", out: "b measured" } });
     let journaled = generatorJournal().length;
     let scansBefore = scans();
@@ -308,11 +308,11 @@ export async function runCoverageChecks(ctx) {
     knobs.runHandler = scripted({ "npm install": { exit: 1, err: "npm ERR! offline" }, "go -C b test ./...": { produces: "go" } });
     setRunDelay(120);
     const diagBatch = get(diagnostics).length;
-    byText("Run with MANVI").click(); await tick(); await wait();
+    byText("Run with Manvi").click(); await tick(); await wait();
     ok("while a batch runs, every other run control is disabled",
       () => {
-        const runControls = [...region().querySelectorAll("button")].filter(node => /^Run .* coverage$/.test(node.textContent.trim()) || node.title.startsWith("Run with MANVI:"));
-        return runControls.length > 0 && runControls.every(node => node.disabled) && !!byText("Running…") && !byText("Run with MANVI");
+        const runControls = [...region().querySelectorAll("button")].filter(node => /^Run .* coverage$/.test(node.textContent.trim()) || node.title.startsWith("Run with Manvi:"));
+        return runControls.length > 0 && runControls.every(node => node.disabled) && !!byText("Running…") && !byText("Run with Manvi");
       });
     await until(() => idle() && argvs().length >= 3);
     await settle();
@@ -329,7 +329,7 @@ export async function runCoverageChecks(ctx) {
     runs.length = 0;
     knobs.runHandler = null;
     journaled = generatorJournal().length;
-    byText("Run with MANVI").click();
+    byText("Run with Manvi").click();
     await until(() => argvs().length === 2 && idle());
     await settle();
     ok("both failing languages ran and were journaled as failures",
@@ -365,10 +365,10 @@ export async function runCoverageChecks(ctx) {
     ok("both attempts are journaled", () => generatorJournal().length === journaled + 2);
     ok("a recovered pass is not drawn as a plain pass",
       () => rowText(PYTEST).includes("passed (recovered)") && rowText(PYTEST).includes("Retried without bench/my stress.py")
-        && !!rowOf(PYTEST).querySelector(".text-amber-400\\/90") && !rowOf(PYTEST).querySelector(".text-emerald-400\\/90"), () => rowText(PYTEST));
+        && !!rowOf(PYTEST).querySelector(".text-warn\\/90") && !rowOf(PYTEST).querySelector(".text-ok\\/90"), () => rowText(PYTEST));
     button("Copy coverage report").click(); await wait();
     ok("the copied report says what the recovery excluded", () => copied.at(-1).includes("bench/my stress.py") && copied.at(-1).includes("excluded from measurement"), () => copied.at(-1));
-    button("MANVI: analyze coverage with the local model").click(); await tick();
+    button("Manvi: analyze coverage with the local model").click(); await tick();
     knobs.aiHandler = () => aiResult("No steps.");
     byText("Generate AI report").click();
     await until(() => aiCalls.length === 1);
@@ -604,13 +604,13 @@ export async function runCoverageChecks(ctx) {
     // ---- A failed rescan ------------------------------------------------------
     setMode("failed");
     button("Rescan coverage artifacts").click();
-    await until(() => region().textContent.includes("Rescan failed: Fixture scan failed") && idle());
-    ok("a failed rescan keeps the previous results and offers a retry", () => header().includes("62.5%") && !!byText("Retry scan"));
+    await until(() => region().textContent.includes("Couldn't rescan coverage.") && region().textContent.includes("Fixture scan failed") && idle());
+    ok("a failed rescan keeps the previous results and offers a retry", () => header().includes("62.5%") && region().textContent.includes("Showing previous results.") && !!byText("Try again"));
     button("Copy scan error").click(); await wait();
     ok("the scan error is copyable, and the copy is acknowledged", () => copied.at(-1).includes("Fixture scan failed") && !!byText("Copied"), () => copied.at(-1));
     setMode("measured");
-    byText("Retry scan").click();
-    await until(() => !region().textContent.includes("Rescan failed") && idle());
+    byText("Try again").click();
+    await until(() => !region().textContent.includes("Couldn't rescan coverage.") && idle());
 
     // ---- Honesty about what was measured --------------------------------------
     setMode("ojas");
@@ -620,7 +620,7 @@ export async function runCoverageChecks(ctx) {
     ok("a family with no planned command still states why, and offers no Run button",
       () => flat(card("python")).includes("No Python tests found") && !card("python").querySelector("button"));
     ok("a family with a planned command carries its chip in the wide pane",
-      () => [...card("go").querySelectorAll("button")].some(node => node.title === "Run with MANVI: go -C go test ./... -coverprofile=coverage.out"));
+      () => [...card("go").querySelectorAll("button")].some(node => node.title === "Run with Manvi: go -C go test ./... -coverprofile=coverage.out"));
     setMode("ojas-mixed");
     button("Rescan coverage artifacts").click();
     await until(() => document.querySelectorAll("[data-coverage-family]").length === 3 && idle());
@@ -628,13 +628,13 @@ export async function runCoverageChecks(ctx) {
     ok("in the strip the same family states why and offers no Run button",
       () => flat(inStrip("python")).includes("No Python tests found") && !inStrip("python").querySelector("button"));
     ok("in the strip the planned command is the same chip",
-      () => [...inStrip("go").querySelectorAll("button")].some(node => node.title === "Run with MANVI: go -C go test ./... -coverprofile=coverage.out"));
+      () => [...inStrip("go").querySelectorAll("button")].some(node => node.title === "Run with Manvi: go -C go test ./... -coverprofile=coverage.out"));
     const notices = [{ resource: "covered files", kept: 4000, total: 12873, inventory_only: false }, { resource: "manifests", kept: 5, total: 5, inventory_only: false }];
     await enter([family("javascript", "JavaScript", { suggested_commands: ["npm run cov-a"] })], { truncated: true, limit_notices: notices });
     ok("the capped chip names exact counts, and only for caps that dropped rows",
-      () => flat(strip()).includes("scan capped: 4000 of 12873 covered files") && !flat(strip()).includes("5 of 5"), () => flat(strip()));
+      () => flat(strip()).includes("Scan capped: 4000 of 12873 covered files") && !flat(strip()).includes("5 of 5"), () => flat(strip()));
     await enter([family("javascript", "JavaScript", { suggested_commands: ["npm run cov-a"] })], { truncated: true, limit_notices: [] });
-    ok("with no published counts the chip says only that the scan was capped", () => /scan capped(?!:)/.test(flat(strip())) && !flat(strip()).includes("scan capped:"));
+    ok("with no published counts the chip says only that the scan was capped", () => /Scan capped(?!:)/.test(flat(strip())) && !flat(strip()).includes("Scan capped:"));
 
     // ---- Commands the panel will not run, and what it says about the rest ----
     const bad = family("javascript", "JavaScript", { suggested_commands: ['npm run "unclosed'], duration_hint: "Takes a few minutes." });
@@ -652,7 +652,7 @@ export async function runCoverageChecks(ctx) {
     await enter([go]);
     knobs.runHandler = scripted({});
     scanBase = scans();
-    [...card("go").querySelectorAll("button")].find(node => node.title === "Run with MANVI: go -C a test ./...").click();
+    [...card("go").querySelectorAll("button")].find(node => node.title === "Run with Manvi: go -C a test ./...").click();
     await settle();
     ok("running one command by its chip runs only that command, then rescans", () => argvs().join("|") === "go -C a test ./..." && scans() > scanBase, () => [argvs(), scans() - scanBase]);
 
@@ -685,7 +685,7 @@ export async function runCoverageChecks(ctx) {
     await enter([quick]);
     // The chip runs one script without the batch flag, so only the script's own
     // running state can be what disables the issue button.
-    [...card("javascript").querySelectorAll("button")].find(node => node.title === "Run with MANVI: npm run cov-a").click(); await tick(); await wait();
+    [...card("javascript").querySelectorAll("button")].find(node => node.title === "Run with Manvi: npm run cov-a").click(); await tick(); await wait();
     ok("a coverage command in flight disables filing an issue", () => issueButton().disabled && !byText("Running…"));
     await settle();
     setRunDelay(0);

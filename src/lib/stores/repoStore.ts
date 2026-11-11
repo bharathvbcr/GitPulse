@@ -1,5 +1,5 @@
 import type { RebaseStep } from "../rebase/planner";
-import { derived, get, writable } from "svelte/store";
+import { derived, get, readable, writable, type Readable } from "svelte/store";
 import { invalidateSharedReads, invoke, ipcErrorKind } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -80,7 +80,7 @@ import {
 } from "../repos/stripNav";
 import { expandedStacks, lastUsedCheckouts, noteActiveCheckout } from "../repos/stackState";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
-import { sanitizeHistoryList, type HistoryList } from "../views/historyList";
+import { historySelectionLabel, sanitizeHistoryList, type HistoryList } from "../views/historyList";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
 import type { MergeMode } from "../branches/mergeSelection";
 import { parseGitPreflight, type GitIdentity, type GitPreflight, type IdentityScope } from "../repos/gitPreflight";
@@ -136,6 +136,7 @@ import {
   changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
+  statusPollRequest,
   statusPollRestMs,
   statusesEqual,
 } from "../repos/statusPoll";
@@ -264,6 +265,17 @@ const REPOSITORY_CHANGED = "The repository changed while this was waiting; nothi
  * staged/unstaged split moves, or the file disappears). After these, the open
  * selection is refetched so the pane stops displaying pre-mutation content.
  */
+/**
+ * `runMutating` options for a mutation that rewrites the index or worktree
+ * bytes and cannot move a ref: stage, unstage, patch staging, discard. Its
+ * refresh is the status facet, the same one the watcher schedules for a
+ * `worktree` or `index` change, so branches and the graph window are not
+ * reloaded. A mutation that can move a ref (commit, checkout, merge, reset,
+ * stash, ...) must not use this. `runMutating` widens it back to `all` while an
+ * operation is parked or its probe failed.
+ */
+const WORKTREE_ONLY = { facet: "status" } as const satisfies { facet: HydrationFacet };
+
 const REFETCH_SELECTION_KINDS = new Set([
   "stage",
   "unstage",
@@ -344,6 +356,24 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   };
 
   const { subscribe, set } = writable<RepoState>(emptyProjected());
+
+  /**
+   * One field of the projection as a store of its own, notifying only when the
+   * field's reference changes. A plain `derived` would fire every publish for
+   * an array or object (Svelte treats every object set as a change), so each
+   * subscriber would re-run for a publish that left its field alone.
+   */
+  function field<T>(select: (state: RepoState) => T): Readable<T> {
+    return readable(select(get({ subscribe })), (setValue) => {
+      let held: { value: T } | null = null;
+      return subscribe((state) => {
+        const value = select(state);
+        if (held !== null && Object.is(held.value, value)) return;
+        held = { value };
+        setValue(value);
+      });
+    });
+  }
   // A full watcher/manual refresh can observe M→M content edits while every
   // status field stays equal. Keep this signal separate from the UI snapshot
   // so content readers update without invalidating every repository subscriber.
@@ -536,9 +566,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     try {
       let statuses: FileStatus[];
       try {
-        statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
-          repoPath: path,
-        });
+        statuses = await invokeFn<FileStatus[]>("cmd_get_status", statusPollRequest(path));
       } catch (error) {
         // Only a refused read counts. One failure is a repo that vanished (the
         // next full refresh reports it) or a blip; a run of them is a status
@@ -593,9 +621,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         const before = live && live.generation === generation ? live.statuses : [];
         applyToSession(sessionId, generation, { statuses });
-        // The watcher cannot see nested edits (its worktree watch is
-        // non-recursive); the poll can, so it announces them to the views
-        // derived from files.
+        // The watcher can miss nested edits (non-recursive on Linux and
+        // Windows, filtered on macOS); the poll cannot, so it announces them to
+        // the views derived from files.
         const polled = changeFromStatusPoll(before, statuses);
         if (polled) for (const listener of polledChangeListeners) listener(path, polled);
       } catch (error) {
@@ -1971,6 +1999,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * out of effect bodies.
      */
     currentPath: derived({ subscribe }, (state) => state.currentPath),
+    /**
+     * The active repository's changed files, branches, and the open tab list,
+     * each notifying only when its array is replaced (see `field`), plus the
+     * conflicted and staged counts the projection took once per statuses array.
+     * A component that needs one of these reads it here, not through
+     * `$repoStore`, so a publish it did not cause costs it nothing.
+     */
+    statuses: field((state) => state.statuses),
+    branches: field((state) => state.branches),
+    openTabs: field((state) => state.openTabs),
+    conflictedCount: field((state) => state.conflictedCount),
+    stagedCount: field((state) => state.stagedCount),
     /** The active tab's commit message; see `commitDraftStore`. */
     commitDraft: commitDrafts,
     mutationActivity: { subscribe: mutationActivity.subscribe },
@@ -3024,6 +3064,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (selectionKind !== "file" || !filePath) return;
       void store.selectFileDiff(filePath, isStaged);
     },
+    /**
+     * Selects a commit in History from any of Graph's lists: the commit graph,
+     * HEAD moves or Suspects. One path for all three, so the graph's
+     * selection (header, files, ring on the canvas) and the diff below can
+     * never name different commits, whichever list the click came from.
+     *
+     * `pin` is for the lists that are not the graph: their row stays selected
+     * across a graph reload that stops drawing it (`graphStore.selectCommitById`).
+     * `summary` labels a commit the graph does not draw until its details land;
+     * `label` is what that list calls it (a reflog selector), for the details
+     * pane's prompts.
+     */
+    selectHistoryCommit: (
+      commitId: string,
+      opts: { summary?: string; pin?: boolean; label?: string } = {},
+    ) => {
+      if (!commitId) return;
+      historySelectionLabel.set(opts.label ? { commitId, label: opts.label } : null);
+      void graphStore.selectCommitById(commitId, { summary: opts.summary, pin: opts.pin });
+      void store.selectCommitDiff(commitId);
+    },
     selectCommitDiff: (commitId: string) =>
       diffSelection.select({
         read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_commit_diff", { repoPath, commitId }),
@@ -3086,6 +3147,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     stageFile: async (filePath: string) =>
       runMutating("stage", filePath, (path) =>
         invokeFn("cmd_stage_file", { repoPath: path, filePath }),
+        WORKTREE_ONLY,
       ),
     unstageFile: async (filePath: string) => {
       const session = activeSession();
@@ -3094,7 +3156,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const filePaths = file ? indexSelectionPaths([file], "unstage") : [filePath];
       return runMutating("unstage", filePath, (path) => filePaths.length > 1
         ? invokeFn("cmd_change_index", { repoPath: path, filePaths, action: "unstage" })
-        : invokeFn("cmd_unstage_file", { repoPath: path, filePath }), { session });
+        : invokeFn("cmd_unstage_file", { repoPath: path, filePath }), { session, ...WORKTREE_ONLY });
     },
     stageSelectivePatch: async (
       filePatch: FilePatch,
@@ -3103,6 +3165,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (isStaging) {
         return runMutating("stage-patch", filePatch.new_path, (path) =>
           invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch }),
+          WORKTREE_ONLY,
         );
       } else {
         return runMutating("unstage-patch", filePatch.new_path, (path) =>
@@ -3110,6 +3173,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             repoPath: path,
             filePatch,
           }),
+          WORKTREE_ONLY,
         );
       }
     },
@@ -3118,7 +3182,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     discardChanges: async (filePath: string, target?: MutationTarget | null) =>
       runMutating("discard", filePath, (path) =>
         invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
-        { target },
+        { target, ...WORKTREE_ONLY },
       ),
     commit: async (message: string, amend: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
@@ -3965,11 +4029,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const finishActivity = beginMutation(session.path, `${kind}-all`);
     try {
       const outcome = await runMutating(`${kind}-all`, `${filePaths.length} paths`, (path) =>
-        invokeFn("cmd_change_index", { repoPath: path, filePaths, action: kind }), { session, trackActivity: false });
+        invokeFn("cmd_change_index", { repoPath: path, filePaths, action: kind }), { session, trackActivity: false, ...WORKTREE_ONLY });
       // Native batches can stop after a completed chunk. Keep activity alive
       // through recovery and retain the diagnostic after hydration.
       if (!outcome.ok) {
-        await store.refresh(session.path);
+        await store.refresh(session.path, "status");
         applyToSession(session.id, session.generation, { error: outcome.error ?? "Index update failed" });
       }
       return outcome;
@@ -4038,8 +4102,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       });
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
+        // The narrow facet reads statuses only. The operation banner, its
+        // conflicted count and Continue, and the review-diff revision come from
+        // the full hydrate, so while a merge or rebase is parked (or the probe
+        // for one could not run) staging the last conflicted file must run it.
+        const operationLive = still.operation.operation !== null || still.operation.probeFailed;
         const refreshFacet: HydrationFacet =
-          opts.facet && still.hasHydrated ? opts.facet : "all";
+          opts.facet && still.hasHydrated && !operationLive ? opts.facet : "all";
         await store.refresh(path, refreshFacet);
         refreshed = true;
         // The refresh updates statuses/branches but nothing refetches the

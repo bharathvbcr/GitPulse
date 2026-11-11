@@ -145,11 +145,16 @@ fn an_ordinary_diff_is_delivered_complete_and_unflagged() {
     assert_eq!(adds, 200, "a complete diff must keep every added line");
 }
 
-/// Blame on a large file goes through the same discipline: `--line-porcelain`
-/// emits ~10 metadata lines per source line, so it outgrows its file fast.
+/// Blame on a large file goes through the same discipline: `--porcelain`
+/// costs a ~55-byte header per source line on top of the line itself, so a
+/// short-lined file outgrows the cap while staying under the 8 MiB working-tree
+/// limit (300,000 ten-byte lines are 3.3 MB of text and ~20 MB of blame).
+/// This fixture was 60,000 lines of 120 bytes while blame used
+/// `--line-porcelain`; that file now blames whole (see
+/// `blame_past_the_old_line_porcelain_ceiling_is_complete` in `git_reader`).
 #[test]
 fn blame_on_a_large_file_stays_within_its_budget() {
-    let (dir, _) = huge_diff_repo(60_000, 120);
+    let (dir, _) = huge_diff_repo(300_000, 10);
     let repo = dir.path().to_str().expect("utf8 path");
 
     // Vec<BlameLine> cannot carry a truncation verdict. Returning a prefix

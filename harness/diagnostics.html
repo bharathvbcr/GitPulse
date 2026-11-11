@@ -150,7 +150,7 @@
       Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async()=>{throw Error("clipboard denied");}}});
       document.execCommand=()=>false;
       await click("Copy DevMap logs");
-      check("clipboard denial is visible without claiming success",target.textContent.includes("Could not copy DevMap logs.")&&!target.textContent.includes("DevMap logs copied."));
+      check("clipboard denial is visible without claiming success",target.textContent.includes("Couldn't copy DevMap logs.")&&!target.textContent.includes("DevMap logs copied."));
       Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copiedLogs.push(text);}}});
       fixture.cmd_diagnostic_log_tail = a => defer("copy-log",a);
       await click("Copy DevMap logs");
@@ -234,14 +234,14 @@
       await settle();
       check(
         "a stalled devmap status probe does not hold an arrived map",
-        target.textContent.includes("NEWER-MAP-AREA") && !target.textContent.includes("Loading map") && staleMap !== null && requests.some((r) => r.kind === "map-status"),
+        target.textContent.includes("NEWER-MAP-AREA") && !target.querySelector('[data-testid="map-loading"]') && staleMap !== null && requests.some((r) => r.kind === "map-status"),
         `pending status=${requests.some((r) => r.kind === "map-status")} started=${staleMap !== null} text=${target.textContent.slice(0, 280)}`,
       );
       if (staleMap) staleMap.resolve(mapLoad("STALE-MAP-AREA"));
       await settle();
       check(
         "a superseded reload does not replace the map or leave the panel loading",
-        target.textContent.includes("NEWER-MAP-AREA") && !target.textContent.includes("STALE-MAP-AREA") && !target.textContent.includes("Loading map"),
+        target.textContent.includes("NEWER-MAP-AREA") && !target.textContent.includes("STALE-MAP-AREA") && !target.querySelector('[data-testid="map-loading"]'),
         target.textContent.slice(0, 280),
       );
       while (requests.some((r) => r.kind === "map-status")) take("map-status").resolve(quietStatus);
@@ -308,7 +308,7 @@
     const okRefresh=fixture.cmd_docs_refresh;
     fixture.cmd_docs_refresh=()=>{throw new Error("vault refresh boom");};
     await click("Docs");
-    check("a failed vault refresh says the links could not be checked",target.textContent.includes("Could not check links.")&&!target.textContent.includes("None found in the indexed vault."));
+    check("a failed vault refresh says the links could not be checked",target.textContent.includes("Couldn't check links.")&&!target.textContent.includes("None found in the indexed vault."));
     fixture.cmd_docs_refresh=okRefresh;
     await click("Symbols");take("graph").resolve({available:false,reason:"symbols",kind:"code_graph",payload:null});await settle();
     await click("Files");const oldGraph=take("graph");

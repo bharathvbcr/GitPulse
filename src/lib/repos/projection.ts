@@ -7,7 +7,7 @@ import { familyFromCommonDir } from "./repoFamily";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { WATCH_UNKNOWN } from "./watchState";
 import { IDLE_OPERATION } from "./operation";
-import type { OpenRepoTab, RepoSession, RepoState, InternalState } from "./storeTypes";
+import type { FileStatus, OpenRepoTab, RepoSession, RepoState, InternalState } from "./storeTypes";
 
 /**
  * Session generations never restart — not on close+reopen, not on workspace
@@ -35,6 +35,8 @@ export function emptyProjected(): RepoState {
     currentBranch: null,
     defaultBranch: null,
     statuses: [],
+    conflictedCount: 0,
+    stagedCount: 0,
     selectedCommitId: null,
     selectedCompareBase: null,
     selectedFilePath: null,
@@ -145,10 +147,33 @@ export interface ProjectionCache {
   tabs: readonly TabRecord[] | null;
   labels: Map<string, string>;
   rows: Map<string, { tab: TabRecord; session: RepoSession | undefined; active: boolean; label: string; row: OpenRepoTab }>;
+  /** The array `project` returned last, handed back while no row changed or moved. */
+  openTabs: OpenRepoTab[] | null;
+  /** Counts for the statuses array they were taken from; recounted only for a different array. */
+  counts: { statuses: readonly FileStatus[]; conflicted: number; staged: number } | null;
 }
 
 export function createProjectionCache(): ProjectionCache {
-  return { tabs: null, labels: new Map(), rows: new Map() };
+  return { tabs: null, labels: new Map(), rows: new Map(), openTabs: null, counts: null };
+}
+
+function countStatuses(cache: ProjectionCache, statuses: readonly FileStatus[]) {
+  if (cache.counts?.statuses !== statuses) {
+    let conflicted = 0;
+    let staged = 0;
+    for (const file of statuses) {
+      if (file.is_conflicted) conflicted += 1;
+      if (file.is_staged) staged += 1;
+    }
+    cache.counts = { statuses, conflicted, staged };
+  }
+  return cache.counts;
+}
+
+/** Every `OpenRepoTab` field is a primitive, so equal keys and values is equal. */
+function sameRow(a: OpenRepoTab, b: OpenRepoTab): boolean {
+  const keys = Object.keys(a) as (keyof OpenRepoTab)[];
+  return keys.length === Object.keys(b).length && keys.every((key) => Object.is(a[key], b[key]));
 }
 
 export function project(
@@ -164,7 +189,7 @@ export function project(
     for (const id of cache.rows.keys()) if (!live.has(id)) cache.rows.delete(id);
   }
   const labels = cache.labels;
-  const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
+  const mapped: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
     const session = internal.sessions[tab.id];
     const active = tab.id === internal.workspace.activeId;
     const label = labels.get(tab.path) ?? displayName(tab.path);
@@ -172,15 +197,28 @@ export function project(
     if (kept && kept.tab === tab && kept.session === session && kept.active === active && kept.label === label) {
       return kept.row;
     }
-    const row = projectTab(tab, session, active, label, options);
+    const built = projectTab(tab, session, active, label, options);
+    // The store replaces a session on every change, selection and status
+    // included, so a rebuilt row is usually equal to the one it replaces.
+    // Keeping the old object is what lets the array below keep its identity.
+    const row = kept && sameRow(kept.row, built) ? kept.row : built;
     cache.rows.set(tab.id, { tab, session, active, label, row });
     return row;
   });
+  // Positionally identical, not merely "every row came from the cache": a
+  // drag reorder reuses every row and moves them, and must publish a new array.
+  const previous = cache.openTabs;
+  const openTabs =
+    previous && previous.length === mapped.length && mapped.every((row, i) => row === previous[i])
+      ? (previous as OpenRepoTab[])
+      : mapped;
+  cache.openTabs = openTabs;
 
   const active = internal.workspace.activeId
     ? internal.sessions[internal.workspace.activeId]
     : undefined;
-  return projectRest(internal, openTabs, active);
+  const counts = active ? countStatuses(cache, active.statuses) : null;
+  return projectRest(internal, openTabs, active, counts?.conflicted ?? 0, counts?.staged ?? 0);
 }
 
 function projectTab(
@@ -217,10 +255,22 @@ function projectTab(
     };
 }
 
+/**
+ * What a field reads as with no repository open. One frozen array rather than a
+ * fresh `[]` per publish: the field stores (`repoStore.statuses` and the rest)
+ * notify when the reference changes, so a new empty array each time woke every
+ * subscriber on every publish while nothing was open.
+ */
+const NONE: never[] = [];
+Object.freeze(NONE);
+const NO_SECTIONS: Record<string, string> = Object.freeze({});
+
 function projectRest(
   internal: InternalState,
   openTabs: OpenRepoTab[],
   active: RepoSession | undefined,
+  conflictedCount: number,
+  stagedCount: number,
 ): RepoState {
   const base = emptyProjected();
   return {
@@ -229,14 +279,16 @@ function projectRest(
     activeTabId: internal.workspace.activeId,
     recentRepos: internal.workspace.recents,
     lastClosed: internal.workspace.lastClosed,
-    collapsedGroups: internal.workspace.collapsedGroups ?? [],
-    groupColors: internal.workspace.groupColors ?? [],
+    collapsedGroups: internal.workspace.collapsedGroups ?? NONE,
+    groupColors: internal.workspace.groupColors ?? NONE,
     currentPath: active?.path ?? null,
-    branches: active?.branches ?? [],
-    tags: active?.tags ?? [],
+    branches: active?.branches ?? NONE,
+    tags: active?.tags ?? NONE,
     currentBranch: active?.currentBranch ?? null,
     defaultBranch: active?.defaultBranch ?? null,
-    statuses: active?.statuses ?? [],
+    statuses: active?.statuses ?? NONE,
+    conflictedCount,
+    stagedCount,
     selectedCommitId: active?.selectedCommitId ?? null,
     selectedCompareBase: active?.selectedCompareBase ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
@@ -249,7 +301,7 @@ function projectRest(
     selectedDiffError: active?.selectedDiffError ?? null,
     selectionKind: active?.selectionKind ?? "file",
     activeTab: active?.activeTab ?? "work",
-    viewSections: active?.viewSections ?? {},
+    viewSections: active?.viewSections ?? NO_SECTIONS,
     historyList: active?.historyList ?? "commits",
     terminalOpen: active?.terminalOpen ?? false,
     isLoading: active?.isLoading ?? false,
@@ -262,7 +314,7 @@ function projectRest(
     statsFailed: active?.statsFailed ?? false,
     statusUnavailableSince: active?.statusUnavailableSince ?? null,
     operation: active?.operation ?? IDLE_OPERATION,
-    stashEntries: active?.stashEntries ?? [],
+    stashEntries: active?.stashEntries ?? NONE,
     stashFailed: active?.stashFailed ?? false,
     stashTruncated: active?.stashTruncated ?? false,
     tagsTruncated: active?.tagsTruncated ?? false,

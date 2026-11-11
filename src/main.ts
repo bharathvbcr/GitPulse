@@ -10,14 +10,16 @@ import { installNavigationDiagnostics } from "./lib/diagnostics/navigation";
 import { get } from "svelte/store";
 import { interfaceStore } from "./lib/stores/interfaceStore";
 import { repoStore } from "./lib/stores/repoStore";
-import { configureSharedReads } from "./lib/ipc/invoke";
-import { SHARED_READ_COMMANDS } from "./lib/ipc/sharedReads";
+import { configureReadCancellation, configureSharedReads } from "./lib/ipc/invoke";
+import { cancelRead, CANCELLABLE_READ_COMMANDS, SHARED_READ_COMMANDS } from "./lib/ipc/sharedReads";
 
 applyPlatformClass();
 
 // Identical in-flight snapshot reads are joined in this window only; the
 // status popover's bundle never carries the list (see `configureSharedReads`).
 configureSharedReads(SHARED_READ_COMMANDS);
+// Likewise the reads the backend can stop once their last caller has gone.
+configureReadCancellation(CANCELLABLE_READ_COMMANDS, cancelRead);
 
 // Ask the backend which host this is before anything platform-gated renders.
 // Fire-and-forget on purpose: the store starts at a conservative fallback that

@@ -17,7 +17,8 @@
    * that.
    */
   import { AlertTriangle, Check, ChevronRight, RefreshCw } from "@lucide/svelte";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Skeleton from "./Skeleton.svelte";
   import { askConfirm } from "../stores/modalStore";
   import { displayName } from "../repos/paths";
   import {
@@ -51,6 +52,14 @@
   let expanded = $state<IntegrationHost | null>(null);
   let applying = $state<IntegrationHost | null>(null);
   let applied = $state<IntegrationPlan | null>(null);
+  /** Checking and previewing that could not run are "unknown"; a write that failed is "danger". */
+  let loadErrorTone = $state<"unknown" | "danger">("unknown");
+
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
 
   const rows = $derived(
     INTEGRATION_HOSTS.map((host) => ({ host, plan: plans.get(host) })).filter(
@@ -68,7 +77,8 @@
       loadError = null;
     } catch (error) {
       plans = new Map();
-      loadError = formatError(error);
+      loadErrorTone = "unknown";
+      loadError = failure("check", "the agent integration", error);
     } finally {
       loading = false;
     }
@@ -92,7 +102,8 @@
       plans = new Map(plans).set(host, fresh);
       loadError = null;
     } catch (error) {
-      loadError = formatError(error);
+      loadErrorTone = "unknown";
+      loadError = failure("preview", "the integration changes", error);
     }
   }
 
@@ -112,13 +123,15 @@
       }
       applied = outcome;
       plans = new Map(plans).set(host, outcome);
-      loadError = outcome.available ? null : (outcome.reason ?? "Integration failed");
+      loadErrorTone = "danger";
+      loadError = outcome.available ? null : (outcome.reason ?? "Couldn't apply the integration.");
       // The applied plan describes what was written; re-survey so the row goes
       // back to describing what is left to do.
       await survey(path);
       expanded = host;
     } catch (error) {
-      loadError = formatError(error);
+      loadErrorTone = "danger";
+      loadError = failure("apply", "the integration", error);
     } finally {
       applying = null;
     }
@@ -133,39 +146,39 @@
 
 <div class="space-y-2" data-testid="agent-integration">
   <div class="flex items-center justify-between gap-2">
-    <h4 class="text-textPrimary text-[11px] font-medium">Agent host integration</h4>
+    <h4 class="text-textPrimary text-meta font-medium">Agent host integration</h4>
     <button
       type="button"
-      class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+      class="gp-btn" data-size="sm"
       disabled={loading || !repoPath}
       onclick={() => repoPath && void survey(repoPath)}
     >
       <RefreshCw size={10} class={loading ? "animate-spin" : undefined} />
-      Re-check
+      Rescan
     </button>
   </div>
 
-  <p class="text-textMuted text-[10px] leading-snug">
+  <p class="text-textMuted text-micro leading-snug">
     Writes agent guides, editor rules, MCP entries and skills into
     {#if repoPath}<span class="font-mono">{displayName(repoPath)}</span>{:else}the open
       repository{/if}. Previewed first; nothing is written until you apply.
   </p>
 
   {#if loadError}
-    <p class="text-amber-600 dark:text-amber-400 text-[10px]">{loadError}</p>
+    <div class="gp-notice" data-tone={loadErrorTone} role={loadErrorTone === "danger" ? "alert" : "status"}>{loadError}</div>
   {/if}
 
   {#if !repoPath}
-    <p class="text-textMuted text-[10px]">Open a repository to check its agent integration.</p>
+    <p class="text-textMuted text-micro">Open a repository to check its agent integration.</p>
   {:else if loading && plans.size === 0}
-    <p class="text-textMuted text-[10px]">Checking…</p>
+    <Skeleton variant="text" count={3} />
   {:else}
     <ul class="space-y-1.5">
       {#each rows as row (row.host)}
         {@const host = row.host}
         {@const plan = row.plan}
         {@const total = totalChanges(plan)}
-        <li class="rounded-xl border border-border/70 bg-background/60">
+        <li class="rounded-xl bg-background/60">
           <button
             type="button"
             class="flex w-full items-start gap-2 p-2 text-left"
@@ -174,9 +187,9 @@
           >
             <span class="mt-0.5 shrink-0">
               {#if !plan.available}
-                <AlertTriangle size={11} class="text-amber-600 dark:text-amber-400" />
+                <AlertTriangle size={11} class="text-warn" />
               {:else if total === 0}
-                <Check size={11} class="text-emerald-600 dark:text-emerald-400" />
+                <Check size={11} class="text-ok" />
               {:else}
                 <ChevronRight
                   size={11}
@@ -187,23 +200,23 @@
               {/if}
             </span>
             <span class="min-w-0 flex-1">
-              <span class="text-textPrimary block text-[11px] font-medium"
+              <span class="text-textPrimary block text-meta font-medium"
                 >{hostLabel(host)}</span
               >
-              <span class="text-textMuted block text-[10px] leading-snug">
+              <span class="text-textMuted block text-micro leading-snug">
                 {planSummary(plan)}
               </span>
             </span>
           </button>
 
           {#if expanded === host && plan.available}
-            <div class="border-border/70 space-y-1.5 border-t px-2 pt-1.5 pb-2">
+            <div class="space-y-1.5 px-2 pt-1.5 pb-2">
               {#if plan.entries.length === 0}
-                <p class="text-textMuted text-[10px]">Nothing to write.</p>
+                <p class="text-textMuted text-micro">Nothing to write.</p>
               {:else}
                 <ul class="space-y-0.5">
                   {#each plan.entries as entry, i (`${entry.kind}:${entry.path}:${i}`)}
-                    <li class="text-[10px] leading-snug">
+                    <li class="text-micro leading-snug">
                       <span
                         class="font-medium {entry.changed
                           ? 'text-textPrimary'
@@ -213,7 +226,7 @@
                       </span>
                       <span class="text-textMuted"> · {entry.disposition}</span>
                       {#if entry.outside_repo}
-                        <span class="text-amber-600 dark:text-amber-400">
+                        <span class="text-warn">
                           · outside this repository</span
                         >
                       {/if}
@@ -230,25 +243,25 @@
               {/if}
 
               {#if plan.protected.length > 0}
-                <p class="text-textMuted text-[10px] leading-snug">
+                <p class="text-textMuted text-micro leading-snug">
                   Left alone because you wrote {plan.protected.length === 1 ? "it" : "them"}:
                   <span class="font-mono break-all">{plan.protected.join(", ")}</span>
                 </p>
               {/if}
 
               {#each plan.notes as note, i (`${i}:${note.slice(0, 40)}`)}
-                <p class="text-textMuted text-[10px] leading-snug">{note}</p>
+                <p class="text-textMuted text-micro leading-snug">{note}</p>
               {/each}
 
               {#if plan.applied}
-                <p class="text-[10px] leading-snug text-emerald-700 dark:text-emerald-300">
+                <p class="text-micro leading-snug text-ok">
                   Written.
                 </p>
               {/if}
 
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[10px]"
+                class="gp-btn" data-size="sm"
                 disabled={applying !== null || !canApply(plan)}
                 onclick={() => void apply(host)}
               >
@@ -262,8 +275,8 @@
   {/if}
 
   {#if applied && !applied.available}
-    <p class="text-[10px] text-rose-700 dark:text-rose-300">
-      {applied.reason ?? "Integration failed"}
-    </p>
+    <div class="gp-notice" data-tone="danger" role="alert">
+      {applied.reason ?? "Couldn't apply the integration."}
+    </div>
   {/if}
 </div>

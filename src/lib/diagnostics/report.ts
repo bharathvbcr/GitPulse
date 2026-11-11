@@ -28,7 +28,7 @@ export type PanelSource =
   | "firebase"
   | "health"
   | "hygiene"
-  | "ops"
+  | "branch-cleanup"
   | "clone"
   | "rebase"
   | "remotes"

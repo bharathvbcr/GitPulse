@@ -8,6 +8,7 @@
   import { mountStatusResize } from "./statusResize";
   import { isMacOS, isTauri } from "../platform";
   import { formatError } from "../ui/formatError";
+  import { installTransparencyPreference } from "../ui/transparencyPreference";
   let snapshot = $state<MenuState | null>(null);
   let error = $state<string | null>(null);
   let pending = $state(false);
@@ -35,6 +36,9 @@
   onMount(() => {
     if (!isTauri()) { error = "Open this panel from the GitPulse menu bar icon."; return; }
     void connection.connect();
+    // WKWebView lacks `prefers-reduced-transparency`; the native bridge stamps
+    // `data-transparency` on <html> for StatusPopover to key off.
+    const stopTransparency = installTransparencyPreference();
     const stopResize = mountStatusResize(host, {
       send: (height) => invoke("cmd_resize_status", { height }),
       failed: (cause) => { if (!disposed) error = formatError(cause); },
@@ -43,6 +47,7 @@
     return () => {
       disposed = true;
       connection.dispose();
+      void stopTransparency.then((stop) => stop());
       stopResize();
     };
   });

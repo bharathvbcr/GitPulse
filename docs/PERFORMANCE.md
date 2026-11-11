@@ -238,7 +238,12 @@ Closed since (2026-10-07):
   code index or the document vault; a source edit skips the vault. An index
   write counts as content (git writes it whenever it rewrites tracked files),
   and an unknown or unreadable change refreshes everything. The worktree watch
-  stays non-recursive, so a path list means "at least these".
+  is non-recursive on Linux and Windows, where a path list names top-level
+  entries and means "at least these"; on macOS it is recursive and filtered
+  (see the 2026-11-09 section at the end), and a path list names the files.
+  There the backend also answers a status poll from the read it kept when the
+  stream delivered no event at all since; where the watch is not recursive
+  nothing can, and the status poll is the detector.
 
 ## Current gate status
 
@@ -846,6 +851,166 @@ on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
 
+## 2026-11-09: `gitpulse_insights` asks the app first (perf1109-mcp-asks-app)
+
+Every agent session has its own `gitpulse-mcp`, and each keeps its own
+`ref_cache` and `status_cell` statics, so N sessions asking `gitpulse_insights`
+scan the same worktrees N times (the audit sampled about 26 MCP processes, three
+scanning one repository within 7 s, and one call at 625-667 ms).
+
+**Shape.** `Request::InsightsRead { id, repo }` on the same mailbox, answered on
+its own connection by the sink `launch::establish` attaches
+(`hooks::serve_insights`, which calls `insights::app_facets::serve`). The reply
+is `AppFacets`: `repo` (the canonical path the app read), `worktrees`,
+`agents`, `changes`, `collisions` (each `Option`), `age_ms`, `deadline_expired`
+and `not_scanned` (`facet` and `reason` for every `None`). `agents` is the
+agent-session count attributed over the same listing, which the asker cannot
+attribute from the capped worktree rows. `resources::insights_document`
+(`gitpulse_insights` and the `gitpulse://insights` resource) asks through
+`hooks::insights_from_app` (`COLLISION_APP_DEADLINE` 2 s) and reads the ledger
+and code graph itself. An answer from the app adds `served_by: {source: "app",
+age_ms}` to the document, declared in the tool's output schema and described in
+its description; a fallback adds nothing.
+
+**Where the answer comes from.** The same status cell and listing memo as the
+collision scan, with a shorter promise. The app reads with a clock that began
+`APP_TTL` (2 s) ago, so a worktree status read that began within 2 s is
+accepted and nothing older, and a memoised listing older than 2 s is listed
+again (`CollisionMemo::listing`). **Why 2 s and not the collision scan's 5 s:**
+a *negative* ("nothing overlaps") is the answer an agent about to edit acts on,
+and the asker's own scan is fresh at the call. 2 s lets asks that arrive within
+it share the reads already made, but at most four are served at once
+(`MAX_INSIGHTS_HANDLERS`); with 26 sessions asking together, the rest scan for
+themselves for that call, so the saving is the reads and listing the served
+asks share, not 26 into 1. The edit hook, which is the gate and checks again at
+edit time, keeps its own 5 s. The
+asker refuses an answer older than `INSIGHTS_MAX_AGE_MS` (4 s, twice the
+promise, so a clock hiccup does not discard a good answer). **Trust is checked
+first, for every request** (`validate_repo`), because a listing served from
+memory skips the listing's own check, and every read is of the canonical path it
+returned. **A positive is read again**: every worktree a positive collision
+names as a party (a file dirty in two worktrees) is re-read with a clock that
+began now before the facets are derived, and so is a worktree that holds two or
+more live sessions whose kept read shows it dirty. A shared worktree whose kept
+read is clean is not a positive and is not re-read. A positive that cannot be
+re-read inside `APP_BUDGET` is reported not scanned (the facets are derived
+under the re-read's own bound), never served from the kept read. A facet the app
+could not read is `None` with a reason, and the asker also refuses an answer
+with `deadline_expired`, or with any unscanned or failed worktree, or a
+worktree with no dirty count (the app's budget is shorter than the asker's own
+scan's), and one about another repository: it scans for itself.
+
+**What `age_ms` is.** The age, at the moment the facets were derived, of the
+oldest read the answer stands on: the worktree listing, the status behind
+`changes`, and the status of every worktree that was read. Each is stamped
+*before* it is read, from the cache's report of the kept read's age (a newer
+read handed over only makes the stamp older, never younger), or with the ask's
+own instant when the cache would not hand its read over; a worktree read again
+because it is a positive is stamped with the instant its re-read began. The
+stamps are taken once and the age is computed from them, so a concurrent asker
+refreshing the cache afterwards cannot lower it, and one re-read worktree does
+not make the answer look fresh. When the checkout `changes` describes is itself
+a positive, `changes` is taken again from the re-read, so its row and the facet
+are one moment (and if that re-read missed its bound `changes` is not scanned).
+The asker refuses `age_ms` above `INSIGHTS_MAX_AGE_MS` (4 s).
+
+**Limits, stated plainly.** A shared checkout that was clean at its kept read
+and has been dirtied since goes unseen for at most about 2 s, where `main`
+scanned on every ask. "One status child" for a dirty shared checkout is per
+ask, not per coalesced window. The child counts below are n=1, in one test
+process, on a synthetic farm, taken at the load recorded with them.
+
+**Bounds.** At most `MAX_INSIGHTS_HANDLERS` (4) reads at once, drawn from the
+`MAX_GATE_HANDLERS` slots, so the MCP processes cannot fill the slots the edit
+hooks use; one past is answered "busy". The handler does its git work in
+`Admission::Background`, the class the asker's own scan has (`gitpulse-mcp` is a
+background process), so agents' reads do not compete with the UI. The app's
+status reads stop starting `APP_BUDGET` (1.2 s) after the ask, and the handler
+waits `HANDLER_DEADLINE` (1.6 s, under the asker's 2 s) for its own reading and
+then answers every facet "not scanned" and frees its slot; the reading is
+abandoned, not cancelled (git has no handle to cancel), so at most
+`MAX_ABANDONED` (4) abandoned readings may be running before new asks are
+refused. A reply that would not fit `MAX_FRAME` is refused at once ("the answer
+is N bytes") instead of being written. The request carries an id and an
+absolute path of at most 1024 bytes.
+
+**Asker backoff.** After an ask that failed in transport (a missed deadline, a
+refusal, nobody answering) the same app is not asked again for 30 s
+(`ask_backoff`), so a wedged app costs each MCP process one deadline, not one
+per call, and a deferral retry never pays it twice. Three answers in a row that
+could not be used (partial, too old, another repository, malformed) start the
+same 30 s, and the first usable answer resets the count: one partial answer is
+ordinary on a loaded host and two can be chance, but an app that cannot serve a
+repository (more worktrees than its budget reads) would otherwise cost every
+call the app's time and then its own scan. The reason is kept and shown in
+"not asking: <reason>". **A "busy" refusal is neither**: the app is alive and
+answering, so that call scans for itself and the next call asks again. The
+refusal is immediate (no deadline paid), askers retry on their own calls'
+schedules rather than a shared timer, and the four slots bound the app's load
+however many ask, so there is nothing to synchronise into a herd. The app is
+named by its socket's identity, so a new instance is asked at once.
+
+**Version skew.** `PROTOCOL` is not bumped, and should not be: the greeting is
+strictly parsed, so a bump would make a new app refuse every installed old hook
+and relaunch. An older app does not parse the new `kind`, refuses the frame
+(its own log line is a warning per connection, so one per backoff interval per
+MCP process), and the MCP scans for itself; the MCP's fallback logs at debug
+level. An older MCP never asks. An app without the sink attached refuses with
+"the insights read is not attached".
+
+**Profile directory.** The asker, like the collision-guard hook, asks only the
+app that owns `tool_config::default_config_dir()` (derived from `$HOME`), which
+is the directory the app claims at launch (`launch::establish`). Both use the
+one resolver, so they agree with the app; a process with another `$HOME`, or an
+app run under another profile, is never asked and scans for itself.
+
+**Measured** (counts inside one test process with the real serving code, not
+the installed binaries; 7 sibling worktrees dirty, a repository shaped like the
+audit's sample): the asker's git children per `gitpulse_insights` call were
+`worktree list` 1, `status` 7, other 5 (13) alone and `worktree list` 1,
+`status` 0, other 0 (1) with a fake app replaying the app's answer
+(`hooks::tests::a_fresh_app_answer_replaces_the_askers_own_scan`; the one left is
+the ledger's address resolution in the asker). The *handler's* git children for
+a second ask, for the two shapes of a busy main checkout (two live sessions,
+two sibling worktrees, nothing contended), were: **clean** main checkout
+`worktree list` 0, `status` 0
+(`insights::app_facets::tests::a_clean_shared_checkout_is_not_read_again`);
+**dirty** main checkout `worktree list` 0, `status` 1, the main checkout itself
+(`a_dirty_shared_checkout_is_read_again_on_every_ask`). This repository is
+always the second shape, so its ask costs one status child, not zero.
+Re-run on 2026-11-10 with the final tree, n=1 each, in one test process on a
+synthetic farm, load average 16.8 (1 min) before and 22.6 after the run: asker
+alone 13 children, asker with a fake app 1, handler second ask 0 (clean shared
+checkout) and 1 (dirty shared checkout), the same as above.
+The live re-sample needs the app, `gitpulse-mcp` and `gitpulse-hook` rebuilt
+and reinstalled.
+
+**Security impact.** Read-only; no write path, no new socket, mode or
+permission. A caller can now ask for the `worktrees`, `changes` and `collisions`
+facets of a repository GitPulse is trusted in. It could already read them by
+running `git` there itself (and `gitpulse-mcp` does exactly that), and the
+paths and counts are what `gitpulse_insights` already returns. Trust, the
+same-uid peer check, the 0700 directory and the 0600 socket are the mailbox's
+and `validate_repo`'s, unchanged; `resolve_worktree_family` is not on this path
+and nothing here memoises it. Two changes tighten it: the app reads the
+canonical path validation returned, not the string the peer sent, and echoes it
+in the reply, and the asker refuses a reply about any other repository. The
+app's git work runs in the background admission class, so a peer cannot use the
+request to take UI-priority git slots, and a handler that cannot finish in
+1.6 s answers "not scanned" and frees its slot (the readings it abandons are
+capped at four).
+
+**Why a hook process scanned while the app was up (still unproven for the
+sampled pid).** One path never asks: `run_session_brief` calls
+`insights::snapshot` directly, so every SessionStart hook runs a full worktree
+scan whatever the app is doing. The other ways collision-guard itself scans are
+all logged at debug level (`collision guard: scanning here, the app did not:
+why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
+verdicts), the mailbox's 24-connection admission (a connection past it is closed
+without a greeting), an answer older than 10 s, a reply that read no worktree,
+the 2 s deadline under load, the app quitting mid-ask ("GitPulse is quitting"),
+and an owner on an incompatible protocol version (`reach_owner` returns none).
+
 ## 2026-10-12: benchmark harness and the loaded-host baseline (ft-c0d9313f)
 
 The audit's perf cards need a number to be measured against. Before this there
@@ -940,6 +1105,7 @@ measurement.
 | --- | --- | --- |
 | `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
+| `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the size of the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
@@ -1132,6 +1298,111 @@ N is the sample count per row (full mode, not `--smoke`).
 | lane_solver merge-heavy 10k | 1.88 ms | 2.33 ms | 2.81 ms | 9,997 rows, 8,330 connections, 1,666 merges, width 4 |
 | lane_solver linear 100k | 41.07 ms | 43.12 ms | 45.32 ms | 100,000 rows, 99,999 connections |
 | lane_solver merge-heavy 100k | 24.83 ms | 25.82 ms | 29.00 ms | 99,601 rows, 83,000 connections, 16,600 merges, width 4 |
+
+`graph_window` (perf1109-graph-blame-reads; N = 7, load average 16.2 on 18
+cores, generated 12-commit merge cycle with ~55-character subjects, no
+repository; `assemble` includes cloning the input commits, as the command
+moves them, so it slightly overstates the solve):
+
+| row | min | p50 | p95 | counters |
+| --- | --- | --- | --- | --- |
+| assemble 5k | 2.15 ms | 2.69 ms | 2.90 ms | 5,000 rows, 5,415 connections |
+| assemble 30k | 15.23 ms | 16.56 ms | 17.77 ms | 30,000 rows |
+| assemble 100k | 57.94 ms | 65.20 ms | 71.10 ms | 100,000 rows, 108,332 connections |
+| serialize 100k | 28.20 ms | 31.08 ms | 32.86 ms | 52,395,741 payload bytes (about 524 B per row) |
+| decode 100k (`serde_json::Value`, a stand-in for `JSON.parse`) | 137.45 ms | 147.57 ms | 157.86 ms | same bytes |
+| serialize 5k / 30k | 1.34 / 8.51 ms | | | 2.6 MB / 15.7 MB |
+| unchanged payload serialize | 4.21 us | 5.08 us | 8.83 us | 208 payload bytes |
+
+The last row serializes a hand-built `unchanged` struct and nothing else: its
+208 bytes are the size of the answer on the wire, but its 4 us is not the cost
+of an unchanged reload. A real hit still stats every ref file and runs the
+HEAD, ref-decoration, default-branch and hidden-ref probes before it can
+answer; the real hit and the stale-token reload, whose probes now run before
+the history walk instead of beside it, are timed in the `graph_hit_path` table
+below. The token is also
+refused once it is older than the ref cache's 60 s TTL (the stamp cannot see
+files pulled in by `include.path`), so a reload after a minute is a full one.
+
+`graph_hit_path` (perf1109-graph-blame-reads): the real command
+(`cmd_get_commit_graph` plus the JSON the IPC layer writes) with and without a
+revision token, on `main` plus 20 branches of empty commits, 6,000 commits with
+the default 5,000-row window and 100,000 commits with a 30,000-row window. 23
+rounds, the first 2 discarded, n = 21; the arm that goes first alternates by
+round parity; each cold arm reads its own fresh APFS clone (a path the process
+has never read); each warm pair starts from one untimed read. Load average 8.4
+at the start and 11.5 at the end (18 cores, both below 30). `old` is the
+command with no token, which is the previous path plus one stamp read and one
+token hash (the merge-base build has no token argument and cannot be called
+from the bench); `new-hit` is the unchanged answer; `new-stale` is a
+well-formed token that names nothing real; `new-moved` is the genuine token the
+same repository issued before one ref moved by one commit (4 s earlier, so the
+stamp has settled). Times in ms; the paired difference is second minus first;
+git processes come from an untimed trace2 pass. These are the numbers after the
+fix below. A first run of the same bench before the fix measured the cold
+stale-token reload at +53 ms (5k) and +118 ms (30k), and a second run's
+moved-ref null pair was biased (the second-prepared clone always went to one
+arm, 16 of 21 rounds), so it was thrown away and the harness counterbalanced.
+
+| pair (window) | first arm: median / min / max | second arm: median / min / max | paired diff median [IQR] | second faster | git processes (first / second) |
+| --- | --- | --- | --- | --- | --- |
+| warm null, old vs old (5k) | 4.75 / 3.84 / 5.98 | 4.69 / 3.80 / 6.30 | +0.06 [-0.05, 0.14] | 9/21 | 0 / 0 |
+| warm, old vs new-hit (5k) | 4.79 / 3.81 / 10.57 | 1.15 / 0.69 / 4.37 | -3.66 [-3.85, -3.40] | 21/21 | 0 / 0 |
+| cold null, old vs old (5k) | 130.11 / 101.95 / 173.23 | 130.37 / 103.51 / 150.89 | +0.35 [-9.62, 3.90] | 10/21 | 11 / 11 |
+| cold, old vs new-stale (5k) | 133.35 / 120.37 / 206.68 | 130.53 / 118.59 / 147.93 | -1.04 [-13.58, 8.20] | 12/21 | 11 / 11 |
+| moved null, old vs old (5k) | 101.55 / 85.51 / 159.35 | 103.16 / 94.29 / 122.12 | -0.41 [-5.63, 2.95] | 13/21 | |
+| one ref moved, old vs new-moved (5k) | 103.98 / 82.78 / 128.50 | 104.23 / 88.03 / 160.01 | -1.02 [-5.71, 3.28] | 12/21 | |
+| warm null, old vs old (30k) | 26.44 / 21.94 / 31.74 | 25.51 / 22.28 / 37.41 | +0.28 [-0.33, 0.61] | 7/21 | 0 / 0 |
+| warm, old vs new-hit (30k) | 25.19 / 22.08 / 37.83 | 1.11 / 0.78 / 1.72 | -24.06 [-26.56, -22.03] | 21/21 | 0 / 0 |
+| cold null, old vs old (30k) | 1802.66 / 1622.58 / 2143.66 | 1805.21 / 1626.35 / 2192.85 | -10.23 [-21.13, 45.91] | 11/21 | 16 / 16 |
+| cold, old vs new-stale (30k) | 1845.16 / 1581.91 / 2104.27 | 1730.51 / 1598.72 / 2120.15 | -31.93 [-105.80, 9.02] | 13/21 | 16 / 16 |
+| moved null, old vs old (30k) | 1644.62 / 1521.41 / 2020.79 | 1668.69 / 1535.05 / 2061.33 | +5.90 [-45.85, 41.18] | 10/21 | |
+| one ref moved, old vs new-moved (30k) | 1655.00 / 1539.31 / 2074.76 | 1641.83 / 1557.01 / 2008.49 | -11.44 [-71.26, 34.98] | 11/21 | |
+
+Git child CPU (median) was 0 in every warm arm (no git process ran) and within
+a few percent between the two arms of every cold and moved pair. All six null
+pairs are valid (median within half the IQR of its own paired differences), so
+the noise floor is about 0.1 ms warm at 5k and 0.5 ms at 30k, about 7 ms cold
+and 4 ms moved at 5k, and about 34 ms cold and 44 ms moved at 30k. Where a
+cold reload's time goes, cold, n = 21 (probes alone, then walk alone, each on
+its own fresh clone): 127 / 58 ms at 5k and 122 / 1931 ms at 30k.
+
+Reading it. **Faster:** a warm unchanged reload, 4.8 to 1.15 ms at 5,000 rows
+(3.7 ms faster) and 25.2 to 1.11 ms at 30,000 (24.1 ms faster), in 21 of 21
+rounds, far outside the noise; none of it is git (both arms spawn nothing, the
+old warm path being answered from the ref cache), so the saving is the cached
+walk text, the lane solve and the serialization. **Not slower, not faster:** a
+cold reload with a stale token and a reload after one ref moved by one commit
+are level with no token (differences of -1 and -1 ms at 5k, -32 and -11 ms at
+30k, each inside its null pair's spread, 11 to 13 of 21 rounds); the earlier
++53 ms (5k) and +118 ms (30k) are gone. The cause was that any request
+carrying a token waited for the four probes before starting its walk, so a
+stale one paid the probes and the walk in series where no token overlaps them,
+a cost equal to the smaller of the two (probes 122 to 127 ms, walk 58 ms at 5k
+and 1,931 ms at 30k). A token that cannot hold (another view, another stamp,
+expired) now starts the walk at once, decided by one comparison of the stamp
+already read. A token that does hold (same view and stamp) still waits for the
+probes to compare tip content, and if the content then differs the walk runs
+after them: that rare case still pays the series cost and is not measured. A
+reload after a ref moved is still a full re-read, about 100 ms at 5k and
+1.65 s at 30k, of which the probes are 122 to 127 ms and, at 5k, more than the
+walk itself. **Recommendation, not built:** at 30k and above the walk is the
+cost (1.9 s), and a window can be patched after a one-commit ref move by
+walking only `old-tips..new-tips` and re-solving lanes over the spliced rows,
+which would take the reload to about the probes; at 5k the probes (the
+for-each-ref, HEAD, default-branch and hidden-ref reads) are the larger cost,
+and speeding them up, or sharing one ref listing between them, would pay more
+than patching. There is no read-ahead on this branch, so scrolling to an older
+window is the `old` path and is not a separate arm. Only the first window of
+one view carries a token, and only while the stamp has settled (3 s after the
+last ref write).
+
+So the audit's 45-60 MB estimate for a 100k-row reload holds (52.4 MB on this
+fixture) and the lane solve is tens of milliseconds, so on the payload side the
+cost of a reload that changed nothing is bytes and decode rather than the
+solve; the `graph_window` rows alone do not say what the token answer saves
+against what its probes cost, which is what the `graph_hit_path` table above
+measures. A real repository's subjects and lane width move the byte counts.
 
 `watcher` (N = 60): `record_event_signal` over 10,000 events: min 15.14 ms, p50
 18.21 ms, p95 20.17 ms; 549k events/s at p50-ish (metric); 7,000 admitted, 3,000
@@ -2416,6 +2687,30 @@ This change takes the snapshot from N+1 to N status reads (27 to 26 processes in
 - A read with no caller deadline that ends at git's own 90 s limit ends every waiter on it with the same error at the same moment; only a cut that was a caller's deadline is retried by the next waiter.
 - `changed_paths_only` (a pathspec-limited status) is a different question and is not routed through the cell.
 
+## 2026-11-10: `get_status` numstat limited to the reported paths, up to 100 (perf1109-refresh-scope, F-3)
+
+`get_status` read `git diff --numstat -z` (and `--cached`) over every index entry to find churn for the few paths `status` had just named. It now passes those paths as literal pathspecs behind `--` (both sides of a rename or copy), and reads the whole tree when there are more than `MAX_NUMSTAT_PATHSPECS` = 100 paths, more than 16 KiB of them, a path that is not valid UTF-8, or a path `listing_must_match_path_exactly` names (`*?[:`, which Git for Windows mishandles after `:(literal)`). A numstat that fails still fails the report.
+
+Bench: `repo_read`, `numstat_paired` (`GITPULSE_BENCH_ONLY="50k files" GITPULSE_BENCH_ROUNDS=21 cargo bench --bench repo_read`). Synthetic repository: 50,000 files in 500 directories, 24-line files, 2 commits; one repository per dirty count shared by both arms. n=21 pairs per count after 2 discarded rounds. Each round does one untimed status read, then runs both arms in an order that alternates by round. Host load 11.9 at the start of the run and 9.3 at the end on 18 cores. The "whole" arm is `get_status_whole_tree_numstat`, the read this replaced. Median ms [min..max]; "paired" is limited minus whole per round, "smaller" is the rounds in which limited was faster:
+
+| dirty | wall limited | wall whole | paired median, smaller | child CPU limited | child CPU whole |
+|---:|---|---|---|---|---|
+| 1 | 128 [114..172] | 159 [146..206] | -32, 20/21 | 482 [443..829] | 897 [859..988] |
+| 50 | 139 [123..172] | 158 [140..508] | -21, 20/21 | 523 [403..832] | 935 [846..1065] |
+| 100 | 144 [135..168] | 155 [150..165] | -11, 19/21 | 585 [531..881] | 1032 [959..1075] |
+| 200 | 180 [168..199] | 186 [161..234] | -4, 13/21 | 964 [909..1291] | 965 [856..1260] |
+| 300 | 196 [177..245] | 198 [177..226] | +3, 8/21 | 971 [894..1279] | 982 [883..1340] |
+| 500 | 219 [205..247] | 218 [202..270] | -2, 14/21 | 946 [889..1337] | 963 [900..1308] |
+| 2000 | 405 [343..563] | 409 [364..440] | -3, 11/21 | 1179 [1125..1449] | 1183 [1127..1474] |
+
+Above 100 both arms are the same code (the shipped read falls back), so the rows at 200 to 2000 are four null checks: the arms agree within their spread (paired medians -4, +3, -2, -3 ms). The run also aborts if the 2000 pair disagrees beyond the smaller arm's inter-quartile range; it passed.
+
+What this saves: child CPU, about 46% at 1 dirty file, 44% at 50, 43% at 100. Wall time improves by 10 to 30 ms (7 to 20%) at 1 to 100, with the limited arm faster in 19 or 20 of 21 rounds; at 50 the medians differ by 19 ms but the whole arm's max is an outlier (508), so read the paired column. What it does not save: anything above 100, which is the whole-tree read again.
+
+Why the cap is 100. The same bench before the cap was lowered (cap 512, same repository shape, load 9 to 15), limited minus whole in median wall: 1 dirty -29 ms, 50 -23, 100 -10 (17/21, min 139 vs 154), 200 +16 (5/21, min 194 vs 172), 300 +31 (2/21), 500 +57 (1/21); the same-code pair at 2000 read +16 (7/21), the noise floor. Raw `git diff --numstat -z` with one literal pathspec per dirty file at 2000: 746 ms against 322 ms whole tree, limited smaller in 0 of 21. So pathspec matching cost grows with the list; beyond about 100 paths it costs more wall time than the whole-tree stat pass it avoids, though child CPU stayed lower up to 500 (about -24%). The rule took the largest measured count whose median and min are not worse, erring low. Not measured: path depth and length (the 16 KiB byte bound caps argument size regardless), and counts between 100 and 200.
+
+Earlier numbers in this work that should not be used: the first two tables (4 counts, then 7 counts) queued each pair's arms in a fixed order, so the first arm paid the cold file-system cache and looked slower even at 2000 where both arms ran the same code. Their child-CPU columns were probably less affected but showed the same bias.
+
 ## 2026-11-06: repository tuning thresholds (ft-6b68be32)
 
 The Storage panel may offer, and on a click apply, three changes: `core.untrackedCache`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
@@ -2646,3 +2941,95 @@ How to read the new field: the periodic gate line now ends with the call sites b
 - The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.
 - Only the launching caller is counted. A read that joined another caller's in-flight identical read (coalesced) launched nothing of its own, so the leader's source is credited and the joiner's is not.
 - A thread that hops (`thread::scope`, a pool) starts `unattributed`; carry the source across with `with_spawn_source(current_spawn_source(), ...)`, as `current_admission()` is carried.
+
+## 2026-11-09: macOS worktree root watched recursively, events filtered for delivery only (ft-cb978b2f6a22e7c93aa9f69715b40426)
+
+On macOS the worktree root is registered with the same FSEvents stream as `.git`, which is recursive in the kernel; the backend's `NonRecursive` mode only discarded nested paths in user space. It is now `Recursive` (`watcher/filter.rs` `ROOT_WATCH_MODE`), so an edit, create, delete or rename at any depth announces `repo-changed` within the debounce instead of waiting for the 6 s status poll. Linux and Windows keep the non-recursive root watch (inotify holds a descriptor per directory; ReadDirectoryChangesW reports a whole tree).
+
+What would flood the bounded event queue (a build writing thousands of files under `target/`) is dropped on the backend's own callback thread by the same classifier the debounce loop uses (`event_has_signal`), before it takes a slot. A full queue is answered with one full refresh, which is the cost the filter avoids.
+
+### What the filter may be wrong about
+
+Only delivery. The 6 s status poll reads every time, exactly as before this change, and nothing treats the absence of an event as proof that the worktree is unchanged. A path wrongly dropped therefore costs one refresh at most one poll late, which is what a nested edit cost before. The ignore list behind the filter is `git ls-files -o -i --directory`: it says which directories hold only ignored files now, not which are excluded by a rule (a `:build/` holding only a swap file is listed), and it can be stale (renaming a directory that holds a `.gitignore` leaves its old names listed). Two reproductions of exactly those cases are tests (`a_renamed_ancestor_of_a_rule_file_costs_at_most_a_poll`, `a_directory_listed_as_ignored_only_because_of_its_contents_costs_at_most_a_poll`): the event is dropped, the poll reads and shows the file.
+
+Ignored FILES (not directories) that the same listing prints one by one, such as a nested `.claude/settings.local.json`, `crates/x/lcov.info` or `.DS_Store`, are dropped too when an event names nothing else: main produced no event at all for a nested file (the backend discarded every nested path), so forwarding them would be a new refresh per write. The list is bounded (4,096 names, 256 KiB of names); past either bound a file is forwarded, never dropped. An editor's atomic save (write a temporary file, rename it over the tracked file) is still forwarded: the event that names the tracked path is not all-ignored, and the tracked path alone is not listed.
+
+A `.gitignore` event under a directory the list names, or under a build-looking name (`node_modules/pkg/.gitignore`), is itself dropped by the callback and never reaches the loop, so it cannot ask for a reload. That does not matter for delivery: git ignores a `.gitignore` inside an ignored directory, and in a directory listed only because its files are ignored a stale list costs a refresh now and then, which the poll covers. Forwarding them would hand a reload to every `npm install`.
+
+On Linux and Windows nothing below the root is delivered, so a new directory does not ask for a reload there (a stale list hides nothing); only the recursive macOS watch does.
+
+Never dropped: a backend error, a must-rescan flag, an event with no path, an event naming the worktree root (the only trace of a repository that moved away).
+
+### When the ignore list is reloaded
+
+One bounded (3 s) `git ls-files` on the watch thread, when a `.gitignore` or `info/exclude` event arrives or a directory appears outside `.git`, or every 30 s while the last attempt failed. At most one per `SCAN_COALESCE` (2 s) however many triggers arrive: a trigger that falls inside the window is remembered and served when it ends. A write to `index`, `HEAD` or `config` is not a trigger, so a terminal full of `git add` reloads nothing (`index_writes_never_reload_the_rules_and_a_directory_storm_reloads_at_most_once_per_window`: 20 index writes, 0 reloads; 30 new directories over about 3 s, at most one reload per window).
+
+### Event volume
+
+Asserted, not timed, by `ten_thousand_writes_under_an_ignored_directory_are_never_announced` through the real watcher and loop: 10,000 files written under a directory a `.gitignore` names announce nothing, the callback classifies each delivered path once (no git is spawned per event), and nothing reloads the rules.
+
+Callback cost, measured (`measure_callback_cost_of_ignored_churn_main_versus_stage_1`, `#[ignore]`, `cargo test --lib watcher::tests::measure_callback_cost -- --ignored --nocapture`): 50,000 file creations in an ignored directory, three arms interleaved per repetition (no watcher, main's non-recursive watch, the recursive watch with the filter), n = 3.
+
+| arm | callbacks | forwarded | process CPU ms (3 runs) |
+| --- | --- | --- | --- |
+| no watcher | 0 | 0 | 3979, 3625, 2771 |
+| main (non-recursive) | 0 | 0 | 3977, 3645, 3111 |
+| recursive + filter | 165039, 158964, 160596 | 0 | 4727, 3306, 3375 |
+
+The recursive watch costs about 3.2 callback invocations per created file (create, modify and flag events) and forwards none of them; main's callback never ran because the backend dropped the nested paths before it. The CPU difference between the arms is inside the spread of the no-watcher arm (2771 to 3979 ms), so it is not resolved at n = 3, and the bulk of the process time is the test's own file creation. Load average (1 min) was 26.6 at the start and 24.5 at the end of a busy host, below the 30 line but not quiet: an indication of order of magnitude, not a precise cost.
+
+### The status poll skips its read only when nothing happened
+
+`cmd_get_status` takes `skipIfUnchanged` (only the 6 s poll sets it; a refresh the user or the watcher asked for always reads). When the worktree has a live recursive watch, a read kept from an earlier poll is returned again, with no `git status` spawned, if the stream delivered NO event of any kind since that read began: not on an ignored path, not inside `.git`, not one the delivery filter would drop, not a rescan flag or a backend error. The callback counts every event the notify layer delivers to it before it filters (`watcher/skip.rs`, `EventFilter::admit`), so no path is ever classified as unable to matter. Events that carry no flags are dropped inside the notify layer, before that counter, so they do not move the epoch; that is the one place the rule is not "any event at all", and it is the layer's own contract rather than a decision made here. Three earlier designs that did classify (by ignore rules) were each broken by a rename of a directory holding a `.gitignore`, a directory named like a git pathspec (`:build`), and a listing artefact; none of those reasonings exist now. The epoch is taken before a read starts and the answer is kept under it, so an event that lands while the read runs is never covered by it.
+
+An active build in an ignored directory therefore makes every poll read, exactly as before; an idle worktree skips.
+
+The skip exists only on macOS, where the root watch is recursive (`ROOT_WATCH_MODE`); on Linux and Windows `PollSkip::begin` answers `Unavailable` every time and the poll reads as it always did. The unit tests that arm a watch need a root inode and are gated to `unix`; the cases that need none (non-recursive, no root) run everywhere, and where the platform has no root identity (Windows) a recursive watch is still unavailable, which `non_unix_tests` pins and Windows CI runs. The real-stream tests are gated to `target_os = "macos"`, and `without_a_recursive_root_watch_every_poll_reads` covers Linux and Windows against a real session.
+
+Unknown is never clean: the poll reads, and keeps nothing, when the root watch is not recursive (Linux, Windows: `ROOT_WATCH_MODE`), the watch has ended or was never registered (failed registration, parked, evicted), the worktree root is no longer the directory that was registered (checked by device and inode, since a moved root sends no event), or the watch is convicted. A kept read older than 60 s is not served, and an answer of more than 4096 rows is not kept (it is logged once; such a worktree reads every poll).
+
+#### Does GitPulse's own read move the epoch?
+
+Measured with a recursive FSEvents watch while the read set of a refresh ran five times (status, `diff --numstat` both ways, refs, `rev-parse`, stash, log) with `GIT_OPTIONAL_LOCKS=0`, which every GitPulse git child already has and which this change does not depend on:
+
+| config | events from GitPulse's own reads |
+| --- | --- |
+| default | 0 |
+| `core.untrackedCache`, `feature.manyFiles`, `index.version=4` | 0 |
+| `core.fsmonitor=true` | 15: `.git/fsmonitor--daemon/cookies/<pid>-<n>`, one per read |
+| `core.splitIndex=true` | 10: `.git/sharedindex.<sha>` touched by every index read |
+
+On the default configuration an idle worktree and ten rounds of the whole refresh read set move the epoch zero times with the real watcher (`an_idle_worktree_and_its_own_reads_move_no_epoch_so_the_poll_is_skipped`). Under `core.fsmonitor` and `core.splitIndex` git itself writes under `.git` on a read, the epoch moves on every read, and the poll reads every time, which is what it did before: the skip is inert there, not wrong. Excluding those two paths would be a path-based guess about which events cannot matter, which is the thing this design refuses to do; preventing them at the source would mean disabling fsmonitor or the split index for GitPulse's own reads, which costs the users who turned them on for speed. Not done.
+
+#### How stale can an answer be
+
+| situation | bound on a stale answer | why |
+| --- | --- | --- |
+| healthy watch | the stream's delivery latency (not measured; the stream is created with zero latency and no deferral), corrected by the next poll | an event is counted when the callback runs; a change made a moment before a poll may not have been delivered yet, and is seen by the following poll |
+| dropped queue entry, rescan flag, backend error | same | each is a callback invocation, so each moves the epoch |
+| silent stream (registered, delivers nothing) | up to 60 s (`KEPT_STATUS_MAX_AGE`) | the read at the cap is compared with the kept one; if the paths or status codes differ with no event, the watch is suspect, and convicted after 3 s without one |
+| a change no worktree watch can see (global excludes file, `~/.gitconfig`) | up to 60 s | indistinguishable from a silent stream, and handled the same way: the read at the cap differs, the watch is convicted |
+| convicted | none; every poll reads | until the watch is re-registered |
+
+Only paths and status codes are compared between two reads. Line counts and warnings depend on a budget (an untracked-file scan stops at 2,000 file opens, and a warm cache does not spend it), so they differ between two reads of an unchanged tree and convicted a healthy watch with 2,100 untracked files (`a_large_unchanged_tree_with_budget_limited_counts_is_not_convicted`).
+
+A conviction is visible in the `watcher` log target, in words that say what happens (the poll now reads every time for that worktree) and that the cause may be a change no worktree watch can see rather than a lost event; so is an answer too large to keep. Both lines end with that watch's poll counters.
+
+The counters are also appended to the existing periodic gate line (`log_refusals`, log target `spawn_gate`, at most every 30 s, written when the spawn gate refuses work), as one segment: `[poll-skip] skipped=S read_after_events=E read_aged=A read_suspect=X read_convicted=C unavailable_no_root=.. unavailable_not_recursive=.. unavailable_ended=.. unavailable_no_identity=.. unavailable_root_moved=..`. `skipped` above zero is a skip that is alive and firing; `skipped=0` with `read_after_events` climbing is a skip that is alive but whose events never stop (a build, or `core.fsmonitor`); `read_convicted` is a conviction; any `unavailable_*` names why this process's watches never could. The counts are process-wide since start. That segment appears only when the gate refuses. To read the counters on a healthy host, open the diagnostics modal (or export its report): reading the backend log tail (`cmd_diagnostic_log_tail`) records the same `[poll-skip] ...` text as one ordinary `watcher` entry when the counters have changed since the last read, so it is in the ring and in the durable log, with no timer, no new command and no new wire field. An untouched process (no poll decided yet) records nothing, so an empty log still reads as empty. There is no backend-to-frontend channel for watch health today (`watchState.ts` is fed by the result of `cmd_watch_repo` and by `repo-gone`), so the status bar does not show it; adding one is an IPC change and was not done here.
+
+### Measured
+
+`cargo test --lib watcher::tests::measure_poll_skip -- --ignored --nocapture`, one M-series Mac (macOS 27), `src-tauri/src/watcher/mod.rs`, on a scratch repository (an empty `git init` plus one ignore rule, not a real checkout). Counter-based: `git status` spawns counted at the spawn site over ten real polls at the production cadence (`STATUS_POLL_INTERVAL_MS`, 6 s, so 60 s). Four arms run side by side in every repetition, each in its own repository: an idle worktree and one with a build writing a file into an ignored directory every 200 ms, each polled the old way (`skipIfUnchanged` off: what the poll did before, and what stage 1 leaves untouched) and the new way.
+
+| arm (n = 5 repetitions, arms side by side) | spawns per 10 polls (60 s) | spread |
+| --- | --- | --- |
+| idle, every poll reads (before) | 10, 10, 10, 10, 10 | none |
+| idle, skip | 1, 1, 1, 1, 1 | none |
+| build churning an ignored directory, every poll reads (before) | 10, 10, 10, 10, 10 | none |
+| build churning an ignored directory, skip | 10, 10, 10, 10, 10 | none |
+
+Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30 line, so this run is a result. A first run of the same test started at load 43.9 (the build of the test binary raised it) and is not a result; it printed the same counts. The ten polls span 54 s, inside the 60 s cap, so "1" is the first read; in steady state the cap adds one capped read per minute, so an idle worktree makes about one read per minute against ten before. The churn arm shows the cost of the dumb rule on purpose: a build writing in an ignored directory ends the skip for every poll, exactly as before this change.
+
+A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with GitPulse running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
+
+Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.

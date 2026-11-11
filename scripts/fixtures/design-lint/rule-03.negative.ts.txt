@@ -1,0 +1,5 @@
+// text-rose-400 in a comment is not a class
+export const TONE = {
+  danger: "text-danger bg-danger/15",
+  note: "amber",
+} as const;

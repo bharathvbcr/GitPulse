@@ -2,7 +2,8 @@
  * Issue to Task transformation and agent handoff preparation.
  *
  * Provides a robust, boundary-hardened bridge between the GitHub issue monitor
- * (e.g. in the Policy page / ManviOpsPanel) and Workbench tasks.
+ * (the Open issues block of Work's Remote pane, through IssueTaskActions) and
+ * Workbench tasks.
  *
  * Every issue converted through this module produces a well-formed TaskDraft
  * that satisfies all repository and SQLite workbench store invariants:
@@ -208,7 +209,7 @@ export function formatAgentDescription(issue: Partial<IssueInfo>, guidance?: str
   sections.push("");
   sections.push("### Context & Objective");
   sections.push(
-    `This task was imported from GitHub issue #${num} via the policy page issue monitor so autonomous coding agents can resolve it.`,
+    `This task was imported from GitHub issue #${num} via Remote's issue import so autonomous coding agents can resolve it.`,
   );
 
   if (guidance?.trim()) {

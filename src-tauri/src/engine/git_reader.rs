@@ -1020,22 +1020,60 @@ impl GitReader {
         // window of n rows needs ceil((n - 1) / chunk) chunks, so chunk + 1
         // rows is one walk, and the chunks stay aligned (and kept) as before.
         let wire = chunk.saturating_add(1);
+        // One stamp for the whole window: every chunk is kept under the refs
+        // as they were before the first walk started, as a lone walk is.
+        let stamp = ref_cache::stamp(&repo, history_namespaces(revision, scope));
+        let stash = std::cell::RefCell::new(HashMap::new());
         let mut commits = if count <= wire {
-            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+            let run = ChunkRun {
+                stamp: stamp.as_ref(),
+                stash: &stash,
+                chunk,
+                last_start: skipped,
+                ahead_tried: std::cell::Cell::new(false),
+            };
+            Self::history_chunk(
+                &repo,
+                skipped,
+                count,
+                revision,
+                spec.as_deref(),
+                scope,
+                &run,
+            )?
         } else {
             // A long window is read as aligned chunks, each kept on its own.
             // One 100k-commit answer exceeded the cache's per-entry cap and
             // was never kept, so every "load more" walked and parsed the whole
             // window again; chunks stay under the cap, and growing the window
-            // reads only the chunks it has not seen. (Git still skips past
-            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            // reads only the chunks it has not seen. A cold read is ONE walk:
+            // its output is cut into the chunks the window still needs
+            // ([`slice_history_walk`]) and each is kept under the key a walk
+            // of that chunk alone would have had, instead of one `--skip`
+            // walk per chunk, each of which re-walks every commit before it.
             let end = skipped.saturating_add(count);
-            let mut start = skipped - skipped % chunk;
+            let first = skipped - skipped % chunk;
+            let run = ChunkRun {
+                stamp: stamp.as_ref(),
+                stash: &stash,
+                chunk,
+                // The loop below reads chunks while `start + 1 < end`.
+                last_start: first + ((end - 2 - first) / chunk) * chunk,
+                ahead_tried: std::cell::Cell::new(false),
+            };
+            let mut start = first;
             let mut taken_to = skipped;
             let mut commits = Vec::with_capacity(count);
             while start.saturating_add(1) < end {
-                let rows =
-                    Self::history_chunk(&repo, start, wire, revision, spec.as_deref(), scope)?;
+                let rows = Self::history_chunk(
+                    &repo,
+                    start,
+                    wire,
+                    revision,
+                    spec.as_deref(),
+                    scope,
+                    &run,
+                )?;
                 let ended = rows.len() < wire;
                 let to = end.min(start + rows.len());
                 if to > taken_to {
@@ -1062,58 +1100,40 @@ impl GitReader {
         revision: Option<&str>,
         spec: Option<&str>,
         scope: RefScope,
+        run: &ChunkRun<'_>,
     ) -> Result<Vec<RawCommitNode>, CommandError> {
-        let count_arg = format!("-n{count}");
-        let skip_arg = format!("--skip={skip}");
-        let mut args: Vec<&str> = Vec::new();
-        if spec.is_some() {
-            // Path bytes reach us raw rather than octal-escaped, matching the
-            // pathspec we hand back to git.
-            args.extend_from_slice(&["-c", "core.quotepath=off"]);
-        }
-        args.extend_from_slice(&["log", count_arg.as_str(), skip_arg.as_str(), "--topo-order"]);
-        if spec.is_some() {
-            // Parent rewriting only. `--parents` prepends parent oids to the
-            // DEFAULT log line; with a custom `--format` it adds no fields, so
-            // the record layout below is untouched.
-            args.push("--parents");
-        }
-        // Subjects may legally contain any byte except NUL, so the RECORD
-        // terminator is %x00 — a hostile subject can no longer split the
-        // stream into bogus records. Fields use %x01, which a subject,
-        // author name or email may legally contain too: the risky
-        // variable-length fields therefore sit at the END of the record
-        // and parsing works from the RIGHT (see [`parse_history_record`]),
-        // so such a byte can only truncate the one field it landed in —
-        // never shift id, parents or timestamp.
-        args.push("--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00");
-        if let Some(rev) = revision {
-            validate_ref_name(rev)?;
-            args.push(rev);
-        } else {
-            // NOT `--all`. `--all` walks every namespace under `refs/` —
-            // including agent turn checkpoints, prefetch mirrors and CI pull
-            // refs — while only heads/remotes/tags are ever labelled, so
-            // those namespaces opened lanes nothing could name. One owner
-            // decides the set for both sides; see crate::graph::ref_scope.
-            args.extend_from_slice(crate::graph::history_rev_args(scope));
-        }
-        if let Some(spec) = spec {
-            args.push("--");
-            args.push(spec);
-        }
+        let argv = history_log_args(skip, count, revision, spec, scope)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         // The graph, the history list and the AI context ask for the same
         // page at once after a change; queued identical walks share a child.
         // The walk is a function of the refs it starts from and of objects,
         // which never change, so a refresh caused by a working-tree edit is
-        // answered without a walk. A named revision or `--all` may start
-        // anywhere in the ref store, every worktree's HEAD included.
-        let namespaces: &[&str] = if revision.is_some() || scope == RefScope::All {
-            &[ref_cache::ALL_REFS]
-        } else {
-            &crate::graph::ref_scope::NAMED_REF_PATTERNS
-        };
-        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
+        // answered without a walk.
+        let stdout = ref_cache::through_stamped(repo, &args, run.stamp, || {
+            if let Some(text) = run.stash.borrow_mut().remove(&skip) {
+                return Ok((text, true));
+            }
+            if run.last_start > skip && !run.ahead_tried.replace(true) {
+                // Chunks follow this one in the window, and none is held:
+                // one walk from here to the window's last chunk answers all.
+                let wire = run.chunk.saturating_add(1);
+                let rows = run.last_start + wire - skip;
+                let long = history_log_args(skip, rows, revision, spec, scope)?;
+                let long: Vec<&str> = long.iter().map(String::as_str).collect();
+                let (text, cut) = git_cli::git_text_capped_shared(repo, &long, history_walk_cap())?;
+                let mut pieces =
+                    slice_history_walk(&text, skip, run.chunk, wire, run.last_start, cut.is_none())
+                        .into_iter();
+                // A walk cut at the output cap or a deadline may not even
+                // cover this chunk; then it is read on its own, as before.
+                if let Some((start, first)) = pieces.next() {
+                    debug_assert_eq!(start, skip);
+                    run.stash.borrow_mut().extend(pieces);
+                    return Ok((first, true));
+                }
+            }
+            git_cli::git_text_shared(repo, &args).map(|text| (text, true))
+        })?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -1225,7 +1245,12 @@ impl GitReader {
         repo_path: &str,
         not_before: Instant,
     ) -> Result<Vec<FileStatus>, CommandError> {
-        Self::get_status_in(repo_path, UntrackedBudget::SHIPPED, not_before)
+        Self::get_status_in(
+            repo_path,
+            UntrackedBudget::SHIPPED,
+            not_before,
+            NumstatReach::ChangedPaths,
+        )
     }
 
     /// [`Self::get_status`] with `untracked` as the most it may read to count
@@ -1235,13 +1260,33 @@ impl GitReader {
         repo_path: &str,
         untracked: UntrackedBudget,
     ) -> Result<Vec<FileStatus>, CommandError> {
-        Self::get_status_in(repo_path, untracked, Instant::now())
+        Self::get_status_in(
+            repo_path,
+            untracked,
+            Instant::now(),
+            NumstatReach::ChangedPaths,
+        )
+    }
+
+    /// [`Self::get_status`] with both numstats read over the whole tree, as
+    /// every status did before they were limited to the reported paths. The
+    /// baseline arm of the `repo_read` benchmark, and the oracle the parity
+    /// test compares against.
+    #[doc(hidden)]
+    pub fn get_status_whole_tree_numstat(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
+        Self::get_status_in(
+            repo_path,
+            UntrackedBudget::SHIPPED,
+            Instant::now(),
+            NumstatReach::WholeTree,
+        )
     }
 
     fn get_status_in(
         repo_path: &str,
         untracked: UntrackedBudget,
         not_before: Instant,
+        reach: NumstatReach,
     ) -> Result<Vec<FileStatus>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
@@ -1264,16 +1309,30 @@ impl GitReader {
         // broken diff must fail the report rather than fabricate numbers, and
         // records that decode but carry unparseable counts ride their row as
         // an explicit warning instead of reading as fact.
+        //
+        // Each numstat is limited to the paths its rows look up (see
+        // [`numstat_pathspecs`]); past the bound it reads the whole tree.
         let numstat_work = if reads_work {
-            parse_numstat_with_issues(&git_text_shared(&repo, &["diff", "--numstat", "-z"])?)
+            let paths = numstat_pathspecs(
+                records
+                    .iter()
+                    .filter(|r| status_kind(r.index_status, r.work_status).work_changed),
+                reach,
+                cfg!(windows),
+            );
+            read_numstat(&repo, &["diff", "--numstat", "-z"], paths)?
         } else {
             NumstatParse::default()
         };
         let numstat_index = if reads_index {
-            parse_numstat_with_issues(&git_text_shared(
-                &repo,
-                &["diff", "--cached", "--numstat", "-z"],
-            )?)
+            let paths = numstat_pathspecs(
+                records
+                    .iter()
+                    .filter(|r| status_kind(r.index_status, r.work_status).staged),
+                reach,
+                cfg!(windows),
+            );
+            read_numstat(&repo, &["diff", "--cached", "--numstat", "-z"], paths)?
         } else {
             NumstatParse::default()
         };
@@ -1400,13 +1459,15 @@ impl GitReader {
         // "weird?.txt" with no such literal file fails outright), and it
         // rejects pathspec magic entirely ("fatal: no such path
         // ':(literal)...' in HEAD"), so prefixing would break every call.
-        // `--line-porcelain` emits ~10 metadata lines per source line, so a
-        // large file's blame is an order of magnitude bigger than the file
-        // itself. This Vec-only API cannot label a prefix as incomplete, so
-        // hitting the cap must fail visibly instead of returning partial data.
+        // `--porcelain` states a commit's ~10 metadata lines once and then
+        // costs one header line per source line, so a file's blame is a small
+        // multiple of the file itself (`--line-porcelain` repeated the metadata
+        // for every line). This Vec-only API cannot label a prefix as
+        // incomplete, so hitting the cap must fail visibly instead of
+        // returning partial data.
         let result = git_text_capped(
             &repo,
-            &["blame", "--line-porcelain", "--", file_path],
+            &["blame", "--porcelain", "--", file_path],
             budget::MAX_BLAME_BYTES,
         );
         let (stdout, incomplete) = match result {
@@ -1448,7 +1509,7 @@ impl GitReader {
         if let Some(reason) = incomplete {
             return Err(format!("Blame unavailable: {}", reason.describe()).into());
         }
-        Ok(parse_blame_porcelain(&stdout))
+        bound_blame_payload(parse_blame_porcelain(&stdout, false)?)
     }
 
     /// Lists every path the file explorer may show: tracked files plus
@@ -2679,14 +2740,14 @@ impl GitReader {
                 break;
             }
 
-            let mut args = vec!["blame", "--line-porcelain", "-w"];
+            let mut args = vec!["blame", "--porcelain", "-w"];
             args.extend(mailmap_flag("blame"));
             args.extend([head, "--", file_path.as_str()]);
 
-            let stdout = match git_text_capped(repo, &args, blame_cap) {
+            let (stdout, cut) = match git_text_capped(repo, &args, blame_cap) {
                 Ok((out, incomplete)) => {
                     blame_cut_short |= incomplete.is_some();
-                    out
+                    (out, incomplete.is_some())
                 }
                 Err(_) => {
                     blame_failed = true;
@@ -2694,7 +2755,12 @@ impl GitReader {
                 }
             };
 
-            let lines = parse_blame_porcelain(&stdout);
+            // A prefix is kept as a lower bound (flagged above); anything else
+            // the parser refuses is a failed blame, never a partial one.
+            let Ok(lines) = parse_blame_porcelain(&stdout, cut) else {
+                blame_failed = true;
+                continue;
+            };
             if lines.is_empty() {
                 continue;
             }
@@ -3858,6 +3924,13 @@ fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<CommandErr
 /// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
 pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
     config_snapshot_with(repo, Reads::Cached)
+}
+
+/// [`config_snapshot`] straight from git, never from the cache. For a caller
+/// that decides on what the config says (the commit identity gate), since the
+/// cache's stamp does not see a file pulled in by `include.path`.
+pub(crate) fn config_snapshot_fresh(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
+    config_snapshot_with(repo, Reads::Fresh)
 }
 
 /// How the default-base lookup reads the two inputs that live outside the
@@ -5321,6 +5394,132 @@ impl FirstParentPass {
     }
 }
 
+/// What the chunks of one history window share while it is read.
+struct ChunkRun<'a> {
+    /// The ref stamp read once before the window's first walk.
+    stamp: Option<&'a ref_cache::Stamp>,
+    /// Chunks a single walk already produced for the ones after it, by start.
+    stash: &'a std::cell::RefCell<HashMap<usize, String>>,
+    chunk: usize,
+    /// Start of the window's last chunk. A chunk at this start has nothing
+    /// after it to read ahead for.
+    last_start: usize,
+    /// A read-ahead walk has been run for this window. Only one is: when it
+    /// ended early (the output cap or the deadline) a later chunk reads its
+    /// own rows, because a second walk to the same last chunk would be cut the
+    /// same way and cost the same deadline again for every chunk after it.
+    ahead_tried: std::cell::Cell<bool>,
+}
+
+/// The refs a history walk starts from, as a ref listing is stamped: a named
+/// revision or `--all` may start anywhere in the ref store, every worktree's
+/// HEAD included.
+fn history_namespaces(revision: Option<&str>, scope: RefScope) -> &'static [&'static str] {
+    if revision.is_some() || scope == RefScope::All {
+        &[ref_cache::ALL_REFS]
+    } else {
+        &crate::graph::ref_scope::NAMED_REF_PATTERNS
+    }
+}
+
+/// The `git log` argv for `count` rows after `skip`.
+fn history_log_args(
+    skip: usize,
+    count: usize,
+    revision: Option<&str>,
+    spec: Option<&str>,
+    scope: RefScope,
+) -> Result<Vec<String>, CommandError> {
+    let mut args: Vec<String> = Vec::new();
+    if spec.is_some() {
+        // Path bytes reach us raw rather than octal-escaped, matching the
+        // pathspec we hand back to git.
+        args.extend(["-c", "core.quotepath=off"].map(String::from));
+    }
+    args.extend([
+        "log".to_string(),
+        format!("-n{count}"),
+        format!("--skip={skip}"),
+        "--topo-order".to_string(),
+    ]);
+    if spec.is_some() {
+        // Parent rewriting only. `--parents` prepends parent oids to the
+        // DEFAULT log line; with a custom `--format` it adds no fields, so
+        // the record layout below is untouched.
+        args.push("--parents".to_string());
+    }
+    // Subjects may legally contain any byte except NUL, so the RECORD
+    // terminator is %x00 — a hostile subject can no longer split the
+    // stream into bogus records. Fields use %x01, which a subject,
+    // author name or email may legally contain too: the risky
+    // variable-length fields therefore sit at the END of the record
+    // and parsing works from the RIGHT (see [`parse_history_record`]),
+    // so such a byte can only truncate the one field it landed in —
+    // never shift id, parents or timestamp.
+    args.push("--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00".to_string());
+    if let Some(rev) = revision {
+        validate_ref_name(rev)?;
+        args.push(rev.to_string());
+    } else {
+        // NOT `--all`. `--all` walks every namespace under `refs/` —
+        // including agent turn checkpoints, prefetch mirrors and CI pull
+        // refs — while only heads/remotes/tags are ever labelled, so
+        // those namespaces opened lanes nothing could name. One owner
+        // decides the set for both sides; see crate::graph::ref_scope.
+        args.extend(
+            crate::graph::history_rev_args(scope)
+                .iter()
+                .map(|arg| (*arg).to_string()),
+        );
+    }
+    if let Some(spec) = spec {
+        args.push("--".to_string());
+        args.push(spec.to_string());
+    }
+    Ok(args)
+}
+
+/// Cuts the stdout of one `git log --skip=from` walk into the stdout that a
+/// walk of each aligned chunk alone would have printed: for the chunk starting
+/// at `from + j * chunk`, its `wire` records beginning at record `j * chunk`.
+/// Chunks run from `from` to `last_start`. Records end in NUL.
+///
+/// `complete` says the walk ran to its end. A cut walk only yields the chunks
+/// it covers whole, so a chunk is never short because the output was.
+fn slice_history_walk(
+    text: &str,
+    from: usize,
+    chunk: usize,
+    wire: usize,
+    last_start: usize,
+    complete: bool,
+) -> Vec<(usize, String)> {
+    let ends: Vec<usize> = text.match_indices('\0').map(|(at, _)| at + 1).collect();
+    let records = ends.len();
+    let mut pieces = Vec::new();
+    let mut start = from;
+    while start <= last_start {
+        let first = start - from;
+        let after = first.saturating_add(wire);
+        if !complete && records < after {
+            break;
+        }
+        if first >= records && !pieces.is_empty() {
+            // History ended: the loop that reads the chunks stops before it.
+            break;
+        }
+        let piece = if first >= records {
+            ""
+        } else {
+            let begin = if first == 0 { 0 } else { ends[first - 1] };
+            text[begin..ends[after.min(records) - 1]].trim_start_matches('\n')
+        };
+        pieces.push((start, piece.to_string()));
+        start += chunk;
+    }
+    pieces
+}
+
 /// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
 const HISTORY_CHUNK: usize = 5_000;
 
@@ -5352,6 +5551,39 @@ pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T 
         }
     }
     let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
+}
+
+/// Output bytes one read-ahead walk of a history window may print before it is
+/// cut: the engine's own backstop.
+#[cfg(not(test))]
+fn history_walk_cap() -> usize {
+    git_cli::MAX_OUTPUT_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    static WALK_CAP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_walk_cap() -> usize {
+    WALK_CAP_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(git_cli::MAX_OUTPUT_BYTES)
+}
+
+/// Runs `body` with a small read-ahead cap, so a test can cut a window's walk
+/// without printing 64 MiB.
+#[cfg(test)]
+fn with_history_walk_cap<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_CAP_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_CAP_OVERRIDE.with(|cell| cell.replace(Some(bytes))));
     body()
 }
 
@@ -6028,13 +6260,13 @@ fn blame_at_revision(
     // path, not a pathspec, and rejects `:(literal)` magic.
     let (stdout, incomplete) = git_text_capped(
         repo,
-        &["blame", "--line-porcelain", oid, "--", file_path],
+        &["blame", "--porcelain", oid, "--", file_path],
         budget::MAX_BLAME_BYTES,
     )?;
     if let Some(reason) = incomplete {
         return Err(format!("Blame unavailable: {}", reason.describe()).into());
     }
-    Ok(parse_blame_porcelain(&stdout))
+    bound_blame_payload(parse_blame_porcelain(&stdout, false)?)
 }
 
 /// A new file has content but no committed author. Preserve every line while
@@ -6081,10 +6313,7 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, Co
             previous_commit: None,
             previous_path: None,
         };
-        payload_bytes += serde_json::to_vec(&line)
-            .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?
-            .len()
-            + 1;
+        payload_bytes += blame_wire_bytes(&line)?;
         if payload_bytes > budget::MAX_BLAME_BYTES {
             return Err("Blame unavailable: uncommitted lines exceeded the output budget".into());
         }
@@ -6093,7 +6322,48 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, Co
     Ok(lines)
 }
 
-/// Returns the commit oid when `line` opens a `--line-porcelain` header.
+/// Bytes `line` costs on the IPC wire as JSON, with the comma after it.
+fn blame_wire_bytes(line: &BlameLine) -> Result<usize, CommandError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, line)
+        .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?;
+    Ok(count.0 + 1)
+}
+
+/// Refuses a blame whose JSON would outgrow [`budget::MAX_BLAME_BYTES`].
+///
+/// The git read is capped on what git PRINTS, which `--porcelain` made a small
+/// fraction of what each line costs once it is a `BlameLine` (a 40-byte oid, the
+/// author's name and email and the key names are repeated per line): a file of
+/// short lines could print 13 MB and send 44. The budget is the one the
+/// uncommitted-file path already spends, counted in the same unit, on what
+/// crosses IPC. Over it is an error by name, never a prefix.
+fn bound_blame_payload(lines: Vec<BlameLine>) -> Result<Vec<BlameLine>, CommandError> {
+    let mut bytes = 2;
+    for line in &lines {
+        bytes += blame_wire_bytes(line)?;
+        if bytes > budget::MAX_BLAME_BYTES {
+            return Err(format!(
+                "Blame unavailable: exceeded {} MB of blame payload",
+                budget::MAX_BLAME_BYTES / (1024 * 1024)
+            )
+            .into());
+        }
+    }
+    Ok(lines)
+}
+
+/// Returns the commit oid when `line` opens a `--porcelain` header.
 ///
 /// Oid length depends on the repository hash (SHA-1: 40, SHA-256: 64), so any
 /// 32–64 character hex token qualifies; once a first header pins the expected
@@ -6111,54 +6381,170 @@ fn blame_header_oid(line: &str, expected_len: Option<usize>) -> Option<&str> {
     }
 }
 
-/// Parses `git blame --line-porcelain` output. See [`blame_header_oid`] for
-/// how the commit oid is recognised across hash algorithms.
-fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
-    let mut blame_lines = Vec::new();
-    let mut current_sha = String::new();
-    let mut current_author = String::new();
-    let mut current_email = String::new();
-    let mut current_time: i64 = 0;
-    let mut line_no = 0usize;
-    let mut oid_len: Option<usize> = None;
-    // `previous` is emitted only when the commit has a parent to blame
-    // through, so it is reset at every header: `--line-porcelain` repeats the
-    // whole block per line, and a stale value would point a root commit's
-    // line at an unrelated parent.
-    let mut current_previous: Option<(String, String)> = None;
+/// What `git blame --porcelain` states once per commit, at its first group.
+#[derive(Default)]
+struct BlameCommit {
+    author: Option<String>,
+    email: Option<String>,
+    time: Option<i64>,
+    /// `previous` as the commit's first `filename` block gave it.
+    previous: Option<(String, String)>,
+    /// A `filename` line has been seen for this commit.
+    pathed: bool,
+}
 
-    for line in stdout.lines() {
+/// The group a header opened: `left` more content lines are owed to it.
+struct BlameGroup {
+    oid: String,
+    left: usize,
+    /// `previous` for every line of the group: the commit's own, or the one
+    /// the group's `filename` block restated (a commit that touched more than
+    /// one path restates `previous` and `filename` per group).
+    previous: Option<(String, String)>,
+}
+
+fn malformed_blame(why: &str) -> CommandError {
+    format!("Blame unavailable: git printed a blame this reader cannot trust ({why})").into()
+}
+
+/// Parses `git blame --porcelain` output. See [`blame_header_oid`] for how the
+/// commit oid is recognised across hash algorithms.
+///
+/// `--porcelain` states a commit's author fields once, at its first group, and
+/// later groups of the same commit carry only `<oid> <orig> <final> [<count>]`,
+/// so the commit's fields are remembered. A header's `<count>` opens a group
+/// of exactly that many content lines; a header without one continues it.
+///
+/// Fails closed, never returns a partial blame as complete: a content line
+/// before any header, a group continued by a different commit or left open, a
+/// line number that skips, a commit used before its author was stated, a
+/// header with no content line, and output that stops mid-line are all errors.
+///
+/// `cut_short` is for output the caller already knows was cut at a cap or a
+/// deadline: the unfinished tail is dropped and the complete lines before it
+/// are returned (the caller marks its own result as a lower bound).
+fn parse_blame_porcelain(stdout: &str, cut_short: bool) -> Result<Vec<BlameLine>, CommandError> {
+    let text = if cut_short {
+        stdout.rfind('\n').map_or("", |end| &stdout[..=end])
+    } else if stdout.is_empty() || stdout.ends_with('\n') {
+        stdout
+    } else {
+        return Err(malformed_blame("the output stops inside a line"));
+    };
+    let mut commits: HashMap<String, BlameCommit> = HashMap::new();
+    let mut blame_lines: Vec<BlameLine> = Vec::new();
+    let mut group: Option<BlameGroup> = None;
+    let mut awaiting_content = false;
+    let mut block_previous: Option<(String, String)> = None;
+    let mut oid_len: Option<usize> = None;
+
+    for line in text.lines() {
         if let Some(content) = line.strip_prefix('\t') {
-            line_no += 1;
-            let (previous_commit, previous_path) = match &current_previous {
+            if !awaiting_content {
+                return Err(malformed_blame("a content line has no header"));
+            }
+            awaiting_content = false;
+            let open = group
+                .as_mut()
+                .ok_or_else(|| malformed_blame("a content line has no group"))?;
+            let commit = &commits[&open.oid];
+            let (Some(author), Some(email), Some(time)) =
+                (&commit.author, &commit.email, commit.time)
+            else {
+                return Err(malformed_blame(
+                    "a commit is used before its author is stated",
+                ));
+            };
+            let (previous_commit, previous_path) = match &open.previous {
                 Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
                 None => (None, None),
             };
             blame_lines.push(BlameLine {
-                line_no,
-                commit_id: current_sha.clone(),
-                author_name: current_author.clone(),
-                author_email: current_email.clone(),
-                timestamp: current_time,
+                line_no: blame_lines.len() + 1,
+                commit_id: open.oid.clone(),
+                author_name: author.clone(),
+                author_email: email.clone(),
+                timestamp: time,
                 content: content.to_string(),
                 previous_commit,
                 previous_path,
             });
-        } else if let Some(author) = line.strip_prefix("author ") {
-            current_author = author.to_string();
-        } else if let Some(mail) = line.strip_prefix("author-mail ") {
-            current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
-        } else if let Some(time) = line.strip_prefix("author-time ") {
-            current_time = time.parse().unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("previous ") {
-            current_previous = parse_blame_previous(rest, oid_len);
+            open.left -= 1;
         } else if let Some(oid) = blame_header_oid(line, oid_len) {
+            if awaiting_content {
+                return Err(malformed_blame("a header follows a header with no line"));
+            }
+            let number = |field: Option<&str>| field.and_then(|f| f.parse::<usize>().ok());
+            let mut fields = line.split_whitespace().skip(1);
+            let (Some(_original), Some(final_line)) =
+                (number(fields.next()), number(fields.next()))
+            else {
+                return Err(malformed_blame("a header has no line numbers"));
+            };
+            let count = fields.next();
+            if fields.next().is_some() || count.is_some_and(|c| number(Some(c)).is_none()) {
+                return Err(malformed_blame("a header has extra fields"));
+            }
+            if final_line != blame_lines.len() + 1 {
+                return Err(malformed_blame("a line number is skipped or repeated"));
+            }
             oid_len = Some(oid.len());
-            current_sha = oid.to_string();
-            current_previous = None;
+            match number(count) {
+                Some(0) => return Err(malformed_blame("a group of no lines")),
+                Some(lines) => {
+                    if group.as_ref().is_some_and(|open| open.left > 0) {
+                        return Err(malformed_blame("a group ends before its last line"));
+                    }
+                    let commit = commits.entry(oid.to_string()).or_default();
+                    group = Some(BlameGroup {
+                        oid: oid.to_string(),
+                        left: lines,
+                        previous: commit.previous.clone(),
+                    });
+                    block_previous = None;
+                }
+                None => {
+                    if !group
+                        .as_ref()
+                        .is_some_and(|open| open.left > 0 && open.oid == oid)
+                    {
+                        return Err(malformed_blame("a line belongs to no open group"));
+                    }
+                }
+            }
+            awaiting_content = true;
+        } else {
+            if !awaiting_content {
+                return Err(malformed_blame("commit fields appear outside a header"));
+            }
+            let Some(open) = group.as_mut() else {
+                return Err(malformed_blame("commit fields have no group"));
+            };
+            let commit = commits.entry(open.oid.clone()).or_default();
+            if let Some(author) = line.strip_prefix("author ") {
+                commit.author = Some(author.to_string());
+            } else if let Some(mail) = line.strip_prefix("author-mail ") {
+                commit.email = Some(mail.trim_matches(|c| c == '<' || c == '>').to_string());
+            } else if let Some(time) = line.strip_prefix("author-time ") {
+                commit.time = Some(time.parse().unwrap_or(0));
+            } else if let Some(rest) = line.strip_prefix("previous ") {
+                block_previous = parse_blame_previous(rest, oid_len);
+            } else if line.starts_with("filename ") {
+                // `previous` precedes `filename` in a block, and a block that
+                // names a path restates it for this group even when absent.
+                if !commit.pathed {
+                    commit.pathed = true;
+                    commit.previous = block_previous.clone();
+                }
+                open.previous = block_previous.take();
+            }
+            // committer*, summary, boundary, ignored, unblamable: not carried.
         }
     }
-    blame_lines
+    if !cut_short && (awaiting_content || group.is_some_and(|open| open.left > 0)) {
+        return Err(malformed_blame("the output ends inside a group"));
+    }
+    Ok(blame_lines)
 }
 
 /// Parses the `<oid> <path>` tail of a porcelain `previous` line. The oid must
@@ -6289,6 +6675,96 @@ fn status_kind(index_status: char, work_status: char) -> StatusKind {
         untracked: index_status == '?' && work_status == '?',
         work_changed: work_status != ' ' && work_status != '?',
     }
+}
+
+/// How far a status's numstat reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumstatReach {
+    /// Only the paths the status reported, whenever they fit the bound.
+    ChangedPaths,
+    /// Every index entry, as before the limit existed.
+    WholeTree,
+}
+
+/// Most paths, and bytes of them, one numstat's pathspec list may carry. They
+/// ride on the command line (`git diff` takes no `--pathspec-from-file`), whose
+/// limit is smallest on Windows (about 32 KiB for the whole line). Past either
+/// bound the whole tree is read, which is slower but cannot be wrong.
+///
+/// The count is where limiting stops paying in wall time, measured on
+/// 2026-11-10 by the `repo_read` bench (`numstat_paired`, rows
+/// `get_status <N> dirty`): 50k tracked files in 500 directories, 24-line files,
+/// n=21 counterbalanced pairs per count, host load 9-15 on 18 cores, null check
+/// passed (the 2000-dirty arms run the same code and agreed). Limited minus
+/// whole, median wall: 1 dirty -29 ms, 50 -23, 100 -10 (smaller in 17/21
+/// rounds, min 139 vs 154), 200 +16 (5/21, min 194 vs 172), 300 +31 (2/21), 500
+/// +57 (1/21). The same-code null pair at 2000 reads +16 (7/21), so +16 is the
+/// noise floor and 200 is not distinguishable from it; the rule took the largest
+/// count whose median AND min are not worse than whole-tree, erring low: 100.
+/// Child CPU is lower at every count up to 500 (about -47% at 1, -41% at 100,
+/// -24% at 500), so the cap is set by wall time. Unmeasured: path depth and
+/// length (the byte bound below caps total argument size regardless).
+const MAX_NUMSTAT_PATHSPECS: usize = 100;
+const MAX_NUMSTAT_PATHSPEC_BYTES: usize = 16 * 1024;
+
+/// The literal pathspecs for the paths of `rows` (both sides of a rename or
+/// copy: the status row looks its churn up under either), or `None` to read the
+/// whole tree. `None` is also the answer when
+/// - `reach` asks for it;
+/// - there are more paths than [`MAX_NUMSTAT_PATHSPECS`] or more bytes of them
+///   than [`MAX_NUMSTAT_PATHSPEC_BYTES`]. Rename detection is bounded by
+///   `diff.renameLimit` on the candidates a pathspec leaves, so a long list
+///   could pair what the status did not; the count bound keeps the two apart;
+/// - a path is not valid UTF-8: it was decoded with replacement characters, and
+///   a pathspec built from those names a file that does not exist, which would
+///   read as zero churn;
+/// - `windows` and a path is one [`listing_must_match_path_exactly`] names
+///   (`*?[` or `:`): Git for Windows glob-expands `*?[` after `:(literal)` and
+///   reads `X:rest` as a drive ("is outside repository"), which would fail the
+///   whole report. Git on macOS and Linux names those paths exactly (a
+///   SvelteKit `src/routes/[id]/+page.svelte` included), so there they keep
+///   the limited read. `windows` is a parameter, not a `cfg!`, so both
+///   answers are tested on any host; production passes `cfg!(windows)`.
+fn numstat_pathspecs<'a>(
+    rows: impl Iterator<Item = &'a RawStatusRecord>,
+    reach: NumstatReach,
+    windows: bool,
+) -> Option<Vec<String>> {
+    if reach == NumstatReach::WholeTree {
+        return None;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for row in rows {
+        for path in std::iter::once(&row.path).chain(row.old_path.as_ref()) {
+            if undecodable_path_warning(path).is_some()
+                || (windows && listing_must_match_path_exactly(path))
+            {
+                return None;
+            }
+            paths.insert(path.as_str());
+        }
+    }
+    let bytes: usize = paths.iter().map(|path| path.len()).sum();
+    if paths.len() > MAX_NUMSTAT_PATHSPECS || bytes > MAX_NUMSTAT_PATHSPEC_BYTES {
+        return None;
+    }
+    Some(paths.into_iter().map(literal_pathspec).collect())
+}
+
+/// `git diff --numstat -z`, over `pathspecs` when given and the whole tree
+/// otherwise. A failed read is an error either way: it never reads as zero
+/// churn.
+fn read_numstat(
+    repo: &Path,
+    base: &[&str],
+    pathspecs: Option<Vec<String>>,
+) -> Result<NumstatParse, CommandError> {
+    let mut args = base.to_vec();
+    if let Some(pathspecs) = &pathspecs {
+        args.push("--");
+        args.extend(pathspecs.iter().map(String::as_str));
+    }
+    Ok(parse_numstat_with_issues(&git_text_shared(repo, &args)?))
 }
 
 fn parse_numstat_with_issues(stdout: &str) -> NumstatParse {
@@ -10620,9 +11096,10 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .is_none());
     }
 
-    fn blame_block(oid: &str, content: &str) -> String {
+    /// One complete group of one line, the way `--line-porcelain` states it.
+    fn blame_block(oid: &str, line: usize, content: &str) -> String {
         format!(
-            "{oid} 1 1 1\n\
+            "{oid} {line} {line} 1\n\
              author T\n\
              author-mail <t@example.com>\n\
              author-time 1700000000\n\
@@ -10642,11 +11119,15 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     #[test]
     fn test_blame_porcelain_accepts_sha256_oid_length() {
         let oid64 = "b".repeat(64);
-        let lines = parse_blame_porcelain(&format!(
-            "{}{}",
-            blame_block(&oid64, "alpha"),
-            blame_block(&oid64, "beta")
-        ));
+        let lines = parse_blame_porcelain(
+            &format!(
+                "{}{}",
+                blame_block(&oid64, 1, "alpha"),
+                blame_block(&oid64, 2, "beta")
+            ),
+            false,
+        )
+        .unwrap();
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|l| l.commit_id.len() == 64));
         assert_eq!(lines[0].line_no, 1);
@@ -10654,22 +11135,26 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(lines[0].author_email, "t@example.com");
 
         let oid40 = "a".repeat(40);
-        let lines = parse_blame_porcelain(&blame_block(&oid40, "gamma"));
+        let lines = parse_blame_porcelain(&blame_block(&oid40, 1, "gamma"), false).unwrap();
         assert_eq!(lines[0].commit_id.len(), 40);
     }
 
-    /// `previous` belongs to the header it follows. `--line-porcelain`
-    /// repeats every block, so a root commit's line after a non-root one must
-    /// not inherit the earlier line's parent.
+    /// `previous` belongs to the block it sits in. A block that restates the
+    /// commit's `filename` without a `previous` (a root commit's path) must not
+    /// inherit an earlier group's parent.
     #[test]
     fn test_blame_porcelain_previous_is_per_header_and_unquoted() {
         let a = "a".repeat(40);
         let p = "1".repeat(40);
-        let with_previous = blame_block(&a, "child").replace(
+        let with_previous = blame_block(&a, 1, "child").replace(
             "filename f.txt",
             &format!("previous {p} \"dir/sp\\303\\251c \\\"x\\\".txt\"\nfilename f.txt"),
         );
-        let lines = parse_blame_porcelain(&format!("{with_previous}{}", blame_block(&a, "root")));
+        let lines = parse_blame_porcelain(
+            &format!("{with_previous}{}", blame_block(&a, 2, "root")),
+            false,
+        )
+        .unwrap();
         assert_eq!(lines[0].previous_commit.as_deref(), Some(p.as_str()));
         assert_eq!(
             lines[0].previous_path.as_deref(),
@@ -10679,11 +11164,14 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(lines[1].previous_path, None);
 
         // A wrong-length oid or a malformed quoted name never becomes a target.
-        let bad = blame_block(&a, "x").replace(
+        let bad = blame_block(&a, 1, "x").replace(
             "filename f.txt",
             &format!("previous {} f.txt\nfilename f.txt", "1".repeat(64)),
         );
-        assert_eq!(parse_blame_porcelain(&bad)[0].previous_commit, None);
+        assert_eq!(
+            parse_blame_porcelain(&bad, false).unwrap()[0].previous_commit,
+            None
+        );
         assert_eq!(unquote_c_style("\"bad\\q\""), None);
         assert_eq!(unquote_c_style("\"trailing\\\""), None);
         assert_eq!(
@@ -10695,19 +11183,474 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     #[test]
     fn test_blame_porcelain_pins_oid_length_after_first_header() {
         let oid64 = "b".repeat(64);
-        let mut stream = blame_block(&oid64, "real");
+        let mut stream = blame_block(&oid64, 1, "real");
         // A 40-char token arriving after the length was pinned to 64 must not
-        // hijack blame attribution for later lines.
-        stream.push_str(&format!("{} 9 9 1\n", "c".repeat(40)));
+        // hijack blame attribution for later lines: it is not a header, so
+        // the line after it has none, and the stream is refused whole rather
+        // than attributed to the commit before it (the old parser's answer).
+        stream.push_str(&format!("{} 2 2 1\n", "c".repeat(40)));
         stream.push_str("\thijack probe\n");
-        let lines = parse_blame_porcelain(&stream);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[1].commit_id.len(),
-            64,
+        assert!(
+            parse_blame_porcelain(&stream, false).is_err(),
             "pinned length must reject mismatched oids"
         );
-        assert_eq!(lines[1].content, "hijack probe");
+    }
+
+    /// The `--line-porcelain` parser this module shipped before blame moved to
+    /// `--porcelain`, kept only as the oracle the parity tests compare against.
+    fn oracle_line_porcelain(stdout: &str) -> Vec<BlameLine> {
+        let mut blame_lines = Vec::new();
+        let mut current_sha = String::new();
+        let mut current_author = String::new();
+        let mut current_email = String::new();
+        let mut current_time: i64 = 0;
+        let mut line_no = 0usize;
+        let mut oid_len: Option<usize> = None;
+        let mut current_previous: Option<(String, String)> = None;
+        for line in stdout.lines() {
+            if let Some(content) = line.strip_prefix('\t') {
+                line_no += 1;
+                let (previous_commit, previous_path) = match &current_previous {
+                    Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
+                    None => (None, None),
+                };
+                blame_lines.push(BlameLine {
+                    line_no,
+                    commit_id: current_sha.clone(),
+                    author_name: current_author.clone(),
+                    author_email: current_email.clone(),
+                    timestamp: current_time,
+                    content: content.to_string(),
+                    previous_commit,
+                    previous_path,
+                });
+            } else if let Some(author) = line.strip_prefix("author ") {
+                current_author = author.to_string();
+            } else if let Some(mail) = line.strip_prefix("author-mail ") {
+                current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
+            } else if let Some(time) = line.strip_prefix("author-time ") {
+                current_time = time.parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("previous ") {
+                current_previous = parse_blame_previous(rest, oid_len);
+            } else if let Some(oid) = blame_header_oid(line, oid_len) {
+                oid_len = Some(oid.len());
+                current_sha = oid.to_string();
+                current_previous = None;
+            }
+        }
+        blame_lines
+    }
+
+    /// The IPC JSON of `lines`. Git stamps an uncommitted line with the moment
+    /// it ran, which differs between two runs, so that one value is zeroed.
+    fn blame_json(lines: &[BlameLine]) -> String {
+        let steady: Vec<BlameLine> = lines
+            .iter()
+            .cloned()
+            .map(|mut line| {
+                if line.commit_id.bytes().all(|b| b == b'0') {
+                    line.timestamp = 0;
+                }
+                line
+            })
+            .collect();
+        serde_json::to_string(&steady).unwrap()
+    }
+
+    /// `git blame <args>` read both ways: the oracle over `--line-porcelain`
+    /// and the shipped parser over `--porcelain`.
+    fn blame_both_ways(repo: &Path, args: &[&str]) -> (Vec<BlameLine>, Vec<BlameLine>) {
+        let run = |format: &str| {
+            let mut argv = vec!["blame", format];
+            argv.extend_from_slice(args);
+            git_text_capped(repo, &argv, 32 * 1024 * 1024).unwrap().0
+        };
+        let old = oracle_line_porcelain(&run("--line-porcelain"));
+        let new = parse_blame_porcelain(&run("--porcelain"), false).unwrap();
+        (old, new)
+    }
+
+    /// Commits `message` as `name <email>`; `name` is raw bytes so an author
+    /// that is not UTF-8 can be recorded.
+    #[cfg(unix)]
+    fn commit_as(dir: &Path, name: &[u8], email: &str, message: &str) {
+        use std::os::unix::ffi::OsStrExt;
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
+            .args(["commit", "-q", "-m", message])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", std::ffi::OsStr::from_bytes(name))
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", "Committer")
+            .env("GIT_COMMITTER_EMAIL", "c@example.com")
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Every shape a blame has to attribute: three authors editing one file,
+    /// a rename edited in place (the file's lines come from two paths), the
+    /// root commit's boundary lines, CRLF text, a last line with no newline,
+    /// an empty file, an author that is not UTF-8, and uncommitted lines.
+    #[cfg(unix)]
+    fn blame_parity_repo() -> tempfile::TempDir {
+        // No seed commit: Ann's commit is the root, so its lines are boundary.
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let root = dir.path();
+        let write = |name: &str, text: &[u8]| std::fs::write(root.join(name), text).unwrap();
+        let story = |tag: &str| -> Vec<u8> {
+            (1..=6)
+                .map(|n| format!("{tag} line {n}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        write("story.txt", &story("a"));
+        // Long enough for git to see the rename (it needs similar content).
+        let old: String = (1..=20).map(|n| format!("original line {n}\n")).collect();
+        write("old.txt", old.as_bytes());
+        write("crlf.txt", b"one\r\ntwo\r\nthree\r\n");
+        write("nonl.txt", b"first\nlast without newline");
+        write("empty.txt", b"");
+        write("dirty.txt", b"d1\nd2\nd3\n");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Ann", "ann@example.com", "one");
+
+        let edit = |name: &str, from: &str, to: &str| {
+            let text = std::fs::read_to_string(root.join(name)).unwrap();
+            std::fs::write(root.join(name), text.replacen(from, to, 1)).unwrap();
+        };
+        edit("story.txt", "a line 2", "b line 2");
+        edit("story.txt", "a line 5", "b line 5");
+        git_in(root, &["mv", "old.txt", "moved.txt"]);
+        edit("moved.txt", "original line 7\n", "line 7 by bob\n");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Bob", "bob@example.com", "two");
+
+        edit("story.txt", "a line 4", "c line 4");
+        let mut story_text = std::fs::read_to_string(root.join("story.txt")).unwrap();
+        story_text.push_str("c line 7\nc line 8\n");
+        std::fs::write(root.join("story.txt"), story_text).unwrap();
+        edit("dirty.txt", "d2", "d2 by cy");
+        edit("crlf.txt", "two", "two edited");
+        git_in(root, &["add", "."]);
+        commit_as(root, b"Cy", "cy@example.com", "three");
+
+        write("latin.txt", b"l1\nl2\n");
+        git_in(root, &["add", "latin.txt"]);
+        commit_as(root, b"Ren\xe9 Latin", "rene@example.com", "four");
+
+        // Uncommitted: an edit in the middle and a new last line.
+        edit("dirty.txt", "d1", "d1 uncommitted");
+        let mut dirty = std::fs::read_to_string(root.join("dirty.txt")).unwrap();
+        dirty.push_str("d4 uncommitted\n");
+        std::fs::write(root.join("dirty.txt"), dirty).unwrap();
+        dir
+    }
+
+    /// The parser that reads `--porcelain` gives, line for line and byte for
+    /// byte of the IPC JSON, what the `--line-porcelain` parser gave on the
+    /// same repository, in the working tree and at a revision, and the shipped
+    /// `get_file_blame` answers the same. No call site passes `-M` or `-C`.
+    #[cfg(unix)]
+    #[test]
+    fn porcelain_blame_equals_line_porcelain_blame_on_every_shape() {
+        let dir = blame_parity_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let mut compared = 0;
+        let mut zero_oid_lines = 0;
+        let mut restated_paths = 0;
+        for file in [
+            "story.txt",
+            "moved.txt",
+            "crlf.txt",
+            "nonl.txt",
+            "empty.txt",
+            "dirty.txt",
+            "latin.txt",
+        ] {
+            for revision in [None, Some("HEAD"), Some("HEAD~1")] {
+                if file == "dirty.txt" && revision.is_none() {
+                    // Uncommitted lines only exist in the working tree.
+                } else if revision.is_some() && file == "latin.txt" && revision == Some("HEAD~1") {
+                    continue; // the file does not exist there
+                }
+                let mut args: Vec<&str> = Vec::new();
+                if let Some(revision) = revision {
+                    args.push(revision);
+                }
+                args.extend(["--", file]);
+                let (old, new) = blame_both_ways(&repo, &args);
+                assert_eq!(
+                    blame_json(&old),
+                    blame_json(&new),
+                    "{file} at {revision:?}: --porcelain differs from --line-porcelain"
+                );
+                let shipped = GitReader::get_file_blame(path, file, revision).unwrap();
+                assert_eq!(
+                    blame_json(&shipped),
+                    blame_json(&old),
+                    "{file} {revision:?}"
+                );
+                zero_oid_lines += new
+                    .iter()
+                    .filter(|l| l.commit_id.starts_with("0000"))
+                    .count();
+                restated_paths += new.iter().filter(|l| l.previous_path.is_some()).count();
+                compared += new.len();
+            }
+        }
+        // The comparison was not vacuous.
+        let raw = git_text_capped(&repo, &["blame", "--porcelain", "--", "story.txt"], 1 << 20)
+            .unwrap()
+            .0;
+        assert!(
+            raw.contains("\nboundary\n"),
+            "root-commit lines are boundary"
+        );
+        assert!(compared > 60, "{compared} lines compared");
+        assert!(zero_oid_lines >= 2, "uncommitted lines were compared");
+        assert!(restated_paths >= 1, "a `previous` header was compared");
+        // The renamed file's lines come from two paths: git names the older
+        // one in a `filename` line of its own.
+        let moved = git_text_capped(&repo, &["blame", "--porcelain", "--", "moved.txt"], 1 << 20)
+            .unwrap()
+            .0;
+        assert!(
+            moved.contains("\nfilename old.txt\n") && moved.contains("\nfilename moved.txt\n"),
+            "the filename changes inside one file's blame: {moved}"
+        );
+        let story = GitReader::get_file_blame(path, "story.txt", None).unwrap();
+        let authors: HashSet<&str> = story.iter().map(|l| l.author_name.as_str()).collect();
+        assert_eq!(authors, HashSet::from(["Ann", "Bob", "Cy"]));
+        let latin = GitReader::get_file_blame(path, "latin.txt", None).unwrap();
+        // Git re-encodes the byte on its way out, so this names the author
+        // whole; the lossy decode of a truly invalid name is the same call
+        // for both parsers (they read the same `&str`).
+        assert!(latin[0].author_name.starts_with("Ren"), "{:?}", latin[0]);
+        let crlf = GitReader::get_file_blame(path, "crlf.txt", None).unwrap();
+        assert_eq!(crlf[0].content, "one", "CRLF is stripped as it always was");
+        let nonl = GitReader::get_file_blame(path, "nonl.txt", None).unwrap();
+        assert_eq!(nonl[1].content, "last without newline");
+        assert!(GitReader::get_file_blame(path, "empty.txt", None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Output cut at ANY byte is an error or a prefix made of whole lines that
+    /// equal the full parse's: never a short line, never a line attributed to
+    /// another commit. With `cut_short` (the caller knows the output was cut)
+    /// it is always the complete lines before the cut.
+    #[cfg(unix)]
+    #[test]
+    fn a_blame_cut_at_any_byte_fails_closed_or_is_a_whole_prefix() {
+        let dir = blame_parity_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let full_text =
+            git_text_capped(&repo, &["blame", "--porcelain", "--", "story.txt"], 1 << 20)
+                .unwrap()
+                .0;
+        assert!(full_text.is_ascii());
+        let full = parse_blame_porcelain(&full_text, false).unwrap();
+        assert_eq!(full.len(), 8);
+        let groups = full_text
+            .lines()
+            .filter(|l| blame_header_oid(l, None).is_some() && l.split_whitespace().count() == 4)
+            .count();
+        let mut whole_prefixes = 0;
+        for cut in 0..full_text.len() {
+            let prefix = &full_text[..cut];
+            match parse_blame_porcelain(prefix, false) {
+                Ok(lines) => {
+                    whole_prefixes += 1;
+                    assert_eq!(
+                        blame_json(&lines),
+                        blame_json(&full[..lines.len()]),
+                        "cut {cut} returned a different blame"
+                    );
+                }
+                Err(error) => assert!(
+                    error.message().contains("Blame unavailable"),
+                    "{}",
+                    error.message()
+                ),
+            }
+            let lines = parse_blame_porcelain(prefix, true).unwrap();
+            assert_eq!(
+                blame_json(&lines),
+                blame_json(&full[..lines.len()]),
+                "cut_short {cut}"
+            );
+        }
+        // Only the cuts that land exactly between groups read as a smaller,
+        // whole blame (the caller's cap flag is what tells that apart).
+        assert!(
+            whole_prefixes <= groups,
+            "{whole_prefixes} prefixes parsed, {groups} groups"
+        );
+        assert!(parse_blame_porcelain(&full_text[..full_text.len() - 1], false).is_err());
+    }
+
+    #[test]
+    fn a_blame_that_names_a_commit_it_never_described_is_refused() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let described = blame_block(&a, 1, "x");
+        let refused = |text: String, why: &str| {
+            let error = parse_blame_porcelain(&text, false)
+                .expect_err(why)
+                .message()
+                .to_string();
+            assert!(error.contains("Blame unavailable"), "{why}: {error}");
+        };
+        // A header and its line, but no author block ever.
+        refused(format!("{a} 1 1 1\n\tx\n"), "never described");
+        // A continuation line for a commit that is not the open group.
+        refused(
+            format!("{described}{b} 2 2\n\ty\n"),
+            "a bare header for an unknown commit",
+        );
+        // A bare header after a group that is already full.
+        refused(
+            format!("{described}{a} 2 2\n\ty\n"),
+            "a bare header with no open group",
+        );
+        // A new group for a commit whose fields were never stated.
+        refused(
+            format!("{described}{b} 2 2 1\n\ty\n"),
+            "a second commit with no fields",
+        );
+        refused("\tstray\n".to_string(), "content with no header");
+        refused("author T\n".to_string(), "fields with no header");
+        refused(
+            format!("{described}{a} 3 3 1\nauthor T\n\tz\n"),
+            "a skipped line number",
+        );
+        refused(
+            format!("{a} 1 1 2\nauthor T\n{a} 2 2 1\n\tx\n"),
+            "a header where the first line should be",
+        );
+        refused(
+            blame_block(&a, 1, "x").replacen("1 1 1", "1 1 2", 1),
+            "a group of two that stops at one",
+        );
+        refused(format!("{a} 1 1 0\n"), "a group of no lines");
+        refused(format!("{a} one 1 1\n"), "a header with no numbers");
+        refused(
+            described.trim_end_matches('\n').to_string(),
+            "output that stops inside a line",
+        );
+        // The same cut is a lower bound when the caller knows it was cut.
+        assert!(
+            parse_blame_porcelain(described.trim_end_matches('\n'), true)
+                .unwrap()
+                .is_empty()
+        );
+        // ...but a cut never excuses a line that is wrong, only one missing.
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 2\nauthor T\n\tx\n"), true).is_err());
+        let short_group = blame_block(&a, 1, "x").replacen("1 1 1", "1 1 2", 1);
+        assert_eq!(parse_blame_porcelain(&short_group, true).unwrap().len(), 1);
+    }
+
+    /// A repository holding one commit by `author` with message `summary` that
+    /// adds `lines` lines of `width` bytes (`width + 1` with the newline) to
+    /// `big.txt`.
+    fn one_commit_big_file(
+        lines: usize,
+        width: usize,
+        author: &str,
+        summary: &str,
+    ) -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        let body: String = (0..lines)
+            .map(|n| format!("{n:06} {}\n", "x".repeat(width - 7)))
+            .collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        git_in(dir.path(), &["add", "big.txt"]);
+        let author = format!("{author} <a@example.com>");
+        git_in(
+            dir.path(),
+            &["commit", "-q", "--author", &author, "-m", summary],
+        );
+        dir
+    }
+
+    /// `--line-porcelain` repeated a commit's metadata for EVERY line: with an
+    /// 80-byte author and a 300-byte summary, 40,000 lines print ~26 MB and
+    /// were refused at the 16 MiB cap ("exceeded 16 MB"). `--porcelain` states
+    /// the metadata once, so the same file is a header per line and blames
+    /// whole, and its IPC JSON (~12 MB here) is inside the same bound.
+    #[test]
+    fn blame_past_the_old_line_porcelain_ceiling_is_complete() {
+        let (author, summary) = ("a".repeat(80), "s".repeat(300));
+        let dir = one_commit_big_file(40_000, 20, &author, &summary);
+        let path = dir.path().to_str().unwrap();
+        let old = git_text_capped(
+            dir.path(),
+            &["blame", "--line-porcelain", "HEAD", "--", "big.txt"],
+            32 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(
+            old.1.is_none() && old.0.len() > budget::MAX_BLAME_BYTES,
+            "the old format is past the cap for this file: {} bytes",
+            old.0.len()
+        );
+        let lines = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
+            .expect("a 40,000-line one-commit file is under the bound");
+        assert_eq!(lines.len(), 40_000);
+        assert_eq!(lines[0].line_no, 1);
+        assert_eq!(lines[39_999].line_no, 40_000);
+        assert!(lines[39_999].content.starts_with("039999 "));
+        assert!(lines.iter().all(|l| l.commit_id == lines[0].commit_id));
+        assert!(blame_json(&lines).len() < budget::MAX_BLAME_BYTES);
+    }
+
+    /// What is SENT is bounded, not only what git prints: `--porcelain` is ~66
+    /// bytes a line here, but each line crosses IPC as ~220 bytes of JSON plus
+    /// its text. 200,000 short lines are 13 MB of git output (under the read
+    /// cap) and ~44 MB of JSON (over [`budget::MAX_BLAME_BYTES`]): refused by
+    /// name on both single-file paths, never truncated, never whole.
+    #[test]
+    fn a_blame_whose_json_outgrows_the_ipc_budget_is_refused() {
+        let dir = one_commit_big_file(200_000, 10, "Test User", "big");
+        let path = dir.path().to_str().unwrap();
+        for revision in [Some("HEAD"), None] {
+            let error = GitReader::get_file_blame(path, "big.txt", revision)
+                .expect_err("a blame over the IPC budget must not be returned");
+            let message = error.message();
+            assert!(
+                message.contains("Blame unavailable") && message.contains("exceeded"),
+                "{revision:?}: the refusal must name the size limit: {message}"
+            );
+        }
+        // The same payload is accepted below the bound.
+        let small = one_commit_big_file(50_000, 10, "Test User", "big");
+        let lines =
+            GitReader::get_file_blame(small.path().to_str().unwrap(), "big.txt", None).unwrap();
+        assert_eq!(lines.len(), 50_000);
+        assert!(blame_json(&lines).len() < budget::MAX_BLAME_BYTES);
+    }
+
+    /// The cap itself still holds: a file whose porcelain exceeds
+    /// [`budget::MAX_BLAME_BYTES`] is refused for its size by name, never
+    /// returned as an empty or partial blame.
+    #[test]
+    fn blame_over_the_porcelain_cap_is_refused_for_size_never_partial() {
+        let dir = one_commit_big_file(120_000, 100, "Test User", "big");
+        let path = dir.path().to_str().unwrap();
+        let error = GitReader::get_file_blame(path, "big.txt", Some("HEAD"))
+            .expect_err("a blame over the cap must not be returned");
+        let message = error.message();
+        assert!(
+            message.contains("Blame unavailable") && message.contains("exceeded"),
+            "the refusal must name the size limit: {message}"
+        );
     }
 
     #[test]
@@ -13081,6 +14024,303 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(ids(&mid), ids(&whole[9..22]));
     }
 
+    /// A cold window of several chunks is ONE `git log`, not one `--skip` walk
+    /// per chunk (each of which re-walks every commit before its skip), and
+    /// every chunk it filled is kept, so reading the same window again spawns
+    /// nothing. Every row equals a single unchunked walk's.
+    #[test]
+    fn a_cold_multi_chunk_window_is_one_log_and_fills_every_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_argvs = |since: usize| -> Vec<Vec<String>> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .cloned()
+                .collect()
+        };
+        let spawned = || git_cli::spawn_log::spawns_in(&repo).len();
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 45);
+
+        // Cold: 45 rows over chunks of 10 are five chunks (starts 0..=40).
+        let (cold, warm, grown, walks_cold, walks_warm, walks_grown) =
+            with_history_chunk(10, || {
+                eager_unhurried(|| {
+                    let before = spawned();
+                    let cold = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_cold = log_argvs(before);
+                    let before = spawned();
+                    let warm = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        None,
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_warm = log_argvs(before);
+                    // A named revision is a different question: cold again.
+                    let before = spawned();
+                    let grown = GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        45,
+                        Some("main"),
+                        None,
+                        RefScope::Named,
+                    )
+                    .unwrap();
+                    let walks_grown = log_argvs(before);
+                    (cold, warm, grown, walks_cold, walks_warm, walks_grown)
+                })
+            });
+        assert_eq!(
+            ids(&cold),
+            ids(&whole),
+            "the cold window differs from one walk"
+        );
+        assert_eq!(ids(&warm), ids(&whole));
+        assert_eq!(ids(&grown), ids(&whole));
+        assert_eq!(
+            walks_cold.len(),
+            1,
+            "a cold window of five chunks must be one log, got {walks_cold:?}"
+        );
+        assert_eq!(
+            walks_warm.len(),
+            0,
+            "kept chunks are not read again: {walks_warm:?}"
+        );
+        // A different revision is a different question: its own single walk.
+        assert_eq!(walks_grown.len(), 1, "{walks_grown:?}");
+    }
+
+    /// A window that grows past kept chunks walks once from the first chunk it
+    /// does not hold, however many chunks that leaves.
+    #[test]
+    fn growing_over_several_missing_chunks_is_one_log_from_the_first_missing() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let (rows, argvs) = with_history_chunk(10, || {
+            eager_unhurried(|| {
+                // Starts 0, 10, 20 are held after this.
+                GitReader::read_commit_history_paged(path, 0, 22, None, None, RefScope::Named)
+                    .unwrap();
+                let mid = git_cli::spawn_log::spawns_in(&repo).len();
+                let rows =
+                    GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+                        .unwrap();
+                let argvs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[mid..]
+                    .iter()
+                    .filter(|argv| argv.iter().any(|a| a == "log"))
+                    .cloned()
+                    .collect();
+                (rows, argvs)
+            })
+        });
+        assert!(git_cli::spawn_log::spawns_in(&repo).len() > before);
+        assert_eq!(rows.len(), 45);
+        assert_eq!(argvs.len(), 1, "starts 30 and 40 are one walk: {argvs:?}");
+        assert!(
+            argvs[0].iter().any(|a| a == "--skip=30"),
+            "the walk starts at the first missing chunk: {argvs:?}"
+        );
+    }
+
+    /// The cut of one long walk into chunks is exactly what a walk of each
+    /// chunk alone prints, for a path-limited walk (whose parents are
+    /// rewritten) as for the whole history, and a walk cut short yields only
+    /// the chunks it covers whole.
+    #[test]
+    fn a_one_walk_window_equals_chunked_walks_for_a_path_limited_history() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..14 {
+            if n % 2 == 0 {
+                std::fs::write(dir.path().join("a.txt"), format!("{n}\n")).unwrap();
+                git_in(dir.path(), &["add", "a.txt"]);
+                git_in(dir.path(), &["commit", "-q", "-m", &format!("a{n}")]);
+            } else {
+                git_in(
+                    dir.path(),
+                    &["commit", "--allow-empty", "-m", &format!("e{n}")],
+                );
+            }
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let rows = |chunk: usize| {
+            with_history_chunk(chunk, || {
+                eager_unhurried(|| {
+                    GitReader::read_commit_history_paged(
+                        path,
+                        0,
+                        8,
+                        None,
+                        Some("a.txt"),
+                        RefScope::Named,
+                    )
+                })
+            })
+            .unwrap()
+        };
+        let whole = rows(usize::MAX);
+        assert_eq!(whole.len(), 7, "seven commits touch a.txt");
+        for chunk in [1, 2, 3] {
+            let got = rows(chunk);
+            assert_eq!(got.len(), whole.len(), "chunk {chunk}");
+            for (a, b) in got.iter().zip(&whole) {
+                assert_eq!(
+                    (&a.id, &a.parent_ids),
+                    (&b.id, &b.parent_ids),
+                    "chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slicing_a_walk_gives_each_chunk_the_rows_its_own_walk_would() {
+        let walk = |rows: std::ops::Range<usize>| -> String {
+            rows.map(|n| format!("r{n}\0"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Chunks of 4 rows (+1 overlap = 5 on the wire) from skip 8, 13 rows.
+        let text = walk(0..13);
+        let pieces = slice_history_walk(&text, 8, 4, 5, 16, true);
+        let starts: Vec<usize> = pieces.iter().map(|(s, _)| *s).collect();
+        assert_eq!(starts, vec![8, 12, 16]);
+        assert_eq!(pieces[0].1, walk(0..5));
+        assert_eq!(pieces[1].1, walk(4..9));
+        assert_eq!(pieces[2].1, walk(8..13));
+        // A walk cut after 9 whole rows covers chunk 8 (rows 0..5) and 12
+        // (rows 4..9) and nothing more; the half row after them is dropped.
+        let cut = format!("{}\nhalf", walk(0..9));
+        let pieces = slice_history_walk(&cut, 8, 4, 5, 16, false);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].1, walk(4..9));
+        // A cut that does not cover the first chunk yields nothing.
+        assert!(slice_history_walk(&walk(0..3), 8, 4, 5, 16, false).is_empty());
+        // History that ends inside the window: later chunks are not invented.
+        let pieces = slice_history_walk(&walk(0..6), 8, 4, 5, 16, true);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].1, walk(4..6));
+        // A window past the end of history is one empty chunk.
+        assert_eq!(
+            slice_history_walk("", 8, 4, 5, 16, true),
+            vec![(8, String::new())]
+        );
+    }
+
+    /// A read-ahead walk cut at its output cap (or its deadline) is not
+    /// repeated: every chunk after it reads only its own rows, as the code did
+    /// before it read ahead, so a window costs one cut walk plus one read per
+    /// chunk, not a cut walk per chunk.
+    #[test]
+    fn a_cut_read_ahead_walk_is_not_repeated_for_every_later_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..44 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        // 400 bytes is three records: the walk covers no whole chunk of ten.
+        let rows = with_history_walk_cap(400, || {
+            with_history_chunk(10, || {
+                eager_unhurried(|| {
+                    GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
+                })
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            whole.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            "a cut walk changed the window"
+        );
+        let logs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..]
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "log"))
+            .cloned()
+            .collect();
+        let long = logs
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "-n51"))
+            .count();
+        assert_eq!(long, 1, "one read-ahead walk, however it ended: {logs:?}");
+        assert_eq!(
+            logs.len(),
+            6,
+            "the cut walk plus one read for each of the five chunks: {logs:?}"
+        );
+    }
+
+    /// One page that fits a chunk (and its probe row) is one process in total:
+    /// the `git log` and nothing else, root commit and all.
+    #[test]
+    fn one_history_page_spawns_exactly_one_process() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..9 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let rows = eager_unhurried(|| {
+            GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 10, "the page reaches the root commit");
+        let spawned: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..].to_vec();
+        assert_eq!(spawned.len(), 1, "one page, one process: {spawned:?}");
+        assert!(spawned[0].iter().any(|a| a == "log"), "{spawned:?}");
+    }
+
     /// Every (chunk size, history length, skip, count) over a small repository
     /// reads exactly the rows one unchunked walk holds: no boundary row is
     /// doubled by the overlap, none dropped, and a history shorter than a
@@ -13407,6 +14647,510 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(churn("empty.txt"), (0, 0));
         assert_eq!(churn("binary.dat"), (0, 0));
         assert_eq!(churn("sub/one.txt"), (1, 0));
+    }
+
+    /// Every `diff --numstat` child recorded for `root` so far.
+    fn numstat_spawns(root: &Path) -> Vec<Vec<String>> {
+        crate::engine::git_cli::spawn_log::spawns_in(root)
+            .into_iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "--numstat"))
+            .collect()
+    }
+
+    /// Both reads of the same worktree: the shipped one (numstat limited to
+    /// the reported paths) and the whole-tree oracle, as Debug text, which is
+    /// every field of every row, plus the numstat children the first one ran.
+    fn status_both_ways(root: &Path) -> (String, String, Vec<Vec<String>>) {
+        let path = root.to_str().unwrap();
+        let seen = numstat_spawns(root).len();
+        let limited = GitReader::get_status(path).unwrap();
+        let spawned: Vec<Vec<String>> = numstat_spawns(root).into_iter().skip(seen).collect();
+        let whole = GitReader::get_status_whole_tree_numstat(path).unwrap();
+        (format!("{limited:#?}"), format!("{whole:#?}"), spawned)
+    }
+
+    /// F-3: `get_status` ran `git diff --numstat` (and `--cached`) over every
+    /// index entry to find churn for the few paths `status` had just named.
+    /// Now each is limited to those paths as literal pathspecs. The fixture is
+    /// every shape the limit could get wrong: both sides of a staged rename
+    /// that is also edited, spaces, a newline, a leading dash, glob and magic
+    /// characters (with a decoy a glob would widen to), non-ASCII, a binary
+    /// edit, a deletion staged and not, intent-to-add, an unmerged path, a
+    /// moved submodule, and untracked files. The rows must equal the
+    /// whole-tree read's, field for field.
+    #[cfg(unix)]
+    #[test]
+    fn status_numstat_is_limited_to_reported_paths_and_matches_the_whole_tree_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git = |args: &[&str]| crate::test_support::git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        let body = |tag: &str| {
+            (1..=12)
+                .map(|n| format!("{tag} line {n}\n"))
+                .collect::<String>()
+        };
+        let tracked = [
+            "plain.txt",
+            "sp ace.txt",
+            "new\nline.txt",
+            "-dash.txt",
+            "glob_decoy.txt",
+            "ünï.txt",
+            "ren_src.txt",
+            "gone.txt",
+            "removed.txt",
+            "staged_only.txt",
+            "both.txt",
+            "conflict.txt",
+            "dir/nested.txt",
+            // Names Git for Windows cannot take as a literal pathspec; here a
+            // `:(literal)` pathspec names them exactly (a glob would widen
+            // `glob*.txt` to its decoy), so the read stays limited.
+            "src/routes/[id]/+page.svelte",
+            "glob*.txt",
+            ":colon.txt",
+        ];
+        for name in tracked {
+            std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+            std::fs::write(root.join(name), body(name)).unwrap();
+        }
+        std::fs::write(root.join("bin.dat"), b"a\0b\n").unwrap();
+        for n in 0..40 {
+            std::fs::write(root.join(format!("bystander{n:02}.txt")), body("by")).unwrap();
+        }
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        crate::test_support::git_in(&sub, &["init", "-q", "-b", "main"]);
+        std::fs::write(sub.join("f.txt"), "one\n").unwrap();
+        crate::test_support::git_in(&sub, &["add", "f.txt"]);
+        crate::test_support::git_in(&sub, &["commit", "-q", "-m", "sub one"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // An unmerged path first: a merge will not start on a dirty index.
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("conflict.txt"), body("side")).unwrap();
+        git(&["commit", "-q", "-am", "side"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("conflict.txt"), body("main")).unwrap();
+        git(&["commit", "-q", "-am", "main"]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .env("GIT_AUTHOR_NAME", "GitPulse")
+            .env("GIT_AUTHOR_EMAIL", "gitpulse@test.local")
+            .env("GIT_COMMITTER_NAME", "GitPulse")
+            .env("GIT_COMMITTER_EMAIL", "gitpulse@test.local")
+            .current_dir(&root)
+            .output_locked()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge must conflict");
+
+        let edit = |name: &str| {
+            let mut text = std::fs::read_to_string(root.join(name)).unwrap();
+            text = text.replacen("line 3\n", "line 3 edited\nextra\n", 1);
+            std::fs::write(root.join(name), text).unwrap();
+        };
+        for name in [
+            "plain.txt",
+            "sp ace.txt",
+            "new\nline.txt",
+            "-dash.txt",
+            "glob_decoy.txt",
+            "ünï.txt",
+            "dir/nested.txt",
+            "src/routes/[id]/+page.svelte",
+            "glob*.txt",
+            ":colon.txt",
+        ] {
+            edit(name);
+        }
+        git(&["mv", "ren_src.txt", "ren_dst.txt"]);
+        edit("ren_dst.txt");
+        git(&["add", "ren_dst.txt"]);
+        std::fs::write(root.join("ren_dst.txt"), body("ren_src.txt") + "tail\n").unwrap();
+        edit("staged_only.txt");
+        git(&["add", "staged_only.txt"]);
+        edit("both.txt");
+        git(&["add", "both.txt"]);
+        std::fs::write(root.join("both.txt"), "all new\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        git(&["rm", "-q", "removed.txt"]);
+        std::fs::write(root.join("bin.dat"), b"a\0b\0c\n").unwrap();
+        std::fs::write(root.join("itm.txt"), body("itm")).unwrap();
+        git(&["add", "-N", "itm.txt"]);
+        std::fs::write(root.join("untracked.txt"), body("u")).unwrap();
+        std::fs::write(sub.join("f.txt"), "two\n").unwrap();
+        crate::test_support::git_in(&sub, &["commit", "-q", "-am", "sub two"]);
+
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole, "limited numstat must read the same churn");
+        for token in [
+            "ren_dst.txt",
+            "ren_src.txt",
+            "itm.txt",
+            "conflict.txt",
+            "sub",
+        ] {
+            assert!(
+                limited.contains(token),
+                "{token} is in the report: {limited}"
+            );
+        }
+
+        assert_eq!(spawned.len(), 2, "one numstat each way: {spawned:?}");
+        for argv in &spawned {
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("pathspec fence");
+            assert!(
+                argv[at + 1..]
+                    .iter()
+                    .all(|spec| spec.starts_with(":(literal)")),
+                "every pathspec is literal: {argv:?}"
+            );
+        }
+        let worktree = spawned
+            .iter()
+            .find(|a| !a.iter().any(|x| x == "--cached"))
+            .unwrap();
+        for wanted in [
+            ":(literal)-dash.txt",
+            ":(literal)new\nline.txt",
+            ":(literal)src/routes/[id]/+page.svelte",
+            ":(literal)glob*.txt",
+            ":(literal):colon.txt",
+        ] {
+            assert!(
+                worktree.iter().any(|spec| spec == wanted),
+                "{wanted}: {worktree:?}"
+            );
+        }
+        assert!(
+            !worktree.iter().any(|spec| spec.contains("bystander")),
+            "paths status did not report stay out: {worktree:?}"
+        );
+        let staged = spawned
+            .iter()
+            .find(|a| a.iter().any(|x| x == "--cached"))
+            .unwrap();
+        for wanted in [":(literal)ren_src.txt", ":(literal)ren_dst.txt"] {
+            assert!(
+                staged.iter().any(|spec| spec == wanted),
+                "both sides: {staged:?}"
+            );
+        }
+    }
+
+    /// Git for Windows reads `:(literal)X:rest` as a drive path ("is outside
+    /// repository") and glob-expands `*?[` after `:(literal)`, so a status
+    /// that names such a path cannot take the limited read there. The decision
+    /// is a function of (paths, is_windows), so both answers are checked here
+    /// on any host; the Windows behaviour of git itself is not exercised.
+    /// Elsewhere the same names keep the limited read: git there names them
+    /// exactly (see `status_numstat_is_limited_to_reported_paths_and_matches_the_whole_tree_read`).
+    #[test]
+    fn numstat_pathspecs_are_withheld_on_windows_for_paths_a_pathspec_cannot_name_exactly() {
+        let row = |path: &str| RawStatusRecord {
+            index_status: ' ',
+            work_status: 'M',
+            path: path.to_string(),
+            old_path: None,
+        };
+        for hostile in [
+            "glob*.txt",
+            "q?.txt",
+            "br[ac].txt",
+            ":colon.txt",
+            "C:rest.txt",
+            "d/a:b",
+            "src/routes/[id]/+page.svelte",
+        ] {
+            let rows = [row("fine.txt"), row(hostile)];
+            assert_eq!(
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, true),
+                None,
+                "{hostile}"
+            );
+            let renamed = [RawStatusRecord {
+                old_path: Some(hostile.to_string()),
+                ..row("fine.txt")
+            }];
+            assert_eq!(
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths, true),
+                None,
+                "old side {hostile}"
+            );
+            // Off Windows the same rows are limited, literal and complete.
+            assert_eq!(
+                numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, false),
+                Some(vec![
+                    literal_pathspec("fine.txt"),
+                    literal_pathspec(hostile)
+                ])
+                .map(|mut specs| {
+                    specs.sort();
+                    specs
+                }),
+                "{hostile}"
+            );
+            assert_eq!(
+                numstat_pathspecs(renamed.iter(), NumstatReach::ChangedPaths, false)
+                    .map(|specs| specs.len()),
+                Some(2),
+                "old side {hostile}"
+            );
+        }
+        assert!(
+            numstat_pathspecs([row("fine.txt")].iter(), NumstatReach::ChangedPaths, true).is_some()
+        );
+    }
+
+    /// The same names through a real status: the report carries their churn
+    /// either way. On Windows the read is over the whole tree; everywhere else
+    /// it stays limited to the dirty paths, so a SvelteKit or Next.js route
+    /// (`src/routes/[id]/+page.svelte`) does not give the optimization away.
+    #[test]
+    fn status_numstat_with_glob_and_drive_like_names_reads_per_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        let names = [
+            "glob*.txt",
+            "glob_decoy.txt",
+            ":colon.txt",
+            "src/routes/[id]/+page.svelte",
+        ];
+        for name in names {
+            std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+            std::fs::write(root.join(name), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for name in names {
+            std::fs::write(root.join(name), "a\nb\n").unwrap();
+        }
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(limited.contains("additions: 1"), "churn counted: {limited}");
+        let fenced = spawned[0].iter().any(|arg| arg == "--");
+        assert_eq!(
+            fenced,
+            !cfg!(windows),
+            "limited off Windows, whole-tree on it: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// Exactly [`MAX_NUMSTAT_PATHSPECS`] paths are limited; one more is not.
+    /// The same line for their bytes: [`MAX_NUMSTAT_PATHSPEC_BYTES`] fit, one
+    /// byte more does not.
+    #[test]
+    fn numstat_pathspecs_fall_back_exactly_past_the_count_and_byte_bounds() {
+        let rows = |paths: Vec<String>| -> Vec<RawStatusRecord> {
+            paths
+                .into_iter()
+                .map(|path| RawStatusRecord {
+                    index_status: ' ',
+                    work_status: 'M',
+                    path,
+                    old_path: None,
+                })
+                .collect()
+        };
+        let limited = |rows: &[RawStatusRecord]| {
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, cfg!(windows))
+                .map(|specs| specs.len())
+        };
+        let short = |count: usize| rows((0..count).map(|n| format!("f{n:04}")).collect());
+        assert_eq!(
+            limited(&short(MAX_NUMSTAT_PATHSPECS)),
+            Some(MAX_NUMSTAT_PATHSPECS)
+        );
+        assert_eq!(limited(&short(MAX_NUMSTAT_PATHSPECS + 1)), None);
+        // 16 paths of 1024 bytes each are exactly the byte bound.
+        let long = |count: usize, tail: usize| {
+            rows(
+                (0..count)
+                    .map(|n| format!("{n:04}{}", "x".repeat(1020 + usize::from(n == 0) * tail)))
+                    .collect(),
+            )
+        };
+        let per_path = MAX_NUMSTAT_PATHSPEC_BYTES / 16;
+        assert_eq!(per_path, 1024);
+        assert_eq!(limited(&long(16, 0)), Some(16));
+        assert_eq!(limited(&long(16, 1)), None);
+        // Both sides of a rename count, once each, and a path is not counted twice.
+        let rename = || RawStatusRecord {
+            index_status: 'R',
+            work_status: ' ',
+            path: "b".into(),
+            old_path: Some("a".into()),
+        };
+        assert_eq!(limited(&[rename()]), Some(2));
+        assert_eq!(limited(&[rename(), rename()]), Some(2));
+    }
+
+    /// Past the bound the list would not fit a command line, so the whole tree
+    /// is read, and the rows are still the whole-tree read's.
+    #[test]
+    fn status_numstat_reads_the_whole_tree_past_the_pathspec_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        let count = MAX_NUMSTAT_PATHSPECS + 8;
+        for n in 0..count {
+            std::fs::write(root.join(format!("f{n:04}.txt")), "a\nb\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for n in 0..count {
+            std::fs::write(root.join(format!("f{n:04}.txt")), "a\nc\nd\n").unwrap();
+        }
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "over the bound the read is whole-tree: {:?}",
+            spawned[0]
+        );
+        assert!(limited.contains("additions: 2"), "churn was counted");
+    }
+
+    /// The form switches exactly at the cap, counted on the numstat child's
+    /// argv: `MAX_NUMSTAT_PATHSPECS` changed files are read through a pathspec
+    /// list, one more reads the whole tree, and the rows are the whole-tree
+    /// read's either way. No timing: which form ran is read off the command.
+    #[test]
+    fn status_numstat_switches_form_exactly_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        for n in 0..=MAX_NUMSTAT_PATHSPECS {
+            std::fs::write(root.join(format!("f{n:03}.txt")), "a\n").unwrap();
+        }
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let change = |count: usize| {
+            for n in 0..count {
+                std::fs::write(root.join(format!("f{n:03}.txt")), "a\nb\n").unwrap();
+            }
+        };
+        change(MAX_NUMSTAT_PATHSPECS);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        let argv = &spawned[0];
+        let at = argv.iter().position(|arg| arg == "--").expect("at the cap");
+        assert_eq!(
+            argv.len() - at - 1,
+            MAX_NUMSTAT_PATHSPECS,
+            "one spec per file"
+        );
+        change(MAX_NUMSTAT_PATHSPECS + 1);
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "one past the cap reads the whole tree: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// A path that is not valid UTF-8 reaches the report with replacement
+    /// characters, which no pathspec can name. Limiting the read to it would
+    /// report zero churn for a file that changed, so that status reads the
+    /// whole tree and counts the churn. Linux only: APFS refuses such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_numstat_with_a_non_utf8_path_reads_the_whole_tree() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        let odd = root.join(std::ffi::OsStr::from_bytes(b"odd\xff.txt"));
+        std::fs::write(&odd, "a\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(&odd, "a\nb\nc\n").unwrap();
+        let (limited, whole, spawned) = status_both_ways(&root);
+        assert_eq!(limited, whole);
+        assert!(limited.contains("additions: 2"), "churn counted: {limited}");
+        assert!(
+            !spawned[0].iter().any(|arg| arg == "--"),
+            "whole-tree read: {:?}",
+            spawned[0]
+        );
+    }
+
+    /// The same decision without a file system that may refuse the name: a
+    /// replacement character in either side of a row means no pathspec list.
+    #[test]
+    fn numstat_pathspecs_are_withheld_for_an_undecodable_path_and_for_whole_tree_reach() {
+        let row = |path: &str, old_path: Option<&str>| RawStatusRecord {
+            index_status: 'R',
+            work_status: ' ',
+            path: path.to_string(),
+            old_path: old_path.map(str::to_string),
+        };
+        let rows = [row("new.txt", Some("old.txt")), row("b.txt", None)];
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::ChangedPaths, cfg!(windows)),
+            Some(vec![
+                ":(literal)b.txt".to_string(),
+                ":(literal)new.txt".to_string(),
+                ":(literal)old.txt".to_string(),
+            ]),
+            "both sides of the rename, sorted and literal"
+        );
+        assert_eq!(
+            numstat_pathspecs(rows.iter(), NumstatReach::WholeTree, cfg!(windows)),
+            None
+        );
+        for odd in [
+            [row("odd\u{FFFD}.txt", None)],
+            [row("new.txt", Some("odd\u{FFFD}.txt"))],
+        ] {
+            assert_eq!(
+                numstat_pathspecs(odd.iter(), NumstatReach::ChangedPaths, cfg!(windows)),
+                None
+            );
+        }
+    }
+
+    /// A numstat git cannot complete fails the report; it is never zero churn.
+    /// The staged blob is removed, so `status` (which compares object ids) still
+    /// answers while `diff --cached --numstat` cannot read the content.
+    #[cfg(unix)]
+    #[test]
+    fn status_fails_when_its_numstat_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree-unique-blob\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "a.txt"]);
+        let oid = git_text(&root, &["rev-parse", ":a.txt"]).unwrap();
+        let oid = oid.trim();
+        let object = root.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(&object).unwrap();
+        // While the file still matches the index entry git reads the staged
+        // side from the working tree instead of the object, so change it.
+        std::fs::write(root.join("a.txt"), "edited after staging\n").unwrap();
+        let alternates = root.join(".git/objects/info/alternates");
+        assert!(
+            git_text(&root, &["cat-file", "-t", oid]).is_err(),
+            "the staged blob must be gone from every object store (alternates: {:?})",
+            std::fs::read_to_string(alternates)
+        );
+        let error = GitReader::get_status(root.to_str().unwrap())
+            .expect_err("an unreadable numstat must fail the report");
+        assert!(!error.message().is_empty());
     }
 
     /// A repository holding one tracked file and `count` untracked ones,

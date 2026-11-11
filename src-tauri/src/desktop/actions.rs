@@ -78,9 +78,7 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         title: "Work",
         entries: &[
             ("section:work:overview", "Overview"),
-            ("section:work:resolve", "Resolve"),
             ("section:work:remote", "Remote"),
-            ("section:work:policy", "Policy"),
             ("section:work:tasks", "Tasks"),
         ],
     },
@@ -96,7 +94,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
         entries: &[
             ("section:history:graph", "Graph"),
             ("section:history:diff", "Diff"),
-            ("section:history:suspects", "Suspects"),
         ],
     },
     SectionMenu {
@@ -327,17 +324,20 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        // 14 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // 12 is owned by `scripts/view-menu-contract.test.ts`, which compares
         // this catalog against the frontend view registry entry by entry and
         // label by label. This assertion is the cheap smoke check beside it —
         // it went stale at 16 once when the section count dropped, again at 15
         // when History gained Suspects, and again at 16 when Insights gained
         // Secrets, at 17 when Code gained Search, at 18 before Secrets folded
         // into Health (17) and Code's Search and Blame became toggles inside
-        // Explorer (15), and at 15 when Reflog folded into History › Graph
-        // (14); the parity contract is what proves the number is the right
-        // one rather than just the current one.
-        assert_eq!(entries.len(), 14);
+        // Explorer (15), at 15 when Reflog folded into History › Graph (14),
+        // at 14 when Work's Resolve folded into Policy (13), at 13 when
+        // Policy's cards moved to Overview, Remote and Settings (12), and at
+        // 12 when History's Suspects folded into Graph as a list (11); the
+        // parity contract is what proves the number is the right one rather
+        // than just the current one.
+        assert_eq!(entries.len(), 11);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {
@@ -432,6 +432,11 @@ mod tests {
         assert_eq!(NativeAction::parse("tab-manvi"), None);
         assert_eq!(NativeAction::parse("tab-stack"), None);
         assert_eq!(NativeAction::parse("tab-conflict"), None);
+        // Resolve folded into Policy, then both into Overview, which leads
+        // with the conflict editor while a merge or rebase is parked.
+        assert_eq!(NativeAction::parse("section:work:resolve"), None);
+        assert_eq!(NativeAction::parse("section:work:policy"), None);
+        assert!(NativeAction::parse("section:work:overview").is_some());
         // Files and Blame became sections of Code.
         assert_eq!(NativeAction::parse("tab-files"), None);
         assert_eq!(NativeAction::parse("tab-blame"), None);

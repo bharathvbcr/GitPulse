@@ -295,7 +295,7 @@ export function buildMenuState(
     ...workingRepos
       .slice(0, 8).map(([path, actions]) => `${path.split(/[\\/]/).pop()}: ${actions.join(", ")}`));
   const trayTarget = !hasRepo ? "open" : !loaded || repo.operation.probeFailed ? "refresh"
-    : conflicts ? "section:work:resolve" : changes || operation || gitBusy.length ? "section:work:overview" : "section:history:graph";
+    : conflicts || changes || operation || gitBusy.length ? "section:work:overview" : "section:history:graph";
   const brief = !hasRepo ? "Open a repository…" : !loaded || repo.operation.probeFailed ? status
     : conflicts ? `Resolve ${conflicts} conflict${conflicts === 1 ? "" : "s"}`
     : gitBusy.length ? labelText(gitBusy[0] === "unstash" ? "stash-pop" : gitBusy[0]) ?? "Git action running…"
@@ -476,7 +476,7 @@ export function statusKeyAction(
   const card = snapshot.status;
   if (event.key === "1" && can("section:work:overview") && card.changed) return { id: "section:work:overview" };
   if (event.key === "2" && can("section:work:overview") && card.staged) return { id: "section:work:overview" };
-  if (event.key === "3" && can("section:work:resolve") && card.conflicts) return { id: "section:work:resolve" };
+  if (event.key === "3" && can("section:work:overview") && card.conflicts) return { id: "section:work:overview" };
   if (event.key === "4" && can("section:work:overview") && card.stashes) return { id: "section:work:overview" };
   return null;
 }

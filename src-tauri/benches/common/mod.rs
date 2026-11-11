@@ -167,6 +167,9 @@ pub struct Row {
     pub counters: BTreeMap<&'static str, u64>,
     /// Median of each metric across samples.
     pub metrics: BTreeMap<&'static str, f64>,
+    /// Smallest and largest sample of each metric, so a median is never read
+    /// without its spread.
+    pub metric_ranges: BTreeMap<&'static str, (f64, f64)>,
 }
 
 impl Row {
@@ -196,6 +199,7 @@ impl Row {
             "max_ns": self.ns.last(),
             "counters": self.counters,
             "metrics": self.metrics,
+            "metric_ranges": self.metric_ranges,
         })
     }
 }
@@ -256,6 +260,14 @@ pub fn interleave(cases: Vec<Case<'_>>, rounds: usize, warmup: usize) -> Vec<Row
         .zip(metrics)
         .map(|(((case, mut ns), counters), metrics)| {
             ns.sort_unstable();
+            let metric_ranges = metrics
+                .iter()
+                .map(|(name, values)| {
+                    let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+                    let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    (*name, (low, high))
+                })
+                .collect();
             Row {
                 name: case.name,
                 time_gated: case.time_gated,
@@ -265,6 +277,7 @@ pub fn interleave(cases: Vec<Case<'_>>, rounds: usize, warmup: usize) -> Vec<Row
                     .into_iter()
                     .map(|(name, mut values)| (name, median(&mut values)))
                     .collect(),
+                metric_ranges,
             }
         })
         .collect()
@@ -483,7 +496,10 @@ impl Report {
             let metrics: Vec<String> = row
                 .metrics
                 .iter()
-                .map(|(k, v)| format!("{k}~{v:.2}"))
+                .map(|(k, v)| match row.metric_ranges.get(k) {
+                    Some((low, high)) => format!("{k}~{v:.2}[{low:.2}..{high:.2}]"),
+                    None => format!("{k}~{v:.2}"),
+                })
                 .collect();
             println!(
                 "{:<width$}  {:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {} {}",

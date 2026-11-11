@@ -60,11 +60,11 @@ export interface PersistedTab {
   terminalOpen?: boolean;
   /**
    * Which list History › Graph was drawing (see `views/historyList.ts`).
-   * Written only as `"moves"`: absent is the commit graph, so a blob from a
-   * session that never opened the reflog is unchanged, and an older build
+   * Written only as `"moves"` or `"suspects"`: absent is the commit graph, so
+   * a blob from a session that never left it is unchanged, and an older build
    * ignores the field and opens on the graph.
    */
-  historyList?: "moves";
+  historyList?: "moves" | "suspects";
   searchQuery: string;
   selectedBranch: string | null;
 }
@@ -178,11 +178,14 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // into one row each — the GitHub and MANVI views were rendering halves of
   // the same answer beside it, down to issuing the same `cmd_github_context`
   // call twice. Resolve is not a destination either: it is what a blocked
-  // row opens into, and Work already sorts blocked rows first.
+  // row opens into, and Work already sorts blocked rows first. The conflict
+  // editor now leads Overview while a merge or rebase is parked, and MANVI's
+  // cards went to the surfaces that own their subject — Overview keeps the
+  // cleanup and the policy journal, so that is where a saved Manvi tab lands.
   github: { tab: "work", section: "remote" },
-  manvi: { tab: "work", section: "policy" },
+  manvi: { tab: "work", section: "overview" },
   stack: { tab: "work" },
-  conflict: { tab: "work", section: "resolve" },
+  conflict: { tab: "work", section: "overview" },
   // Files and Blame are two readings of one file. Both keyed off
   // `selectedFilePath`, and Blame had grown its own explorer rail and its own
   // path box so a user would not have to walk back to Files for the file they
@@ -193,35 +196,6 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   files: { tab: "code", section: "explorer" },
   blame: { tab: "code", section: "explorer" },
 };
-
-/**
- * Sections this build no longer registers, by view, and the section of the
- * same view that shows their content now.
- *
- * A remembered section the registry does not offer falls back to the view's
- * first section, which for a section that merged into a sibling lands the
- * reader on an unrelated pane and reads as the content having been deleted.
- *
- * Only restored sessions read this. Menu and palette destinations naming a
- * retired section still do not navigate (`nativeActions.ts`), so a stale
- * native menu id cannot open a surprise pane.
- */
-export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
-  // Secrets became a section of Health: one verdict, one agent bar.
-  insights: { secrets: "health" },
-  // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
-  // the file a saved session was searching or blaming is still the selection.
-  code: { search: "explorer", blame: "explorer" },
-  // Reflog became Graph's "HEAD moves" list (`views/historyList.ts`); the list
-  // itself is restored from the same retired id by `restoredHistoryList`.
-  history: { reflog: "graph" },
-};
-
-/** Where a remembered section of `view` lives now; unchanged when not retired. */
-export function retiredSectionFor(view: ViewTab, section: string): string {
-  const moved = RETIRED_SECTIONS[view];
-  return moved && Object.hasOwn(moved, section) ? moved[section] : section;
-}
 
 /** The retirement record for a persisted id, or null when it is not retired. */
 export function retiredViewFor(value: unknown): RetiredView | null {
@@ -250,9 +224,10 @@ export function migrateViewTab(value: unknown): ViewTab {
  * restoring "History" without "on the Diff" is the retirement reading as a
  * deletion.
  *
- * Every id is narrowed by the registry: a section renamed or dropped since
- * the blob was written falls back to the view's default rather than selecting
- * a pane that no longer exists.
+ * Every id is narrowed by the registry: a section folded into a sibling lands
+ * where its content went (`RETIRED_SECTIONS` in views/viewRegistry.ts), and one
+ * renamed or dropped since the blob was written falls back to the view's
+ * default rather than selecting a pane that no longer exists.
  */
 export function sanitizeViewSections(
   raw: unknown,
@@ -262,7 +237,7 @@ export function sanitizeViewSections(
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [view, section] of Object.entries(raw as Record<string, unknown>)) {
       if (!isViewTab(view) || typeof section !== "string") continue;
-      const resolved = resolveSection(view, retiredSectionFor(view, section));
+      const resolved = resolveSection(view, section);
       if (resolved) out[view] = resolved;
     }
   }
@@ -577,7 +552,9 @@ export function workspaceToPersisted(
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
-        ...(session?.historyList === "moves" ? { historyList: "moves" as const } : {}),
+        ...(session?.historyList && session.historyList !== "commits"
+          ? { historyList: session.historyList }
+          : {}),
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -617,8 +594,11 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
       // spawns a shell, so the permissive reading is the costly one.
       terminalOpen: record.terminalOpen === true,
       // Read from the raw record, before `sanitizeViewSections` narrows a
-      // retired `history: "reflog"` to Graph and the mode with it.
-      ...(restoredHistoryList(record) === "moves" ? { historyList: "moves" as const } : {}),
+      // retired `history: "reflog"` or `"suspects"` to Graph and the list with it.
+      ...(() => {
+        const list = restoredHistoryList(record);
+        return list === "commits" ? {} : { historyList: list };
+      })(),
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

@@ -112,7 +112,9 @@ describe("CommitDetails single current commit", () => {
     expect(source).toContain('{#if detailsStatus === "error"}');
     expect(source).toContain("Could not load commit details: {detailsError}");
     expect(source).toContain("onclick={retryDetails}");
-    expect(source).toContain("graphStore.selectCommit(selectedCommit)");
+    // Retry re-reads the same selection; it must not drop a HEAD-moves or
+    // Suspects pin (held by graphStore.offGraph.test.ts).
+    expect(source).toContain("graphStore.retryDetails()");
   });
 
   it("orders the preview states: reading, failed, text, empty commit, no commit", () => {

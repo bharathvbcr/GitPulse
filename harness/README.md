@@ -376,8 +376,20 @@ never reaches the final assignment — that is how the StoragePanel defect
 presented).
 
 - `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `FleetView` |
-  `TerminalPanel` | `ManviOpsPanel` | `StatusBar` | `LoopCanary`
-- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs`
+  `TerminalPanel` | `GitHubPanel` | `StatusBar` | `LoopCanary` | `FileTreePanel`
+- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs` | `treebuilds`
+- `treebuilds` counts how many times the Code view's file tree is built
+  (`fileTreeBuildCount()`, read at `buildFileTree`) per file click, per unrelated
+  publish and per status change, into `__gpResult.treebuilds`. A count, so load
+  does not move it. Expected on the current tree: 0, 0, 1. On the tree before
+  the identity fix (`git checkout 55d605b8 -- src/lib/components/files/FileTreePanel.svelte
+  src/lib/files/fileStatus.ts src/lib/files/fileQuery.ts`, then back with
+  `git checkout HEAD -- …`): 1, 1, 1.
+- Run it with `node scripts/stress-probe.mjs "<query>"` (the browser
+  runner cannot select a stress.html scenario), e.g.
+  `"c=FileTreePanel&scenario=treebuilds&paths=20000&dirty=20&tabs=1&cycles=8"`.
+  The cost of one build is `bun scripts/tree-build-bench.ts` (skips itself above
+  a 1-minute load of 30).
 - `termtabs` drives the terminal strip through the real DOM (open / switch / close),
   because that state is internal to the component. Pair it with `TerminalPanel`:
   every open mounts an xterm into a visible box and hides the previous one, which

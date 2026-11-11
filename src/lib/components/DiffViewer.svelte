@@ -160,6 +160,7 @@
     symbolsForFile,
   } from "../codeintel/client";
   import { hunkSymbolLabels, type HunkLineRange } from "../diff/symbolGroups";
+  import { openSuspectsFor } from "../codeintel/openSuspects";
   import { parseHunkHeaderNumbers } from "../diff/patchBuilder";
   import { previewMarkers } from "../codeintel/previewStore";
   import {
@@ -2066,6 +2067,15 @@
             <span class="shrink-0 font-mono opacity-70">{currentHunk.header}</span>
             {#if currentHunkSymbol}
               <span class="min-w-0 truncate font-mono text-accent/80">{currentHunkSymbol}</span>
+              <!-- The symbol this hunk changes, as a symptom: which commit
+                   since the last known good could have broken it. -->
+              <button
+                type="button"
+                class="shrink-0 rounded px-1 text-micro text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+                onclick={() => openSuspectsFor(currentHunkSymbol)}
+                title="Find suspects for {currentHunkSymbol}: which commit since the last known good could have broken it"
+                aria-label="Find suspects for {currentHunkSymbol}"
+              >suspects</button>
             {:else if currentHunk.heading}
               <span class="min-w-0 truncate font-mono opacity-60">{currentHunk.heading}</span>
             {/if}

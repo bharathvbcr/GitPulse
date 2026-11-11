@@ -1105,7 +1105,9 @@
       </button>
     </div>
   {:else if loading && !map}
-    <div class="flex-1 p-4 flex flex-col gap-3" aria-busy="true">
+    <!-- The test id is how harness/diagnostics.html tells a panel still
+         loading from one that has its map: the skeleton carries no text. -->
+    <div class="flex-1 p-4 flex flex-col gap-3" aria-busy="true" data-testid="map-loading">
       <Skeleton variant="text" width="40%" height="1rem" />
       <Skeleton variant="card" />
       <Skeleton variant="text" count={5} />

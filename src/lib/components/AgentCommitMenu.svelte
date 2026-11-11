@@ -16,7 +16,6 @@
     ChevronDown,
     Code,
     Copy,
-    LoaderCircle,
     Sparkles,
     Terminal,
     X,
@@ -26,7 +25,8 @@
   import { portal } from "../dom/portal";
   import { popover, restoreFocusTo, type DismissReason, type PopoverOptions } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import SettingSegment from "./SettingSegment.svelte";
   import { repoScope } from "../repos/repoScope.svelte";
   import {
     formatCommitAgentPrompt,
@@ -61,6 +61,12 @@
   const panelId = `agent-commit-panel-${uid}`;
   const noteId = `agent-commit-note-${uid}`;
 
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
   /** How long the success confirmation stays before the panel closes itself. */
   const SUCCESS_CLOSE_MS = 1800;
   const COPIED_MS = 1800;
@@ -88,8 +94,8 @@
   const repoPath = $derived($currentRepoPath);
   const statuses = $derived($repoStore.statuses);
   const dirtyCount = $derived(statuses.length);
-  const stagedCount = $derived(statuses.filter((s) => s.is_staged).length);
-  const conflictedCount = $derived(statuses.filter((s) => s.is_conflicted).length);
+  const stagedCount = $derived($repoStore.stagedCount);
+  const conflictedCount = $derived($repoStore.conflictedCount);
 
   /**
    * Scope is a choice only while some — not all — changes are staged. The
@@ -135,7 +141,7 @@
         error: null,
       };
     } catch (err: unknown) {
-      return { text: "", error: formatError(err) };
+      return { text: "", error: failure("build", "the prompt", err) };
     }
   });
 
@@ -294,10 +300,10 @@
         notice = res.notice ?? "Agent session opened in the terminal.";
         if (open) closeTimer = setTimeout(() => close(), SUCCESS_CLOSE_MS);
       } else {
-        error = res.error ?? "Failed to launch agent session.";
+        error = failure("open", "the agent session", res.error ?? "No reason was reported");
       }
     } catch (err: unknown) {
-      if (!stale()) error = formatError(err);
+      if (!stale()) error = failure("open", "the agent session", err);
     } finally {
       if (!stale()) launching = false;
     }
@@ -316,7 +322,7 @@
         copied = false;
       }, COPIED_MS);
     } else {
-      error = "Could not copy to clipboard.";
+      error = "Couldn't copy to the clipboard.";
     }
   }
 </script>
@@ -332,10 +338,11 @@
       aria-controls={open ? panelId : undefined}
       disabled={Boolean(disabledReason)}
       title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
-      class="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium border border-border/80 bg-surface/70 text-textMuted hover:text-accent hover:border-accent/50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+      class="gp-btn text-textMuted hover:text-accent"
+      data-size="sm"
     >
       <Sparkles size={11} class="text-accent shrink-0" />
-      <span class="font-sans">Ask Agent</span>
+      <span class="font-sans">Ask agent</span>
     </button>
   {:else}
     <button
@@ -347,10 +354,11 @@
       aria-controls={open ? panelId : undefined}
       disabled={Boolean(disabledReason)}
       title={disabledReason ?? "Ask Antigravity or Claude to review changes and commit"}
-      class="gp-btn py-0.5! px-2! text-[11px] inline-flex items-center gap-1.5 text-textMuted hover:text-textPrimary disabled:opacity-40 disabled:cursor-not-allowed"
+      class="gp-btn text-textMuted hover:text-textPrimary"
+      data-size="sm"
     >
       <Sparkles size={12} class="text-accent shrink-0" />
-      <span>Ask Agent to Commit</span>
+      <span>Ask agent to commit</span>
       <ChevronDown size={11} class="opacity-70" />
     </button>
   {/if}
@@ -364,22 +372,23 @@
     use:popover={dismissal}
     id={panelId}
     data-agent-commit-panel={uid}
-    class="fixed gp-menu gp-pop gp-scroll p-3 w-80 max-w-[calc(100vw-16px)] max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain flex flex-col gap-2.5 shadow-2xl rounded-xl border border-border/80 bg-surface font-sans"
+    class="fixed gp-menu gp-pop gp-scroll p-3 w-80 max-w-[calc(100vw-16px)] max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain flex flex-col gap-2.5 font-sans"
     style="z-index: {LAYERS.MENU}"
     role="dialog"
     aria-label="Ask coding agent to commit"
     data-testid="agent-commit-menu"
   >
     <!-- Header -->
-    <div class="flex items-center justify-between border-b border-border/60 pb-1.5">
+    <div class="flex items-center justify-between pb-1.5">
       <div class="flex items-center gap-1.5">
         <Sparkles size={13} class="text-accent" />
-        <span class="text-xs font-semibold text-textPrimary">Ask Agent to Commit</span>
+        <span class="text-xs font-semibold text-textPrimary">Ask agent to commit</span>
       </div>
       <button
         type="button"
         onclick={() => close({ restoreFocus: true })}
-        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn"
+        data-size="sm"
         aria-label="Close"
       >
         <X size={12} />
@@ -389,35 +398,22 @@
     <!-- Scope selection (only while some, not all, changes are staged) -->
     {#if scopeSelectable}
       <div class="flex flex-col gap-1">
-        <span class="text-[10px] font-medium text-textMuted uppercase tracking-wide">Scope</span>
-        <div class="grid grid-cols-2 gap-1 bg-surfaceHover/40 p-0.5 rounded-lg border border-border/50 text-[11px]">
-          <button
-            type="button"
-            aria-pressed={scope === "staged"}
-            class="px-2 py-1 rounded text-center font-medium transition-colors {scope === 'staged'
-              ? 'bg-accent/15 text-accent border border-accent/30'
-              : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => (scopeChoice = "staged")}
-          >
-            Staged ({stagedCount})
-          </button>
-          <button
-            type="button"
-            aria-pressed={scope === "all"}
-            class="px-2 py-1 rounded text-center font-medium transition-colors {scope === 'all'
-              ? 'bg-accent/15 text-accent border border-accent/30'
-              : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => (scopeChoice = "all")}
-          >
-            All changes ({dirtyCount})
-          </button>
-        </div>
+        <span class="gp-label">Scope</span>
+        <SettingSegment
+          ariaLabel="Scope"
+          options={[
+            { value: "staged", label: `Staged (${stagedCount})` },
+            { value: "all", label: `All changes (${dirtyCount})` },
+          ]}
+          value={scope}
+          onselect={(next) => (scopeChoice = next)}
+        />
       </div>
     {/if}
 
     <!-- Custom note / instruction -->
     <div class="flex flex-col gap-1">
-      <label for={noteId} class="text-[10px] font-medium text-textMuted uppercase tracking-wide">
+      <label for={noteId} class="gp-label">
         Note (optional)
       </label>
       <input
@@ -425,8 +421,8 @@
         id={noteId}
         bind:value={userNote}
         type="text"
-        placeholder="e.g. Focus on UI fix, follow conventional commit..."
-        class="w-full bg-background border border-border/70 rounded-lg px-2.5 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden focus:border-accent/60 font-sans"
+        placeholder="e.g. Focus on UI fix, follow conventional commit…"
+        class="gp-field w-full font-sans"
       />
     </div>
 
@@ -437,7 +433,8 @@
         disabled={launching || Boolean(blockedReason)}
         title={blockedReason ?? undefined}
         onclick={() => void handleLaunch("agy")}
-        class="w-full flex items-center justify-between px-3 py-1.5 rounded-xl border border-accent/40 bg-accent/10 hover:bg-accent/20 text-accent font-medium text-xs transition-colors disabled:opacity-50"
+        class="gp-btn w-full justify-between"
+        data-variant="primary"
       >
         <div class="flex items-center gap-2">
           <Sparkles size={13} class="shrink-0" />
@@ -451,10 +448,10 @@
         disabled={launching || Boolean(blockedReason)}
         title={blockedReason ?? undefined}
         onclick={() => void handleLaunch("claude")}
-        class="w-full flex items-center justify-between px-3 py-1.5 rounded-xl border border-border/80 bg-surfaceHover/50 hover:bg-surfaceHover text-textPrimary font-medium text-xs transition-colors disabled:opacity-50"
+        class="gp-btn w-full justify-between"
       >
         <div class="flex items-center gap-2">
-          <Bot size={13} class="text-amber-500 shrink-0" />
+          <Bot size={13} class="shrink-0" />
           <span>Ask Claude Code</span>
         </div>
         <Terminal size={12} class="opacity-70 shrink-0" />
@@ -463,37 +460,36 @@
 
     <!-- Notice / Error banners -->
     {#if launching}
-      <div class="flex items-center gap-2 rounded-lg bg-surfaceHover/60 px-2.5 py-1.5 text-[11px] text-textMuted">
-        <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
+      <div role="status" class="gp-notice" data-tone="info">
         <span>Opening session in terminal dock…</span>
       </div>
     {/if}
 
     {#if notice}
-      <div role="status" class="flex items-center gap-2 rounded-lg bg-emerald-500/10 border border-emerald-500/25 px-2.5 py-1.5 text-[11px] text-emerald-400">
-        <Check size={13} class="shrink-0" />
+      <div role="status" class="gp-notice" data-tone="ok">
+        <Check size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
         <span>{notice}</span>
       </div>
     {/if}
 
     {#if error ?? (!notice && blockedReason)}
-      <div role="alert" class="flex items-center gap-2 rounded-lg bg-rose-500/10 border border-rose-500/25 px-2.5 py-1.5 text-[11px] text-rose-400">
-        <AlertTriangle size={13} class="shrink-0" />
+      <div role="alert" class="gp-notice" data-tone={error ? "danger" : "info"}>
+        <AlertTriangle size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
         <span class="break-words min-w-0">{error ?? blockedReason}</span>
       </div>
     {/if}
 
     <!-- Expandable Developer CLI / SDK commands -->
-    <div class="border-t border-border/60 pt-1.5">
+    <div class="pt-1.5">
       <button
         type="button"
         aria-expanded={detailsOpen}
         onclick={() => (detailsOpen = !detailsOpen)}
-        class="flex items-center justify-between w-full text-[10px] text-textMuted hover:text-textPrimary transition-colors py-0.5"
+        class="flex items-center justify-between w-full text-micro text-textMuted hover:text-textPrimary transition-colors py-0.5"
       >
         <span class="flex items-center gap-1">
           <Code size={11} />
-          <span>CLI & Developer SDK</span>
+          <span>CLI & developer SDK</span>
         </span>
         <ChevronDown size={11} class="transition-transform {detailsOpen ? 'rotate-180' : ''}" />
       </button>
@@ -501,48 +497,30 @@
       {#if detailsOpen}
         <div class="flex flex-col gap-1.5 mt-1.5">
           <!-- Tabs -->
-          <div class="flex border-b border-border/50 text-[10px]">
-            <button
-              type="button"
-              aria-pressed={previewTab === "prompt"}
-              class="px-2 py-0.5 border-b-2 font-medium transition-colors {previewTab === 'prompt'
-                ? 'border-accent text-accent'
-                : 'border-transparent text-textMuted hover:text-textPrimary'}"
-              onclick={() => (previewTab = "prompt")}
-            >
-              Prompt
-            </button>
-            <button
-              type="button"
-              aria-pressed={previewTab === "cli"}
-              class="px-2 py-0.5 border-b-2 font-medium transition-colors {previewTab === 'cli'
-                ? 'border-accent text-accent'
-                : 'border-transparent text-textMuted hover:text-textPrimary'}"
-              onclick={() => (previewTab = "cli")}
-            >
-              CLI Command
-            </button>
-            <button
-              type="button"
-              aria-pressed={previewTab === "sdk"}
-              class="px-2 py-0.5 border-b-2 font-medium transition-colors {previewTab === 'sdk'
-                ? 'border-accent text-accent'
-                : 'border-transparent text-textMuted hover:text-textPrimary'}"
-              onclick={() => (previewTab = "sdk")}
-            >
-              Python SDK
-            </button>
+          <div class="flex items-center gap-2">
+            <SettingSegment
+              ariaLabel="Preview"
+              options={[
+                { value: "prompt", label: "Prompt" },
+                { value: "cli", label: "CLI command" },
+                { value: "sdk", label: "Python SDK" },
+              ]}
+              value={previewTab}
+              onselect={(next) => (previewTab = next)}
+            />
 
             <button
               type="button"
               disabled={!previewText}
               onclick={() => void handleCopy(previewText)}
-              class="ml-auto inline-flex items-center gap-1 text-[10px] text-textMuted hover:text-accent font-mono py-0.5 disabled:opacity-40"
+              class="gp-btn ml-auto"
+              data-variant="ghost"
+              data-size="sm"
               title="Copy current content"
             >
               {#if copied}
-                <Check size={10} class="text-emerald-400" />
-                <span class="text-emerald-400">Copied</span>
+                <Check size={10} />
+                <span>Copied</span>
               {:else}
                 <Copy size={10} />
                 <span>Copy</span>
@@ -551,7 +529,7 @@
           </div>
 
           <!-- Content preview -->
-          <pre class="w-full max-h-36 overflow-y-auto overscroll-contain p-2 rounded-lg bg-background border border-border/60 font-mono text-[9px] text-textSecondary leading-relaxed whitespace-pre-wrap break-all select-all gp-scroll">{previewText}</pre>
+          <pre class="w-full max-h-36 overflow-y-auto overscroll-contain p-2 rounded-lg bg-background font-mono text-micro text-textSecondary leading-relaxed whitespace-pre-wrap break-all select-all gp-scroll">{previewText}</pre>
         </div>
       {/if}
     </div>

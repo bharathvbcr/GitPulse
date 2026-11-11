@@ -14,6 +14,8 @@
  * tab tooltip and the status bar.
  */
 
+import { describeDestination } from "../views/viewRegistry";
+
 /** Mirrors the Rust `OperationKind`; serde emits unit variants as their names. */
 export type OperationKind =
   | "Merge"
@@ -143,7 +145,7 @@ export function nextStep(op: RepoOperation): string {
   const n = op.conflicted_total;
   if (n > 0) {
     const files = n === 1 ? "1 file" : `${n} files`;
-    return `Resolve ${files} in the Resolve view, stage the result, then continue.`;
+    return `Resolve ${files} in ${describeDestination("work", "overview")}, stage the result, then continue.`;
   }
   if (op.available.includes("continue")) {
     return "All conflicts are resolved — continue to finish the operation.";
@@ -274,7 +276,7 @@ export function blockedReason(state: OperationState, verb: string): string | nul
  *
  * The snapshot builds a fresh `OperationState` object on every status poll, so
  * reference equality reports "changed" every six seconds and republishes the
- * whole store to every subscriber — which re-runs the Resolve view's load
+ * whole store to every subscriber — which re-runs the conflict editor's load
  * effect and repaints the graph on a repository where nothing happened. The
  * gate needs to know whether the *content* moved.
  *

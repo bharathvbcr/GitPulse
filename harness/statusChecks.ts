@@ -293,7 +293,7 @@ export async function checkStatusPopover() {
       afterEscape.closed && afterEscape.action);
     await select(1, "conflicts");
     check("conflicts receive a specific headline and card", element("h1").textContent === "Conflicts need your attention" && button('[aria-label="2 conflicts"]').classList.contains("attention"));
-    await click(".primary"); check("the conflict action opens Resolve", action("section:work:resolve"));
+    await click(".primary"); check("the conflict action opens Overview, which leads with the conflicts", action("section:work:overview"));
     await select(1, "clean");
     check("clean state shows real zeros and disables all cards", metrics().every(m => m.disabled && m.querySelector("strong")?.textContent === "0"));
     await click(".primary"); check("clean state offers history", action("section:history:graph"));
@@ -319,6 +319,15 @@ export async function checkStatusPopover() {
     check("light accessibility fallback is opaque and unfiltered", getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)" && backdrop() === "none");
     fallback.media.mediaText = media; await settle();
     check("restoring the preference restores glass without remounting", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
+    // WKWebView does not implement prefers-reduced-transparency, so the native
+    // bridge stamps this attribute instead. It has to give the same fallback.
+    const root = document.documentElement;
+    root.dataset.transparency = "reduced"; await settle();
+    check("data-transparency=reduced gives the opaque unfiltered fallback without the media feature", getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)" && backdrop() === "none" && getComputedStyle(element(".panel")).backgroundImage === "none");
+    root.dataset.transparency = "unknown"; await settle();
+    check("an unknown Reduce Transparency read does not claim reduced", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
+    delete root.dataset.transparency; await settle();
+    check("clearing data-transparency restores glass", backdrop().includes("blur(34px)") && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
     await select(2, "opaque");
     check("the non-native fallback stays opaque", backdrop() === "none" && getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)");
     await select(2, "preview");

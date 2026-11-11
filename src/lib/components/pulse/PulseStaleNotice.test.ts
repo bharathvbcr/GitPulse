@@ -64,17 +64,17 @@ const panels: ReadonlyArray<{
   {
     name: "PulseKnowledgeMap",
     html: (props) => render(PulseKnowledgeMap, { props: { knowledge, ...props } }).body,
-    stillShown: "Bus Factor",
+    stillShown: "Bus factor",
   },
   {
     name: "PulseCodeAge",
     html: (props) => render(PulseCodeAge, { props: { knowledge, ...props } }).body,
-    stillShown: "Repo Code Half-Life",
+    stillShown: "Repository code half-life",
   },
   {
     name: "PulseDora",
     html: (props) => render(PulseDora, { props: { dora, ...props } }).body,
-    stillShown: "Deploy Frequency",
+    stillShown: "Deploy frequency",
   },
 ];
 
@@ -83,20 +83,20 @@ describe.each(panels)("$name stale-on-failure notice", ({ html, stillShown }) =>
     const body = html({ error: "blame timed out", measuredAt: Date.now() - 5 * 60_000 });
     expect(body).toContain('role="status"');
     expect(body).toContain(
-      "Last refresh failed: blame timed out. Showing the previous scan from 5m ago.",
+      "Couldn't refresh the scan. blame timed out. Showing the previous scan from 5m ago.",
     );
     expect(body).toContain(stillShown);
   });
 
   it("omits the age clause when no measurement time is known", () => {
     const body = html({ error: "blame timed out", measuredAt: null });
-    expect(body).toContain("Last refresh failed: blame timed out. Showing the previous scan.");
+    expect(body).toContain("Couldn't refresh the scan. blame timed out. Showing the previous scan.");
     expect(body).not.toContain("scan from");
   });
 
   it("stays silent when the last refresh succeeded", () => {
     const body = html({ error: null, measuredAt: Date.now() });
-    expect(body).not.toContain("Last refresh failed");
+    expect(body).not.toContain("Couldn't refresh the scan");
     expect(body).toContain(stillShown);
   });
 });
@@ -112,19 +112,19 @@ describe("PulseStaleNotice wording", () => {
 
   it("does not double the full stop when the error already ends in one", () => {
     const body = notice({ error: "blame timed out.", measuredAt: null });
-    expect(body).toContain("Last refresh failed: blame timed out. Showing the previous scan.");
+    expect(body).toContain("Couldn't refresh the scan. blame timed out. Showing the previous scan.");
     expect(body).not.toContain("..");
   });
 });
 
 describe("knowledge tab announces a failed refresh once", () => {
   const props = { knowledge, error: "blame timed out", measuredAt: Date.now() - 5 * 60_000 };
-  const occurrences = (body: string) => body.split("Last refresh failed").length - 1;
+  const occurrences = (body: string) => body.split("Couldn't refresh the scan").length - 1;
 
   it("PulseCodeAge can leave the notice to the card above it", () => {
     const body = render(PulseCodeAge, { props: { ...props, staleNotice: false } }).body;
     expect(occurrences(body)).toBe(0);
-    expect(body).toContain("Repo Code Half-Life");
+    expect(body).toContain("Repository code half-life");
   });
 
   it("PulseCodeAge keeps its own notice when used on its own", () => {

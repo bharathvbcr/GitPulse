@@ -5,7 +5,8 @@ import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
 import { askText } from "../stores/modalStore";
 import { promptQuickCommit } from "../commit/quickCommit";
-import { VIEW_REGISTRY } from "../views/viewRegistry";
+import { VIEW_REGISTRY, describeDestination } from "../views/viewRegistry";
+import { openSuspectsFor } from "../codeintel/openSuspects";
 import { setEditorLens, showExplorerRail } from "../files/explorerLens";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
@@ -13,8 +14,20 @@ import { SESSION_TYPES } from "../terminal/tabs";
 import { hostPlatform } from "../stores/platformStore";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
+import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
+import { openManviFocus } from "../ui/openManviFocus";
+import { openConflicts } from "../ui/workConflicts";
+import { policyActivityVisible } from "../harness/policyActivityVisible";
+import { harnessStore } from "../stores/harnessStore";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
+/** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
+const MANVI_PALETTE_LABELS: Readonly<Record<ManviFocusId, string>> = {
+  harness: "Open Manvi policy settings — connection and capability boundary",
+  model: "Open local model servers — the models Manvi and agents can use",
+  activity: "Open policy activity — Manvi verdicts, grants and the agent journal",
+  cleanup: "Open branch and tag cleanup — merged branches and tags safe to delete",
+};
 const dispatch = (event: string) => { window.dispatchEvent(new CustomEvent(event)); };
 
 export function repoUnavailable(state: RepoState): string | undefined {
@@ -24,7 +37,7 @@ export function repoUnavailable(state: RepoState): string | undefined {
 export function worktreeUnavailable(state: RepoState): string | undefined {
   return repoUnavailable(state) ?? (state.isBare ? "This bare repository has no working tree." :
     state.operation.probeFailed ? "Operation status is unavailable. Refresh the repository first." :
-    state.operation.operation ? "Finish the current Git operation in Work → Resolve first." :
+    state.operation.operation ? `Finish the current Git operation in ${describeDestination("work", "overview")} first.` :
     state.statuses.some(file => file.is_conflicted) ? "Resolve conflicted files first." : undefined);
 }
 
@@ -53,6 +66,8 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       throw Error(current.error || "The repository could not be opened.");
     }
   };
+  // Read once per build, like `state`: the palette is rebuilt when it opens.
+  const harness = get(harnessStore);
   const views: PaletteItem[] = Object.values(VIEW_REGISTRY).flatMap(view => [
     { id: view.id, label: view.paletteCommand ?? `Open ${view.label}`, description: view.summary, category: "Views", icon: icons[view.id], disabledReason: unavailable, action: () => {
       interfaceStore.setGlobalSurface("repository");
@@ -79,7 +94,55 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         repoStore.setActiveTab("history", "graph");
         repoStore.setHistoryList("moves");
       },
+    }, {
+      // Suspects folded the same way, as Graph's third list. The id is the
+      // one the registry derived for it as a section, so a remembered command
+      // still finds it. The list is set after the section: naming Graph
+      // resets it to the commit graph.
+      id: "history:suspects", label: "Find regression suspects — which commit broke this symbol",
+      description: "History → Graph → Suspects · Which commit since a known-good ref could have caused a symptom. Ranked by what the call graph reaches, not by how recent they are; the window ends at the indexed commit, not at HEAD.",
+      keywords: "History Graph suspects regression bisect blame symptom broke", category: "Views", icon: icons.history, disabledReason: unavailable,
+      action: () => openSuspectsFor(),
+    }, {
+      // Explorer's way in: the open file is the symptom. The file node is the
+      // one graph node that answers for a whole file.
+      id: "history:suspects-file", label: "Find suspects for the open file — which commit broke it",
+      description: state.selectedFilePath
+        ? `History → Graph → Suspects · Rank the commits since the last known good by what the call graph reaches from ${state.selectedFilePath}.`
+        : "History → Graph → Suspects · Open a file in Explorer first; its path becomes the symptom.",
+      keywords: "History Graph suspects regression file symptom broke explorer", category: "Views", icon: icons.history,
+      disabledReason: unavailable ?? (state.selectedFilePath ? undefined : "Open a file in Explorer first"),
+      action: () => openSuspectsFor(state.selectedFilePath),
     }] : []),
+    // Resolve and Policy were sections of Work, and the palette was one of
+    // their doors. Their content moved to the surfaces that own its subject,
+    // so the registry derives no command for them; these keep a reader who
+    // types "resolve", "conflicts", "policy" or "cleanup" landing on the card
+    // that answers it rather than on nothing.
+    ...(view.id === "work" ? [
+      {
+        id: "work:conflicts", label: "Resolve conflicts — finish a parked merge or rebase",
+        description: "Work → Overview · The conflict editor leads Overview while a merge, rebase or cherry-pick is parked.",
+        keywords: "Work Overview Resolve conflicts merge rebase cherry-pick parked continue abort markers", category: "Views", icon: icons.work,
+        disabledReason: unavailable ?? (state.operation.operation || state.operation.probeFailed || state.statuses.some(file => file.is_conflicted) ? undefined : "No merge, rebase or cherry-pick is waiting on you."),
+        action: () => {
+          interfaceStore.setGlobalSurface("repository");
+          openConflicts();
+        },
+      },
+      ...MANVI_FOCUS_LIST.map(target => ({
+        id: `manvi:${target.id}`, label: MANVI_PALETTE_LABELS[target.id],
+        description: `${target.destination.label} → ${target.label}`,
+        keywords: `Manvi Policy ${target.destination.label.replace("→", "")} ${target.label}`, category: "Views", icon: icons.work,
+        disabledReason: target.destination.kind === "settings" ? undefined
+          : unavailable ?? (target.id === "activity" && !policyActivityVisible(harness.harness, harness.actions.length, harness.error)
+            ? "Manvi is not installed and nothing has been recorded." : undefined),
+        action: () => {
+          if (target.destination.kind === "view") interfaceStore.setGlobalSurface("repository");
+          openManviFocus(target.id);
+        },
+      })),
+    ] : []),
   ]);
   // Search and Blame were sections of Code; they are toggles inside Explorer
   // now (`files/explorerLens.ts`), so the registry no longer generates their

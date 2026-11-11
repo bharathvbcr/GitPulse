@@ -96,6 +96,10 @@
         cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
         cmd_worktree_task: () => null,
         cmd_github_context: () => new Promise((resolve) => { releaseContext = () => resolve(githubContext); }),
+        // Remote's issue actions register the repository with the workbench and
+        // read its task list once per repository, to mark issues already on the board.
+        cmd_workbench_register_repository: (a) => JSON.stringify({ ok: true, repository: { id: "repo-1", revision: 1, updated_at: 1, name: a.repoPath.split("/").pop(), identity_key: a.repoPath, remote_url: null } }),
+        cmd_workbench_request: () => JSON.stringify({ ok: true, items: [], total: 0, shown: 0, has_more: false, next_cursor: null }),
         cmd_github_workflows: () => ({ available: false, cli_present: true, workflows: [], truncated: false, error: null }),
         cmd_get_reflog: () => [],
         cmd_get_head_id: () => "c".repeat(40),
@@ -282,7 +286,7 @@
         await show(GitHubPanel);
         await until(() => typeof releaseContext === "function");
         check("GitHubPanel: the context call is in flight", () => typeof releaseContext === "function");
-        const ghCalls = (await callsDuring(churn)).filter((cmd) => cmd.startsWith("cmd_github_"));
+        const ghCalls = (await callsDuring(churn)).filter((cmd) => cmd.startsWith("cmd_github_") || cmd.startsWith("cmd_workbench_"));
         releaseContext?.();
         await until(() => !app.querySelector(".animate-spin"));
         check(`GitHubPanel: one context call across unrelated publishes (saw ${count("cmd_github_context") - before})`, () => count("cmd_github_context") - before === 1);

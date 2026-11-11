@@ -1,6 +1,7 @@
 <script lang="ts">
   import { AlertCircle } from "@lucide/svelte";
   import { formatRelativeTime, withoutTrailingPeriod } from "../../format";
+  import { describeFailure } from "../../ui/copy/describeFailure";
 
   let {
     error,
@@ -19,16 +20,16 @@
     const relative = measuredAt ? formatRelativeTime(Math.floor(measuredAt / 1000)) : "";
     return relative === "just now" ? "moments ago" : relative;
   });
+
+  // The headline comes from the action alone; the backend text is the reason.
+  const headline = describeFailure({ verb: "refresh", object: "the scan" }, "").headline;
 </script>
 
 <!-- A refresh that failed after an earlier success leaves the old figures on
      screen. Without this line they read as current. -->
-<div
-  role="status"
-  class="px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-500 flex items-start gap-2"
->
-  <AlertCircle size={14} class="shrink-0 mt-px" />
+<div class="gp-notice" data-tone="warn" role="status">
+  <AlertCircle size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
   <span class="min-w-0 wrap-break-word"
-    >Last refresh failed: {withoutTrailingPeriod(error)}. Showing the previous scan{age ? ` from ${age}` : ""}.</span
+    >{headline} {withoutTrailingPeriod(error)}. Showing the previous scan{age ? ` from ${age}` : ""}.</span
   >
 </div>

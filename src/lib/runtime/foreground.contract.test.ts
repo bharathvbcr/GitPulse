@@ -14,7 +14,7 @@ const GATES = [
   "components/TaskArchive.svelte",
   "components/HygienePanel.svelte",
   "components/TaskBoard.svelte",
-  "components/ManviOpsPanel.svelte",
+  "components/IssueTaskActions.svelte",
 ] as const;
 
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -57,7 +57,9 @@ describe("background work shares one foreground rule", () => {
     expect(board).toContain("bindForegroundChanges");
     expect(board).not.toContain('window.addEventListener("focus", scheduleRefresh)');
 
-    const ops = read("components/ManviOpsPanel.svelte");
+    // Issue import marks issues already on the board; the task list it reads
+    // moved with the import actions from Policy into Remote's Open issues.
+    const ops = read("components/IssueTaskActions.svelte");
     const tasks = ops.slice(ops.indexOf("const repoTaskLoader = createLiveLoader("), ops.indexOf("async function loadRepoTasks"));
     expect(tasks).toMatch(/canRun: \(\) => !readBackgroundDocument\(\)/);
     expect(tasks).toMatch(/function scheduleRefreshRepoTasks\(\) \{ repoTaskLoader\.schedule\(\); \}/);

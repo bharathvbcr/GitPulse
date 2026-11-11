@@ -75,15 +75,15 @@
 
   const trendTone = $derived(
     pulse.trend.direction === "up" || pulse.trend.direction === "new"
-      ? "text-emerald-600 dark:text-emerald-400"
+      ? "text-ok"
       : pulse.trend.direction === "down"
-        ? "text-amber-600 dark:text-amber-400"
+        ? "text-warn"
         : "text-textMuted",
   );
 </script>
 
 <section
-  class="shrink-0 border-b border-border gp-section-edge px-4 py-2.5"
+  class="shrink-0 px-4 py-2.5"
   aria-label="Fleet Pulse"
   data-testid="fleet-pulse"
 >
@@ -97,20 +97,20 @@
     >
       {#if open}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
       <Activity size={12} class="text-accent" />
-      <span class="text-[11px] font-semibold tracking-wide">Fleet Pulse</span>
+      <span class="text-meta font-semibold">Fleet Pulse</span>
     </button>
 
     {#if pulse.counted > 0}
       <!-- A capped walk read the newest commits and stopped, so every number
            here is a floor. Same mark, same meaning, as the grid's cells: the
            `.gp-floor` underline spans the reading it qualifies. -->
-      <span class="text-[10px] text-textMuted tabular-nums {pulse.partial ? 'gp-floor' : ''}">
+      <span class="text-micro text-textMuted tabular-nums {pulse.partial ? 'gp-floor' : ''}">
         {pulse.commits.toLocaleString()}
         {pulse.commits === 1 ? "commit" : "commits"} · last {pulse.windowDays}d
       </span>
       {#if pulse.partial}
         <span
-          class="text-amber-600 dark:text-amber-400 text-[10px] font-semibold"
+          class="text-warn text-micro font-semibold"
           title="At least one repository's history was capped, so these counts are floors."
           data-testid="fleet-pulse-partial">≥</span
         >
@@ -123,7 +123,7 @@
          the span it was taken over, so the span is a control rather than a
          caption, and changing it re-reads rather than relabels. -->
     <div
-      class="flex items-center gap-0.5 shrink-0"
+      class="gp-segmented shrink-0"
       role="group"
       aria-label="Commit window"
       data-testid="fleet-window"
@@ -131,10 +131,8 @@
       {#each COMMIT_WINDOWS as days (days)}
         <button
           type="button"
-          class="px-1.5 py-0.5 rounded text-[10px] tabular-nums transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50 {days ===
-          windowDays
-            ? 'bg-accent/15 text-accent font-semibold'
-            : 'text-textMuted hover:text-textPrimary hover:bg-surfaceHover'}"
+          class="gp-seg-btn tabular-nums disabled:opacity-50"
+          data-active={days === windowDays ? "true" : "false"}
           aria-pressed={days === windowDays}
           disabled={loading}
           onclick={() => onWindow?.(days)}
@@ -146,7 +144,7 @@
     </div>
 
     {#if coverage}
-      <span class="text-[10px] text-amber-600 dark:text-amber-400 truncate" title={coverage}>
+      <span class="text-micro text-warn truncate" title={coverage}>
         {coverage}
       </span>
     {/if}
@@ -154,7 +152,7 @@
 
   {#if open}
     {#if pulse.counted === 0}
-      <p class="mt-2 text-[11px] text-textMuted" data-testid="fleet-pulse-empty">
+      <p class="mt-2 text-meta text-textMuted" data-testid="fleet-pulse-empty">
         <!-- Never a flat chart here. A baseline drawn over nothing is
              indistinguishable from a workspace that is genuinely quiet. -->
         {coverage || "No commit history has been read yet."}
@@ -164,8 +162,8 @@
         <!-- The chart, and the one sentence that qualifies it. -->
         <div class="gp-card rounded-lg px-3 py-2 flex flex-col gap-1.5 min-w-0">
           <div class="flex items-baseline gap-2 flex-wrap">
-            <span class="text-[10px] uppercase tracking-wider text-textMuted">Commit activity</span>
-            <span class="inline-flex items-center gap-1 text-[10px] {trendTone}">
+            <span class="gp-label">Commit activity</span>
+            <span class="inline-flex items-center gap-1 text-micro {trendTone}">
               {#if pulse.trend.direction === "down"}
                 <TrendingDown size={10} />
               {:else if pulse.trend.direction !== "flat"}
@@ -183,7 +181,7 @@
             barWidth={3}
             label="Fleet commits"
           />
-          <div class="flex items-center gap-3 text-[10px] text-textMuted tabular-nums flex-wrap">
+          <div class="flex items-center gap-3 text-micro text-textMuted tabular-nums flex-wrap">
             <span>{pulse.activeDays} of {pulse.windowDays} days active</span>
             <span class="inline-flex items-center gap-1" title="Authors summed per repository — someone working in three repositories counts three times, because the sweep reports counts, never identities.">
               <Users size={10} />{pulse.authorSlots} author {pulse.authorSlots === 1 ? "slot" : "slots"}
@@ -194,18 +192,18 @@
 
         <!-- Who is moving, and who has stopped. -->
         <div class="gp-card rounded-lg px-3 py-2 flex flex-col gap-1.5 min-w-0">
-          <span class="text-[10px] uppercase tracking-wider text-textMuted">Movers</span>
+          <span class="gp-label">Movers</span>
           {#if pulse.busiest.length > 0}
             <ul class="flex flex-col gap-0.5">
               {#each pulse.busiest as repo (repo.path)}
                 <li>
                   <button
                     type="button"
-                    class="w-full flex items-center gap-1.5 text-[11px] text-left rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
+                    class="gp-row w-full gap-1.5 text-meta text-left"
                     onclick={() => onSelect?.(repo.path)}
                     title="{repo.path} — {repo.commits} commits in the window"
                   >
-                    <Flame size={10} class="text-amber-500 shrink-0" />
+                    <Flame size={10} class="text-warn shrink-0" />
                     <span class="truncate flex-1 text-textPrimary">{repo.label}</span>
                     <span class="tabular-nums text-textMuted shrink-0">{repo.recent}/{TREND_DAYS}d</span>
                   </button>
@@ -213,15 +211,16 @@
               {/each}
             </ul>
           {:else}
-            <p class="text-[11px] text-textMuted">Nothing committed in the window.</p>
+            <p class="text-meta text-textMuted">Nothing committed in the window.</p>
           {/if}
 
           {#if pulse.dormant.length > 0}
             <!-- The reason anyone reads this list is to decide whether a
                  project is finished, parked, or forgotten — so the decision is
                  offered here rather than requiring a hunt down the grid. -->
-            <div class="pt-1 border-t border-border/50 mt-0.5 flex flex-col gap-0.5">
-              <span class="inline-flex items-center gap-1 text-[10px] text-textMuted">
+            <span class="gp-separator" aria-hidden="true"></span>
+            <div class="flex flex-col gap-0.5">
+              <span class="inline-flex items-center gap-1 text-micro text-textMuted">
                 <Moon size={10} class="shrink-0" />
                 Quiet for {pulse.windowDays}d
               </span>
@@ -230,14 +229,16 @@
                   <li class="flex items-center gap-1">
                     <button
                       type="button"
-                      class="flex-1 min-w-0 text-left text-[11px] truncate text-textPrimary rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
+                      class="gp-row flex-1 min-w-0 text-left text-meta truncate text-textPrimary"
                       onclick={() => onSelect?.(repo.path)}
                       title="{repo.path} — no commits in the window. Click to find its row."
                       >{repo.label}</button
                     >
                     <button
                       type="button"
-                      class="p-0.5 rounded text-textMuted/60 hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
+                      class="gp-icon-btn"
+                      data-size="sm"
+                      data-tone="danger"
                       title="Remove {repo.label} from Fleet (closes the repository)"
                       aria-label="Remove {repo.label} from Fleet"
                       data-testid="fleet-dormant-remove"
@@ -257,29 +258,29 @@
       {#if languageStats.length > 0}
         <div class="mt-2 gp-card rounded-lg px-3 py-2 flex flex-col gap-1.5">
           <div class="flex items-baseline gap-2 flex-wrap">
-            <span class="text-[10px] uppercase tracking-wider text-textMuted">Fleet languages</span>
+            <span class="gp-label">Fleet languages</span>
             <span
-              class="text-[10px] text-textMuted tabular-nums {languages.partial ? 'gp-floor' : ''}"
+              class="text-micro text-textMuted tabular-nums {languages.partial ? 'gp-floor' : ''}"
             >
               {languages.totalLines.toLocaleString()} lines across {languages.counted} of {languages.eligible}
             </span>
             {#if languages.partial}
               <span
-                class="text-amber-600 dark:text-amber-400 text-[10px] font-semibold"
+                class="text-warn text-micro font-semibold"
                 title="At least one language scan stopped at a budget, so this mix is drawn from floors."
                 data-testid="fleet-languages-partial">≥</span
               >
             {/if}
             {#if languages.withoutBreakdown > 0}
               <span
-                class="text-[10px] text-textMuted"
+                class="text-micro text-textMuted"
                 title="These repositories have a line count on file but no language breakdown — rescan them to include their mix here."
                 >{languages.withoutBreakdown} without a breakdown</span
               >
             {/if}
           </div>
           <FleetLanguageBar stats={languageStats} height={8} label="Fleet language mix" />
-          <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">
+          <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-micro">
             {#each languageStats as stat (stat.language)}
               <span class="inline-flex items-center gap-1">
                 <span
@@ -293,8 +294,8 @@
           </div>
         </div>
       {:else if languages.eligible > 0}
-        <p class="mt-2 text-[10px] text-textMuted" data-testid="fleet-languages-empty">
-          No language breakdown recorded yet — run the Lines of code scan to fill it in.
+        <p class="mt-2 text-micro text-textMuted" data-testid="fleet-languages-empty">
+          No language breakdown recorded yet. Run the Lines of code scan to fill it in.
         </p>
       {/if}
     {/if}

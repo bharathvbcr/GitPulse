@@ -6,6 +6,7 @@ import { render } from "svelte/server";
 import WorkView from "./WorkView.svelte";
 import { stripMarkupComments } from "../dom/markupText";
 import { ALL_STATUSES } from "../work/projection";
+import { functionBody } from "../stores/sourceScan";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "WorkView.svelte"),
@@ -158,11 +159,24 @@ describe("WorkView", () => {
 
   it("opens the stuck worktree, not the first one on the row", () => {
     expect(source).toContain("openPathFor(row)");
-    // A parked operation still goes to Resolve — a section of Work now, so
-    // it switches section without leaving the view the row was clicked in.
-    // Anything else lands on the working-tree diff, a section of History.
-    expect(source).toContain('repoStore.setActiveTab("work", "resolve")');
+    // A parked operation goes to Overview, which leads with the conflict editor
+    // while one is parked — the same section, so it never leaves the view the
+    // row was clicked in. Anything else lands on the working-tree diff, a
+    // section of History.
+    expect(source).toContain("showConflicts();\n          else reviewChanges();");
     expect(source).toContain('repoStore.setActiveTab("history", "graph")');
+  });
+
+  it("sends every Resolve control to Overview, and scrolls the editor into view when already there", () => {
+    // Policy retired; a button that switched to a section that no longer
+    // exists would do nothing, and one that only switched would do nothing
+    // from Overview itself, where the reader may be scrolled among the rows.
+    expect(source).not.toContain('"policy"');
+    const body = functionBody(source, "showConflicts");
+    // The one door navigates and leaves a request the Overview pane takes,
+    // which scrolls to the editor whether or not the switch remounted it.
+    expect(body).toContain("openConflicts();");
+    expect(source.match(/onclick=\{showConflicts\}/g)).toHaveLength(3);
   });
 
   it("refreshes when repository status generation changes", () => {
@@ -196,5 +210,127 @@ describe("WorkView", () => {
   it("marks the current worktree and shows each worktree's path", () => {
     expect(source).toContain("Current worktree");
     expect(source).toContain("{row.worktrees[0].worktree.path}");
+  });
+
+  it("keeps the disclosures in order, collapsed, and nothing new above the rows", () => {
+    const order = [
+      "Remotes, submodules and stash",
+      "Branch chains and stacked diffs",
+      "<BranchTagCleanup bind:open={showCleanup} />",
+      "<PolicyActivity bind:open={showActivity} />",
+    ].map((marker) => source.indexOf(marker));
+    expect(order.every((index) => index > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // All four sit after the rows.
+    expect(order[0]).toBeGreaterThan(source.indexOf("{#each renderedRows as row"));
+    // None starts open: only the reader or a deep link expands one.
+    for (const name of ["showRepoDetail", "showStackDetail", "showCleanup", "showActivity"]) {
+      expect(source).toContain(`let ${name} = $state(false);`);
+    }
+  });
+
+  it("draws no cleanup disclosure with no repository open", () => {
+    const { body } = render(WorkView);
+    // No repository: the disclosures are about a repository, so none is drawn.
+    expect(body).not.toContain("Branch and tag cleanup");
+  });
+});
+
+describe("WorkView deep links", () => {
+  it("says why nothing opened when the card is not offered, instead of a dead click", () => {
+    // Policy activity is hidden while Manvi is absent and nothing is recorded.
+    // The request is already taken, so it cannot fire later; the reader is
+    // told rather than left at the top of Overview wondering.
+    const body = functionBody(source, "revealFocus");
+    const missing = body.slice(body.indexOf("if (!section) {"));
+    expect(missing).toContain("toastStore.info(");
+    expect(missing.indexOf("toastStore.info(")).toBeLessThan(missing.indexOf("return;"));
+  });
+
+  it("takes only the requests whose card lives on a view, on mount and on every change", () => {
+    expect(source).toContain('takeManviFocusFor("view")');
+    expect(source).toContain("$manviFocusRequest");
+    expect(source).not.toContain("takeManviFocus()");
+  });
+
+  it("expands the disclosure before looking for the anchor", () => {
+    const reveal = source.slice(source.indexOf("async function revealFocus"));
+    expect(reveal.indexOf("showCleanup = true")).toBeLessThan(
+      reveal.indexOf("document.getElementById(manviSectionId(id))"),
+    );
+    expect(reveal.indexOf("showActivity = true")).toBeLessThan(
+      reveal.indexOf("document.getElementById(manviSectionId(id))"),
+    );
+    expect(reveal).toContain("await tick();");
+  });
+
+  it("lands instantly and moves focus with the scroll", () => {
+    // Smooth scrolling never advances in a webview that is not compositing,
+    // which turns the whole deep link into a no-op; every other
+    // scroll-into-view in the app is instant too.
+    expect(source).not.toContain('behavior: "smooth"');
+    expect(source).toContain('section.scrollIntoView({ block: "start" });');
+    expect(source).toContain("section.focus({ preventScroll: true });");
+  });
+
+  it("re-aligns over the page's settle, and yields to a scroll gesture", () => {
+    // Cards above the target grow as their data arrives; without the second
+    // pass the reader lands just under the heading they asked for.
+    expect(source).toContain("const REALIGN_DELAYS_MS = [0, 250];");
+    expect(source).toContain("window.addEventListener(event, clearRealign, { once: true, passive: true });");
+  });
+
+  it("flashes the landing cue for 1.6 s, then drops it with its timers and listeners on teardown", () => {
+    expect(source).toContain('section.classList.add("gp-focus-flash");');
+    expect(source).toContain("window.setTimeout(() => clearFlash(), 1600)");
+    expect(source).toContain('flashed?.classList.remove("gp-focus-flash");');
+    const teardown = source.slice(source.indexOf("return () => {\n      clearFlash();"));
+    expect(teardown).toContain("clearRealign();");
+    expect(teardown).toContain("window.removeEventListener(event, clearRealign);");
+  });
+
+  it("offers the policy journal unless Manvi is known to be absent", () => {
+    expect(source).toContain("policyActivityVisible(");
+    expect(source).toContain("{#if showPolicyActivity}");
+  });
+
+  it("sits flush with the section pane above the heading and below the last block", () => {
+    // Block-axis padding on the scroller is a band of the pane's background
+    // between the section tabs and the heading, and again under the last
+    // block. Inline padding stays so the bands still inset from the sides.
+    const ruleStart = source.indexOf(".work-overview {");
+    const rule = source.slice(ruleStart, source.indexOf("}", ruleStart));
+    expect(rule).toContain("padding-block: 0");
+    expect(rule).not.toMatch(/(^|\n)\s*padding\s*:/);
+    const markupStart = source.indexOf('class="work-overview');
+    const markup = source.slice(markupStart, source.indexOf(">", markupStart));
+    expect(markup).not.toMatch(/\b(?:p|py|pt|pb)-\d/);
+  });
+});
+
+describe("WorkView's lazily loaded disclosures", () => {
+  const source = readFileSync(new URL("./WorkView.svelte", import.meta.url), "utf8");
+
+  it("waits for the requested disclosure's chunk before looking for its section", () => {
+    // Branch and tag cleanup and Policy activity load as chunks of their own.
+    // A deep link that looked one tick later found nothing while the chunk was
+    // still in flight, and told the user the card had nothing to show.
+    const reveal = source.slice(source.indexOf("async function revealFocus"));
+    const awaitCleanup = reveal.indexOf("await loadBranchTagCleanup()");
+    const awaitActivity = reveal.indexOf("await loadPolicyActivity()");
+    const lookup = reveal.indexOf("document.getElementById(manviSectionId(id))");
+    expect(awaitCleanup).toBeGreaterThan(-1);
+    expect(awaitActivity).toBeGreaterThan(-1);
+    expect(awaitCleanup).toBeLessThan(lookup);
+    expect(awaitActivity).toBeLessThan(lookup);
+  });
+
+  it("can retry a chunk that failed to load instead of replaying the rejection", () => {
+    expect(source).toContain("cleanupModule = null;");
+    expect(source).toContain("activityModule = null;");
+    expect(source).toContain("onclick={() => cleanupAttempt++}>Retry</button>");
+    expect(source).toContain("onclick={() => activityAttempt++}>Retry</button>");
+    expect(source).toContain("{#key cleanupAttempt}");
+    expect(source).toContain("{#key activityAttempt}");
   });
 });

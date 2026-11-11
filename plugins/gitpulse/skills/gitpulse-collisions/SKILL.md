@@ -27,4 +27,4 @@ The overlap list needs two dirty worktrees, so from a clean worktree it is empty
 
 If `sessions_ok` is false, some agent kind could not be observed (the process table could not be read, a session's directory was unreadable, or — on a platform with no process scan — Codex, which keeps no registry of running sessions) or the hook claims that attribute a session to its worktree could not be read in full (`sessions_error` names which, under `attribution:`), so an empty `shared_worktrees` is not proof you are alone in your checkout. Each kind in `agents.live.kinds` says whether it was observed; one with `ok: false` is unknown, not zero.
 
-A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, or `operation` on change context) is blocked on a person. Do not push more edits into that worktree until it is continued or aborted in GitPulse's Resolve view.
+A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, or `operation` on change context) is blocked on a person. Do not push more edits into that worktree until it is continued or aborted in GitPulse (Work → Overview leads with the conflict editor while one is parked).

@@ -34,7 +34,7 @@
     memguardLine,
     sensorStateLabel,
   } from "../../health/hostLoad";
-  import { explainError } from "../../workbench/client";
+  import { describeFailure, type FailureAction, type FailureCopy } from "../../ui/copy/describeFailure";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
 
   const REFRESH_MS = 4_000;
@@ -46,7 +46,7 @@
     { label: "Memory" },
   ]);
   const TREE_COLUMNS = Object.freeze([
-    { label: "Launch" },
+    { label: "Run" },
     { label: "Processes" },
     { label: "Memory" },
     { label: "Disk writes" },
@@ -58,14 +58,20 @@
   ]);
   const ORPHAN_COLUMNS = Object.freeze([
     { label: "Process" },
-    { label: "Checkout" },
+    { label: "Worktree" },
     { label: "Running" },
     { label: "CPU" },
     { label: "Memory" },
     { label: "Action", hideLabel: true, width: "w-32" },
   ]);
 
-  let error = $state("");
+  /** A failed action as one sentence for an outcome line: headline, then reason. */
+  function failureText(action: FailureAction, cause: unknown): string {
+    const failure = describeFailure(action, cause);
+    return failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
+  }
+
+  let error = $state<FailureCopy | null>(null);
   let confirming = $state<number | null>(null);
   let terminating = $state(false);
   let outcome = $state("");
@@ -79,9 +85,9 @@
   async function refresh() {
     try {
       await refreshHostLoad();
-      error = "";
+      error = null;
     } catch (cause) {
-      error = explainError(cause);
+      error = describeFailure({ verb: "read", object: "host load" }, cause);
     }
   }
 
@@ -104,7 +110,7 @@
     try {
       admitOutcome = await admitAnyway();
     } catch (cause) {
-      admitOutcome = explainError(cause);
+      admitOutcome = failureText({ verb: "admit", object: "new runs" }, cause);
     } finally {
       admitting = false;
     }
@@ -120,7 +126,7 @@
     try {
       outcome = await terminateOrphan(orphan.pid, orphan.start_us);
     } catch (cause) {
-      outcome = explainError(cause);
+      outcome = failureText({ verb: "terminate", object: "that process" }, cause);
     } finally {
       terminating = false;
       confirming = null;
@@ -152,14 +158,19 @@
   }
 </script>
 
-<div class="space-y-3 text-[11px]" data-testid="host-load">
+<div class="space-y-3 text-meta" data-testid="host-load">
   {#if error}
-    <p class="text-amber-300">Host load could not be read: {error}</p>
+    <div role="alert" class="gp-notice" data-tone="warn">
+      <div class="min-w-0 flex-1">
+        <span class="font-medium">{error.headline}</span>
+        {#if error.detail}{error.detail}{/if}
+      </div>
+    </div>
   {/if}
   {#if !status}
     <p class="text-textMuted">Reading host load…</p>
   {:else}
-    <div class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card space-y-1">
+    <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-1">
       <p class="text-textPrimary font-medium" data-testid="host-load-sensor">
         Memory pressure {levelLabel(status.sensor.level)} · sensor {sensorStateLabel(status.sensor.state, status.sensor.age_ms)}
         {#if status.sensor.enabled === false}
@@ -167,7 +178,7 @@
         {/if}
       </p>
       {#if status.sensor.reason}
-        <p class="text-amber-300">{status.sensor.reason}</p>
+        <p class="text-warn">{status.sensor.reason}</p>
       {/if}
       <p class="text-textMuted">{PLATFORM_LABEL[status.platform]}</p>
       <p class="text-textMuted font-mono" data-testid="host-load-writer">{roleLine()}</p>
@@ -179,22 +190,23 @@
       </p>
     </div>
 
-    <div class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
+    <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
       <p class="text-textPrimary font-medium" data-testid="host-load-governor-shedding">{governorLine(status.governor)}</p>
-      <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-amber-300'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
+      <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-warn'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
       {#if status.governor.verdict.reason === "sensor_unavailable"}
-        <p class="text-amber-300">Launches are admitted and nothing extra is shed while the sensor cannot be read.</p>
+        <p class="text-warn">New runs are admitted and nothing extra is shed while the sensor cannot be read.</p>
       {/if}
       {#if !status.governor.verdict.admit && status.governor.override_remaining_s === null}
         <div class="flex items-center gap-2 pt-1">
           <button
             type="button"
-            class="rounded border border-border/70 px-2 py-0.5 text-textPrimary hover:bg-surfaceHover disabled:opacity-50"
+            class="gp-btn"
+            data-size="sm"
             disabled={admitting}
             onclick={() => void admit()}
             data-testid="host-load-admit-anyway"
           >Admit anyway</button>
-          <span class="text-textMuted">Asks in a system dialog; admits launches for two minutes.</span>
+          <span class="text-textMuted">Asks in a system dialog; admits new runs for two minutes.</span>
         </div>
       {/if}
       {#if admitOutcome}
@@ -212,29 +224,35 @@
         <div><dt class="text-textMuted">Free disk</dt><dd class="text-textPrimary">{describeReading(host.free_disk, bytes)}</dd></div>
         <div><dt class="text-textMuted">Thermal · power</dt><dd class="text-textPrimary">{describeReading(host.thermal, String)} · {describeReading(host.power, (p) => p === "ac" ? "on power" : "on battery")}</dd></div>
         <div><dt class="text-textMuted">Processes</dt><dd class="text-textPrimary">{describeReading(snap.processes, String)}{snap.unreadable_processes > 0 ? ` (${snap.unreadable_processes} unreadable)` : ""}</dd></div>
-        <div><dt class="text-textMuted">Launched by GitPulse</dt><dd class="text-textPrimary">{describeReading(snap.launched_footprint, bytes)} · writing {describeReading(snap.launched_write_rate, bytesPerSecond)}</dd></div>
+        <div><dt class="text-textMuted">Started by GitPulse</dt><dd class="text-textPrimary">{describeReading(snap.launched_footprint, bytes)} · writing {describeReading(snap.launched_write_rate, bytesPerSecond)}</dd></div>
         <div><dt class="text-textMuted">Other agent sessions</dt><dd class="text-textPrimary">{describeReading(snap.observed_footprint, bytes)}</dd></div>
-        <div><dt class="text-textMuted">Claude sessions</dt><dd class="text-textPrimary">{describeReading(snap.claude, (c) => `${c.launched} launched · ${c.observed} other`)}</dd></div>
-        <div><dt class="text-textMuted">Codex sessions</dt><dd class="text-textPrimary">{describeReading(snap.codex, (c) => `${c.launched} launched · ${c.observed} other`)}</dd></div>
+        <div><dt class="text-textMuted">Claude sessions</dt><dd class="text-textPrimary">{describeReading(snap.claude, (c) => `${c.launched} started here · ${c.observed} other`)}</dd></div>
+        <div><dt class="text-textMuted">Codex sessions</dt><dd class="text-textPrimary">{describeReading(snap.codex, (c) => `${c.launched} started here · ${c.observed} other`)}</dd></div>
       </dl>
     {/if}
 
     {#if procs}
       {#if !procs.ok}
-        <p class="text-amber-300">The process table could not be read{procs.error ? `: ${procs.error}` : ""}. Sessions and memory use below are unknown, not zero.</p>
+        <div role="status" class="gp-notice" data-tone="unknown">
+          <div class="min-w-0 flex-1">
+            <span class="font-medium">Couldn't read the process table.</span>
+            {#if procs.error}{procs.error}.{/if}
+            Sessions and memory use below are unknown, not zero.
+          </div>
+        </div>
       {/if}
 
-      <p class="{procs.memguard.warn ? 'text-amber-300' : 'text-textMuted'}" data-testid="host-load-memguard">
+      <p class="{procs.memguard.warn ? 'text-warn' : 'text-textMuted'}" data-testid="host-load-memguard">
         {memguardLine(procs.memguard)}
       </p>
       {#each procs.memguard.warnings as warning (warning)}
-        <p class="text-amber-300">{warning}</p>
+        <p class="text-warn">{warning}</p>
       {/each}
 
       {#if procs.sessions.length > 0}
         <HealthTable caption="Agent sessions running on this machine" columns={SESSION_COLUMNS}>
           {#each keyedList(procs.sessions, (s) => `${s.pid}:${s.start_us}`) as { item: session, key } (key)}
-            <tr class="border-t border-border/40">
+            <tr>
               <td class="px-3 py-1.5 text-textPrimary">{session.kind}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted">{session.pid}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{session.cwd ?? "unknown"}</td>
@@ -244,14 +262,14 @@
           {/each}
         </HealthTable>
         {#if procs.sessions_truncated}
-          <p class="text-amber-300">More sessions are running than one scan describes; the counts above are a floor.</p>
+          <p class="text-warn">More sessions are running than one scan describes; the counts above are a floor.</p>
         {/if}
       {/if}
 
       {#if procs.trees.length > 0}
-        <HealthTable caption="Process trees GitPulse launched" columns={TREE_COLUMNS}>
+        <HealthTable caption="Process trees GitPulse started" columns={TREE_COLUMNS}>
           {#each keyedList(procs.trees, (t) => t.tree) as { item: tree, key } (key)}
-            <tr class="border-t border-border/40">
+            <tr>
               <td class="px-3 py-1.5 font-mono text-textPrimary">{tree.run_id ? `task ${tree.run_id}` : (tree.session_id ?? tree.tree)}</td>
               <td class="px-3 py-1.5 text-textMuted">{tree.members}</td>
               <td class="px-3 py-1.5 text-textMuted">{describeReading(tree.footprint, bytes)}{tree.unreadable_members > 0 ? ` (+${tree.unreadable_members} unreadable)` : ""}</td>
@@ -264,7 +282,7 @@
       {#if procs.foreign_top.length > 0}
         <HealthTable caption="The heaviest processes GitPulse did not start" columns={FOREIGN_COLUMNS}>
           {#each keyedList(procs.foreign_top, (p) => String(p.pid)) as { item: proc, key } (key)}
-            <tr class="border-t border-border/40">
+            <tr>
               <td class="px-3 py-1.5 text-textPrimary">{proc.name}{proc.session ? ` (${proc.session} session)` : ""}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted">{proc.pid}</td>
               <td class="px-3 py-1.5 text-textMuted">{bytes(proc.footprint)}</td>
@@ -281,7 +299,7 @@
       {#if procs.orphans.length > 0}
         <HealthTable caption="Processes that look orphaned" columns={ORPHAN_COLUMNS}>
           {#each keyedList(procs.orphans, (o) => `${o.pid}:${o.start_us}`) as { item: orphan, key } (key)}
-            <tr class="border-t border-border/40">
+            <tr>
               <td class="px-3 py-1.5 text-textPrimary" title={orphan.exec ?? ""}>{orphan.name} <span class="font-mono text-textMuted">{orphan.pid}</span></td>
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{orphan.checkout}</td>
               <td class="px-3 py-1.5 text-textMuted">{formatAge(orphan.age_s * 1000)}</td>
@@ -290,7 +308,9 @@
               <td class="px-3 py-1.5">
                 <button
                   type="button"
-                  class="gp-btn py-0.5! px-2! text-[10px]! {confirming === orphan.pid ? 'text-rose-400' : ''}"
+                  class="gp-btn"
+                  data-size="sm"
+                  data-variant={confirming === orphan.pid ? "danger" : undefined}
                   disabled={terminating}
                   onclick={() => void terminate(orphan)}
                   data-testid="host-load-terminate"
@@ -302,7 +322,7 @@
           {/each}
         </HealthTable>
         <p class="text-textMuted">
-          Each has no parent left, works in a git checkout, belongs to no agent session or GitPulse launch, and has
+          Each has no parent left, works in a git worktree, belongs to no agent session or GitPulse run, and has
           kept a CPU busy for most of its life. GitPulse only lists them; Terminate asks you to confirm in a system
           dialog, then sends SIGTERM after checking again that it is still the same process.
         </p>
@@ -318,7 +338,7 @@
       CPU {(status.tick.cpu_ns / 1e9).toFixed(1)} s
     </p>
     {#each status.problems as problem (problem)}
-      <p class="text-amber-300">{problem}</p>
+      <p class="text-warn">{problem}</p>
     {/each}
   {/if}
 </div>

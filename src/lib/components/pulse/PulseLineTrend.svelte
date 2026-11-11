@@ -32,7 +32,7 @@
   );
 
   // The headline totals sum the same 26 weekly buckets the chart draws, so the
-  // numbers beside "(Past 26 Weeks)" are what the bars show. Summing every
+  // numbers beside "(past 26 weeks)" are what the bars show. Summing every
   // scanned commit here made them many times the chart on a long history.
   const totalAdditions = $derived(weeks.reduce((sum, w) => sum + w.additions, 0));
   const totalDeletions = $derived(weeks.reduce((sum, w) => sum + w.deletions, 0));
@@ -43,22 +43,22 @@
   const scannedDeletions = $derived(commits.reduce((sum, c) => sum + c.deletions, 0));
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
-  <div class="flex items-center justify-between border-b border-border/50 pb-2.5">
+<div class="gp-card p-4 flex flex-col gap-4">
+  <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       <TrendingUp size={15} class="text-accent shrink-0" />
-      <span class="text-xs font-semibold text-textPrimary uppercase tracking-wider">Line Changes & LOC History</span>
-      <span class="text-[11px] text-textMuted">(Past 26 Weeks)</span>
+      <span class="text-xs font-semibold text-textPrimary">Line changes and LOC history</span>
+      <span class="text-meta text-textMuted">(past 26 weeks)</span>
     </div>
 
     <!-- Aggregate Net Churn Badge -->
     <div class="flex flex-col items-end gap-0.5">
       <div class="flex items-center gap-3 text-xs font-mono">
-        <div class="flex items-center gap-1 text-emerald-500">
+        <div class="flex items-center gap-1 text-ok">
           <ArrowUp size={12} />
           <span>+{totalAdditions.toLocaleString()}</span>
         </div>
-        <div class="flex items-center gap-1 text-rose-500">
+        <div class="flex items-center gap-1 text-danger">
           <ArrowDown size={12} />
           <span>-{totalDeletions.toLocaleString()}</span>
         </div>
@@ -66,7 +66,7 @@
           Net {totalNet >= 0 ? `+${totalNet.toLocaleString()}` : totalNet.toLocaleString()}
         </div>
       </div>
-      <span class="text-[10px] text-textMuted font-mono">
+      <span class="text-micro text-textMuted font-mono">
         {scoped ? "Selected author's" : "All"} {commits.length.toLocaleString()} scanned commit{commits.length === 1 ? "" : "s"}: +{scannedAdditions.toLocaleString()} / −{scannedDeletions.toLocaleString()}
       </span>
     </div>
@@ -74,7 +74,7 @@
 
   <!-- Weekly Stacked Bar Chart -->
   <div class="flex flex-col gap-1.5">
-    <div class="h-32 flex items-end gap-1.5 pt-4 pb-2 border-b border-border/40 select-none">
+    <div class="h-32 flex items-end gap-1.5 pt-4 pb-2 select-none">
       {#each weeks as bucket (bucket.weekStart)}
         {@const addHeight = Math.min(100, Math.round((bucket.additions / maxWeeklyDelta) * 55))}
         {@const delHeight = Math.min(100, Math.round((bucket.deletions / maxWeeklyDelta) * 55))}
@@ -90,13 +90,13 @@
           <div class="w-full flex flex-col items-center">
             <!-- Additions (pointing up) -->
             <div
-              class="w-full max-w-[12px] bg-emerald-500/80 rounded-t-[2px] transition-all group-hover:bg-emerald-400"
+              class="w-full max-w-[12px] bg-ok/80 rounded-t-xs transition-colors group-hover:bg-ok"
               style="height: {addHeight}px;"
             ></div>
             <div class="w-full h-px bg-border my-0.5"></div>
             <!-- Deletions (pointing down) -->
             <div
-              class="w-full max-w-[12px] bg-rose-500/80 rounded-b-[2px] transition-all group-hover:bg-rose-400"
+              class="w-full max-w-[12px] bg-danger/80 rounded-b-xs transition-colors group-hover:bg-danger"
               style="height: {delHeight}px;"
             ></div>
           </div>
@@ -105,21 +105,21 @@
     </div>
 
     <!-- Weeks Axis Labels -->
-    <div class="flex justify-between text-[10px] text-textMuted px-1">
+    <div class="flex justify-between text-micro text-textMuted px-1">
       <span>{weeks[0]?.weekStart ?? ''}</span>
-      <span>Weekly Additions (green) & Deletions (red)</span>
+      <span>Weekly additions (green) and deletions (red)</span>
       <span>{weeks[weeks.length - 1]?.weekStart ?? ''}</span>
     </div>
   </div>
 
   <!-- Footer Hover Info -->
   <div class="gp-separator" aria-hidden="true"></div>
-  <div class="text-[11px] text-textMuted pt-1 flex items-center justify-between min-h-5">
+  <div class="text-meta text-textMuted pt-1 flex items-center justify-between min-h-5">
     {#if hoveredBucket}
       <div>
         <span class="font-medium text-textPrimary">Week of {hoveredBucket.weekStart}</span>:
-        <span class="text-emerald-500 font-mono ml-1.5">+{hoveredBucket.additions.toLocaleString()}</span>
-        <span class="text-rose-500 font-mono ml-1.5">-{hoveredBucket.deletions.toLocaleString()}</span>
+        <span class="text-ok font-mono ml-1.5">+{hoveredBucket.additions.toLocaleString()}</span>
+        <span class="text-danger font-mono ml-1.5">-{hoveredBucket.deletions.toLocaleString()}</span>
         <span class="text-textPrimary font-mono ml-2">
           (Net {hoveredBucket.net >= 0 ? `+${hoveredBucket.net.toLocaleString()}` : hoveredBucket.net.toLocaleString()})
         </span>
@@ -130,23 +130,23 @@
 
     {#if locStatus === "ok" || locStatus === "partial"}
       <div class="text-textPrimary text-xs flex items-center gap-1.5">
-        <span class="text-textMuted text-[11px]">{locStatus === "partial" ? "Partial LOC:" : "Current Total LOC:"}</span>
-        <span class="font-mono font-bold text-accent">{totalLoc.toLocaleString()}</span>
+        <span class="text-textMuted text-meta">{locStatus === "partial" ? "Partial LOC:" : "Current total LOC:"}</span>
+        <span class="font-mono font-semibold text-accent">{totalLoc.toLocaleString()}</span>
       </div>
     {:else if locStatus === "failed"}
-      <span class="text-[11px] text-rose-400">LOC scan failed</span>
+      <span class="text-meta text-danger">Couldn't count lines</span>
     {:else if locStatus === "loading"}
-      <span class="text-[11px] text-textMuted">Counting lines…</span>
+      <span class="text-meta text-textMuted">Counting lines…</span>
     {/if}
   </div>
 
   {#if locTrend.length > 1 && locMax > 0}
     <div class="flex flex-col gap-1">
-      <span class="text-[10px] text-textMuted uppercase tracking-wider">Reconstructed LOC (from today’s count, walking numstat backwards)</span>
+      <span class="gp-label">Reconstructed LOC (from today’s count, walking numstat backwards)</span>
       <div class="h-12 flex items-end gap-px">
         {#each locTrend as point (point.date)}
           <div
-            class="flex-1 bg-accent/70 rounded-t-[1px] min-w-px"
+            class="flex-1 bg-accent/70 rounded-t-xs min-w-px"
             style="height: {Math.max(2, Math.round((point.totalLoc / locMax) * 48))}px;"
             title="{point.date}: {point.totalLoc.toLocaleString()} LOC"
           ></div>

@@ -101,7 +101,7 @@
            moved. A first scan has no direction, and "+0" would be a claim
            about a past nobody observed. -->
       <span
-        class="text-[10px] tabular-nums {deltaTone(cell.delta, deltaGoal)}"
+        class="text-micro tabular-nums {deltaTone(cell.delta, deltaGoal)}"
         title={describeDelta(cell.delta, deltaUnit, label)}
         data-testid="fleet-cell-delta">{deltaText}</span
       >
@@ -120,7 +120,7 @@
       <!-- A floor rendered like a total is the "capped sample presented as
            complete coverage" failure; the marker is what stops it. -->
       <span
-        class="text-amber-600 dark:text-amber-400 text-[10px] font-semibold leading-none"
+        class="text-warn text-micro font-semibold leading-none"
         title={partialNote}
         aria-label="{label}: partial — {partialNote}"
         data-testid="fleet-cell-partial">≥</span
@@ -132,7 +132,7 @@
        has no measurement to preserve, and "scanning" is more informative than
        "not scanned" for a repository being scanned right now. -->
   <div
-    class="flex items-center gap-1.5 {alignClass} text-accent text-[11px]"
+    class="flex items-center gap-1.5 {alignClass} text-accent text-meta"
     title="{label} is being scanned for this repository now."
     data-testid="fleet-cell"
     data-state="scanning"
@@ -157,7 +157,7 @@
           onScan();
         }
       : undefined}
-    class="flex items-center gap-1 {alignClass} text-textMuted/70 text-[11px] italic w-full {onScan
+    class="flex items-center gap-1 {alignClass} text-faint text-meta italic w-full {onScan
       ? 'hover:text-accent hover:not-italic focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
       : ''}"
     title={onScan
@@ -179,16 +179,16 @@
           onScan();
         }
       : undefined}
-    class="flex items-center gap-1 {alignClass} text-rose-600 dark:text-rose-400 text-[11px] w-full {onScan
-      ? 'hover:text-rose-500 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
+    class="flex items-center gap-1 {alignClass} text-danger text-meta w-full {onScan
+      ? 'hover:underline focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
       : ''}"
     title={onScan
-      ? `${label} could not be read: ${cell.reason}. Click to try this repository again.`
-      : `${label} could not be read: ${cell.reason}`}
+      ? `Couldn't read ${label}: ${cell.reason}. Click to try this repository again.`
+      : `Couldn't read ${label}: ${cell.reason}`}
     data-testid="fleet-cell"
     data-state="failed"
   >
     <AlertTriangle size={11} class="shrink-0" />
-    <span class="truncate">could not read</span>
+    <span class="truncate">couldn't read</span>
   </svelte:element>
 {/if}

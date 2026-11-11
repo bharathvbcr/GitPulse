@@ -56,6 +56,8 @@ describe("matchSettings", () => {
     expect(matchSettings("indent").settings).toContain("tab-width");
     expect(matchSettings("animation").settings).toContain("motion");
     expect(matchSettings("dependabot").settings).toContain("auto-github-alerts");
+    // The title-bar label does not say "local model"; the keyword column does.
+    expect(matchSettings("local model").settings).toContain("harness-badges");
   });
 
   it("is case-insensitive", () => {

@@ -90,6 +90,8 @@
       /** Every blame request's arguments, so a step can be checked by what it asked for. */
       const blameCalls = [];
       let coverageCalls = 0;
+      /** Questions the toolbar's Suspects button asked. */
+      const suspectsCalls = [];
       /** A coverage read that fails, and a blame read that answers late. */
       let coverageRefused = false, blameDelayMs = 0;
 
@@ -110,6 +112,9 @@
           case "cmd_list_tags": return { tags: [], truncated: false };
           case "cmd_branch_stats": return {};
           case "cmd_repo_operation": case "cmd_workspace_sync": return null;
+          case "cmd_codeintel_suspects":
+            suspectsCalls.push(args);
+            return { response: { source_freshness: { fresh: true }, available: true, items: [], total: 0, shown: 0, truncated: false }, scope: { indexed_head: oid("7"), since: args.since, cone_size: 1, blamed_symbols: 1, refusals: [] } };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       });
@@ -479,6 +484,19 @@
               document.querySelector("[data-blame-path]").getBoundingClientRect().width >= 60);
           }
           buttonNamed("Toggle narrow layout").click(); await tick();
+
+          // --- Blame's way into Suspects ---------------------------------------
+          // The open file is the symptom: the button lands History › Graph on
+          // its Suspects list and asks there, against the default window.
+          const blamed = get(repoStore).selectedFilePath;
+          document.querySelector("[data-blame-suspects]").click();
+          await until(() => suspectsCalls.length > 0);
+          check("the Suspects button asks about the blamed file", () =>
+            suspectsCalls.at(-1).symptom === blamed && suspectsCalls.at(-1).since === "HEAD~20");
+          check("and lands on History › Graph › Suspects", () =>
+            get(repoStore).activeTab === "history" &&
+            get(repoStore).viewSections.history === "graph" &&
+            get(repoStore).historyList === "suspects");
 
           check("no unhandled runtime errors", () => errors.length === 0);
           report();

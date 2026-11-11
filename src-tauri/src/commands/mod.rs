@@ -9,6 +9,7 @@ use crate::diff::conflict_session::{
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
+use crate::engine::git_cli::read_cancel::ReadScope;
 use crate::engine::git_cli::{
     git_text, resolve_repo, sandbox_create, sandbox_overwrite_edited_text,
     sandbox_save_edited_text, validate_repo, FileWriteError, ResolvedRepo, SavedFile,
@@ -100,9 +101,36 @@ where
     F: FnOnce() -> Result<T, crate::ipc_error::CommandError> + Send + 'static,
     T: Send + 'static,
 {
-    let mut timing = crate::logging::performance::CommandTiming::queue(std::any::type_name::<F>());
-    // The command this body belongs to, for the deferral retry's allowlist.
-    let command = crate::ipc_error::command_name(std::any::type_name::<F>());
+    // The command this body belongs to, for the deferral retry's allowlist,
+    // read from the closure's type: it names the `cmd_*` function it is
+    // written in.
+    let label = std::any::type_name::<F>();
+    run_off_thread(label, crate::ipc_error::command_name(label), body).await
+}
+
+/// [`off_thread`] for a body written outside its `cmd_*` function, in a helper
+/// the command and its tests share. The closure's type names the helper, not
+/// the command, so the command is named here; without it a wrapped deferral of
+/// a replay-safe read is not retried and the timing label loses the command.
+/// Held by `every_off_thread_body_is_written_inside_its_command`.
+async fn off_thread_for<F, T>(command: &'static str, body: F) -> Result<T, IpcError>
+where
+    F: FnOnce() -> Result<T, crate::ipc_error::CommandError> + Send + 'static,
+    T: Send + 'static,
+{
+    run_off_thread(command, Some(command), body).await
+}
+
+async fn run_off_thread<F, T>(
+    label: &'static str,
+    command: Option<&'static str>,
+    body: F,
+) -> Result<T, IpcError>
+where
+    F: FnOnce() -> Result<T, crate::ipc_error::CommandError> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut timing = crate::logging::performance::CommandTiming::queue(label);
     // A test's governor injection is thread-local; carry it to the pool thread
     // so a test can drive the real command under pressure.
     #[cfg(test)]
@@ -170,6 +198,8 @@ where
 
 #[cfg(test)]
 mod assemble_tests;
+#[cfg(test)]
+mod graph_token_tests;
 #[cfg(all(test, unix))]
 mod parity_tests;
 #[cfg(test)]

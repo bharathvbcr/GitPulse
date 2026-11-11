@@ -1318,7 +1318,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean. When the GitPulse app is running its worktrees, changes, collisions and agent counts may come from the app's shared reads instead of a scan made at call time; such a document carries served_by {source: \"app\", age_ms}. age_ms is the age, when the answer was assembled, of the oldest read it stands on: the worktree listing, the status of this checkout (changes) and the status of each worktree. It is at most about 4 seconds (an older answer is not used). A collision reported absent may therefore have begun up to age_ms ago, and so may dirty files in a worktree shared by two sessions that was clean when last read; a collision between worktrees, and a shared worktree that was dirty, were read again for this call. No served_by means this call scanned for itself.",
             RepoArgs::properties(),
             &RepoArgs::required(),
             json!({
@@ -1330,7 +1330,15 @@ fn build_tools() -> Vec<Value> {
                     "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
                     "ledger": ledger_facet_output(),
-                    "codeintel": { "type": "object" }
+                    "codeintel": { "type": "object" },
+                    "served_by": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string", "enum": ["app"] },
+                            "age_ms": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["source", "age_ms"]
+                    }
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
             }),

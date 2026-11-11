@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { MessageSquare } from "@lucide/svelte";
   import { mergeLoadedPage } from "../workbench/pageMerge";
-  import { decisionWrite, decisionQuestions, structuredDecisionAnswer, explainError, listAgentDecisions, listPendingDecisions, saveAgentDecision, WorkbenchError, type AgentDecision, type DecisionQuestion, type DecisionWrite, type TaskRun } from "../workbench/client";
+  import { decisionWrite, decisionQuestions, structuredDecisionAnswer, listAgentDecisions, listPendingDecisions, saveAgentDecision, WorkbenchError, type AgentDecision, type DecisionQuestion, type DecisionWrite, type TaskRun } from "../workbench/client";
   let { run, refreshToken = 0, active = true }: { run: TaskRun; refreshToken?: number; active?: boolean } = $props();
   let rows = $state<AgentDecision[]>([]), total = $state(0), cursor = $state<string | null>(null);
   let loading = $state(false), busy = $state(false), error = $state("");
@@ -12,6 +16,11 @@
   // Set once a "Load more" page has landed, so a head refresh keeps that cursor.
   let pagedBeyond = false;
   let disposed = false;
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
   const labels = { pending: "Needs review", decided: "Decision saved · delivery pending", dispatching: "Delivery attempted · awaiting provider confirmation", resolved: "Provider confirmed resolution", cancelled: "Request cancelled" };
   async function refresh(more = false) {
     if (loading || busy || pending || disposed || !active) return;
@@ -39,7 +48,7 @@
       if (more) pagedBeyond = true;
       total = page.total; error = "";
       if (more || !pagedBeyond) cursor = page.next_cursor;
-    } catch (cause) { if (!disposed) error = explainError(cause); }
+    } catch (cause) { if (!disposed) error = failure("load", "agent requests", cause); }
     finally { if (!disposed) loading = false; }
   }
   $effect(() => { void refreshToken; if (active) untrack(() => { void refresh(); }); });
@@ -58,20 +67,21 @@
       rows = rows.map((row) => row.id === result.id ? result : row); pending = null;
     } catch (cause) {
       if (!disposed) {
-        error = explainError(cause);
+        error = failure("save", "the decision", cause);
         if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error", "protocol_error", "timeout"].includes(cause.code)) pending = null;
       }
     } finally { if (!disposed) busy = false; }
   }
 </script>
 
-<section class="agent-decisions" aria-label="Agent requests">
-  <div class="heading"><h4>Agent requests</h4><button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading || busy || !!pending}>Refresh requests</button></div>
+<section class="agent-decisions gp-card" aria-label="Agent requests">
+  <div class="heading"><h4>Agent requests</h4><button class="gp-btn" data-size="sm" type="button" onclick={() => refresh()} disabled={loading || busy || !!pending}>Refresh requests</button></div>
   <p>Decisions apply to the exact request below. Saving a decision does not prove that the provider received it or accept the task.</p>
   <p>{rows.length} shown / {total} requests</p>
-  {#if error}<p role="alert">{error}</p>{/if}
-  {#if pending}<p role="status">The save result is uncertain. Retry this exact decision before choosing another.</p><button class="gp-btn" type="button" onclick={() => { if (pending) void decide(pending.source, pending.input.decision); }} disabled={busy}>Retry saved decision</button>{/if}
-  {#if !rows.length}<p>{loading ? "Loading requests…" : "No structured requests recorded. Terminal handoffs continue to ask in the provider’s terminal."}</p>{/if}
+  {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
+  {#if pending}<div class="gp-notice" data-tone="unknown" role="status"><span class="min-w-0 flex-1">Couldn't confirm the save. Try again with this exact decision before choosing another.</span><button class="gp-btn shrink-0" data-size="sm" type="button" onclick={() => { if (pending) void decide(pending.source, pending.input.decision); }} disabled={busy}>Try again</button></div>{/if}
+  {#if !rows.length && loading}<Skeleton variant="text" count={3} />
+  {:else if !rows.length && !error}<EmptyState compact icon={MessageSquare} title="No agent requests" hint="Terminal handoffs ask in the provider’s terminal." />{/if}
   {#each rows as item (item.id)}
     <article>
       <strong>{item.kind === "permission" ? "Permission request" : "Question"} · {labels[item.state]}</strong>
@@ -107,5 +117,15 @@
 </section>
 
 <style>
-  .agent-decisions{margin:12px 0;padding:12px;border:1px solid rgb(var(--c-border));border-radius:8px}.heading{display:flex;align-items:center;justify-content:space-between;gap:8px}h4{margin:0}p{color:rgb(var(--c-text-muted));line-height:1.5;overflow-wrap:anywhere}article{border-top:1px solid rgb(var(--c-border));padding:12px 0}.payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--mac-fill-bg,rgb(var(--c-bg)));padding:10px;border-radius:6px;font-size:11px}button{font:inherit;padding:6px 9px;border:1px solid rgb(var(--c-border));border-radius:6px;margin:4px 6px 4px 0}button:disabled{opacity:.5}fieldset{padding:0;border:0}label{display:grid;gap:6px}textarea{font:inherit;width:100%;color:inherit;background:var(--mac-fill-bg,rgb(var(--c-bg)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:8px}summary{cursor:pointer}[role=alert]{color:#dc6565}
+  .agent-decisions{margin:12px 0;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  h4{margin:0}
+  p{margin:0;color:rgb(var(--c-text-muted));line-height:1.5;overflow-wrap:anywhere}
+  article{display:flex;flex-direction:column;gap:6px;padding:12px;border-radius:var(--gp-r-md);background:var(--mac-fill-bg,rgb(var(--c-bg)))}
+  .payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:0.6875rem}
+  fieldset{padding:0;border:0}
+  fieldset button{margin:4px 6px 4px 0}
+  label{display:grid;gap:6px}
+  textarea{font:inherit;width:100%}
+  summary{cursor:pointer}
 </style>

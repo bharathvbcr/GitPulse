@@ -32,6 +32,11 @@ mod thread_io;
 
 mod shared_budget;
 
+pub(crate) mod read_cancel;
+
+#[cfg(test)]
+mod read_cancel_tests;
+
 #[cfg(test)]
 mod awaiting_adversarial_tests;
 
@@ -1070,7 +1075,19 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, CommandError> {
 
 pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
     let bytes = git(repo, args)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
+}
+
+/// The text of captured output, decoded lossily: the one owner of that
+/// decode for buffers the caller owns. Valid UTF-8, which is nearly every
+/// git output, becomes the `String` over the SAME allocation; only a buffer
+/// with invalid bytes is copied, once, into its lossy form.
+/// `String::from_utf8_lossy(&bytes).into_owned()` copies a buffer it just
+/// proved valid, which for a 100k-row graph window or a large diff is one
+/// extra memcpy of up to the whole stream.
+pub(crate) fn text_from_bytes(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
 }
 
 /// Like [`git_text`], but an over-cap stream is data rather than an error:
@@ -1079,10 +1096,7 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
 /// scan would be worse than reading part of the listing.
 pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), CommandError> {
     let (bytes, incomplete) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
-    Ok((
-        String::from_utf8_lossy(&bytes).into_owned(),
-        incomplete.is_some(),
-    ))
+    Ok((text_from_bytes(bytes), incomplete.is_some()))
 }
 
 /// Runs `git` with an explicit stdout budget, returning the text plus whether
@@ -1098,7 +1112,7 @@ pub fn git_text_capped(
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+    Ok((text_from_bytes(bytes), incomplete))
 }
 
 /// [`git_text_capped`] without the UTF-8 decode: git's exact stdout bytes plus
@@ -1516,7 +1530,7 @@ pub fn git_text_with_timeout(
     timeout: Duration,
 ) -> Result<String, CommandError> {
     let bytes = git_with_timeout(repo, args, timeout)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
 }
 
 /// Runs network-bound git plumbing in `repo` under [`NETWORK_TIMEOUT`].
@@ -2720,6 +2734,21 @@ pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> CommandError {
     refusal_message_at(label, refusal, None)
 }
 
+/// What a spawn refused because its caller cancelled while it queued says
+/// after its label.
+const CANCELLED_BEFORE_SPAWN: &str = " cancelled before spawn";
+
+/// Whether `error` is a cancellation (a read whose callers have gone, or any
+/// spawn cancelled while it queued) and so no fault of the process: it is not
+/// counted as a process failure, which feeds health reporting.
+///
+/// Decided by the kind its producer gave it, never by its words: git's stderr
+/// becomes error text, and a line of it that matched a marker must not pass for
+/// a cancel. The kind survives a layer that wraps the message.
+fn is_cancellation(error: &CommandError) -> bool {
+    error.origin() == Some(crate::ipc_error::IpcErrorKind::ReadCancelled)
+}
+
 /// [`refusal_message`], naming the bucket that refused and its level when the
 /// gate knows them. The text before the level is unchanged, so every reader
 /// that matches on the deferral (see [`is_deferred_under_load`]) reads it as
@@ -2736,7 +2765,7 @@ pub(crate) fn refusal_message_at(
     let deferred =
         |text: String| CommandError::typed(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text);
     match refusal {
-        Refusal::Cancelled => format!("{label} cancelled before spawn").into(),
+        Refusal::Cancelled => format!("{label}{CANCELLED_BEFORE_SPAWN}").into(),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
@@ -3022,6 +3051,14 @@ pub(crate) enum OutputStream {
 pub(crate) trait ProcessObserver {
     fn cancelled(&self) -> bool {
         false
+    }
+    /// The error a spawn that was cancelled while it queued returns, when this
+    /// observer's cancel has a meaning of its own. `None` keeps the runner's
+    /// plain "cancelled before spawn", which is what every other observer
+    /// (secrets, hooks, tool install, devmap, the commit graph) gets and what
+    /// reaches the frontend unclassified.
+    fn cancellation(&self) -> Option<CommandError> {
+        None
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
     /// True when the observer keeps what it needs from stdout itself, so the
@@ -4660,6 +4697,15 @@ struct SharedReadKey {
 struct SharedRead {
     result: Mutex<Option<Result<BoundedRun, CommandError>>>,
     done: Condvar,
+    /// Every request waiting on this flight, the leader's first. A request
+    /// that named no id is `None` and waits for good, so a flight with one is
+    /// never cancelled; otherwise the flight is cancelled when every flag is
+    /// set (see [`abandon_if_all_gone`]). Pushed only while the table is held.
+    waiters: Mutex<Vec<Option<read_cancel::ReadCancel>>>,
+    /// Set, with the flight leaving the table, by the decision to cancel it.
+    /// A flight that is abandoned is never joined: a caller that arrives
+    /// later, however it found the flight, starts a read of its own.
+    abandoned: std::sync::atomic::AtomicBool,
     /// Where this flight's joiners go when its leader's deadline passed
     /// before theirs: the one flight that asks again for all of them, set by
     /// the first to arrive. It stays reachable from here after the gate has
@@ -4673,8 +4719,79 @@ impl SharedRead {
         Arc::new(Self {
             result: Mutex::new(None),
             done: Condvar::new(),
+            waiters: Mutex::new(Vec::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             retry: Mutex::new(None),
         })
+    }
+}
+
+/// How often a joiner looks at its own cancel flag while it waits for the
+/// leader's answer.
+const JOINER_CANCEL_POLL: Duration = Duration::from_millis(20);
+
+/// Cancels `flight` if every request waiting on it has been cancelled, and
+/// says whether it is (now or already) cancelled.
+///
+/// The decision and the flight's leaving the table are one step under the
+/// table lock, which is also what a joiner holds while it joins and registers
+/// itself: a joiner is either counted here, and the flight lives, or it comes
+/// after and finds no flight, and starts a read of its own. Nobody inherits a
+/// cancellation.
+fn abandon_if_all_gone(key: &SharedReadKey, flight: &Arc<SharedRead>) -> bool {
+    use std::sync::atomic::Ordering;
+    if flight.abandoned.load(Ordering::Acquire) {
+        return true;
+    }
+    let all_gone = |waiters: &[Option<read_cancel::ReadCancel>]| {
+        waiters.iter().all(|waiter| {
+            waiter
+                .as_ref()
+                .is_some_and(read_cancel::ReadCancel::is_cancelled)
+        })
+    };
+    // Without the table: nearly every poll of a flight someone still wants.
+    if !all_gone(
+        &flight
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ) {
+        return false;
+    }
+    let mut reads = shared_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let waiters = flight
+        .waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !all_gone(&waiters) {
+        return false;
+    }
+    flight.abandoned.store(true, Ordering::Release);
+    if reads
+        .get(key)
+        .is_some_and(|entry| Arc::ptr_eq(entry, flight))
+    {
+        reads.remove(key);
+    }
+    true
+}
+
+/// The leader's observer: the child stops when nobody waits for its answer.
+struct FlightObserver<'a> {
+    key: &'a SharedReadKey,
+    flight: &'a Arc<SharedRead>,
+}
+
+impl ProcessObserver for FlightObserver<'_> {
+    fn cancelled(&self) -> bool {
+        abandon_if_all_gone(self.key, self.flight)
+    }
+
+    fn cancellation(&self) -> Option<CommandError> {
+        Some(read_cancel::cancelled())
     }
 }
 
@@ -4702,6 +4819,8 @@ fn run_read_shared(
 ) -> Result<BoundedRun, CommandError> {
     let deadline = Instant::now() + timeout;
     let mut attempt = timeout;
+    // The request this thread is serving, if its caller can cancel it.
+    let cancel = read_cancel::current();
     // The flight whose leader timed out last, and the longest prefix any such
     // leader printed: a keeping caller's rerun may reach its deadline with
     // less than that.
@@ -4716,6 +4835,7 @@ fn run_read_shared(
             stdout_cap,
             gate,
             after.as_ref(),
+            cancel.as_ref(),
         ) {
             SharedAttempt::Done(result) => result,
             SharedAttempt::LeaderTimedOut { flight, printed } => {
@@ -4836,6 +4956,7 @@ fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, Comman
     Err(error)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_read_shared_once(
     cmd: &mut Command,
     label: &str,
@@ -4844,16 +4965,17 @@ fn run_read_shared_once(
     stdout_cap: usize,
     gate: &'static SpawnGate,
     after: Option<&Arc<SharedRead>>,
+    cancel: Option<&read_cancel::ReadCancel>,
 ) -> SharedAttempt {
     let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
+        // Never shared, so its one waiter is its own request.
+        let mut own = cancel.map(read_cancel::OwnCancel);
+        let observer: &mut dyn ProcessObserver = match own.as_mut() {
+            Some(observer) => observer,
+            None => &mut (),
+        };
         return SharedAttempt::Done(run_with_gate(
-            cmd,
-            label,
-            timeout,
-            None,
-            stdout_cap,
-            &mut (),
-            gate,
+            cmd, label, timeout, None, stdout_cap, observer, gate,
         ));
     };
     let key = SharedReadKey {
@@ -4877,10 +4999,14 @@ fn run_read_shared_once(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        // A flight that was cancelled is joined by no one, however it is found.
+        let live =
+            |flight: &Arc<SharedRead>| !flight.abandoned.load(std::sync::atomic::Ordering::Acquire);
         let known = retry
             .as_deref()
             .and_then(Clone::clone)
-            .or_else(|| reads.get(&key).cloned());
+            .filter(live)
+            .or_else(|| reads.get(&key).cloned().filter(live));
         let (flight, leader) = match known {
             Some(flight) => (flight, false),
             None => {
@@ -4890,8 +5016,17 @@ fn run_read_shared_once(
             }
         };
         if let Some(slot) = retry.as_deref_mut() {
-            slot.get_or_insert_with(|| Arc::clone(&flight));
+            if slot.as_ref().is_none_or(|held| !live(held)) {
+                *slot = Some(Arc::clone(&flight));
+            }
         }
+        // Counted as a waiter in the same step that found the flight, so the
+        // decision to cancel it (also under the table) sees this request.
+        flight
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(cancel.cloned());
         (flight, leader)
     };
     if !leader {
@@ -4903,24 +5038,38 @@ fn run_read_shared_once(
         // The leader always publishes, even when it panics (`Publish`), but
         // its child may outlast this caller's deadline: wait no longer than
         // that. An answer that is there wins over a deadline that has just
-        // passed. There is no cancel on this path to poll: the read runs
-        // without an observer, so only the deadline bounds the wait.
+        // passed. A joiner whose own request is cancelled leaves at once and
+        // the leader runs on for whoever still waits (the leader stops only
+        // when all of them have left, see [`abandon_if_all_gone`]).
+        let mut left_by_cancel = false;
         let shared = loop {
             if let Some(shared) = result.as_ref() {
                 break Some(shared.clone());
+            }
+            if cancel.is_some_and(read_cancel::ReadCancel::is_cancelled) {
+                left_by_cancel = true;
+                break None;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break None;
             }
+            let slice = if cancel.is_some() {
+                left.min(JOINER_CANCEL_POLL)
+            } else {
+                left
+            };
             result = flight
                 .done
-                .wait_timeout(result, left)
+                .wait_timeout(result, slice)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         };
         drop(result);
         let Some(shared) = shared else {
+            if left_by_cancel {
+                return SharedAttempt::Done(Err(read_cancel::cancelled()));
+            }
             return SharedAttempt::Done(deadline_expired(label, timeout));
         };
         if is_deadline_outcome(&shared) && Instant::now() < deadline {
@@ -4933,7 +5082,11 @@ fn run_read_shared_once(
         }
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
-        if let Err(error) = &shared {
+        if let Some(error) = shared
+            .as_ref()
+            .err()
+            .filter(|error| !is_cancellation(error))
+        {
             note_process_failure(error);
         }
         return SharedAttempt::Done(shared);
@@ -4967,13 +5120,19 @@ fn run_read_shared_once(
         label,
         outcome: None,
     };
+    // The leader's observer is the flight's, not its own request's: the child
+    // serves every waiter, so it stops when none is left.
+    let mut observer = FlightObserver {
+        key: &key,
+        flight: &flight,
+    };
     let outcome = run_admitted(
         cmd,
         label,
         timeout,
         None,
         stdout_cap,
-        &mut (),
+        &mut observer,
         gate,
         &|| close_shared_read(&key, &flight),
     );
@@ -5024,9 +5183,10 @@ fn log_refusals(
     );
     log::warn!(
         target: "spawn_gate",
-        "{} | {refused_by} | {}",
+        "{} | {refused_by} | {} | {}",
         format_gate_report(counters, sharing),
-        top()
+        top(),
+        crate::watcher::skip::summary()
     );
 }
 
@@ -5468,7 +5628,11 @@ fn run_admitted(
         }
         other => other,
     };
-    if let Err(error) = &result {
+    if let Some(error) = result
+        .as_ref()
+        .err()
+        .filter(|error| !is_cancellation(error))
+    {
         note_process_failure(error);
     }
     result
@@ -5536,7 +5700,14 @@ fn run_admitted_inner(
         with_admission(class, || {
             gate.acquire_judged(queue_deadline, &|| observer.cancelled())
         })
-        .map_err(|(refusal, level)| refusal_message_at(label, refusal, level))?,
+        .map_err(|(refusal, level)| {
+            // Decided here, where the observer that cancelled is known: only a
+            // read-cancel observer's cancel is a `ReadCancelled`.
+            match observer.cancellation() {
+                Some(cancelled) if refusal == Refusal::Cancelled => cancelled,
+                _ => refusal_message_at(label, refusal, level),
+            }
+        })?,
     );
     gate.note_admitted_label(label);
     on_admitted();
@@ -6047,7 +6218,7 @@ pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, Comm
     if let Some(reason) = incomplete {
         return Err(incomplete_is_failure(sub, reason).into());
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(text_from_bytes(bytes))
 }
 
 /// [`git_text_capped`] for a read that identical callers may share, under the
@@ -6060,7 +6231,7 @@ pub(crate) fn git_text_capped_shared(
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_run_inner(Some(repo), args, DEFAULT_TIMEOUT, None, cap, true)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+    Ok((text_from_bytes(bytes), incomplete))
 }
 
 fn git_run_inner(
@@ -6089,17 +6260,42 @@ fn git_run_inner(
     // whole stream (`git_timeout`, `git_text_shared`) still turn that prefix
     // into an error. Callers that opted into a cap (pulse) show it.
     let _keep_deadline_prefix = KeepDeadlinePrefix::enter();
+    // The request this thread serves, when its caller can cancel it (see
+    // [`read_cancel`]). A command that runs hooks is a write and has its own
+    // cancel, so it never takes this one.
+    let cancel = read_cancel::current().filter(|_| hooked.is_none());
     loop {
+        // A cancelled request starts nothing more: a reader that falls back to
+        // a second command when the first fails must not spawn it for a caller
+        // who has gone.
+        if cancel
+            .as_ref()
+            .is_some_and(read_cancel::ReadCancel::is_cancelled)
+        {
+            return Err(read_cancel::cancelled());
+        }
         let cmd = git_command(repo, args);
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()).into());
         }
         // A hook-running command is cancellable and can write, so it is
-        // never shared whatever the caller asked: the shared path has no
-        // observer to poll.
-        let mut out = if shared && stdin_bytes.is_none() && hooked.is_none() {
-            run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
+        // never shared whatever the caller asked. A shared read observes its
+        // flight (see [`FlightObserver`]); one that is not shared observes
+        // its own request.
+        let ran = if shared && stdin_bytes.is_none() && hooked.is_none() {
+            run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())
+        } else if let Some(cancel) = &cancel {
+            let mut cmd = cmd;
+            let mut observer = read_cancel::OwnCancel(cancel);
+            run_observed(
+                &mut cmd,
+                &label,
+                remaining,
+                stdin_bytes,
+                stdout_cap,
+                &mut observer,
+            )
         } else if let Some((_, run)) = &hooked {
             let mut cmd = cmd;
             let mut observer = HookObserver(run);
@@ -6110,10 +6306,14 @@ fn git_run_inner(
                 stdin_bytes,
                 stdout_cap,
                 &mut observer,
-            )?
+            )
         } else {
-            run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?
+            run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)
         };
+        // A read cancelled while it queued for a slot has already come back as
+        // the same cancellation as one cancelled while it ran
+        // (`ProcessObserver::cancellation`), not a refusal with a label of its own.
+        let mut out = ran?;
         if let Some((repo, _)) = &hooked {
             if out.cancelled {
                 return Err(hooks::cancelled_message(repo, sub).into());
@@ -6121,6 +6321,11 @@ fn git_run_inner(
             if let Some(Incomplete::Deadline { message, .. }) = &mut out.incomplete {
                 *message = hooks::timeout_message(repo, sub, message);
             }
+        } else if out.cancelled {
+            // Stopped because nobody waits for it. Not a result: the output
+            // is a partial stream, and an error is what keeps every caller
+            // from parsing, keeping or sharing it as one.
+            return Err(read_cancel::cancelled());
         }
         if out.success || matches!(out.incomplete, Some(Incomplete::Deadline { .. })) {
             return Ok((out.stdout, out.incomplete));
@@ -6361,6 +6566,31 @@ pub fn repo_name_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::procguard::LockedSpawn;
+
+    /// F-10. Decoding captured output that is valid UTF-8 hands the buffer
+    /// over: the text is over the allocation the process read into, not a
+    /// second copy of it. The old expression is asserted to copy, so this
+    /// test discriminates.
+    #[test]
+    fn decoding_valid_captured_output_does_not_copy_the_buffer() {
+        let bytes = "commit \u{e9}\u{4e16}\n".repeat(4096).into_bytes();
+        let at = bytes.as_ptr();
+        let old = String::from_utf8_lossy(&bytes).into_owned();
+        assert_ne!(old.as_ptr(), at, "the previous decode copied");
+        let text = super::text_from_bytes(bytes);
+        assert_eq!(text.as_ptr(), at, "valid UTF-8 was copied again");
+        assert_eq!(text, old);
+    }
+
+    /// Invalid bytes still decode the way `from_utf8_lossy` does, once.
+    #[test]
+    fn decoding_invalid_captured_output_replaces_the_bad_bytes() {
+        let bytes = b"ok \xff\xfe tail \xe4\xb8".to_vec();
+        let expected = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(super::text_from_bytes(bytes), expected);
+        assert!(expected.contains('\u{fffd}'));
+        assert_eq!(super::text_from_bytes(Vec::new()), "");
+    }
     /// S3-08. One status argv, shared by the file list and the worktree scans,
     /// and `status.showUntrackedFiles=all` pinned beside the other settings a
     /// developer's own config must not change.

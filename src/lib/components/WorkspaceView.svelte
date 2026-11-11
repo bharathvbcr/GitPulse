@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { openConflicts } from "../ui/workConflicts";
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewContextBar from "./ViewContextBar.svelte";
@@ -6,7 +7,7 @@
 
   /** Named once: the tab and its panel must agree on the id. */
   const view = "work" as const;
-  import WorkView from "./WorkView.svelte";
+  import WorkOverviewPane from "./WorkOverviewPane.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   const loadTasks = () => import("./RepositoryTasks.svelte");
 
@@ -17,7 +18,9 @@
    * the app's strictest honesty contracts (an unreadable verdict is never
    * counted as allowed; a source that could not be read is named rather than
    * rendered as empty), and those must not move in the same change that moves
-   * the layout. This component only decides which pane is on screen.
+   * the layout. `WorkOverviewPane` wraps it with the conflict editor, which
+   * leads only while a merge needs a person. This component only decides which
+   * pane is on screen.
    *
    * What the merge actually removes is duplication: the GitHub and MANVI
    * views each issued `cmd_github_context` — four `gh` round trips, up to 45s
@@ -29,18 +32,14 @@
     loadConflict,
     loadGitHub,
     loadStack,
-    loadManvi,
   }: {
     loadConflict: ViewLoader;
     loadGitHub: ViewLoader;
     loadStack: ViewLoader;
-    loadManvi: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("work", $repoStore.viewSections));
-  const conflictedCount = $derived(
-    $repoStore.statuses.filter((s) => s.is_conflicted).length,
-  );
+  const conflictedCount = $derived($repoStore.conflictedCount);
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
@@ -53,7 +52,7 @@
     <ViewContextBar label="Conflicts">
       <button
         type="button"
-        onclick={() => repoStore.setViewSection("work", "resolve")}
+        onclick={openConflicts}
         class="ml-auto shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors"
         title="{conflictedCount} file{conflictedCount === 1 ? '' : 's'} still carry conflict markers"
       >
@@ -65,16 +64,12 @@
 
     {#if section === "tasks"}
       <LazyView load={loadTasks} name="repository tasks" props={{ active: section === "tasks" }} />
-    {:else if section === "resolve"}
-      <LazyView load={loadConflict} name="the conflict editor" />
     {:else if section === "remote"}
       <LazyView load={loadGitHub} name="GitHub" />
     {:else if section === "stack"}
       <LazyView load={loadStack} name="the code stack" />
-    {:else if section === "policy"}
-      <LazyView load={loadManvi} name="Manvi ops" />
     {:else}
-      <WorkView />
+      <WorkOverviewPane {loadConflict} />
     {/if}
   </ViewSectionPanel>
 </div>

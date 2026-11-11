@@ -59,8 +59,8 @@ describe("formatDelta", () => {
 
 describe("deltaClass", () => {
   it("colors growth as warning and shrink as good", () => {
-    expect(deltaClass(10)).toContain("amber");
-    expect(deltaClass(-10)).toContain("emerald");
+    expect(deltaClass(10)).toBe("text-warn");
+    expect(deltaClass(-10)).toBe("text-ok");
     expect(deltaClass(0)).toContain("textMuted");
   });
 });

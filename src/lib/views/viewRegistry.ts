@@ -67,43 +67,37 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "work",
     label: "Work",
     summary:
-      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Branch chains and blocked items sort first.",
+      "Everything in flight: worktrees, pull requests, CI runs and Manvi verdicts. Branch chains, blocked items and a parked merge sort first.",
     paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
     // Everything in flight, and the surfaces that act on it. GitHub and MANVI
     // were separate views rendering halves of the same answer Work already
     // joins — both issued `cmd_github_context`, four `gh` round trips each,
-    // to draw overlapping lists. Resolve was never a destination: it is what
-    // a blocked row opens into, and Work already sorts blocked rows first.
-    // Stack joined Overview as a collapsible card: branch chains are another
-    // reading of "this repository's branches", the subject the Overview's
-    // standing row already opens.
+    // to draw overlapping lists. Stack joined Overview as a collapsible card:
+    // branch chains are another reading of "this repository's branches".
+    //
+    // Resolve and Policy then dissolved into the sections whose subject they
+    // act on. Resolve was never a destination: agents finish most parked
+    // merges, so the tab was an empty state nearly every visit, and what it
+    // shows is the state of this repository — the conflict editor now leads
+    // Overview while a merge or rebase is parked and is absent otherwise.
+    // Policy was a page named after the engine underneath rather than a
+    // subject: branch and tag cleanup and the policy journal are collapsed
+    // disclosures on Overview, issues, releases and outgoing commits joined
+    // Remote's lists of the same objects, and the Manvi connection and model
+    // servers are configuration, so they live in Settings → Agents.
     sections: [
       {
         id: "overview",
         label: "Overview",
         summary:
-          "The joined list of this repository's worktrees, pull requests and runs. A blocked row is the one to open.",
-      },
-      {
-        id: "resolve",
-        label: "Resolve",
-        summary:
-          "Finish a parked merge or rebase. Conflicted files, chunk by chunk, without leaving Work.",
-        paletteCommand: "Open Resolve — finish a parked merge or rebase",
+          "The joined list of this repository's worktrees, pull requests and runs. A parked merge or rebase leads the page until it is finished.",
       },
       {
         id: "remote",
         label: "Remote",
         summary:
-          "Pull requests, issues, Actions runs and releases from GitHub for this repository.",
+          "Pull requests, issues, Actions runs and releases from GitHub, and the commits about to be pushed.",
         paletteCommand: "Open GitHub — pull requests, issues, runs and releases",
-      },
-      {
-        id: "policy",
-        label: "Policy",
-        summary:
-          "MANVI gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
-        paletteCommand: "Open MANVI — gates, verdicts and branch cleanup",
       },
       {
         id: "tasks",
@@ -145,8 +139,8 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "history",
     label: "History",
     summary:
-      "What happened in this repository. The graph, HEAD's moves (the reflog) and the selected commit's diff share one selection.",
-    paletteCommand: "Open History — the commit graph, the reflog and diffs",
+      "What happened in this repository. The graph, HEAD's moves (the reflog), regression suspects and the selected commit's diff share one selection.",
+    paletteCommand: "Open History — the commit graph, the reflog, suspects and diffs",
     // Renderings of one subject: what happened to this repository. They were
     // separate tabs, and the split cost more than it saved — the Diff view
     // had to grow its own commit picker and file rail purely so the user
@@ -158,12 +152,19 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // the same details pane, and as a separate pane a click on an entry
     // selected a commit on a Graph nobody was looking at. Its palette door
     // is `history:head-moves` in palette/catalog.ts.
+    //
+    // Suspects followed as Graph's third list: its ranking is a list of
+    // commits too, and as a section a click left it for Diff, so the ranking
+    // and the commit it named were never on screen together. Its question
+    // sits in the context bar, its verdict in the details pane, and the other
+    // lists chip the commits it ranked. Its palette door keeps the id
+    // `history:suspects`.
     sections: [
       {
         id: "graph",
         label: "Graph",
         summary:
-          "The commit graph, or every movement of HEAD (the reflog) with its recovery points. The commit you select is described below either list.",
+          "The commit graph, every movement of HEAD (the reflog) with its recovery points, or the commits ranked as suspects for a symptom. The commit you select is described below whichever list is showing.",
       },
       {
         id: "diff",
@@ -171,13 +172,6 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         summary:
           "The changes in the selected commit — or the working tree, if none is selected.",
         paletteCommand: "Open Diff — changes in the selected commit",
-      },
-      {
-        id: "suspects",
-        label: "Suspects",
-        summary:
-          "Which commit since a known-good ref could have caused a symptom. Ranked by what the call graph reaches, not by how recent they are; the window ends at the indexed commit, not at HEAD.",
-        paletteCommand: "Find regression suspects — which commit broke this symbol",
       },
     ],
   },
@@ -209,7 +203,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
       // repository like the advisories beside it, and alone it had no way to
       // hand its findings to a coding agent; inside Health it shares the
       // verdict and the agent bar. A restored "secrets" lands here
-      // (`RETIRED_SECTIONS` in repos/persist.ts).
+      // (`RETIRED_SECTIONS` below).
       {
         id: "health",
         label: "Health",
@@ -248,7 +242,7 @@ export function sectionsFor(id: ViewTab): readonly ViewSection[] {
  * A destination's name, the way the header and section bar spell it.
  *
  * For UI elsewhere in the app that sends the reader to a pane and has to say
- * where they are about to land ("Work → Resolve"). Derived from the registry
+ * where they are about to land ("Work → Remote"). Derived from the registry
  * rather than written out at the call site, so renaming a section renames
  * every promise made about it. An unknown section id degrades to the view's
  * own name instead of inventing one.
@@ -300,10 +294,53 @@ export function isSectionOnScreen(
 export function resolveSection(id: ViewTab, candidate: unknown): string | null {
   const sections = sectionsFor(id);
   if (sections.length === 0) return null;
-  if (typeof candidate === "string" && sections.some((s) => s.id === candidate)) {
-    return candidate;
+  if (typeof candidate === "string") {
+    if (sections.some((s) => s.id === candidate)) return candidate;
+    const merged = retiredSectionFor(id, candidate);
+    if (merged) return merged;
   }
   return sections[0].id;
+}
+
+/**
+ * Sections folded into another section of the same view, by retired id.
+ *
+ * The default fallback is right for a section that simply went away, and
+ * wrong for one whose content moved: a saved selection, or a native menu
+ * build, that still names it must land where the content went, not on the
+ * view's first section. Resolve is the case that matters: a conflicts chip
+ * must land on the conflict editor, which now leads Overview while a merge
+ * or rebase is parked.
+ *
+ * This is the one retirement map: [`resolveSection`] reads it, so restored
+ * sessions (`sanitizeViewSections` in repos/persist.ts) and live callers land
+ * in the same place. Native menu destinations naming a retired section still
+ * do not navigate (`nativeActions.ts` matches live sections only), so a stale
+ * native menu id cannot open a surprise pane.
+ */
+export const RETIRED_SECTIONS: Readonly<Partial<Record<ViewTab, Readonly<Record<string, string>>>>> = {
+  // Resolve leads Overview while a merge or rebase is parked. Policy's cards
+  // moved to the surfaces that own their subject; the nearest whole page is
+  // Overview, where cleanup and the policy journal live. Both ids point at the
+  // destination directly, because this lookup does not chain.
+  work: { resolve: "overview", policy: "overview" },
+  // Secrets became a section of Health: one verdict, one agent bar.
+  insights: { secrets: "health" },
+  // Search and Blame became toggles inside Explorer (`files/explorerLens.ts`):
+  // the file a saved session was searching or blaming is still the selection.
+  code: { search: "explorer", blame: "explorer" },
+  // Reflog and Suspects became Graph's "HEAD moves" and "Suspects" lists
+  // (`views/historyList.ts`); each list is restored from the same retired id
+  // by `restoredHistoryList`.
+  history: { reflog: "graph", suspects: "graph" },
+};
+
+/** Where a retired section's content now lives, or null when it is not retired. */
+export function retiredSectionFor(id: ViewTab, candidate: string): string | null {
+  const retired = RETIRED_SECTIONS[id];
+  if (!retired || !Object.hasOwn(retired, candidate)) return null;
+  const target = retired[candidate];
+  return sectionsFor(id).some((s) => s.id === target) ? target : null;
 }
 
 /** Native menu ids are `tab-<id>`; derived so a new view cannot be missed. */

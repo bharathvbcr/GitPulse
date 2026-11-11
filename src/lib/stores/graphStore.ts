@@ -13,7 +13,12 @@ import { isRefScope, type RefScope } from "../graph/refScope";
 import { interfaceStore } from "./interfaceStore";
 import type { CommitSignatureCheck } from "../pulse/types";
 
-export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+export type InvokeFn = <T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+  /** Only `signal` is honoured: aborting it is this caller leaving (see `ipc/invoke.ts`). */
+  options?: { signal?: AbortSignal },
+) => Promise<T>;
 
 export interface CommitFileChange {
   path: string;
@@ -205,6 +210,19 @@ export interface CommitGraphPayload {
    * no ref resolved.
    */
   mainline_name?: string | null;
+  /**
+   * Names the repository state this page was drawn from; handed back as
+   * `knownToken` on the next reload of the same view. Null or absent when the
+   * backend could not vouch for the state (a revision view, a degraded facet,
+   * refs written too recently to tell apart).
+   */
+  graph_token?: string | null;
+  /**
+   * True when `knownToken` still names the state: the page already held is
+   * current, and `rows` and `refs` are empty rather than resent. `head_id`,
+   * `warnings` and `notices` are current as on any answer.
+   */
+  unchanged?: boolean;
 }
 
 /**
@@ -303,6 +321,12 @@ interface CachedGraph {
    * watcher refresh, on top of the walk over the new payload.
    */
   signature: string;
+  /**
+   * The backend's `graph_token` for this page, sent back as `knownToken` so
+   * an unchanged repository costs no rows on the wire and no decode. Only a
+   * reload of the exact same view (query, scope, window) may send it.
+   */
+  graphToken: string | null;
 }
 /**
  * Stand-in row for a selected commit the graph walk does not draw. It has no
@@ -470,6 +494,14 @@ export function createGraphStore(
    */
   const shed = new Map<string, ShedView>();
   /**
+   * The commit each repository's selection was pinned to by a list that is
+   * not the graph (HEAD moves, Suspects). A reload keeps a pinned selection
+   * even when its rows stop drawing it: the reader clicked it in a list that
+   * still shows it, and swapping in the newest row would change the details
+   * pane under a highlight that did not move. A graph click clears the pin.
+   */
+  const pinned = new Map<string, string>();
+  /**
    * Ordering epochs come from store-wide monotonic counters, so a value is
    * never handed out twice. That is what makes pruning safe: evict() deletes
    * both maps' entries for the path (absent entry ⇒ every outstanding token
@@ -477,6 +509,12 @@ export function createGraphStore(
    * fetch the way a per-path counter reset to 1 would.
    */
   const generations = new Map<string, number>();
+  /**
+   * The graph load now in flight per repository. A newer load aborts it once
+   * its own read is issued, which tells the backend the older walk has no
+   * caller left (unless the newer load joined it).
+   */
+  const loads = new Map<string, AbortController>();
   /**
    * The warning set last written to diagnostics, per repository.
    *
@@ -532,6 +570,21 @@ export function createGraphStore(
 
   function limitFor(repoPath: string): number {
     return cache.get(repoPath)?.maxCommits ?? shed.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
+  }
+
+  /**
+   * A reload that confirmed what is on screen ends the load: the progress flag
+   * and any error banner from an earlier failed load are retired, because the
+   * rows shown have just been shown to be current. Without this a banner
+   * outlived the success that answered it, since neither confirming path
+   * replaces the visible state.
+   */
+  function settleVisible(path: string): void {
+    if (visiblePath !== path || latestState === null) return;
+    if (!latestState.isLoading && latestState.error === null && latestState.errorRequest === null) {
+      return;
+    }
+    update((s) => ({ ...s, isLoading: false, error: null, errorRequest: null }));
   }
 
   /** Marks `path` most recently used. */
@@ -710,6 +763,7 @@ export function createGraphStore(
     evict: (path: string) => {
       cache.delete(path);
       shed.delete(path);
+      pinned.delete(path);
       // Prune the ordering maps too: entries for closed repos would otherwise
       // grow without bound. A missing entry orphans every outstanding token
       // for this path (undefined === token is false), which is exactly what
@@ -717,6 +771,8 @@ export function createGraphStore(
       // store-wide sources above.
       generations.delete(path);
       selections.delete(path);
+      loads.get(path)?.abort();
+      loads.delete(path);
       warnedSignatures.delete(path);
       if (visiblePath === path) {
         visiblePath = null;
@@ -732,8 +788,8 @@ export function createGraphStore(
       repoPath: string,
       query = "",
       revision: string | null = null,
-      opts: { forceLimit?: number; refScope?: RefScope } = {}
-    ) => {
+      opts: { forceLimit?: number; refScope?: RefScope; withoutToken?: boolean } = {}
+    ): Promise<void> => {
       if (!repoPath) return;
       query = normalizeGraphQuery(query);
       const token = bump(repoPath);
@@ -759,14 +815,42 @@ export function createGraphStore(
           visiblePath: repoPath,
         }));
       }
+      const controller = new AbortController();
+      const olderLoad = loads.get(repoPath);
+      loads.set(repoPath, controller);
+      // The token vouches for the page held, so it is offered only for a
+      // reload of that very page: same query, branch, scope and window. A
+      // "load more" raises the window and so never sends one.
+      const knownToken =
+        !opts.withoutToken &&
+        cached !== undefined &&
+        !refining &&
+        cached.maxCommits === max &&
+        !revision
+          ? cached.graphToken
+          : null;
       try {
-        const payload = await invokeFn<CommitGraphPayload>("cmd_get_commit_graph", {
-          repoPath,
-          maxCommits: max,
-          query: query || null,
-          revision: revision || null,
-          refScope,
-        });
+        let pending: Promise<CommitGraphPayload>;
+        try {
+          pending = invokeFn<CommitGraphPayload>(
+            "cmd_get_commit_graph",
+            {
+              repoPath,
+              maxCommits: max,
+              query: query || null,
+              revision: revision || null,
+              refScope,
+              knownToken,
+            },
+            { signal: controller.signal },
+          );
+        } finally {
+          // After the newer read is issued, never before: a newer load of the
+          // same request joins the older read, and the older one is stopped
+          // only when nobody else waits for it.
+          olderLoad?.abort();
+        }
+        const payload = await pending;
         if (!isCurrent(repoPath, token)) return;
 
         // Assembly warnings ride along with an otherwise-good payload: each
@@ -811,6 +895,26 @@ export function createGraphStore(
         }
 
         const previous = cache.get(repoPath);
+        if (payload.unchanged === true) {
+          // The token named the page held: nothing to decode, hash or swap.
+          // Only trusted while the entry it was issued for is still the one
+          // cached; if that moved while the call was in flight, ask again for
+          // the whole page rather than keep rows that answer another view.
+          if (
+            knownToken !== null &&
+            payload.graph_token === knownToken &&
+            previous !== undefined &&
+            previous.graphToken === knownToken &&
+            previous.query === query &&
+            previous.revision === revision &&
+            previous.refScope === refScope &&
+            previous.maxCommits === max
+          ) {
+            settleVisible(repoPath);
+            return;
+          }
+          return api.loadGraph(repoPath, query, revision, { ...opts, withoutToken: true });
+        }
         // One walk over the payload per reload: the cached side was hashed
         // when it was stored, and the new entry keeps this one.
         const signature = graphPayloadSignature(payload);
@@ -823,10 +927,10 @@ export function createGraphStore(
           previous.signature === signature
         ) {
           // Identical reload: retire the flag, keep every array identity so
-          // downstream caches (canvas strips) survive untouched.
-          if (visiblePath === repoPath && latestState?.isLoading) {
-            update((s) => ({ ...s, isLoading: false }));
-          }
+          // downstream caches (canvas strips) survive untouched. The state
+          // moved without moving the page, so the token is the new one.
+          previous.graphToken = payload.graph_token ?? null;
+          settleVisible(repoPath);
           return;
         }
 
@@ -836,12 +940,17 @@ export function createGraphStore(
         // (a reflog entry a reset orphaned): the walk was never going to hold
         // it, so a reload keeps it rather than swapping in the newest row. A
         // drawn selection a filter dropped still falls back, as before.
+        // A selection pinned by HEAD moves or Suspects is kept the same way,
+        // drawn or not: that list still highlights it.
         const offGraph =
-          previous?.selectedCommit && !previous.rows.some((row) => row.id === previous.selectedCommit?.id)
+          previous?.selectedCommit &&
+          (pinned.get(repoPath) === previous.selectedCommit.id ||
+            !previous.rows.some((row) => row.id === previous.selectedCommit?.id))
             ? previous.selectedCommit
             : undefined;
         const selectedCommit =
           kept ?? offGraph ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
+        if (selectedCommit?.id !== pinned.get(repoPath)) pinned.delete(repoPath);
         const keepDetails =
           previous &&
           selectedCommit &&
@@ -867,6 +976,7 @@ export function createGraphStore(
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
           signature,
+          graphToken: payload.graph_token ?? null,
         };
         shed.delete(repoPath);
         touch(repoPath, next);
@@ -945,27 +1055,17 @@ export function createGraphStore(
       await api.loadGraph(repoPath, query, revision, { forceLimit: next });
       return true;
     },
-    selectCommit: async (commit: VisualCommitRow, repoPath?: string) => {
+    /** Selects a drawn row, as a click on the graph does. Clears any pin. */
+    selectCommit: (commit: VisualCommitRow, repoPath?: string) => select(commit, repoPath, false),
+    /**
+     * Reads the selected commit's details again (the details pane's Retry),
+     * keeping the selection's pin: retrying is not choosing a commit.
+     */
+    retryDetails: (repoPath?: string) => {
       const path = repoPath ?? visiblePath;
-      // The status describes the selected commit, so it cannot outlive a
-      // change of selection: only details already held for this commit keep
-      // their verdict, anything else starts over (the fetch below says "loading").
-      update((s) => ({
-        ...s,
-        selectedCommit: commit,
-        ...(commit && s.selectedCommitDetails?.id === commit.id
-          ? {}
-          : { selectedCommitDetailsStatus: "idle" as const, selectedCommitDetailsError: null }),
-      }));
-      if (path && visiblePath === path) {
-        const cached = cache.get(path);
-        if (cached) cached.selectedCommit = commit;
-      }
-      if (path && commit) {
-        const token = generations.get(path) ?? 0;
-        const seq = selectionSeq(path);
-        await fetchDetails(path, token, commit.id, seq);
-      }
+      const commit = (path ? cache.get(path)?.selectedCommit : undefined) ?? latestState?.selectedCommit ?? null;
+      if (!commit) return Promise.resolve();
+      return select(commit, repoPath, path !== null && pinned.get(path) === commit.id);
     },
     /**
      * Selects a commit by id, whether or not the loaded rows draw it.
@@ -974,19 +1074,48 @@ export function createGraphStore(
      * not reach (a reflog entry a reset or amend orphaned) gets a stand-in row
      * carrying only its id and `hint.summary`; its details are read like any
      * other, and a pruned object lands in the pane's error-and-Retry state.
+     * `hint.pin` is for lists other than the graph: it keeps the selection
+     * across a reload that stops drawing it (see `pinned`).
      */
     selectCommitById: async (
       commitId: string,
-      hint: { summary?: string } = {},
+      hint: { summary?: string; pin?: boolean } = {},
       repoPath?: string
     ) => {
       if (!commitId) return;
       const path = repoPath ?? visiblePath;
       const rows = (path ? cache.get(path)?.rows : undefined) ?? latestState?.rows ?? [];
       const drawn = rows.find((r) => r.id === commitId);
-      await api.selectCommit(drawn ?? offGraphRow(commitId, hint.summary ?? ""), repoPath);
+      await select(drawn ?? offGraphRow(commitId, hint.summary ?? ""), repoPath, hint.pin === true);
     },
   };
+
+  async function select(commit: VisualCommitRow, repoPath: string | undefined, pin: boolean) {
+    const path = repoPath ?? visiblePath;
+    if (path) {
+      if (pin) pinned.set(path, commit.id);
+      else pinned.delete(path);
+    }
+    // The status describes the selected commit, so it cannot outlive a
+    // change of selection: only details already held for this commit keep
+    // their verdict, anything else starts over (the fetch below says "loading").
+    update((s) => ({
+      ...s,
+      selectedCommit: commit,
+      ...(commit && s.selectedCommitDetails?.id === commit.id
+        ? {}
+        : { selectedCommitDetailsStatus: "idle" as const, selectedCommitDetailsError: null }),
+    }));
+    if (path && visiblePath === path) {
+      const cached = cache.get(path);
+      if (cached) cached.selectedCommit = commit;
+    }
+    if (path && commit) {
+      const token = generations.get(path) ?? 0;
+      const seq = selectionSeq(path);
+      await fetchDetails(path, token, commit.id, seq);
+    }
+  }
 
   return api;
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { themeStore, type ThemePreference } from "../stores/themeStore";
   import { densityStore, type DensityMode } from "../stores/densityStore";
@@ -75,6 +75,16 @@
   import SettingSegment from "./SettingSegment.svelte";
   import type { BranchRowLayout } from "../sidebar/metrics";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import ManviConnection from "./ManviConnection.svelte";
+  import LocalModelServers from "./LocalModelServers.svelte";
+  import { harnessStore } from "../stores/harnessStore";
+  import {
+    MANVI_FOCUS_TARGETS,
+    manviFocusRequest,
+    manviSectionId,
+    takeManviFocusFor,
+    type ManviFocusId,
+  } from "../ui/manviFocus";
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
@@ -202,6 +212,88 @@
     if (!railSections.some((entry) => entry.id === activeSection)) {
       untrack(() => { activeSection = railSections[0].id; });
     }
+  });
+
+
+  // --- Manvi deep links ----------------------------------------------------
+  // A control elsewhere in the app that says "open Manvi" names a card, not a
+  // page. Settings is a dialog that mounts lazily, so the request is parked in
+  // `manviFocusRequest` and taken here — on open, and again when one arrives
+  // while the dialog is already showing.
+  let flashTimer: number | null = null;
+  let flashed: HTMLElement | null = null;
+  let realignTimers: number[] = [];
+  const REALIGN_DELAYS_MS = [0, 250];
+  const REALIGN_EVENTS = ["wheel", "touchstart", "keydown"] as const;
+
+  function clearFlash() {
+    if (flashTimer !== null) {
+      window.clearTimeout(flashTimer);
+      flashTimer = null;
+    }
+    flashed?.classList.remove("gp-focus-flash");
+    flashed = null;
+  }
+
+  function clearRealign() {
+    for (const timer of realignTimers) window.clearTimeout(timer);
+    realignTimers = [];
+    for (const event of REALIGN_EVENTS) window.removeEventListener(event, clearRealign);
+  }
+
+  /**
+   * Panels above the card keep settling for a moment (status probes resolve),
+   * and each height change slides it off the top. Two bounded re-alignments
+   * cover that; a scroll gesture cancels them, because yanking a reader back
+   * is worse than drift.
+   */
+  function keepAligned(card: HTMLElement) {
+    clearRealign();
+    for (const delay of REALIGN_DELAYS_MS) {
+      realignTimers.push(window.setTimeout(() => card.scrollIntoView({ block: "start" }), delay));
+    }
+    for (const event of REALIGN_EVENTS) {
+      window.addEventListener(event, clearRealign, { once: true, passive: true });
+    }
+  }
+
+  async function revealManviFocus(id: ManviFocusId) {
+    const destination = MANVI_FOCUS_TARGETS[id].destination;
+    if (destination.kind !== "settings") return;
+    // A query that hides the card would leave the reader on an empty pane.
+    query = "";
+    activeSection = destination.section;
+    await tick();
+    const card = document.getElementById(manviSectionId(id));
+    if (!card) return;
+    card.scrollIntoView({ block: "start" });
+    keepAligned(card);
+    // The card carries tabindex="-1": keyboard users land where the scroll did.
+    card.focus({ preventScroll: true });
+    clearFlash();
+    card.classList.add("gp-focus-flash");
+    flashed = card;
+    flashTimer = window.setTimeout(clearFlash, 1600);
+  }
+
+  $effect(() => {
+    // Reading the store is what re-runs this for a request that arrives later.
+    if ($manviFocusRequest === null || !isOpen) return;
+    const id = takeManviFocusFor("settings");
+    if (id) void revealManviFocus(id);
+  });
+
+  $effect(() => {
+    if (!isOpen) {
+      clearFlash();
+      clearRealign();
+    }
+  });
+  // An effect's cleanup rather than onDestroy: onDestroy also runs during
+  // server rendering, where there is no window to remove listeners from.
+  $effect(() => () => {
+    clearFlash();
+    clearRealign();
   });
 
   // Closing clears the query, so reopening starts on the whole page rather
@@ -1031,9 +1123,9 @@
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle
-                        label="MANVI status badges"
-                        description="Harness and local-model chips in the toolbar."
-                        ariaLabel="Show MANVI status badges"
+                        label="Manvi status in the title bar"
+                        description="Policy and local-model status in the title bar."
+                        ariaLabel="Show Manvi status in the title bar"
                         checked={$interfaceStore.showHarnessBadges}
                         onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
                       />
@@ -1046,7 +1138,7 @@
                     Unchecking a view removes it from the header only. It stays reachable from
                     the command palette ({shortcutTextLabel("⌘K", $hostPlatform.os)}) and the View menu, the view you are currently in
                     always shows, and Work reappears on its own while conflicts are
-                    unresolved — that is where Resolve lives.
+                    unresolved — its Overview leads with the conflict editor until they are.
                   </p>
 
                   <!-- One flat list: the header is four tabs, so grouping
@@ -1386,13 +1478,19 @@
                     </div>
                   {/if}
                 </div>
+                <div class="mt-3" data-setting="manvi-policy" hidden={!shown("manvi-policy")}>
+                  <ManviConnection onNavigate={() => onClose?.()} />
+                </div>
+                <div class="mt-3" data-setting="local-model-servers" hidden={!shown("local-model-servers")}>
+                  <LocalModelServers />
+                </div>
                 <div data-setting="external-tools" hidden={!shown("external-tools")} class="mt-3 space-y-1.5">
                   <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
                     External CLIs
                   </h4>
                   <p class="text-textMuted text-[10px] leading-snug">
                     Install or update <span class="font-mono">devmap</span> (Code → Map) and
-                    <span class="font-mono">manvi</span> (policy harness) via the install ladder:
+                    <span class="font-mono">manvi</span> (policy) via the install ladder:
                     PATH → prebuilt release → cargo/go install → local checkout. Env vars still win
                     over saved config.
                   </p>
@@ -1403,7 +1501,7 @@
                   >
                     Run setup
                   </button>
-                  <ExternalToolsPanel />
+                  <ExternalToolsPanel onInstalled={(tool) => { if (tool === "manvi") void harnessStore.reconnect(); }} />
                   <div class="border-border/70 mt-3 border-t pt-3">
                     <DevcouncilSuitePanel
                       repoPath={$repoStore.currentPath}

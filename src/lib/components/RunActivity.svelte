@@ -23,7 +23,9 @@
     spentSummary,
     type RunTimeline,
   } from "../ledger/runTimeline";
-  import { explainError, type TaskRun } from "../workbench/client";
+  import type { TaskRun } from "../workbench/client";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Skeleton from "./Skeleton.svelte";
 
   let { run, now, active = true }: { run: TaskRun; now: number; active?: boolean } = $props();
 
@@ -51,7 +53,8 @@
       error = "";
     } catch (cause) {
       if (mine !== ticket) return;
-      error = explainError(cause);
+      const copy = describeFailure({ verb: "read", object: "this run's activity" }, cause);
+      error = copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
     } finally {
       if (mine === ticket) loading = false;
     }
@@ -83,8 +86,8 @@
   <summary>
     Activity{#if timeline && summary} · <span class="spent" data-testid="agent-activity-summary">{summary}</span>{/if}
   </summary>
-  {#if loading && !timeline}<p class="meta" role="status">Reading this attempt's activity…</p>{/if}
-  {#if error}<p class="problem" role="alert" data-testid="agent-activity-error">Activity could not be read: {error}</p>{/if}
+  {#if loading && !timeline}<Skeleton variant="text" count={3} />{/if}
+  {#if error}<div class="gp-notice" data-tone="danger" role="alert" data-testid="agent-activity-error">{error}</div>{/if}
   {#if timeline}
     {#if timeline.segments.length}
       <div class="bar" role="img" aria-label={summary || "No time observed"} data-testid="agent-activity-bar">
@@ -101,7 +104,7 @@
       {#if timeline.segments.some((s) => s.durationMs === null && s.state !== "ended")}<p class="meta" data-testid="agent-activity-unbounded">How long the last stretch lasted was not observed, so it is not drawn.</p>{/if}
       {#if timeline.segments.some((s) => s.bound === "now")}<p class="meta">The newest span is still open and counted up to the last read.</p>{/if}
     {:else}
-      <p class="meta" data-testid="agent-activity-no-lifecycle">No lifecycle events were recorded for this attempt, so how its time was spent is not known.</p>
+      <p class="meta" data-testid="agent-activity-no-lifecycle">No lifecycle events were recorded for this run, so how its time was spent is not known.</p>
     {/if}
 
     <p class="meta" data-testid="agent-activity-tokens">
@@ -130,29 +133,28 @@
         {/each}
       </ul>
       {#if timeline.items.length > PREVIEW_ITEMS}
-        <button class="gp-btn" type="button" onclick={() => { showAll = !showAll; }}>{showAll ? "Show fewer" : `Show all ${timeline.items.length}`}</button>
+        <button class="gp-btn" data-size="sm" type="button" onclick={() => { showAll = !showAll; }}>{showAll ? "Show fewer" : `Show all ${timeline.items.length}`}</button>
       {/if}
       {#if timeline.failed || timeline.unobserved}
         <p class="meta" data-testid="agent-activity-counts">{timeline.failed} failed · {timeline.unobserved} with no result seen</p>
       {/if}
     {:else}
-      <p class="meta">No edits or commands were recorded for this attempt yet.</p>
+      <p class="meta">No edits or commands were recorded for this run yet.</p>
     {/if}
   {/if}
 </details>
 
 <style>
-  .activity{margin-top:8px;font-size:11.5px}
+  .activity{margin-top:8px;font-size:0.6875rem}
   summary{cursor:pointer;font-weight:600;color:rgb(var(--c-text))}
-  summary:focus-visible{outline:2px solid rgb(var(--c-accent)/.6);outline-offset:2px}
-  .spent{font-weight:450;color:rgb(var(--c-text-muted))}
-  .meta{color:rgb(var(--c-text-muted));font-size:11px;margin:6px 0 0}
-  .problem{color:#dc6565;margin:6px 0 0}
+  summary:focus-visible{outline:2px solid rgb(var(--c-accent)/.65);outline-offset:2px}
+  .spent{font-weight:500;color:rgb(var(--c-text-muted))}
+  .meta{color:rgb(var(--c-text-muted));font-size:0.6875rem;margin:6px 0 0}
   .bar{display:flex;height:8px;margin-top:8px;border-radius:4px;overflow:hidden;background:rgb(var(--c-text-muted)/.12)}
   .bar span,.swatch{background:rgb(var(--c-text-muted)/.5)}
-  .bar [data-state="working"],li[data-state="working"] .swatch{background:#3fb950}
+  .bar [data-state="working"],li[data-state="working"] .swatch{background:rgb(var(--c-ok))}
   .bar [data-state="waiting_tool"],li[data-state="waiting_tool"] .swatch{background:rgb(var(--c-accent))}
-  .bar [data-state="waiting_you"],li[data-state="waiting_you"] .swatch{background:#d29922}
+  .bar [data-state="waiting_you"],li[data-state="waiting_you"] .swatch{background:rgb(var(--c-warn))}
   .bar [data-state="idle"],li[data-state="idle"] .swatch{background:rgb(var(--c-text-muted)/.55)}
   .bar [data-state="unknown"],li[data-state="unknown"] .swatch{background:repeating-linear-gradient(45deg,rgb(var(--c-text-muted)/.25) 0 3px,transparent 3px 6px)}
   .legend{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:4px 12px;color:rgb(var(--c-text-muted))}
@@ -160,11 +162,11 @@
   .swatch{width:8px;height:8px;border-radius:2px;display:inline-block}
   .items{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}
   .items li{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:baseline;gap:2px 8px;min-width:0}
-  .kind{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:rgb(var(--c-text-muted))}
+  .kind{font-size:0.625rem;color:rgb(var(--c-text-muted))}
   .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  .sub{font-size:10px;color:rgb(var(--c-text-muted))}
-  .outcome{font-size:10.5px;color:rgb(var(--c-text-muted))}
-  li[data-outcome="failed"] .outcome,li[data-outcome="failed"] .label{color:#dc6565}
+  .sub{font-size:0.625rem;color:rgb(var(--c-text-muted))}
+  .outcome{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  li[data-outcome="failed"] .outcome,li[data-outcome="failed"] .label{color:rgb(var(--c-danger))}
   .took{font-variant-numeric:tabular-nums;color:rgb(var(--c-text-muted));text-align:right}
   .track{grid-column:2 / -1;height:2px;background:rgb(var(--c-text-muted)/.12);border-radius:1px;overflow:hidden}
   .track span{display:block;height:100%;background:rgb(var(--c-accent)/.7)}

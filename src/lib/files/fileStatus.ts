@@ -137,8 +137,11 @@ export function dirtyAncestorSet(statusPaths: readonly string[]): Set<string> {
 export function mergeListedAndStatusPaths(
   listed: readonly string[],
   statusPaths: readonly string[],
-): string[] {
-  if (statusPaths.length === 0) return [...listed];
+): readonly string[] {
+  // `listed` itself when nothing is added: the tree downstream is rebuilt
+  // only when this array's identity changes, so a copy here would rebuild it
+  // on every publish.
+  if (statusPaths.length === 0) return listed;
   const seen = new Set(listed);
   const extra: string[] = [];
   for (const path of statusPaths) {
@@ -146,7 +149,7 @@ export function mergeListedAndStatusPaths(
     seen.add(path);
     extra.push(path);
   }
-  if (extra.length === 0) return [...listed];
+  if (extra.length === 0) return listed;
   return listed.concat(extra);
 }
 

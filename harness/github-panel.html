@@ -40,11 +40,22 @@
       const B = "/fixture/beta";
       const C = "/fixture/gamma";
       const D = "/fixture/delta";
-      const BRANCH = { [A]: "feat/search", [B]: "main", [C]: "main", [D]: "main" };
+      const E = "/fixture/epsilon";
+      const BRANCH = { [A]: "feat/search", [B]: "main", [C]: "main", [D]: "main", [E]: "main" };
+      // What the Outgoing commits card reads: A is two commits ahead of its upstream,
+      // B and C are level with theirs, D tracks nothing (so its count is unknown).
+      const TRACKING = {
+        [A]: { upstream: "origin/feat/search", ahead_count: 2, behind_count: 0 },
+        [B]: { upstream: "origin/main", ahead_count: 0, behind_count: 0 },
+        [C]: { upstream: "origin/main", ahead_count: 0, behind_count: 0 },
+        [D]: { upstream: null, ahead_count: 0, behind_count: 0 },
+        [E]: { upstream: "origin/main", ahead_count: 3, behind_count: 0 },
+      };
       const branches = (path) => {
         const current = BRANCH[path];
         const row = (name) => ({
           name, is_current: name === current, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
+          ...(name === current ? TRACKING[path] : { upstream: null, ahead_count: 0, behind_count: 0 }),
           is_default: name === "main", is_gone: false, last_commit_timestamp: 1700000000, last_author: "Ada", last_summary: "Work",
         });
         return current === "main" ? [row("main")] : [row(current), row("main")];
@@ -116,6 +127,8 @@
           releases: [], releases_truncated: false, releases_error: null, warnings: [], error: null,
         },
       };
+      // Never fetched before the failing read, and ahead of its upstream: the local check must show without gh.
+      contexts[E] = { ...structuredClone(contexts[D]), owner: "acme", repo: "epsilon", html_url: "https://github.com/acme/epsilon", pull_requests: [] };
       const workflowsFor = (path) => path === A
         ? { available: true, cli_present: true, truncated: true, error: null,
             workflows: Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `Workflow ${i + 1}`, path: `.github/workflows/w${i + 1}.yml`, state: "active" })) }
@@ -137,6 +150,12 @@
       /** Pending cmd_ci_local calls, resolved by the checks. */
       const ciPending = [];
       let actionOutput = "";
+      /** "ok" or "throw": whether the task catalog can be read. */
+      let tasksMode = "ok";
+      /** Tasks the fixture workbench holds, per repository id. */
+      const taskStore = [];
+      const repoId = (path) => `repo-${path.split("/").pop()}`;
+      const workbenchPage = (items) => JSON.stringify({ ok: true, items, total: items.length, shown: items.length, has_more: false, next_cursor: null });
 
       const fixtures = {
         cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
@@ -181,6 +200,29 @@
           return { policy: null, output: `Merged #${a.action.number} into main.` };
         },
         cmd_github_workflows: (a) => workflowsFor(a.repoPath),
+        cmd_review_outgoing_commits: () => ({
+          range: "origin/feat/search..HEAD", total_commits: 2, reviewed_commits: 2, truncated: false, conventional_commits: 1, issue_linked_commits: 0,
+          findings: [{ commit_id: "f".repeat(40), short_id: "fffffff", severity: "warning", code: "not-conventional", subject: "wip stuff", detail: "Use type(scope): summary." }],
+        }),
+        cmd_github_create_issue: () => ({ policy: VERDICT, output: "https://github.com/acme/app/issues/99" }),
+        cmd_publish_release: (a) => ({ policy: VERDICT, output: { tag: a.tag, remote: "origin", created_tag: true, tag_policy: null, output: "" } }),
+        cmd_workbench_register_repository: (a) => JSON.stringify({
+          ok: true, repository: { id: repoId(a.repoPath), revision: 1, updated_at: 1, name: a.repoPath.split("/").pop(), identity_key: a.repoPath, remote_url: null },
+        }),
+        cmd_workbench_request: (a) => {
+          const input = JSON.parse(a.input);
+          if (a.method === "items.list") {
+            if (tasksMode === "throw") throw new Error("task store unavailable");
+            return workbenchPage(taskStore.filter((t) => t.repository_ids.includes(input.repository_id)));
+          }
+          if (a.method === "items.put") {
+            const saved = { ...input, revision: 1, updated_at: 1, due_at: input.due_at ?? null };
+            taskStore.push(saved);
+            return JSON.stringify({ ok: true, item: saved });
+          }
+          unexpected.push(`cmd_workbench_request:${a.method}`);
+          return null;
+        },
         cmd_github_runs: (a) => pollAnswers.shift() ?? { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "no answer queued", went_red: [] },
         cmd_github_trigger_workflow: () => ({ policy: VERDICT, output: actionOutput }),
         cmd_github_rerun_run: () => ({ policy: null, output: "rerun queued by gh" }),
@@ -208,6 +250,8 @@
         }),
       };
       const opened = [];
+      // The workbench change listener unlistens through this on teardown.
+      window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "plugin:opener|open_url") { opened.push(args.url); return null; }
@@ -652,6 +696,151 @@
           button("Refresh").click();
           await until(() => text().includes("PR 31"));
           check("and Refresh from it reads the repository", () => text().includes("PR 31") && !text().includes("network is unreachable"));
+
+          // The error card is all there is for E, and the local check is not part of it.
+          const outgoing = () => $('[data-testid="outgoing-commits"]', stage);
+          contextMode = "throw";
+          await repoStore.openRepo(E);
+          await until(() => text().includes("gh: network is unreachable"));
+          await settle();
+          check("with gh failing and nothing fetched, Outgoing commits is still there with its count", () =>
+            text().includes("gh: network is unreachable") && !text().includes("Open pull requests") &&
+            !!outgoing() && words(outgoing()).includes("3 unpushed"));
+          button("Review messages", outgoing()).click();
+          await until(() => words(outgoing()).includes("1 finding"));
+          check("and Review messages still works without gh", () => lastArgs("cmd_review_outgoing_commits")?.repoPath === E && words(outgoing()).includes("1 finding"));
+          // A branch with no upstream has an unmeasured count: the card says so rather than hiding as zero.
+          await activate(D);
+          await settle();
+          check("an unmeasured ahead count is said, not hidden as zero", () =>
+            !!outgoing() && words(outgoing()).includes("Couldn't check for unpushed commits") && words(outgoing()).includes("no upstream"));
+          contextMode = "ok";
+
+          // ---- Outgoing commits: visible when ahead, hidden when level ------------------------
+          await activate(B);
+          await until(() => text().includes("acme/beta"));
+          check("a branch level with its upstream shows no Outgoing commits card", () => !outgoing());
+          await activate(A);
+          await until(() => text().includes("PR 1") && text().includes("#11 Issue 11"));
+          await settle();
+          check("a branch ahead of its upstream shows Outgoing commits with the count", () =>
+            !!outgoing() && words(outgoing()).includes("2 unpushed") &&
+            words(outgoing()).includes("Conventional format, duplicate subjects, issue links and length, checked before you push."));
+          check("it sits above the pull requests", () =>
+            !!(outgoing().compareDocumentPosition(section("Open pull requests")) & Node.DOCUMENT_POSITION_FOLLOWING));
+          button("Review messages", outgoing()).click();
+          await until(() => words(outgoing()).includes("1 finding"));
+          check("Review messages runs the review for this repository and lists the findings", () =>
+            lastArgs("cmd_review_outgoing_commits")?.repoPath === A &&
+            words(outgoing()).includes("origin/feat/search..HEAD") && words(outgoing()).includes("not-conventional") && words(outgoing()).includes("wip stuff"));
+
+          // ---- Issues: report, add to tasks, add all, and the paused catalog --------------------
+          const issues = () => section("Open issues");
+          const addAll = () => $$("button", issues()).find((el) => words(el).startsWith("Add all to tasks"));
+          await until(() => $$("button", issues()).some((el) => words(el) === "Add to tasks" && !el.disabled));
+          check("each issue carries Add to tasks, and the one list is Remote's", () =>
+            $$("button", issues()).filter((el) => words(el) === "Add to tasks").length === 5 &&
+            $$("button[aria-label^='Open issue #']", issues()).length === 5);
+          check("Add all to tasks counts what is not a task yet", () => words(addAll()) === "Add all to tasks 5");
+          button("Report issue…", issues()).click();
+          await settle();
+          check("Report issue… opens title, description and labels", () =>
+            !!$('input[aria-label="Issue title"]', issues()) && !!$('textarea[aria-label="Issue description"]', issues()) &&
+            $('input[aria-label="Issue labels"]', issues()).value === "bug");
+          check("and cannot send without a title", () => button("Report issue", issues()).disabled);
+          await input($('input[aria-label="Issue title"]', issues()), "Search is slow");
+          const contextsBeforeReport = count("cmd_github_context");
+          button("Report issue", issues()).click();
+          await until(() => text().includes("Issue reported"));
+          await settle();
+          check("a reported issue is filed with its labels", () =>
+            lastArgs("cmd_github_create_issue")?.title === "Search is slow" && lastArgs("cmd_github_create_issue")?.labels.join() === "bug");
+          check("and says so with the policy verdict, then opens it", () =>
+            text().includes("Issue reported — ") && opened.includes("https://github.com/acme/app/issues/99"));
+          check("and Remote re-reads GitHub so the issue can appear", () => count("cmd_github_context") > contextsBeforeReport);
+
+          const addButton = (n) => $$("button", issues()).filter((el) => words(el) === "Add to tasks")[n];
+          const putsBefore = taskStore.length;
+          addButton(0).click();
+          await until(() => taskStore.length === putsBefore + 1);
+          await settle();
+          check("Add to tasks creates one task for that issue and the row becomes In tasks", () =>
+            taskStore.length === putsBefore + 1 && taskStore.at(-1).title.includes("11") &&
+            $$("button", issues()).filter((el) => words(el) === "In tasks").length === 1);
+          check("and offers the Tasks board", () => !!button("Open Tasks", issues()) && text().includes("Task [#11] created."));
+          addAll().click();
+          await until(() => !!get(promptState));
+          check("Add all to tasks asks first, naming how many", () => /Create 4 tasks/.test(get(promptState)?.options?.message ?? ""));
+          completePrompt(true);
+          await until(() => taskStore.length === putsBefore + 5);
+          await settle();
+          check("and then creates a task for every issue that was not one", () =>
+            taskStore.length === putsBefore + 5 && $$("button", issues()).filter((el) => words(el) === "In tasks").length === 5 &&
+            !$$("button", issues()).some((el) => words(el) === "Add to tasks"));
+          addAll().click();
+          await settle();
+          check("(all in tasks) pressing it again creates nothing", () => taskStore.length === putsBefore + 5 && text().includes("All open issues are already in tasks."));
+
+          // An unreadable task list is unknown, never empty: nothing may be imported against it.
+          tasksMode = "throw";
+          await activate(B);
+          await activate(A);
+          await until(() => text().includes("Task import paused"));
+          await settle();
+          check("a task list that could not be read pauses the import and says why", () =>
+            text().includes("Task import paused") && text().includes("task store unavailable"));
+          check("while paused, Add all to tasks and every Add to tasks are disabled", () =>
+            addAll().disabled && $$("button", issues()).filter((el) => words(el) === "Add to tasks").every((el) => el.disabled));
+          const putsPaused = taskStore.length;
+          tasksMode = "ok";
+          button("Try again", issues()).click();
+          await until(() => !text().includes("Task import paused"));
+          await settle();
+          check("Try again reads the catalog, and the existing tasks show as In tasks rather than being re-created", () =>
+            taskStore.length === putsPaused && $$("button", issues()).filter((el) => words(el) === "In tasks").length === 5);
+
+          // Report issue… stays available when the listing itself failed.
+          await activate(B);
+          await until(() => text().includes("issues are disabled for this repository"));
+          check("Report issue… is there even when the issue listing failed", () => !!button("Report issue…", issues()));
+          await activate(A);
+          await until(() => text().includes("#11 Issue 11"));
+
+          // ---- Releases: Push release tag… ---------------------------------------------------
+          const releases = () => section("Releases");
+          check("the Releases block names the latest release and offers Push release tag…", () =>
+            words(releases()).includes("Latest release v3.0.0") && !!button("Push release tag…", releases()));
+          check("the push form is closed until asked", () => !$('input[aria-label="Release tag"]', releases()));
+          button("Push release tag…", releases()).click();
+          await settle();
+          check("opening it suggests the next patch and states what the gate will still require", () =>
+            !!$('input[aria-label="Release tag"]', releases()) && words(releases()).includes("GitPulse will still require a clean, fully synchronized default branch"));
+          await input($('input[aria-label="Release tag"]', releases()), "v3.0.1");
+          check("without the confirmation, Push release tag is disabled and nothing is sent", () =>
+            button("Push release tag", releases()).disabled && count("cmd_publish_release") === 0);
+          $('input[type="checkbox"]', releases()).click();
+          await settle();
+          check("confirming enables it", () => !button("Push release tag", releases()).disabled);
+          await input($('input[aria-label="Release tag"]', releases()), "");
+          check("an empty tag disables it again", () => button("Push release tag", releases()).disabled);
+          await input($('input[aria-label="Release tag"]', releases()), "v3.0.1");
+          const contextsBeforePush = count("cmd_github_context");
+          button("Push release tag", releases()).click();
+          await until(() => text().includes("Pushed v3.0.1 to origin"));
+          await settle();
+          check("pushing sends the tag, then says where it went, with the verdict", () =>
+            lastArgs("cmd_publish_release")?.tag === "v3.0.1" && lastArgs("cmd_publish_release")?.message === "Release v3.0.1" &&
+            text().includes("Pushed v3.0.1 to origin — ") && text().includes("the release workflow can now build the app"));
+          check("the form closes and Remote re-reads GitHub", () =>
+            !$('input[aria-label="Release tag"]', releases()) && count("cmd_github_context") > contextsBeforePush);
+          // A message the person wrote is theirs, even one that starts with
+          // "Release ": the tag rewrites only a message nobody has typed.
+          button("Push release tag…", releases()).click();
+          await settle();
+          await input($('input[aria-label="Release message"]', releases()), "Release notes: login hotfix");
+          await input($('input[aria-label="Release tag"]', releases()), "v3.0.2");
+          check("a typed release message survives a tag edit, even one starting with Release", () =>
+            $('input[aria-label="Release message"]', releases())?.value === "Release notes: login hotfix");
 
           check("no window.open anywhere", () => windowOpens.length === 0);
           check("every IPC call had a fixture", () => unexpected.length === 0);

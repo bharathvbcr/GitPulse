@@ -38,7 +38,7 @@ use crate::engine::git_cli::{self, Incomplete};
 const RACY_WINDOW: Duration = Duration::from_secs(3);
 
 /// Upper bound on how long any answer is served, whatever its stamp says.
-const TTL: Duration = Duration::from_secs(60);
+pub(crate) const TTL: Duration = Duration::from_secs(60);
 
 /// Files and directories one stamp may cover. A repository with more loose
 /// refs than this is answered by git every time, as it was before.
@@ -280,14 +280,46 @@ impl RefStamp {
 /// whether anything moved between two of them. Opaque: the only operation is
 /// equality, and a stamp is returned whether or not it has settled, because a
 /// caller comparing two reads is not storing an answer under it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Stamp(RefStamp);
+///
+/// The racy-window rule is decided ONCE, when the stamp is read, and carried
+/// with it: a caller that stores several answers under one stamp (the chunks of
+/// a history window, each stored after the walk before it) must not see a stamp
+/// that was inside the window at read time pass as old enough by the time a
+/// later answer is stored. Equality is the state alone.
+#[derive(Clone, Debug)]
+pub(crate) struct Stamp(RefStamp, bool);
+
+impl PartialEq for Stamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Stamp {
+    /// A stamp of `state`, judged against the clock as of this call.
+    fn new(state: RefStamp) -> Self {
+        let settled_at_read = state.settled(wall_now());
+        Self(state, settled_at_read)
+    }
+}
 
 /// [`Stamp`] of `namespaces`; `None` when the walk cannot describe the state
 /// (a symlink, an unreadable entry, too many refs), which is never equal to
 /// anything.
 pub(crate) fn stamp(repo: &Path, namespaces: &[&str]) -> Option<Stamp> {
-    RefStamp::read(repo, namespaces).map(Stamp)
+    RefStamp::read(repo, namespaces).map(Stamp::new)
+}
+
+impl Stamp {
+    /// A hash of the state this stamp describes, for a caller that carries it
+    /// to a later ask, or `None` while a write inside the same timestamp tick
+    /// could still be indistinguishable from it. A caller that only keeps this
+    /// value cannot tell two states apart that the stamp could not, so an
+    /// unsettled stamp yields nothing to keep, as it yields nothing to store.
+    /// A hash is not an identity: use it to short-circuit, never to prove.
+    pub(crate) fn settled_fingerprint(&self) -> Option<u64> {
+        self.0.settled(wall_now()).then(|| self.0.fingerprint())
+    }
 }
 
 #[derive(Default)]
@@ -442,8 +474,9 @@ pub(crate) fn through(
 /// [`through`] with the stamp the caller already read for `namespaces`, so a
 /// caller that compares stamps itself (single-flight coalescing) reads the
 /// files once per call, not twice. `None` is a stamp that could not be read,
-/// as in [`stamp`]: the answer is computed and not kept. Settledness is
-/// judged here, so the clock is still read in one place.
+/// as in [`stamp`]: the answer is computed and not kept. Whether the stamp was
+/// inside the racy window when it was read is carried by the stamp itself; the
+/// clock is read here only to refuse a stamp from the future.
 pub(crate) fn through_stamped(
     repo: &Path,
     args: &[&str],
@@ -455,9 +488,11 @@ pub(crate) fn through_stamped(
         repo: repo.to_path_buf(),
         argv: args.iter().map(|arg| (*arg).to_string()).collect(),
     };
+    // Settled when it was read AND now: the first is the racy-window rule, the
+    // second also refuses a stamp from the future after the clock stepped back.
     let stamp = stamp
+        .filter(|stamp| stamp.1 && stamp.0.settled(wall_now()))
         .map(|stamp| &stamp.0)
-        .filter(|stamp| stamp.settled(wall_now()))
         .cloned();
     if let Some(stamp) = &stamp {
         let table = kept().lock().unwrap_or_else(PoisonError::into_inner);
@@ -1412,7 +1447,7 @@ mod tests {
 
     /// A stamp for `through_stamped` whose newest file is `age` old on `clock`.
     fn stamp_aged(clock: &ManualClock, age: Duration) -> Stamp {
-        Stamp(RefStamp {
+        Stamp::new(RefStamp {
             entries: Vec::new(),
             newest: clock.now() - age,
         })
@@ -1440,7 +1475,7 @@ mod tests {
     fn answers_stored_by_a_test_without_retention_do_not_evict_the_holders() {
         let _held = retention();
         let fx = fixture(None).unwrap();
-        let settled = Stamp(RefStamp {
+        let settled = Stamp::new(RefStamp {
             entries: Vec::new(),
             newest: SystemTime::UNIX_EPOCH,
         });
@@ -1552,6 +1587,32 @@ mod tests {
             !computed(&fx, &["log", "racy-settled"], &settled),
             "3.000 s old is stored"
         );
+    }
+
+    /// A stamp is judged at the moment it is READ. A caller that keeps one
+    /// stamp across several answers (the chunks of a history window, each stored
+    /// after the walk before it) must not have a stamp that was inside the racy
+    /// window at read time pass as old enough by the time a later answer is
+    /// stored: the files could have changed twice inside one tick of the
+    /// timestamp it describes, and a walk of seconds does not unsay that.
+    #[test]
+    fn a_stamp_racy_when_read_stores_no_later_answer_either() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let young = stamp_aged(&clock, RACY_WINDOW - MILLI);
+        assert!(computed(&fx, &["log", "first-chunk"], &young));
+        // The walk that produced the first answer took ten seconds.
+        clock.advance(Duration::from_secs(10));
+        assert!(computed(&fx, &["log", "second-chunk"], &young));
+        assert!(
+            computed(&fx, &["log", "second-chunk"], &young),
+            "an answer stored under a stamp that was racy at read time was kept"
+        );
+        // A stamp read after the window is stored, as before.
+        let old = stamp_aged(&clock, RACY_WINDOW);
+        assert!(computed(&fx, &["log", "later-read"], &old));
+        assert!(!computed(&fx, &["log", "later-read"], &old));
     }
 
     /// An NTP step backwards must neither pin a stale answer until the clock

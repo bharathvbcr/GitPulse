@@ -22,6 +22,8 @@ import {themeStore} from "../src/lib/stores/themeStore";
 import {repoStore} from "../src/lib/stores/repoStore";
 import {conflictSessions} from "../src/lib/diff/conflictSession";
 import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
+import WorkOverviewPane from "../src/lib/components/WorkOverviewPane.svelte";
+import {openConflicts} from "../src/lib/ui/workConflicts";
 const params = new URLSearchParams(location.search);
 if(params.has("check"))conflictSessions.clear();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
@@ -68,6 +70,11 @@ const fixture={
  cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
  cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
  cmd_workspace_sync:()=>({repos:[]}),
+ // Work → Overview mounts the real WorkView under the editor; its sources are fixtures too.
+ cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>[],
+ cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],warnings:[],prs_truncated:false,runs_truncated:false,issues:[],releases:[],error:null}),
+ cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:0,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,sessions_ok:true,sessions_error:"",shared_worktrees:[]}),
  cmd_devcouncil_init:()=>({repo:"/fixture",state_dir:"/fixture/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
  cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
  cmd_repo_operation:()=>({kind:"Merge",current_step:null,total_steps:null,head_ref:"main",incoming_ref:"feature/workspace",conflicted_paths:files,conflicted_total:files.length,available:files.length?["abort"]:["continue","abort"]}),
@@ -106,6 +113,35 @@ let editor=mount(ConflictEditor,{target:root});
 await waitFor(()=>root.querySelectorAll("textarea").length===2);
 if(params.has("check")){
  try{
+  // Work → Overview with conflicts: the editor keeps the full pane height it had
+  // as its own section, and Overview follows below it in one scroller. The host
+  // fills #app the way the view pane does, so the real height chain is tested.
+  await unmount(editor);
+  const host=document.createElement("div");host.style.cssText="flex:1;min-height:0;display:flex;flex-direction:column";root.replaceChildren(host);
+  const policy=mount(WorkOverviewPane,{target:host,props:{loadConflict:()=>Promise.resolve({default:ConflictEditor})}});
+  await waitFor(()=>host.querySelectorAll("textarea").length===2&&host.querySelector(".work-overview"));
+  const scroller=host.querySelector("[data-overview-layout='with-conflicts']"), page=host.querySelector(".resolve-page"), overview=host.querySelector(".work-overview");
+  check("overview leads with the conflict editor at full pane height, the workspace below",scroller&&Math.abs(page.getBoundingClientRect().height-scroller.clientHeight)<=2&&overview.getBoundingClientRect().top>=page.getBoundingClientRect().bottom-1);
+  scroller.scrollTop=scroller.scrollHeight;await settle();
+  check("overview scrolls as one pane down to the workspace",scroller.scrollTop>0&&overview.getBoundingClientRect().top<host.getBoundingClientRect().bottom);
+  // A conflict door used while the reader is down among the rows (status bar,
+  // tray, palette, a row's Resolve) brings the editor back and focuses it.
+  openConflicts();await settle();
+  const editorSection=host.querySelector("#work-conflicts");
+  check("a conflict door scrolls back to the editor and focuses it",Math.abs(editorSection.getBoundingClientRect().top-scroller.getBoundingClientRect().top)<=2&&document.activeElement===editorSection);
+  // The merge finishes under the reader (an agent's doing): the editor goes,
+  // the opened file's draft is kept as a row, and Overview is the same node.
+  const parkedFiles=files, operation=fixture.cmd_repo_operation;
+  files=[];fixture.cmd_repo_operation=()=>null;await repoStore.refresh();
+  await waitFor(()=>!host.querySelector(".resolve-page"));
+  check("a finished merge hands the pane back to Overview without remounting it",host.querySelector(".work-overview")===overview&&host.querySelector("[data-overview-layout='overview']"));
+  check("drafts kept from the finished merge get a row, not the pane",host.querySelector("[data-testid='work-retained-drafts']")&&!host.querySelector("[data-overview-layout='with-conflicts']"));
+  [...host.querySelectorAll("button")].find(b=>b.textContent.trim()==="Review drafts").click();
+  await waitFor(()=>host.querySelector(".resolve-page"));
+  check("reviewing drafts opens the editor above the same Overview",host.querySelector(".work-overview")===overview&&host.querySelector(".recovery-panel"));
+  files=parkedFiles;fixture.cmd_repo_operation=operation;await repoStore.refresh();await settle();
+  await unmount(policy);root.replaceChildren();
+  editor=mount(ConflictEditor,{target:root});await waitFor(()=>root.querySelectorAll("textarea").length===2);
   check("initial choices are unresolved and save is disabled",button("Save & stage file").disabled);
   check("two conflicts are grouped and ancestor is available",root.querySelectorAll(".conflict-block").length===2&&root.textContent.includes("Common ancestor"));
   await click("Accept Ours");

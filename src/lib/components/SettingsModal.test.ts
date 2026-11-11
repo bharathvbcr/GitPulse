@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import SettingsModal from "./SettingsModal.svelte";
 import { SETTINGS_SECTIONS } from "../ui/settingsSections";
-import { SETTINGS_CATALOG } from "../ui/settingsCatalog";
+import { SETTINGS_CATALOG, matchSettings } from "../ui/settingsCatalog";
 import { ACCENTS } from "../ui/accents";
 import { TAB_WIDTHS } from "../ui/codeDisplay";
 import { VIEW_TABS } from "../repos/persist";
@@ -128,7 +128,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="switch"');
     expect(body).toContain('aria-label="Show the language mix in the status bar"');
-    expect(body).toContain('aria-label="Show MANVI status badges"');
+    expect(body).toContain('aria-label="Show Manvi status in the title bar"');
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
@@ -187,7 +187,8 @@ describe("SettingsModal layout options", () => {
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
     expect(layout).toContain('aria-label="Show the language mix in the status bar"');
-    expect(layout).toContain('aria-label="Show MANVI status badges"');
+    expect(layout).toContain('aria-label="Show Manvi status in the title bar"');
+    expect(prose(layout)).toContain("Policy and local-model status in the title bar.");
   });
 
   it("says a hidden status bar still comes back for anything that needs attention", () => {
@@ -441,8 +442,9 @@ describe("SettingsModal category rail keyboard support", () => {
     // which answered an arrow key.
     expect(body.match(/tabindex="0"/g) ?? []).toHaveLength(1);
     expect(body.match(/tabindex="-1"/g) ?? []).toHaveLength(
-      // Every unselected tab, plus the dialog container itself.
-      SETTINGS_SECTIONS.length - 1 + 1,
+      // Every unselected tab, the dialog container itself, and the two Manvi
+      // card anchors (programmatic focus targets for deep links, not tab stops).
+      SETTINGS_SECTIONS.length - 1 + 1 + 2,
     );
   });
 
@@ -559,5 +561,74 @@ describe("SettingsModal diff and code panel", () => {
       expect(diff, `missing tab width ${width}`).toContain(`>${width}`);
     }
     expect(prose(diff)).toContain("Display only");
+  });
+});
+
+describe("SettingsModal Manvi cards in Agents", () => {
+  it("renders the three cards under their catalog headings inside the agents panel", () => {
+    const agents = panel(open(), "agents");
+    for (const heading of ["Manvi policy", "Capability boundary", "Local model servers"]) {
+      expect(agents, heading).toContain(heading);
+    }
+    expect(agents).toContain('data-setting="manvi-policy"');
+    expect(agents).toContain('data-setting="local-model-servers"');
+    expect(agents).toContain('id="manvi-section-harness"');
+    expect(agents).toContain('id="manvi-section-model"');
+  });
+
+  it("renders the External CLIs panel once, never again inside a Manvi card", () => {
+    expect([...source.matchAll(/<ExternalToolsPanel\b/g)]).toHaveLength(1);
+    expect(source).toContain('if (tool === "manvi") void harnessStore.reconnect()');
+  });
+
+  it("closes itself when a Manvi shortcut navigates the app behind it", () => {
+    expect(source).toContain("<ManviConnection onNavigate={() => onClose?.()} />");
+  });
+
+  it("finds the cards by the words a reader would type", () => {
+    for (const query of ["manvi", "policy", "model servers", "capability"]) {
+      const result = matchSettings(query);
+      const hits = result.settings.filter((id) => ["manvi-policy", "local-model-servers"].includes(id));
+      expect(hits.length, query).toBeGreaterThan(0);
+    }
+    expect(matchSettings("model servers").settings).toContain("local-model-servers");
+    expect(matchSettings("capability").settings).toContain("manvi-policy");
+    expect(matchSettings("policy").settings).toContain("manvi-policy");
+  });
+});
+
+describe("SettingsModal Manvi deep links", () => {
+  it("takes only requests for Settings, on open and while open", () => {
+    expect(source).toContain('takeManviFocusFor("settings")');
+    const effect = source.slice(source.indexOf("if ($manviFocusRequest === null"));
+    expect(effect.slice(0, 220)).toContain("!isOpen");
+  });
+
+  it("opens the destination section with the search cleared before scrolling to the card", () => {
+    const reveal = source.slice(
+      source.indexOf("async function revealManviFocus"),
+      source.indexOf("$effect(", source.indexOf("async function revealManviFocus")),
+    );
+    const order = [
+      'query = "";',
+      "activeSection = destination.section;",
+      "await tick();",
+      "document.getElementById(manviSectionId(id))",
+      "card.scrollIntoView({ block: \"start\" });",
+      "card.focus({ preventScroll: true });",
+      'card.classList.add("gp-focus-flash");',
+      "window.setTimeout(clearFlash, 1600)",
+    ].map((needle) => {
+      const at = reveal.indexOf(needle);
+      expect(at, needle).toBeGreaterThan(-1);
+      return at;
+    });
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
+  it("clears the flash and any pending re-alignment on close and on destroy", () => {
+    expect(source).toContain("$effect(() => () => {\n    clearFlash();\n    clearRealign();");
+    const close = source.slice(source.indexOf("if (!isOpen) {\n      clearFlash();"));
+    expect(close.slice(0, 80)).toContain("clearRealign");
   });
 });

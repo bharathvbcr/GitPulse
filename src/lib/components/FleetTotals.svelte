@@ -47,25 +47,25 @@
 </script>
 
 <div
-  class="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px]"
+  class="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-meta"
   data-testid="fleet-totals"
 >
   {#each totals as total (total.key)}
     {@const clause = clauseOf(total)}
     <span class="inline-flex items-baseline gap-1.5 min-w-0">
-      <span class="text-[10px] uppercase tracking-wider text-textMuted">{total.label}</span>
+      <span class="gp-label">{total.label}</span>
       <span class="font-semibold text-textPrimary tabular-nums">{total.text}</span>
       {#if clause && !complete(total)}
         <!-- A number that could not cover everything never travels alone. The
              clause is amber and inline rather than a grey caption, because it
              is the part that changes what the number means. -->
         <span
-          class="text-[10px] text-amber-600 dark:text-amber-400 truncate max-w-[16rem]"
+          class="text-micro text-warn truncate max-w-64"
           title={clause}
           data-testid="fleet-total-shortfall">{clause}</span
         >
       {:else if clause}
-        <span class="text-[10px] text-textMuted truncate max-w-48" title={clause}>
+        <span class="text-micro text-textMuted truncate max-w-48" title={clause}>
           {clause}
         </span>
       {/if}

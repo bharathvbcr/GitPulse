@@ -205,8 +205,8 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   {
     id: "harness-badges",
     section: "layout",
-    label: "MANVI status badges",
-    keywords: "manvi harness local model chips toolbar agents",
+    label: "Manvi status in the title bar",
+    keywords: "manvi policy harness local model chips title bar header hide show toolbar agents",
   },
   {
     id: "view-visibility",
@@ -306,6 +306,18 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "agents",
     label: "Host load",
     keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability",
+  },
+  {
+    id: "manvi-policy",
+    section: "agents",
+    label: "Manvi policy",
+    keywords: "manvi policy connection gate guard reconnect protocol posture mutation approval blocked unguarded harness capability boundary scoped action runner interactive shell pty terminal health coverage ci local shortcuts",
+  },
+  {
+    id: "local-model-servers",
+    section: "agents",
+    label: "Local model servers",
+    keywords: "local model servers ollama lm studio llama.cpp vllm endpoint scan discover pick pin select model manvi claude anthropic api key keychain loopback chat completion tools context window",
   },
   {
     id: "external-tools",

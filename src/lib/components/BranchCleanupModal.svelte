@@ -172,9 +172,10 @@
       backupsTarget = target;
       // An unreadable list is not an empty one: the tab is where deleted
       // branches are recovered, so "no backups" must never stand in for it.
-      // Recorded and redacted like every other panel's read failure; the
-      // modal opens from the Ops pane, so it reports as "ops".
-      backupsError = reportPanelError("ops", err);
+      // Recorded and redacted like every other panel's read failure, under
+      // its own name: it opens from the palette, Hygiene, the branch list and
+      // Overview's branch and tag cleanup, so no one surface owns it.
+      backupsError = reportPanelError("branch-cleanup", err);
     } finally {
       if (seq === backupsSeq) backupsLoading = false;
     }

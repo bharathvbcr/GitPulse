@@ -46,7 +46,8 @@
   import { harnessStore } from "../stores/harnessStore";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
-  import { requestManviFocus } from "../ui/manviFocus";
+  import { manviFocusHint } from "../ui/manviFocus";
+  import { openManviFocus } from "../ui/openManviFocus";
   import { askConfirm } from "../stores/modalStore";
   import SettingToggle from "./SettingToggle.svelte";
 
@@ -736,7 +737,7 @@
       {:else}
         <p class="warn">Pick a local model in Local model servers</p>
       {/if}
-      <button type="button" class="change-link" onclick={() => requestManviFocus("model")}>Change</button>
+      <button type="button" class="change-link" title={manviFocusHint("model")} onclick={() => openManviFocus("model")}>Change</button>
     </div>
     {#if configurationError}
       <p class="warn">{configurationError}</p>

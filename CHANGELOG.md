@@ -57,6 +57,13 @@ before that tag is pushed.
 
 ### Fixed
 
+- **A commit clicked in HEAD moves or Suspects stays selected when the graph
+  reloads without it.** A filter typed above the reflog, the page size or a
+  watcher refresh dropped the clicked commit from the loaded graph and the
+  details pane jumped to the newest commit, under a highlight that had not
+  moved. Those lists now pin their selection; a click on the graph itself
+  still falls back as before when a filter drops it.
+
 - **A branch comparison in the Diff view no longer lists the working tree's
   files.** The file rail guessed the selection's kind from which ids were set, so
   a range diff (`main...feature`) read as a worktree file and offered your
@@ -89,11 +96,74 @@ before that tag is pushed.
 
 ### Changed
 
+- **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
+  are gone as pages; their content lives with the subject it acts on.
+  - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or
+    revert is parked (or its state could not be read), and is absent otherwise.
+    Every way in — the status bar, the tray and its `3` key, the merge dialog,
+    blocked rows, the palette's *Resolve conflicts* — lands on the editor, even
+    when you were already on Overview and scrolled into the rows.
+  - **Overview** gains two collapsed disclosures: *Branch and tag cleanup*
+    (always listed, no count until a scan has run; *Stale branches…* opens the
+    dead-branch cleanup) and *Policy activity* (grants and the agent journal).
+  - **Remote** gains *Outgoing commits* (checked before you push, works without
+    `gh`), *Report issue…*, *Add to tasks* / *Add all to tasks*, and *Push
+    release tag…* on Releases. Its issue list stays the only one.
+  - **Settings → Agents** holds *Manvi policy*, *Capability boundary* and
+    *Local model servers*; branch naming moved beside the new-branch field of
+    the Worktrees panel.
+  - Quick pull and Quick push are gone; they ran the same pull and push the
+    sidebar, palette and branch menu offer.
+  - A saved Resolve or Policy selection, an old native menu build, and the
+    palette's Manvi phrases all land on the card that answers them. The Go →
+    Work menu and the tray drop `section:work:policy` (12 sections now).
+
+- **Regression suspects are Graph's third list, not their own section.**
+  Graph's toggle reads *Commits | HEAD moves | Suspects*, and the commit
+  details stay under whichever list is showing. History has two sections now
+  (Graph, Diff), so ⌥3 goes and the Go → History menu loses its Suspects item.
+  *Find regression suspects* in the command palette still opens it (same
+  command id), with the symptom field focused, and a session saved on the old
+  Suspects section reopens on the Suspects list.
+  - **The question replaces the commit filter** in History's context bar while
+    Suspects is showing: symptom, last known good, cone depth, *Find suspects*.
+    ⌘F focuses the symptom there. The filter does not narrow a ranking, whose
+    scores mean something only within one answer.
+  - **Clicking a suspect selects it in place.** It used to jump to the Diff
+    section, so the ranking and the commit it named were never on screen
+    together. The details pane now carries the suspect's verdict (evidence,
+    hops, touched symbols) whichever list selected the commit.
+  - **The other lists mark what was ranked.** Commit rows and HEAD moves show a
+    *suspect #n* chip whose tooltip names the symptom and window it came from;
+    the chips go when the answer does, or when the repository changes.
+  - **Any commit can start the question.** *Suspects since* in the details pane
+    makes the commit on screen the last known good and switches to the list,
+    running at once when a symptom is already named.
+  - **Blame, a diff hunk and the code graph can ask too.** Blame's toolbar has
+    *Suspects* for the blamed file, a diff hunk names the symbol it changes
+    with *suspects* beside it, and a code-graph node's connections panel offers
+    *Find suspects for …* by its DevMap id. The palette gains *Find suspects
+    for the open file*. All of them land on Graph's Suspects list through one
+    entry point (`codeintel/openSuspects.ts`) and ask at once.
+  - **Branch and Reset act on the commit in the details pane**, whichever list
+    selected it, instead of sitting on every HEAD-moves row. They are the same
+    two actions as the graph's row menu, which gains *Reset Branch Here (keep
+    changes)…*; one module owns both (`branches/commitActions.ts`), where the
+    row menu and the reflog each had their own branch-at-commit. The reset
+    still previews every commit that would leave the branch, still names the
+    reflog entry it came from, and still uses `reset --keep`. HEAD moves now
+    reloads whenever HEAD moves, not only after its own buttons.
+  - **One selection path for all three lists** (`repoStore.selectHistoryCommit`).
+    The answer lives in a store (`codeintel/suspectsQuery.ts`) rather than in
+    the pane, so switching lists keeps it; the code-graph client still loads on
+    first run, not with History.
+
 - **The reflog is part of History › Graph, not its own section.** A
   *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
-  reflog, with the commit details below either list. History has three
-  sections now (Graph, Diff, Suspects), so Suspects moves from ⌥4 to ⌥3 and
-  the Go → History menu loses its Reflog item. *Open Reflog — HEAD movements
+  reflog, with the commit details below either list. History had three
+  sections after this (Graph, Diff, Suspects; Suspects then folded into Graph
+  too, above), so Suspects moved from ⌥4 to ⌥3 and the Go → History menu lost
+  its Reflog item. *Open Reflog — HEAD movements
   and recovery points* in the command palette still opens it, and a session
   saved on the old Reflog section reopens on the HEAD-moves list.
   - **Clicking an entry selects it in place.** It used to select the commit on

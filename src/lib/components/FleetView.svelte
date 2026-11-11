@@ -36,18 +36,19 @@
   /** Tone for a row's severity stripe. Spelled out so a new severity is a
    *  compile-time gap rather than a stripe that silently renders as default. */
   export const SEVERITY_STRIPE: Record<FleetRow["severity"], string> = {
-    conflicts: "bg-rose-500",
-    operation: "bg-amber-500",
-    unknown: "bg-textMuted/50",
-    uncommitted: "bg-sky-500",
-    unpushed: "bg-sky-500/60",
+    conflicts: "bg-danger",
+    operation: "bg-warn",
+    unknown: "bg-unknown",
+    uncommitted: "bg-info",
+    unpushed: "bg-info/60",
     stash: "bg-textMuted/40",
-    clean: "bg-emerald-500/50",
+    clean: "bg-ok/50",
   };
 </script>
 
 <script lang="ts">
   import { untrack } from "svelte";
+  import { recomputeWhileActive } from "../runtime/recomputeWhileActive";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   let cleanerOpen = $state(false);
   /**
@@ -81,8 +82,6 @@
     RefreshCw,
     Search,
     ShieldAlert,
-    Square,
-    SquareCheck,
     SquareCode,
     Trash2,
     Trees,
@@ -123,10 +122,12 @@
     runIndexSweep,
     summarizeIndexSweep,
   } from "../fleet/indexSweep";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import { LAYERS } from "../ui/layers";
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { isImeComposition } from "../keyboard/imeGuard";
   import EmptyState from "./EmptyState.svelte";
+  import Toggle from "./Toggle.svelte";
   import FleetCell from "./FleetCell.svelte";
   import FleetLanguageBar from "./FleetLanguageBar.svelte";
   import FleetPulsePanel from "./FleetPulse.svelte";
@@ -134,39 +135,68 @@
   import FleetTotals, { type FleetTotal } from "./FleetTotals.svelte";
   import VirtualList from "./VirtualList.svelte";
 
+  /** "Couldn't <verb> <object>. <Reason>", the one template for an error toast. */
+  function failureLine(verb: string, object: string, err: unknown): string {
+    const failure = describeFailure({ verb, object }, err);
+    return failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
+  }
+
   let filter = $state<FleetFilter>("all");
   let query = $state("");
   let sort = $state<SortState>(DEFAULT_SORT);
   let focusedIndex = $state(0);
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
 
-  const openFacts = $derived.by(() => {
-    // Touch the session fields the facts are derived from so this re-runs
-    // whenever any of them changes.
-    void $repoStore.openTabs;
-    void $repoStore.statuses;
-    void $repoStore.operation;
-    void $repoStore.stashEntries;
-    void $repoStore.watch;
-    return repoStore.repoFacts();
-  });
+  /**
+   * Whether the Fleet surface is the one on screen. The view stays mounted
+   * behind `class:hidden`, so without this every publish of any session
+   * recomputed every tab's facts for a grid nobody could see. While false the
+   * three inputs below hold their last value and read nothing from the stores;
+   * when it turns true they recompute, so the grid is current when shown.
+   */
+  let { active = true }: { active?: boolean } = $props();
 
-  const recents = $derived.by(() => {
-    const openPaths = openFacts.map((facts) => facts.path);
-    const paths = $repoStore.recentRepos.filter((path) => !isPathAmong(path, openPaths, pathOpts));
-    const labels = disambiguateLabels(paths);
-    return paths.map((path) => ({ path, label: labels.get(path) ?? displayName(path) }));
-  });
+  const openFacts = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () => {
+        // Touch the session fields the facts are derived from so this re-runs
+        // whenever any of them changes.
+        void $repoStore.openTabs;
+        void $repoStore.statuses;
+        void $repoStore.operation;
+        void $repoStore.stashEntries;
+        void $repoStore.watch;
+        return repoStore.repoFacts();
+      },
+    ),
+  );
 
-  const rows = $derived(
-    buildFleetRows({
-      open: openFacts,
-      recents,
-      snapshot: $fleetStore.snapshot,
-      snapshotError: $fleetStore.snapshotError,
-      scanFailures: $fleetStore.scanFailures,
-      now: Date.now(),
-    }),
+  const recents = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () => {
+        const openPaths = openFacts.map((facts) => facts.path);
+        const paths = $repoStore.recentRepos.filter((path) => !isPathAmong(path, openPaths, pathOpts));
+        const labels = disambiguateLabels(paths);
+        return paths.map((path) => ({ path, label: labels.get(path) ?? displayName(path) }));
+      },
+    ),
+  );
+
+  const rows = $derived.by(
+    recomputeWhileActive(
+      () => active,
+      () =>
+        buildFleetRows({
+          open: openFacts,
+          recents,
+          snapshot: $fleetStore.snapshot,
+          snapshotError: $fleetStore.snapshotError,
+          scanFailures: $fleetStore.scanFailures,
+          now: Date.now(),
+        }),
+    ),
   );
 
   // Filter, then search, then order. The severity sort delegates to the same
@@ -465,7 +495,7 @@
       const failure = firstIndexFailure(report);
       toastStore.warning(failure ? `${line} — ${failure.label}: ${failure.reason}` : line);
     } catch (err: unknown) {
-      toastStore.warning(`Could not index the fleet: ${formatError(err)}`);
+      toastStore.warning(failureLine("index", "the fleet", err));
     } finally {
       indexing = false;
       indexProgress = null;
@@ -499,10 +529,10 @@
       } else if (result.status === "skipped") {
         toastStore.warning(`Skipped ${row.label} — ${result.reason ?? "it is not in a fetchable state."}`);
       } else {
-        toastStore.warning(`Could not fetch ${row.label}: ${result.error ?? "the fetch failed."}`);
+        toastStore.warning(failureLine("fetch", row.label, result.error ?? "The remote did not answer."));
       }
     } catch (err: unknown) {
-      toastStore.warning(`Could not fetch ${row.label}: ${formatError(err)}`);
+      toastStore.warning(failureLine("fetch", row.label, err));
     } finally {
       syncing = null;
       syncProgress = null;
@@ -656,13 +686,13 @@
   onkeydown={onGridKeydown}
 >
   <!-- Header band: the one sentence, then the totals. -->
-  <header class="shrink-0 border-b border-border gp-section-edge px-4 py-3 flex flex-col gap-3">
+  <header class="shrink-0 bg-surface px-4 py-3 flex flex-col gap-3">
     <div class="flex items-start gap-3">
       <div class="flex items-center gap-2 min-w-0 flex-1">
         <LayoutGrid size={16} class="text-accent shrink-0" />
         <div class="min-w-0">
           <h1 class="text-sm font-semibold text-textPrimary">Fleet</h1>
-          <p class="text-[11px] text-textMuted truncate" data-testid="fleet-headline">
+          <p class="text-meta text-textMuted truncate" data-testid="fleet-headline">
             {headline.sentence}
           </p>
         </div>
@@ -670,7 +700,8 @@
       <div class="flex items-center gap-1.5 shrink-0">
         <button
           type="button"
-          class="gp-btn py-1! px-2! text-[11px]!"
+          class="gp-btn"
+          data-size="sm"
           onclick={() => void fleetStore.refresh(sweepPaths)}
           disabled={$fleetStore.snapshotLoading}
           title="Re-read worktrees, agent sessions, commit history and last activity. Cheap: two git calls per repository, three for one that has been quiet all quarter."
@@ -681,6 +712,7 @@
         <button
           type="button"
           class="gp-icon-btn"
+          data-size="sm"
           onclick={() => interfaceStore.setFleetOpen(false)}
           title="Close Fleet"
           aria-label="Close Fleet"
@@ -691,14 +723,15 @@
     </div>
 
     {#if $fleetStore.snapshotError}
-      <div
-        class="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-700 dark:text-rose-300"
-        role="alert"
-      >
-        <CircleAlert size={12} class="shrink-0 mt-0.5" />
-        <span>
-          Worktrees, agent sessions, commit history and last activity could not be read for any
-          repository: {$fleetStore.snapshotError}
+      {@const unread = describeFailure(
+        { verb: "read", object: "worktrees, agent sessions, commit history or last activity for any repository" },
+        $fleetStore.snapshotError,
+      )}
+      <div class="gp-notice text-meta" data-tone="danger" role="alert">
+        <CircleAlert size={12} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+        <span class="min-w-0 flex-1">
+          {unread.headline}
+          {#if unread.detail}{unread.detail}{/if}
         </span>
       </div>
     {/if}
@@ -709,8 +742,8 @@
     <FleetTotals totals={totalStrip} />
   </header>
 
-  <div class="shrink-0 px-4 py-2 border-b border-border">
-    <button class="gp-btn" aria-expanded={cleanerOpen} onclick={() => cleanerOpen = !cleanerOpen}>Global build cleaner</button>
+  <div class="shrink-0 px-4 py-2">
+    <button class="gp-btn" data-size="sm" aria-expanded={cleanerOpen} onclick={() => cleanerOpen = !cleanerOpen}>Global build cleaner</button>
     {#if cleanerOpen}<div class="max-h-[60vh] overflow-auto py-4"><GlobalCleaner /></div>{/if}
   </div>
 
@@ -728,28 +761,30 @@
   />
 
   <!-- Toolbar: filter, search, and the four scans that cost something. -->
-  <div class="shrink-0 border-b border-border gp-section-edge px-4 py-2 flex flex-wrap items-center gap-2">
+  <div class="shrink-0 bg-surface px-4 py-2 flex flex-wrap items-center gap-2">
     <div class="flex items-center gap-1" role="group" aria-label="Filter repositories">
       <button
         type="button"
-        class="gp-chip {filter === 'all' ? 'ring-1 ring-accent/60' : ''}"
+        class="gp-chip cursor-pointer"
+        data-kind="label"
+        data-tone={filter === "all" ? "accent" : "neutral"}
         aria-pressed={filter === "all"}
         onclick={() => (filter = "all")}>All ({rows.length})</button
       >
       <button
         type="button"
-        class="gp-chip {filter === 'attention' ? 'ring-1 ring-accent/60' : ''}"
+        class="gp-chip cursor-pointer"
+        data-kind="label"
+        data-tone={filter === "attention" ? "accent" : "neutral"}
         aria-pressed={filter === "attention"}
         onclick={() => (filter = "attention")}>Needs attention ({headline.attention})</button
       >
     </div>
 
-    <!-- Same shape as the History filter, so the one search box in the app
-         does not have two appearances. -->
-    <div
-      class="flex items-center gap-1.5 w-56 bg-background border border-border/80 rounded-full px-2.5 py-0.5 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-(--ring-focus)"
-    >
-      <Search size={12} class="text-textMuted shrink-0" />
+    <!-- The one search field of the app: a gp-field pill with the icon and the
+         clear button laid over its padding. -->
+    <div class="relative w-56">
+      <Search size={12} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted" />
       <label class="sr-only" for="gitpulse-fleet-filter">
         Filter repositories by name, path, branch or language
       </label>
@@ -758,7 +793,7 @@
         type="text"
         bind:value={query}
         placeholder="Filter by name, branch, language…"
-        class="w-full bg-transparent text-textPrimary placeholder:text-textMuted/60 text-[11px] focus:outline-hidden"
+        class="gp-field w-full pl-7! pr-7!"
         data-testid="fleet-search"
       />
       {#if query !== ""}
@@ -767,7 +802,8 @@
           onclick={() => (query = "")}
           aria-label="Clear repository filter"
           title="Clear filter"
-          class="gp-icon-btn p-0.5!"
+          class="gp-icon-btn absolute right-0.5 top-1/2 -translate-y-1/2"
+          data-size="sm"
         >
           <X size={11} />
         </button>
@@ -775,7 +811,7 @@
     </div>
 
     {#if query.trim() !== ""}
-      <span class="text-[10px] text-textMuted tabular-nums" role="status">
+      <span class="text-micro text-textMuted tabular-nums" role="status">
         {visibleRows.length} of {applyFilter(rows, filter).length} match
       </span>
     {/if}
@@ -785,12 +821,12 @@
     <!-- Fetch and pull are the two operations that change repositories; they
          sit apart from the four scans, which only measure them. -->
     {#if syncing && syncProgress}
-      <span class="text-[11px] text-textMuted tabular-nums" role="status">
+      <span class="text-meta text-textMuted tabular-nums" role="status">
         {syncing === "fetch" ? "Fetching" : "Pulling"}: {syncProgress.done}/{syncProgress.total}
       </span>
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         onclick={() => {
           if (syncToken) syncToken.aborted = true;
         }}
@@ -800,7 +836,7 @@
     {:else}
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         disabled={targets.length === 0 || $fleetStore.scanning !== null}
         onclick={() => void syncAll("fetch")}
         title="Fetch every open repository. Repositories parked mid-operation, still loading, or holding conflicts are skipped and reported as skipped — never counted as fetched."
@@ -810,7 +846,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         disabled={targets.length === 0 || $fleetStore.scanning !== null}
         onclick={() => void syncAll("pull")}
         title="Pull every open repository. Same skip rules as Fetch all: nothing with uncommitted work or a parked operation is touched."
@@ -818,18 +854,18 @@
         <ArrowDownToLine size={11} />
         <span>Pull all</span>
       </button>
-      <div class="h-3.5 w-1 rounded-full bg-border/50" aria-hidden="true"></div>
+      <div class="h-3.5 w-1 rounded-full bg-edgeSoft" aria-hidden="true"></div>
     {/if}
 
     <!-- Indexing is local and touches nothing git tracks, so it is not gated on
          the sync state the two operations above share. -->
     {#if indexing && indexProgress}
-      <span class="text-[11px] text-textMuted tabular-nums" role="status" data-testid="fleet-index-progress">
+      <span class="text-meta text-textMuted tabular-nums" role="status" data-testid="fleet-index-progress">
         Indexing: {indexProgress.done}/{indexProgress.total}
       </span>
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         onclick={() => {
           if (indexToken) indexToken.aborted = true;
         }}
@@ -839,16 +875,16 @@
     {:else}
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         data-testid="fleet-index-all"
         disabled={targets.length === 0 || $fleetStore.scanning !== null}
         onclick={() => void indexAll()}
-        title="Build the DevMap code index for every open repository, one at a time. Writes only each repository's own ignored state directory — nothing git tracks. Repositories that are already current are reported as such rather than rebuilt."
+        title="Build the code map for every open repository, one at a time. Writes only each repository's own ignored state directory — nothing git tracks. Repositories that are already current are reported as such rather than rebuilt."
       >
         <SquareCode size={11} />
         <span>Index all</span>
       </button>
-      <div class="h-3.5 w-1 rounded-full bg-border/50" aria-hidden="true"></div>
+      <div class="h-3.5 w-1 rounded-full bg-edgeSoft" aria-hidden="true"></div>
     {/if}
 
     <!-- Columns and density. A grid of eleven columns is not the same grid for
@@ -856,7 +892,7 @@
     <div class="relative">
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
+        class="gp-btn" data-size="sm"
         aria-expanded={columnMenuOpen}
         aria-haspopup="true"
         onclick={() => (columnMenuOpen = !columnMenuOpen)}
@@ -871,7 +907,8 @@
       </button>
       {#if columnMenuOpen}
         <div
-          class="absolute right-0 top-full mt-1 z-20 gp-menu gp-pop p-2 w-52 flex flex-col gap-0.5"
+          class="absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-52 flex flex-col gap-0.5"
+          style="z-index: {LAYERS.MENU}"
           role="group"
           aria-label="Grid columns"
           data-testid="fleet-columns-menu"
@@ -879,62 +916,45 @@
           {#each HIDEABLE_COLUMNS as key (key)}
             {@const column = COLUMNS.find((c) => c.key === key)}
             {#if column}
-              <button
-                type="button"
-                class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
-                role="switch"
-                aria-checked={!hiddenColumns.has(key)}
-                onclick={() => interfaceStore.toggleFleetColumn(key)}
-              >
-                {#if hiddenColumns.has(key)}
-                  <Square size={11} class="text-textMuted shrink-0" />
-                {:else}
-                  <SquareCheck size={11} class="text-accent shrink-0" />
-                {/if}
-                <span class="flex-1 text-textPrimary">{column.label}</span>
-              </button>
+              <Toggle
+                label={column.label}
+                checked={!hiddenColumns.has(key)}
+                onchange={() => interfaceStore.toggleFleetColumn(key)}
+              />
             {/if}
           {/each}
-          <div class="border-t border-border/60 mt-1 pt-1 flex flex-col gap-0.5">
-            <button
-              type="button"
-              class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
-              role="switch"
-              aria-checked={$interfaceStore.fleetCompact}
-              onclick={() => interfaceStore.toggleFleetCompact()}
-            >
-              {#if $interfaceStore.fleetCompact}
-                <SquareCheck size={11} class="text-accent shrink-0" />
-              {:else}
-                <Square size={11} class="text-textMuted shrink-0" />
-              {/if}
-              <span class="flex-1 text-textPrimary">Compact rows</span>
-            </button>
-            <button
-              type="button"
-              class="px-1.5 py-1 rounded text-[11px] text-left text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50"
-              disabled={hiddenColumns.size === 0}
-              onclick={() => interfaceStore.showAllFleetColumns()}
-            >
-              Show all columns
-            </button>
-          </div>
+          <span class="gp-menu-sep" aria-hidden="true"></span>
+          <Toggle
+            label="Compact rows"
+            checked={$interfaceStore.fleetCompact}
+            onchange={() => interfaceStore.toggleFleetCompact()}
+          />
+          <button
+            type="button"
+            class="gp-btn self-start"
+            data-variant="ghost"
+            data-size="sm"
+            disabled={hiddenColumns.size === 0}
+            onclick={() => interfaceStore.showAllFleetColumns()}
+          >
+            Show all columns
+          </button>
         </div>
       {/if}
     </div>
 
     {#if $fleetStore.scanning && $fleetStore.progress}
-      <span class="text-[11px] text-textMuted tabular-nums" role="status">
+      <span class="text-meta text-textMuted tabular-nums" role="status">
         {FAMILY_LABEL[$fleetStore.scanning]}: {$fleetStore.progress.done}/{$fleetStore.progress.total}
       </span>
-      <button type="button" class="gp-btn py-1! px-2! text-[11px]!" onclick={() => fleetStore.cancelScan()}>
+      <button type="button" class="gp-btn" data-size="sm" onclick={() => fleetStore.cancelScan()}>
         Stop
       </button>
     {:else}
       {#each SCAN_FAMILIES as family (family)}
         <button
           type="button"
-          class="gp-btn py-1! px-2! text-[11px]!"
+          class="gp-btn" data-size="sm"
           disabled={targets.length === 0 || syncing !== null}
           onclick={() => void sweep(family)}
           title="Run this scan across every open repository. Nothing here runs on its own — storage walks the whole tree and the audit spawns your package manager. To fill in one repository, click its cell instead."
@@ -953,19 +973,25 @@
        failure disappear with it would be the same lie as a blank cell, moved
        up a level — so hiding is allowed, and what hiding cost is reported. -->
   {#if hiddenIssues.length > 0}
-    <p
-      class="shrink-0 border-b border-border px-4 py-1.5 text-[10px] text-amber-600 dark:text-amber-400"
-      role="status"
-      data-testid="fleet-hidden-failures"
-    >
-      Hidden columns are holding failures:
-      {hiddenIssues
-        .map(
-          (issue) =>
-            `${COLUMNS.find((c) => c.key === issue.key)?.label ?? issue.key} (${issue.count})`,
-        )
-        .join(", ")}. Show the column to see which repositories.
-    </p>
+    <div class="shrink-0 px-4 py-2">
+      <p
+        class="gp-notice text-micro"
+        data-tone="warn"
+        role="status"
+        data-testid="fleet-hidden-failures"
+      >
+        <CircleAlert size={11} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
+        <span class="min-w-0 flex-1">
+          Hidden columns are holding failures:
+          {hiddenIssues
+            .map(
+              (issue) =>
+                `${COLUMNS.find((c) => c.key === issue.key)?.label ?? issue.key} (${issue.count})`,
+            )
+            .join(", ")}. Show the column to see which repositories.
+        </span>
+      </p>
+    </div>
   {/if}
 
   <!-- The grid. -->
@@ -975,7 +1001,7 @@
         icon={FolderGit2}
         title="No repositories yet"
         hint="Open a repository and it appears here, alongside every other one you are working in."
-        action={{ label: "Open Repository", onClick: () => void repoStore.pickAndOpenRepo() }}
+        action={{ label: "Open repository", onClick: () => void repoStore.pickAndOpenRepo() }}
       />
     {:else if visibleRows.length === 0 && query.trim() !== ""}
       <EmptyState
@@ -1014,9 +1040,9 @@
         action={{ label: "Show all", onClick: () => (filter = "all") }}
       />
     {:else}
-      <table class="w-full text-[11px] border-collapse">
-        <thead class="sticky top-0 z-10 bg-surface">
-          <tr class="text-left text-textMuted uppercase tracking-wider text-[10px]">
+      <table class="w-full text-meta border-collapse">
+        <thead class="sticky top-0 bg-surface" style="z-index: {LAYERS.STICKY}">
+          <tr class="gp-label text-left">
             {#each shownColumns as column (column.key)}
               <th
                 scope="col"
@@ -1048,7 +1074,7 @@
         </thead>
         {#snippet repoRow(row: FleetRow, index: number)}
             <tr
-              class="border-t border-border/60 hover:bg-surfaceHover/60 focus-within:bg-surfaceHover/60 {row.presence ===
+              class="hover:bg-surfaceHover/60 focus-within:bg-surfaceHover/60 {row.presence ===
               'recent'
                 ? 'opacity-60'
                 : ''}"
@@ -1075,17 +1101,17 @@
                     <span class="flex items-center gap-1.5">
                       <span class="font-medium text-textPrimary truncate">{row.label}</span>
                       {#if row.presence === "recent"}
-                        <span class="gp-chip py-0! px-1! text-[9px]!">not open</span>
+                        <span class="gp-chip" data-kind="count" data-tone="neutral">not open</span>
                       {/if}
                       {#if row.watchWarning}
                         <CircleAlert
                           size={10}
-                          class="text-amber-600 dark:text-amber-400 shrink-0"
+                          class="text-warn shrink-0"
                           aria-label={row.watchWarning}
                         />
                       {/if}
                     </span>
-                    <span class="flex items-center gap-1 text-[10px] text-textMuted">
+                    <span class="flex items-center gap-1 text-micro text-textMuted">
                       {#if row.branch}
                         <GitBranch size={9} class="shrink-0" />
                         <span class="truncate max-w-40">{row.branch}</span>
@@ -1108,9 +1134,9 @@
                     <button type="button" class="text-textPrimary hover:text-accent hover:underline" title="Preview uncommitted files and modifications in {row.label}"
                       onclick={() => void repoStore.previewUncommitted(row.path)}>
                     <span>{row.changes.value.files}</span>
-                    <span class="text-textMuted text-[10px]">
+                    <span class="text-textMuted text-micro">
                       {#if row.changes.value.conflicted > 0}
-                        <span class="text-rose-600 dark:text-rose-400"
+                        <span class="text-danger"
                           >{row.changes.value.conflicted}✗</span
                         >
                       {/if}
@@ -1131,7 +1157,7 @@
                 >
                   {#if row.sync.kind === "read"}
                     <span class="text-textPrimary">↑{row.sync.value.ahead}</span>
-                    <span class="text-textMuted text-[10px]">
+                    <span class="text-textMuted text-micro">
                       ↓{row.sync.value.behind}{row.sync.value.stash > 0
                         ? ` · ${row.sync.value.stash} stashed`
                         : ""}
@@ -1141,7 +1167,8 @@
                            "↓3" is exactly where someone decides to fetch. -->
                       <button
                         type="button"
-                        class="p-0.5 rounded text-textMuted/60 hover:text-accent hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40"
+                        class="gp-icon-btn disabled:opacity-40"
+                        data-size="sm"
                         disabled={syncing !== null || $fleetStore.scanning !== null}
                         title="Fetch {row.label}"
                         aria-label="Fetch {row.label}"
@@ -1173,7 +1200,9 @@
                     {#if row.work.value.agentSessions > 0}
                       <button
                         type="button"
-                        class="rounded-full px-1 text-[10px] text-textMuted hover:bg-surfaceHover hover:text-accent"
+                        class="gp-chip cursor-pointer hover:text-accent"
+                        data-kind="label"
+                        data-tone="neutral"
                         data-testid="fleet-open-agents"
                         title={agentKindsTitle(row.work.value.agentKinds)}
                         onclick={(e) => {
@@ -1212,7 +1241,7 @@
                       <span class="text-textPrimary">{row.commits.value.commits}</span>
                     </span>
                     <span
-                      class="text-[10px] text-textMuted"
+                      class="text-micro text-textMuted"
                       title="{row.commits.value.authors} author {row.commits.value.authors === 1
                         ? 'email'
                         : 'emails'}, active on {row.commits.value.activeDays} of the last {row.commits
@@ -1254,7 +1283,7 @@
                       <span class="inline-flex items-baseline gap-1">
                         <span class="text-textPrimary">{row.loc.value.lines.toLocaleString()}</span>
                         {#if row.loc.value.language}
-                          <span class="text-[10px] text-textMuted">{row.loc.value.language}</span>
+                          <span class="text-micro text-textMuted">{row.loc.value.language}</span>
                         {/if}
                       </span>
                       {#if row.loc.value.languages.length > 0}
@@ -1285,7 +1314,7 @@
                     <span class="text-textPrimary">{humanBytes(row.storage.value.bytes)}</span>
                     {#if row.storage.value.reclaimableBytes > 0}
                       <span
-                        class="text-[10px] text-amber-600 dark:text-amber-400"
+                        class="text-micro text-warn"
                         title="Build output and caches that can be deleted"
                         >{humanBytes(row.storage.value.reclaimableBytes)} reclaimable</span
                       >
@@ -1309,7 +1338,7 @@
                   {#if row.health.kind === "read"}
                     <span
                       class={row.health.value.total > 0
-                        ? "text-rose-600 dark:text-rose-400"
+                        ? "text-danger"
                         : "text-textPrimary"}
                       title={formatAuditCounts(row.health.value, {
                         complete: row.health.value.complete,
@@ -1342,7 +1371,9 @@
               <td class="{cellPad} align-top text-right">
                 <button
                   type="button"
-                  class="p-1 rounded text-textMuted hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  data-tone="danger"
                   title={row.presence === "open"
                     ? `Remove ${row.label} from Fleet (closes repository)`
                     : `Remove ${row.label} from Fleet`}
@@ -1374,11 +1405,11 @@
                 <th
                   colspan={shownColumns.length + 1}
                   scope="colgroup"
-                  class="text-left px-3 py-1.5 bg-surface/60 border-t border-border/60"
+                  class="text-left px-3 py-1.5 bg-surface/60"
                 >
                   <button
                     type="button"
-                    class="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-semibold text-textMuted hover:text-textPrimary transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
+                    class="gp-label inline-flex items-center gap-1.5 font-semibold hover:text-textPrimary transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
                     aria-expanded={!bandCollapsed}
                     onclick={() => toggleBand(band.severity)}
                     data-testid="fleet-band-toggle"
@@ -1409,7 +1440,7 @@
                 >
                   {#snippet row(row, index)}
                     {#if row}
-                      <table class="w-full text-[11px] border-collapse table-fixed">
+                      <table class="w-full text-meta border-collapse table-fixed">
                         <tbody>
                           {@render repoRow(row, index)}
                         </tbody>
@@ -1431,7 +1462,7 @@
 
       {#if $fleetStore.snapshot?.truncated}
         {@const snapshot = $fleetStore.snapshot}
-        <p class="px-4 py-2 text-[10px] text-amber-600 dark:text-amber-400" role="status">
+        <p class="gp-notice mx-4! my-2 text-micro" data-tone="warn" role="status">
           {#if snapshot.requested > snapshot.repos.length}
             <!-- The repository cap, not the clock: refreshing sends the same
                  list and reaches the same ones, so it must not promise more. -->

@@ -1,12 +1,12 @@
-import { invoke } from "../ipc/invoke";
 import { createAsyncGuard } from "../async/guard";
+import { listRepoFiles } from "../files/repoListing";
 import { searchSymbols, searchWorkspaceSymbols, listWorkspaceRepos } from "../codeintel/client";
 import type { CodeintelSymbolHit, WorkspaceFederatedHit, WorkspaceRepoEntry } from "../codeintel/types";
 import { boundText, boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
 import type { PaletteMode } from "./model";
 
 export interface SearchResult {
-  files: string[];
+  files: readonly string[];
   symbols: CodeintelSymbolHit[];
   workspace: WorkspaceFederatedHit[];
   repos: WorkspaceRepoEntry[];
@@ -22,7 +22,7 @@ export const searchDependencies = {
   symbols: searchSymbols,
   workspace: searchWorkspaceSymbols,
   repos: listWorkspaceRepos,
-  files: (repoPath: string) => invoke<string[]>("cmd_list_repo_files", { repoPath }),
+  files: (repoPath: string) => listRepoFiles(repoPath),
 };
 
 /** One lifecycle for all remote providers: debounce, clear stale rows, deadline, cleanup.

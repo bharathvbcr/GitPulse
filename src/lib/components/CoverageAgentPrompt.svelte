@@ -7,8 +7,9 @@
   import { repoStore } from "../stores/repoStore";
   import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
   import { PROVIDER_LABELS } from "../workbench/taskHandoff";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure, type FailureCopy } from "../ui/copy/describeFailure";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
+  import Checkbox from "./Checkbox.svelte";
 
   let { repoPath, report, exclusions = [], scanFailed = false, focus, selectedScope = $bindable(false), onRescan, scanning = false }: {
     repoPath: string | null;
@@ -35,7 +36,9 @@
   let copying = $state(false);
   let launching = $state(false);
   let previewOpen = $state(false);
-  let error = $state<string | null>(null);
+  let failure = $state<FailureCopy | null>(null);
+  const uid = $props.id();
+  const focusId = `coverage-focus-${uid}`;
   let notice = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
   let launchController: AbortController | undefined;
@@ -45,7 +48,7 @@
     // Feedback always refers to the snapshot currently shown in the preview.
     void prompt;
     copied = false;
-    error = null;
+    failure = null;
     clearTimeout(copyTimer);
   });
 
@@ -60,7 +63,7 @@
     const text = prompt;
     copying = true;
     copied = false;
-    error = null;
+    failure = null;
     const ok = await copyText(text);
     if (destroyed) return;
     copying = false;
@@ -70,7 +73,7 @@
       clearTimeout(copyTimer);
       copyTimer = setTimeout(() => { copied = false; }, 1800);
     } else {
-      error = "Could not copy. Select and copy the prompt from the preview.";
+      failure = describeFailure({ verb: "copy", object: "the prompt" }, "Select and copy it from the preview.");
       previewOpen = true;
     }
   }
@@ -78,7 +81,7 @@
   async function runAgent(launcher: PromptLauncher) {
     if (!repoPath || launching) return;
     launching = true;
-    error = null;
+    failure = null;
     notice = null;
     launchController = new AbortController();
     try {
@@ -87,7 +90,7 @@
       await opened;
       if (!destroyed) notice = "Agent session opened in the terminal. Follow progress below, then Rescan coverage.";
     } catch (err: unknown) {
-      if (!destroyed) error = formatError(err);
+      if (!destroyed) failure = describeFailure({ verb: "run", object: "the agent" }, err);
     } finally {
       if (!destroyed) launching = false;
     }
@@ -105,16 +108,18 @@
   tooltip, and the preview stays a `<details>` — a chip on this row when
   closed, a full-width panel when open.
 -->
-<section aria-label="Generate coverage with a coding agent" class="shrink-0 border-b border-border/60 bg-surface/40 px-4 py-1.5 font-sans max-h-[45%] overflow-y-auto">
+<section aria-label="Generate coverage with a coding agent" class="shrink-0 bg-surface/40 px-4 py-1.5 font-sans max-h-[45%] overflow-y-auto">
   <div class="flex flex-wrap items-center gap-x-2 gap-y-1.5">
     <Terminal size={13} class="shrink-0 text-textMuted" />
-    <span class="shrink-0 text-textMuted">Agent</span>
-    <select aria-label="Coverage coding agent" bind:value={launcher} class="gp-select max-w-40 py-1 text-[11px]">
+    <span class="gp-label shrink-0">Agent</span>
+    <select aria-label="Coverage coding agent" bind:value={launcher} class="gp-select max-w-40">
       {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
     </select>
     <button
       type="button"
-      class="gp-btn-primary py-1! px-2.5! text-[11px]!"
+      class="gp-btn"
+      data-variant="primary"
+      data-size="sm"
       aria-label={`Run in ${PROVIDER_LABELS[launcher]}`}
       title="Runs in GitPulse’s terminal with this repository as the working directory"
       disabled={!repoPath || launching}
@@ -124,7 +129,8 @@
     </button>
     <button
       type="button"
-      class="gp-btn py-1! px-2.5! text-[11px]!"
+      class="gp-btn"
+      data-size="sm"
       title="Copy the prompt for an agent session you already have open"
       disabled={!repoPath || copying}
       onclick={() => void copyPrompt()}
@@ -134,30 +140,34 @@
       {copied ? "Copied" : "Copy prompt"}
     </button>
     {#if focus}
-      <label class="gp-chip min-w-0 cursor-pointer border-border/70 text-textMuted hover:text-textPrimary" title="Scope the prompt to {focus.file.path}">
-        <input type="checkbox" bind:checked={selectedScope} class="shrink-0" />
-        <span class="truncate">Focus on {focus.file.path}</span>
-      </label>
+      <span class="gp-chip min-w-0" data-tone="neutral" title="Scope the prompt to {focus.file.path}">
+        <Checkbox id={focusId} ariaLabel="Focus on {focus.file.path}" checked={selectedScope} onchange={(next) => { selectedScope = next; }} />
+        <label for={focusId} class="min-w-0 cursor-pointer truncate hover:text-textPrimary">Focus on {focus.file.path}</label>
+      </span>
     {/if}
     <!-- Full width only while open, so the closed disclosure costs this row's
          tail rather than a row of its own. -->
-    <details class="text-[11px] {previewOpen ? 'w-full' : 'ml-auto shrink-0'}" bind:open={previewOpen}>
-      <summary class="gp-chip w-fit cursor-pointer border-border/70 text-textMuted hover:text-textPrimary">Preview prompt</summary>
+    <details class="text-meta {previewOpen ? 'w-full' : 'ml-auto shrink-0'}" bind:open={previewOpen}>
+      <summary class="gp-chip w-fit cursor-pointer hover:text-textPrimary" data-tone="neutral" data-kind="label">Preview prompt</summary>
       <p class="my-2 text-textMuted">Includes this checkout’s path, accepted report locations and coverage snapshot. The agent runs tests using its configured permissions; artifacts appear after Rescan.</p>
-      <textarea aria-label="Coverage agent prompt" readonly value={prompt} spellcheck={false} class="gp-field gp-field-multi h-48 w-full resize-y p-3 font-mono text-[11px] leading-relaxed"></textarea>
+      <textarea aria-label="Coverage agent prompt" readonly value={prompt} spellcheck={false} class="gp-field gp-field-multi h-48 w-full resize-y p-3 font-mono text-meta leading-relaxed"></textarea>
     </details>
   </div>
   {#if recentSession}
-    <div class="mt-1.5 flex flex-wrap items-center gap-2 text-[11px]">
+    <div class="mt-1.5 flex flex-wrap items-center gap-2 text-meta">
       <span class="text-textMuted">{PROVIDER_LABELS[recentSession.launcher]} session: {recentSession.status}</span>
-      <button type="button" class="gp-btn py-0.5! px-2!" onclick={() => { repoStore.setTerminalOpen(true); recentSession?.reveal(); }}>View agent session</button>
-      <button type="button" class="gp-btn py-0.5! px-2!" disabled={scanning} onclick={onRescan}><RefreshCw size={11} /> Rescan results</button>
+      <button type="button" class="gp-btn" data-size="sm" onclick={() => { repoStore.setTerminalOpen(true); recentSession?.reveal(); }}>View agent session</button>
+      <button type="button" class="gp-btn" data-size="sm" disabled={scanning} onclick={onRescan}><RefreshCw size={11} /> Rescan results</button>
       <span class="text-textMuted">Session status does not verify coverage. Rescan after the report is written.</span>
     </div>
   {/if}
-  {#if !repoPath}<p class="mt-1.5 text-[11px] text-textMuted">Open a repository to generate its coverage prompt.</p>{/if}
-  {#if launching}<p role="status" class="mt-1.5 text-[11px] text-textMuted">Opening agent terminal…</p>{/if}
+  {#if !repoPath}<p class="mt-1.5 text-meta text-textMuted">Open a repository to generate its coverage prompt.</p>{/if}
+  {#if launching}<p role="status" class="mt-1.5 text-meta text-textMuted">Opening agent terminal…</p>{/if}
   {#if copied}<p role="status" class="sr-only">Agent prompt copied</p>{/if}
-  {#if error}<p role="alert" class="mt-1.5 text-[11px] text-rose-400">{error}</p>{/if}
-  {#if notice && !recentSession}<p role="status" class="mt-1.5 text-[11px] text-textMuted">{notice}</p>{/if}
+  {#if failure}
+    <div class="mt-1.5">
+      <div role="alert" class="gp-notice text-meta" data-tone="danger">{failure.headline}{#if failure.detail} {failure.detail}{/if}</div>
+    </div>
+  {/if}
+  {#if notice && !recentSession}<p role="status" class="mt-1.5 text-meta text-textMuted">{notice}</p>{/if}
 </section>

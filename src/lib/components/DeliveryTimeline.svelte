@@ -42,6 +42,8 @@
     type TimelineRow,
   } from "../delivery/timeline";
   import { openExternal } from "../desktop/openExternal";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import EmptyState from "./EmptyState.svelte";
 
   /** How the live poll is doing, so a stopped one can say so. */
   export interface LiveState {
@@ -58,6 +60,7 @@
     error = null,
     sampleNoun = "runs",
     live = { kind: "idle", reason: "" },
+    onRescan,
   }: {
     title: string;
     rows: readonly TimelineRow[];
@@ -67,6 +70,8 @@
     error?: string | null;
     sampleNoun?: string;
     live?: LiveState;
+    /** Re-lists the runs. When the parent supplies it, the "couldn't read" notice offers it. */
+    onRescan?: () => void;
   } = $props();
 
   let expanded = $state(false);
@@ -75,80 +80,82 @@
   const rate = $derived(verdictRate(rows));
   const median = $derived(medianSettledDurationMs(rows, now));
   const longest = $derived(longestDurationMs(rows, now));
+  // The headline is built from the action alone; the backend text is the reason.
+  const failure = $derived(describeFailure({ verb: "read", object: sampleNoun }, error ?? ""));
 
   /**
-   * Bar colour per phase. Both shades on every verdict, matching
-   * `runStateClass` and `rolloutStateClass` — a bare `-400` is tuned for the
-   * dark theme and washes out on the light theme's near-white card.
+   * Bar colour per phase, from the status roles. The role tokens carry both
+   * themes, so no verdict needs a light and a dark shade written out.
    */
   function barClass(phase: TimelineRow["phase"]): string {
-    if (phase === "settled_ok") return "bg-green-600 dark:bg-green-500";
-    if (phase === "settled_bad") return "bg-red-600 dark:bg-red-500";
-    if (phase === "in_flight") return "bg-amber-500 dark:bg-amber-400";
+    if (phase === "settled_ok") return "bg-ok";
+    if (phase === "settled_bad") return "bg-danger";
+    if (phase === "in_flight") return "bg-warn";
     // No verdict to colour: a neutral track, visibly not a pass or a fail.
     return "bg-border";
   }
 
   function textClass(phase: TimelineRow["phase"]): string {
-    if (phase === "settled_ok") return "text-green-700 dark:text-green-400";
-    if (phase === "settled_bad") return "text-red-700 dark:text-red-400";
-    if (phase === "in_flight") return "text-amber-700 dark:text-amber-400";
+    if (phase === "settled_ok") return "text-ok";
+    if (phase === "settled_bad") return "text-danger";
+    if (phase === "in_flight") return "text-warn";
     return "text-textMuted";
   }
 </script>
 
-<div
-  class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-3 min-w-0 w-full"
-  data-panel="delivery"
->
-  <div class="flex items-center gap-2 border-b border-border/50 pb-2.5 flex-wrap min-w-0">
+<div class="gp-card p-4 flex flex-col gap-3 min-w-0 w-full" data-panel="delivery">
+  <div class="flex items-center gap-2 flex-wrap min-w-0">
     <GitCommitHorizontal size={15} class="text-accent shrink-0" />
-    <span class="text-xs font-semibold text-textPrimary uppercase tracking-wider min-w-0 truncate">{title}</span>
+    <span class="text-xs font-semibold text-textPrimary min-w-0 truncate">{title}</span>
     {#if live.kind === "live"}
       <!-- The reason is the tooltip because it also says "retrying after N
            failure(s)": a poll that is struggling but has not given up is
            still live, and hiding that entirely would make the badge a
            promise it cannot keep. -->
-      <span
-        class="inline-flex items-center gap-1 text-[11px] text-amber-700 dark:text-amber-400 min-w-0"
-        title={live.reason}
-      >
+      <span class="gp-chip" data-tone="info" data-kind="label" title={live.reason}>
         <Radio size={12} class="shrink-0" />
         Live
-      </span>
-    {:else if live.kind === "paused"}
-      <!-- The case that must reach the screen: updates have stopped while
-           rows keep rendering. Silence here is how stale reads as current. -->
-      <span
-        class="inline-flex items-center gap-1 text-[11px] text-textMuted min-w-0"
-        title={live.reason}
-      >
-        <PauseCircle size={12} class="shrink-0" />
-        <span class="min-w-0 wrap-break-word">Live updates paused — {live.reason}</span>
       </span>
     {/if}
   </div>
 
+  {#if live.kind === "paused"}
+    <!-- The case that must reach the screen: updates have stopped while
+         rows keep rendering. Silence here is how stale reads as current. -->
+    <div class="gp-notice" data-tone="warn" role="status" title={live.reason}>
+      <PauseCircle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+      <span class="min-w-0 wrap-break-word">Live updates paused — {live.reason}</span>
+    </div>
+  {/if}
+
   {#if !checked}
     <!-- Could not check. Never an empty list: that would read as "nothing to
          report", which is a claim this report cannot make. -->
-    <div class="flex items-start gap-2 text-xs py-3 min-w-0">
-      <CircleAlert size={14} class="text-rose-500 shrink-0 mt-0.5" />
+    <div class="gp-notice" data-tone="unknown" role="status">
+      <CircleAlert size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       <div class="min-w-0">
-        <p class="text-rose-600 dark:text-rose-400 font-medium">
-          Could not read {sampleNoun} — this is not an absence of {sampleNoun}.
+        <p class="font-medium">
+          {failure.headline} This is not an absence of {sampleNoun}.
         </p>
-        {#if error}
-          <p class="font-mono text-[11px] text-textMuted wrap-break-word mt-1">{error}</p>
+        {#if error && failure.detail}
+          <p class="font-mono text-meta text-textMuted wrap-break-word mt-1">{failure.detail}</p>
         {/if}
       </div>
+      {#if onRescan}
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => onRescan?.()}>Rescan</button>
+      {/if}
     </div>
   {:else if rows.length === 0}
-    <p class="text-xs text-textMuted py-3">No {sampleNoun} recorded for this repository.</p>
+    <EmptyState
+      compact
+      icon={GitCommitHorizontal}
+      title="No {sampleNoun} recorded for this repository"
+      hint="They appear here once one has finished."
+    />
   {:else}
     <!-- Derived figures, each stated with the sample behind it. A rate with no
          denominator is the shape that lets 1-of-1 read like 200-of-200. -->
-    <div class="flex items-center gap-x-4 gap-y-1 flex-wrap text-[11px] min-w-0">
+    <div class="flex items-center gap-x-4 gap-y-1 flex-wrap text-meta min-w-0">
       <span class="text-textMuted">
         Passed:
         {#if rate.ratePct === null}
@@ -171,7 +178,7 @@
       <span class="text-textMuted">
         Sample: last <span class="font-mono">{rows.length}</span>
         {#if truncated}
-          <span class="text-amber-700 dark:text-amber-400">(capped — more exist)</span>
+          <span class="text-warn">(capped — more exist)</span>
         {/if}
       </span>
     </div>
@@ -207,16 +214,16 @@
         {@const width = barWidthPct(ms, longest)}
         {@const name = glanceName(row)}
         {@const tip = glanceTitle(row)}
-        {@const tileClass = "flex flex-col gap-1 min-w-0 p-1.5 rounded-lg border border-border/60 bg-surface/40 text-left"}
+        {@const tileClass = "flex flex-col gap-1 min-w-0 p-1.5 rounded-lg border border-edgeSoft bg-surfaceHover/40 text-left"}
         {#snippet glanceBody()}
           <div class="flex items-center gap-1 min-w-0">
             <span class="size-1.5 rounded-full shrink-0 {barClass(row.phase)}" aria-hidden="true"></span>
             <!-- `data-delivery-state` lets a rendered check read a row's
                  verdict without matching the card's "Passed:" rate label. -->
-            <span class="text-[10px] font-medium truncate {textClass(row.phase)}" data-delivery-state={row.phase}>
+            <span class="text-micro font-medium truncate {textClass(row.phase)}" data-delivery-state={row.phase}>
               {glanceState(row.phase)}
             </span>
-            <span class="ml-auto font-mono tabular-nums text-[11px] text-textPrimary shrink-0 whitespace-nowrap">
+            <span class="ml-auto font-mono tabular-nums text-meta text-textPrimary shrink-0 whitespace-nowrap">
               {formatDuration(ms)}
             </span>
           </div>
@@ -229,7 +236,7 @@
               ></span>
             {/if}
           </span>
-          <div class="flex items-center gap-1 min-w-0 text-[10px] text-textMuted">
+          <div class="flex items-center gap-1 min-w-0 text-micro text-textMuted">
             {#if name}
               <span class="truncate min-w-0">{name}</span>
             {/if}
@@ -241,7 +248,7 @@
         {#if row.url}
           <button
             type="button"
-            class="{tileClass} hover:border-accent/50 hover:bg-surface/80 transition-colors"
+            class="{tileClass} hover:border-accent hover:bg-surfaceHover transition-colors"
             data-delivery-row={row.id}
             title={tip}
             aria-label="{name} {glanceState(row.phase)} {formatDuration(ms)}"
@@ -260,7 +267,9 @@
     {#if overflowsPreview(rows.length, TIMELINE_PREVIEW_COUNT)}
       <button
         type="button"
-        class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+        class="gp-btn w-full"
+        data-variant="ghost"
+        data-size="sm"
         data-delivery-expand
         aria-expanded={expanded}
         onclick={() => (expanded = !expanded)}

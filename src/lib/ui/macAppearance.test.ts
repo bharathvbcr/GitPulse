@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "svelte/server";
+import { DURATION_MS, EXIT_MS } from "../motion/tokens";
 import { isMacOS } from "../platform";
 import { cardScale, cardScaleOut, liquidSelection } from "./transitions";
 import ViewTabBar from "../components/ViewTabBar.svelte";
@@ -28,24 +29,30 @@ describe("Mac appearance boundary", () => {
   });
 
   it("uses a softer Mac entrance and preserves a fast exit", () => {
+    // The Mac entrance is the dialog token (320 ms, was a literal 260) and the
+    // exit is the 70 ms exit token (was 60); what stays Mac-specific is the
+    // closer-to-full start scale.
     vi.stubGlobal("navigator", { platform: "MacIntel", maxTouchPoints: 0 });
     const entrance = cardScale(null);
-    expect(entrance.duration).toBe(260);
+    expect(entrance.duration).toBe(DURATION_MS.slow);
+    expect(entrance.duration).toBe(320);
     expect(entrance.start).toBe(0.985);
-    expect(cardScaleOut(null).duration).toBe(60);
+    expect(cardScaleOut(null).duration).toBe(EXIT_MS.slow);
+    expect(cardScaleOut(null).duration).toBe(70);
     expect(cardScaleOut(null).start).toBe(0.985);
+    expect(cardScaleOut(null).duration).toBeLessThan(entrance.duration);
   });
 
   it("resolves reduced motion again for each Mac transition", () => {
     vi.stubGlobal("navigator", { platform: "MacIntel", maxTouchPoints: 0 });
     let reduced = false;
     vi.stubGlobal("window", { matchMedia: () => ({ matches: reduced }) });
-    expect(cardScale().duration).toBe(260);
+    expect(cardScale().duration).toBe(320);
     reduced = true;
     expect(cardScale().duration).toBe(0);
     expect(cardScaleOut().duration).toBe(0);
     reduced = false;
-    expect(cardScale().duration).toBe(260);
+    expect(cardScale().duration).toBe(320);
   });
 
   it("renders one decorative liquid selection per selected control, without duplicating its semantics", () => {

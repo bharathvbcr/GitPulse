@@ -40,11 +40,22 @@
 /// cap, so nothing renderable is lost to it.
 pub const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
-/// `git blame --line-porcelain` output for one file.
+/// One file's blame, bounded twice with this one number.
 ///
-/// Porcelain emits ~10 metadata lines per source line, so this is deliberately
-/// larger than the file-content budget for the same file: 16 MiB of porcelain
-/// is roughly a 40k-line file, past which the blame gutter is not usable.
+/// What git PRINTS: `--porcelain` states a commit's ~10 metadata lines once
+/// and costs a header line (`<oid> <orig> <final>`, about 50 bytes) plus the
+/// line's own text for every source line.
+///
+/// What is SENT: each line crosses IPC as a `BlameLine` of JSON, about 220
+/// bytes of oid, author, email, timestamp and key names plus its text (more
+/// with a longer author name), the same unit the uncommitted-file path already
+/// counted against this budget. That is the binding bound: 16 MiB of JSON is
+/// roughly 70,000 ten-byte lines, or 50,000 hundred-byte ones. It is derived
+/// from the per-line wire cost, not measured in the webview.
+///
+/// A file that outgrows either is refused by name (`Blame unavailable:
+/// exceeded ...`), never returned as a prefix. The ownership scan counts lines
+/// in-process and sends none, so only git's output cap applies to it.
 pub const MAX_BLAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// One working-tree or blob file loaded into the viewer.

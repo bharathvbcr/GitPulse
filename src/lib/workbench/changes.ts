@@ -1,7 +1,7 @@
 /**
  * The one subscription to the host's `workbench-changed` event.
  *
- * Four surfaces (board, archive dock, attention inbox, Manvi ops panel) used
+ * Four surfaces (board, archive dock, attention inbox, and the issue import now on Remote) used
  * to listen for it themselves, each ignoring the payload, and each answered
  * every event with a full reload. The host also announces one write twice:
  * `{sequence}` straight from the writing command, then `{sequence: null,
