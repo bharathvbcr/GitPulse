@@ -2,7 +2,7 @@
 /**
  * design-lint: the mechanical half of docs/design/UI_RULES.md section 1.
  *
- * It implements rules 1-15. Rule 14 (banned copy terms) reads the list owned
+ * It implements rules 1-16. Rule 14 (banned copy terms) reads the list owned
  * by the vocabulary (`BANNED_UI_TERMS` in src/lib/ui/copy/vocabulary.ts); it is
  * one entry in the flat `RULES` registry below. That list is a .ts file, which
  * node loads by type stripping (node 22.18+ / 24+; the repo runs node 26).
@@ -1408,6 +1408,31 @@ export const RULES = [
       for (const [c, at] of reduceAttr) if (!reduceMedia.has(c)) report(at, `.${c} is in the data-motion list but not the prefers-reduced-motion list`);
     },
   },
+  {
+    id: 16,
+    name: "heading-separator",
+    summary: "gp-separator directly under a section heading, which already separates its group",
+    svelte: true,
+    ts: false,
+    css: false,
+    run(m, report) {
+      // A heading is an <h1>-<h6>, or an element carrying `font-semibold` or
+      // `gp-label` whose own content holds no element of the same name. The
+      // separator must follow its closing tag with nothing between: a
+      // separator that divides one group from the next (a menu group, a
+      // heading that comes after it) is not this.
+      const SEPARATOR = String.raw`\s*<(?:div|span|hr)\b[^>]*\bgp-separator\b`;
+      const patterns = [
+        new RegExp(String.raw`<(h[1-6])\b[^>]*>[\s\S]*?</\1>${SEPARATOR}`, "g"),
+        new RegExp(String.raw`<(div|span|p)\b[^>]*\b(?:font-semibold|gp-label)\b[^>]*>(?:(?!</?\1\b)[\s\S])*</\1>${SEPARATOR}`, "g"),
+      ];
+      for (const re of patterns) {
+        for (const hit of m.src.matchAll(re)) {
+          report((hit.index ?? 0) + hit[0].lastIndexOf("<"), "gp-separator under a heading: the heading already separates its group, so use spacing (mb-2 on the heading row)");
+        }
+      }
+    },
+  },
 ];
 
 /** @param {string} name */
@@ -1688,7 +1713,7 @@ function git(root, args) {
 export function usage() {
   return formatUsage({
     name: "design-lint",
-    summary: "Check UI_RULES section 1 (rules 1-15) against a per-rule, per-file baseline that may only go down.",
+    summary: "Check UI_RULES section 1 (rules 1-16) against a per-rule, per-file baseline that may only go down.",
     flags: [
       { flag: "--baseline", description: "write scripts/design-lint.baseline.json from the current tree and HEAD" },
       { flag: "--allow-dirty", description: "with --baseline: accept uncommitted changes under src/" },

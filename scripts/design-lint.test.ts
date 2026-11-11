@@ -34,7 +34,7 @@ function hits(rule: number, name: string, as?: string): Violation[] {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** rule -> [positive count, svelte negative file exists] */
-const SVELTE_RULES: Record<number, number> = { 1: 4, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10 };
+const SVELTE_RULES: Record<number, number> = { 1: 4, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10, 16: 3 };
 
 describe("design-lint rules: one positive and one negative fixture each", () => {
   for (const [rule, expected] of Object.entries(SVELTE_RULES)) {
@@ -189,8 +189,8 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
 });
 
 describe("design-lint registry", () => {
-  it("has one entry per rule 1-15, rule 14 being the single banned-terms entry", () => {
-    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  it("has one entry per rule 1-16, rule 14 being the single banned-terms entry", () => {
+    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     expect(new Set(RULES.map((r) => r.name)).size).toBe(RULES.length);
     for (const r of RULES) expect(r.summary).not.toBe("");
     expect(RULES.filter((r) => r.id === 14).map((r) => r.name)).toEqual(["banned-ui-terms"]);

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "aa588aea659943eb5837cb50364890d6f74bab39",
+  "commit": "d22f86583d9c4e53a7ef63baeab0668c6837f448",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
@@ -80,6 +80,11 @@
     },
     "15": {
       "name": "reduced-motion-lists",
+      "total": 0,
+      "files": {}
+    },
+    "16": {
+      "name": "heading-separator",
       "total": 0,
       "files": {}
     }

@@ -57,6 +57,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 | 13 | `...` in a user-visible string | `…` |
 | 14 | Banned terms in UI strings (§3): `BANNED_UI_TERMS` in `src/lib/ui/copy/vocabulary.ts`, checked in the same `.svelte` user-copy positions as rule 13: markup text, display attributes (`title`, `aria-label`, `placeholder`, `alt`, `label`, `data-tip`) and string literals inside `{…}`. Not checked: `<script>` strings, `.ts` files, `src/lib/ui/copy/` itself. The linter header lists the exact positions and the blind spots. The retired verbs (`RETIRED_VERB_TERMS`) and voice checks (`VOICE_TERMS`) are separate lists, added to the lint in Wave 2 once each view has cleared them. | The glossary word |
 | 15 | An animated class missing from the reduced-motion lists, or a translucent surface missing from the reduced-transparency block | Add it to **both** lists in the same commit. The paired tests pin them equal |
+| 16 | A `gp-separator` directly under a section heading | The heading already separates its group: put `mb-2` on the heading row. A separator that divides one group from the next (a menu group, a heading that follows it) is fine |
 
 ## 2. Use this, never that
 
