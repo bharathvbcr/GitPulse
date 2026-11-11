@@ -993,6 +993,29 @@
           await sleepUntil(() => dropVeil() === null, 3000);
           check("drop: the veil is gone once the folder is dropped", () => dropVeil() === null);
           delete fixtures.cmd_resolve_git_root;
+
+          // ---- 8. closing the docked terminal leaves with a short exit ----------
+          // Docked is the default mode and used to close with no animation at
+          // all. The exit must be a real animation on transform and opacity only,
+          // 70 ms or less, running while the row is still there; only after it
+          // does the dock hide.
+          await switchTo(ALPHA);
+          repoStore.setTerminalOpen(true);
+          await sleepUntil(() => $("[data-terminal-dock]") !== null, 5000);
+          await settle();
+          const dock = () => $("[data-terminal-dock]");
+          check("dock exit: the dock is open and docked (the default mode)", () => !!dock() && dock().dataset.dockMode === "docked" && !dock().classList.contains("hidden"));
+          repoStore.setTerminalOpen(false);
+          await tick();
+          const exitAnims = () => (dock()?.getAnimations() ?? []).filter((a) => a.animationName === "gp-dock-slide-out");
+          const exiting = exitAnims();
+          const animatedProps = exiting.flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k).filter((p) => !["offset", "easing", "composite", "computedOffset"].includes(p))));
+          check("dock exit: closing in docked mode starts the exit animation", () => exiting.length === 1 && dock().dataset.phase === "slide-out");
+          check("dock exit: it is 70 ms or less", () => exiting.length === 1 && exiting[0].effect.getComputedTiming().duration <= 70);
+          check("dock exit: it animates transform and opacity and nothing else", () => animatedProps.length > 0 && animatedProps.every((p) => p === "transform" || p === "opacity"));
+          check("dock exit: the row is still there while it runs", () => !dock().classList.contains("hidden"));
+          await sleepUntil(() => dock().classList.contains("hidden"), 2000);
+          check("dock exit: after the exit the dock is hidden, not unmounted", () => !!dock() && dock().classList.contains("hidden"));
           report_();
         } catch (error) {
           stopped(error);
