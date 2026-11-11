@@ -290,23 +290,20 @@ fn resolve_stack_lease_donor(repo: &Path) -> Result<Option<PathBuf>, CommandErro
 pub(super) fn open_verified_stacked_store(
     repo: &Path,
 ) -> Result<Option<(Store, StackedBaseMeta, devmap_query::StackedStore)>, CommandError> {
-    refuse_legacy_base_store_ref(repo)?;
-    let lease_path = devmap_extract::paths::stack_lease_path(repo);
-    if !lease_path.is_file() {
+    // Family first, from the lease alone: since the base moved into the lane,
+    // opening the store first would try a lease's base before anything had
+    // asked whose lease it is, and a spoofed lease would be refused (or
+    // admitted) for the wrong reason.
+    let Some(anchor_root) = resolve_stack_lease_donor(repo)? else {
         return Ok(None);
-    }
+    };
     let stacked = devmap_query::StackedStore::open(repo)
         .map_err(|e| CommandError::from(format!("failed to open stacked store: {e}")))?;
-    let anchor_root = validate_repo(&stacked.lease().source_repo_root)?;
-    let repo_common = crate::engine::git_cli::resolve_git_common_dir(repo)?;
-    let anchor_common = crate::engine::git_cli::resolve_git_common_dir(&anchor_root)?;
-    if repo_common != anchor_common
-        || !devmap_extract::paths::same_registered_repo(repo, &anchor_root)
-    {
+    // The store read the lease again; it must still name the donor just checked.
+    if validate_repo(&stacked.lease().source_repo_root)? != anchor_root {
         return Err(CommandError::from(format!(
-            "refusing stack lease {} pointing outside worktree family ({})",
-            lease_path.display(),
-            anchor_root.display()
+            "refusing stack lease {}: it changed while the lane was being opened",
+            devmap_extract::paths::stack_lease_path(repo).display()
         )));
     }
     let base_sqlite = stacked.lease().base_sqlite_path();
@@ -1638,7 +1635,8 @@ pub(super) fn open_verified_stacked_csr(
     meta: &StackedBaseMeta,
     stacked: &devmap_query::StackedStore,
 ) -> Result<Option<devmap_store::CsrGraphReader>, CommandError> {
-    let (Some(record), Some(csr_path)) = (stacked.lease().csr.as_ref(), meta.base_csr_path.as_ref())
+    let (Some(record), Some(csr_path)) =
+        (stacked.lease().csr.as_ref(), meta.base_csr_path.as_ref())
     else {
         return Ok(None);
     };
