@@ -16,6 +16,7 @@
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { checkoutNameFor, highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
   import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
@@ -83,7 +84,7 @@
     const opened = await repoStore.openRepo(root);
     const current = get(repoStore);
     if (!opened || !current.currentPath || !sameRepo(root, current.currentPath, { caseInsensitive: isCaseInsensitiveFs() })) {
-      throw Error(current.error || "The target repository could not be opened. No file was selected.");
+      throw Error(current.error || "The target repository couldn't be opened. No file was selected.");
     }
     selectFile(filePath);
   }
@@ -267,7 +268,7 @@
           {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
         </div>
       {/if}
-      <div bind:this={listEl} id="command-palette-listbox" class="palette-results" role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
+      <div bind:this={listEl} id="command-palette-listbox" class="palette-results scroll-py-8" use:scrollEdgeFade role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
         {#if searchResult.loading && isRemoteSearch}
           <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
         {:else}
@@ -299,39 +300,39 @@
   .palette-card { width: min(680px, 100%); max-height: calc(100dvh - min(12vh, 100px) - 20px); display:flex; flex-direction:column; overflow:hidden; border-radius:18px; }
   .palette-header { padding:16px 18px 0; flex-shrink:0; }
   .palette-heading,.palette-brand,.palette-repo,.palette-search,.palette-meta,.palette-footer,.palette-pages { display:flex; align-items:center; }
-  .palette-heading { gap:12px; color:var(--color-textMuted); font-size:var(--text-meta, 0.6875rem); }
+  .palette-heading { gap:12px; color:var(--color-textMuted); font-size:var(--text-meta); }
   .palette-brand { gap:7px; flex:1; }
-  h2 { font-size:var(--text-meta, 0.6875rem); font-weight:600; margin:0; }
+  h2 { font-size:var(--text-meta); font-weight:600; margin:0; }
   .palette-repo { gap:5px; max-width:40%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .palette-close,.palette-clear { padding:5px; border-radius:6px; color:var(--color-textMuted); }
   .palette-search { gap:12px; padding:19px 0 17px; }
-  input { min-width:0; width:100%; background:transparent; border:0; border-radius:5px; font-size:1.125rem; color:var(--color-textPrimary); }
-  input::placeholder { color:var(--color-textMuted); font-size:0.8125rem; }
+  input { min-width:0; width:100%; background:transparent; border:0; border-radius:5px; font-size: var(--text-lg); color:var(--color-textPrimary); }
+  input::placeholder { color:var(--color-textMuted); font-size: var(--text-sm); }
   .palette-modes { display:flex; gap:3px; overflow-x:auto; padding-bottom:12px; }
-  .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:var(--text-micro, 0.625rem); white-space:nowrap; border-radius:6px; color:var(--color-textMuted); }
+  .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:var(--text-micro); white-space:nowrap; border-radius:6px; color:var(--color-textMuted); }
   .palette-modes button[aria-pressed="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); color:var(--color-accent); }
-  .palette-modes kbd { opacity:.65; font-size:var(--text-micro, 0.625rem); }
-  .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:var(--text-micro, 0.625rem); color:var(--color-textMuted); }
+  .palette-modes kbd { opacity:.65; font-size:var(--text-micro); }
+  .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:var(--text-micro); color:var(--color-textMuted); }
   .palette-results { min-height:130px; max-height:390px; overflow-y:auto; overscroll-behavior:contain; padding:0 8px 8px; }
   .palette-option { display:flex; align-items:center; gap:11px; text-align:left; width:100%; padding:10px; border-radius:9px; color:var(--color-textPrimary); }
   .palette-option[data-highlighted="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--color-accent) 24%, transparent); }
   .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius:8px; background:var(--mac-fill-bg, rgb(var(--c-bg))); color:var(--color-textMuted); }
   .palette-option[data-highlighted="true"] .palette-icon { color:var(--color-accent); }
   .palette-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:3px; }
-  .palette-label { font-size:0.75rem; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-label { font-size: var(--text-xs); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .palette-label b { color:var(--color-accent); font-weight:600; }
-  .palette-description { font-size:var(--text-micro, 0.625rem); color:var(--color-textMuted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-description { font-size:var(--text-micro); color:var(--color-textMuted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .palette-disabled .palette-label,.palette-disabled .palette-icon { color:var(--color-textMuted); }
-  .palette-trailing { display:flex; align-items:center; gap:10px; color:var(--color-textMuted); font-size:var(--text-micro, 0.625rem); }
-  .palette-empty { min-height:145px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--color-textMuted); font-size:var(--text-meta, 0.6875rem); text-align:center; padding:22px; }
-  .palette-empty strong { color:var(--color-textPrimary); font-size:0.8125rem; font-weight:500; }
-  .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:var(--text-meta, 0.6875rem); overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
+  .palette-trailing { display:flex; align-items:center; gap:10px; color:var(--color-textMuted); font-size:var(--text-micro); }
+  .palette-empty { min-height:145px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--color-textMuted); font-size:var(--text-meta); text-align:center; padding:22px; }
+  .palette-empty strong { color:var(--color-textPrimary); font-size: var(--text-sm); font-weight:500; }
+  .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:var(--text-meta); overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
   .palette-notice p { margin:0 0 6px; }
-  .palette-notice button { margin:2px 6px 0 0; font-size:var(--text-micro, 0.625rem); }
+  .palette-notice button { margin:2px 6px 0 0; font-size:var(--text-micro); }
   .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--mac-fill-bg, rgb(var(--c-bg))); }
-  .palette-detail { padding:9px 18px; min-height:34px; font-size:var(--text-micro, 0.625rem); color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
-  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:var(--text-micro, 0.625rem); color:var(--color-textMuted); gap:8px; }
-  .palette-footer kbd { margin:0 3px 0 6px; font-size:var(--text-micro, 0.625rem); }
+  .palette-detail { padding:9px 18px; min-height:34px; font-size:var(--text-micro); color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
+  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:var(--text-micro); color:var(--color-textMuted); gap:8px; }
+  .palette-footer kbd { margin:0 3px 0 6px; font-size:var(--text-micro); }
   .palette-pages { gap:8px; }
   .palette-pages button { padding:0 6px; }
   button:focus-visible { outline:2px solid var(--color-accent); outline-offset:-2px; }

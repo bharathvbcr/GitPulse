@@ -127,17 +127,19 @@ Radius tokens (`--gp-r-*`, 4px grid, concentric-friendly):
 
 ## 6. Type
 
-Scale (6 steps, rem so `uiFontScale`/webview zoom carries it). Naming constraint [verified by count this session, non-test `.svelte`/`.ts`]: `text-xs` 315 uses, `text-sm` 42, `text-base` 15, `text-lg` 0, `text-xl` 3, `text-2xl` 9, and the `gp-btn`/`gp-field`/`gp-notice`/`gp-seg-btn`/`gp-select` utilities all `@apply text-xs` [verified app.css:53, 67, 297, 309, 328]. So **`text-xs` keeps Tailwind's 12px** (it already is the body size) and is not redefined; the two smaller steps get new names; `sm`/`base`/`lg` are redefined because their use is small and visibly reviewed by the codemod.
+Scale (7 steps, rem so `uiFontScale`/webview zoom carries it). Naming constraint [verified by count this session, non-test `.svelte`/`.ts`]: `text-xs` 315 uses, `text-sm` 42, `text-base` 15, `text-lg` 0, `text-xl` 3, `text-2xl` 9, and the `gp-btn`/`gp-field`/`gp-notice`/`gp-seg-btn`/`gp-select` utilities all `@apply text-xs` [verified app.css:53, 67, 297, 309, 328]. So **`text-xs` keeps Tailwind's 12px** (it already is the body size) and is not redefined; the two smaller steps get new names; `sm`/`base`/`lg` are redefined because their use is small and visibly reviewed by the codemod.
 
 | Utility | rem | px@16 | Line-height | Use | Change |
 | --- | --- | --- | --- | --- | --- |
 | `text-micro` | 0.625 | 10 | 1.3 | badges, keycaps, the attention count | new; 9px literals → this (nothing renders below 10) |
 | `text-meta` | 0.6875 | 11 | 1.4 | metadata, chips, descriptions, table cells | new; 11px literals → this |
-| `text-xs` | 0.75 | 12 | 1.45 | **body default** (= `body { font-size: 0.75rem }` [verified app.css:710]), buttons, fields, menu items | unchanged |
+| `text-xs` | 0.75 | 12 | 1.333 (4/3) | **body default** (= `body { font-size: 0.75rem }` [verified app.css:710]), buttons, fields, menu items | unchanged |
 | `text-sm` | 0.8125 | 13 | 1.45 | panel headers, emphasised rows | redefined 14→13 (42 sites) |
 | `text-base` | 0.9375 | 15 | 1.3 | surface titles (today's `gp-surface-title` 15px [verified app.css:290]) | redefined 16→15 (15 sites) |
-| `text-lg` | 1.125 | 18 | 1.25 | dialog titles, splash, empty-state title | redefined 18→18 (0 sites); `text-xl`/`text-2xl` (12 sites) codemod to this and are then banned |
+| `text-lg` | 1.125 | 18 | 1.25 | dialog titles, splash, empty-state title | redefined 18→18 (0 sites); a heading that was `text-xl` or `text-2xl` codemods to this; a metric numeral that was `text-2xl` or `text-3xl` goes to `text-display`; both are then banned |
 | `text-display` | 1.5 | 24 | 1.1 | metric numerals only: a count on a card, a stat. Not for headings or prose | new; `--text-display` for a component `<style>`, `text-display` in markup |
+
+**`text-xs` keeps line-height 1.333, not 1.45 [verified app.css:79-80, `--text-xs--line-height: calc(1 / 0.75)`].** Tailwind ships `text-xs` at that height, and 1.45 would change the height of every one of the 315 `text-xs` uses (rows, buttons, fields, menu items) and reflow the app for no gain. The other six steps use the heights in the table; `text-xs` is the one place the table is a decision, not a default. **`text-display` is 24 px (1.5 rem), line-height 1.1** [verified app.css:88-89]: it exists for one job, a metric numeral (a count on a card, a stat in Pulse or Work), and `text-2xl`/`text-3xl` metric numerals map to it. A heading that was `text-xl` becomes `text-lg`. The scale has seven steps in all; a font size outside them is a rule 1 failure in markup, in a scoped `<style>` and in a `.ts` class string.
 
 The `@theme` override of `--text-sm/base/lg` and the codemod land in **the same step** (§13 step 4), never in the tokens-first step, because redefining a utility already in use is a component change. `text-[9px]`/`[10px]`/`[11px]` become lint failures with the one-to-one codemod (9→micro, 10→micro, 11→meta). Weights: **3** — `font-normal` 400, `font-medium` 500, `font-semibold` 600; `font-bold` and `font-weight: 650` literals are retired (650 → 600). Label style: **sentence case, `text-xs font-medium text-textMuted`, no uppercase, no tracking**; the 184 uppercase+tracking lines become plain section labels (a `gp-label` utility owns the style so it can be changed once). Monospace: only for code, paths, hashes, refs, keycaps and the terminal; never for numbers in prose. Line heights are fixed per step above; `leading-*` utilities are not used on text (lint).
 

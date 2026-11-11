@@ -49,7 +49,7 @@
       if (disposed) return;
       current = null; task = null; notice = null; Editor = null;
       await receive();
-    } catch (cause) { if (!disposed) error = cause instanceof Error ? cause.message : "Could not acknowledge this notification. Try closing again."; }
+    } catch (cause) { if (!disposed) error = cause instanceof Error ? cause.message : "Couldn't acknowledge this notification. Try closing again."; }
     finally { if (!disposed) busy = false; }
   }
   onMount(() => {
@@ -74,5 +74,5 @@
 {:else if error}<div class="activation-error gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status" out:fade={backdropFadeOut()}>{error} <button type="button" class="gp-btn" onclick={() => { error = ""; }}>Dismiss</button></div>{/if}
 
 <style>
-  .native-activation{position:fixed;top:48px;bottom:24px;left:0;right:0;margin-inline:auto;width:min(620px,calc(100vw - 48px));overflow:hidden;display:flex;flex-direction:column;color:rgb(var(--c-text))}.native-activation :global(.task-editor){width:100%;box-sizing:border-box;border-left:0;flex:1;min-height:0;overflow:hidden}.receipt{flex-shrink:0;padding:16px 20px;font-size:0.75rem;border-bottom:1px solid rgb(var(--c-border))}.receipt p{color:rgb(var(--c-text-muted));line-height:1.5}.activation-error{position:fixed;bottom:30px;right:20px;max-width:360px;padding:12px;font-size:0.75rem}[role=alert]{color:rgb(var(--c-danger))}
+  .native-activation{position:fixed;top:48px;bottom:24px;left:0;right:0;margin-inline:auto;width:min(620px,calc(100vw - 48px));overflow:hidden;display:flex;flex-direction:column;color:rgb(var(--c-text))}.native-activation :global(.task-editor){width:100%;box-sizing:border-box;border-left:0;flex:1;min-height:0;overflow:hidden}.receipt{flex-shrink:0;padding:16px 20px;font-size: var(--text-xs);border-bottom:1px solid rgb(var(--c-border))}.receipt p{color:rgb(var(--c-text-muted));line-height:1.5}.activation-error{position:fixed;bottom:30px;right:20px;max-width:360px;padding:12px;font-size: var(--text-xs)}[role=alert]{color:rgb(var(--c-danger))}
 </style>

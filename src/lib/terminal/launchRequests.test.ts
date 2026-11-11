@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED, TERMINAL_SESSION_PENDING } from "./launchRequests";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
@@ -96,7 +96,7 @@ describe("terminal agent launch requests", () => {
   it("rejects duplicate pending launches and reports capacity refusal", async () => {
     const requests = createTerminalLaunchRequests();
     const launched = requests.request("/a", "claude", "Generate coverage");
-    await expect(requests.request("/a", "codex", "Another")).rejects.toThrow("already pending");
+    await expect(requests.request("/a", "codex", "Another")).rejects.toThrow(TERMINAL_SESSION_PENDING);
     requests.take("/a")?.complete("All terminal sessions are in use");
     await expect(launched).rejects.toThrow("All terminal sessions");
   });

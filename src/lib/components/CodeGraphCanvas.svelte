@@ -595,7 +595,7 @@
   .map-results .map-pagination button, .map-pagination button { width: auto; padding: 5px; }
   .map-stage { overflow: hidden; background-image: radial-gradient(circle, rgb(var(--c-text-muted) / 0.08) .65px, transparent .65px); background-size: 22px 22px; }
   .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: 9px; background: var(--map-panel); box-shadow: var(--shadow-card); }
-  .map-zoom button { width: 28px; height: 28px; border-radius: 5px; font-size: 1.125rem; }
+  .map-zoom button { width: 28px; height: 28px; border-radius: 5px; font-size: var(--text-lg); }
   .map-zoom button:hover { background: var(--map-hover); }
   .map-zoom span { width: 42px; text-align: center; font-size: var(--text-micro); color: var(--map-muted); font-variant-numeric: tabular-nums; }
   .map-zoom .gp-btn { width: auto; padding: 0 10px; margin-left: 4px; font-size: var(--text-meta); }
@@ -609,7 +609,7 @@
   .result-copy strong { font-size: var(--text-meta); font-weight: 500; }
   .result-copy strong, .inspector-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .result-copy small { font-size: var(--text-micro); color: var(--map-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 0.75rem; color: var(--map-muted); pointer-events: none; }
+  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: var(--text-xs); color: var(--map-muted); pointer-events: none; }
   .map-inspector { min-height: 55px; padding: 10px 20px; display: flex; align-items: center; gap: 12px; border-top: 1px solid var(--map-border); font-size: var(--text-meta); }
   .inspector-copy { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
   .inspector-copy strong { font-weight: 500; }

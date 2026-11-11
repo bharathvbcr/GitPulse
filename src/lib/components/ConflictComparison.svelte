@@ -45,11 +45,11 @@
   }
   .side.incoming { --side-color: var(--c-info); }
   .side-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 11px 12px 8px; color: rgb(var(--side-color)); }
-  .side-heading strong { font-size: 0.6875rem; font-weight: 600; }
-  .side-heading strong span { font-size: 0.625rem; opacity: .8; font-weight: 400; margin-left: 4px; }
-  .side-heading code { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.625rem; color: rgb(var(--c-text-muted)); }
+  .side-heading strong { font-size: var(--text-meta); font-weight: 600; }
+  .side-heading strong span { font-size: var(--text-micro); opacity: .8; font-weight: 400; margin-left: 4px; }
+  .side-heading code { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
   .source-scroll { flex: 1; overflow: auto; min-height: 75px; max-height: 320px; background: rgb(var(--side-color) / .045); user-select: text; }
-  .code-lines, .plain-code, .empty-side { min-width: max-content; margin: 0; padding: 10px 0; font: 0.6875rem/1.8 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+  .code-lines, .plain-code, .empty-side { min-width: max-content; margin: 0; padding: 10px 0; font: var(--text-meta)/1.8 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
   .plain-code, .empty-side { padding: 10px 12px; }
   .code-line { display: flex; min-height: 1.8em; }
   .line-number { display: inline-block; min-width: 35px; text-align: right; padding-right: 12px; user-select: none; color: rgb(var(--c-text-muted) / .65); }
@@ -57,6 +57,6 @@
   .side-actions { display: flex; gap: 5px; flex-wrap: wrap; padding: 9px; }
   button[aria-pressed="true"] { border-color: rgb(var(--side-color)); background: rgb(var(--side-color) / .15); color: rgb(var(--c-text)); }
   .source-scroll:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: -2px; }
-  .plain-note { padding: 6px 10px; color: rgb(var(--c-text-muted)); font-size: 0.625rem; }
+  .plain-note { padding: 6px 10px; color: rgb(var(--c-text-muted)); font-size: var(--text-micro); }
   @media (max-width: 650px) { .comparison { grid-template-columns: 1fr; } }
 </style>

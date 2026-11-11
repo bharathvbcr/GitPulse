@@ -45,7 +45,7 @@ export function describeLaunchAtLogin(value: LaunchAtLogin): {
     case "unknown":
       return {
         disabled: true,
-        note: { tone: "warn", text: `Launch at login is unknown: it could not be read (${value.error}).` },
+        note: { tone: "warn", text: `Open at login is unknown: it couldn't be read (${value.error}).` },
       };
     default:
       return {
@@ -53,7 +53,7 @@ export function describeLaunchAtLogin(value: LaunchAtLogin): {
         note: value.error
           ? {
               tone: "warn",
-              text: `Could not change launch at login: ${value.error}. It is currently ${value.state}.`,
+              text: `Couldn't change open at login: ${value.error}. It is currently ${value.state}.`,
             }
           : null,
       };

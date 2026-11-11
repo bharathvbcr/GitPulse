@@ -94,7 +94,7 @@
     <button bind:this={trigger} type="button" class="gp-btn" data-size={compact ? "sm" : "md"} aria-expanded={opened} aria-controls={settingsID} disabled={saving || pending !== null} onclick={toggle}>{compact ? "Auto" : "Automatic suggestions"} <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
     {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" class="gp-btn" data-size="sm" onclick={() => wakeAutomatic()}>Resume</button>{/if}
   </div>
-  {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions could not start: {$automaticUpdates.error}</p>{/if}
+  {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions couldn't start: {$automaticUpdates.error}</p>{/if}
   {#if (!compact || opened) && status?.reason}<p role="status">{status.reason}</p>{/if}
   {#if opened}
     <div id={settingsID} class="settings" class:gp-card={compact} class:shadow-float={compact}
@@ -122,7 +122,7 @@
 </section>
 
 <style>
-  .automation{padding:8px 24px;font-size:0.75rem;position:relative}
+  .automation{padding:8px 24px;font-size: var(--text-xs);position:relative}
   .automation.compact{border:0;padding:0}
   .automation.compact .settings{position:absolute;right:0;top:calc(100% + 6px);width:min(360px,70vw);padding:10px 12px;border:1px solid rgb(var(--c-border));border-radius:10px;max-height:min(560px,calc(100vh - 150px));overflow:auto}
   .summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}fieldset:disabled{opacity:.55}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:rgb(var(--c-danger))}.settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}

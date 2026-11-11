@@ -8,6 +8,9 @@ export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" |
 /** The one text a canceled terminal start carries, so a caller that passes it on and a test that checks it cannot drift. */
 export const TERMINAL_SESSION_CANCELED = "Terminal session canceled";
 
+/** Refused while another terminal session is still waiting for the panel to claim it; exported so a test compares against the constant, not a copy. */
+export const TERMINAL_SESSION_PENDING = "Another terminal session is already starting";
+
 export const PROMPT_LAUNCHERS: readonly PromptLauncher[] = ["claude", "codex", "grok", "agy"];
 
 export function isPromptLauncher(value: unknown): value is PromptLauncher {
@@ -89,7 +92,7 @@ export function createTerminalLaunchRequests() {
   function enqueue(fields: Omit<LaunchRequest, "complete">, signal?: AbortSignal): Promise<void> {
     if (!fields.repoPath.trim()) return Promise.reject(new Error("Open a repository before starting a terminal session"));
     if (signal?.aborted) return Promise.reject(new Error(TERMINAL_SESSION_CANCELED));
-    if (busy) return Promise.reject(new Error("A terminal launch is already pending"));
+    if (busy) return Promise.reject(new Error(TERMINAL_SESSION_PENDING));
     return new Promise<void>((resolve, reject) => {
       busy = true;
       let settled = false;

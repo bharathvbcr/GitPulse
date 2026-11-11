@@ -29,7 +29,7 @@
       <Zap size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{rhythm.currentStreak}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{rhythm.currentStreak}</span>
       <span class="text-xs text-textMuted font-normal">day{rhythm.currentStreak === 1 ? '' : 's'}</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
@@ -44,7 +44,7 @@
       <Flame size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{rhythm.longestStreak}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{rhythm.longestStreak}</span>
       <span class="text-xs text-textMuted font-normal">day{rhythm.longestStreak === 1 ? '' : 's'}</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
@@ -59,7 +59,7 @@
       <Calendar size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{rhythm.activeDaysInWindow}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{rhythm.activeDaysInWindow}</span>
       <span class="text-xs text-textMuted font-normal">of {rhythm.totalDaysInWindow} days</span>
     </div>
     <div class="text-micro text-textMuted mt-1 flex items-center justify-between">
@@ -77,7 +77,7 @@
       <Hourglass size={14} class="text-textMuted shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{rhythm.longestInactiveGap}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{rhythm.longestInactiveGap}</span>
       <span class="text-xs text-textMuted font-normal">day{rhythm.longestInactiveGap === 1 ? '' : 's'}</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">

@@ -55,13 +55,13 @@ describe("describeLaunchAtLogin", () => {
     const row = describeLaunchAtLogin({ state: "unknown", error: "denied" });
     expect(row.disabled).toBe(true);
     expect(row.note?.tone).toBe("warn");
-    expect(row.note?.text).toContain("could not be read (denied)");
+    expect(row.note?.text).toContain("couldn't be read (denied)");
   });
 
   it("a refused change leaves the toggle usable and says what the OS reports now", () => {
     const row = describeLaunchAtLogin({ state: "off", error: "denied" });
     expect(row.disabled).toBe(false);
-    expect(row.note).toEqual({ tone: "warn", text: "Could not change launch at login: denied. It is currently off." });
+    expect(row.note).toEqual({ tone: "warn", text: "Couldn't change open at login: denied. It is currently off." });
   });
 
   it("a clean on or off has no note", () => {

@@ -1,28 +1,12 @@
 {
   "schema": 1,
-  "commit": "196fe98eba643625f978db712849e549990b3f64",
+  "commit": "eda06b3ad9348c808b5e834291709f391cd34823",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 67,
-      "files": {
-        "src/lib/components/AutomaticEnhancements.svelte": 1,
-        "src/lib/components/CodeGraphCanvas.svelte": 2,
-        "src/lib/components/CommandPalette.svelte": 4,
-        "src/lib/components/ConflictComparison.svelte": 4,
-        "src/lib/components/ConflictEditor.svelte": 32,
-        "src/lib/components/NativeNotificationBridgeView.svelte": 2,
-        "src/lib/components/NativeNotificationSettings.svelte": 1,
-        "src/lib/components/SessionNotificationBridge.svelte": 1,
-        "src/lib/components/onboarding/ProductTour.svelte": 2,
-        "src/lib/components/pulse/PulseCodeAge.svelte": 1,
-        "src/lib/components/pulse/PulseDora.svelte": 4,
-        "src/lib/components/pulse/PulseHygiene.svelte": 5,
-        "src/lib/components/pulse/PulseKnowledgeMap.svelte": 3,
-        "src/lib/components/pulse/PulseRhythm.svelte": 4,
-        "src/lib/coverage/fileCoverage.ts": 1
-      }
+      "total": 0,
+      "files": {}
     },
     "2": {
       "name": "weight-and-case",
@@ -31,10 +15,8 @@
     },
     "3": {
       "name": "palette-colors",
-      "total": 2,
-      "files": {
-        "src/lib/coverage/format.ts": 2
-      }
+      "total": 0,
+      "files": {}
     },
     "4": {
       "name": "color-literals",

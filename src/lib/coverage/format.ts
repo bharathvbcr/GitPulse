@@ -7,8 +7,8 @@ export function coverageBarColor(percentage: number): string {
 
 export function coverageHitClass(hits: number | undefined): string {
   if (hits === undefined || !Number.isFinite(hits) || hits < 0) return "";
-  if (hits > 0) return "bg-emerald-500/15";
-  return "bg-red-500/20";
+  if (hits > 0) return "bg-ok/15";
+  return "bg-danger/20";
 }
 
 export function formatCoveragePercent(percentage: number): string {
