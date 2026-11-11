@@ -368,10 +368,22 @@
             await sleepUntil(() => !$('[role="tooltip"][aria-label="Command Palette"]'), 3000);
             if (words.includes("light")) document.documentElement.classList.replace("dark", "light");
             if (words.includes("fullscreen")) document.documentElement.setAttribute("data-fullscreen", "");
+            // `tabs` opens four more repositories (the fixture answers any path
+            // with an empty repository) so the strip reads as a working window.
+            if (words.includes("tabs")) {
+              for (const name of ["gamma", "delta-service", "epsilon", "zeta-docs"]) await repoStore.openRepo(`/code/tabs/${name}`, { activate: false });
+            }
+            // `shortcuts` opens the shortcuts sheet through the status bar's own button.
+            if (words.includes("shortcuts")) {
+              $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+              await sleepUntil(() => !!$('[role="dialog"]'), 3000);
+            }
             for (const surface of ["fleet", "agents", "tasks"]) {
               if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
             }
             await settle();
+            // Let the list and sheet entrances finish before the picture.
+            await wait(900);
             $("#result").textContent = `shot ready: ${shot}`;
             document.documentElement.dataset.gpShot = "ready";
             return;
