@@ -475,8 +475,12 @@
         fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
         await show(WorkView);
         await until(() => app.textContent.includes("Couldn't check overlapping files"));
-        check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
-          () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
+        // The `until` above only waits; it asserts nothing and returns on a
+        // timeout. The headline is therefore asserted here, in the check, or a
+        // regression to "Could not check…" would pass on the other two phrases.
+        check("WorkView: a failed collision scan says it couldn't check, never that there is no overlap",
+          () => app.textContent.includes("Couldn't check overlapping files")
+            && app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
         fixtures.cmd_collision_risk = collisionFixture;
 
         check(`no crash (${crashes.join(" | ") || "none"})`, () => crashes.length === 0);

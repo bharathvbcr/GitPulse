@@ -23,6 +23,10 @@ pane to inspect both themes.
 | `?scenario=unavailable` | Absent GitHub and failed overlap scan |
 | `?scenario=long` | Long repository path; the normal interactions also run |
 
+The regression gate runs every row above in one go (`bun run test:browser --
+--harness overview`, and `test:webkit` for WebKit): its host page frames each
+scenario as `?scenario=…&frame=1`, which runs its own checks and reports them.
+
 Focused checks:
 
 ```sh
