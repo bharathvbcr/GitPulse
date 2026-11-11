@@ -17,7 +17,7 @@ import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
 import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
 import { openManviFocus } from "../ui/openManviFocus";
 import { openConflicts } from "../ui/workConflicts";
-import { policyActivityVisible } from "../harness/policyPresentation";
+import { policyActivityVisible } from "../harness/policyActivityVisible";
 import { harnessStore } from "../stores/harnessStore";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };

@@ -52,10 +52,13 @@ describe("BranchNameSuggestion", () => {
 describe("WorktreesPanel hosts the suggestion beside the new-branch field", () => {
   it("places it after the branch and start-point inputs and fills the branch field", () => {
     const branchField = worktrees.indexOf('placeholder="new branch (optional)"');
-    const suggestion = worktrees.indexOf("<BranchNameSuggestion");
+    // Mounted through LazyView (its own chunk, out of the entry bundle), with
+    // the same callback filling the branch field.
+    const suggestion = worktrees.indexOf("load={loadBranchNameSuggestion}");
     expect(branchField).toBeGreaterThan(-1);
     expect(suggestion).toBeGreaterThan(branchField);
     expect(worktrees.slice(branchField, suggestion)).toContain('placeholder="start point"');
-    expect(worktrees).toContain("onUse={(name) => (newBranch = name)}");
+    expect(worktrees).toContain('const loadBranchNameSuggestion: ViewLoader = () => import("./BranchNameSuggestion.svelte");');
+    expect(worktrees).toContain("onUse: (name: string) => (newBranch = name)");
   });
 });

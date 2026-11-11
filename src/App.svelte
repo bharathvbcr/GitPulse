@@ -64,7 +64,8 @@
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
+  // The gate loads the tour's component only while the tour is open.
+  import ProductTour from "./lib/components/onboarding/ProductTourGate.svelte";
   import {
     dismissFirstRun,
     onboardingStore,

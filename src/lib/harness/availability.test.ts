@@ -56,8 +56,9 @@ describe("harness permission availability", () => {
     const components = [
       "../components/HarnessBadge.svelte",
       "../components/ManviConnection.svelte",
-      // Whether Overview offers Policy activity is decided here, for WorkView and the palette.
-      "./policyPresentation.ts",
+      // Whether Overview offers Policy activity is decided here, for WorkView and the
+      // palette (its own module, so neither pulls policyPresentation into the entry chunk).
+      "./policyActivityVisible.ts",
     ].map((path) => readFileSync(new URL(path, import.meta.url), "utf8"));
 
     for (const source of components) {

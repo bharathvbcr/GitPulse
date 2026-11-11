@@ -15,6 +15,19 @@
    * parent update).
    */
   const loadStack: ViewLoader = () => import("./CodeStackViewer.svelte");
+
+  /**
+   * Overview's two collapsed disclosures, branch and tag cleanup and Policy
+   * activity, load as chunks of their own. Imported eagerly they put ~48 KB in
+   * the entry chunk and took `main` over the 640 KB production limit
+   * (vite.config.ts). Both are bound (`bind:open`), which LazyView's props seam
+   * cannot carry, so each is awaited in the template from a memoised loader:
+   * one import per session, not one per render.
+   */
+  let cleanupModule: Promise<typeof import("./BranchTagCleanup.svelte")> | null = null;
+  const loadBranchTagCleanup = () => (cleanupModule ??= import("./BranchTagCleanup.svelte"));
+  let activityModule: Promise<typeof import("./PolicyActivity.svelte")> | null = null;
+  const loadPolicyActivity = () => (activityModule ??= import("./PolicyActivity.svelte"));
 </script>
 
 <script lang="ts">
@@ -70,9 +83,7 @@
   } from "../work/focus";
   import { timestampFormat } from "../ui/timestampFormat";
   import { harnessStore, type PolicyStatus } from "../stores/harnessStore";
-  import BranchTagCleanup from "./BranchTagCleanup.svelte";
-  import PolicyActivity from "./PolicyActivity.svelte";
-  import { policyActivityVisible } from "../harness/policyPresentation";
+  import { policyActivityVisible } from "../harness/policyActivityVisible";
   import { openConflicts } from "../ui/workConflicts";
   import {
     MANVI_FOCUS_TARGETS,
@@ -1155,9 +1166,17 @@
       {/if}
     </div>
 
-    <BranchTagCleanup bind:open={showCleanup} />
+    {#await loadBranchTagCleanup() then { default: BranchTagCleanup }}
+      <BranchTagCleanup bind:open={showCleanup} />
+    {:catch error}
+      <p class="gp-notice" data-tone="danger" role="alert">Could not load branch and tag cleanup: {String(error)}</p>
+    {/await}
     {#if showPolicyActivity}
-      <PolicyActivity bind:open={showActivity} />
+      {#await loadPolicyActivity() then { default: PolicyActivity }}
+        <PolicyActivity bind:open={showActivity} />
+      {:catch error}
+        <p class="gp-notice" data-tone="danger" role="alert">Could not load Policy activity: {String(error)}</p>
+      {/await}
     {/if}
   {/if}
 </div>
