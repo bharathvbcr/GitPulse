@@ -82,8 +82,8 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/AutomaticEnhancements.svelte",
@@ -180,8 +180,8 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/SendToAgent.svelte",
@@ -234,11 +234,10 @@
     {
       "file": "src/lib/components/TaskArchive.svelte",
       "rules": [
-        1,
-        17
+        1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskBoard.svelte",
@@ -253,16 +252,16 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskEditor.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskHandoffForm.svelte",
@@ -337,14 +336,6 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/TaskSavedViews.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/TaskSearchField.svelte",
       "rules": [
         1
@@ -361,14 +352,6 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/TaskViewMenu.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/VerificationChip.svelte",
       "rules": [
         1
@@ -381,24 +364,24 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/WorkView.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/WorkspaceEditor.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/onboarding/ProductTour.svelte",

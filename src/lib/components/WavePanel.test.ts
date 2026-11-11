@@ -62,7 +62,8 @@ describe("WavePanel", () => {
     expect(body).toContain("Refused to start from a partial ranking");
     expect(body).toMatch(/385 open tasks(&#39;|') links were not read/);
     expect(body).toContain('data-testid="wave-accept-unchecked"');
-    expect(body).not.toMatch(/data-testid="wave-accept-unchecked"[^>]*checked/);
+    // The box's accessible name also contains "checked", so match the attribute itself.
+    expect(body).not.toMatch(/data-testid="wave-accept-unchecked"[^>]*\schecked[\s=>/]/);
   });
 
   it("does not call a wave that refused its second batch one that never started", () => {

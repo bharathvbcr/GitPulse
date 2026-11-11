@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "commit": "5a67c7bf099872a223a4c32187fba26599a6b777",
+  "commit": "d8d90267b4651e151b2ba01e4d0c1f69a4ef6b3e",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 234,
+      "total": 214,
       "files": {
         "src/lib/components/AgentDecisions.svelte": 1,
         "src/lib/components/AgentInbox.svelte": 16,
@@ -18,7 +18,7 @@
         "src/lib/components/NativeNotificationBridge.svelte": 2,
         "src/lib/components/NativeNotificationSettings.svelte": 1,
         "src/lib/components/RunActivity.svelte": 5,
-        "src/lib/components/ScanProposals.svelte": 7,
+        "src/lib/components/ScanProposals.svelte": 5,
         "src/lib/components/SendToAgent.svelte": 2,
         "src/lib/components/SessionNotificationBridge.svelte": 1,
         "src/lib/components/TaskActionDialog.svelte": 2,
@@ -26,7 +26,7 @@
         "src/lib/components/TaskArchive.svelte": 1,
         "src/lib/components/TaskBoard.svelte": 29,
         "src/lib/components/TaskDuePicker.svelte": 7,
-        "src/lib/components/TaskEditor.svelte": 15,
+        "src/lib/components/TaskEditor.svelte": 9,
         "src/lib/components/TaskHandoffForm.svelte": 1,
         "src/lib/components/TaskHandoffSheet.svelte": 2,
         "src/lib/components/TaskManviAssist.svelte": 7,
@@ -36,12 +36,10 @@
         "src/lib/components/TaskRefine.svelte": 3,
         "src/lib/components/TaskRelations.svelte": 3,
         "src/lib/components/TaskRepositoryPicker.svelte": 12,
-        "src/lib/components/TaskSavedViews.svelte": 3,
         "src/lib/components/TaskSearchField.svelte": 1,
         "src/lib/components/TaskSuggestPanel.svelte": 5,
-        "src/lib/components/TaskViewMenu.svelte": 5,
         "src/lib/components/VerificationChip.svelte": 1,
-        "src/lib/components/WavePanel.svelte": 6,
+        "src/lib/components/WavePanel.svelte": 2,
         "src/lib/components/WorkView.svelte": 2,
         "src/lib/components/WorkspaceEditor.svelte": 2,
         "src/lib/components/onboarding/ProductTour.svelte": 2,
@@ -151,12 +149,11 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 5,
+      "total": 4,
       "files": {
         "src/lib/components/AgentDefaultsSettings.svelte": 1,
         "src/lib/components/AgentLimitSetting.svelte": 1,
-        "src/lib/components/AgentModelSettings.svelte": 2,
-        "src/lib/components/TaskArchive.svelte": 1
+        "src/lib/components/AgentModelSettings.svelte": 2
       }
     },
     "18": {

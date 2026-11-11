@@ -238,7 +238,7 @@
                 <label>Title <input class="gp-field" data-testid="proposal-edit-title" bind:value={mine.title} maxlength="300" /></label>
                 <label>Description <textarea class="gp-field" rows="5" bind:value={mine.description}></textarea></label>
                 <label>Priority
-                  <select class="gp-field" bind:value={mine.priority}>
+                  <select class="gp-select" bind:value={mine.priority}>
                     {#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}
                   </select>
                 </label>
@@ -277,20 +277,20 @@
   header{display:flex;align-items:center;justify-content:space-between;gap:8px}
   h2{margin:0;font-size:0.8125rem;font-weight:600}
   .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-  .lede,.state,.empty{margin:0;font-size:12px;color:rgb(var(--c-text-muted))}
-  .error{margin:0;font-size:12px;color:rgb(var(--c-danger))}
-  .coverage{padding:8px 10px;border-radius:10px;font-size:12px;border:1px solid rgb(var(--c-border) / 0.65)}
+  .lede,.state,.empty{margin:0;font-size:0.75rem;color:rgb(var(--c-text-muted))}
+  .error{margin:0;font-size:0.75rem;color:rgb(var(--c-danger))}
+  .coverage{padding:8px 10px;border-radius:10px;font-size:0.75rem;border:1px solid rgb(var(--c-border) / 0.65)}
   .coverage ul{margin:4px 0 0;padding-left:16px}
   .list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
-  .proposal{padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:12px}
+  .proposal{padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:0.75rem}
   .proposal.dismissed{opacity:.6}
   .head{display:flex;gap:6px;flex-wrap:wrap}
   .title{margin:0;font-weight:600;overflow-wrap:anywhere}
   .evidence{margin:0;padding-left:16px;color:rgb(var(--c-text-muted))}
   .source{font-weight:600}
-  pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
+  pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--text-meta)}
   .editor{display:flex;flex-direction:column;gap:6px}
-  .editor label{display:flex;flex-direction:column;gap:2px;font-size:11px}
+  .editor label{display:flex;flex-direction:column;gap:2px;font-size:var(--text-meta)}
   .filed{margin:0;color:rgb(var(--c-accent))}
   .related{padding:8px;border-radius:8px;border:1px solid rgb(var(--c-border) / 0.65)}
   .related p,.related ul{margin:0 0 4px}

@@ -327,7 +327,7 @@
       {loading ? "Refreshing" : "Refresh"}
     </button>
     <span class="text-micro text-textMuted" aria-live="polite">
-      {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{:else if loading}Loading workspace…{/if}
+      {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{/if}
     </span>
     </div>
   </div>
@@ -1061,7 +1061,7 @@
 
   .overview-metric-value {
     margin: 4px 0 3px;
-    font-size: 24px;
+    font-size: 1.5rem;
     font-weight: 600;
     line-height: 1.15;
     letter-spacing: -0.04em;

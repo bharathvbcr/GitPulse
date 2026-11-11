@@ -109,12 +109,12 @@
 <style>
   .panel{max-height:min(70vh,32rem);overflow:hidden auto}
   .view-row{display:flex;align-items:center;gap:4px}
-  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:5px;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .apply:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .apply[aria-pressed="true"]{color:rgb(var(--c-accent));font-weight:600}
   .apply:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
   .save{display:flex;gap:4px;padding-top:6px}
-  .save input{flex:1;min-width:0;font-size:11px;padding:3px 6px}
-  .note{margin:0;padding:0 6px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
+  .save input{flex:1;min-width:0;font-size:var(--text-meta);padding:3px 6px}
+  .note{margin:0;padding:0 6px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
   .note.failed{color:rgb(var(--c-danger))}
 </style>

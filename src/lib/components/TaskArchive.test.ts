@@ -125,7 +125,7 @@ describe("what the fixture cannot reach", () => {
   });
 
   it("teaches the archive rule in the empty state from the same constant as the header", () => {
-    expect(source).toContain("Nothing here yet. ${ARCHIVE_RULE}");
+    expect(source).toContain('title="Nothing here yet" hint={ARCHIVE_RULE}');
     expect(source).toContain("ARCHIVE_RULE :");
   });
 
