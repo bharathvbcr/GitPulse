@@ -94,8 +94,9 @@
     Search,
   } from "@lucide/svelte";
   import ScrollCue from "./ScrollCue.svelte";
-  import { onDestroy } from "svelte";
-  import { DURATION_MS, motionExitMs, motionMs } from "../motion/tokens";
+  import { onDestroy, tick, untrack } from "svelte";
+  import { motionExitMs, motionMs } from "../motion/tokens";
+  import { slideDocked } from "../sidebar/dockedSlide";
   import { panelModes } from "../ui/panelMode";
   import { floatingPanelDismiss } from "../ui/panelDismiss";
   import { popover, type PopoverOptions } from "../ui/popover";
@@ -105,21 +106,65 @@
 
   let overlay = $derived($panelModes.sidebar === "overlay");
   let collapsed = $derived($layoutStore.collapsed);
-  /** True for one `fast` window after a docked toggle: the one-shot width slide. */
-  let settling = $state(false);
-  let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * What the docked column draws. It follows `collapsed` at once on an expand
+   * (the column widens first, then the panel slides in) and a beat late on a
+   * collapse (the panel slides out, then the column narrows), so the workspace
+   * reflows once either way and never while the panel is moving. The slide is
+   * transform and opacity only (dockedSlide.ts).
+   */
+  let shownCollapsed = $state($layoutStore.collapsed);
+  let dockedAside = $state<HTMLElement | null>(null);
+  let wasCollapsed = $layoutStore.collapsed;
+  let activeSlide: Animation | null = null;
+  /** Bumped whenever a slide is cancelled or replaced, so a late finish cannot act on a stale one. */
+  let slideGeneration = 0;
+
+  function endSlide() {
+    slideGeneration += 1;
+    activeSlide?.cancel();
+    activeSlide = null;
+  }
+
+  function followCollapsed(next: boolean, floating: boolean) {
+    const changed = next !== wasCollapsed;
+    wasCollapsed = next;
+    endSlide();
+    // Nothing to play: no change, a floating panel (it has its own transition),
+    // a column being dragged, or no column mounted yet.
+    if (!changed || floating || dragging || !dockedAside) {
+      shownCollapsed = next;
+      return;
+    }
+    const generation = slideGeneration;
+    const travel = $layoutStore.width - SIDEBAR_COLLAPSED_WIDTH;
+    if (!next) {
+      shownCollapsed = false;
+      void tick().then(() => {
+        if (generation === slideGeneration && dockedAside) {
+          activeSlide = slideDocked(dockedAside, "in", travel, () => {});
+        }
+      });
+      return;
+    }
+    activeSlide = slideDocked(dockedAside, "out", travel, () => {
+      if (generation !== slideGeneration) return;
+      shownCollapsed = true;
+      void tick().then(() => {
+        if (generation === slideGeneration && dockedAside) {
+          activeSlide = slideDocked(dockedAside, "settle", 0, () => {});
+        }
+      });
+    });
+  }
+
+  $effect(() => {
+    const next = collapsed;
+    const floating = overlay;
+    untrack(() => followCollapsed(next, floating));
+  });
 
   function toggleCollapsed() {
-    if (!overlay) {
-      // The class and the new width land in the same flush, so the width
-      // transition runs once; it is dropped again before the next gesture.
-      settling = true;
-      if (settleTimer) clearTimeout(settleTimer);
-      settleTimer = setTimeout(() => {
-        settling = false;
-        settleTimer = null;
-      }, DURATION_MS.fast + 40);
-    }
     layoutStore.toggleCollapsed();
   }
 
@@ -164,7 +209,7 @@
   }
 
   onDestroy(() => {
-    if (settleTimer) clearTimeout(settleTimer);
+    endSlide();
   });
 
   // An agent can touch thousands of files in one pass; lists mount a window
@@ -512,7 +557,7 @@
 
     <!-- Main Scrollable Section -->
     <div class="relative flex-1 min-h-0 mt-2">
-    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 scroll-py-12 space-y-5">
+    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5 scroll-py-12">
       <!-- Above the branch list on purpose. This says why everything below it
            may be incomplete, and the branch list has no height cap in this
            scroller — under it, on a repository with many branches, the notice
@@ -803,9 +848,10 @@
 {/snippet}
 
 <!-- The window's one sidebar, in one of two modes (panelMode.ts).
-     Docked: the aside owns a column, the workspace reflows, and the open or
-     close animates once (`gp-slide-docked`, never while a drag writes the
-     width). Overlay: a 44 px rail keeps the column and the open panel floats
+     Docked: the aside owns a column and the workspace reflows once, at the
+     start of an open or the end of a close, while the panel slides on
+     transform and opacity (dockedSlide.ts); a drag writes the width live with
+     no slide. Overlay: a 44 px rail keeps the column and the open panel floats
      over the workspace, sliding on transform and opacity. -->
 <svelte:window onkeydown={escapeCloses} />
 
@@ -835,13 +881,12 @@
   {/if}
 {:else}
   <aside
-    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {settling && !dragging
-      ? 'gp-slide-docked'
-      : ''}"
-    style="width:{collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
+    bind:this={dockedAside}
+    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane"
+    style="width:{shownCollapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
     data-sidebar-mode="docked"
   >
-    {#if !collapsed}
+    {#if !shownCollapsed}
       {@render expanded()}
       {@render resizer()}
     {:else}

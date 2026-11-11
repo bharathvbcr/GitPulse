@@ -162,8 +162,8 @@ describe("design-lint widened scopes: <style> blocks, stylesheets and .ts string
     expect(hits(8, "rule-08.negative.css")).toEqual([]);
   });
 
-  it("rule 9 reads layout transitions in a stylesheet, and names gp-slide-docked as the one exception", () => {
-    expect(hits(9, "rule-09.positive.css")).toHaveLength(4);
+  it("rule 9 reads layout transitions in a stylesheet, and has no exception: the old gp-slide-docked utility is a hit", () => {
+    expect(hits(9, "rule-09.positive.css")).toHaveLength(5);
     expect(hits(9, "rule-09.negative.css")).toEqual([]);
   });
 

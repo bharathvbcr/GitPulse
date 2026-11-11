@@ -650,19 +650,6 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   letter-spacing: normal;
 }
 
-@utility gp-slide-docked {
-  /* The one sanctioned layout transition (design language §8.3, §8.5): a
-     docked sidebar or dock changing size on a discrete user action, inside a
-     `contain: layout paint` pane. One-shot and capped at --gp-dur-fast (140 ms,
-     under the 200 ms ceiling). Never apply it while a drag is writing the size
-     live -- remove the class for the drag, as Sidebar does with its width
-     transition today. The effect curve never overshoots, so the panel cannot
-     spring past its size. Reduced motion zeroes it in both lists below. */
-  transition-property: width, height;
-  transition-duration: var(--gp-dur-fast);
-  transition-timing-function: var(--gp-ease-effect);
-}
-
 @utility gp-indeterminate {
   /* The indeterminate progress strip's mover: a bar that sweeps across its
      track while a long load runs (the commit graph's loading strip). It
@@ -1811,7 +1798,7 @@ html.macos.light .gp-sidebar {
    on: the overlay is floating chrome. */
 html.light .gp-sidebar[data-sidebar-panel] {
   background-image: linear-gradient(rgb(var(--c-border) / 0.1), rgb(var(--c-border) / 0.1));
-  border-color: rgb(var(--c-border) / 0.86);
+  border-color: var(--gp-edge-strong);
 }
 
 /* The sidebar's scroll cue. ScrollCue draws a 2rem chevron band at an edge
@@ -2212,7 +2199,7 @@ html[data-fullscreen] .gp-traffic-inset {
     animation: none !important;
   }
 
-  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
     transition: none !important;
   }
 
@@ -2225,7 +2212,7 @@ html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion,
   animation: none !important;
 }
 
-html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
   transition: none !important;
 }
 

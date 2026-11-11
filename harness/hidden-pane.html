@@ -155,9 +155,33 @@
     const rowHeightBefore = scroller().clientHeight;
     check("the list was measured (a non-zero viewport)", () => rowHeightBefore > 100);
 
+    // The docked toggle animates transform and opacity only, and the workspace
+    // reflows once: at the end of a collapse, at the start of an expand. Each
+    // frame is sampled (workspace width, column width, what is animating).
+    const KEYFRAME_META = new Set(["offset", "easing", "composite", "computedOffset"]);
+    const slideProps = () => [...new Set(sidebar().getAnimations().flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k))))].filter((k) => !KEYFRAME_META.has(k));
+    const openWidth = Math.round(width(sidebar()));
+    async function traceToggle() {
+      const samples = [];
+      const end = performance.now() + 2500;
+      let seen = false;
+      do {
+        const n = sidebar().getAnimations().length;
+        seen ||= n > 0;
+        samples.push({ w: Math.round(width(pane())), sw: Math.round(width(sidebar())), n, props: slideProps() });
+        await frame();
+      } while (performance.now() < end && (sidebar().getAnimations().length || !seen));
+      return samples;
+    }
+    const jumps = (samples) => samples.filter((s, i) => i && Math.abs(s.w - samples[i - 1].w) > 2).length;
+    const propsOf = (samples) => [...new Set(samples.flatMap((s) => s.props))];
+
     clickBtn('button[aria-label="Collapse sidebar"]');
     await tick();
-    check("a docked toggle plays the one-shot width slide", () => sidebar().classList.contains("gp-slide-docked"));
+    const collapse = await traceToggle();
+    check(`a docked collapse slides the panel out on transform and opacity only (${propsOf(collapse).join(", ")})`, () => propsOf(collapse).length > 0 && propsOf(collapse).every((p) => p === "transform" || p === "opacity"));
+    check("the slide spans frames with the column still wide", () => collapse.some((s) => s.n > 0 && s.sw > 100));
+    check("the workspace reflows once, and not while the panel is still leaving", () => jumps(collapse) === 1 && collapse.every((s) => !(s.sw > 100 && Math.abs(s.w - startWidth) > 2)));
     await until(() => Math.round(width(sidebar())) === 44, "docked collapse to the 44 px rail");
     check("collapsed, the docked sidebar is the 44 px rail with its expand button", () => !!$('[data-sidebar-rail] button[aria-label="Expand sidebar"]'));
     // The rail is icons only: no label may spill past the 44 px column ("Ask
@@ -174,11 +198,22 @@
     const askRail = $('[data-sidebar-rail] [aria-label="Ask agent"]');
     check("the rail's Ask agent is an icon with the label as its name and tooltip, not text", () => (askRail.textContent || "").trim() === "" && askRail.title.length > 0);
     check("no rail child overflows the 44 px rail's width", () => { const o = railOverflow(); if (o.bad.length || o.scroll > 0 || o.rail > 0) throw new Error(JSON.stringify(o)); return true; });
-    await until(() => !sidebar().classList.contains("gp-slide-docked"), "the slide class is dropped again");
-    check("the slide class does not linger after the toggle", () => !sidebar().classList.contains("gp-slide-docked"));
+    await until(() => sidebar().getAnimations().length === 0, "the collapse animations end");
+    check("nothing lingers after the toggle: no animation, no layout transition on the column", () => {
+      // `all` is the initial property list; it only matters with a duration.
+      const cs = getComputedStyle(sidebar());
+      const durations = cs.transitionDuration.split(",").map((d) => parseFloat(d) * (d.trim().endsWith("ms") ? 1 : 1000));
+      const layout = cs.transitionProperty.split(",").map((p) => p.trim()).filter((p, i) => /^(width|height|all)$/.test(p) && durations[i % durations.length] > 0);
+      return sidebar().getAnimations().length === 0 && layout.length === 0;
+    });
     check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
     clickBtn('button[aria-label="Expand sidebar"]');
+    await tick();
+    const expand = await traceToggle();
+    check(`a docked expand slides the panel in on transform and opacity only (${propsOf(expand).join(", ")})`, () => propsOf(expand).length > 0 && propsOf(expand).every((p) => p === "transform" || p === "opacity"));
+    check("the workspace has its final width on the first frame and never moves again", () => Math.abs(expand[0].w - startWidth) < 2 && jumps(expand) === 0 && Math.abs(expand[0].sw - openWidth) < 2);
     await until(() => Math.abs(width(pane()) - startWidth) < 2, "docked expand settles back to the original pane width");
+    await until(() => sidebar().getAnimations().length === 0, "the expand animations end");
     await fullEventually("after docked expand");
     check("expanding restores the pane width and full rows", () => Math.abs(width(pane()) - startWidth) < 2 && full());
 
@@ -479,6 +514,31 @@
     await until(() => !panel(), "the panel closes after the scroll-edge checks");
     panelModes.set("sidebar", "docked");
     await settle();
+
+    // ---- the docked toggle under reduced motion, and a toggle storm ---------------
+    if ($('[data-sidebar-rail] button[aria-label="Expand sidebar"]')) clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => width(sidebar()) > 200 && sidebar().getAnimations().length === 0, "the docked sidebar is open for the reduced-motion checks");
+    setReduceMotionOverride(true);
+    document.documentElement.dataset.motion = "reduced";
+    clickBtn('button[aria-label="Collapse sidebar"]');
+    await tick();
+    check("under reduced motion a docked collapse is immediate: no animation, the 44 px rail", () => sidebar().getAnimations().length === 0 && Math.round(width(sidebar())) === 44 && !!$('[data-sidebar-rail]'));
+    clickBtn('button[aria-label="Expand sidebar"]');
+    await tick();
+    check("and a docked expand is immediate: no animation, the open panel", () => sidebar().getAnimations().length === 0 && width(sidebar()) > 200 && !$('[data-sidebar-rail]'));
+    setReduceMotionOverride(false);
+    delete document.documentElement.dataset.motion;
+    for (let i = 0; i < 20; i += 1) {
+      clickBtn(sidebar().querySelector('button[aria-label="Collapse sidebar"]') ? 'button[aria-label="Collapse sidebar"]' : 'button[aria-label="Expand sidebar"]');
+      await frame();
+    }
+    await wait(400);
+    await settle();
+    await until(() => sidebar().getAnimations().length === 0, "the storm's animations end");
+    {
+      // An even number of toggles from open ends open, however they overlapped.
+      check("a 20-toggle docked storm ends open, settled and with a full list", () => width(sidebar()) > 200 && !!$("[data-sidebar-panel], aside.gp-sidebar [role=separator]") && Math.abs(width(pane()) - startWidth) < 2 && full());
+    }
 
     check("no runtime errors", () => errors.length === 0);
     document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

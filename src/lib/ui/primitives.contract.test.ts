@@ -166,9 +166,9 @@ describe("gp-field-multi", () => {
   });
 
   it("is in both reduced-motion lists and the macOS field fill, beside gp-field", () => {
-    // gp-check sits between gp-field-multi and gp-slide-docked in both lists.
-    expect(css).toMatch(/html :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-slide-docked[^)]*\) \{\s*transition: none !important;/);
-    expect(css).toMatch(/html\[data-motion="reduced"\] :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-slide-docked[^)]*\) \{\s*transition: none !important;/);
+    // gp-check sits between gp-field-multi and gp-view-flyout-item in both lists.
+    expect(css).toMatch(/html :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-view-flyout-item[^)]*\) \{\s*transition: none !important;/);
+    expect(css).toMatch(/html\[data-motion="reduced"\] :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-view-flyout-item[^)]*\) \{\s*transition: none !important;/);
     expect(css).toContain('html.macos :where([class~="bg-background"], .gp-field, .gp-field-multi, .gp-select) {');
   });
 
