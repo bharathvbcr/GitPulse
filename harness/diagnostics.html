@@ -247,6 +247,73 @@
       while (requests.some((r) => r.kind === "map-status")) take("map-status").resolve(quietStatus);
       if (staleStatus) staleStatus.resolve(quietStatus);
       await settle();
+
+      // The navigator tree, rendered and driven in a real DOM: nested areas,
+      // a shared prefix that is not an area, an exact duplicate area, keyboard
+      // movement, a neighbour link and the hand-off to the subsystem map.
+      const area = (name, neighbors = []) => ({
+        area: name, summary: `${name}: harness area`, entry_points: [], critical_files: [],
+        neighbors, handoff_paths: [], role_files: {}, role_file_counts: {},
+      });
+      const treeMap = mapLoad("unused");
+      treeMap.map.subsystems = [
+        area("src-tauri", ["scripts"]),
+        area("src-tauri/src"),
+        area("src-tauri/framework/muda/src"),
+        area("src-tauri/framework/tao/examples"),
+        area("scripts"),
+        area("scripts"),
+      ];
+      treeMap.map.liveness_meta.subsystems.shown = 6;
+      treeMap.map.liveness_meta.subsystems.total = 6;
+      fixture.cmd_devmap_repo_map = () => treeMap;
+      fixture.cmd_devmap_status = () => quietStatus;
+      fixture.cmd_devmap_map_preview = () => ({ available: false, reason: "Harness: no subsystem map", path: null, kind: "map_preview", payload: null });
+      liveIndex.snapshots.set(snapshot(43));
+      await settle();
+      const tree = target.querySelector('[role="tree"]');
+      const rowsOf = () => tree ? [...tree.querySelectorAll('[role="treeitem"]')] : [];
+      const labelOf = (row) => row?.querySelector(".font-mono")?.textContent.trim() ?? "";
+      const rows = rowsOf();
+      const rowShape = JSON.stringify(rows.map((r) => [labelOf(r), r.getAttribute("aria-level")]));
+      check(
+        "the map navigator nests areas, groups a shared prefix and shows a duplicate area once",
+        labelOf(rows.find((r) => labelOf(r) === "src")) === "src"
+          && rows.find((r) => labelOf(r) === "src")?.getAttribute("aria-level") === "2"
+          && rows.some((r) => labelOf(r) === "framework" && r.getAttribute("aria-selected") === null)
+          && rows.filter((r) => labelOf(r) === "scripts").length === 1
+          && rows.some((r) => labelOf(r) === "scripts" && r.textContent.includes("×2")),
+        rowShape,
+      );
+      const stop = tree?.querySelector('[role="treeitem"][tabindex="0"]');
+      stop?.focus();
+      stop?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      await settle();
+      const nextStop = tree?.querySelector('[role="treeitem"][tabindex="0"]');
+      check(
+        "ArrowDown moves the map navigator's focus to the next row",
+        Boolean(stop) && Boolean(nextStop) && nextStop !== stop && document.activeElement === nextStop,
+        `${labelOf(stop)} -> ${labelOf(nextStop)} (active ${labelOf(document.activeElement)})`,
+      );
+      rowsOf().find((r) => labelOf(r) === "src-tauri")?.click();
+      await settle();
+      const detailTitle = () => target.querySelector("h2.font-mono")?.textContent.trim() ?? "";
+      [...target.querySelectorAll("button")].find((b) => b.textContent.trim() === "scripts")?.click();
+      await settle();
+      check(
+        "a neighbour that is in the map selects that area and names the duplicate",
+        detailTitle() === "scripts" && Boolean(target.querySelector('[data-testid="map-duplicate-area"]')),
+        detailTitle(),
+      );
+      await click("Show on map");
+      check(
+        "Show on map hands the selected area to the subsystem map",
+        [...target.querySelectorAll('[role="tab"][aria-selected="true"]')].some((t) => t.textContent.trim() === "Subsystems")
+          && calls.get("cmd_devmap_map_preview") > 0,
+        [...target.querySelectorAll('[role="tab"][aria-selected="true"]')].map((t) => t.textContent.trim()).join(","),
+      );
+      await click("Navigator");
+
       fixture.cmd_devmap_repo_map = () => ({ available: false, reason: "Harness: map not indexed", map: null, path: null });
       fixture.cmd_devmap_status = () => quietStatus;
     }
