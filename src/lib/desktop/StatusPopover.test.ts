@@ -143,6 +143,14 @@ describe("status popover speaks the shared grammar", () => {
     expect(styles).not.toMatch(/[;{]\s*(?:-webkit-)?backdrop-filter:\s*(?!none)\S/);
   });
 
+  it("gets its stylesheet from the window entry, not from inside the component", () => {
+    expect(markup).not.toMatch(/import\s+["'][^"']*\.css["']/);
+    const entry = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../status.ts"), "utf8");
+    // status.css is unlayered and has to come last so its transparent body wins.
+    expect(entry.indexOf('import "./app.css"')).toBeGreaterThan(-1);
+    expect(entry.indexOf('import "./status.css"')).toBeGreaterThan(entry.indexOf('import "./app.css"'));
+  });
+
   it("keeps the actions on gp-btn, gp-chip and gp-icon-btn with the test ids the harness uses", () => {
     expect(markup).toContain('data-variant="primary"');
     expect(markup).toContain('data-testid="status-primary"');

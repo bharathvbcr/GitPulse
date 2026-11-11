@@ -1,8 +1,4 @@
 <script lang="ts">
-  // The menu-bar window loads only status.css, so the shared tokens and the
-  // gp-btn / gp-chip / gp-icon-btn utilities come in with the component that
-  // uses them (it is the one place both the window and the harness mount it).
-  import "../../app.css";
   import { slide } from "svelte/transition";
   import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Bot, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
   import type { MenuState } from "./menuState";
