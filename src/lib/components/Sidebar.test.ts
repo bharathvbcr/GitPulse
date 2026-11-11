@@ -73,13 +73,17 @@ describe("Sidebar resize shell", () => {
 
   it("drives width from the persisted layout store, not a hardcoded class", () => {
     expect(source).not.toContain("w-80 ");
-    expect(source).toMatch(/style="width:\{collapsed \? SIDEBAR_COLLAPSED_WIDTH : \$layoutStore\.width\}px"/);
+    expect(source).toMatch(/style="width:\{shownCollapsed \? SIDEBAR_COLLAPSED_WIDTH : \$layoutStore\.width\}px"/);
     // Was: "transition-[width] duration-(--gp-dur-fast)" on every non-drag
-    // frame. Now the width slide is the one-shot `gp-slide-docked` utility
-    // (the sanctioned exception), applied for one toggle and never mid-drag;
-    // the overlay mode slides on transform and opacity instead.
+    // frame, then the one-shot `gp-slide-docked` width utility. Nothing
+    // animates layout now: the column takes its final width once (at the start
+    // of an open, at the end of a close) and the panel slides on transform and
+    // opacity (dockedSlide.ts), never mid-drag.
     expect(source).not.toContain("transition-[width]");
-    expect(source).toMatch(/settling && !dragging\s*\?\s*'gp-slide-docked'/);
+    expect(source).not.toContain("gp-slide-docked");
+    expect(source).toMatch(/slideDocked\(dockedAside, "in", travel/);
+    expect(source).toMatch(/slideDocked\(dockedAside, "out", travel/);
+    expect(source).toMatch(/!changed \|\| floating \|\| dragging \|\| !dockedAside/);
     expect(source).toContain("if (!dragging) return;");
   });
 
@@ -105,8 +109,9 @@ describe("Sidebar resize shell", () => {
     expect(railStart).toBeGreaterThan(-1);
     // The resizer snippet is rendered only beside the expanded shell: once in
     // the docked aside and once in the overlay panel, each inside its own
-    // `{#if !collapsed}`, and never in the rail.
-    expect(source.match(/\{#if !collapsed\}/g)?.length).toBe(2);
+    // `{#if !collapsed}` / `{#if !shownCollapsed}` (the docked column draws the
+    // panel until its slide-out ends), and never in the rail.
+    expect(source.match(/\{#if !(?:collapsed|shownCollapsed)\}/g)?.length).toBe(2);
     expect(source.match(/\{@render resizer\(\)\}/g)?.length).toBe(2);
     const rail = source.slice(source.indexOf("{#snippet rail()}"), source.indexOf("{#snippet resizer()}"));
     expect(rail).not.toContain('role="separator"');

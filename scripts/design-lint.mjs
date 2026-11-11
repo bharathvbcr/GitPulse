@@ -36,8 +36,7 @@
  *   (isOwnedDeclaration). A rule that USES a token reads it through `var(--x)` and is
  *   checked like any other. Nothing else in a stylesheet is exempt: not a primitive
  *   (`gp-btn`, `gp-field`), not a keyframe recipe; they are findings, held by the
- *   ratchet. The one named exception is `gp-slide-docked`, rule 9's docked-sidebar width
- *   transition (DESIGN_LANGUAGE section 8.5).
+ *   ratchet. Rule 9 has no named exception: nothing animates layout.
  *
  * HOW IT READS A FILE (this is what keeps false positives out)
  *   - A real tokenizer, not a line grep. A `.svelte` file is split into tags
@@ -98,10 +97,8 @@
  *      in `<style>` `transition`/`transition-property`. Class strings in `.ts` files
  *      are read too. A bare `transition` token is not
  *      flagged (Tailwind's default list includes box-shadow and filter, but the
- *      rule text names only the explicit forms). The `gp-slide-docked` utility in
- *      app.css, the docked sidebar's one-shot width slide, is the single named
- *      exception (LAYOUT_TRANSITION_OWNERS); the same properties in a stylesheet
- *      rule or a stylesheet `@apply` are otherwise hits.
+ *      rule text names only the explicit forms). The same properties in a stylesheet
+ *      rule, a stylesheet `@apply` or an `@utility` are hits; there is no exception.
  *   10 motion literals: tokens `duration-N|[..]`, `ease-in|out|in-out|linear|[..]`;
  *      a time or easing literal inside an `animate-[...]`/`transition-[...]`
  *      arbitrary value (`animate-[x_200ms_ease-out]`);
@@ -1177,14 +1174,6 @@ const HEX_QUOTED = new RegExp(`(?<=["'])#${HEX}(?=["'])`, "g");
 const HEX_ARBITRARY = new RegExp(`(?<=\\[)#${HEX}(?=[\\]/_])`, "g");
 const COLOR_FN = /(?<![\w-])(?:rgb|rgba|hsl|hsla)\(\s*\d/g;
 
-/**
- * The one layout transition the design language allows (DESIGN_LANGUAGE section 8.5):
- * the docked sidebar slides its width once, off while it is dragged. Rule 9 reads
- * stylesheets, so this utility is named here rather than allow-listed, which would
- * excuse every other layout transition in the same file.
- */
-const LAYOUT_TRANSITION_OWNERS = new Set(["gp-slide-docked"]);
-
 /** @param {CssRule} r the utility a rule defines (`@utility gp-x`), or the empty string */
 function utilityName(r) {
   return r.selector.startsWith("@utility ") ? r.selector.slice(9).trim() : "";
@@ -1523,7 +1512,6 @@ export const RULES = [
       });
       for (const d of m.decls) {
         if (d.prop !== "transition" && d.prop !== "transition-property") continue;
-        if (chain(d.rule).some((r) => LAYOUT_TRANSITION_OWNERS.has(utilityName(r)))) continue;
         const bad = transitionedProperties(d.value).filter((p) => BANNED_TRANSITION_PROPS.has(p));
         if (bad.length > 0) report(d.start, `${d.prop} names ${bad.join(", ")}; animate transform and opacity only`);
       }

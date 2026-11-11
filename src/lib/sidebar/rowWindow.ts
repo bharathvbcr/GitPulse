@@ -204,22 +204,30 @@ export function windowFromOffsets(
  * already inside does not move the list at all. Returning `null` rather than
  * the current `scrollTop` keeps "no movement" distinguishable from "move to
  * exactly here", so the caller never issues a redundant smooth scroll.
+ *
+ * `inset` keeps the row that far inside each edge, for a scroller whose edges
+ * are covered by a fade and a chevron (the sidebar's branch list): a row
+ * revealed flush to the edge would be revealed under them. It is capped at a
+ * quarter of the viewport so a short list is still navigable, and 0 (the
+ * default) is the flush behaviour.
  */
 export function scrollOffsetToReveal(
   offsets: readonly number[],
   index: number,
   scrollTop: number,
-  viewportHeight: number
+  viewportHeight: number,
+  inset = 0
 ): number | null {
   if (!Number.isInteger(index) || index < 0 || index >= rowCount(offsets)) return null;
   if (!Number.isFinite(scrollTop) || !Number.isFinite(viewportHeight) || viewportHeight <= 0) {
     return null;
   }
   const safeScrollTop = Math.max(0, scrollTop);
-  const top = rowTop(offsets, index);
-  const bottom = rowBottom(offsets, index);
-  if (top < safeScrollTop) return top;
-  if (bottom > safeScrollTop + viewportHeight) return bottom - viewportHeight;
+  const edge = Number.isFinite(inset) ? Math.min(Math.max(0, inset), viewportHeight / 4) : 0;
+  const above = Math.max(0, rowTop(offsets, index) - edge);
+  if (above < safeScrollTop) return above;
+  const below = rowBottom(offsets, index) - viewportHeight + edge;
+  if (below > safeScrollTop) return below;
   return null;
 }
 

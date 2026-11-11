@@ -177,7 +177,7 @@ describe("WorktreesPanel removal safety", () => {
     expect(fn).toContain("mergeSquash = squashesByDefault(wt.branch)");
     const armed = source.slice(source.indexOf("{#if mergeConfirmPath === wt.path}"));
     expect(armed.slice(0, 1200)).toContain("Press merge again to confirm.");
-    expect(armed.slice(0, 1200)).toContain("bind:checked={mergeSquash}");
+    expect(armed.slice(0, 1200)).toContain("checked={mergeSquash}");
     expect(armed.slice(0, 1200)).toContain("Squash into one commit");
   });
 
@@ -396,8 +396,8 @@ describe("WorktreesPanel DevMap seeding and sparse-cone provisioning", () => {
     expect(source).toContain("let seedDevmap = $state(true);");
     expect(source).toContain("let zeroCopyDevmap = $state(false);");
     expect(source).toContain("let sparsePathsInput = $state(\"\");");
-    expect(source).toContain("Seed DevMap index (copy-on-write clone, then built here)");
-    expect(source).toContain("Zero-copy DevMap pointer instead (GitPulse only)");
+    expect(source).toContain("Seed the code map index (copy-on-write clone, then built here)");
+    expect(source).toContain("Link to the main code map instead of copying it (GitPulse only)");
     expect(source).toContain('aria-label="Sparse checkout paths"');
     expect(source).toContain("seedDevmap,");
     expect(source).toContain("zeroCopyDevmap,");

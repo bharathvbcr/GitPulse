@@ -149,7 +149,7 @@ describe("shape, space, density and edge tokens", () => {
 });
 
 describe("the vocabulary utilities", () => {
-  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-actions", "gp-row", "gp-label", "gp-select", "gp-slide-docked"])(
+  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-actions", "gp-row", "gp-label", "gp-select"])(
     "defines @utility %s",
     (name) => {
       expect(css).toMatch(new RegExp(`^@utility ${name} \\{`, "m"));
@@ -186,21 +186,19 @@ describe("the vocabulary utilities", () => {
     expect(select).toMatch(/\bpl-3\b/);
   });
 
-  it("caps gp-slide-docked at the fast token, under the 200 ms the spec allows, and animates only size", () => {
-    const slide = blockOf("@utility gp-slide-docked {");
-    expect(slide).toContain("transition-property: width, height;");
-    expect(slide).toContain("transition-duration: var(--gp-dur-fast);");
-    expect(DURATION_MS.fast).toBeLessThanOrEqual(200);
-    // It is the single sanctioned layout transition: no other utility animates width or height.
-    const others = [...css.matchAll(/^@utility ([\w-]+) \{/gm)].map((match) => match[1]).filter((name) => name !== "gp-slide-docked");
-    for (const name of others) {
+  it("has no utility that animates layout: the docked slide is gone and every utility animates paint properties only", () => {
+    // The docked sidebar's width slide was the one sanctioned layout transition. It is
+    // transform and opacity now (Sidebar.svelte), so no utility may name a layout property.
+    expect(css).not.toMatch(/^@utility gp-slide-docked\b/m);
+    const all = [...css.matchAll(/^@utility ([\w-]+) \{/gm)].map((match) => match[1]);
+    for (const name of all) {
       expect(blockOf(`@utility ${name} {`), name).not.toMatch(/transition(?:-property)?:[^;]*\b(?:width|height|margin|padding|top|left|filter|box-shadow|backdrop-filter)\b/);
     }
   });
 
   it("zeroes every animated vocabulary class under reduced motion, in both lists", () => {
     // The pairing itself is pinned by motionPreference.test.ts; this names the classes this wave added.
-    for (const name of ["gp-btn", "gp-chip", "gp-row", "gp-slide-docked"]) {
+    for (const name of ["gp-btn", "gp-chip", "gp-row"]) {
       expect(css, name).toMatch(new RegExp(`html :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
       expect(css, name).toMatch(new RegExp(`html\\[data-motion="reduced"\\] :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
     }

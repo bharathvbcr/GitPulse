@@ -41,10 +41,16 @@
 
   let {
     compact = false,
+    iconOnly = false,
     align = "left",
     direction = "down",
   }: {
     compact?: boolean;
+    /**
+     * Icon only, for the 44 px rail: the label moves to `aria-label` and the
+     * tooltip, so nothing can spill past the column. Applies to `compact`.
+     */
+    iconOnly?: boolean;
     /** Which trigger edge the panel lines up with. */
     align?: "left" | "right";
     /** Preferred side; the panel flips when that side cannot hold it. */
@@ -338,11 +344,12 @@
       aria-controls={open ? panelId : undefined}
       disabled={Boolean(disabledReason)}
       title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
-      class="gp-btn text-textMuted hover:text-accent"
+      aria-label={iconOnly ? "Ask agent" : undefined}
+      class={iconOnly ? "gp-icon-btn hover:text-accent" : "gp-btn text-textMuted hover:text-accent"}
       data-size="sm"
     >
-      <Sparkles size={11} class="text-accent shrink-0" />
-      <span class="font-sans">Ask agent</span>
+      <Sparkles size={iconOnly ? 14 : 11} class="text-accent shrink-0" />
+      {#if !iconOnly}<span class="font-sans">Ask agent</span>{/if}
     </button>
   {:else}
     <button

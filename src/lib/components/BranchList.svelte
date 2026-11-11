@@ -38,6 +38,7 @@
   import { LAYERS } from "../ui/layers";
   import BranchHealthDot from "./BranchHealthDot.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import EmptyState from "./EmptyState.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
   import {
@@ -117,7 +118,11 @@
   // Tailwind's scanner sees every variant.
   let gapBand = $derived($densityStore === "compact" ? "mb-1" : "mb-1.5");
   let gapChips = $derived($densityStore === "compact" ? "mb-1.5" : "mb-2");
-  let scrollerAir = $derived($densityStore === "compact" ? "" : "pb-1");
+  // The list's bottom padding clears the last row off the edge once the fade
+  // is gone at the end of the list.
+  let scrollerAir = $derived($densityStore === "compact" ? "pb-1" : "pb-2");
+  /** The chevron band and fade ramp at a scroll edge (`--gp-sidebar-cue-band` + `-ramp` in app.css, 2rem + 0.5rem). */
+  const CUE_CLEAR_PX = 40;
 
   let activeTab = $state<BranchFilterTab>("all");
   let pinnedNames = $state<Set<string>>(new Set());
@@ -447,7 +452,7 @@
     // follows `scroll` events, which a busy frame delivers late, so a second
     // arrow key pressed before the first scroll's event landed was measured
     // against a stale offset and left its row clipped at the edge.
-    const top = scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight);
+    const top = scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight, CUE_CLEAR_PX);
     if (top !== null) containerEl.scrollTo({ top });
   }
 
@@ -1376,9 +1381,7 @@
     class="h-full overflow-y-auto min-h-0 relative select-none will-change-scroll {scrollerAir}"
   >
     {#if allRows.length === 0}
-      <div class="px-3 py-6 text-center text-meta text-textMuted">
-        {query ? `No branches match "${query}"` : "No branches found"}
-      </div>
+      <EmptyState compact icon={GitBranch} title={query ? `No branches match "${query}"` : "No branches found"} />
     {:else}
       <!-- Total Virtual Spacer -->
       <div style="height: {totalHeight}px; position: relative; width: 100%;">
