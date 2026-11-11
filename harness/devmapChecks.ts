@@ -86,9 +86,9 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
   setLoad({...explorer,payload:{...explorer.payload!,generation_id:8}}); await settle();
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 36 match filters") throw new Error("Refresh lost filters");
   await click('.map-filters button');
-  await click('.map-filters label:nth-child(2) input');
+  await click('.map-filters input[aria-label="Hide generated/vendor"]');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "35 of 36 match filters") throw new Error("Generated path filter failed");
-  await click('.map-filters label:nth-child(3) input');
+  await click('.map-filters input[aria-label="Connected only"]');
   if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 36 match filters") throw new Error("Connected-only filter retained isolated nodes");
   await click('.map-filters button');
   await click('.map-actions > button');

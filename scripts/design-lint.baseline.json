@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "a747af18bf31a9d3bcafddbccc2551e8bb8f9632",
+  "commit": "4b22f9be38e8408d82fbd4836cbc60ebd8254c09",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
@@ -151,14 +151,11 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 15,
+      "total": 5,
       "files": {
         "src/lib/components/AgentDefaultsSettings.svelte": 1,
         "src/lib/components/AgentLimitSetting.svelte": 1,
         "src/lib/components/AgentModelSettings.svelte": 2,
-        "src/lib/components/DiffViewer.svelte": 2,
-        "src/lib/components/RepoMapPanel.svelte": 1,
-        "src/lib/components/RepoPanel.svelte": 7,
         "src/lib/components/TaskArchive.svelte": 1
       }
     },

@@ -853,7 +853,7 @@
       repoStore.setTerminalOpen(true);
       await opened;
       if (agentLaunchController !== controller) return;
-      agentNotice = `${PROVIDER_LABELS[launcher]} session opened in the terminal. Rescan Health after it finishes.`;
+      agentNotice = `${PROVIDER_LABELS[launcher]} session opened in the terminal. Rescan health after it finishes.`;
     } catch (err) {
       if (agentLaunchController !== controller) return;
       const failure = describeFailure({ verb: "open", object: "the agent session" }, err);
@@ -1501,7 +1501,7 @@
                   title="Rescan repository health"
                 >
                   <RefreshCw size={11} class={loading ? "animate-spin" : ""} />
-                  <span>Rescan Health</span>
+                  <span>Rescan health</span>
                 </button>
               </div>
             {/if}
@@ -1766,9 +1766,6 @@
                 <div class="gp-label">Edges</div>
               </div>
             </div>
-            {#if codegraph.generation_id != null}
-              <p class="mt-2 text-micro font-mono text-textMuted">generation {codegraph.generation_id}</p>
-            {/if}
             <p class="mt-2 text-meta text-textMuted">
               Agents query this map for symbol search, impact, traces and dead symbols. A dash means that count was
               not stored, not that it is zero.

@@ -713,7 +713,7 @@
     role="status"
   >
     {#if loading && !map}
-      <span>Loading map…</span>
+      <div class="w-24"><Skeleton variant="text" height="0.625rem" /></div>
     {:else if statusPayload}
       <span
         class={statusPayload.is_fresh
@@ -888,7 +888,7 @@
         >
           <input
             type="search"
-            class="gp-input flex-1 text-xs py-1 px-2"
+            class="gp-field flex-1 text-xs py-1 px-2"
             placeholder="Full-text markdown search…"
             bind:value={docsQuery}
             aria-label="Search repository markdown"
@@ -940,7 +940,7 @@
           {/if}
         </h3>
         {#if brokenSection === "loading"}
-          <p class="text-meta text-textMuted">Loading…</p>
+          <Skeleton variant="rect" count={2} height="2.75rem" />
         {:else if brokenSection === "error"}
           <p class="text-meta text-danger" role="alert" data-testid="docs-broken-error">Couldn't check links. {boundStrip(brokenError)}</p>
           <button type="button" class="gp-btn text-meta px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Try again</button>
@@ -987,7 +987,7 @@
         <p class="text-meta text-danger">{boundStrip(linksError)}</p>
       {/if}
       {#if linksLoading}
-        <p class="text-meta text-textMuted">Loading…</p>
+        <Skeleton variant="rect" count={2} height="2.75rem" />
       {:else if linkResult && linkResult.links.length > 0}
         <ul class="space-y-1.5">
           {#each keyedList(linkResult.links, (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
