@@ -2026,3 +2026,63 @@ fn excluding_other_tips_would_cut_a_chain_a_mid_chain_tip_shares() {
     assert_eq!(parent_of(&payload, "a"), Some("x".to_string()));
     assert_eq!(payload.unresolved_branches, 0);
 }
+
+/// The deferral retry and the timing label find a command by the `cmd_*`
+/// segment in its body's closure type (`ipc_error::command_name`). A body
+/// written in a helper the command and its tests share has no such segment, so
+/// it silently lost the retry for a wrapped deferral and its timing name
+/// (cmd_get_status did, after its body moved into `get_status_through_watch`).
+/// Such a helper names its command with `off_thread_for`; this holds every
+/// other `off_thread` call to sit inside the `cmd_*` function it serves.
+#[test]
+fn every_off_thread_body_is_written_inside_its_command() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+    let mut strays = Vec::new();
+    let mut scanned = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("commands dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read source");
+        // Production code only: a module's own `#[cfg(test)] mod tests` sits at its end.
+        let source = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(&source);
+        let mut from = 0;
+        while let Some(at) = source[from..].find("off_thread(") {
+            let at = from + at;
+            from = at + "off_thread(".len();
+            // `off_thread(` inside `fn off_thread(` or `off_thread_for(` is not a call site.
+            let before = &source[..at];
+            if before.ends_with("fn ") || before.ends_with('_') {
+                continue;
+            }
+            scanned += 1;
+            let enclosing = before
+                .rsplit("fn ")
+                .next()
+                .and_then(|tail| {
+                    tail.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                })
+                .unwrap_or("");
+            // The background variant forwards its caller's closure, whose type
+            // still names the command.
+            if !enclosing.starts_with("cmd_") && enclosing != "off_thread_background" {
+                let line = before.matches('\n').count() + 1;
+                strays.push(format!("{name}:{line} in fn {enclosing}"));
+            }
+        }
+    }
+    assert!(
+        scanned > 50,
+        "the scan found only {scanned} off_thread calls; it is not reading the command sources"
+    );
+    assert!(
+        strays.is_empty(),
+        "off_thread bodies outside their cmd_* function lose the command's name; use off_thread_for: {strays:?}"
+    );
+}

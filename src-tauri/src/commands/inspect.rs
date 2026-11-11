@@ -55,7 +55,7 @@ pub(crate) async fn get_status_through_watch(
     repo_path: String,
     may_reuse: bool,
 ) -> Result<Vec<FileStatus>, IpcError> {
-    off_thread(move || {
+    off_thread_for("cmd_get_status", move || {
         crate::watcher::status_through_watch(&watcher, &repo_path, may_reuse, || {
             GitReader::get_status(&repo_path)
         })
