@@ -307,3 +307,30 @@ describe("WorkView deep links", () => {
     expect(markup).not.toMatch(/\b(?:p|py|pt|pb)-\d/);
   });
 });
+
+describe("WorkView's lazily loaded disclosures", () => {
+  const source = readFileSync(new URL("./WorkView.svelte", import.meta.url), "utf8");
+
+  it("waits for the requested disclosure's chunk before looking for its section", () => {
+    // Branch and tag cleanup and Policy activity load as chunks of their own.
+    // A deep link that looked one tick later found nothing while the chunk was
+    // still in flight, and told the user the card had nothing to show.
+    const reveal = source.slice(source.indexOf("async function revealFocus"));
+    const awaitCleanup = reveal.indexOf("await loadBranchTagCleanup()");
+    const awaitActivity = reveal.indexOf("await loadPolicyActivity()");
+    const lookup = reveal.indexOf("document.getElementById(manviSectionId(id))");
+    expect(awaitCleanup).toBeGreaterThan(-1);
+    expect(awaitActivity).toBeGreaterThan(-1);
+    expect(awaitCleanup).toBeLessThan(lookup);
+    expect(awaitActivity).toBeLessThan(lookup);
+  });
+
+  it("can retry a chunk that failed to load instead of replaying the rejection", () => {
+    expect(source).toContain("cleanupModule = null;");
+    expect(source).toContain("activityModule = null;");
+    expect(source).toContain("onclick={() => cleanupAttempt++}>Retry</button>");
+    expect(source).toContain("onclick={() => activityAttempt++}>Retry</button>");
+    expect(source).toContain("{#key cleanupAttempt}");
+    expect(source).toContain("{#key activityAttempt}");
+  });
+});

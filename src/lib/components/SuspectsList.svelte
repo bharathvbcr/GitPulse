@@ -112,8 +112,10 @@
 
       {#if !answer.available}
         {@const reasonTitle = tooltipWalkIncomplete([answer.reason])}
-        <p class="gp-notice mx-0 mt-0 min-w-0 line-clamp-3" data-tone="warn" title={reasonTitle}>
-          Suspects unavailable{reasonTitle ? `: ${reasonTitle}` : ""} — not the same as no suspects.
+        <!-- The clamp sits on an inner span: gp-notice's data-tone rule sets
+             display:flex, which line-clamp on the notice itself would lose to. -->
+        <p class="gp-notice mx-0 mt-0 min-w-0" data-tone="warn" title={reasonTitle}>
+          <span class="min-w-0 line-clamp-3">Suspects unavailable{reasonTitle ? `: ${reasonTitle}` : ""} — not the same as no suspects.</span>
         </p>
       {:else if suspects.length === 0}
         <p class="gp-notice mx-0 mt-0 text-textSecondary">

@@ -10,7 +10,9 @@
 </script>
 <script lang="ts">
   import type { Writable } from "svelte/store";
-  import ProductTour from "../src/lib/components/onboarding/ProductTour.svelte";
+  // The gate, as App mounts it: it decides when the tour's chunk loads, so the
+  // harness has to go through it or it tests a mount path production never takes.
+  import ProductTour from "../src/lib/components/onboarding/ProductTourGate.svelte";
   import Logo from "../src/lib/components/Logo.svelte";
   import { VIEW_REGISTRY } from "../src/lib/views/viewRegistry";
   import type { ProductTourStore } from "../src/lib/tools/productTour";

@@ -24,10 +24,20 @@
    * cannot carry, so each is awaited in the template from a memoised loader:
    * one import per session, not one per render.
    */
+  // A failed import clears its memo, so Retry (or the next deep link) asks again
+  // instead of replaying the same rejection for the rest of the session.
   let cleanupModule: Promise<typeof import("./BranchTagCleanup.svelte")> | null = null;
-  const loadBranchTagCleanup = () => (cleanupModule ??= import("./BranchTagCleanup.svelte"));
+  const loadBranchTagCleanup = () =>
+    (cleanupModule ??= import("./BranchTagCleanup.svelte").catch((error: unknown) => {
+      cleanupModule = null;
+      throw error;
+    }));
   let activityModule: Promise<typeof import("./PolicyActivity.svelte")> | null = null;
-  const loadPolicyActivity = () => (activityModule ??= import("./PolicyActivity.svelte"));
+  const loadPolicyActivity = () =>
+    (activityModule ??= import("./PolicyActivity.svelte").catch((error: unknown) => {
+      activityModule = null;
+      throw error;
+    }));
 </script>
 
 <script lang="ts">
@@ -340,6 +350,9 @@
   // answer questions about the repository rather than work in flight, so they
   // must not push the rows down.
   let showCleanup = $state(false);
+  /** Bumped by Retry: re-runs a disclosure's import after a failed chunk load. */
+  let cleanupAttempt = $state(0);
+  let activityAttempt = $state(0);
   let showActivity = $state(false);
 
   const showPolicyActivity = $derived(
@@ -399,6 +412,17 @@
     // The disclosure that holds the card is opened here, before looking for it.
     if (id === "cleanup") showCleanup = true;
     else if (id === "activity") showActivity = true;
+    // Both disclosures arrive in chunks of their own: wait for the one asked
+    // for, or the lookup below runs before its section exists and reports a
+    // card that is merely still loading as absent. A failed load is shown in
+    // place by its {:catch} notice, so it is not reported here as well.
+    try {
+      if (id === "cleanup") await loadBranchTagCleanup();
+      else if (id === "activity" && showPolicyActivity) await loadPolicyActivity();
+    } catch {
+      return;
+    }
+    await tick();
     await tick();
     const section = document.getElementById(manviSectionId(id));
     if (!section) {
@@ -1166,17 +1190,27 @@
       {/if}
     </div>
 
-    {#await loadBranchTagCleanup() then { default: BranchTagCleanup }}
-      <BranchTagCleanup bind:open={showCleanup} />
-    {:catch error}
-      <p class="gp-notice" data-tone="danger" role="alert">Could not load branch and tag cleanup: {String(error)}</p>
-    {/await}
-    {#if showPolicyActivity}
-      {#await loadPolicyActivity() then { default: PolicyActivity }}
-        <PolicyActivity bind:open={showActivity} />
+    {#key cleanupAttempt}
+      {#await loadBranchTagCleanup() then { default: BranchTagCleanup }}
+        <BranchTagCleanup bind:open={showCleanup} />
       {:catch error}
-        <p class="gp-notice" data-tone="danger" role="alert">Could not load Policy activity: {String(error)}</p>
+        <p class="gp-notice flex items-center gap-2" data-tone="danger" role="alert">
+          <span class="min-w-0 flex-1">Could not load branch and tag cleanup: {String(error)}</span>
+          <button type="button" class="gp-btn" onclick={() => cleanupAttempt++}>Retry</button>
+        </p>
       {/await}
+    {/key}
+    {#if showPolicyActivity}
+      {#key activityAttempt}
+        {#await loadPolicyActivity() then { default: PolicyActivity }}
+          <PolicyActivity bind:open={showActivity} />
+        {:catch error}
+          <p class="gp-notice flex items-center gap-2" data-tone="danger" role="alert">
+            <span class="min-w-0 flex-1">Could not load Policy activity: {String(error)}</span>
+            <button type="button" class="gp-btn" onclick={() => activityAttempt++}>Retry</button>
+          </p>
+        {/await}
+      {/key}
     {/if}
   {/if}
 </div>
