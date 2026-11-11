@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { MAX_QUEUED_BROWSE, createBrowseQueue, parseBrowseRequest, type BrowseDeps } from "./browseRequests";
+import { BROWSE_TERMINAL_STARTING, MAX_QUEUED_BROWSE, createBrowseQueue, parseBrowseRequest, type BrowseDeps } from "./browseRequests";
 import { isLoopbackUrl } from "./browserSession";
 import { createTerminalLaunchRequests } from "../terminal/launchRequests";
 import { browserTabFor, initialState, openBrowserTab, setTabUrl } from "../terminal/tabs";
@@ -63,7 +63,7 @@ describe("agents' browser session requests", () => {
     queue.push({ repo: "/a", url: "http://localhost:3/" });
     await queue.settled();
     expect(failures).toHaveLength(2);
-    expect(failures[0]).toContain("/gone could not be opened");
+    expect(failures[0]).toContain("Couldn't open /gone.");
     expect(failures[1]).toContain("8 browser sessions are open");
     expect(log.at(-1)).toBe("launch http://localhost:3/");
   });
@@ -74,7 +74,7 @@ describe("agents' browser session requests", () => {
     const queue = createBrowseQueue(fake.deps);
     queue.push({ repo: "/a", url: "http://localhost:1/" });
     await queue.settled();
-    expect(fake.failures[0]).toContain("still pending");
+    expect(fake.failures[0]).toContain(BROWSE_TERMINAL_STARTING);
   });
 
   it("holds at most a bounded number of requests, and says so past it", async () => {

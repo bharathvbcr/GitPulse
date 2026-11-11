@@ -155,7 +155,7 @@
       check("Shift Tab wraps inside final dialog", () => document.activeElement === buttons.at(-1));
       fail = true; await click("Finish");
       check("save failure stays open", () => body());
-      check("save failure announced", () => body().querySelector('[role="alert"]')?.textContent.includes("could not be saved"));
+      check("save failure announced", () => body().querySelector('[role="alert"]')?.textContent.includes("couldn't be saved"));
       check("failed finish not persisted", () => JSON.parse(saved).status !== "completed");
       fail = false; await click("Finish");
       for (let i = 0; i < 30; i++) { try { if (!body()) break; } catch {} await settle(); } // exits are <=70 ms transitions
