@@ -94,7 +94,7 @@
     <button bind:this={trigger} type="button" class="gp-btn" data-size={compact ? "sm" : "md"} aria-expanded={opened} aria-controls={settingsID} disabled={saving || pending !== null} onclick={toggle}>{compact ? "Auto" : "Automatic suggestions"} <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
     {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" class="gp-btn" data-size="sm" onclick={() => wakeAutomatic()}>Resume</button>{/if}
   </div>
-  {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions could not start: {$automaticUpdates.error}</p>{/if}
+  {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions couldn't start: {$automaticUpdates.error}</p>{/if}
   {#if (!compact || opened) && status?.reason}<p role="status">{status.reason}</p>{/if}
   {#if opened}
     <div id={settingsID} class="settings" class:gp-card={compact} class:shadow-float={compact}

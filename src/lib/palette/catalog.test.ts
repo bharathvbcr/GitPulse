@@ -337,9 +337,9 @@ describe("command catalog and context", () => {
     await commands.find(command => command.id === "recent:/four/same")?.action();
     expect(open).toHaveBeenLastCalledWith("/four/same");
     open.mockResolvedValueOnce(false);
-    await expect(commands.find(command => command.id === "switch:a")?.action()).rejects.toThrow("could not be opened");
+    await expect(commands.find(command => command.id === "switch:a")?.action()).rejects.toThrow("couldn't be opened");
     open.mockResolvedValueOnce(false);
-    await expect(commands.find(command => command.id === "recent:/four/same")?.action()).rejects.toThrow("could not be opened");
+    await expect(commands.find(command => command.id === "recent:/four/same")?.action()).rejects.toThrow("couldn't be opened");
     await commands.find(command => command.id === "move_tab_left")?.action(); expect(move).toHaveBeenLastCalledWith("b", -1);
     await commands.find(command => command.id === "move_tab_right")?.action(); expect(move).toHaveBeenLastCalledWith("b", 1);
     await helpCommands(() => {}).find(command => command.id === "help_map_docs")?.action(); expect(navigate).toHaveBeenLastCalledWith("code", "map");

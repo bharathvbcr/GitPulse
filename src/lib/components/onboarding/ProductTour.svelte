@@ -66,7 +66,7 @@
     if (busy || (complete && !tour.finish())) return;
     busy = true; actionError = null;
     try { await onOpenRepository(); }
-    catch { actionError = "The repository could not be opened. Try again or skip this step."; }
+    catch { actionError = "The repository couldn't be opened. Try again or skip this step."; }
     finally { busy = false; }
   }
   async function leaveForTools() {

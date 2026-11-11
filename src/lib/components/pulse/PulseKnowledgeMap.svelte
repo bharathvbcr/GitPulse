@@ -236,7 +236,7 @@
               : ""}.
           {/if}
           {#if knowledge.churn_unavailable}
-            Churn could not be read, so files were taken in path order.
+            Churn couldn't be read, so files were taken in path order.
           {:else if knowledge.churn_window_capped}
             Churn covers only the newest commits; a file busy only before that ranks low.
           {/if}

@@ -83,7 +83,7 @@
       releasePicker(); await settle();
       check("settled picker can be retried", () => text().includes("Choose a repository"));
       picker = "fail"; await click("Choose a repository");
-      check("picker error visible", () => body().querySelector('[role="alert"]')?.textContent.includes("could not be opened"));
+      check("picker error visible", () => body().querySelector('[role="alert"]')?.textContent.includes("couldn't be opened"));
       picker = "cancel"; await click("Choose a repository");
       for (let i = 0; i < 30; i++) { try { if (!body().querySelector('[role="alert"]')) break; } catch {} await settle(); } // exits are <=70 ms transitions
       check("retry clears action error", () => !body().querySelector('[role="alert"]'));

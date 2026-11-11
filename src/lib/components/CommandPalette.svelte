@@ -84,7 +84,7 @@
     const opened = await repoStore.openRepo(root);
     const current = get(repoStore);
     if (!opened || !current.currentPath || !sameRepo(root, current.currentPath, { caseInsensitive: isCaseInsensitiveFs() })) {
-      throw Error(current.error || "The target repository could not be opened. No file was selected.");
+      throw Error(current.error || "The target repository couldn't be opened. No file was selected.");
     }
     selectFile(filePath);
   }

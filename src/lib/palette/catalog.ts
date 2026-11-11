@@ -61,7 +61,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     const opened = await repoStore.openRepo(path);
     const current = get(repoStore);
     if (!opened || !current.currentPath || !sameRepo(current.currentPath, path, { caseInsensitive: isCaseInsensitiveFs() })) {
-      throw Error(current.error || "The repository could not be opened.");
+      throw Error(current.error || "The repository couldn't be opened.");
     }
   };
   const views: PaletteItem[] = Object.values(VIEW_REGISTRY).flatMap(view => [
@@ -198,7 +198,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "shortcuts", label: "Keyboard shortcuts cheat sheet", category: "Help", icon: Keyboard, shortcut: "⌘/", closeBefore: true, action: () => dispatch("gitpulse:shortcuts") },
     { id: "diagnostics", label: "Open diagnostics", category: "Help", icon: Bug, closeBefore: true, action: () => dispatch("gitpulse:diagnostics") },
     { id: "settings", label: "Open Settings", category: "Settings", icon: Settings, shortcut: "⌘,", closeBefore: true, action: () => dispatch("gitpulse:settings") },
-    { id: "mcp_setup", label: "Connect an agent (MCP 2.0 / agent plugins)", category: "Settings", icon: Plug, closeBefore: true, action: () => dispatch("gitpulse:settings") },
+    { id: "mcp_setup", label: "Connect an agent (MCP 2.0 / Agent Plugins)", category: "Settings", icon: Plug, closeBefore: true, action: () => dispatch("gitpulse:settings") },
     { id: "optional_tools_setup", label: "Set up optional tools (DevMap and Manvi)", category: "Settings", icon: Wrench, closeBefore: true, action: () => openSetupWizard("devmap", "explain") },
   ];
 }
