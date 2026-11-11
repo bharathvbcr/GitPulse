@@ -86,6 +86,7 @@
       };
 
       // ---- the fixture backend ------------------------------------------------
+      let spawnedShells = 0;
       const calls = [];
       // Readable from outside the page, so a screenshot run can say which host
       // commands a surface asked for.
@@ -199,6 +200,15 @@
         }),
         cmd_grants_view: () => ({ available: false, error: "", grants: [] }),
         cmd_terminal_sessions: () => [],
+        // Opening the dock spawns a shell and reads `.id` off the reply. Answered
+        // with nothing, the dock showed "TypeError: Cannot read properties of null
+        // (reading 'id')": a fixture fault, as the host replies `{ id, cwd, shell }`.
+        cmd_terminal_spawn: async (a) => {
+          const { adoptOutput } = await import("./tauriMocks.ts");
+          const id = `fixture-shell-${++spawnedShells}`;
+          adoptOutput(id, a);
+          return { id, cwd: a.repoPath, shell: "/bin/zsh" };
+        },
         cmd_terminal_backend: () => ({ backend: "in-process", trouble: [] }),
         cmd_ledger_tail: () => [],
         cmd_get_file_content: () => "export {};\n",
@@ -211,7 +221,14 @@
       // window mounts, so answering it with nothing put an "invalid response"
       // card on screen: an empty page is the real shape of "none pending".
       const emptyWorkbenchPage = () => JSON.stringify({ ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null });
-      const workbenchFixture = (a) => (a.method === "notifications.native.pending" || a.method === "runs.list" ? emptyWorkbenchPage() : null);
+      // Every `*.list` the Tasks surface reads is a page in the same shape
+      // (`page()` in src/lib/workbench/client.ts). `repositories.list` and
+      // `workspaces.list` were answered with nothing, so the surface showed
+      // "Couldn't load tasks. Task storage returned an invalid response."
+      const EMPTY_PAGE_METHODS = new Set([
+        "notifications.native.pending", "runs.list", "repositories.list", "workspaces.list", "items.list", "events.list",
+      ]);
+      const workbenchFixture = (a) => (EMPTY_PAGE_METHODS.has(a.method) ? emptyWorkbenchPage() : null);
       // Answered with nothing, on purpose: the window's background services
       // (menus, alerts, tool discovery, the ledger, GitHub alerts) that a tab
       // switch neither starts nor waits for. Listed rather than defaulted so a
@@ -220,7 +237,9 @@
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
         "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_external_tools_status",
         "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
-        "cmd_catch_up", "cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
+        // What an open dock asks after its shell spawns (a screenshot opens it).
+        "cmd_terminal_context", "cmd_terminal_resize", "cmd_session_alerts_visible",
+        "cmd_catch_up","cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",
@@ -232,7 +251,7 @@
       // a refused call means to its callers.
       const REFUSED = new Set(["cmd_devmap_preview_many", "cmd_codeintel_impact_layered_many"]);
       const handler = async (cmd, args) => {
-        calls.push({ cmd, repo: args?.repoPath ?? null, at: performance.now() });
+        calls.push({ cmd, repo: args?.repoPath ?? null, method: args?.method ?? null, at: performance.now() });
         const gate = holds.get(`${cmd}|${args?.repoPath}`);
         if (gate) await gate;
         if (cmd.startsWith("plugin:")) return 1;
@@ -862,6 +881,17 @@
             for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
               !controls().inert && !$("[data-viewbar-surface]", row2));
+            // The Tasks surface, mounted in the real App on this page's fixture. A
+            // list the fixture answered in the wrong shape made it say "Couldn't
+            // load tasks. Task storage returned an invalid response." in every
+            // shot=tasks picture, so the surface is checked here, not only looked at.
+            interfaceStore.setGlobalSurface("tasks");
+            await sleepUntil(() => /Workspaces/.test(text(document.body)) || /Couldn't load tasks/.test(text(document.body)), 15000);
+            await settle();
+            check("tasks: the surface renders its board with no load-error card", () =>
+              /Workspaces/.test(text(document.body)) && !/Couldn't load tasks|invalid response/.test(text(document.body)));
+            interfaceStore.setGlobalSurface("repository");
+            await settle();
             // Full screen is stamped on <html>; the inset collapses with it.
             const inset = $(".gp-traffic-inset");
             if (inset) {

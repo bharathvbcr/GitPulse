@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tipGuideOf, tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
+import { anchorOwnsOpenPopup, tipGuideOf, tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
 
 class FakeTipHost implements TipHost {
   attributes = new Map<string, string>();
@@ -154,5 +154,13 @@ describe("tooltipAnchorFromTarget", () => {
     expect(tipGuideOf(el)).toBeNull();
     expect(tooltipAnchorFromTarget(el)).toBe(el);
     expect(el.getAttribute("data-tip-text")).toBe("Save");
+  });
+});
+
+describe("anchorOwnsOpenPopup", () => {
+  it("is true only for a control whose own popup is open", () => {
+    expect(anchorOwnsOpenPopup(new FakeTipHost({ "aria-expanded": "true", title: "Toggle" }))).toBe(true);
+    expect(anchorOwnsOpenPopup(new FakeTipHost({ "aria-expanded": "false", title: "Toggle" }))).toBe(false);
+    expect(anchorOwnsOpenPopup(new FakeTipHost({ title: "Toggle" }))).toBe(false);
   });
 });
