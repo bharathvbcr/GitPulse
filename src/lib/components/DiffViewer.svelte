@@ -94,11 +94,10 @@
     AlertTriangle,
     Palette,
     PanelLeftOpen,
-    Search,
     WrapText,
-    X,
   } from "@lucide/svelte";
   import LazyMount from "./LazyMount.svelte";
+  import FindField from "./FindField.svelte";
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
   const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
@@ -548,17 +547,6 @@
     searchOpen = false;
     searchQuery = "";
     searchIndex = 0;
-  }
-
-  /** Enter and Shift+Enter step, Escape closes — owned by the box, so no window rule has to guess. */
-  function onSearchKeydown(event: KeyboardEvent): void {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      stepSearch(event.shiftKey ? -1 : 1);
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      closeSearch();
-    }
   }
 
   // Re-anchor on the visible row whenever the result set changes, so typing
@@ -1109,7 +1097,7 @@
     }
     // Enter steps only from the diff body itself: on a focused button it is
     // that button's activation (Stage Hunk, Close find), and it is the find
-    // box's own business inside the box (see onSearchKeydown).
+    // box's own business inside the box (FindField owns Enter and Escape).
     const enterInDiff =
       searchOpen &&
       event.key === "Enter" &&
@@ -1781,17 +1769,21 @@
       </button>
     {/if}
 
-    <button
-      type="button"
-      class="gp-btn {searchOpen ? PRESSED : 'text-textMuted'}"
-      data-size="sm"
-      aria-pressed={searchOpen}
-      onclick={() => (searchOpen ? closeSearch() : openSearch())}
-      title="Find in this diff ({shortcutTextLabel('⌘F', $hostPlatform.os)})"
-    >
-      <Search size={13} />
-      <span class="hidden sm:inline">Find</span>
-    </button>
+    <FindField
+      bind:open={searchOpen}
+      bind:query={searchQuery}
+      bind:caseSensitive={searchCase}
+      bind:regex={searchRegex}
+      bind:input={searchInput}
+      label="Find in this diff"
+      placeholder="Find in this diff…"
+      shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+      status={matchLabel(search, searchIndex)}
+      invalid={search.invalid}
+      hasMatches={search.matches.length > 0}
+      onstep={stepSearch}
+      onclose={closeSearch}
+    />
 
     <div class="flex items-center gap-1">
       <button
@@ -1896,80 +1888,6 @@
       </div>
     </div>
   </div>
-
-  {#if searchOpen}
-    <div
-      class="flex shrink-0 select-none items-center gap-2 bg-surface/50 px-3 py-1 font-sans"
-    >
-      <Search size={13} class="shrink-0 text-textMuted" />
-      <input
-        bind:this={searchInput}
-        bind:value={searchQuery}
-        onkeydown={onSearchKeydown}
-        type="text"
-        class="min-w-0 flex-1 bg-transparent py-0.5 text-meta text-textPrimary outline-hidden placeholder:text-faint"
-        placeholder="Find in this diff…"
-        aria-label="Find in this diff"
-      />
-      <span
-        class="shrink-0 tabular-nums text-micro {search.invalid ? 'text-danger' : 'text-textMuted'}"
-      >
-        {matchLabel(search, searchIndex)}
-      </span>
-      <button
-        type="button"
-        class="gp-btn text-meta {searchCase ? PRESSED : 'text-textMuted'}"
-        data-size="sm"
-        aria-pressed={searchCase}
-        onclick={() => (searchCase = !searchCase)}
-        title="Match case"
-      >
-        Aa
-      </button>
-      <button
-        type="button"
-        class="gp-btn font-mono text-meta {searchRegex ? PRESSED : 'text-textMuted'}"
-        data-size="sm"
-        aria-pressed={searchRegex}
-        onclick={() => (searchRegex = !searchRegex)}
-        title="Regular expression"
-      >
-        .*
-      </button>
-      <button
-        type="button"
-        class="gp-icon-btn disabled:opacity-40"
-        data-size="sm"
-        disabled={search.matches.length === 0}
-        onclick={() => stepSearch(-1)}
-        title="Previous match (Shift+F3)"
-        aria-label="Previous match"
-      >
-        <ChevronUp size={13} />
-      </button>
-      <button
-        type="button"
-        class="gp-icon-btn disabled:opacity-40"
-        data-size="sm"
-        disabled={search.matches.length === 0}
-        onclick={() => stepSearch(1)}
-        title="Next match (F3)"
-        aria-label="Next match"
-      >
-        <ChevronDown size={13} />
-      </button>
-      <button
-        type="button"
-        class="gp-icon-btn"
-        data-size="sm"
-        onclick={closeSearch}
-        title="Close find"
-        aria-label="Close find"
-      >
-        <X size={13} />
-      </button>
-    </div>
-  {/if}
 
   {#if truncatedSource}
     <div class="gp-notice flex shrink-0 items-center gap-2 font-sans" data-tone="warn" role="status">

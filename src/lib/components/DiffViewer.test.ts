@@ -48,7 +48,16 @@ describe("DiffViewer source contracts", () => {
     // Enter that is not in the find box belongs to a control unless it is on the diff body.
     expect(handler).not.toMatch(/searchOpen && !typing && event\.key === "Enter"/);
     expect(handler).toContain("!onControl");
-    expect(source).toContain("onkeydown={onSearchKeydown}");
+    // The find box owns its Enter and Escape: the shared in-place field
+    // handles them on its own input and marks them handled, so the window
+    // rule above (which returns on defaultPrevented) never sees them.
+    expect(source).toContain("<FindField");
+    const field = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "FindField.svelte"), "utf8");
+    const keys = field.slice(field.indexOf("function onkeydown"), field.indexOf("</script>"));
+    expect(keys).toContain('event.key === "Enter"');
+    expect(keys).toContain('event.key === "Escape"');
+    expect((keys.match(/event\.preventDefault\(\)/g) ?? []).length).toBe(2);
+    expect(field).toMatch(/<input[\s\S]*?\{onkeydown\}/);
   });
 
   it("says a copied patch is partial when the backend cut the diff", () => {

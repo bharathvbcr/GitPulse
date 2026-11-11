@@ -92,6 +92,28 @@ const type = async value => { const area = textarea(); area.value = value; area.
   check("a reveal for the file already open lands on the named line", () => host.textContent.includes("Ln 2, Col 1"));
   check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
 
+  // Find used to open a second bar under the toolbar, styled unlike the
+  // diff's. It is the same in-place field now: the pill widens where it sat.
+  {
+    const trigger = () => host.querySelector("[data-find-trigger]");
+    const field = () => host.querySelector("[data-find-field]");
+    check("the file toolbar offers Find as one pill", () => !!trigger() && !field());
+    const slot = trigger().parentElement;
+    trigger().click();
+    await until(() => !!field(), "find field");
+    await tick();
+    check("Find opens in place in the toolbar row, focused, with no second bar", () =>
+      field().parentElement === slot && !trigger() && document.activeElement === field().querySelector("input"));
+    const input = field().querySelector("input");
+    input.value = "o";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await until(() => / of /.test(field().querySelector("[data-find-status]")?.textContent ?? ""), "match count");
+    check("a query shows its match count inside the field", () => /^1 of [1-9]/.test(field().querySelector("[data-find-status]").textContent.trim()));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !field(), "find closed");
+    check("Escape folds it back to the Find pill", () => !!trigger() && !field());
+  }
+
   // A reload of the open file (a status change, an agent's edit) swaps the
   // blob in place. Tag the live viewer, then reload it while the read is held.
   const lnSpan = () => [...host.querySelectorAll("span")].find(el => /^Ln \d+, Col 1$/.test(el.textContent.trim()));

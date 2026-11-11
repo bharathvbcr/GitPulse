@@ -23,9 +23,6 @@
   import { askConfirm } from "../../stores/modalStore";
   import { createAsyncGuard } from "../../async/guard";
   import {
-    Search,
-    ChevronUp,
-    ChevronDown,
     WrapText,
     Copy,
     Check,
@@ -37,6 +34,7 @@
   } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
+  import FindField from "../FindField.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
@@ -74,7 +72,6 @@
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
   let actionBar: HTMLDivElement | undefined = $state();
-  let searchBar: HTMLDivElement | undefined = $state();
   let goToBar: HTMLDivElement | undefined = $state();
   let statusBar: HTMLDivElement | undefined = $state();
   const OVERSCAN = 20;
@@ -505,15 +502,22 @@
         <span class="text-micro font-semibold text-warn" role="status">Unsaved</span>
       {/if}
 
-      <button
-        type="button"
-        onclick={() => (isSearchOpen = !isSearchOpen)}
-        class="gp-btn px-2! ml-2 flex items-center gap-1 text-meta {isSearchOpen ? 'border-accent bg-accent/15 text-accent' : ''}" data-size="sm"
-      >
-        <Search size={11} />
-        <span>Find</span>
-        <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘F", $hostPlatform.os)}</span>
-      </button>
+      <div class="ml-2 flex min-w-0 items-center">
+        <FindField
+          bind:open={isSearchOpen}
+          bind:query={searchQuery}
+          bind:caseSensitive={isCaseSensitive}
+          bind:regex={isRegex}
+          bind:input={searchInputEl}
+          label="Find in file"
+          placeholder="Find in file…"
+          shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+          status={matchLabel(searchResult, currentMatchIdx)}
+          invalid={searchResult.invalid}
+          hasMatches={matchCount > 0}
+          onstep={(delta) => (delta === 1 ? nextMatch() : prevMatch())}
+        />
+      </div>
 
       <button
         type="button"
@@ -619,86 +623,6 @@
     </div>
     <ScrollCue target={actionBar} axis="x" />
   </div>
-
-  <!-- Search Bar -->
-  {#if isSearchOpen}
-    <div class="relative shrink-0 gp-section-edge bg-surface select-none" data-tip-place="above">
-      <div bind:this={searchBar} class="gp-header-scroll">
-        <div class="flex items-center justify-between gap-3 px-3 py-2 min-w-max w-full">
-      <div class="flex items-center gap-2 shrink-0 min-w-48 max-w-md flex-1">
-        <div class="flex items-center gap-1.5 bg-background border border-border rounded-full px-2.5 py-1 flex-1 focus-within:border-accent">
-          <Search size={12} class="text-textMuted shrink-0" />
-          <input
-            bind:this={searchInputEl}
-            type="text"
-            bind:value={searchQuery}
-            onkeydown={(e) => {
-              if (e.key === "Enter") {
-                if (e.shiftKey) prevMatch();
-                else nextMatch();
-              }
-            }}
-            placeholder="Find in file…"
-            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden"
-          />
-          {#if searchQuery}
-            <span class="text-micro font-mono text-textMuted shrink-0">
-              {matchLabel(searchResult, currentMatchIdx)}
-            </span>
-          {/if}
-        </div>
-
-        <div class="flex items-center gap-1">
-          <button
-            type="button"
-            onclick={() => (isCaseSensitive = !isCaseSensitive)}
-            class="px-2 py-0.5 text-micro font-mono rounded border transition-colors {isCaseSensitive
-              ? 'bg-accent/20 border-accent text-accent font-semibold'
-              : 'border-edgeSoft text-textMuted hover:text-textPrimary'}"
-            title="Match case"
-          >Aa</button>
-          <button
-            type="button"
-            onclick={() => (isRegex = !isRegex)}
-            class="px-2 py-0.5 text-micro font-mono rounded border transition-colors {isRegex
-              ? 'bg-accent/20 border-accent text-accent font-semibold'
-              : 'border-edgeSoft text-textMuted hover:text-textPrimary'}"
-            title="Use regular expression"
-          >.*</button>
-        </div>
-      </div>
-
-      <div class="flex items-center gap-1">
-        <button
-          type="button"
-          onclick={prevMatch}
-          disabled={matchCount === 0}
-          class="gp-btn px-2! flex items-center gap-1" data-size="sm"
-          title="Previous match (Shift+Enter)"
-        >
-          <ChevronUp size={12} />
-        </button>
-        <button
-          type="button"
-          onclick={nextMatch}
-          disabled={matchCount === 0}
-          class="gp-btn px-2! flex items-center gap-1" data-size="sm"
-          title="Next match (Enter)"
-        >
-          <ChevronDown size={12} />
-        </button>
-        <button
-          type="button"
-          onclick={() => { isSearchOpen = false; searchQuery = ""; }}
-          class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
-          aria-label="Close find"
-        >✕</button>
-      </div>
-        </div>
-      </div>
-      <ScrollCue target={searchBar} axis="x" />
-    </div>
-  {/if}
 
   {#if goToLineOpen}
     <div class="relative shrink-0 bg-surface select-none">
