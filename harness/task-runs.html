@@ -848,7 +848,7 @@
         const summaryText=()=>document.querySelector('[data-testid="agents-summary"]').textContent.trim();
         const panelText=()=>document.querySelector('[data-testid="task-agent-panel"]').textContent;
         check("A failed first read says the attempts could not be read, not that there are none",
-          summaryText()==="Runs could not be read."&&!panelText().includes("No runs yet"));
+          summaryText()==="Couldn't read runs."&&!panelText().includes("No runs yet"));
         check("An unread history does not open the launch form",launchForm().hidden);
         failRunsList=false;button("Try again").click();
         await wait(()=>summaryText()==="No runs yet.");

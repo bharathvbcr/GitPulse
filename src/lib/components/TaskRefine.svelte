@@ -221,7 +221,7 @@
 </section>
 
 <style>
-  .refine{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:.75rem}
+  .refine{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:var(--text-xs)}
   .bar{display:flex;align-items:center;gap:8px}
   .hint,.meta,.rationale,.grounding{margin:0;color:rgb(var(--c-text-muted))}
   .error{margin:0;color:rgb(var(--c-danger))}
@@ -234,6 +234,6 @@
   .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-danger))}
   .held p,.held ul{margin:0}
   ins{text-decoration:none;color:rgb(var(--c-accent))}
-  .cites{display:block;font-size:.625rem;color:rgb(var(--c-text-muted))}
-  pre{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem}
+  .cites{display:block;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
+  pre{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--text-meta)}
 </style>

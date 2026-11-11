@@ -747,15 +747,15 @@
   .collab-block{padding-top:12px}
   .head{display:flex;align-items:baseline;justify-content:space-between;font-weight:500}
   .head-with-icon{display:inline-flex;align-items:center;gap:5px}
-  .count,.hint{font-weight:400;color:rgb(var(--c-text-muted));font-size:0.6875rem;margin:0}
+  .count,.hint{font-weight:400;color:rgb(var(--c-text-muted));font-size:var(--text-meta);margin:0}
   ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:180px;overflow-y:auto}
-  li{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);border:1px solid var(--gp-edge-soft);font-size:0.6875rem}
+  li{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
   .subtask-card,.linked-thread-item{flex-direction:column;align-items:stretch;gap:6px;padding:6px 8px}
   .subtask-row-top{display:flex;align-items:center;gap:6px;min-width:0}
   .subtask-title{flex:1;min-width:0;justify-content:flex-start;white-space:normal;text-align:left;padding-inline:0;overflow-wrap:anywhere;color:inherit}
   .kickoff-mode-row,.kickoff-pills,.breakdown-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .compact-select{width:auto}
-  .breakdown-area{font-size:0.6875rem}
+  .breakdown-area{font-size:var(--text-meta)}
   .item-text,.title{overflow-wrap:anywhere;flex:1;min-width:0}
   .done{text-decoration:line-through;color:rgb(var(--c-text-muted))}
   .gone{color:rgb(var(--c-text-muted));font-style:italic}

@@ -8,12 +8,13 @@
    * the reader's preferences (`interfaceStore.taskBoards`), not in the task
    * store, so saving one never writes a task or a workspace.
    *
-   * Placed and dismissed the way the View menu beside it is: `absolute` under
-   * its own trigger, with dismissal from the shared popover owner.
+   * Placed and dismissed by the shared popover owner: portaled to the body,
+   * anchored under its own trigger, and clamped to the window.
    */
   import { Bookmark, X } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { popover } from "../ui/popover";
+  import { portal } from "../dom/portal";
+  import { popover, restoreFocusTo } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { MAX_VIEW_NAME, boardPrefs, sameSnapshot, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import { newID } from "../workbench/client";
@@ -28,7 +29,6 @@
   } = $props();
 
   let open = $state(false);
-  let root: HTMLDivElement | undefined = $state();
   let name = $state("");
   let message = $state("");
   let failed = $state(false);
@@ -38,13 +38,24 @@
   // A different board's draft name and message must not carry over.
   $effect(() => { board; name = ""; message = ""; failed = false; });
 
-  const dismissal = {
-    dismiss: { inside: "[data-task-saved-views]", escape: "bubble" as const },
+  let toggleEl: HTMLButtonElement | undefined = $state();
+
+  /**
+   * Anchored under the trigger and right-aligned to it, then clamped to the
+   * window: the Tasks pane is paint-contained and sits beside the sidebar, so
+   * a CSS `absolute` panel that opens leftwards was cut off at the pane edge.
+   * `revision` re-places it when a saved or deleted view changes its height.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: toggleEl, gap: 4, align: "end" as const },
+    inset: 8,
+    revision: `${views.length}|${message}`,
+    dismiss: { inside: "[data-task-saved-views]", escape: "bubble" as const, resize: true },
     onDismiss: (reason: string) => {
       open = false;
-      if (reason === "escape") root?.querySelector<HTMLButtonElement>("[data-task-views-toggle]")?.focus();
+      if (reason === "escape") restoreFocusTo(toggleEl);
     },
-  };
+  });
 
   function save(event: SubmitEvent) {
     event.preventDefault();
@@ -66,11 +77,12 @@
   }
 </script>
 
-<div class="relative" bind:this={root} data-task-saved-views>
+<div class="relative" data-task-saved-views>
   <button
     type="button"
     class="gp-btn"
     data-task-views-toggle
+    bind:this={toggleEl}
     aria-expanded={open}
     aria-haspopup="true"
     {disabled}
@@ -82,8 +94,10 @@
   </button>
   {#if open}
     <div
+      use:portal={"body"}
       use:popover={dismissal}
-      class="panel absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-64 flex flex-col gap-1"
+      data-task-saved-views
+      class="panel fixed gp-menu gp-pop p-2 w-64 flex flex-col gap-1"
       style="z-index: {LAYERS.MENU}"
       role="group"
       aria-label={`Saved views for ${boardName}`}

@@ -194,7 +194,7 @@
           else reviewChanges();
         },
       });
-      if (!opened) navigationError = $repoStore.error || `Could not open ${path}`;
+      if (!opened) navigationError = $repoStore.error || `Couldn't open ${path}.`;
     } catch (error) { navigationError = formatError(error); }
   }
 
@@ -309,7 +309,7 @@
 <div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-xs text-textPrimary">
   <div class="flex items-start justify-between gap-3 mb-3 w-full">
     <div class="min-w-0">
-      <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
+      <h2 class="text-lg font-semibold tracking-tight">Overview</h2>
       <p class="mt-1 text-textMuted text-xs leading-relaxed">
         {hasTasks
           ? "Your workspace, from tasks to pull requests."
@@ -456,7 +456,7 @@
         </button>
       {:else if $repoStore.operation.probeFailed}
         <p class="mt-2 text-meta text-warn">
-          Could not check for a parked merge or rebase here — this line is not “nothing is parked”.
+          Couldn't check for a parked merge or rebase here — this line is not “nothing is parked”.
         </p>
       {/if}
     </section>
@@ -595,7 +595,7 @@
       data-tone="unknown"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px text-unknown" />
-      <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
+      <span>Couldn't check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
       <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={loading} onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}>Rescan</button>
     </div>
   {/if}
@@ -723,7 +723,7 @@
         title={projection.degraded ? "Workspace data unavailable" : "Nothing in flight"}
         hint={!projection.degraded
           ? "No worktrees, pull requests or runs were found for this repository."
-          : "Some workspace sources could not be read. Refresh to try again."}
+          : "Some workspace sources couldn't be read. Refresh to try again."}
       />
     </div>
   {:else if projection}
@@ -1061,7 +1061,7 @@
 
   .overview-metric-value {
     margin: 4px 0 3px;
-    font-size: 1.5rem;
+    font-size:var(--text-display);
     font-weight: 600;
     line-height: 1.15;
     letter-spacing: -0.04em;

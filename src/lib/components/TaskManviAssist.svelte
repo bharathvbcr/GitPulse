@@ -919,21 +919,21 @@
   .manvi-assist{margin:0 0 16px;padding:12px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-lg)}
   .manvi-assist.quick{margin-top:8px;padding-top:8px;border:0;border-radius:0;padding-left:0;padding-right:0}
   .assist-head{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}
-  .assist-title{margin:0;font-size:0.75rem;font-weight:600}
-  .assist-hint,.meta{margin:4px 0 0;font-size:0.6875rem;color:rgb(var(--c-text-muted));line-height:1.45}
+  .assist-title{margin:0;font-size:var(--text-xs);font-weight:600}
+  .assist-hint,.meta{margin:4px 0 0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));line-height:1.45}
   .notes-label{display:block;margin:8px 0}
   pre{width:100%;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
   textarea{resize:vertical;width:100%;min-width:0}
   .field-picks{margin:0 0 8px}
   .engine-picks{margin:0 0 8px}
-  .engine-badge{margin-left:5px;font-size:0.625rem;opacity:.75}
+  .engine-badge{margin-left:5px;font-size:var(--text-micro);opacity:.75}
   .ask{margin-top:8px}
-  label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:0.75rem}
+  label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:var(--text-xs)}
   .actions,.history-row,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .model-row{justify-content:space-between;margin:4px 0 8px}
   .locks{margin:4px 0 8px}
   .manvi-assist :global(.gp-notice){margin:8px 0 0;display:flex;align-items:center;gap:8px}
-  .warn{font-size:0.6875rem;margin:4px 0}
+  .warn{font-size:var(--text-meta);margin:4px 0}
   .history-row{margin-top:12px;padding-top:10px}
   /* The picker takes the row's slack so a long label ellipsises rather than
      pushing Refresh and Load more onto their own line. */
@@ -942,8 +942,8 @@
   .field-review{margin:12px 0}
   .check{margin:0}
   .advanced-hidden{display:none}
-  h3{font-size:0.8125rem;font-weight:600;margin:14px 0 4px}
-  h4{font-size:0.75rem;font-weight:600;margin:10px 0 6px}
+  h3{font-size:var(--text-sm);font-weight:600;margin:14px 0 4px}
+  h4{font-size:var(--text-xs);font-weight:600;margin:10px 0 6px}
   pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;font:0.75rem/1.5 inherit;margin:4px 0 8px}
   .suggestion{border-left:3px solid rgb(var(--c-accent))}
 </style>

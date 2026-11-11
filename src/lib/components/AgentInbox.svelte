@@ -1632,7 +1632,7 @@
     min-height: 480px;
     background: var(--mac-fill-surface, rgb(var(--c-surface)));
     color: rgb(var(--c-text));
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
     border-radius: var(--gp-r-md);
     overflow: hidden;
   }
@@ -1686,7 +1686,7 @@
     padding: 6px 16px;
     background: rgb(var(--c-bg) / 0.5);
     overflow-x: auto;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
   }
 
   .lanes-label {
@@ -1810,13 +1810,13 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
     color: rgb(var(--c-text-muted));
   }
 
   .thread-title {
     margin: 0;
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
     font-weight: 600;
     line-height: 1.3;
     overflow: hidden;
@@ -1828,7 +1828,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 0.625rem;
+    font-size:var(--text-micro);
     color: rgb(var(--c-text-muted));
   }
 
@@ -1853,7 +1853,7 @@
 
   .detail-title {
     margin: 0 0 6px 0;
-    font-size: 0.9375rem;
+    font-size:var(--text-base);
     font-weight: 600;
   }
 
@@ -1862,7 +1862,7 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
   }
 
   .agent-route {
@@ -1910,12 +1910,12 @@
     align-items: center;
     gap: 6px;
     font-weight: 600;
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
     color: rgb(var(--c-accent));
   }
 
   .ask-prompt {
-    font-size: 0.8125rem;
+    font-size:var(--text-sm);
     font-weight: 500;
     margin: 0 0 12px 0;
   }
@@ -1947,7 +1947,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
   }
 
   .step-text.checked {
@@ -1971,7 +1971,7 @@
     border-radius: var(--gp-r-xs);
     max-height: 140px;
     overflow: auto;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
     margin: 8px 0;
   }
 
@@ -1992,7 +1992,7 @@
     align-items: center;
     gap: 6px;
     margin: 0 0 12px 0;
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
     font-weight: 600;
     color: rgb(var(--c-text-muted));
   }
@@ -2017,7 +2017,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
     margin-bottom: 4px;
   }
 
@@ -2034,7 +2034,7 @@
 
   .message-text {
     margin: 0;
-    font-size: 0.75rem;
+    font-size:var(--text-xs);
     white-space: pre-wrap;
     line-height: 1.4;
   }
@@ -2059,7 +2059,7 @@
     padding: 8px 16px;
     background: var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)));
     flex-wrap: wrap;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
   }
 
   .batch-meta,
@@ -2095,7 +2095,7 @@
     padding: 8px 18px;
     background: rgb(var(--c-bg) / 0.5);
     flex-wrap: wrap;
-    font-size: 0.6875rem;
+    font-size:var(--text-meta);
   }
 
   .kickoff-label {
