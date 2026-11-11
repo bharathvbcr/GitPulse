@@ -139,21 +139,21 @@ function optionalBoolean(value: unknown): boolean | null | undefined {
   if (value === undefined) return undefined;
   if (value === null) return null;
   if (typeof value === "boolean") return value;
-  throw new Error("codeintel: expected a boolean");
+  throw new Error("Code map: expected a boolean");
 }
 
 function optionalFiniteNumber(value: unknown): number | null | undefined {
   if (value === undefined) return undefined;
   if (value === null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  throw new Error("codeintel: expected a number");
+  throw new Error("Code map: expected a number");
 }
 
 function optionalString(value: unknown): string | null | undefined {
   if (value === undefined) return undefined;
   if (value === null) return null;
   if (typeof value === "string") return value;
-  throw new Error("codeintel: expected a string");
+  throw new Error("Code map: expected a string");
 }
 
 function requiredStringList(value: unknown, command: string, field: string): string[] {
@@ -279,12 +279,12 @@ export function parseCodeintelResponse<T>(
   let histogram: CodeintelRungHistogram | undefined;
   if (rungs !== undefined && rungs !== null) {
     if (!isRecord(rungs)) {
-      throw new Error(`${command} returned a corrupt rung histogram`);
+      throw new Error(`${command} returned a corrupt confidence breakdown`);
     }
     const num = (key: keyof CodeintelRungHistogram) => {
       const raw = rungs[key];
       if (typeof raw !== "number" || !Number.isFinite(raw)) {
-        throw new Error(`${command} returned a corrupt rung histogram`);
+        throw new Error(`${command} returned a corrupt confidence breakdown`);
       }
       return raw;
     };

@@ -305,7 +305,7 @@ export function summarizePreview(
   } else if (files.length === 0) {
     headline = "No staged files to preview";
   } else if (opts.cancelled) {
-    headline = "Preview cancelled before every staged file finished";
+    headline = "Preview canceled before every staged file finished";
   } else if (filesOmitted > 0) {
     headline = `Preview fan-out capped: ${filesOmitted} of ${filesTotal} file(s) not previewed — not a clean bill of health`;
   } else if (unavailableFiles === files.length) {

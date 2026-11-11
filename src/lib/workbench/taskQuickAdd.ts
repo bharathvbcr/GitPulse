@@ -556,7 +556,7 @@ export function quickAddDraft(
 }
 
 /** The one-line syntax reminder shown under the quick-add field. */
-export const QUICK_ADD_HINT = "!priority  #label  @owner  ~type  ^repo  due:friday  ::notes";
+export const QUICK_ADD_HINT = "!priority  #label  @owner  ~type  ^repository  due:friday  ::notes";
 
 /** Which Return the reader gets: save the line, or save it and ask for a draft. */
 export type QuickAddMode = "manual" | "assist";

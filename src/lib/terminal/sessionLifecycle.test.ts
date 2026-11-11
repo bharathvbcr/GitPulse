@@ -166,7 +166,7 @@ describe("terminal lifecycle races", () => {
     f.exit();
     await f.owner.restart();
     expect(f.transport.spawn).toHaveBeenCalledTimes(2);
-    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("attempt ended"));
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("run ended"));
     f.owner.dispose(); await flush();
   });
   it("rejects a changed process identity during task reconnect without discarding its owner", async () => {

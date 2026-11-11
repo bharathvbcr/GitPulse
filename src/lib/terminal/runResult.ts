@@ -67,7 +67,7 @@ export function formatRunSummary(res: TerminalRunResult): string {
   const first = firstLine(err) || firstLine(out);
   if (first) return clampLine(first);
   return runPassed(res)
-    ? "Command completed successfully (exit 0)"
+    ? "Command completed (exit 0)"
     : `Command failed (exit ${res.exit_code ?? "?"})`;
 }
 
@@ -182,7 +182,7 @@ export function formatRunDetail(res: TerminalRunResult): string {
   } else if (!res.timed_out) {
     parts.push(
       runPassed(res)
-        ? "Command completed successfully (exit 0)"
+        ? "Command completed (exit 0)"
         : `Command failed (exit ${res.exit_code ?? "?"}) and produced no output.`,
     );
   } else {

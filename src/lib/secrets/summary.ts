@@ -48,7 +48,7 @@ export const LOCATION_COPY: Record<
     tone: "warn",
   },
   nested_repo: {
-    label: "Nested repo",
+    label: "Nested repository",
     hint: "Belongs to a nested repository or submodule inside this tree.",
     tone: "warn",
   },
@@ -200,7 +200,7 @@ export function scopeNotes(report: SecretsReport): string[] {
     "Working tree only: commit history is not scanned.",
     "Values are matched locally and never validated against a provider.",
     "Symbolic links are not followed, and Kingfisher skips some directories itself (node_modules).",
-    "Inline kingfisher:ignore comments are honoured.",
+    "Inline kingfisher:ignore comments are honored.",
   ];
   if (report.max_file_size_mb > 0) {
     notes.push(`Files over ${report.max_file_size_mb} MB are skipped without being reported.`);

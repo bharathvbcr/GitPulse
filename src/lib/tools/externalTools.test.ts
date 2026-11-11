@@ -144,7 +144,7 @@ describe("classifyMapFailure", () => {
   it("mapFailureMessage names the action for each mode", () => {
     expect(mapFailureMessage("no_cli")).toContain("Setup");
     expect(mapFailureMessage("no_sqlite_store")).toContain("Build");
-    expect(mapFailureMessage("no_json_artifact")).toContain("repo_map.json");
+    expect(mapFailureMessage("no_json_artifact")).toContain("code map overview");
     expect(mapFailureMessage("other", "custom")).toBe("custom");
     expect(mapFailureMessage("other")).toBe("Map unavailable");
   });

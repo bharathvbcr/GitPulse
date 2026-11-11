@@ -19,7 +19,7 @@ describe("attempt review", () => {
   });
   it("says which range a review covers and when it went stale", () => {
     expect(reviewSummary(view)).toBe(`Not reviewed: gitpulse/fix-1234abcd @ ${"b".repeat(12)} (2 files since ${"a".repeat(12)}).`);
-    expect(reviewSummary({ ...view, ended: false })).toMatch(/^Reviewable once the attempt ends/);
+    expect(reviewSummary({ ...view, ended: false })).toMatch(/^Reviewable once the run ends/);
     expect(reviewSummary({ ...view, review: { status: "stale", reviewed_head: "c".repeat(40) } })).toMatch(/Approved at c{12}, but the branch has moved/);
     expect(reviewSummary({ ...view, review: { status: "changes_requested", note: "add a test" } })).toMatch(/Note: add a test$/);
   });

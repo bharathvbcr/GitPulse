@@ -32,9 +32,9 @@ export const MANVI_PANES: Readonly<Record<ManviPane, ManviPaneRegistration>> = {
   },
   harness: {
     id: "harness",
-    label: "Harness & AI",
+    label: "Policy & AI",
     summary:
-      "Harness connection, local model servers, branch naming, and the agent activity journal.",
+      "Manvi policy connection, local model servers, branch naming, and the agent activity journal.",
   },
 };
 
@@ -61,7 +61,7 @@ export interface ManviFocusTarget {
 export const MANVI_FOCUS_TARGETS: Readonly<
   Record<ManviFocusId, ManviFocusTarget>
 > = {
-  harness: { id: "harness", pane: "harness", label: "MANVI harness" },
+  harness: { id: "harness", pane: "harness", label: "Manvi policy" },
   model: { id: "model", pane: "harness", label: "Local model servers" },
   activity: { id: "activity", pane: "harness", label: "Agent activity" },
   cleanup: { id: "cleanup", pane: "ops", label: "Branch cleanup" },
@@ -86,7 +86,7 @@ export function manviSectionId(id: ManviFocusId): string {
  */
 export function manviFocusHint(id: ManviFocusId): string {
   const target = MANVI_FOCUS_TARGETS[id];
-  return `Opens MANVI → ${MANVI_PANES[target.pane].label} → ${target.label}.`;
+  return `Opens Manvi → ${MANVI_PANES[target.pane].label} → ${target.label}.`;
 }
 
 /**

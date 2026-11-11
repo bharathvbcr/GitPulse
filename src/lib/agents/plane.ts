@@ -114,7 +114,7 @@ const REASON_LABEL: Record<AttentionReason, string> = {
   error: "Stopped on an error",
   pending: "Requests waiting",
   blocked: "Git operation parked",
-  collision: "Overlaps another checkout",
+  collision: "Overlaps another worktree",
   disconnected: "Running, not shown in this window",
   unstarted: "Prepared, not started",
   signalled: "Asked for attention",
@@ -611,7 +611,7 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
       ? place.checkout
       : cwd
         ? "Outside the repositories read"
-        : "Main checkout";
+        : "Main worktree";
   return {
     repoPath: family?.repoPath || terminal.repoPath,
     repoLabel: family?.repoLabel || clean(terminal.repoPath, 80),
@@ -671,7 +671,7 @@ function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: Pa
     checkoutPath: task.cwd || null,
     origin: "task",
     presence: "missing",
-    presenceDetail: "The workbench has this attempt, and no terminal in this window is attached to it.",
+    presenceDetail: "The workbench has this run, and no terminal in this window is attached to it.",
     attention: new Set(taskReasons(task)),
     liveKey: null,
     taskRunId: task.runId,
@@ -1004,7 +1004,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         if (!key) continue;
         const known = places.get(key);
         if (!known || known.checkout === "Checkout") {
-          places.set(key, { family, path: item.path, checkout: item.is_main ? "Main checkout" : checkoutLabel(item) });
+          places.set(key, { family, path: item.path, checkout: item.is_main ? "Main worktree" : checkoutLabel(item) });
         }
         // The rule `agent_summary` counts by, so a row here is a session there.
         if (!item.agent_kind || checkouts.has(key)) continue;
@@ -1056,14 +1056,14 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       repoPath: "",
       label: "Tasks",
       kind: "unread",
-      reason: "Task attempts have not been read yet.",
+      reason: "Task runs have not been read yet.",
     });
   } else if (!input.tasks.ok) {
     gaps.push({
       repoPath: "",
       label: "Tasks",
       kind: "failed",
-      reason: clean(input.tasks.error || "Task attempts could not be read.", 240),
+      reason: clean(input.tasks.error || "Task runs could not be read.", 240),
     });
   } else {
     if (!input.tasks.complete) {
@@ -1073,7 +1073,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         repoPath: "",
         label: "Tasks",
         kind: "partial",
-        reason: "The task-attempt list was capped. Counts of attempts are a floor.",
+        reason: "The task run list was capped. Counts of runs are a floor.",
       });
     }
     const byRun = new Map<string, Draft>();
@@ -1369,8 +1369,8 @@ export function planeHeadline(plane: AgentPlane, visible: number): string {
   ];
   if (plane.tasksWatched) {
     parts.push(plane.taskAttempts === null
-      ? "task attempts not read"
-      : `${plane.tasksFloor ? "at least " : ""}${plural(plane.taskAttempts, "task attempt", "task attempts")}`);
+      ? "task runs not read"
+      : `${plane.tasksFloor ? "at least " : ""}${plural(plane.taskAttempts, "task run", "task runs")}`);
   }
   if (plane.childSessions > 0) parts.push(plural(plane.childSessions, "child session", "child sessions"));
   parts.push(`${plane.attention.needing} need attention`);

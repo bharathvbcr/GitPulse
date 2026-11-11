@@ -30,7 +30,7 @@ describe("linkCandidatesHonesty", () => {
         repos_considered: 2,
         coverage_gaps: [],
       }),
-    ).toBe("Showing 1 of 4 candidates across 2 repo(s).");
+    ).toBe("Showing 1 of 4 candidates across 2 repositories.");
   });
 
   it("never reads an empty list as none when something could not be read", () => {

@@ -903,7 +903,7 @@ describe("repoStore tabs", () => {
       await store.openRepo("/r/alpha");
       const closing = store.closeTab(get(store).activeTabId!);
       await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 3 terminal sessions?"));
-      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another checkout of this repository, hosted here; they keep running.");
+      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another worktree of this repository, hosted here; they keep running.");
       cancelPrompt();
       await closing;
       expect(get(store).openTabs).toHaveLength(1);

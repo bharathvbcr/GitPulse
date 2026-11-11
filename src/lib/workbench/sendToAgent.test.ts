@@ -33,7 +33,7 @@ describe("the message a CI notice composes", () => {
 
   it("is the facts alone without a note, and leaves out a run URL the source did not give", () => {
     const text = composeAgentMessage({ ...SIGNAL, url: null, kind: "ci_cancelled" }, "");
-    expect(text).toBe(["CI was cancelled on the branch you pushed.", "Workflow: CI", "Conclusion: failure", "Branch: gitpulse/fix-e42", `Commit: ${"a".repeat(40)}`].join("\n"));
+    expect(text).toBe(["CI was canceled on the branch you pushed.", "Workflow: CI", "Conclusion: failure", "Branch: gitpulse/fix-e42", `Commit: ${"a".repeat(40)}`].join("\n"));
     expect(text).not.toContain("Run:");
   });
 

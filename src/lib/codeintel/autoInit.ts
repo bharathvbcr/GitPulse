@@ -204,7 +204,7 @@ export function createAutoInit(opts?: {
       if (announce && report.exclude.status === "refused") {
         warn(
           "devcouncil-init",
-          `${activeKey}: DevMap state could not be hidden from git status — ${report.exclude.reason}`,
+          `${activeKey}: Code map state could not be hidden from git status — ${report.exclude.reason}`,
         );
       }
       if (announce && report.workspace_registry === null && report.workspace_reason) {

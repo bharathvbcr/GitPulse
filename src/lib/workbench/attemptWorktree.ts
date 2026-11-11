@@ -78,7 +78,7 @@ export async function mainCheckoutOf(cwd: string): Promise<string> {
     root = familyFromCommonDir(resolved.common_dir, opts)?.root ?? null;
   }
   if (!root) throw new Error(`GitPulse could not tell which repository ${cwd} belongs to, so it will not merge or remove it.`);
-  if (identityKey(root, opts) === key) throw new Error("This attempt ran in the repository's main checkout, so there is no worktree to merge or discard.");
+  if (identityKey(root, opts) === key) throw new Error("This run worked in the repository's main worktree, so there is no separate worktree to merge or discard.");
   return root;
 }
 
@@ -226,13 +226,13 @@ export async function openAttemptDiff(
   let truncated = false;
   let shown: AttemptDiffOpening["shown"] = "none";
   if (!ready) {
-    notices.push(`The attempt's checkout did not finish opening, so its changes are not shown. Open it from the task and try again.`);
+    notices.push(`The run's worktree did not finish opening, so its changes are not shown. Open it from the task and try again.`);
   } else {
     const opts = options();
     const view = get(repoStore);
     const here = view.currentPath !== null && identityKey(view.currentPath, opts) === identityKey(run.cwd, opts) && view.selectionKind === "range" && view.selectedFilePath === `${from}...${to}`;
     if (!here) {
-      notices.push("The repository view moved on before this attempt's changes were selected, so it may not be showing them. Use View diff again.");
+      notices.push("The repository view moved on before this run's changes were selected, so it may not be showing them. Use View diff again.");
     } else if (view.selectedDiffError) {
       notices.push(`The diff could not be read: ${view.selectedDiffError}`);
     } else {
@@ -267,7 +267,7 @@ export async function reviewAttemptChanges(run: Pick<TaskRun, "id" | "cwd">): Pr
   try {
     review = await readAttemptReview(run.id);
   } catch (cause) {
-    toastStore.add({ kind: "warning", message: `This attempt's commits could not be read (${formatError(cause)}), so only its uncommitted files are shown.`, duration: NOTICE_MS });
+    toastStore.add({ kind: "warning", message: `This run's commits could not be read (${formatError(cause)}), so only its uncommitted files are shown.`, duration: NOTICE_MS });
     return reviewAttemptUncommitted(run);
   }
   if (review.head_oid === review.base_oid) return reviewAttemptUncommitted(run);
@@ -319,7 +319,7 @@ export async function mergeAttemptWorktree(run: AttemptRef, options: { expectedT
     throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${options.expectedTip.slice(0, 12)} was approved, so it is not landed. Review the new commits.`);
   }
   const target = main?.branch ?? null;
-  if (!target) throw new Error("The main checkout is not on a branch, so there is nothing to merge into.");
+  if (!target) throw new Error("The main worktree is not on a branch, so there is nothing to merge into.");
   const squash = await askHowToMerge({
     branch: own.branch,
     target,
@@ -396,11 +396,11 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (own.head !== expectedHead) throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${expectedHead.slice(0, 8)} was verified, so it is not merged.`);
   if (own.dirty_files !== 0) throw new Error(own.dirty_files === null ? "The worktree's uncommitted changes could not be counted, so it is not merged." : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
   const target = main?.branch ?? null;
-  if (!main || !target) throw new Error("The main checkout is not on a branch, so there is nothing to merge into.");
-  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main checkout ${root} could not be checked for uncommitted work, so nothing is merged into it.` : `The main checkout ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
+  if (!main || !target) throw new Error("The main worktree is not on a branch, so there is nothing to merge into.");
+  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main worktree ${root} could not be checked for uncommitted work, so nothing is merged into it.` : `The main worktree ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
   const live = await listAllLiveRuns();
-  if (!live.complete) throw new Error("Live attempts could not all be read, so the main checkout cannot be shown free of other sessions.");
-  if (liveRunIn(root, live.runs)) throw new Error(`Another attempt is working in the main checkout ${root}, so nothing is merged into it.`);
+  if (!live.complete) throw new Error("Live runs could not all be read, so the main worktree cannot be shown free of other sessions.");
+  if (liveRunIn(root, live.runs)) throw new Error(`Another run is working in the main worktree ${root}, so nothing is merged into it.`);
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
   // The head the verdict was reached for is the tip the host holds the merge to.
   const mutationTarget = await mainCheckoutTarget(root, known);

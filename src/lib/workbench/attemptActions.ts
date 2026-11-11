@@ -30,5 +30,5 @@ export function canAct(runId: string, inflight: InflightActions, holder: string 
 export function slotHeldNote(runId: string, inflight: InflightActions, holder: string | null): string | null {
   if (holder === null || holder === runId) return null;
   const verb = inflight[holder];
-  return verb ? `Waiting: another attempt is ${verb.toLowerCase()}.` : "Waiting: another attempt's action is running.";
+  return verb ? `Waiting: another run is ${verb.toLowerCase()}.` : "Waiting: another run's action is running.";
 }

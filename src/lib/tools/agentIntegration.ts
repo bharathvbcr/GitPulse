@@ -18,7 +18,7 @@ export const HOST_LABEL: Record<string, string> = {
 
 export const KIND_LABEL: Record<IntegrationKind, string> = {
   guide: "Agent guide",
-  project_mcp: "Project MCP",
+  project_mcp: "Repository MCP",
   global_mcp: "Global MCP",
   hook: "Hook config",
   skill: "Skill",

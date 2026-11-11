@@ -103,9 +103,9 @@ describe("sessions a reloaded page left running", () => {
   it("a task attempt's is shown through its own launch path, which takes its session over", async () => {
     const { registry, adopt } = setup([row({ run_id: "run-1" })]);
     await adopt();
-    expect(get(registry)[0]).toMatchObject({ taskRunId: "run-1", title: "Task attempt", launcher: "claude" });
+    expect(get(registry)[0]).toMatchObject({ taskRunId: "run-1", title: "Task run", launcher: "claude" });
     get(registry)[0].reveal?.();
-    expect(get(taskTerminalRequests)).toEqual([{ runId: "run-1", repoPath: "/repos/app", provider: "claude", title: "Task attempt" }]);
+    expect(get(taskTerminalRequests)).toEqual([{ runId: "run-1", repoPath: "/repos/app", provider: "claude", title: "Task run" }]);
   });
 
   it("leave the list when their process ends on its own", async () => {
@@ -131,7 +131,7 @@ describe("sessions a reloaded page left running", () => {
     const record = get(registry)[0];
     expect(await record.confirmClose?.()).toBe(false);
     expect(asked[0]).toMatchObject({ ...stopQuestion({ run_id: "run-1" }, "Claude"), confirmLabel: "Stop", destructive: true });
-    expect(asked[0].message).toContain("ends that attempt");
+    expect(asked[0].message).toContain("ends that run");
     expect(calls.some((call) => call.command === "cmd_terminal_kill")).toBe(false);
     expect(stopQuestion({ run_id: null }, "Shell").message).toContain("still running, not shown in any tab");
   });

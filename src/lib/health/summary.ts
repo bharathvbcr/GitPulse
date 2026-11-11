@@ -358,9 +358,9 @@ function deadCodeFacet(
     return {
       id,
       label,
-      value: "no code graph",
+      value: "no code map",
       tone: "unknown",
-      caveat: `Dead-code detection has no code graph to read${
+      caveat: `Dead-code detection has no code map to read${
         codegraph?.reason ? `: ${codegraph.reason}` : ""
       }.`,
     };

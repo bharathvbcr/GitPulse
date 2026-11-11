@@ -207,7 +207,7 @@ describe("checkoutChanges", () => {
 
 describe("releasedNote", () => {
   it("tells the reader the attempt's worktree stays on disk, and where", () => {
-    // "The checkout is free for another attempt" read like the worktree had
+    // "The checkout is free for another run" read like the worktree had
     // gone. Releasing ends the attempt's hold; the host never removes an
     // accepted attempt's worktree (agent_worktree.rs), and its work is there.
     const own = { id: "A1B2-C3D4", cwd: "/work/repo/.gitpulse/worktrees/fix-a1b2c3d4" };
@@ -218,7 +218,7 @@ describe("releasedNote", () => {
 
   it("says the checkout is free when the attempt ran in a checkout it did not make", () => {
     const note = releasedNote({ id: "A1B2-C3D4", cwd: "/work/repo" });
-    expect(note).toContain("free for another attempt");
+    expect(note).toContain("free for another run");
     expect(note).not.toContain("stays on disk");
   });
 });

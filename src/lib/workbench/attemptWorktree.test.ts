@@ -87,7 +87,7 @@ describe("mainCheckoutOf", () => {
 
   it("refuses the main checkout itself, and a directory whose repository cannot be told", async () => {
     invoke.mockResolvedValueOnce({ path: "/work/repo", name: "repo", is_bare: false, common_dir: "/work/repo/.git" });
-    await expect(mainCheckoutOf("/work/repo")).rejects.toThrow(/main checkout, so there is no worktree/);
+    await expect(mainCheckoutOf("/work/repo")).rejects.toThrow(/main worktree, so there is no separate worktree/);
     invoke.mockResolvedValueOnce({ path: WT, name: "fix", is_bare: false, common_dir: null });
     await expect(mainCheckoutOf(WT)).rejects.toThrow(/could not tell which repository/);
     invoke.mockRejectedValueOnce(new Error("not a git repository"));

@@ -9,7 +9,7 @@ import type { LiveIndexPhase } from "./liveIndex";
  * act on. `failed`, `paused` and `skipped` are deliberately not blockers — the
  * automatic path has stopped, so a manual build is the user's recourse.
  */
-export const CLI_MISSING_BUILD_REASON = "devmap CLI is not installed — run Setup first";
+export const CLI_MISSING_BUILD_REASON = "The code map tool is not installed — run Setup first";
 export const INDEX_RUNNING_BUILD_REASON =
   "The automatic index is already running — wait for it to finish";
 
