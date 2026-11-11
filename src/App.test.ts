@@ -489,7 +489,8 @@ describe("the two header rows", () => {
   it("makes each row its own container and gives both the dense glass fill", () => {
     expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 200)).toContain("@container");
     expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 300)).toContain("gp-repo-tabs");
-    expect(viewBarSource).toContain("@container gp-glass gp-repo-tabs gp-viewbar");
+    expect(viewBarSource).toContain("@container gp-glass gp-repo-tabs");
+    expect(viewBarSource).toMatch(/<nav[^>]*\bdata-viewbar\b/s);
   });
 
   it("stamps the traffic-light inset a class the full-screen rule can collapse", () => {

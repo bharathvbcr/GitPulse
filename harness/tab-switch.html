@@ -210,6 +210,10 @@
       holdForeground();
       const { mockIPCWithEvents } = await import("./tauriMocks.ts");
       mockIPCWithEvents(handler);
+      // getCurrentWindow() reads the window label from the host-provided metadata, which
+      // the IPC mock does not install; without it the shell's native-drag subscription
+      // throws after the menu listeners, so a file drop could never be exercised here.
+      window.__TAURI_INTERNALS__.metadata = { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } };
 
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");
@@ -965,6 +969,53 @@
           delete fixtures.cmd_get_commit_details;
           delete fixtures.cmd_verify_commit_signature;
           check("the graph and commit-details commands had fixtures throughout", () => unexpected.length === 0);
+
+          // ---- 7. dropping a folder on the window opens it -----------------------
+          // The native drag events (tauri://drag-*) are what the shell listens
+          // to; the window's own event routing is what the mock reproduces. An
+          // in-app drag carries no paths and must not raise the veil.
+          const DROPPED = "/code/tabs/dropped-folder";
+          fixtures.cmd_resolve_git_root = (a) => a.path;
+          const dropVeil = () => $('[data-testid="drop-overlay"]');
+          const emitDrag = (type, paths) => emit(`tauri://drag-${type}`, { paths, position: { type: "Physical", x: 40, y: 40 } });
+          await emitDrag("enter", []);
+          await wait(250);
+          check("drop: an in-app drag (no file paths) does not show the veil", () => dropVeil() === null);
+          await emitDrag("leave", []);
+          await emitDrag("enter", [DROPPED]);
+          await sleepUntil(() => dropVeil() !== null, 3000);
+          check("drop: a folder dragged over the window shows the veil", () => dropVeil() !== null && /Drop a Git repository to open/.test(text(dropVeil())));
+          check("drop: the veil takes no pointer events, so the drop reaches the window", () => dropVeil() !== null && getComputedStyle(dropVeil()).pointerEvents === "none");
+          check("drop: nothing has opened before the drop", () => !tabFor(DROPPED));
+          await emitDrag("drop", [DROPPED]);
+          await sleepUntil(() => !!tabFor(DROPPED), 5000);
+          check("drop: dropping the folder opens it as a repository tab", () => !!tabFor(DROPPED));
+          await sleepUntil(() => dropVeil() === null, 3000);
+          check("drop: the veil is gone once the folder is dropped", () => dropVeil() === null);
+          delete fixtures.cmd_resolve_git_root;
+
+          // ---- 8. closing the docked terminal leaves with a short exit ----------
+          // Docked is the default mode and used to close with no animation at
+          // all. The exit must be a real animation on transform and opacity only,
+          // 70 ms or less, running while the row is still there; only after it
+          // does the dock hide.
+          await switchTo(ALPHA);
+          repoStore.setTerminalOpen(true);
+          await sleepUntil(() => $("[data-terminal-dock]") !== null, 5000);
+          await settle();
+          const dock = () => $("[data-terminal-dock]");
+          check("dock exit: the dock is open and docked (the default mode)", () => !!dock() && dock().dataset.dockMode === "docked" && !dock().classList.contains("hidden"));
+          repoStore.setTerminalOpen(false);
+          await tick();
+          const exitAnims = () => (dock()?.getAnimations() ?? []).filter((a) => a.animationName === "gp-dock-slide-out");
+          const exiting = exitAnims();
+          const animatedProps = exiting.flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k).filter((p) => !["offset", "easing", "composite", "computedOffset"].includes(p))));
+          check("dock exit: closing in docked mode starts the exit animation", () => exiting.length === 1 && dock().dataset.phase === "slide-out");
+          check("dock exit: it is 70 ms or less", () => exiting.length === 1 && exiting[0].effect.getComputedTiming().duration <= 70);
+          check("dock exit: it animates transform and opacity and nothing else", () => animatedProps.length > 0 && animatedProps.every((p) => p === "transform" || p === "opacity"));
+          check("dock exit: the row is still there while it runs", () => !dock().classList.contains("hidden"));
+          await sleepUntil(() => dock().classList.contains("hidden"), 2000);
+          check("dock exit: after the exit the dock is hidden, not unmounted", () => !!dock() && dock().classList.contains("hidden"));
           report_();
         } catch (error) {
           stopped(error);

@@ -1,35 +1,56 @@
 {
   "schema": 1,
-  "commit": "bc9ddc05b2bf69d7215fa58c25edb55aee23c048",
+  "commit": "5cd026c737dc15c06a832531a5c2fecebd34ef44",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 92,
+      "total": 234,
       "files": {
-        "src/app.css": 9,
+        "src/lib/components/AgentDecisions.svelte": 1,
+        "src/lib/components/AgentInbox.svelte": 16,
         "src/lib/components/AttentionInbox.svelte": 1,
         "src/lib/components/AutomaticEnhancements.svelte": 1,
+        "src/lib/components/CodeGraphCanvas.svelte": 2,
         "src/lib/components/CommandPalette.svelte": 17,
+        "src/lib/components/ConflictComparison.svelte": 4,
+        "src/lib/components/ConflictEditor.svelte": 32,
         "src/lib/components/NativeNotificationBridge.svelte": 2,
         "src/lib/components/NativeNotificationSettings.svelte": 1,
-        "src/lib/components/ScanProposals.svelte": 6,
+        "src/lib/components/RunActivity.svelte": 5,
+        "src/lib/components/ScanProposals.svelte": 7,
+        "src/lib/components/SendToAgent.svelte": 2,
         "src/lib/components/SessionNotificationBridge.svelte": 1,
-        "src/lib/components/TaskActionDialog.svelte": 1,
+        "src/lib/components/TaskActionDialog.svelte": 2,
+        "src/lib/components/TaskAgentPanel.svelte": 4,
         "src/lib/components/TaskArchive.svelte": 1,
-        "src/lib/components/TaskDuePicker.svelte": 4,
-        "src/lib/components/TaskEditor.svelte": 9,
+        "src/lib/components/TaskBoard.svelte": 29,
+        "src/lib/components/TaskDuePicker.svelte": 7,
+        "src/lib/components/TaskEditor.svelte": 15,
         "src/lib/components/TaskHandoffForm.svelte": 1,
-        "src/lib/components/TaskHandoffSheet.svelte": 1,
-        "src/lib/components/TaskMergeDialog.svelte": 1,
+        "src/lib/components/TaskHandoffSheet.svelte": 2,
+        "src/lib/components/TaskManviAssist.svelte": 7,
+        "src/lib/components/TaskMergeDialog.svelte": 2,
+        "src/lib/components/TaskOrganizePanel.svelte": 3,
+        "src/lib/components/TaskQuickAdd.svelte": 6,
+        "src/lib/components/TaskRefine.svelte": 3,
+        "src/lib/components/TaskRelations.svelte": 3,
+        "src/lib/components/TaskRepositoryPicker.svelte": 12,
         "src/lib/components/TaskSavedViews.svelte": 3,
+        "src/lib/components/TaskSearchField.svelte": 1,
+        "src/lib/components/TaskSuggestPanel.svelte": 5,
         "src/lib/components/TaskViewMenu.svelte": 5,
+        "src/lib/components/VerificationChip.svelte": 1,
         "src/lib/components/WavePanel.svelte": 6,
-        "src/lib/components/WorkView.svelte": 1,
-        "src/lib/components/WorkspaceEditor.svelte": 1,
-        "src/lib/components/onboarding/ProductTour.svelte": 1,
-        "src/lib/coverage/fileCoverage.ts": 1,
-        "src/lib/desktop/StatusPopover.svelte": 18
+        "src/lib/components/WorkView.svelte": 2,
+        "src/lib/components/WorkspaceEditor.svelte": 2,
+        "src/lib/components/onboarding/ProductTour.svelte": 2,
+        "src/lib/components/pulse/PulseCodeAge.svelte": 1,
+        "src/lib/components/pulse/PulseDora.svelte": 4,
+        "src/lib/components/pulse/PulseHygiene.svelte": 5,
+        "src/lib/components/pulse/PulseKnowledgeMap.svelte": 3,
+        "src/lib/components/pulse/PulseRhythm.svelte": 4,
+        "src/lib/coverage/fileCoverage.ts": 1
       }
     },
     "2": {
@@ -39,17 +60,15 @@
     },
     "3": {
       "name": "palette-colors",
-      "total": 9,
+      "total": 2,
       "files": {
-        "src/app.css": 7,
         "src/lib/coverage/format.ts": 2
       }
     },
     "4": {
       "name": "color-literals",
-      "total": 28,
+      "total": 17,
       "files": {
-        "src/app.css": 11,
         "src/lib/components/Logo.svelte": 8,
         "src/lib/components/files/MarkDevLogo.svelte": 9
       }
@@ -71,24 +90,18 @@
     },
     "8": {
       "name": "border-opacity",
-      "total": 23,
-      "files": {
-        "src/app.css": 23
-      }
+      "total": 0,
+      "files": {}
     },
     "9": {
       "name": "layout-transitions",
-      "total": 6,
-      "files": {
-        "src/app.css": 6
-      }
+      "total": 0,
+      "files": {}
     },
     "10": {
       "name": "motion-literals",
-      "total": 20,
-      "files": {
-        "src/app.css": 20
-      }
+      "total": 0,
+      "files": {}
     },
     "11": {
       "name": "backdrop-blur",
@@ -107,7 +120,7 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 143,
+      "total": 142,
       "files": {
         "src/lib/agents/plane.ts": 11,
         "src/lib/branches/types.ts": 2,
@@ -123,7 +136,6 @@
         "src/lib/components/FirebasePanel.svelte": 4,
         "src/lib/components/HostLoadSetting.svelte": 1,
         "src/lib/components/LappiSettings.svelte": 1,
-        "src/lib/components/LazyView.svelte": 1,
         "src/lib/components/NativeNotificationSettings.svelte": 2,
         "src/lib/components/SessionAlertSettings.svelte": 2,
         "src/lib/components/SettingsModal.svelte": 1,
@@ -181,28 +193,21 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 21,
+      "total": 15,
       "files": {
-        "src/App.svelte": 1,
         "src/lib/components/AgentDefaultsSettings.svelte": 1,
         "src/lib/components/AgentLimitSetting.svelte": 1,
         "src/lib/components/AgentModelSettings.svelte": 2,
         "src/lib/components/DiffViewer.svelte": 2,
         "src/lib/components/RepoMapPanel.svelte": 1,
         "src/lib/components/RepoPanel.svelte": 7,
-        "src/lib/components/RepoTabBar.svelte": 1,
-        "src/lib/components/TaskArchive.svelte": 1,
-        "src/lib/components/ViewBar.svelte": 1,
-        "src/lib/components/ViewSectionTabs.svelte": 2,
-        "src/lib/components/ViewTabBar.svelte": 1
+        "src/lib/components/TaskArchive.svelte": 1
       }
     },
     "18": {
       "name": "unused-gp-class",
-      "total": 2,
-      "files": {
-        "src/app.css": 2
-      }
+      "total": 0,
+      "files": {}
     }
   }
 }

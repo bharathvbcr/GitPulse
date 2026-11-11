@@ -96,7 +96,7 @@
   </div>
   <div
     bind:this={list}
-    class="gp-section-tabs flex items-center gap-0.5"
+    class="flex items-center gap-0.5"
     role="tablist"
     aria-label="{groupLabel} sections"
     tabindex="-1"
@@ -122,7 +122,7 @@
         data-section={section.id}
         data-tip-guide={guideKey}
         onclick={() => repoStore.setViewSection(view, section.id)}
-        class="gp-seg-btn gp-section-tab relative inline-flex h-[26px] items-center gap-1 text-meta! py-0! {isActive ? 'px-2!' : 'px-1.5! @min-[1100px]:px-2!'}"
+        class="gp-seg-btn relative inline-flex h-[26px] items-center gap-1 text-meta! py-0! {isActive ? 'px-2!' : 'px-1.5! @min-[1100px]:px-2!'}"
       >
         {#if macos && isActive}
           <span

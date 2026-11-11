@@ -114,7 +114,8 @@
 
   /*
    * Docked or overlay (panelMode.ts). Docked, the dock owns a row under the
-   * view and settles in once. Overlay, it floats over the bottom of the view
+   * view, settles in, and leaves in the same exit (transform and opacity, the
+   * row collapsing once it is gone). Overlay, it floats over the bottom of the view
    * and slides on transform; the view keeps the full column. The dock is
    * never unmounted: hiding is display:none, so an overlay holds the element
    * for its exit and only then hides it.
@@ -139,7 +140,7 @@
       if (leaveTimer) clearTimeout(leaveTimer);
       leaveTimer = null;
       exitMs = motionExitMs("slow");
-      if (isOpen || !overlay || exitMs === 0) {
+      if (isOpen || exitMs === 0) {
         leaving = false;
         return;
       }
@@ -271,7 +272,7 @@
     use:popover={dockDismissOptions}
     class="gp-dock-motion flex flex-col bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
     class:hidden={!open && !leaving}
-    style="height: {height}px;{overlay ? ` z-index: ${LAYERS.STICKY}; --gp-dock-exit-ms: ${exitMs}ms;` : ''}"
+    style="height: {height}px; --gp-dock-exit-ms: {exitMs}ms;{overlay ? ` z-index: ${LAYERS.STICKY};` : ''}"
     data-terminal-dock
     data-dock-mode={overlay ? "overlay" : "docked"}
     data-phase={phase}

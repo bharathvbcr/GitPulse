@@ -1647,7 +1647,7 @@
        hosts this: the surfaces and the repositories are one tablist with one
        selected tab and one roving stop; Open, the drag zone and the workspace
        actions follow it. -->
-  <div class="gp-repo-strip relative flex min-w-0 flex-1 items-center gap-1.5 self-stretch text-xs" data-repo-strip>
+  <div class="relative flex min-w-0 flex-1 items-center gap-1.5 self-stretch text-xs" data-repo-strip>
     <div
       bind:this={tablist}
       role="tablist"

@@ -133,7 +133,7 @@
   aria-label="Views"
   data-viewbar
   data-tauri-drag-region
-  class="@container gp-glass gp-repo-tabs gp-viewbar relative flex h-9 shrink-0 items-center text-xs select-none"
+  class="@container gp-glass gp-repo-tabs relative flex h-9 shrink-0 items-center text-xs select-none"
   style:z-index={LAYERS.STICKY}
 >
   {#if !onRepository}

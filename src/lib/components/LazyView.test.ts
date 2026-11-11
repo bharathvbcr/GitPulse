@@ -39,14 +39,14 @@ describe("LazyView pending and failed states", () => {
   });
 
   it("offers a retry instead of telling the user to reopen the window", () => {
-    expect(source).toContain(">\n      Retry\n    </button>");
+    expect(source).toContain(">\n      Try again\n    </button>");
     expect(source).toContain("attempt += 1");
     expect(source).not.toContain("Reopening the window\n      retries it.");
   });
 
   it("re-runs the load effect on retry even though the loader is unchanged", () => {
     // LazyView keys its cache on loader identity, so without reading a
-    // counter the effect would not re-run and Retry would do nothing.
+    // counter the effect would not re-run and Try again would do nothing.
     const effect = source.slice(source.indexOf("$effect(() => {"));
     expect(effect.slice(0, effect.indexOf("loader().then"))).toContain("void attempt;");
   });

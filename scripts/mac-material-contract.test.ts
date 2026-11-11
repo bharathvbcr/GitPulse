@@ -262,14 +262,15 @@ describe("macOS material", () => {
     }
   });
 
-  it("presses every gp-btn alias the same way, success included", () => {
-    // gp-btn-success was missing from all four press and reduced rules, so it
-    // never pressed on macOS and never stopped pressing under reduced motion.
+  it("presses every gp-btn alias the same way", () => {
+    // An alias missing from a press rule never pressed on macOS and never
+    // stopped pressing under reduced motion. The success button is now only
+    // `gp-btn[data-variant="success"]`, which `.gp-btn` already covers.
     // Three :active rules: the live press, and the reduced-motion twin on each trigger.
     const press = [...css.matchAll(/:is\(([^)]*\.gp-btn[^)]*)\)(?::active)/g)].map((match) => match[1]);
     expect(press.length).toBeGreaterThanOrEqual(3);
     for (const group of press) {
-      for (const name of [".gp-btn", ".gp-btn-primary", ".gp-btn-success", ".gp-btn-danger", ".gp-icon-btn"]) {
+      for (const name of [".gp-btn", ".gp-btn-primary", ".gp-btn-danger", ".gp-icon-btn"]) {
         expect(group, `${name} missing from a press rule`).toContain(name);
       }
     }
@@ -812,7 +813,8 @@ describe("macOS material", () => {
     const viewBar = readFileSync(new URL("../src/lib/components/ViewBar.svelte", import.meta.url), "utf8");
     const header = app.slice(app.indexOf("<header"), app.indexOf("<header") + 400);
     expect(header).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
-    expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b[^"]*\bgp-viewbar\b/);
+    expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
+    expect(viewBar).toMatch(/<nav[^>]*\bdata-viewbar\b/s);
     expect(css).toMatch(
       /html\.macos\[data-transparency="reduced"\] \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
     );
@@ -822,14 +824,15 @@ describe("macOS material", () => {
     }
   });
 
-  it("scopes the diffuse scroll edge's backdrop filter to its opt-in strips, off at blur 0 and under Reduce Transparency", () => {
-    // The one sanctioned backdrop filter in chrome: strips at a scroller's
-    // hidden edge, over the tabs. It follows `--gp-float-blur` and vanishes
-    // with the float blur or the transparency preference, leaving the mask.
+  it("keeps the diffuse scroll edge free of any backdrop filter, and off at blur 0 and under Reduce Transparency", () => {
+    // The strips once carried the one backdrop filter in chrome; over the
+    // translucent title bar it drew a hard-edged lighter box at the strip
+    // end. Blur is for floating chrome only, so the strips paint none.
     const from = css.indexOf("/* Header lane I: diffuse scroll edge */");
     const block = css.slice(from, css.indexOf(".gp-scroll-cue-btn[data-hover-only]", from));
     const strip = block.slice(block.indexOf(".gp-scroll-diffuse-strip {"), block.indexOf("}", block.indexOf(".gp-scroll-diffuse-strip {")));
-    expect(strip).toContain("backdrop-filter: blur(var(--gp-diffuse-light))");
+    expect(strip).not.toMatch(/backdrop-filter/);
+    expect(block).not.toMatch(/backdrop-filter/);
     expect(block).toMatch(/html\[data-float-blur="off"\][^{]*\{[^}]*display:\s*none/);
     expect(block).toMatch(/html\[data-transparency~="reduced"\][^{]*\{[^}]*display:\s*none/);
     // The media query sits at the end of app.css (contract tests that find the

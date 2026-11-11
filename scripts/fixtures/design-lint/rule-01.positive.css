@@ -7,3 +7,12 @@
 @utility gp-big {
   font-size: 15.5px;
 }
+.gp-rem {
+  font-size: 0.875rem;
+}
+.gp-em {
+  font-size: 1.18em;
+}
+.gp-keyword {
+  font-size: x-large;
+}

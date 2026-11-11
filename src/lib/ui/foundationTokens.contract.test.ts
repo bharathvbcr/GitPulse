@@ -131,20 +131,25 @@ describe("shape, space, density and edge tokens", () => {
     expect(themeBlock.get("--color-edgeStrong")).toBe("var(--gp-edge-strong)");
   });
 
-  it("adds the two type steps below text-xs and leaves text-sm, text-base and text-lg alone", () => {
-    const themeBlock = declarations(blockOf("@theme {"));
+  it("defines the six-step type scale: micro and meta are new, sm and base move from 14 and 16 to 13 and 15, xs stays 12px, all static so var(--text-*) always resolves", () => {
+    const themeBlock = declarations(blockOf("@theme static"));
     expect(themeBlock.get("--text-micro")).toBe("0.625rem");
     expect(themeBlock.get("--text-meta")).toBe("0.6875rem");
     expect(themeBlock.get("--text-micro--line-height")).toBe("1.3");
     expect(themeBlock.get("--text-meta--line-height")).toBe("1.4");
-    for (const redefined of ["--text-xs", "--text-sm", "--text-base", "--text-lg"]) {
-      expect(themeBlock.has(redefined), `${redefined} is a component change and lands with the type codemod`).toBe(false);
-    }
+    expect(themeBlock.get("--text-sm")).toBe("0.8125rem");
+    expect(themeBlock.get("--text-sm--line-height")).toBe("1.45");
+    expect(themeBlock.get("--text-base")).toBe("0.9375rem");
+    expect(themeBlock.get("--text-base--line-height")).toBe("1.3");
+    expect(themeBlock.get("--text-lg")).toBe("1.125rem");
+    expect(themeBlock.get("--text-lg--line-height")).toBe("1.25");
+    expect(themeBlock.get("--text-xs")).toBe("0.75rem");
+    expect(themeBlock.get("--text-xs--line-height")).toBe("calc(1 / 0.75)");
   });
 });
 
 describe("the vocabulary utilities", () => {
-  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-title", "gp-header-actions", "gp-row", "gp-label", "gp-select", "gp-slide-docked"])(
+  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-actions", "gp-row", "gp-label", "gp-select", "gp-slide-docked"])(
     "defines @utility %s",
     (name) => {
       expect(css).toMatch(new RegExp(`^@utility ${name} \\{`, "m"));
@@ -195,7 +200,7 @@ describe("the vocabulary utilities", () => {
 
   it("zeroes every animated vocabulary class under reduced motion, in both lists", () => {
     // The pairing itself is pinned by motionPreference.test.ts; this names the classes this wave added.
-    for (const name of ["gp-btn", "gp-chip", "gp-row", "gp-slide-docked", "gp-btn-success"]) {
+    for (const name of ["gp-btn", "gp-chip", "gp-row", "gp-slide-docked"]) {
       expect(css, name).toMatch(new RegExp(`html :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
       expect(css, name).toMatch(new RegExp(`html\\[data-motion="reduced"\\] :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
     }
@@ -240,7 +245,7 @@ describe("LAYERS", () => {
 describe("nothing the sheet defined before the vocabulary was lost", () => {
   /** Every `@utility` at the Wave 1 base (overhaul/wave-1 = 13127387). */
   const BASE_UTILITIES = [
-    "gp-btn", "gp-btn-primary", "gp-btn-success", "gp-btn-danger", "gp-icon-btn", "gp-pill", "gp-card", "gp-scrim",
+    "gp-btn", "gp-btn-primary", "gp-btn-danger", "gp-icon-btn", "gp-pill", "gp-card", "gp-scrim",
     "gp-scroll-cue", "gp-scroll-cue-start", "gp-scroll-cue-end", "gp-scroll-cue-y", "gp-scroll-cue-top",
     "gp-scroll-cue-bottom", "gp-scroll-cue-btn", "gp-menu", "gp-menu-item", "gp-separator", "gp-menu-sep",
     "gp-section-edge", "gp-segmented", "gp-surface-header", "gp-surface-title", "gp-notice", "gp-notice-error",
@@ -252,7 +257,7 @@ describe("nothing the sheet defined before the vocabulary was lost", () => {
   });
 
   it("keeps the gp-btn-* aliases as standalone working utilities (Wave 2 empties them, not this wave)", () => {
-    for (const alias of ["gp-btn-primary", "gp-btn-success", "gp-btn-danger"]) {
+    for (const alias of ["gp-btn-primary", "gp-btn-danger"]) {
       const body = blockOf(`@utility ${alias} {`);
       expect(body, alias).toContain("rounded-full");
       expect(body, alias).toContain("background-image");

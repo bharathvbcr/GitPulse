@@ -4,6 +4,6 @@
 </script>
 
 <!-- <div class="text-[11px]"> a commented-out element -->
-<div class="text-[var(--row-text)] text-[length:var(--x)] text-[1.2rem] text-xs text-micro">
+<div class="text-[var(--row-text)] text-[length:var(--x)] text-[1.2rem] text-xs text-micro text-lg text-display">
   arbitrary values that are not pixel sizes
 </div>
