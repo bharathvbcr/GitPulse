@@ -34,6 +34,12 @@
       "file": "src/lib/components/BrowserSession.svelte",
       "term": "Reload",
       "reason": "The embedded browser's own verb: its toolbar mirrors a browser's back, forward and reload controls, and reload re-fetches the page from the network, which is not what Refresh (re-read local state) means."
+    },
+    {
+      "rule": 12,
+      "file": "src/lib/components/HarnessBadge.svelte",
+      "term": "<select>",
+      "reason": "An invisible native <select> (opacity 0, inset 0) sits over a gp-select face that draws the chosen model with its own icon. The native element keeps keyboard, screen-reader role and the platform popup; the painting is the gp-select span beside it."
     }
   ],
   "deferred": []

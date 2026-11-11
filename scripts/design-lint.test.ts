@@ -357,6 +357,38 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
     expect(svelte('<input class="gp-field" /><select class="gp-select"></select>', 12)).toEqual([]);
   });
 
+  it("a literal border-radius length in <style> or a stylesheet is a radius picked by eye; tokens, 0 and circles are not", () => {
+    expect(svelte("<style>\n  .a { border-radius: 9px; }\n  .b { border-top-left-radius: 0.5rem; }\n</style>", 5)).toHaveLength(2);
+    expect(svelte("<style>\n  .a { border-radius: var(--gp-r-md); }\n  .b { border-radius: 50%; }\n  .c { border-radius: 0; }\n  .d { border-radius: calc(var(--gp-r-xs) / 2); }\n  .e { border-radius: var(--gp-r-full, 999px); }\n  .f { border-radius: 0 var(--gp-r-pane) var(--gp-r-pane) 0; }\n</style>", 5)).toEqual([]);
+    const { violations } = lintFiles([["src/app.css", ".x {\n  border-radius: 28px;\n}\n"]]);
+    expect(violations.filter((v) => v.rule === 5)).toHaveLength(1);
+  });
+
+  it("a select wears gp-select and a checkbox is the shared Checkbox", () => {
+    expect(svelte('<select class="rounded border px-2"><option>a</option></select>', 12)).toHaveLength(1);
+    expect(svelte("<select><option>a</option></select>", 12)).toHaveLength(1);
+    expect(svelte('<label><input type="checkbox" bind:checked={x} /> draft</label>', 12)).toHaveLength(1);
+    expect(svelte('<input type="checkbox" class="gp-check" checked={x} onchange={(e) => (x = e.currentTarget.checked)} />', 12)).toHaveLength(1);
+    expect(svelte('<select class="gp-select" data-size="sm"><option>a</option></select><input type="text" class="gp-field" /><Checkbox ariaLabel="Draft" checked={x} />', 12)).toEqual([]);
+    expect(lintSource("src/lib/components/Checkbox.svelte", '<input type="checkbox" class="gp-check" />').filter((v) => v.rule === 12)).toEqual([]);
+  });
+
+  it("a scoped rule that reshapes a primitive in this file's markup is a finding; colour and non-primitives are not", () => {
+    // The shape that squared the code map's "Fit view": a descendant rule reaching a gp-btn.
+    expect(svelte('<div class="zoom"><button class="gp-btn">Fit</button></div>\n<style>\n  .zoom button { height: 28px; border-radius: 5px; }\n</style>', 12)).toHaveLength(1);
+    // Naming the primitive outright is the same override.
+    expect(svelte('<div class="zoom"><button class="gp-btn">Fit</button></div>\n<style>\n  .zoom .gp-btn { padding: 0 10px; }\n</style>', 12)).toHaveLength(1);
+    // A class the primitive also wears, on a field.
+    expect(svelte('<input class="gp-field draft" />\n<style>\n  .draft { padding: 4px; }\n</style>', 12)).toHaveLength(1);
+    // A multi-line field's height is the caller's (rows, a min-height); its shape is not.
+    expect(svelte('<textarea class="gp-field-multi"></textarea>\n<style>\n  textarea { min-height: 78px; }\n</style>', 12)).toEqual([]);
+    expect(svelte('<textarea class="gp-field-multi"></textarea>\n<style>\n  textarea { min-height: 78px; padding: 10px; }\n</style>', 12)).toHaveLength(1);
+    // The rule's ancestor is elsewhere: the gp-btn is not inside .list, so nothing is reshaped.
+    expect(svelte('<ul class="list"><li><button>Row</button></li></ul><button class="gp-btn">Go</button>\n<style>\n  .list button { padding: 8px; }\n</style>', 12)).toEqual([]);
+    // Colour for a pressed state is the caller's; :global and :not(.gp-*) are not overrides.
+    expect(svelte('<button class="gp-btn" aria-pressed="true">A</button>\n<style>\n  button[aria-pressed="true"] { background: red; border-color: red; }\n  :global(.x) button { padding: 0; }\n  :where(input):not(.gp-field) { padding: 8px; }\n</style>\n<input class="gp-field" />', 12)).toEqual([]);
+  });
+
   it("hex needs a color position outside CSS: a whole quoted value or a [#hex] arbitrary value", () => {
     expect(svelte('<p title="Fixes #1234">x</p><button data-go={"#panel"}>y</button>', 4)).toEqual([]);
     expect(svelte("<p class=\"bg-[#abc]/50\"></p><i style={`color: ${c}`}></i>{x ? '#fff' : '#000'}", 4)).toHaveLength(3);
@@ -831,7 +863,7 @@ describe("the committed gate config", () => {
     for (const e of cfg.deferred) expect(e.owner).not.toBe("");
   });
 
-  it("allow-lists nothing but the brand marks (rule 4), Firebase's own word \"project\" two agent prompts and the embedded browser's reload (rule 14)", () => {
+  it("allow-lists nothing but the brand marks (rule 4), the model picker's invisible native select (rule 12), Firebase's own word \"project\" two agent prompts and the embedded browser's reload (rule 14)", () => {
     const cfg = readGateConfig(configFile);
     expect(cfg.allow.map((e) => `${e.rule}:${e.file}${e.term ? `:${e.term}` : ""}`)).toEqual([
       "4:src/lib/components/Logo.svelte",
@@ -840,6 +872,7 @@ describe("the committed gate config", () => {
       "14:src/lib/workbench/taskCompose.ts:snake_case identifier",
       "14:src/lib/secrets/agentPrompt.ts:project",
       "14:src/lib/components/BrowserSession.svelte:Reload",
+      "12:src/lib/components/HarnessBadge.svelte:<select>",
     ]);
   });
 

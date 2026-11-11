@@ -78,8 +78,10 @@
  *      the xterm and canvas adapters convert tokens at their boundary.
  *      `href`/`id`/`for`/`src`-style attributes and `url(#id)` are skipped.
  *   5  radius: tokens `rounded[-side]-[...]` unless the value is
- *      `var(--gp-r-*)`, and `rounded[-side]-3xl`. Misses `border-radius: Npx`
- *      in `<style>` ("picked by eye" has no mechanical test there).
+ *      `var(--gp-r-*)`, and `rounded[-side]-3xl`; and a `border-radius`
+ *      declaration (any corner) in `<style>`, `style=` or a stylesheet whose
+ *      value holds a px/rem/em length other than 0. `50%` circles, `0` and
+ *      `var()`/`calc()` over the tokens pass.
  *   6  z-index: tokens `z-N` (N>0) and `z-[...]`; `z-index: N` (N != 0) in
  *      `<style>`, `style=` and `style:z-index`. `z-0` and `var()` pass.
  *   7  hairlines: tokens `border-{t,b,l,r,x,y,s,e}` and `border-X-N` (N>0),
@@ -239,7 +241,7 @@ export const APP_CSS = "src/app.css";
  * @typedef {{ type: "text" | "expr", start: number, end: number }} Seg
  * @typedef {{ tag: number, tagName: string, name: string, nameStart: number, segs: Seg[] }} Attr
  * @typedef {{ text: string, start: number, css: boolean }} ColorRegion
- * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], labels: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][], styleRanges: [number, number][] }} Model
+ * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], labels: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][], styleRanges: [number, number][], tagNames?: string[], tagParents?: number[], tagStarts?: number[], attrs?: Attr[] }} Model
  * @typedef {{ rule: number, file: string, line: number, col: number, message: string, term?: string }} Violation
  * @typedef {(offset: number, message: string, term?: string) => void} Report
  * @typedef {(file: string, offset: number, message: string, term?: string) => void} RepoReport
@@ -528,6 +530,8 @@ function parseSvelte(src) {
   const parentTag = () => (open.length > 0 ? open[open.length - 1].tag : -1);
   /** @type {[number, number][]} */ const htmlComments = [];
   /** @type {string[]} */ const tags = [];
+  /** @type {number[]} */ const parents = [];
+  /** @type {number[]} */ const tagStarts = [];
   const markupJs = newJsOut();
   let textStart = -1;
   /** @param {number} end */
@@ -540,6 +544,8 @@ function parseSvelte(src) {
     const nm = /^[A-Za-z][\w:.-]*/.exec(src.slice(start + 1, start + 120));
     const name = nm ? nm[0] : "";
     const tag = tags.push(name) - 1;
+    parents[tag] = parentTag();
+    tagStarts[tag] = start;
     let j = start + 1 + name.length;
     let selfClosed = false;
     while (j < n) {
@@ -656,7 +662,7 @@ function parseSvelte(src) {
     i++;
   }
   flush(n);
-  return { scripts, styles, attrs, texts, exprs, htmlComments, tags, markupJs };
+  return { scripts, styles, attrs, texts, exprs, htmlComments, tags, parents, tagStarts, markupJs };
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +796,10 @@ export function buildModel(file, src) {
     return m;
   }
   const p = parseSvelte(src);
+  m.tagNames = p.tags;
+  m.tagParents = p.parents;
+  m.tagStarts = p.tagStarts;
+  m.attrs = p.attrs;
   const scriptJs = newJsOut();
   /** @type {[number, number][]} */
   const comments = [...p.htmlComments, ...p.markupJs.comments];
@@ -1463,16 +1473,22 @@ export const RULES = [
   {
     id: 5,
     name: "radius",
-    summary: "rounded-[...] / rounded-3xl",
+    summary: "rounded-[...] / rounded-3xl / a literal border-radius length",
     svelte: true,
     ts: false,
-    css: false,
+    css: true,
     run(m, report) {
       eachToken(m, (t) => {
         const arb = /^rounded(?:-[a-z]{1,2})?-\[(.+)\]$/.exec(t.util);
         if (arb && !arb[1].startsWith("var(--gp-r-")) report(t.start, `${t.util}: radius picked by eye, use --gp-r-* through the owning component`);
         else if (/^rounded(?:-[a-z]{1,2})?-3xl$/.test(t.util)) report(t.start, `${t.util}: use --gp-r-* through the owning component`);
       });
+      for (const d of m.decls) {
+        if (!/^border(?:-(?:top|bottom|start|end)-(?:left|right|start|end))?-radius$/.test(d.prop)) continue;
+        // A fallback inside var() (`var(--gp-r-full, 999px)`) is the token's, not a pick.
+        const own = d.value.replace(/var\((?:[^()]|\([^()]*\))*\)/g, "");
+        if (/(?<![\w.-])(?!0+(?:\.0+)?(?:px|rem|em)?(?![\w.]))\d*\.?\d+(?:px|rem|em)\b/.test(own)) report(d.start, `${d.prop}: ${d.value}: a radius picked by eye, use var(--gp-r-*) (DESIGN_LANGUAGE section 5)`);
+      }
     },
   },
   {
@@ -1524,7 +1540,8 @@ export const RULES = [
         if (!STOPS.has(t.opacity)) report(t.start, `${t.util}/${t.opacity}: border opacity stops are --gp-edge-soft (35), --gp-edge (65) and --gp-edge-strong (90)`);
       });
       for (const d of m.decls) {
-        if (!/^(?:border|outline)/.test(d.prop)) continue;
+        // A radius has no colour: `calc(var(--gp-r-xs) / 2)` is not an opacity.
+        if (!/^(?:border|outline)/.test(d.prop) || /-radius$/.test(d.prop)) continue;
         for (const hit of d.value.matchAll(/\/\s*(\d*\.?\d+%?)\s*\)/g)) {
           const v = Number.parseFloat(hit[1]) / (hit[1].endsWith("%") ? 100 : 1);
           if (![0.35, 0.65, 0.9, 1].includes(v)) report(d.start, `${d.prop}: opacity ${hit[1]}: border opacity stops are 0.35, 0.65 and 0.9`);
@@ -1643,6 +1660,76 @@ export const RULES = [
             report(pill.start, "gp-field on a <textarea>: a field that grows taller is gp-field-multi, the rounded rect, not the one-line pill");
             break;
           }
+        }
+      }
+      // A scoped rule that repaints a primitive. Component CSS is unlayered and
+      // the gp-* primitives are @utility rules inside a layer, so the scoped
+      // rule wins whatever its specificity: it squared TaskEditor's pills and
+      // the code map's "Fit view" button. Matched against this file's own
+      // markup by the selector's last compound (tag and/or classes).
+      const names = m.tagNames ?? [];
+      const parents = m.tagParents ?? [];
+      /** @type {Set<string>[]} */
+      const classesOf = names.map(() => new Set());
+      for (const cs of m.classSources) {
+        if (cs.tag < 0) continue;
+        for (const t of cs.tokens) if (t.variants.length === 0) classesOf[cs.tag]?.add(t.util);
+      }
+      // A native <select> wears gp-select, and a checkbox is the shared
+      // Checkbox (its own file is the one place a raw one is drawn).
+      if (!/(?:^|\/)Checkbox\.svelte$/.test(m.file)) {
+        for (let el = 0; el < names.length; el++) {
+          const at = m.tagStarts?.[el] ?? 0;
+          if (names[el] === "select" && !classesOf[el].has("gp-select")) report(at, "<select> without gp-select: a native select wears gp-select (pill, field height), or an invisible one sits over a gp-select face", "<select>");
+          if (names[el] === "input") {
+            const type = (m.attrs ?? []).find((a) => a.tag === el && a.name === "type");
+            const value = type ? type.segs.map((sg) => (sg.type === "text" ? m.src.slice(sg.start, sg.end) : "{}")).join("") : "";
+            if (/^["']?checkbox["']?$/.test(value.trim())) report(at, '<input type="checkbox">: use the shared Checkbox component (src/lib/components/Checkbox.svelte)');
+          }
+        }
+      }
+      /** @param {{ tag: string, classes: string[] }} c @param {number} el */
+      const fits = (c, el) => (!c.tag || names[el] === c.tag) && c.classes.every((k) => classesOf[el].has(k));
+      for (const r of m.cssRules) {
+        if (r.at || chain(r).some((a) => /^@/.test(a.selector))) continue;
+        const props = r.decls.map((d) => d.prop).filter((p) => PRIMITIVE_PAINT.test(p));
+        if (props.length === 0) continue;
+        for (const part of splitSelectors(r.selector)) {
+          if (/:global\(/.test(part.text)) continue;
+          const compounds = part.text
+            .replace(/:not\((?:[^()]|\([^)]*\))*\)/g, "")
+            .trim()
+            .split(/\s*[\s>+~]\s*/)
+            .map((raw) => {
+              const c = raw.replace(/::?[\w-]+(?:\((?:[^()]|\([^)]*\))*\))?/g, "").replace(/\[[^\]]*\]/g, "");
+              return { raw, tag: /^[a-z][\w-]*/.exec(c)?.[0] ?? "", classes: [...c.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((h) => h[1]) };
+            });
+          const last = compounds[compounds.length - 1];
+          if (!last || (!last.tag && last.classes.length === 0)) continue;
+          // Naming the primitive outright (`.map-zoom .gp-btn { padding }`) is the same override.
+          const named = PRIMITIVES.find((p) => last.classes.includes(p));
+          if (named) {
+            const own = sizedBy(named, props);
+            if (own.length > 0) report(r.selStart + part.start, `${last.raw}: a scoped rule sets ${own.join(", ")} on a ${named}; scoped CSS beats the layered primitive, so use data-size/data-variant or the primitive's own owner`);
+            continue;
+          }
+          const hit = names.findIndex((_, el) => {
+            if (!fits(last, el) || !PRIMITIVES.some((p) => classesOf[el].has(p))) return false;
+            // Each earlier compound must match some ancestor, in order, walking up.
+            let at = parents[el] ?? -1;
+            for (let i = compounds.length - 2; i >= 0; i--) {
+              const c = compounds[i];
+              if (!c.tag && c.classes.length === 0) continue;
+              while (at >= 0 && !fits(c, at)) at = parents[at] ?? -1;
+              if (at < 0) return false;
+              at = parents[at] ?? -1;
+            }
+            return true;
+          });
+          if (hit < 0) continue;
+          const prim = PRIMITIVES.find((p) => classesOf[hit].has(p)) ?? "";
+          const own = sizedBy(prim, props);
+          if (own.length > 0) report(r.selStart + part.start, `${last.raw}: a scoped rule sets ${own.join(", ")} on a ${prim}; scoped CSS beats the layered primitive, so use data-size/data-variant or the primitive's own owner`);
         }
       }
     },
@@ -1901,6 +1988,47 @@ function isWidgetClass(name) {
   if (/^(?:btn|button|chip|pill|toggle|tab)-(?:primary|secondary|ghost|danger|success|remove|close|dismiss|action|x|icon)$/.test(name)) return true;
   if (/-(?:btn|button|link|chip|pill|toggle|action)$/.test(name)) return true;
   return /^close(?:-[\w-]+)?$/.test(name);
+}
+
+/** The one-line and multi-line primitives a scoped rule must not repaint (rule 12). */
+const PRIMITIVES = ["gp-btn", "gp-btn-primary", "gp-btn-danger", "gp-btn-success", "gp-icon-btn", "gp-chip", "gp-seg-btn", "gp-field", "gp-field-multi", "gp-select", "gp-check"];
+/**
+ * The properties that give a primitive its shape and size: corners, padding,
+ * height and edge width. Colour (background, border-color) is left to the
+ * caller for pressed/active states the primitives do not draw themselves.
+ */
+const PRIMITIVE_PAINT = /^(?:border(?:-(?:top|right|bottom|left))?(?:-(?:width|style))?|border(?:-(?:top|bottom)-(?:left|right))?-radius|padding(?:-(?:top|right|bottom|left|block|inline))?|height|min-height)$/;
+
+/**
+ * The shape properties a scoped rule may not set on this primitive. A
+ * multi-line field's height is chosen per use (rows, a min-height), so only
+ * its shape counts there.
+ * @param {string} prim @param {string[]} props @returns {string[]}
+ */
+function sizedBy(prim, props) {
+  const own = prim === "gp-field-multi" ? props.filter((p) => !/^(?:min-)?height$/.test(p)) : props;
+  return [...new Set(own)];
+}
+
+/**
+ * Split a selector list on its top-level commas.
+ * @param {string} sel @returns {{ text: string, start: number }[]}
+ */
+function splitSelectors(sel) {
+  const parts = [];
+  let depth = 0, from = 0;
+  for (let i = 0; i <= sel.length; i++) {
+    const c = sel[i];
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth--;
+    else if ((c === "," && depth === 0) || i === sel.length) {
+      const raw = sel.slice(from, i);
+      const lead = raw.length - raw.trimStart().length;
+      parts.push({ text: raw.trim(), start: from + lead });
+      from = i + 1;
+    }
+  }
+  return parts.filter((p) => p.text !== "");
 }
 
 // ---------------------------------------------------------------------------
