@@ -86,3 +86,12 @@ describe("getBoardVerdicts", () => {
     await expect(getBoardVerdicts(Array.from({ length: MAX_VERDICT_BATCH + 1 }, (_, n) => `i${n}`))).rejects.toThrow();
   });
 });
+
+describe("verdict labels", () => {
+  it("say what happened in the product's voice, while the state keys stay the wire values Rust writes", async () => {
+    const { VERDICT_LABELS, VERDICT_STATES } = await import("./verification");
+    expect(VERDICT_STATES).toContain("could_not_run");
+    expect(VERDICT_LABELS.could_not_run).toBe("Couldn't run");
+    for (const state of VERDICT_STATES) expect(VERDICT_LABELS[state]).not.toMatch(/could not/i);
+  });
+});

@@ -29,7 +29,7 @@ export const VERDICT_LABELS: Readonly<Record<VerdictState, string>> = Object.fre
   passed: "Passed",
   failed: "Failed",
   degraded: "Degraded",
-  could_not_run: "Could not run",
+  could_not_run: "Couldn't run",
 });
 
 /** What a reader should take from each state, shown beside the chip. */
