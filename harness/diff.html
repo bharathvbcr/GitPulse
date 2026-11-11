@@ -344,9 +344,9 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("a two-file diff is titled by its count, not by the file the reader last clicked",()=>titleButton().textContent.trim()==="2 files");
  check("and wears no single-language icon, because no one language describes it",()=>headerLogo()===null);
  check("each file's section header carries its own file's icon",()=>Boolean(preview.querySelector('[aria-label="Rust"]'))&&Boolean(preview.querySelector('[aria-label="JSON"]')));
- check("a Rust row is coloured as Rust even though the reader's selection is a .json",()=>/purple/.test(spanOf("fn")?.className??""));
+ check("a Rust row is coloured as Rust even though the reader's selection is a .json",()=>/text-syntax-keyword/.test(spanOf("fn")?.className??""));
  const jsonRow=[...preview.querySelectorAll(".gp-diff-text")].find(el=>el.textContent.includes('"b"'));
- check("and the .json row beneath it is not coloured with the Rust tokenizer",()=>Boolean(jsonRow)&&![...jsonRow.querySelectorAll("span")].some(el=>/purple/.test(el.className)));
+ check("and the .json row beneath it is not coloured with the Rust tokenizer",()=>Boolean(jsonRow)&&![...jsonRow.querySelectorAll("span")].some(el=>/text-syntax-keyword/.test(el.className)));
  // --- the gutter -----------------------------------------------------------
  const gutterCells=()=>[...preview.querySelectorAll(".gp-diff-text")].flatMap(code=>[...code.closest('[style*="height"]').querySelectorAll("span.tabular-nums")]).filter(el=>el.textContent.trim());
  await open({text:twoHunks(),truncated:false});

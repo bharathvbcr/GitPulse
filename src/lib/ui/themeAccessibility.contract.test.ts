@@ -63,7 +63,9 @@ describe("native fields keep theme ink in WKWebView", () => {
     // transparent (macOSPrivateApi). The fill colour is what actually paints.
     const field = block("@utility gp-field {");
     expect(field).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
-    expect(field).toMatch(/::placeholder[\s\S]*-webkit-text-fill-color:\s*rgb\(var\(--c-text-muted\)/);
+    expect(field).toMatch(/::placeholder[\s\S]*-webkit-text-fill-color:\s*rgb\(var\(--c-text-faint\)\);/);
+    // An opaque role, not the muted colour at 60% alpha: faint is held to 4.5:1 on every surface.
+    expect(field).not.toMatch(/--c-text-muted\) \/ 0\.6|placeholder:text-textMuted\/60/);
     const select = block("@utility gp-select {");
     expect(select).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
   });

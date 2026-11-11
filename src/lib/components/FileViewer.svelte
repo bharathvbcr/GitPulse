@@ -791,7 +791,7 @@
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
 
     {#if openTabs.length === 0}
-      <span class="text-xs text-textMuted/60 italic pl-1 flex-1">No open files</span>
+      <span class="text-xs text-faint italic pl-1 flex-1">No open files</span>
     {:else}
       <!-- The strip listens for the arrow keys but is not itself a tab stop:
            the roving tabindex on the tabs is what the user lands on. -->
@@ -920,7 +920,7 @@
         <div class="flex items-center gap-0.5 min-w-max py-0.5">
         {#each pathSegments as seg, idx}
           {#if idx > 0}
-            <ChevronRight size={10} class="shrink-0 text-textMuted/40" aria-hidden="true" />
+            <ChevronRight size={10} class="shrink-0 text-faint" aria-hidden="true" />
           {/if}
           {#if idx === pathSegments.length - 1}
             <span class="text-textPrimary font-semibold select-text">{seg}</span>

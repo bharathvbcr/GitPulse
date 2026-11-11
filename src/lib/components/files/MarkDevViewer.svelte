@@ -380,7 +380,7 @@
               style="padding-left: {(h.level - 1) * 12 + 6}px;"
               title={h.title}
             >
-              <span class="text-micro font-mono text-accent/70 mr-1">{"#".repeat(h.level)}</span>
+              <span class="text-micro font-mono text-accent mr-1">{"#".repeat(h.level)}</span>
               <span>{h.title}</span>
             </button>
           {/each}

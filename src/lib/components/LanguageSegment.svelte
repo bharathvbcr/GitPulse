@@ -176,7 +176,7 @@
       {/each}
     </span>
     <span class="font-medium">{mix.dominant.language}</span>
-    <span class="tabular-nums text-micro text-textMuted/70">{mix.dominant.percentage}%</span>
+    <span class="tabular-nums text-micro text-faint">{mix.dominant.percentage}%</span>
     {#if mix.partial}
       <!-- The capped-scan marker rides the compact form too. A floor that
            reads as a total is the one thing this segment must never do. -->

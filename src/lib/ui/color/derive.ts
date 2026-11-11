@@ -16,6 +16,7 @@
  */
 import { TEXT_MIN, ensureContrast } from "./guard";
 import {
+  clampToGamut,
   contrastRatio,
   formatTriplet,
   normalizeHue,
@@ -52,6 +53,69 @@ export const TOKEN_KEYS = [
 ] as const;
 
 export type TokenKey = (typeof TOKEN_KEYS)[number];
+
+/**
+ * The code-colour roles (`--c-syntax-*`). They are not part of `TOKEN_KEYS`
+ * because they are not `R G B` triplets: app.css declares them as `oklch()`
+ * colours and a derived palette answers with `rgb()`, both used directly as a
+ * `<color>`.
+ */
+export const SYNTAX_KEYS = [
+  "--c-syntax-keyword",
+  "--c-syntax-type",
+  "--c-syntax-string",
+  "--c-syntax-number",
+  "--c-syntax-function",
+  "--c-syntax-operator",
+  "--c-syntax-attribute",
+  "--c-syntax-property",
+  "--c-syntax-regex",
+  "--c-syntax-variable",
+  "--c-syntax-punctuation",
+] as const;
+
+export type SyntaxKey = (typeof SYNTAX_KEYS)[number];
+
+/**
+ * The syntax colours app.css ships, per appearance, as the OKLCH it declares.
+ * Transcribed; `derive.syntax.test.ts` compares every one with the stylesheet.
+ * They are the starting point for a custom palette: the guard moves lightness
+ * only when the derived code background needs it.
+ */
+export const SHIPPED_SYNTAX: Readonly<Record<Appearance, Readonly<Record<SyntaxKey, Oklch>>>> = {
+  dark: {
+    "--c-syntax-keyword": { l: 0.8, c: 0.125, h: 305 },
+    "--c-syntax-type": { l: 0.8, c: 0.11, h: 205 },
+    "--c-syntax-string": { l: 0.8, c: 0.12, h: 150 },
+    "--c-syntax-number": { l: 0.82, c: 0.13, h: 70 },
+    "--c-syntax-function": { l: 0.8, c: 0.1, h: 255 },
+    "--c-syntax-operator": { l: 0.8, c: 0.115, h: 10 },
+    "--c-syntax-attribute": { l: 0.82, c: 0.11, h: 100 },
+    "--c-syntax-property": { l: 0.82, c: 0.105, h: 235 },
+    "--c-syntax-regex": { l: 0.82, c: 0.125, h: 345 },
+    "--c-syntax-variable": { l: 0.8, c: 0.1, h: 280 },
+    "--c-syntax-punctuation": { l: 0.76, c: 0.03, h: 265 },
+  },
+  light: {
+    "--c-syntax-keyword": { l: 0.48, c: 0.15, h: 305 },
+    "--c-syntax-type": { l: 0.455, c: 0.075, h: 205 },
+    "--c-syntax-string": { l: 0.45, c: 0.12, h: 150 },
+    "--c-syntax-number": { l: 0.47, c: 0.1, h: 70 },
+    "--c-syntax-function": { l: 0.465, c: 0.15, h: 255 },
+    "--c-syntax-operator": { l: 0.48, c: 0.15, h: 10 },
+    "--c-syntax-attribute": { l: 0.46, c: 0.095, h: 100 },
+    "--c-syntax-property": { l: 0.46, c: 0.095, h: 235 },
+    "--c-syntax-regex": { l: 0.48, c: 0.14, h: 345 },
+    "--c-syntax-variable": { l: 0.475, c: 0.15, h: 280 },
+    "--c-syntax-punctuation": { l: 0.45, c: 0.03, h: 265 },
+  },
+};
+
+/** Alpha of the diff row tints and the selected-line tint that code is read over. */
+export const CODE_TINT_ALPHA = 0.15;
+
+/** The syntax floor: 4.5:1 plus headroom for the rounding to whole `rgb()` channels. */
+export const SYNTAX_MIN = TEXT_MIN + 0.05;
 
 export interface DeriveInputs {
   /** Surface hue and lightness. `#rgb` or `#rrggbb`. */
@@ -180,7 +244,7 @@ export function ladderOffsets(appearance: Appearance): Readonly<Record<LadderRol
 }
 
 export interface GuardReportEntry {
-  readonly key: TokenKey;
+  readonly key: TokenKey | SyntaxKey;
   /** The colour before the guard, as `#rrggbb`. */
   readonly requested: Rgb;
   readonly minimum: number;
@@ -202,6 +266,8 @@ export type DeriveResult =
       readonly ok: true;
       /** `R G B` triplets keyed by CSS custom property. */
       readonly tokens: Readonly<Record<TokenKey, string>>;
+      /** `rgb()` colours for the code roles, each held to 4.5:1 on the derived code background. */
+      readonly syntax: Readonly<Record<SyntaxKey, string>>;
       /** One entry per guarded token: what the guard measured and whether it moved. */
       readonly report: readonly GuardReportEntry[];
     }
@@ -273,7 +339,7 @@ export function deriveTokens(inputs: DeriveInputs, appearance: Appearance): Deri
   const border = oklchToRgb(placeAt(anchor, offsets.border, scale));
   const surfaces: readonly Rgb[] = [bg, surface, surfaceHover];
 
-  const resolved = new Map<TokenKey, Rgb>([
+  const resolved = new Map<TokenKey | SyntaxKey, Rgb>([
     ["--c-bg", bg],
     ["--c-surface", surface],
     ["--c-surface-hover", surfaceHover],
@@ -283,7 +349,7 @@ export function deriveTokens(inputs: DeriveInputs, appearance: Appearance): Deri
 
   /** Runs `requested` through the guard against the worst of `against`. */
   const guard = (
-    key: TokenKey,
+    key: TokenKey | SyntaxKey,
     requested: Rgb,
     against: readonly Rgb[],
     minimum: number,
@@ -360,6 +426,28 @@ export function deriveTokens(inputs: DeriveInputs, appearance: Appearance): Deri
   );
   inkOn("--c-on-unknown", unknown);
 
+  // Code. It is read over the three surfaces and over the paints the viewers
+  // lay on them: the added and removed row tints and the selected-line tint.
+  // The same guard, against the worst of those, so a palette that moves the
+  // code background cannot strand the syntax colours that were tuned for the
+  // shipped one.
+  const tintFills = (["--c-ok", "--c-danger", "--c-accent"] as const).map((key) => resolved.get(key));
+  // A refused status or accent colour has already failed the palette; there is
+  // no tint to measure against, and the palette is not applied either way.
+  if (failures.length === 0 && tintFills.every((fill) => fill !== undefined)) {
+    const codeBackgrounds: Rgb[] = [...surfaces];
+    for (const surfaceRgb of surfaces) {
+      for (const fill of tintFills) {
+        if (!fill) continue;
+        const mix = (i: 0 | 1 | 2): number => fill[i] * CODE_TINT_ALPHA + surfaceRgb[i] * (1 - CODE_TINT_ALPHA);
+        codeBackgrounds.push([mix(0), mix(1), mix(2)]);
+      }
+    }
+    for (const key of SYNTAX_KEYS) {
+      guard(key, oklchToRgb(clampToGamut(SHIPPED_SYNTAX[appearance][key])), codeBackgrounds, SYNTAX_MIN);
+    }
+  }
+
   if (failures.length > 0) return { ok: false, failures };
 
   // Every key is set above; a missing one is a bug in this function, not input.
@@ -389,5 +477,23 @@ export function deriveTokens(inputs: DeriveInputs, appearance: Appearance): Deri
     "--c-unknown": pick("--c-unknown"),
     "--c-on-unknown": pick("--c-on-unknown"),
   };
-  return { ok: true, tokens, report };
+  const pickSyntax = (key: SyntaxKey): string => {
+    const rgb = resolved.get(key);
+    if (!rgb) throw new Error(`deriveTokens did not produce ${key}`);
+    return `rgb(${formatTriplet(rgb)})`;
+  };
+  const syntax: Record<SyntaxKey, string> = {
+    "--c-syntax-keyword": pickSyntax("--c-syntax-keyword"),
+    "--c-syntax-type": pickSyntax("--c-syntax-type"),
+    "--c-syntax-string": pickSyntax("--c-syntax-string"),
+    "--c-syntax-number": pickSyntax("--c-syntax-number"),
+    "--c-syntax-function": pickSyntax("--c-syntax-function"),
+    "--c-syntax-operator": pickSyntax("--c-syntax-operator"),
+    "--c-syntax-attribute": pickSyntax("--c-syntax-attribute"),
+    "--c-syntax-property": pickSyntax("--c-syntax-property"),
+    "--c-syntax-regex": pickSyntax("--c-syntax-regex"),
+    "--c-syntax-variable": pickSyntax("--c-syntax-variable"),
+    "--c-syntax-punctuation": pickSyntax("--c-syntax-punctuation"),
+  };
+  return { ok: true, tokens, syntax, report };
 }

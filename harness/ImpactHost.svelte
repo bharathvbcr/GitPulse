@@ -67,7 +67,7 @@
       <span class="min-w-0 truncate font-medium text-textPrimary"
         >Sources/ExpanderEngine/Engine/AXContextChecker.swift</span
       >
-      <span class="shrink-0 rounded bg-amber-500/15 px-1 font-mono text-[10px] text-amber-600">M</span>
+      <span class="shrink-0 rounded bg-warn/15 px-1 font-mono text-[10px] text-warn">M</span>
       <span class="shrink-0 font-mono text-[10px] tabular-nums text-textMuted">+44 −3</span>
       <span class="shrink-0 text-[10px] text-textMuted">77 lines</span>
       <span class="shrink-0 rounded-full border border-border/70 px-1.5 text-[10px] text-textMuted"

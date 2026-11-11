@@ -15,10 +15,8 @@
     },
     "3": {
       "name": "palette-colors",
-      "total": 11,
-      "files": {
-        "src/lib/files/syntaxHighlight.ts": 11
-      }
+      "total": 0,
+      "files": {}
     },
     "4": {
       "name": "color-literals",

@@ -234,7 +234,7 @@
           </button>
           {#each group.matches as match (`${match.line}:${match.column}`)}
             <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-meta" onclick={() => open(match.path, match)}>
-              <span class="w-9 shrink-0 text-right text-textMuted/60 tabular-nums">{match.line}</span>
+              <span class="w-9 shrink-0 text-right text-faint tabular-nums">{match.line}</span>
               <span class="whitespace-pre truncate text-textPrimary">{match.text}{match.text_clipped ? " …" : ""}</span>
             </button>
           {/each}

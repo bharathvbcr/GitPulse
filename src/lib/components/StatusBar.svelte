@@ -239,7 +239,7 @@
         {/if}
       </button>
     {:else if detail === "full"}
-      <span class="inline-flex items-center gap-1 text-textMuted/70">
+      <span class="inline-flex items-center gap-1 text-faint">
         <CheckCircle2 size={11} class="text-ok/80" />
         <span>Clean</span>
       </span>

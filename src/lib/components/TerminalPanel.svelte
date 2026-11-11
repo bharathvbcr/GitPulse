@@ -1701,7 +1701,7 @@
           aria-label="Console command"
           placeholder="Enter command (e.g. git status, npm test, cargo update)…"
           disabled={running}
-          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden disabled:opacity-50"
+          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden disabled:opacity-50"
         />
       </div>
       <button

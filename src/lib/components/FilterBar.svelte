@@ -36,7 +36,7 @@
       placeholder="Search commits, authors, paths (e.g. author:alice, feat:)…"
       value={$filterStore.searchQuery}
       oninput={(e) => filterStore.setSearch((e.target as HTMLInputElement).value)}
-      class="w-full bg-transparent text-textPrimary placeholder:text-textMuted/60 text-xs focus:outline-hidden"
+      class="w-full bg-transparent text-textPrimary placeholder:text-faint text-xs focus:outline-hidden"
     />
     {#if $filterStore.searchQuery}
       <button onclick={() => filterStore.setSearch("")} aria-label="Clear search" title="Clear search" class="gp-icon-btn p-0.5!">

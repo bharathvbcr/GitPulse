@@ -515,7 +515,7 @@
                 </button>
               {/each}
             </div>
-            <div class="flex items-center justify-between text-micro text-textMuted/80 tabular-nums">
+            <div class="flex items-center justify-between text-micro text-faint tabular-nums">
               <span class="truncate">{axisStartLabel}</span>
               <span class="truncate shrink-0 px-2">
                 {formatShare(timeline.peakPercent)} peak · {granularityLabel(timeline.granularity)}
@@ -558,7 +558,7 @@
               >
                 <span class="w-2.5 h-2.5 rounded-full shrink-0" style:background-color={bandColor(share.band, "fill")}></span>
                 <span>{share.band.label}</span>
-                <span class="text-textMuted/70">{formatShare(share.percent)}</span>
+                <span class="text-faint">{formatShare(share.percent)}</span>
               </button>
             {/each}
           </div>
@@ -673,13 +673,13 @@
               >
                 {#if uncommitted}
                   <span
-                    class="w-16 px-2 text-micro font-mono text-textMuted/50 italic text-left shrink-0 truncate"
+                    class="w-16 px-2 text-micro font-mono text-faint italic text-left shrink-0 truncate"
                     title="Not committed yet"
                   >{grouped ? "" : "uncommitted"}</span>
                 {:else}
                   <button
                     type="button"
-                    class="w-16 px-2 text-micro text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0 transition-opacity
+                    class="w-16 px-2 text-micro text-accent font-mono select-none cursor-pointer hover:underline text-left shrink-0 transition-opacity
                            {grouped ? 'opacity-0 hover:opacity-100 focus-visible:opacity-100' : ''}"
                     title="{shortHash(line.commit_id)} — {line.author_name}, {$timestampFormat.title(line.timestamp)}"
                     onclick={() => {
@@ -691,7 +691,7 @@
                   <button
                     type="button"
                     data-blame-parent
-                    class="w-4 shrink-0 flex items-center justify-center text-textMuted/60 hover:text-accent focus-visible:text-accent"
+                    class="w-4 shrink-0 flex items-center justify-center text-faint hover:text-accent focus-visible:text-accent"
                     title="Blame the parent of {shortHash(line.commit_id)} ({shortHash(line.previous_commit)}{line.previous_path && line.previous_path !== (atRevision?.path ?? filePath) ? `, ${line.previous_path}` : ''})"
                     aria-label="Blame the parent of commit {shortHash(line.commit_id)}"
                     onclick={() => stepToParent(line)}
@@ -701,10 +701,10 @@
                 {/if}
                 <span class="w-24 px-2 text-micro text-textMuted truncate font-sans shrink-0">{grouped ? "" : line.author_name}</span>
                 <span
-                  class="w-[74px] px-1.5 text-micro text-textMuted/70 truncate font-sans shrink-0 tabular-nums"
+                  class="w-[74px] px-1.5 text-micro text-faint truncate font-sans shrink-0 tabular-nums"
                   title={$timestampFormat.title(line.timestamp) || undefined}
                 >{grouped ? "" : $timestampFormat.text(line.timestamp)}</span>
-                <span class="w-8 px-2 text-right text-textMuted/40 text-micro select-none shrink-0">{line.line_no}</span>
+                <span class="w-8 px-2 text-right text-faint text-micro select-none shrink-0">{line.line_no}</span>
                 <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
                 <span class="gp-diff-text px-3 whitespace-pre text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
               </div>

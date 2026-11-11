@@ -20,7 +20,7 @@ import {
 } from "./apply";
 import { setAccentOverride } from "../accents";
 import { contrastRatio, parseHex } from "../color/oklch";
-import { SHIPPED_LADDER } from "../color/derive";
+import { SHIPPED_LADDER, SYNTAX_KEYS } from "../color/derive";
 import { TEXT_MIN } from "../color/guard";
 import { TRANSPARENCY_ATTRIBUTE, applyTransparency, setUserTransparencyReduced } from "../transparencyPreference";
 import { exportTheme } from "./themeSchema";
@@ -255,6 +255,16 @@ describe("imported theme", () => {
     const light = planAppearance(prefs({ customTheme: theme }), macLight);
     expect(light.vars["--c-bg"]).toBeUndefined();
     expect(light.notes.map((note) => note.id)).toContain("theme-other-mode");
+  });
+
+  it("writes the guarded syntax colours with the palette, and clears them when no palette applies", () => {
+    const on = planAppearance(prefs({ customTheme: theme }), mac);
+    for (const key of SYNTAX_KEYS) {
+      expect(on.vars[key], key).toMatch(/^rgb\(\d+ \d+ \d+\)$/);
+      expect(MANAGED_VARS).toContain(key);
+    }
+    const off = planAppearance(prefs(), mac);
+    for (const key of SYNTAX_KEYS) expect(off.vars[key], key).toBeUndefined();
   });
 
   it("hands the accent to applyAccent, the one writer of --c-accent", () => {
