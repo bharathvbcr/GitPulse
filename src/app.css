@@ -1800,6 +1800,42 @@ html.macos.light .gp-sidebar {
   background-color: rgb(var(--c-surface-hover) / calc(0.6 + 0.4 * var(--gp-material, 0)));
 }
 
+/* The floating (overlay) light panel is the same fill over a white workspace,
+   and nothing behind it is a column of its own, so the tonal step alone did
+   not hold it off the plate. It takes a deeper wash of the border colour over
+   that fill and an edge that reads as a separator (3:1 against the workspace
+   it overlaps; harness/hidden-pane.html measures both). The wash is a
+   background-image and the edge a border-color, so the reduced-transparency
+   blocks below, which set `background` and `border-color` at this
+   specificity later in the cascade, still make the panel solid. Blur stays
+   on: the overlay is floating chrome. */
+html.light .gp-sidebar[data-sidebar-panel] {
+  background-image: linear-gradient(rgb(var(--c-border) / 0.1), rgb(var(--c-border) / 0.1));
+  border-color: rgb(var(--c-border) / 0.86);
+}
+
+/* The sidebar's scroll cue. ScrollCue draws a 2rem chevron band at an edge
+   that still hides content, and the generic fade left half of a row showing
+   under the chevron. Inside the sidebar the content is fully clear across that
+   band and ramps in above it, so the chevron never sits on a row. At the end
+   of the list no token is set, so the last row is not faded at all. */
+.gp-sidebar {
+  --gp-sidebar-cue-band: 2rem;
+  --gp-sidebar-cue-ramp: 0.5rem;
+}
+
+.gp-sidebar [data-gp-fade="y-start"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+}
+
+.gp-sidebar [data-gp-fade="y-end"] {
+  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+}
+
+.gp-sidebar [data-gp-fade="y-both"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-sidebar-cue-band) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-sidebar-cue-band)));
+}
+
 html.macos :is(.gp-menu, .gp-card.shadow-float) {
   box-shadow:
     inset 0 1px 0 var(--mac-glass-sheen),

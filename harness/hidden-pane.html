@@ -35,6 +35,18 @@
     cmd_devcouncil_init: () => ({ repo: root, state_dir: `${root}/.devmap`, exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false }),
     cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
     cmd_get_language_stats: () => ({ stats: [], truncated: false }),
+    // Enough branches and changed files that the sidebar's body scrolls inside
+    // the 520 px shell, and a dirty repository so the rail shows its Ask agent.
+    cmd_list_branches: () => [
+      { name: "main", is_current: true, is_default: true },
+      ...Array.from({ length: 10 }, (_, i) => ({ name: `feat/branch-${i}`, is_current: false, is_default: false })),
+    ].map((b) => ({
+      is_remote: false, remote_name: null, tip_commit_id: `${b.name.length}`.padEnd(12, "a"), ahead_count: 0, behind_count: 0, upstream: null,
+      is_gone: false, last_commit_timestamp: Math.floor(Date.now() / 1000) - 3600, last_author: "Alex", last_summary: "Work",
+      commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0, compared_to: "main", ...b,
+    })),
+    cmd_get_status: () => Array.from({ length: 12 }, (_, i) => ({ path: `src/file-${String(i).padStart(2, "0")}.ts`, old_path: null, status_code: "M", is_staged: false, is_conflicted: false, additions: 3, deletions: 1 })),
+    cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
     cmd_last_fetch_at: () => null,
     cmd_note_tab_activated: () => null,
     cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
@@ -148,6 +160,20 @@
     check("a docked toggle plays the one-shot width slide", () => sidebar().classList.contains("gp-slide-docked"));
     await until(() => Math.round(width(sidebar())) === 44, "docked collapse to the 44 px rail");
     check("collapsed, the docked sidebar is the 44 px rail with its expand button", () => !!$('[data-sidebar-rail] button[aria-label="Expand sidebar"]'));
+    // The rail is icons only: no label may spill past the 44 px column ("Ask
+    // age"), and the Ask agent button keeps its name as aria-label and tooltip.
+    const railOverflow = () => {
+      const column = sidebar().getBoundingClientRect();
+      const bad = [...sidebar().querySelectorAll("[data-sidebar-rail] *")].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && (r.left < column.left - 0.5 || r.right > column.right + 0.5);
+      });
+      return { bad: bad.map((el) => `${el.tagName}:${(el.textContent || "").trim().slice(0, 12)}`), scroll: sidebar().scrollWidth - sidebar().clientWidth, rail: $("[data-sidebar-rail]").scrollWidth - $("[data-sidebar-rail]").clientWidth };
+    };
+    await until(() => !!$('[data-sidebar-rail] [aria-label="Ask agent"]'), "the rail shows Ask agent for a dirty repository");
+    const askRail = $('[data-sidebar-rail] [aria-label="Ask agent"]');
+    check("the rail's Ask agent is an icon with the label as its name and tooltip, not text", () => (askRail.textContent || "").trim() === "" && askRail.title.length > 0);
+    check("no rail child overflows the 44 px rail's width", () => { const o = railOverflow(); if (o.bad.length || o.scroll > 0 || o.rail > 0) throw new Error(JSON.stringify(o)); return true; });
     await until(() => !sidebar().classList.contains("gp-slide-docked"), "the slide class is dropped again");
     check("the slide class does not linger after the toggle", () => !sidebar().classList.contains("gp-slide-docked"));
     check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
@@ -365,6 +391,94 @@
     window.__sidebarStep = steps;
     check(`the sidebar steps off the workspace in dark (${steps.dark.step} levels)`, () => steps.dark.step >= 5);
     check(`and in light, at dark's strength (${steps.light.step} levels)`, () => steps.light.step >= 5 && steps.light.step >= steps.dark.step * 0.8);
+
+    // ---- the sidebar body's scroll edge -----------------------------------------
+    // The body scrolls in the open panel. While content remains below, the
+    // chevron sits in a band the content is fully faded out of (so no row is
+    // drawn under it); at the end of the list there is no fade and no chevron,
+    // and the last row clears the bottom edge.
+    // A taller shell: the branch list is the flexible part of the sidebar and
+    // collapses to its padding in 520 px, leaving nothing to scroll.
+    host.setShellSize(1000, 900);
+    panelModes.set("sidebar", "overlay");
+    await settle();
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "panel for the scroll-edge checks"); }
+    await until(() => panel().getAnimations().every((animation) => animation.playState === "finished"), "the panel's slide-in finishes");
+    const body = () => panel().querySelector(".overflow-y-auto");
+    const list = () => panel().querySelector(".will-change-scroll.overflow-y-auto");
+    const remPx = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
+    const downCue = (scroller) => [...scroller.parentElement.children].map((c) => c !== scroller && c.querySelector('button[aria-label="Scroll down"]')).find(Boolean) || null;
+    check("the sidebar body overflows the shell", () => body().scrollHeight > body().clientHeight + 100);
+    check("the branch list scrolls inside it", () => !!list() && list().scrollHeight > list().clientHeight + 20);
+    body().scrollTop = 0;
+    list().scrollTop = 0;
+    await until(() => body().getAttribute("data-gp-fade") === "y-end" && list().getAttribute("data-gp-fade") === "y-end", "a bottom fade on the body and on the branch list");
+    for (const [name, scroller] of [["body", body()], ["branch list", list()]]) {
+      const band = parseFloat(getComputedStyle(scroller).getPropertyValue("--gp-sidebar-cue-band")) * remPx();
+      // Where the resolved mask stops being fully transparent, in px from the
+      // edge; a transparent stop with no length (the generic fade) clears 0.
+      const clear = parseFloat(/(?:transparent|rgba\(0, ?0, ?0, ?0\))\s+(-?\d+(?:\.\d+)?)px/.exec(maskOf(scroller))?.[1] ?? "0");
+      check(`the ${name}'s fade clears the cue band entirely (${Math.round(clear)} px of ${Math.round(band)} px)`, () => Number.isFinite(clear) && clear >= band - 0.5);
+      // The list yields its chevron to the body's while their edges touch, so a
+      // chevron is judged only where it is drawn.
+      const btn = downCue(scroller);
+      if (btn) {
+        const depth = scroller.getBoundingClientRect().bottom - btn.getBoundingClientRect().top;
+        check(`and the ${name}'s chevron sits wholly inside it (${Math.round(depth)} px)`, () => depth <= clear + 0.5);
+      }
+    }
+    check("at least one bottom chevron is drawn", () => $$('[data-sidebar-panel] button[aria-label="Scroll down"]').length >= 1);
+    list().scrollTop = list().scrollHeight;
+    body().scrollTop = body().scrollHeight;
+    await wait(300);
+    await settle();
+    for (const [name, scroller, clearance] of [["body", body(), 8], ["branch list", list(), 6]]) {
+      check(`at the end of the ${name} the bottom fade and chevron are gone`, () => {
+        const state = { fade: scroller.getAttribute("data-gp-fade"), top: scroller.scrollTop, max: scroller.scrollHeight - scroller.clientHeight, cue: !!downCue(scroller) };
+        if (state.fade?.includes("end") || state.fade === "y-both" || state.cue) throw new Error(JSON.stringify(state));
+        return true;
+      });
+      const edge = scroller.getBoundingClientRect().bottom;
+      const last = scroller === body() ? scroller.lastElementChild.getBoundingClientRect() : scroller.firstElementChild.getBoundingClientRect();
+      check(`and the ${name}'s last row clears the bottom edge (${Math.round(edge - last.bottom)} px)`, () => edge - last.bottom >= clearance);
+    }
+    body().scrollTop = 0;
+    list().scrollTop = 0;
+    await settle();
+    host.setShellSize(1000, 520);
+    await settle();
+
+    // ---- the floating panel off the workspace, light ---------------------------
+    // WCAG relative luminance on the composited sRGB values. The edge is a
+    // separator, so it is held to 3:1 against the workspace it overlaps.
+    {
+      document.documentElement.classList.remove("dark");
+      document.documentElement.classList.add("light");
+      await settle();
+      const lin = (c) => { const v = c / 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+      const lum = (rgb) => 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+      const ratio = (a, b) => { const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x); return (hi + 0.05) / (lo + 0.05); };
+      const bgVar = getComputedStyle(document.documentElement).getPropertyValue("--c-bg").trim().split(/\s+/).map(Number);
+      const workspace = over(parseColor(getComputedStyle(pane()).backgroundColor), bgVar);
+      const cs = getComputedStyle(panel());
+      let fill = over(parseColor(cs.backgroundColor), workspace);
+      const wash = /rgba?\([^)]+\)/.exec(cs.backgroundImage);
+      if (wash) fill = over(parseColor(wash[0]), fill);
+      const edge = over(parseColor(cs.borderTopColor), fill);
+      const m = { workspace: workspace.map(Math.round), fill: fill.map(Math.round), edge: edge.map(Math.round), fillVsWorkspace: Math.round(ratio(fill, workspace) * 100) / 100, edgeVsWorkspace: Math.round(ratio(edge, workspace) * 100) / 100, edgeVsFill: Math.round(ratio(edge, fill) * 100) / 100, levels: Math.round(Math.max(...fill.map((c, i) => Math.abs(c - workspace[i])))), blur: cs.backdropFilter };
+      window.__floatingLight = m;
+      check(`the light floating panel steps off the workspace by ${m.levels} levels (${m.fillVsWorkspace}:1)`, () => m.levels >= 14);
+      check(`its edge is a 3:1 separator against the workspace (${m.edgeVsWorkspace}:1) and the panel (${m.edgeVsFill}:1)`, () => m.edgeVsWorkspace >= 3 && m.edgeVsFill >= 3);
+      check("the floating panel keeps its blur: it is floating chrome", () => m.blur !== "none");
+      document.documentElement.classList.remove("light");
+      document.documentElement.classList.add("dark");
+      await settle();
+    }
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "the panel closes after the scroll-edge checks");
+    panelModes.set("sidebar", "docked");
+    await settle();
 
     check("no runtime errors", () => errors.length === 0);
     document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

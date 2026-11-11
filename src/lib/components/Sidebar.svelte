@@ -512,7 +512,7 @@
 
     <!-- Main Scrollable Section -->
     <div class="relative flex-1 min-h-0 mt-2">
-    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5">
+    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 scroll-py-12 space-y-5">
       <!-- Above the branch list on purpose. This says why everything below it
            may be incomplete, and the branch list has no height cap in this
            scroller — under it, on a repository with many branches, the notice
@@ -734,7 +734,7 @@
           {dirtyCount}
         </button>
         {#if dirtyCount > 0}
-          <AgentCommitMenu compact={true} align="left" />
+          <AgentCommitMenu compact={true} iconOnly={true} align="left" />
         {/if}
         <button
           type="button"

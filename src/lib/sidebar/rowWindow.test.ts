@@ -223,6 +223,33 @@ describe("scrollOffsetToReveal", () => {
     }
   });
 
+  it("keeps the row an inset inside each edge, for a scroller whose edges are covered", () => {
+    const viewport = 160;
+    for (let index = 0; index < rowCount(offsets); index++) {
+      for (const anchor of [0, 17, 60, 140, 222, 400]) {
+        const next = scrollOffsetToReveal(offsets, index, anchor, viewport, 30) ?? anchor;
+        // A row at the very top has nothing above to clear, so its inset is 0.
+        expect(rowTop(offsets, index) - next).toBeGreaterThanOrEqual(Math.min(30, rowTop(offsets, index)));
+        expect(next + viewport - rowBottom(offsets, index)).toBeGreaterThanOrEqual(30);
+      }
+    }
+  });
+
+  it("never asks for a scroll to row 0 when the list is already at the top", () => {
+    expect(scrollOffsetToReveal(offsets, 0, 0, 160, 30)).toBeNull();
+    expect(scrollOffsetToReveal(offsets, 1, 0, 160, 30)).toBeNull();
+  });
+
+  it("caps the inset at a quarter of the viewport, so a short list is still navigable", () => {
+    // 60 px viewport: the inset is 15, not 40. Row 1 spans 30–74.
+    expect(scrollOffsetToReveal(offsets, 1, 0, 60, 40)).toBe(74 - 60 + 15);
+  });
+
+  it("treats a negative or non-finite inset as flush", () => {
+    expect(scrollOffsetToReveal(offsets, 4, 0, 100, -5)).toBe(92);
+    expect(scrollOffsetToReveal(offsets, 4, 0, 100, Number.NaN)).toBe(92);
+  });
+
   it("returns null rather than a number for an out-of-range row or geometry", () => {
     expect(scrollOffsetToReveal(offsets, -1, 0, 100)).toBeNull();
     expect(scrollOffsetToReveal(offsets, 99, 0, 100)).toBeNull();

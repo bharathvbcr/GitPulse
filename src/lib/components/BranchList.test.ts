@@ -133,7 +133,7 @@ describe("BranchList virtual window tail guarantee", () => {
     expect(source).toContain("let rowOffsets = $derived(buildRowOffsets(rowHeights));");
     expect(source).toContain("totalRowHeight(rowOffsets)");
     expect(source).toContain("rowTop(rowOffsets, win.start)");
-    expect(source).toContain("scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight)");
+    expect(source).toContain("scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight, CUE_CLEAR_PX)");
     expect(source).toContain("scrollOffsetToCenter(rowOffsets, idx, viewportHeight)");
     // No surviving uniform-height arithmetic.
     expect(source).not.toMatch(/idx \* [A-Z_]*HEIGHT/);
