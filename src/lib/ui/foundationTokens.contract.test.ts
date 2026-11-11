@@ -259,11 +259,11 @@ describe("nothing the sheet defined before the vocabulary was lost", () => {
     }
   });
 
-  it("keeps the theme triplets and the status ramps ViewGuideArt still reads, with no class-attribute colour remap", () => {
+  it("keeps the theme triplets and no light-only status ramp and no class-attribute colour remap", () => {
     for (const name of ["bg", "surface", "surface-hover", "border", "accent", "text", "text-muted"]) {
       expect(css).toMatch(new RegExp(`--c-${name}:\\s*\\d+ \\d+ \\d+;`));
     }
-    expect((css.match(/--c-status-[a-z]+:/g) ?? []).length).toBe(15);
+    expect(css).not.toMatch(/--c-status-/);
     expect(css).not.toMatch(/\[class~=["']text-/);
   });
 

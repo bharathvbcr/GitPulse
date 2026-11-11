@@ -817,7 +817,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
 
 @utility gp-field {
   /* Rounded input field. */
-  @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
+  @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-faint transition-colors duration-150;
   /* WKWebView ignores `color` on form controls when the page is a transparent
      window (macOSPrivateApi). The fill colour is what actually paints, so a
      missing plate cannot revert typed text and placeholders to black. */
@@ -827,7 +827,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     box-shadow: var(--ring-focus);
   }
   &::placeholder {
-    -webkit-text-fill-color: rgb(var(--c-text-muted) / 0.6);
+    -webkit-text-fill-color: rgb(var(--c-text-faint));
   }
   /* The states a field has, shared with `gp-field-multi`:
        invalid   `data-invalid` (not "false") or `aria-invalid="true"` turns the
@@ -1108,24 +1108,6 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --c-syntax-regex: oklch(0.48 0.14 345);
     --c-syntax-variable: oklch(0.475 0.15 280);
     --c-syntax-punctuation: oklch(0.45 0.03 265);
-
-    /* Light-theme semantic colors are deliberately darker than Tailwind's
-     dark-surface ramps so status text remains legible on every light card. */
-    --c-status-amber: 146 64 14;
-    --c-status-emerald: 6 95 70;
-    --c-status-rose: 159 18 57;
-    --c-status-red: 153 27 27;
-    --c-status-sky: 7 89 133;
-    --c-status-cyan: 21 94 117;
-    --c-status-purple: 107 33 168;
-    --c-status-green: 22 101 52;
-    --c-status-orange: 154 52 18;
-    --c-status-teal: 17 94 89;
-    --c-status-indigo: 55 48 163;
-    --c-status-blue: 29 78 216;
-    --c-status-yellow: 133 77 14;
-    --c-status-zinc: 82 82 91;
-    --c-status-slate: 71 85 105;
 
     --shadow-card:
       inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),

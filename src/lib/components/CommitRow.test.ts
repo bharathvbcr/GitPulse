@@ -225,6 +225,15 @@ describe("CommitRow copy SHA control keyboard access", () => {
     expect(button).toContain('title="Click to copy full SHA ({row.id})"');
   });
 
+  it("answers hover and keyboard focus with an underline, never with translucent text", () => {
+    const { body } = render(CommitRow, { props: { row } });
+    const button = body.slice(body.indexOf("<button"), body.indexOf("</button>"));
+    expect(button).toContain("hover:underline");
+    expect(button).toContain("focus-visible:underline");
+    expect(button).toMatch(/class="[^"]*\btext-accent\b/);
+    expect(button).not.toMatch(/text-accent\/\d/);
+  });
+
   it("renders the accessible name on the SHA button", () => {
     const { body } = render(CommitRow, { props: { row } });
     expect(body).toContain(`aria-label="Copy full SHA ${row.id}"`);

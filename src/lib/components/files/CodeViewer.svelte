@@ -638,7 +638,7 @@
               }
             }}
             placeholder="Find in file…"
-            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
+            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden"
           />
           {#if searchQuery}
             <span class="text-micro font-mono text-textMuted shrink-0">

@@ -1220,7 +1220,7 @@
         bind:value={query}
         oninput={(e) => applyFilter(e.currentTarget.value)}
         placeholder="Filter branches…"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
+        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden"
       />
       {#if query}
         <button

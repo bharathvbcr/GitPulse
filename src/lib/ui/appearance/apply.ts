@@ -32,6 +32,7 @@ import {
 import {
   SHIPPED_BASE_HEX,
   SHIPPED_CONTRAST,
+  SYNTAX_KEYS,
   TOKEN_KEYS,
   deriveTokens,
   type Appearance,
@@ -306,6 +307,7 @@ export interface AppearanceContext {
 /** Every inline property this module may set, so a plan can clear what it no longer sets. */
 export const MANAGED_VARS: readonly string[] = [
   ...TOKEN_KEYS.filter((key) => key !== "--c-accent"),
+  ...SYNTAX_KEYS,
   "--gp-font-ui",
   "--gp-font-mono",
   "--gp-radius-scale",
@@ -372,6 +374,8 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
         if (key === "--c-accent") accentOverride = result.tokens[key];
         else vars[key] = result.tokens[key];
       }
+      // The code colours follow the palette: guarded against its own code background.
+      for (const key of SYNTAX_KEYS) vars[key] = result.syntax[key];
       const entry = accentEntry(result.report);
       if (entry?.adjusted) {
         notes.push({

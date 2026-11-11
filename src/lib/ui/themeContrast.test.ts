@@ -48,24 +48,8 @@ describe("light-theme contrast contract", () => {
     expect(contrast(rendered, lightHover)).toBeGreaterThanOrEqual(3);
   });
 
-  it.each([
-    "amber",
-    "emerald",
-    "rose",
-    "red",
-    "sky",
-    "cyan",
-    "purple",
-    "green",
-    "orange",
-    "teal",
-    "indigo",
-    "blue",
-    "yellow",
-    "zinc",
-    "slate",
-  ])("keeps %s status text above WCAG AA", (name) => {
-    expect(contrast(rgbVariable(`c-status-${name}`), lightHover)).toBeGreaterThanOrEqual(4.5);
+  it("has no light-only status ramp: status colour is the --c-ok/warn/danger/info roles, measured in both themes below", () => {
+    expect(css).not.toMatch(/--c-status-/);
   });
 
   it("has no class-attribute remap of text colour, so a theme is only ever the tokens", () => {
@@ -83,7 +67,7 @@ describe("light-theme contrast contract", () => {
         if (entry.isDirectory()) walk(child);
         else if (/\.(svelte|ts)$/.test(entry.name) && !/\.test\.ts$/.test(entry.name)) {
           const text = readFileSync(child, "utf8");
-          const hit = text.match(/(?<![\w:\-/[])text-(?:textMuted\/(?:40|50|60|70|80)|accent\/(?:60|70|80))(?![\w/])/);
+          const hit = text.match(/(?<![\w\-/[])(?:placeholder:)?text-(?:textMuted\/(?:40|50|60|70|80)|accent\/(?:60|70|80))(?![\w/])/);
           if (hit) offenders.push(`${entry.name}: ${hit[0]}`);
         }
       }
