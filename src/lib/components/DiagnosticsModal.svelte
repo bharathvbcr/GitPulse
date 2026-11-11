@@ -424,14 +424,14 @@
                   ? 'text-danger'
                   : 'text-warn'}"
               >{entry.severity}</span>
-              <span class="px-1.5 py-px rounded-md bg-surfaceHover text-micro text-textMuted font-mono">{entry.source}</span>
+              <span class="px-1.5 py-px rounded-sm bg-surfaceHover text-micro text-textMuted font-mono">{entry.source}</span>
               <!-- Only entries that did not come from the running build are
                    marked, so the badge means something when it appears: the
                    ring is persisted, so a log can outlive the build that
                    wrote it and describe a bug that is already fixed. -->
               {#if staleBuildNote(entry.version, APP_VERSION)}
                 <span
-                  class="px-1.5 py-px rounded-md bg-warn/15 text-micro text-warn/90 font-mono shrink-0"
+                  class="px-1.5 py-px rounded-sm bg-warn/15 text-micro text-warn/90 font-mono shrink-0"
                   title="Recorded by {entry.version ?? 'an earlier build'}; this app is running {APP_VERSION}."
                 >{entry.version ?? "older build"}</span>
               {/if}

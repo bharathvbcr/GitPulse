@@ -146,6 +146,21 @@
   --shadow-pop: var(--shadow-pop);
   --shadow-float: var(--shadow-float);
   --shadow-glow: var(--shadow-glow);
+
+  /* Tailwind's corner utilities ride the --gp-r-* ladder (§5), so `rounded-*`
+     follows Appearance → Corner style exactly as the gp-* primitives do.
+     Before this, `rounded-xl` and friends kept Tailwind's own rem values and
+     ignored the setting (and `rounded-md` sat at 6px, off the ladder).
+     Inline: the utilities read the token where they are used. `full` is a
+     static value of the utility, never scaled. */
+  --radius: var(--gp-r-xs);
+  --radius-xs: calc(var(--gp-r-xs) / 2);
+  --radius-sm: var(--gp-r-xs);
+  --radius-md: var(--gp-r-sm);
+  --radius-lg: var(--gp-r-sm);
+  --radius-xl: var(--gp-r-md);
+  --radius-2xl: var(--gp-r-lg);
+  --radius-3xl: var(--gp-r-xl);
 }
 
 /*
@@ -938,7 +953,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
 
 @utility gp-keycap {
   /* Keycap hint. */
-  @apply inline-flex items-center rounded-md border border-edge bg-surface px-1.5 py-0.5 font-mono text-micro leading-none text-textMuted;
+  @apply inline-flex items-center rounded-sm border border-edge bg-surface px-1.5 py-0.5 font-mono text-micro leading-none text-textMuted;
   box-shadow: 0 1.5px 0 rgb(var(--c-border));
 }
 
