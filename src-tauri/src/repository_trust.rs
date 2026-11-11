@@ -188,6 +188,18 @@ fn sessions() -> &'static Mutex<HashMap<PathBuf, Grant>> {
     GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Drops session grants whose repository directory no longer exists.
+///
+/// Run only when the table is full, so a long session that opened and then
+/// deleted many repositories (or a test process creating thousands of
+/// fixtures) is not refused for grants that can never match again: a grant
+/// is checked against the directory's identity, and a directory recreated at
+/// the same path has a new one. Removing these narrows trust and never widens
+/// it. A path whose existence cannot be determined is kept.
+fn prune_dead_session_grants(grants: &mut HashMap<PathBuf, Grant>) {
+    grants.retain(|path, _| path.try_exists().unwrap_or(true));
+}
+
 fn directory(path: &Path) -> Result<DirectoryIdentity, CommandError> {
     let path = path
         .canonicalize()
@@ -954,12 +966,26 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
         let mut grants = sessions()
             .lock()
             .map_err(|_| "Repository trust state is unavailable")?;
-        if grants.len() >= MAX_SESSION_GRANTS && !grants.contains_key(&granted.repository.path) {
+        admit_session_grant(&mut grants, granted)
+    }
+}
+
+/// Records a session grant, within [`MAX_SESSION_GRANTS`].
+///
+/// A full table first sheds grants for directories that no longer exist
+/// ([`prune_dead_session_grants`]); only a table full of live grants refuses.
+fn admit_session_grant(
+    grants: &mut HashMap<PathBuf, Grant>,
+    granted: Grant,
+) -> Result<(), CommandError> {
+    if grants.len() >= MAX_SESSION_GRANTS && !grants.contains_key(&granted.repository.path) {
+        prune_dead_session_grants(grants);
+        if grants.len() >= MAX_SESSION_GRANTS {
             return Err("Too many session repository grants".into());
         }
-        grants.insert(granted.repository.path.clone(), granted);
-        Ok(())
     }
+    grants.insert(granted.repository.path.clone(), granted);
+    Ok(())
 }
 
 /// [`grant`] with `remember`, for a request that came from the webview.
@@ -1425,6 +1451,67 @@ fn admit_directory(
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+
+    /// A grant for `path`'s real identity, under `path` as its key.
+    fn grant_at(identity: &DirectoryIdentity, path: PathBuf) -> Grant {
+        let mut repository = identity.clone();
+        repository.path = path;
+        Grant {
+            version: GRANT_VERSION,
+            repository: repository.clone(),
+            approved: repository,
+        }
+    }
+
+    /// A full session table that holds grants for deleted directories (a test
+    /// process creating thousands of fixtures, or a long session) admits a
+    /// new grant by shedding those, instead of refusing every later approval.
+    #[test]
+    fn a_full_session_table_sheds_grants_for_deleted_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("live");
+        fs::create_dir(&live).unwrap();
+        let identity = directory(&live).unwrap();
+        let mut grants: HashMap<PathBuf, Grant> = (0..MAX_SESSION_GRANTS)
+            .map(|i| {
+                let gone = root.path().join(format!("deleted-{i}"));
+                (gone.clone(), grant_at(&identity, gone))
+            })
+            .collect();
+
+        admit_session_grant(&mut grants, grant_at(&identity, identity.path.clone()))
+            .expect("grants for deleted directories must not fill the table");
+        assert_eq!(grants.len(), 1, "every dead grant was shed");
+        assert!(grants.contains_key(&identity.path));
+    }
+
+    /// The bound still holds: a table full of grants for directories that
+    /// exist refuses a new one and keeps every grant it has.
+    #[test]
+    fn a_full_session_table_of_live_grants_still_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = directory(root.path()).unwrap();
+        let mut grants: HashMap<PathBuf, Grant> = (0..MAX_SESSION_GRANTS)
+            .map(|i| {
+                let dir = root.path().join(format!("live-{i}"));
+                fs::create_dir(&dir).unwrap();
+                (dir.clone(), grant_at(&identity, dir))
+            })
+            .collect();
+        let newcomer = root.path().join("newcomer");
+        fs::create_dir(&newcomer).unwrap();
+
+        let error = admit_session_grant(&mut grants, grant_at(&identity, newcomer.clone()))
+            .expect_err("a table of live grants stays bounded");
+        assert!(
+            error
+                .message()
+                .contains("Too many session repository grants"),
+            "{error:?}"
+        );
+        assert_eq!(grants.len(), MAX_SESSION_GRANTS);
+        assert!(!grants.contains_key(&newcomer));
+    }
 
     #[cfg(windows)]
     #[test]
