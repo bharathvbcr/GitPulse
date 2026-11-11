@@ -209,7 +209,9 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  check("and resets with --keep to the previewed commit",()=>{const a=callsOf("cmd_reset").at(-1).args;return a.mode==="keep"&&a.target===hex(2);});
  branchButton().click();
  await until(()=>get(promptState),"branch prompt");
- check("branch-here asks for a name at the entry",()=>get(promptState).options.message.includes("(HEAD@{2})"));
+ // The reset just moved HEAD, so every reflog selector shifted: the prompt
+ // names the commit, and not HEAD@{2}, which now means a different entry.
+ check("branch-here after a reset names the commit, not the stale selector",()=>{const m=get(promptState).options.message;return m.includes(hex(2).slice(0,8))&&!m.includes("HEAD@{2}");});
  completePrompt("recovered/parser");
  await until(()=>callsOf("cmd_create_branch").length>0,"branch created");
  check("and creates it at that commit",()=>{const a=callsOf("cmd_create_branch").at(-1).args;return JSON.stringify(a).includes("recovered/parser")&&JSON.stringify(a).includes(hex(2));});
