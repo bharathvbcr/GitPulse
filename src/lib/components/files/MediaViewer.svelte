@@ -21,11 +21,14 @@
   let {
     filePath,
     blob,
+    repoPath = null,
     draftContent = null,
     dirty = false,
     onSave,
     onDraftChange,
     onRequestDiscard,
+    revealTarget = null,
+    onSendSelectionToAgent,
   }: {
     filePath: string;
     blob: {
@@ -39,12 +42,17 @@
       disk_base?: string | null;
       eol?: LineEnding | null;
     };
+    repoPath?: string | null;
     draftContent?: string | null;
     dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
+    revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
+    onSendSelectionToAgent?: (reference: string) => void;
   } = $props();
+
+  const effectiveRepoPath = $derived(repoPath ?? $repoStore.currentPath);
 
   // Image viewer state
   let imageZoom = $state(100);
@@ -83,7 +91,7 @@
   });
 
   function openMediaInDefaultApp() {
-    const repo = $repoStore.currentPath;
+    const repo = effectiveRepoPath;
     if (!repo) return;
     void openInDefaultApp(repo, filePath).catch((err) =>
       repoStore.setError(formatError(err)),
@@ -168,7 +176,18 @@
   <LazyMount
     load={loadMarkDevViewer}
     name="The Markdown reader"
-    props={{ filePath, blob, draftContent, dirty, onSave, onDraftChange, onRequestDiscard }}
+    props={{
+      filePath,
+      blob,
+      repoPathOverride: effectiveRepoPath,
+      draftContent,
+      dirty,
+      onSave,
+      onDraftChange,
+      onRequestDiscard,
+      revealTarget,
+      onSendSelectionToAgent,
+    }}
   />
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->
@@ -229,5 +248,7 @@
     {onSave}
     {onDraftChange}
     {onRequestDiscard}
+    {revealTarget}
+    {onSendSelectionToAgent}
   />
 {/if}

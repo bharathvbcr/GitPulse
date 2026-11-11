@@ -18,6 +18,7 @@
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
+  import { requestReveal } from "../files/revealRequests";
   import { observeResize } from "../dom/observeResize";
 
   /**
@@ -105,6 +106,12 @@
    */
   function goToSession(session: TerminalSessionRecord) {
     return focusTerminalSession(session);
+  }
+
+  function openInCodeView(path: string, line: number | null) {
+    requestReveal(path, line, null);
+    repoStore.selectFilePath(path);
+    repoStore.setActiveTab("code");
   }
 
   let host: HTMLDivElement | undefined = $state();
@@ -268,10 +275,12 @@
             props={{
               repoPath: tab.path,
               visible: open && tab.id === $repoStore.activeTabId,
+              dockDragging: dragging,
               onClose,
               expanded,
               onToggleExpanded: () => (expanded = !expanded),
               onGoToSession: goToSession,
+              onOpenInCodeView: openInCodeView,
               checkouts: $repoStore.openTabs,
             }}
           />

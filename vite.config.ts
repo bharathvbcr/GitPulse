@@ -60,6 +60,7 @@ const MAX_PRODUCTION_CHUNK_BYTES = 640_000;
 export function gitpulseManualChunk(id: string): string | undefined {
   const normalized = id.replaceAll("\\", "/");
   if (!normalized.includes("/node_modules/")) return undefined;
+  if (normalized.includes("/node_modules/@xterm/addon-")) return "vendor-xterm-addons";
   if (normalized.includes("/node_modules/@xterm/")) return "vendor-xterm";
   if (normalized.includes("/node_modules/@lucide/svelte/")) return undefined;
   if (normalized.includes("/node_modules/svelte/")) return "vendor-svelte";

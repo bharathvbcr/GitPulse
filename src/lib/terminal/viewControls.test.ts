@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentPromptKeymap,
   clampTerminalFontSize,
   clampTerminalScrollback,
+  commandJumpChord,
   hasRenderedBox,
   macLineEditing,
   macOptionOptions,
@@ -153,5 +155,24 @@ describe("terminal view controls", () => {
     expect(terminalTabDestination(state, "ArrowLeft")).toBe(state.tabs[0].id);
     expect(terminalTabDestination(state, "Enter")).toBeNull();
     expect(terminalTabDestination({ tabs: [], activeId: null }, "Home")).toBeNull();
+  });
+
+  it("maps Shift+Enter to ESC CR for multi-line agent prompts without touching plain Enter or vim", () => {
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true }), "claude", false)).toBe("\x1b\r");
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true }), "agy", true)).toBe("\x1b\r");
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true }), "shell", false)).toBe("\x1b\r");
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true }), "shell", true)).toBeNull();
+    expect(agentPromptKeymap(key("Enter"), "claude", false)).toBeNull();
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true, metaKey: true }), "claude", false)).toBeNull();
+    expect(agentPromptKeymap(key("Enter", { shiftKey: true, isComposing: true }), "claude", false)).toBeNull();
+  });
+
+  it("maps ⌘↑/⌘↓ on macOS and Ctrl+Shift+↑/↓ elsewhere to OSC 133 command jump on the normal buffer", () => {
+    expect(commandJumpChord(key("ArrowUp", { metaKey: true }), "macos", false)).toBe("prev");
+    expect(commandJumpChord(key("ArrowDown", { metaKey: true }), "macos", false)).toBe("next");
+    expect(commandJumpChord(key("ArrowUp", { metaKey: true }), "macos", true)).toBeNull();
+    expect(commandJumpChord(key("ArrowUp", { ctrlKey: true, shiftKey: true }), "macos", false)).toBeNull();
+    expect(commandJumpChord(key("ArrowUp", { ctrlKey: true, shiftKey: true }), "linux", false)).toBe("prev");
+    expect(commandJumpChord(key("ArrowDown", { ctrlKey: true, shiftKey: true }), "windows", false)).toBe("next");
   });
 });

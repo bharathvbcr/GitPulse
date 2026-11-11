@@ -17,6 +17,7 @@ pub mod terminate;
 mod tray;
 #[cfg(target_os = "macos")]
 pub mod webcrash;
+pub mod webview_perf;
 
 pub use state::MenuState;
 pub use tray::build_tray_menu;
@@ -446,7 +447,8 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         // it never reaches the sink, and there is nothing here for the window.
         instance::Request::GateCommand { .. }
         | instance::Request::CollisionScan { .. }
-        | instance::Request::InsightsRead { .. } => {}
+        | instance::Request::InsightsRead { .. }
+        | instance::Request::TerminalOrchestrate { .. } => {}
         // An agent's `gitpulse_browser_open`. The window opens the repository
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.
@@ -457,6 +459,42 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
             let request = crate::browser::BrowseRequest { repo, url };
             if let Err(error) = handle.emit(crate::browser::BROWSE_EVENT, request) {
                 log::warn!(target: "browser", "A browser session request was not delivered to the window: {error}");
+            }
+        }
+        instance::Request::AgentSessionMeta {
+            terminal_id,
+            agent,
+            conversation_id,
+            artifact_dir,
+        } => {
+            let sessions = handle.state::<crate::terminal::TerminalSessions>();
+            if crate::terminal::host::client::registry_holds(&sessions, &terminal_id) != Some(true)
+            {
+                log::debug!(
+                    target: "terminal",
+                    "ignoring agent session metadata for unknown terminal {terminal_id}"
+                );
+                return;
+            }
+            sessions.record_agent_meta(
+                &terminal_id,
+                crate::terminal::AgentSessionMeta {
+                    agent: agent.clone(),
+                    conversation_id: conversation_id.clone(),
+                    artifact_dir: artifact_dir.clone(),
+                },
+            );
+            let payload = crate::terminal::TerminalAgentMetaPayload {
+                id: terminal_id,
+                agent,
+                conversation_id,
+                artifact_dir,
+            };
+            if let Err(error) = handle.emit(crate::terminal::AGENT_META_EVENT, payload) {
+                log::warn!(
+                    target: "terminal",
+                    "could not emit terminal-agent-meta event: {error}"
+                );
             }
         }
         instance::Request::Notification { id, snooze } => {

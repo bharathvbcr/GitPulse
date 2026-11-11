@@ -783,9 +783,13 @@ mod tests {
             parsed["tools"].as_array().unwrap().len(),
             super::super::tools().len()
         );
-        // The task-board tools write the task profile and the policy-gated
+        // The task-board tools write the task profile, the policy-gated
         // `gitpulse_worktree_*` tools mutate worktrees/branches under
-        // `harness::guard_command`; the manifest names both honestly.
+        // `harness::guard_command`, and the desktop mailbox tools
+        // (`gitpulse_browser_open`, `gitpulse_terminal_spawn`,
+        // `gitpulse_terminal_open_file`, `gitpulse_terminal_send`) act on the
+        // running app under repository trust and Option A session lineage;
+        // the manifest names all of them honestly.
         assert_eq!(parsed["readOnly"], false);
         assert_eq!(parsed["gitWrites"], true);
         assert_eq!(
@@ -805,6 +809,9 @@ mod tests {
                 "gitpulse_worktree_release",
                 "gitpulse_worktree_send_message",
                 "gitpulse_browser_open",
+                "gitpulse_terminal_spawn",
+                "gitpulse_terminal_open_file",
+                "gitpulse_terminal_send",
                 "gitpulse_inbox_post",
                 "gitpulse_inbox_withdraw",
                 "gitpulse_kickoff_agent",

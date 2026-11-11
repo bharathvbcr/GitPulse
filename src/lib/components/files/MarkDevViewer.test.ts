@@ -75,11 +75,11 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("renderError = formatError(err);");
   });
 
-  it("re-renders and refetches backlinks only when the note itself changes", () => {
+  it("re-renders and refetches backlinks only when the note itself changes, honouring repoPathOverride", () => {
     // repoStore publishes a fresh object per keystroke and per status poll.
     // `note` and the backlinks effect read a strictly-equal derived of the
     // repository path, so an unrelated publish rebuilds neither.
-    expect(source).toContain("const repoPath = $derived($currentRepoPath);");
+    expect(source).toContain("const repoPath = $derived(repoPathOverride ?? $currentRepoPath);");
     const noteAt = source.indexOf("let note = $derived");
     expect(noteAt).toBeGreaterThan(-1);
     expect(source.slice(noteAt, source.indexOf(");", noteAt))).not.toContain("$repoStore");
@@ -88,6 +88,14 @@ describe("MarkDevViewer", () => {
     const effect = source.slice(source.lastIndexOf("$effect(() => {", backlinksAt), backlinksAt);
     expect(effect).toContain("const repo = repoPath;");
     expect(effect).not.toContain("$repoStore");
+  });
+
+  it("switches rendered Markdown to raw when a split revealTarget names a line and forwards revealTarget + onSendSelectionToAgent to CodeViewer", () => {
+    expect(source).toContain("revealTarget = null");
+    expect(source).toContain("onSendSelectionToAgent");
+    expect(source).toContain("revealTarget?.line !== null");
+    expect(source.match(/\{revealTarget\}/g)?.length).toBe(2);
+    expect(source.match(/\{onSendSelectionToAgent\}/g)?.length).toBe(2);
   });
 
   it("scrolls the rendered page inside the pane", () => {

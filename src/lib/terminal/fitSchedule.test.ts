@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createFitScheduler, FIT_MIN_INTERVAL_MS } from "./fitSchedule";
+import { createFitScheduler, FIT_DRAG_SETTLE_MS, FIT_MIN_INTERVAL_MS } from "./fitSchedule";
 
 /** A clock, timers and animation frames that only move when the test says so. */
 function rig(minIntervalMs?: number) {
@@ -140,5 +140,45 @@ describe("fit scheduler: teardown", () => {
     r.advance(1000);
     r.paint();
     expect(r.runs()).toBe(1);
+  });
+});
+
+describe("fit scheduler: active drag hysteresis", () => {
+  it("debounces SIGWINCH resize storms while dragging and settles on the next frame when the drag ends", () => {
+    const r = rig();
+    r.scheduler.setDragging(true);
+    // 20 rapid pointermove layout observations spaced 16 ms apart (320 ms total):
+    // trailing debounce resets on each move so zero fits happen while moving!
+    for (let i = 0; i < 20; i++) {
+      r.scheduler.request();
+      r.advance(16);
+    }
+    expect(r.runs()).toBe(0);
+    expect(r.pendingTimers()).toBe(1);
+
+    // Pausing pointer movement for FIT_DRAG_SETTLE_MS mid-drag fits once so a user
+    // holding still can inspect layout without releasing the sash.
+    r.advance(FIT_DRAG_SETTLE_MS);
+    expect(r.runs()).toBe(1);
+
+    // Resuming motion holds off again until release, then setDragging(false) settles on rAF.
+    r.scheduler.request();
+    r.advance(20);
+    r.scheduler.request();
+    expect(r.runs()).toBe(1);
+
+    r.scheduler.setDragging(false);
+    expect(r.pendingTimers()).toBe(0);
+    expect(r.pendingFrames()).toBe(1);
+    r.paint();
+    expect(r.runs()).toBe(2);
+  });
+
+  it("setDragging(false) when no request arrived during the drag does not schedule an unnecessary fit", () => {
+    const r = rig();
+    r.scheduler.setDragging(true);
+    r.scheduler.setDragging(false);
+    expect(r.pendingFrames()).toBe(0);
+    expect(r.runs()).toBe(0);
   });
 });

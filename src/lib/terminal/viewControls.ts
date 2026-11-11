@@ -1,4 +1,6 @@
 import { isImeComposition } from "../keyboard/imeGuard";
+import { isPromptLauncher } from "./launchRequests";
+import type { LauncherKind } from "./tabs";
 
 export const TERMINAL_FONT_MIN = 10;
 export const TERMINAL_FONT_MAX = 24;
@@ -137,6 +139,64 @@ export function macLineEditing(
     if (event.key === "ArrowLeft") return "\x1bb";
     if (event.key === "ArrowRight") return "\x1bf";
   }
+  return null;
+}
+
+/**
+ * Multi-line prompt newline (`Shift+Enter` -> `ESC CR`, matching Claude Code's
+ * `/terminal-setup` binding) for coding agent TUIs (`claude`, `agy`, `codex`,
+ * `grok`) and normal-screen interactive shells. Full-screen alternate-buffer
+ * programs inside a plain shell (`vim`, `less`, `htop`) receive raw keys.
+ */
+export function agentPromptKeymap(
+  event: {
+    key: string;
+    metaKey: boolean;
+    ctrlKey: boolean;
+    altKey: boolean;
+    shiftKey: boolean;
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  launcher: LauncherKind,
+  alternateScreen: boolean,
+): string | null {
+  if (isImeComposition(event)) return null;
+  if (event.metaKey || event.ctrlKey || event.altKey) return null;
+  if (event.shiftKey && event.key === "Enter") {
+    if (isPromptLauncher(launcher) || (launcher === "shell" && !alternateScreen)) {
+      return "\x1b\r";
+    }
+  }
+  return null;
+}
+
+export type CommandJumpDirection = "prev" | "next";
+
+/**
+ * Semantic prompt-to-prompt jump (`⌘↑` / `⌘↓` on macOS, `Ctrl+Shift+↑` / `↓`
+ * elsewhere) over OSC 133 command blocks on the normal buffer. Full-screen
+ * alternate-buffer programs (`vim`, `less`, `htop`) receive raw keys.
+ */
+export function commandJumpChord(
+  event: {
+    key: string;
+    metaKey: boolean;
+    ctrlKey: boolean;
+    altKey: boolean;
+    shiftKey: boolean;
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  os: string | undefined,
+  alternateScreen: boolean,
+): CommandJumpDirection | null {
+  if (alternateScreen || isImeComposition(event) || event.altKey) return null;
+  const macJump = os === "macos" && event.metaKey && !event.ctrlKey && !event.shiftKey;
+  const nonMacJump = os !== "macos" && event.ctrlKey && event.shiftKey && !event.metaKey;
+  if (!macJump && !nonMacJump) return null;
+  if (event.key === "ArrowUp") return "prev";
+  if (event.key === "ArrowDown") return "next";
   return null;
 }
 

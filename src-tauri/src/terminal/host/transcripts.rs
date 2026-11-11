@@ -254,6 +254,8 @@ struct Inner {
     /// Why a session's recording stopped, for the sessions it has. The same
     /// reason is written to the session's `.log.err` for a later host.
     failures: Mutex<HashMap<String, String>>,
+    /// Monotonic content bytes written per session stem during this host's life.
+    written: Mutex<HashMap<String, u64>>,
     /// A session whose next data write panics, for the test of what that costs.
     #[cfg(test)]
     panic_on: Mutex<Option<String>>,
@@ -309,6 +311,7 @@ impl Transcripts {
             settled: Condvar::new(),
             files: Mutex::default(),
             failures: Mutex::default(),
+            written: Mutex::default(),
             #[cfg(test)]
             panic_on: Mutex::default(),
             #[cfg(test)]
@@ -602,6 +605,7 @@ impl Inner {
             Op::Open(session, run_id) => {
                 lock(&self.failures).remove(&session);
                 let kept = self.retire_previous(&session, run_id.as_deref());
+                lock(&self.written).insert(session.clone(), 0);
                 let log = self.create(&session);
                 let made = log.is_ok();
                 self.install(&session, log);
@@ -859,6 +863,10 @@ impl Inner {
                 }
             }
         }
+        let mut written = lock(&self.written);
+        if let Some(bytes) = written.remove(session) {
+            written.insert(stem, bytes);
+        }
         Ok(())
     }
 
@@ -874,6 +882,7 @@ impl Inner {
     }
 
     fn remove_files(&self, session: &str) {
+        lock(&self.written).remove(session);
         for path in self.files_of(session) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -890,6 +899,7 @@ impl Inner {
             return;
         }
         let mut rotated = false;
+        let mut appended = 0u64;
         {
             let mut files = lock(&self.files);
             if !files.contains_key(session) {
@@ -914,6 +924,11 @@ impl Inner {
                         Ok(()) => rotated = true,
                         Err(error) => {
                             drop(files);
+                            if appended > 0 {
+                                let mut w = lock(&self.written);
+                                let entry = w.entry(session.to_owned()).or_insert(0);
+                                *entry = entry.saturating_add(appended);
+                            }
                             self.fail(session, error);
                             return;
                         }
@@ -924,13 +939,24 @@ impl Inner {
                 if let Err(error) = log.file.write_all(&bytes[..take]) {
                     let path = self.path(session);
                     drop(files);
+                    if appended > 0 {
+                        let mut w = lock(&self.written);
+                        let entry = w.entry(session.to_owned()).or_insert(0);
+                        *entry = entry.saturating_add(appended);
+                    }
                     self.fail(session, format!("{}: {error}", path.display()));
                     return;
                 }
                 log.len += take as u64;
                 log.dirty = true;
+                appended = appended.saturating_add(take as u64);
                 bytes = &bytes[take..];
             }
+        }
+        if appended > 0 {
+            let mut w = lock(&self.written);
+            let entry = w.entry(session.to_owned()).or_insert(0);
+            *entry = entry.saturating_add(appended);
         }
         if rotated {
             self.enforce();
@@ -1241,10 +1267,16 @@ impl Inner {
         // unknown, which is not the same as nothing missing.
         let recording_error =
             failure.or_else(|| (!live && !raw.ended).then(|| UNCLOSED.to_owned()));
+        let total_bytes = lock(&self.written)
+            .get(session)
+            .copied()
+            .unwrap_or(raw.retained)
+            .max(raw.retained);
         TranscriptRead::Found(TranscriptTail {
             data_b64: BASE64.encode(&bytes),
             bytes: bytes.len(),
             retained: raw.retained,
+            total_bytes,
             truncated: raw.rotated || clipped,
             rotated: raw.rotated,
             clipped,

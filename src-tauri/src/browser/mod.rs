@@ -61,7 +61,8 @@ mod pane;
 
 #[cfg(target_os = "macos")]
 pub use pane::{
-    close, close_all, is_open, open, open_count, set_bounds, set_visible, with_webview, EventSink,
+    close, close_all, is_open, open, open_count, set_bounds, set_visible, snapshot_png,
+    with_webview, EventSink,
 };
 
 use serde::{Deserialize, Serialize};

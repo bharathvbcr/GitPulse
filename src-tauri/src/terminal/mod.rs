@@ -24,9 +24,12 @@ mod input;
 mod ipc;
 #[cfg(unix)]
 mod jobs;
+pub mod orchestrate;
 #[cfg(unix)]
 mod readiness;
 mod ring;
+pub mod scratch_media;
+pub mod shell_integration;
 mod sink;
 mod transcript;
 pub use events::{AppEvents, SessionEnded, SessionEvents};
@@ -40,7 +43,7 @@ pub use sink::{OutputChannel, OutputSink, END_OF_OUTPUT};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,6 +80,10 @@ pub const DEFAULT_PTY_SESSIONS: usize = 32;
 /// this, so 128 + 256 + 128 at the very worst.
 pub const MAX_PTY_SESSIONS: usize = 128;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+/// Canonical terminal session identifier alias exported alongside
+/// `GITPULSE_SESSION_ID` (`crate::alerts::bridge::SESSION_ENV`) so agent skills
+/// and hooks can read either name without ambiguity.
+pub const TERMINAL_SESSION_ENV: &str = "GITPULSE_TERMINAL_SESSION";
 /// Writes that may wait behind the one being delivered to a session. The
 /// frontend sends one at a time and waits for each, so this is headroom for a
 /// burst of IPC calls, not a working depth; past it a write is refused at once.
@@ -306,6 +313,80 @@ pub(crate) trait SessionObserver: Send + Sync {
     fn finished(&self, payload: &TerminalExitPayload);
 }
 
+pub const AGENT_META_EVENT: &str = "terminal-agent-meta";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionMeta {
+    pub agent: String,
+    pub conversation_id: String,
+    pub artifact_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalAgentMetaPayload {
+    pub id: String,
+    pub agent: String,
+    pub conversation_id: String,
+    pub artifact_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentArtifactRead {
+    pub title: String,
+    pub absolute_path: String,
+    pub repo_relative_path: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTelemetry {
+    pub cwd: Option<String>,
+    pub last_exit_code: Option<i32>,
+    pub command_running: bool,
+    pub command_seq: u64,
+    #[serde(default)]
+    pub event_seq: u64,
+    #[serde(default)]
+    pub last_command_event_seq: u64,
+    #[serde(default)]
+    pub last_herdr_event_seq: u64,
+    #[serde(default)]
+    pub last_dev_event_seq: u64,
+    pub herdr_status: Option<crate::alerts::scan::HerdrStatus>,
+    pub dev_server_url: Option<String>,
+    pub ended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSessionMeta {
+    pub session_id: String,
+    pub repo: String,
+    pub cwd: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub launcher: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_hash_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_launcher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_meta: Option<AgentSessionMeta>,
+    pub telemetry: SessionTelemetry,
+}
+
+pub type SharedSessionTelemetry = Arc<(Mutex<SessionTelemetry>, std::sync::Condvar)>;
+
+pub fn new_shared_telemetry() -> SharedSessionTelemetry {
+    Arc::new((
+        Mutex::new(SessionTelemetry::default()),
+        std::sync::Condvar::new(),
+    ))
+}
+
 struct SessionEntry {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -341,6 +422,15 @@ struct SessionEntry {
     /// a view taking the session over holds it across its replay, so the two
     /// never interleave.
     ring: Arc<Mutex<ring::Ring>>,
+    /// Structured OSC 7 / 133 / 7501 and loopback readiness telemetry observed
+    /// by `SessionWatcher`, plus a condition variable woken on transitions.
+    telemetry: SharedSessionTelemetry,
+    rows: Arc<AtomicU16>,
+    cols: Arc<AtomicU16>,
+    parent_session_id: Option<String>,
+    child_launcher: Option<String>,
+    child_title: Option<String>,
+    token_hash_hex: Option<String>,
 }
 
 /// Which backend holds the terminals, as Settings and the quit dialog read it.
@@ -370,7 +460,7 @@ pub struct TerminalSessions {
     /// sheds (`DEFAULT_OUTPUT_STALL`). Live, so a test can shorten it.
     output_stall_ms: Arc<AtomicU64>,
     /// Mass external-signal deaths, recorded once each (see [`incident`]).
-    incidents: Arc<incident::Recorder>,
+    pub(crate) incidents: Arc<incident::Recorder>,
     /// The slower commands that are not per keystroke, off the pool every git
     /// command shares (see `executor`). As wide as the session cap, so closing
     /// every tab at once still closes them side by side, as it did.
@@ -387,6 +477,12 @@ pub struct TerminalSessions {
     /// Copies of a starting session's output that the terminal host armed
     /// (`host::transcripts`). Always empty in the app's own engine.
     ring_taps: Arc<ring::Taps>,
+    /// Authoritative host conversation ids and artifact directories reported by
+    /// agent `SessionStart` hooks inside live PTYs.
+    agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>>,
+    /// Option A capability tokens, parent->child lineage edges, and headless
+    /// `vt100` screens for orchestrated child sessions.
+    pub(crate) orchestration: Arc<orchestrate::OrchestrationRegistry>,
 }
 
 impl Default for TerminalSessions {
@@ -408,6 +504,8 @@ impl Default for TerminalSessions {
             host: None,
             leave_running: Arc::new(AtomicBool::new(false)),
             ring_taps: Arc::default(),
+            agent_meta: Arc::default(),
+            orchestration: Arc::default(),
         }
     }
 }
@@ -417,11 +515,24 @@ impl TerminalSessions {
     /// `config`. Nothing connects until the first call (or [`Self::connect_host`]).
     #[cfg(unix)]
     pub fn with_host(config: host::client::HostConfig) -> Self {
+        let orchestration: Arc<orchestrate::OrchestrationRegistry> = Arc::default();
+        let agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>> = Arc::default();
         Self {
-            host: Some(host::client::HostClient::new(config)),
+            host: Some(host::client::HostClient::with_shared_state(
+                config,
+                orchestration.clone(),
+                agent_meta.clone(),
+            )),
             leave_running: Arc::new(AtomicBool::new(true)),
+            agent_meta,
+            orchestration,
             ..Self::default()
         }
+    }
+
+    /// Option A orchestration registry shared across in-process and hosted PTYs.
+    pub fn orchestration(&self) -> &Arc<orchestrate::OrchestrationRegistry> {
+        &self.orchestration
     }
 
     /// The app's registry: the host when the user has chosen to keep
@@ -613,6 +724,280 @@ impl TerminalSessions {
     fn output_stall(&self) -> Duration {
         Duration::from_millis(self.output_stall_ms.load(Ordering::Acquire))
     }
+
+    /// Records `meta` in this process's `agent_meta` map without forwarding to
+    /// `gitpulse-ptyd` (used both locally and inside `gitpulse-ptyd` itself).
+    pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
+        let mut map = self
+            .agent_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= MAX_PTY_SESSIONS * 2 && !map.contains_key(session_id) {
+            if let Some(stale) = map.keys().next().cloned() {
+                map.remove(&stale);
+            }
+        }
+        map.insert(session_id.to_owned(), meta);
+    }
+
+    /// Records the authoritative conversation id and optional artifact directory
+    /// reported by an agent `SessionStart` hook running inside `session_id`, and
+    /// mirrors it to `gitpulse-ptyd` when hosted so restarts adopt it intact.
+    pub fn record_agent_meta(&self, session_id: &str, meta: AgentSessionMeta) {
+        self.record_agent_meta_local(session_id, meta.clone());
+        #[cfg(unix)]
+        if let Some(host) = &self.host {
+            host.set_agent_meta(session_id, meta);
+        }
+    }
+
+    /// Reads the recorded agent metadata for `session_id`, if any.
+    pub fn agent_meta_for(&self, session_id: &str) -> Option<AgentSessionMeta> {
+        self.agent_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+}
+
+pub(crate) fn session_telemetry(
+    state: &TerminalSessions,
+    session_id: &str,
+) -> Option<SessionTelemetry> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.telemetry(session_id).ok().flatten();
+    }
+    state.lock_sessions().get(session_id).map(|entry| {
+        entry
+            .telemetry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
+}
+
+pub(crate) fn hosted_session_snapshot(state: &TerminalSessions) -> Vec<HostedSessionMeta> {
+    let entries: Vec<HostedSessionMeta> = {
+        let guard = state.lock_sessions();
+        guard
+            .values()
+            .filter(|entry| !entry.dead.load(Ordering::Acquire))
+            .map(|entry| {
+                let id = entry.spawned.id.clone();
+                let launcher = launcher_kind(&entry.spawned.shell)
+                    .unwrap_or("shell")
+                    .to_owned();
+                let telemetry = entry
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                HostedSessionMeta {
+                    session_id: id.clone(),
+                    repo: entry.repo.to_string_lossy().into_owned(),
+                    cwd: entry.spawned.cwd.clone(),
+                    rows: entry.rows.load(Ordering::Acquire),
+                    cols: entry.cols.load(Ordering::Acquire),
+                    launcher,
+                    token_hash_hex: entry.token_hash_hex.clone(),
+                    parent_session_id: entry.parent_session_id.clone(),
+                    child_launcher: entry.child_launcher.clone(),
+                    child_title: entry.child_title.clone(),
+                    agent_meta: state.agent_meta_for(&id),
+                    telemetry,
+                }
+            })
+            .collect()
+    };
+    let mut sorted = entries;
+    sorted.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    sorted
+}
+
+fn validate_hint_artifact_dir(hint: &str) -> Result<std::path::PathBuf, String> {
+    if hint.is_empty() || hint.len() > 4096 || hint.contains('\0') {
+        return Err("Invalid agent artifact directory hint.".into());
+    }
+    let hint_path = std::path::Path::new(hint);
+    if !hint_path.is_absolute()
+        || hint_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("Agent artifact directory hint must be a normalized absolute path.".into());
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "Cannot validate agent artifact directory without HOME.".to_owned())?;
+    let gemini_root = home.join(".gemini");
+    let rel = hint_path
+        .strip_prefix(&gemini_root)
+        .map_err(|_| "Agent artifact directory hint is outside ~/.gemini.".to_owned())?;
+    let segments: Vec<&str> = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Agent artifact directory hint is not valid UTF-8.".to_owned())?;
+    if segments.len() != 3
+        || !matches!(
+            segments[0],
+            "antigravity" | "antigravity-cli" | "antigravity-ide"
+        )
+        || segments[1] != "brain"
+        || segments[2].is_empty()
+        || segments[2].len() > 128
+        || !segments[2]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(
+            "Agent artifact directory hint must match ~/.gemini/antigravity*/brain/<conversation-id>."
+                .into(),
+        );
+    }
+    let mut cursor = gemini_root;
+    for part in [""].into_iter().chain(segments.iter().copied()) {
+        if !part.is_empty() {
+            cursor.push(part);
+        }
+        let meta = std::fs::symlink_metadata(&cursor)
+            .map_err(|e| format!("Could not inspect agent artifact directory: {e}"))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("Agent artifact directory path contains a symlink or non-directory.".into());
+        }
+    }
+    Ok(cursor)
+}
+
+/// Reads the highest-priority Markdown plan or artifact from the artifact
+/// directory reported by `session_id`'s agent (`implementation_plan.md` /
+/// `*plan*.md` first, then other Markdown artifacts, then `task.md`).
+/// Falls back to `hint_artifact_dir` only when it strictly resolves under
+/// `~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/brain/<id>`.
+pub fn read_agent_artifact(
+    state: &TerminalSessions,
+    session_id: &str,
+    hint_artifact_dir: Option<&str>,
+) -> Result<AgentArtifactRead, String> {
+    const MAX_ARTIFACT_BYTES: u64 = 512 * 1024;
+    const MAX_SCAN_ENTRIES: usize = 256;
+
+    let recorded_meta = state.agent_meta_for(session_id);
+    let recorded_dir = recorded_meta
+        .as_ref()
+        .and_then(|m| m.artifact_dir.as_deref())
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    let dir_buf = if let Some(dir_str) = recorded_dir {
+        let dir = std::path::PathBuf::from(dir_str);
+        if !dir.is_absolute() {
+            return Err("Agent artifact directory path must be absolute.".into());
+        }
+        let dir_meta = std::fs::symlink_metadata(&dir)
+            .map_err(|e| format!("Could not inspect agent artifact directory: {e}"))?;
+        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+            return Err("Agent artifact directory is not a regular directory.".into());
+        }
+        dir
+    } else if let Some(hint) = hint_artifact_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        validate_hint_artifact_dir(hint)?
+    } else if recorded_meta.is_some() {
+        return Err("This agent session did not advertise an artifact directory.".into());
+    } else {
+        return Err("No agent artifact metadata recorded for this terminal session.".into());
+    };
+    let dir = dir_buf.as_path();
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Could not read agent artifact directory: {e}"))?;
+    let mut best: Option<(u8, std::time::SystemTime, std::path::PathBuf, String)> = None;
+    for entry in entries.take(MAX_SCAN_ENTRIES) {
+        let Ok(entry) = entry else { continue };
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let lower = file_name.to_ascii_lowercase();
+        if !lower.ends_with(".md") {
+            continue;
+        }
+        let Ok(file_meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if file_meta.file_type().is_symlink()
+            || !file_meta.is_file()
+            || file_meta.len() > MAX_ARTIFACT_BYTES
+        {
+            continue;
+        }
+        let tier = if lower.contains("plan") {
+            0u8
+        } else if lower == "task.md" {
+            2u8
+        } else {
+            1u8
+        };
+        let mtime = file_meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let replace = match &best {
+            None => true,
+            Some((best_tier, best_mtime, _, _)) => {
+                tier < *best_tier || (tier == *best_tier && mtime > *best_mtime)
+            }
+        };
+        if replace {
+            best = Some((tier, mtime, entry.path(), file_name));
+        }
+    }
+
+    let (_, _, chosen_path, title) = best
+        .ok_or_else(|| "No Markdown plan or artifact exists in the agent's artifact directory yet.".to_owned())?;
+    let check_meta = std::fs::symlink_metadata(&chosen_path)
+        .map_err(|e| format!("Could not verify artifact file: {e}"))?;
+    if check_meta.file_type().is_symlink() || !check_meta.is_file() {
+        return Err("Selected artifact is not a regular file.".into());
+    }
+    let file = std::fs::File::open(&chosen_path)
+        .map_err(|e| format!("Could not open artifact '{title}': {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read artifact '{title}': {e}"))?;
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(format!("Artifact '{title}' exceeds the 512 KiB viewer ceiling."));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("Artifact '{title}' is not UTF-8 Markdown: {e}"))?;
+
+    let repo_relative_path = list_sessions(state)
+        .ok()
+        .and_then(|listed| listed.into_iter().find(|s| s.id == session_id))
+        .and_then(|session| {
+            let repo_canon = std::path::Path::new(&session.repo).canonicalize().ok()?;
+            let file_canon = chosen_path.canonicalize().ok()?;
+            let rel = file_canon.strip_prefix(&repo_canon).ok()?;
+            rel.to_str().map(|s| s.replace('\\', "/"))
+        });
+
+    Ok(AgentArtifactRead {
+        title,
+        absolute_path: chosen_path.to_string_lossy().into_owned(),
+        repo_relative_path,
+        content,
+    })
 }
 
 /// Removes a session from the map when its reader thread ends, however it
@@ -660,7 +1045,7 @@ fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, Strin
     })
 }
 
-fn bounded_pty_size(rows: u16, cols: u16) -> PtySize {
+pub(crate) fn bounded_pty_size(rows: u16, cols: u16) -> PtySize {
     PtySize {
         rows: rows.clamp(1, MAX_PTY_ROWS),
         cols: cols.clamp(1, MAX_PTY_COLS),
@@ -763,6 +1148,11 @@ struct PtyEnv {
     /// hands GUI apps none) and safely repairable (`en_US.UTF-8` always
     /// exists there).
     inject_locale: bool,
+    /// Directory containing the running `gitpulse` / `gitpulse-ptyd` executable
+    /// (and sibling helper binaries `gitpulse-hook`, `gitpulse-mcp`) so bare
+    /// `gitpulse-hook` invocations inside any GitPulse PTY resolve even on
+    /// Finder-launched macOS bundles.
+    helper_bin_dir: Option<std::path::PathBuf>,
 }
 
 impl PtyEnv {
@@ -770,6 +1160,9 @@ impl PtyEnv {
         Self {
             vars: std::env::vars().collect(),
             inject_locale: cfg!(target_os = "macos"),
+            helper_bin_dir: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
         }
     }
 
@@ -817,7 +1210,18 @@ fn build_pty_command(
     // and the child's own lookups — a login shell's rc file calling `brew`, an
     // agent CLI shelling out to `node` — must see the same directories.
     let home = pty_env.home();
-    let child_path = extended_child_path(pty_env.os("PATH").as_deref(), home.as_deref());
+    let base_child_path = extended_child_path(pty_env.os("PATH").as_deref(), home.as_deref());
+    let child_path = match (&pty_env.helper_bin_dir, base_child_path) {
+        (Some(bin_dir), Some(existing)) => {
+            let mut entries: Vec<std::path::PathBuf> = std::env::split_paths(&existing).collect();
+            if !entries.iter().any(|entry| entry == bin_dir) {
+                entries.insert(0, bin_dir.clone());
+            }
+            std::env::join_paths(entries).ok().or(Some(existing))
+        }
+        (Some(bin_dir), None) => std::env::join_paths([bin_dir.as_path()]).ok(),
+        (None, other) => other,
+    };
     let resolved = resolve_spawn_program_with(shell, child_path.as_deref(), home.as_deref());
 
     let mut cmd = CommandBuilder::new(&resolved);
@@ -840,22 +1244,29 @@ fn build_pty_command(
     if let Some(ref path) = child_path {
         cmd.env("PATH", path);
     }
-    // Strip parent Claude Code recursion markers on every PTY session (shells
-    // and agent tabs alike) before caller `env` overrides are applied, so a
-    // GitPulse or gitpulse-ptyd started inside a Claude Code shell never blocks
-    // terminal-spun `claude` with a nested-session error.
-    let inherited_claude_vars: Vec<String> = cmd
+    // Strip parent Claude Code recursion markers and any inherited session
+    // capability token on every PTY session before caller `env` overrides are
+    // applied, so a GitPulse or gitpulse-ptyd started inside an existing agent
+    // shell never leaks a parent token or triggers a nested-session error.
+    let inherited_scrub_vars: Vec<String> = cmd
         .iter_full_env_as_str()
         .filter(|(k, _)| {
-            k.eq_ignore_ascii_case("CLAUDECODE") || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+            k.eq_ignore_ascii_case("CLAUDECODE")
+                || k.eq_ignore_ascii_case("CLAUDE_CODE_ENTRYPOINT")
+                || k.eq_ignore_ascii_case(orchestrate::SESSION_TOKEN_ENV)
+                || k.eq_ignore_ascii_case(crate::alerts::bridge::SESSION_ENV)
+                || k.eq_ignore_ascii_case(TERMINAL_SESSION_ENV)
         })
         .map(|(k, _)| k.to_owned())
         .collect();
-    for key in inherited_claude_vars {
+    for key in inherited_scrub_vars {
         cmd.env_remove(key);
     }
     cmd.env_remove("CLAUDECODE");
     cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+    cmd.env_remove(orchestrate::SESSION_TOKEN_ENV);
+    cmd.env_remove(crate::alerts::bridge::SESSION_ENV);
+    cmd.env_remove(TERMINAL_SESSION_ENV);
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
@@ -956,6 +1367,82 @@ pub(crate) fn agent_launcher(program: &str) -> Option<&'static str> {
         .map(|(_, label)| *label)
 }
 
+/// Canonical owner of OSC 7 / 133 / 7501 and loopback readiness state
+/// transitions on [`SessionTelemetry`]. Shared by [`SessionWatcher`] and the
+/// hosted-output mirror in [`orchestrate`].
+pub(crate) fn apply_telemetry_events(
+    state: &mut SessionTelemetry,
+    events: Vec<crate::alerts::scan::TelemetryEvent>,
+) -> (bool, Vec<crate::alerts::scan::HerdrStatus>, bool) {
+    let mut notify = false;
+    let mut herdr_notices = Vec::new();
+    let mut saw_probe = false;
+    for ev in events {
+        match ev {
+            crate::alerts::scan::TelemetryEvent::Osc7Cwd(cwd) => {
+                if state.cwd.as_deref() != Some(cwd.as_str()) {
+                    state.cwd = Some(cwd);
+                    notify = true;
+                }
+            }
+            crate::alerts::scan::TelemetryEvent::Osc133(mark) => match mark {
+                crate::alerts::scan::ShellMark::PromptStart
+                | crate::alerts::scan::ShellMark::CommandStart => {
+                    if state.command_running {
+                        state.command_running = false;
+                        state.event_seq = state.event_seq.saturating_add(1);
+                        state.last_command_event_seq = state.event_seq;
+                        notify = true;
+                    }
+                }
+                crate::alerts::scan::ShellMark::CommandExecuted => {
+                    state.command_running = true;
+                    state.command_seq = state.command_seq.saturating_add(1);
+                    state.event_seq = state.event_seq.saturating_add(1);
+                    notify = true;
+                }
+                crate::alerts::scan::ShellMark::CommandFinished { exit_code } => {
+                    state.command_running = false;
+                    state.last_exit_code = exit_code;
+                    state.command_seq = state.command_seq.saturating_add(1);
+                    state.event_seq = state.event_seq.saturating_add(1);
+                    state.last_command_event_seq = state.event_seq;
+                    notify = true;
+                }
+            },
+            crate::alerts::scan::TelemetryEvent::Osc7501(status) => {
+                if state.herdr_status.as_ref() != Some(&status) {
+                    herdr_notices.push(status.clone());
+                }
+                state.herdr_status = Some(status);
+                state.event_seq = state.event_seq.saturating_add(1);
+                state.last_herdr_event_seq = state.event_seq;
+                notify = true;
+            }
+            crate::alerts::scan::TelemetryEvent::Osc7501Clear => {
+                if state.herdr_status.take().is_some() {
+                    state.event_seq = state.event_seq.saturating_add(1);
+                    state.last_herdr_event_seq = state.event_seq;
+                    notify = true;
+                }
+            }
+            crate::alerts::scan::TelemetryEvent::Osc7501Probe => {
+                saw_probe = true;
+            }
+            crate::alerts::scan::TelemetryEvent::LoopbackUrl(url) => {
+                state.dev_server_url = Some(url);
+                state.event_seq = state.event_seq.saturating_add(1);
+                state.last_dev_event_seq = state.event_seq;
+                notify = true;
+            }
+        }
+    }
+    (notify, herdr_notices, saw_probe)
+}
+
+const OSC7501_PROBE_REPLY: &[u8] = b"\x1b]7501;1\x1b\\";
+const OSC7501_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
 /// One session's standing interest in its own output.
 ///
 /// Owned by the reader thread and touched by nothing else, so reading a
@@ -972,6 +1459,9 @@ struct SessionWatcher {
     reported_drops: u64,
     /// Where a notice goes: a banner in the app, a frame from the host.
     events: Arc<dyn SessionEvents>,
+    telemetry: SharedSessionTelemetry,
+    probe_reply: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    last_probe_reply: Option<Instant>,
 }
 
 impl SessionWatcher {
@@ -992,10 +1482,23 @@ impl SessionWatcher {
             scanner: crate::alerts::scan::Scanner::new(),
             reported_drops: 0,
             events,
+            telemetry: new_shared_telemetry(),
+            probe_reply: None,
+            last_probe_reply: None,
         }
     }
 
-    fn observe(&mut self, bytes: &[u8]) {
+    fn with_telemetry(mut self, telemetry: SharedSessionTelemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    fn with_probe_reply(mut self, reply: impl FnMut(&[u8]) + Send + 'static) -> Self {
+        self.probe_reply = Some(Box::new(reply));
+        self
+    }
+
+    fn observe(&mut self, bytes: &[u8]) -> bool {
         for signal in self.scanner.feed(bytes) {
             self.events.notice(crate::alerts::Notice {
                 key: self.key.clone(),
@@ -1014,18 +1517,70 @@ impl SessionWatcher {
                 agent_id: None,
             });
         }
+        let telemetry_events = self.scanner.drain_telemetry();
+        let mut notify_waiters = false;
+        if !telemetry_events.is_empty() {
+            let (herdr_notices, saw_probe) = {
+                let (lock, cvar) = &*self.telemetry;
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (changed, notices, probe) =
+                    apply_telemetry_events(&mut state, telemetry_events);
+                notify_waiters = changed;
+                if notify_waiters {
+                    cvar.notify_all();
+                }
+                (notices, probe)
+            };
+            if saw_probe
+                && self
+                    .last_probe_reply
+                    .is_none_or(|last| last.elapsed() >= OSC7501_PROBE_MIN_INTERVAL)
+            {
+                if let Some(reply) = self.probe_reply.as_mut() {
+                    self.last_probe_reply = Some(Instant::now());
+                    reply(OSC7501_PROBE_REPLY);
+                }
+            }
+            for status in herdr_notices {
+                self.events.notice(crate::alerts::Notice {
+                    key: self.key.clone(),
+                    origin: crate::alerts::Origin::Terminal,
+                    label: self.label.clone(),
+                    place: self.place.clone(),
+                    event: Some(status.state.bridge_event()),
+                    detail: status.detail,
+                    is_agent: true,
+                    channel: "osc7501",
+                    subject: None,
+                    subagent: false,
+                    agent_id: None,
+                });
+            }
+        }
         let dropped = self.scanner.dropped();
         let new_drops = dropped.saturating_sub(self.reported_drops);
         if new_drops > 0 {
             self.events.scan_drops(new_drops);
         }
         self.reported_drops = dropped;
+        notify_waiters
     }
 
     /// The session's output has ended. Whatever it was asking can no longer
     /// be answered, whether or not its agent's own `SessionEnd` hook ran — a
     /// killed process runs no hooks.
     fn ended(&self) {
+        {
+            let (lock, cvar) = &*self.telemetry;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.ended = true;
+            state.command_running = false;
+            cvar.notify_all();
+        }
         self.events.notice(crate::alerts::Notice {
             key: self.key.clone(),
             origin: crate::alerts::Origin::Terminal,
@@ -1466,7 +2021,7 @@ pub fn session_context(
     if let Some(host) = &state.host {
         return host.context(session_id);
     }
-    let (child, master, repo, closing) = state
+    let (child, master, repo, closing, telemetry) = state
         .lock_sessions()
         .get(session_id)
         .map(|s| {
@@ -1475,9 +2030,19 @@ pub fn session_context(
                 s.master.clone(),
                 s.repo.clone(),
                 s.closing.clone(),
+                s.telemetry.clone(),
             )
         })
         .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let osc7_cwd = || {
+        telemetry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cwd
+            .clone()
+            .map(std::path::PathBuf::from)
+    };
     #[cfg(unix)]
     {
         let mut child = child
@@ -1509,11 +2074,14 @@ pub fn session_context(
         // A program the OS will not describe (sudo, a setuid tool) still runs
         // in the shell's directory far more often than not, but "far more
         // often" is not "is": only the shell's own answer stands in for it.
-        let cwd = view.cwd.or_else(|| {
-            leader
-                .filter(|g| *g != root)
-                .and_then(|_| foreground::describe(root).cwd)
-        });
+        let cwd = view
+            .cwd
+            .or_else(|| {
+                leader
+                    .filter(|g| *g != root)
+                    .and_then(|_| foreground::describe(root).cwd)
+            })
+            .or_else(osc7_cwd);
         drop(child);
         let repo_dir = cwd
             .as_deref()
@@ -1530,8 +2098,18 @@ pub fn session_context(
     }
     #[cfg(not(unix))]
     {
-        let _ = (child, master, repo, closing);
-        Ok(TerminalContext::default())
+        let _ = (child, master, closing);
+        let cwd = osc7_cwd();
+        let repo_dir = cwd
+            .as_deref()
+            .and_then(|cwd| cwd.strip_prefix(&repo).ok())
+            .and_then(|rel| rel.to_str())
+            .map(str::to_owned);
+        Ok(TerminalContext {
+            cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            repo_dir,
+            ..TerminalContext::default()
+        })
     }
 }
 
@@ -1598,6 +2176,9 @@ pub struct TerminalListing {
     /// shown again.
     #[serde(default)]
     pub ending: bool,
+    /// Parent terminal session id when spawned via Option A child orchestration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// Every session this process (or its terminal host) still owns, live or
@@ -1622,6 +2203,7 @@ pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, S
             // An ending session has no view to show it in: it is only ever
             // listed, so it reads as detached.
             detached: s.flow.is_detached() || s.dead.load(Ordering::Acquire),
+            parent_session_id: s.parent_session_id.clone(),
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1791,15 +2373,26 @@ pub fn attach_session(
 ) -> Result<TerminalSpawned, String> {
     #[cfg(unix)]
     if let Some(host) = &state.host {
-        return host.attach(session_id, rows, cols, output);
+        let out = host.attach(session_id, rows, cols, output);
+        if out.is_ok() {
+            state.orchestration.resize(session_id, rows, cols);
+        }
+        return out;
     }
-    let takeover = state
+    let (takeover, entry_rows, entry_cols) = state
         .lock_sessions()
         .get(session_id)
         .filter(|s| !s.dead.load(Ordering::Acquire))
-        .map(Takeover::of)
+        .map(|s| (Takeover::of(s), s.rows.clone(), s.cols.clone()))
         .ok_or_else(|| format!("Terminal session '{session_id}' has ended"))?;
-    takeover.hand_to(output, rows, cols, false, state.output_stall())
+    let out = takeover.hand_to(output, rows, cols, false, state.output_stall());
+    if out.is_ok() {
+        let size = bounded_pty_size(rows, cols);
+        entry_rows.store(size.rows, Ordering::Release);
+        entry_cols.store(size.cols, Ordering::Release);
+        state.orchestration.resize(session_id, rows, cols);
+    }
+    out
 }
 
 /// The live tracked task session of `run_id`, which repairs a lost launch
@@ -1879,8 +2472,8 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     output: OutputSink,
     observer: Arc<dyn SessionObserver>,
 ) -> Result<TerminalSpawned, CommandError> {
+    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
     spawn_at(
-        app,
         state,
         Place::Task {
             cwd: cwd.to_owned(),
@@ -1891,7 +2484,9 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
         Some(args),
         None,
         output,
+        events,
         Some(observer),
+        None,
     )
 }
 
@@ -1944,6 +2539,20 @@ pub struct SpawnRequest {
     pub env: Option<HashMap<String, String>>,
     /// The task run this session belongs to.
     pub run_id: Option<String>,
+    /// Option A parent session id when spawned as an orchestrated child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Logical launcher (`shell`, `claude`, `agy`, …) recorded for orchestrated children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_launcher: Option<String>,
+    /// Optional human title recorded for orchestrated children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_title: Option<String>,
+    /// RAM-only SHA-256 hex digest of `GITPULSE_SESSION_TOKEN` so `gitpulse-ptyd`
+    /// can restore caller authentication across app restarts without ever
+    /// persisting raw capability tokens to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_hash_hex: Option<String>,
 }
 
 /// One session's lanes: its keystrokes and its resizes, each one thread in
@@ -1965,7 +2574,7 @@ pub(crate) fn next_session_id() -> String {
 
 /// Whether `id` is one [`next_session_id`] could have minted. The host takes
 /// ids from the app; one it could not have made is refused, not stored.
-fn is_session_id(id: &str) -> bool {
+pub(crate) fn is_session_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("term-") else {
         return false;
     };
@@ -1996,8 +2605,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, CommandError> {
+    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
     spawn_at(
-        app,
         state,
         Place::Repo {
             repo_path: repo_path.to_owned(),
@@ -2009,16 +2618,18 @@ fn spawn_session_inner<R: tauri::Runtime>(
         args,
         env,
         output,
+        events,
         observer,
+        None,
     )
 }
 
 /// The app's side of every spawn, whichever backend holds the PTY: the checks
 /// that need this process (the load governor's override is held here), the
-/// session id, and the ledger record once the session exists.
+/// session id, the per-session capability token (`GITPULSE_SESSION_TOKEN`) and
+/// Option A lineage registration, and the ledger record once the session exists.
 #[allow(clippy::too_many_arguments)]
-fn spawn_at<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub(crate) fn spawn_at(
     state: &TerminalSessions,
     place: Place,
     rows: u16,
@@ -2027,18 +2638,52 @@ fn spawn_at<R: tauri::Runtime>(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
     output: OutputSink,
+    events: Arc<dyn SessionEvents>,
     observer: Option<Arc<dyn SessionObserver>>,
+    orchestrated: Option<orchestrate::ChildSpawnMeta>,
 ) -> Result<TerminalSpawned, CommandError> {
+    let token = orchestrate::mint_session_token()?;
+    let token_hash_hex = orchestrate::token_hash_hex(&token)?;
+    let mut env_with_token = env.unwrap_or_default();
+    env_with_token.retain(|k, _| !k.eq_ignore_ascii_case(orchestrate::SESSION_TOKEN_ENV));
+    env_with_token.insert(orchestrate::SESSION_TOKEN_ENV.to_owned(), token.clone());
+    let env = Some(env_with_token);
+
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
-    let (repo, _) = place.resolve()?;
+    let (repo, start) = place.resolve()?;
     // An agent CLI is a launch the load governor may refuse under severe
     // memory pressure; the user's own shell (no program) never is.
     if program.as_deref().is_some_and(|p| !p.trim().is_empty()) {
         crate::sysload::admit(crate::sysload::Site::PtySpawn, &repo.to_string_lossy())
             .map_err(|refused| refused.message())?;
     }
+    let session_id = next_session_id();
+    let launcher_label = program
+        .as_deref()
+        .and_then(launcher_kind)
+        .unwrap_or("shell");
+    let (parent_session_id, child_launcher, child_title) = match &orchestrated {
+        Some(meta) => (
+            Some(meta.parent_session_id.clone()),
+            Some(meta.launcher.clone()),
+            meta.title.clone(),
+        ),
+        None => (None, None, None),
+    };
+    state.orchestration.register_session(
+        &session_id,
+        &token,
+        &repo,
+        &start,
+        launcher_label,
+        rows,
+        cols,
+        new_shared_telemetry(),
+        orchestrated,
+    )?;
+
     let request = SpawnRequest {
-        session_id: next_session_id(),
+        session_id: session_id.clone(),
         place,
         rows,
         cols,
@@ -2046,6 +2691,10 @@ fn spawn_at<R: tauri::Runtime>(
         args,
         env,
         run_id: observer.as_ref().map(|o| o.run_id().to_owned()),
+        parent_session_id,
+        child_launcher,
+        child_title,
+        token_hash_hex: Some(token_hash_hex),
     };
     let ledger = (
         request
@@ -2055,14 +2704,23 @@ fn spawn_at<R: tauri::Runtime>(
             .unwrap_or_else(default_shell),
         request.args.clone(),
     );
-    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
     #[cfg(unix)]
-    let started = match &state.host {
-        Some(host) => host.spawn(events, request, output, observer)?,
-        None => start_session(state, request, output, events, observer)?,
+    let started_res = match &state.host {
+        Some(host) => host
+            .spawn(events, request, output, observer)
+            .map_err(CommandError::from),
+        None => start_session(state, request, output, events, observer),
     };
     #[cfg(not(unix))]
-    let started = start_session(state, request, output, events, observer)?;
+    let started_res = start_session(state, request, output, events, observer);
+
+    let started = match started_res {
+        Ok(started) => started,
+        Err(error) => {
+            state.orchestration.remove_aborted(&session_id);
+            return Err(error);
+        }
+    };
     let spawned = started.spawned;
     // The ledger entry resolves the repository's address and task binding
     // (git) and appends (a lock another writer may hold), and none of it can
@@ -2098,9 +2756,27 @@ pub(crate) fn start_session(
         args,
         env,
         run_id,
+        parent_session_id,
+        child_launcher,
+        child_title,
+        token_hash_hex,
     } = request;
     if !is_session_id(&session_id) {
         return Err("Invalid terminal session id".into());
+    }
+    if parent_session_id
+        .as_deref()
+        .is_some_and(|pid| !is_session_id(pid))
+    {
+        return Err("Invalid parent terminal session id".into());
+    }
+    if token_hash_hex.as_deref().is_some_and(|hex| {
+        hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) {
+        return Err("Invalid terminal session token digest".into());
     }
     if run_id.as_deref().is_some_and(|id| {
         id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_graphic())
@@ -2137,6 +2813,12 @@ pub(crate) fn start_session(
         &start,
         &PtyEnv::from_process(),
     );
+    shell_integration::apply_to_default_shell(
+        &mut cmd,
+        &resolved,
+        is_default_shell,
+        args.as_ref().is_some_and(|a| !a.is_empty()),
+    );
     if cfg!(windows) {
         if let Some(refusal) = batch_reparse_refusal(&resolved, args.as_deref().unwrap_or_default())
         {
@@ -2172,6 +2854,7 @@ pub(crate) fn start_session(
     // these two name *this* process's socket and *this* PTY, and an IPC caller
     // supplying its own values would be pointing hooks at neither.
     cmd.env(crate::alerts::bridge::SESSION_ENV, &session_id);
+    cmd.env(TERMINAL_SESSION_ENV, &session_id);
     // Which agent this is, decided here where the launcher is known rather
     // than guessed from a hook payload that names only the host.
     match launcher_kind(&resolved) {
@@ -2253,10 +2936,18 @@ pub(crate) fn start_session(
         &state.ring_taps,
         &session_id,
     )));
+    let telemetry = state
+        .orchestration
+        .telemetry_for(&session_id)
+        .unwrap_or_else(new_shared_telemetry);
     let (input, geometry) = session_lanes();
+    let writer_arc = Arc::new(Mutex::new(writer));
+    let probe_lane = input.clone();
+    let probe_writer = writer_arc.clone();
+    let probe_dead = dead.clone();
     let entry = SessionEntry {
         master: master.clone(),
-        writer: Arc::new(Mutex::new(writer)),
+        writer: writer_arc,
         child: child.clone(),
         dead: dead.clone(),
         flow: output_flow.clone(),
@@ -2275,6 +2966,13 @@ pub(crate) fn start_session(
         geometry,
         events: events.clone(),
         ring: ring.clone(),
+        telemetry: telemetry.clone(),
+        rows: Arc::new(AtomicU16::new(size.rows)),
+        cols: Arc::new(AtomicU16::new(size.cols)),
+        parent_session_id,
+        child_launcher,
+        child_title,
+        token_hash_hex,
     };
 
     {
@@ -2295,6 +2993,7 @@ pub(crate) fn start_session(
     // Reader thread: streams output to the session's view through its output sink.
     let thread_events = events.clone();
     let thread_ring = ring.clone();
+    let thread_orchestration = state.orchestration.clone();
     let sid_for_thread = session_id.clone();
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
@@ -2322,7 +3021,29 @@ pub(crate) fn start_session(
 
     // What a banner from this session will say. Resolved once, here, because
     // the reader thread outlives every borrow it could otherwise take.
-    let watcher = SessionWatcher::new(&session_id, &resolved, &repo, events);
+    let watcher = SessionWatcher::new(&session_id, &resolved, &repo, events)
+        .with_telemetry(telemetry)
+        .with_probe_reply(move |reply_bytes| {
+            let payload = reply_bytes.to_vec();
+            let writer = probe_writer.clone();
+            let dead = probe_dead.clone();
+            let _ = probe_lane.spawn("osc7501_probe", move || {
+                #[cfg(unix)]
+                {
+                    input::write(&writer, &dead, &payload)
+                }
+                #[cfg(not(unix))]
+                {
+                    if !dead.load(Ordering::Acquire) {
+                        if let Ok(mut guard) = writer.lock() {
+                            let _ = guard.write_all(&payload);
+                            let _ = guard.flush();
+                        }
+                    }
+                    Ok(())
+                }
+            });
+        });
 
     let slot = SessionSlot {
         sessions: state.sessions.clone(),
@@ -2470,7 +3191,11 @@ pub(crate) fn start_session(
                         // Read before the liveness check below: a session being
                         // torn down can still be asking for attention, and this
                         // costs one pass over bytes already in cache.
-                        watcher.observe(&buf[filled..filled + n]);
+                        let telemetry_changed = watcher.observe(&buf[filled..filled + n]);
+                        thread_orchestration.observe_output(&sid_for_thread, &buf[filled..filled + n]);
+                        if telemetry_changed {
+                            thread_orchestration.notify_changed();
+                        }
                         if filled == 0 {
                             gathering_since = Instant::now();
                         }
@@ -2685,6 +3410,7 @@ pub(crate) fn start_session(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&sid_for_exit);
+                    thread_orchestration.mark_ended(&sid_for_exit, payload.exit_code);
                     // After the last byte, before the exit: the page delivers
                     // channel messages in order, but an exit is an event and
                     // would overtake bytes still being fetched. The marker is
@@ -2843,7 +3569,11 @@ fn binary_input(data: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Input for a session, wherever it lives.
-fn write_input(state: &TerminalSessions, session_id: &str, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_input(
+    state: &TerminalSessions,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(), String> {
     #[cfg(unix)]
     if let Some(host) = &state.host {
         if data.len() > MAX_PTY_INPUT_BYTES {
@@ -2963,20 +3693,35 @@ pub fn resize_session(
 ) -> Result<(), String> {
     #[cfg(unix)]
     if let Some(host) = &state.host {
-        return host.resize_blocking(session_id, rows, cols);
+        let out = host.resize_blocking(session_id, rows, cols);
+        if out.is_ok() {
+            state.orchestration.resize(session_id, rows, cols);
+        }
+        return out;
     }
     // The map is let go before the master is waited for: one session's busy
     // master must not stall list, write, kill and attach for all the others.
-    let master = state
+    let (master, entry_rows, entry_cols) = state
         .lock_sessions()
         .get(session_id)
-        .map(|session| session.master.clone())
+        .map(|session| {
+            (
+                session.master.clone(),
+                session.rows.clone(),
+                session.cols.clone(),
+            )
+        })
         .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
     // Bounded, like a write's wait for its lock: the lane that calls this is
     // one thread, and a master lock that never came free must make this resize
     // fail, not take every later resize of the session down with it.
-    let resized = lock_within(&master, MASTER_LOCK_BUDGET)?.resize(bounded_pty_size(rows, cols));
-    resized.map_err(|e| format!("Failed to resize terminal: {e}"))
+    let size = bounded_pty_size(rows, cols);
+    let resized = lock_within(&master, MASTER_LOCK_BUDGET)?.resize(size);
+    resized.map_err(|e| format!("Failed to resize terminal: {e}"))?;
+    entry_rows.store(size.rows, Ordering::Release);
+    entry_cols.store(size.cols, Ordering::Release);
+    state.orchestration.resize(session_id, rows, cols);
+    Ok(())
 }
 
 /// Takes `lock` within `budget`, recovering a poisoned one (a PTY master holds
@@ -8301,6 +9046,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn watcher_records_osc7_osc133_osc7501_and_loopback_telemetry() {
+        let events = Arc::new(RecordedEvents::default());
+        let telemetry = new_shared_telemetry();
+        let mut watcher = SessionWatcher::new(
+            "term-7",
+            "/bin/zsh",
+            std::path::Path::new("/w/repo"),
+            events.clone(),
+        )
+        .with_telemetry(telemetry.clone());
+
+        watcher.observe(
+            b"\x1b]7;file://localhost/w/repo/src\x07\x1b]133;C\x07  Local: http://localhost:5173/\r\n\x1b]7501;blocked;Approve migration?\x07\x1b]133;D;42\x07",
+        );
+
+        let snap = telemetry.0.lock().unwrap().clone();
+        assert_eq!(snap.cwd.as_deref(), Some("/w/repo/src"));
+        assert!(!snap.command_running);
+        assert_eq!(snap.last_exit_code, Some(42));
+        assert_eq!(snap.dev_server_url.as_deref(), Some("http://localhost:5173/"));
+        assert_eq!(
+            snap.herdr_status.as_ref().map(|s| s.state),
+            Some(crate::alerts::scan::HerdrState::Blocked)
+        );
+        assert_eq!(
+            snap.herdr_status.as_ref().and_then(|s| s.detail.as_deref()),
+            Some("Approve migration?")
+        );
+
+        let notices = events.notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].channel, "osc7501");
+        assert_eq!(notices[0].event, Some("agent_needs_input"));
+        assert!(notices[0].is_agent);
+        assert_eq!(notices[0].detail.as_deref(), Some("Approve migration?"));
+    }
+
     /// Every event an engine session reports, kept for a test to read.
     #[derive(Default)]
     struct RecordedEvents {
@@ -8376,6 +9159,7 @@ mod tests {
                 ("HOME".to_string(), home.to_string_lossy().into_owned()),
             ]),
             inject_locale: true,
+            helper_bin_dir: None,
         }
     }
 
@@ -8858,5 +9642,29 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn build_pty_command_prepends_helper_bin_dir_and_scrubs_inherited_session_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let helper_dir = home.path().join("GitPulse.app/Contents/MacOS");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        let mut env = gui_launch_env(home.path());
+        env.helper_bin_dir = Some(helper_dir.clone());
+        env.vars.insert(
+            crate::alerts::bridge::SESSION_ENV.to_string(),
+            "term-999-stale".to_string(),
+        );
+        env.vars.insert(
+            TERMINAL_SESSION_ENV.to_string(),
+            "term-999-stale".to_string(),
+        );
+
+        let cmd = build_pty_command("/bin/zsh", true, None, None, home.path(), &env).cmd;
+        let path_val = env_of(&cmd, "PATH").expect("PATH set");
+        let entries: Vec<std::path::PathBuf> = std::env::split_paths(&path_val).collect();
+        assert_eq!(entries.first(), Some(&helper_dir));
+        assert!(env_of(&cmd, crate::alerts::bridge::SESSION_ENV).is_none());
+        assert!(env_of(&cmd, TERMINAL_SESSION_ENV).is_none());
     }
 }

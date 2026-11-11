@@ -23,10 +23,12 @@
 //! `gitpulse_worktree_release`, `gitpulse_worktree_send_message`,
 //! `gitpulse_worktree_prune`, `gitpulse_worktree_merge`),
 //! all behind the repository trust gate (`repository_trust::require`) and
-//! `harness::guard_command` (for git mutations). One tool acts on the running
-//! app instead of on state: `gitpulse_browser_open` asks it, through its
-//! single-instance mailbox, to open a Browser session on a loopback URL in a
-//! trusted repository's dock; it can open a page and nothing more. Destructive tools (`gitpulse_delete_task`,
+//! `harness::guard_command` (for git mutations). Four tools act on the running
+//! app over its single-instance mailbox: `gitpulse_browser_open` opens a
+//! Browser session on a loopback URL in a trusted repository's dock, and
+//! `gitpulse_terminal_spawn`, `gitpulse_terminal_open_file`, and
+//! `gitpulse_terminal_send` drive Option A parent->child terminal sessions and
+//! split file panes authenticated by `GITPULSE_SESSION_TOKEN`. Destructive tools (`gitpulse_delete_task`,
 //! `gitpulse_merge_tasks`, `gitpulse_worktree_prune`, `gitpulse_worktree_merge`)
 //! carry `destructiveHint: true`, and every writing tool is held to the explicit
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
@@ -904,6 +906,184 @@ tool_args! {
             "A local dev server URL: http or https to localhost, 127.0.0.0/8 or [::1]",
             1,
             crate::browser::MAX_URL_CHARS,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalSpawnArgs {
+        repo_path: String = repo_spec(),
+        launcher: Option<String> = Spec::one_of(
+            "Child terminal launcher ('shell', 'claude', 'agy', 'codex', 'manvi', or 'grok'; defaults to 'shell')",
+            &crate::terminal::orchestrate::ALLOWED_CHILD_LAUNCHERS,
+        ),
+        cwd: Option<String> = Spec::bytes(
+            "Optional subdirectory inside repo_path for the child session working directory",
+            1,
+            1024,
+        ),
+        command: Option<String> = Spec::bytes(
+            "Optional initial shell command when launcher is 'shell' (checked against the command gate)",
+            1,
+            crate::terminal::orchestrate::MAX_SEND_BYTES,
+        ),
+        prompt: Option<String> = Spec::bytes(
+            "Optional initial task prompt when launcher is an agent ('claude', 'agy', 'codex', 'manvi', or 'grok')",
+            1,
+            crate::terminal::orchestrate::MAX_PROMPT_BYTES,
+        ),
+        title: Option<String> = Spec::bytes(
+            "Optional tab or split-pane title displayed in GitPulse",
+            1,
+            crate::terminal::orchestrate::MAX_CHILD_TITLE_BYTES,
+        ),
+        split: Option<bool> = Spec::flag(
+            "Open the child session as a right-hand split pane beside the parent session (default true; false opens a background tab)",
+        ),
+        rows: Option<u32> = Spec::int("Initial PTY height in rows (default 28)", 4, 500),
+        cols: Option<u32> = Spec::int("Initial PTY width in columns (default 100)", 20, 1000),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalOpenFileArgs {
+        repo_path: String = repo_spec(),
+        path: String = Spec::bytes(
+            "Repository-relative path of an existing file inside repo_path to open in a right-hand split viewer pane",
+            1,
+            4096,
+        ),
+        line: Option<u32> = Spec::int("Optional 1-based line number to scroll to", 1, 1_000_000),
+        column: Option<u32> = Spec::int("Optional 1-based column number", 1, 10_000),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional caller session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional caller session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalListArgs {
+        repo_path: String = repo_spec(),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalWaitArgs {
+        repo_path: String = repo_spec(),
+        child_session_id: String = Spec::bytes(
+            "Child terminal session id previously spawned by this parent session",
+            1,
+            64,
+        ),
+        timeout_ms: Option<u64> = Spec::int(
+            "Maximum milliseconds to wait before returning timed_out=true (default 10000, max 25000)",
+            1,
+            crate::terminal::orchestrate::MAX_WAIT_TIMEOUT_MS,
+        ),
+        pattern: Option<String> = Spec::bytes(
+            "Optional plain-text substring to match against the rendered, secret-redacted child screen",
+            1,
+            crate::terminal::orchestrate::MAX_PATTERN_BYTES,
+        ),
+        wait_for_idle: Option<bool> = Spec::flag(
+            "Wake when an OSC 133 shell command finishes, OSC 7501 agent status reaches idle/done/blocked/error, or a loopback dev server becomes ready (default true)",
+        ),
+        since_seq: Option<u64> = Spec::int(
+            "Optional telemetry event sequence cursor; defaults to the child's baseline_seq recorded at the latest Send or matched Wait",
+            0,
+            u32::MAX as u64,
+        ),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalReadArgs {
+        repo_path: String = repo_spec(),
+        child_session_id: String = Spec::bytes(
+            "Child terminal session id previously spawned by this parent session",
+            1,
+            64,
+        ),
+        max_lines: Option<usize> = Spec::int(
+            "Maximum rendered screen lines to return from the bottom of the vt100 grid (default 80, max 200)",
+            1,
+            crate::terminal::orchestrate::MAX_READ_LINES as u64,
+        ),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
+    struct TerminalSendArgs {
+        repo_path: String = repo_spec(),
+        child_session_id: String = Spec::bytes(
+            "Child terminal session id previously spawned by this parent session",
+            1,
+            64,
+        ),
+        input: String = Spec::bytes(
+            "Plain-text command or prompt to write to the child PTY (or Ctrl-C / Ctrl-D; ANSI escapes are refused and shell commands pass through the command gate)",
+            1,
+            crate::terminal::orchestrate::MAX_SEND_BYTES,
+        ),
+        append_newline: Option<bool> = Spec::flag(
+            "Append a trailing newline when submitting input (default true; ignored for pure Ctrl-C/Ctrl-D)",
+        ),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
         ),
     }
 }
@@ -1957,6 +2137,169 @@ fn build_tools() -> Vec<Value> {
             }),
             true,
         ),
+        open_world(mutating_tool(
+            "gitpulse_terminal_spawn",
+            "Spawn a scoped child terminal session",
+            "Ask the running GitPulse (macOS) to spawn a scoped child terminal session (shell or coding agent) inside a trusted repository, authenticated by the parent session's GITPULSE_SESSION_TOKEN. Under Option A lineage, only this parent session can list, wait on, read, or send input to the spawned child; user shells and sibling sessions are unreachable",
+            TerminalSpawnArgs::properties(),
+            &TerminalSpawnArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "child_session_id": { "type": "string" },
+                    "launcher": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "split": { "type": "boolean" },
+                    "gate_checked": { "type": "boolean" },
+                    "gate_notice": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "ok", "repo_path", "child_session_id", "launcher",
+                    "cwd", "split", "gate_checked", "gate_notice"
+                ]
+            }),
+            false,
+        )),
+        mutating_tool(
+            "gitpulse_terminal_open_file",
+            "Open a repository file in a terminal split pane",
+            "Ask the running GitPulse (macOS) to open an existing repository-relative file in a right-hand split Code/Markdown viewer pane beside the caller's terminal session, optionally scrolled to a 1-based line and column",
+            TerminalOpenFileArgs::properties(),
+            &TerminalOpenFileArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "path": { "type": "string" },
+                    "line": { "type": ["integer", "null"], "minimum": 1 },
+                    "column": { "type": ["integer", "null"], "minimum": 1 }
+                },
+                "required": ["ok", "repo_path", "path", "line", "column"]
+            }),
+            true,
+        ),
+        tool(
+            "gitpulse_terminal_list",
+            "List child terminal sessions spawned by this parent",
+            "List only the child terminal sessions spawned by this authenticated parent session inside the repository, including OSC 133 command state, OSC 7501 agent status, active working directory, and loopback dev-server URL",
+            TerminalListArgs::properties(),
+            &TerminalListArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "total": { "type": "integer", "minimum": 0 },
+                    "children": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "child_session_id": { "type": "string" },
+                                "launcher": { "type": "string" },
+                                "cwd": { "type": "string" },
+                                "title": { "type": ["string", "null"] },
+                                "ended": { "type": "boolean" },
+                                "exit_code": { "type": ["integer", "null"] },
+                                "command_running": { "type": "boolean" },
+                                "last_exit_code": { "type": ["integer", "null"] },
+                                "herdr_status": { "type": ["string", "null"] },
+                                "dev_server_url": { "type": ["string", "null"] }
+                            },
+                            "required": [
+                                "child_session_id", "launcher", "cwd", "title", "ended",
+                                "exit_code", "command_running", "last_exit_code",
+                                "herdr_status", "dev_server_url"
+                            ]
+                        }
+                    }
+                },
+                "required": ["ok", "repo_path", "total", "children"]
+            }),
+        ),
+        tool(
+            "gitpulse_terminal_wait",
+            "Wait for a child terminal session event or screen pattern",
+            "Wait without busy-polling until a child session spawned by this parent matches a plain-text substring on its rendered screen, finishes an OSC 133 shell command, reports OSC 7501 idle/done/blocked/error, exposes a loopback dev server, exits, or reaches timeout_ms",
+            TerminalWaitArgs::properties(),
+            &TerminalWaitArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "child_session_id": { "type": "string" },
+                    "matched": { "type": "boolean" },
+                    "timed_out": { "type": "boolean" },
+                    "matched_reason": { "type": "string" },
+                    "event_seq": { "type": "integer", "minimum": 0 },
+                    "ended": { "type": "boolean" },
+                    "exit_code": { "type": ["integer", "null"] },
+                    "command_running": { "type": "boolean" },
+                    "last_exit_code": { "type": ["integer", "null"] },
+                    "herdr_status": { "type": ["string", "null"] },
+                    "dev_server_url": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "ok", "child_session_id", "matched", "timed_out", "matched_reason",
+                    "event_seq", "ended", "exit_code", "command_running", "last_exit_code",
+                    "herdr_status", "dev_server_url"
+                ]
+            }),
+        ),
+        tool(
+            "gitpulse_terminal_read",
+            "Read a child terminal session's rendered vt100 screen",
+            "Read the Clean 2D vt100 screen grid of a child session spawned by this parent, automatically resolving carriage-return overwrites and cursor motion while redacting secrets and session capability tokens",
+            TerminalReadArgs::properties(),
+            &TerminalReadArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "child_session_id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "lines_returned": { "type": "integer", "minimum": 0 },
+                    "total_lines": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "ended": { "type": "boolean" },
+                    "exit_code": { "type": ["integer", "null"] },
+                    "command_running": { "type": "boolean" },
+                    "last_exit_code": { "type": ["integer", "null"] },
+                    "herdr_status": { "type": ["string", "null"] },
+                    "dev_server_url": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "ok", "child_session_id", "text", "lines_returned", "total_lines",
+                    "truncated", "ended", "exit_code", "command_running",
+                    "last_exit_code", "herdr_status", "dev_server_url"
+                ]
+            }),
+        ),
+        open_world(mutating_tool(
+            "gitpulse_terminal_send",
+            "Send gated input to a child terminal session",
+            "Write a plain-text command, prompt, or Ctrl-C/Ctrl-D interrupt to a child terminal session spawned by this parent. ANSI escape injection is refused and commands pass through the safety gate before reaching the PTY",
+            TerminalSendArgs::properties(),
+            &TerminalSendArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "child_session_id": { "type": "string" },
+                    "bytes_sent": { "type": "integer", "minimum": 1 },
+                    "baseline_seq": { "type": "integer", "minimum": 0 },
+                    "gate_checked": { "type": "boolean" },
+                    "gate_notice": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "ok", "child_session_id", "bytes_sent", "baseline_seq", "gate_checked", "gate_notice"
+                ]
+            }),
+            false,
+        )),
         tool(
             "gitpulse_worktree_inbox",
             "Read agent coordination inbox",
@@ -2707,6 +3050,79 @@ fn read_target(
         retry,
     )
     .map_err(|error| error.to_string())
+}
+
+fn resolve_orchestrate_context(
+    repo_path: &str,
+    caller_session_id: Option<String>,
+    caller_token: Option<String>,
+) -> Result<(String, String, String), String> {
+    crate::repository_trust::require(std::path::Path::new(repo_path))
+        .map_err(CommandError::into_message)?;
+    let root = crate::engine::git_cli::find_git_root(std::path::Path::new(repo_path))
+        .ok_or_else(|| format!("{repo_path} is not inside a git repository"))?;
+    let repo = root.to_string_lossy().into_owned();
+    let sid = caller_session_id
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var(crate::terminal::TERMINAL_SESSION_ENV)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::env::var(crate::alerts::bridge::SESSION_ENV)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            format!(
+                "missing caller terminal session id: run inside a GitPulse terminal ({} / {} set) or pass caller_session_id",
+                crate::terminal::TERMINAL_SESSION_ENV,
+                crate::alerts::bridge::SESSION_ENV
+            )
+        })?;
+    let tok = caller_token
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var(crate::terminal::orchestrate::SESSION_TOKEN_ENV)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            format!(
+                "missing caller session capability token: run inside a GitPulse terminal ({} set) or pass caller_token",
+                crate::terminal::orchestrate::SESSION_TOKEN_ENV
+            )
+        })?;
+    Ok((repo, sid, tok))
+}
+
+fn ask_app_to_orchestrate(
+    call: crate::terminal::orchestrate::OrchestrateCall,
+) -> Result<Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let profile = crate::browser::profile_dir()
+            .ok_or("GitPulse's profile directory is unknown (no HOME)")?;
+        let owner =
+            crate::desktop::instance::reach_owner(&profile, std::time::Duration::from_secs(2))
+                .ok_or("GitPulse is not running, so there is no terminal orchestrator to reach")?;
+        let seq = NEXT_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = format!("mcp-{}-{seq}", std::process::id());
+        owner.orchestrate(&req_id, call)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = call;
+        Err("Terminal orchestration over the desktop mailbox is available on macOS only for now"
+            .to_string())
+    }
 }
 
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
@@ -3496,6 +3912,87 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "repo_path": repo,
                 "url": url
             }))
+        }
+        "gitpulse_terminal_spawn" => {
+            let a: TerminalSpawnArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::Spawn {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                launcher: a.launcher,
+                cwd: a.cwd,
+                command: a.command,
+                prompt: a.prompt,
+                title: a.title,
+                split: a.split,
+                rows: a.rows.map(|r| r as u16),
+                cols: a.cols.map(|c| c as u16),
+            })
+        }
+        "gitpulse_terminal_open_file" => {
+            let a: TerminalOpenFileArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::OpenFile {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                path: a.path,
+                line: a.line,
+                column: a.column,
+            })
+        }
+        "gitpulse_terminal_list" => {
+            let a: TerminalListArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::List {
+                repo_path,
+                caller_session_id,
+                caller_token,
+            })
+        }
+        "gitpulse_terminal_wait" => {
+            let a: TerminalWaitArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::Wait {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id: a.child_session_id,
+                timeout_ms: a.timeout_ms,
+                pattern: a.pattern,
+                wait_for_idle: a.wait_for_idle,
+                since_seq: a.since_seq,
+            })
+        }
+        "gitpulse_terminal_read" => {
+            let a: TerminalReadArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::Read {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id: a.child_session_id,
+                max_lines: a.max_lines,
+            })
+        }
+        "gitpulse_terminal_send" => {
+            let a: TerminalSendArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::Send {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id: a.child_session_id,
+                input: a.input,
+                append_newline: a.append_newline,
+            })
         }
         "gitpulse_worktree_inbox" => {
             let a: WorktreeInboxArgs = parse(name, arguments)?;
@@ -4815,6 +5312,9 @@ mod tests {
                             | "gitpulse_worktree_release"
                             | "gitpulse_worktree_send_message"
                             | "gitpulse_browser_open"
+                            | "gitpulse_terminal_spawn"
+                            | "gitpulse_terminal_open_file"
+                            | "gitpulse_terminal_send"
                             | "gitpulse_worktree_overlay_sync"
                             | "gitpulse_inbox_post"
                             | "gitpulse_inbox_withdraw"
@@ -4990,6 +5490,7 @@ mod tests {
                 "commit_sha",
                 "commit",
                 "task_id",
+                "child_session_id",
             ] {
                 if tool["inputSchema"]["properties"][extra].is_object() {
                     arguments[extra] = json!("probe");
@@ -5639,6 +6140,26 @@ mod tests {
         ("gitpulse_delete_task", "one deletion receipt, no list"),
         ("gitpulse_browser_open", "one request receipt, no list"),
         (
+            "gitpulse_terminal_spawn",
+            "one child session spawn receipt, no list",
+        ),
+        (
+            "gitpulse_terminal_open_file",
+            "one open-file split receipt, no list",
+        ),
+        (
+            "gitpulse_terminal_wait",
+            "one child wait outcome, no list",
+        ),
+        (
+            "gitpulse_terminal_read",
+            "one rendered screen snapshot, no list",
+        ),
+        (
+            "gitpulse_terminal_send",
+            "one gated input receipt, no list",
+        ),
+        (
             "gitpulse_worktree_switch",
             "one worktree switch receipt, no list",
         ),
@@ -5895,6 +6416,7 @@ mod tests {
                     "since",
                     "file",
                     "content",
+                    "child_session_id",
                 ] {
                     if tool["inputSchema"]["properties"][extra].is_object() {
                         arguments[extra] = json!("probe");
@@ -6156,6 +6678,102 @@ mod tests {
                 remote.as_ref().is_err_and(|e| e.contains("loopback")),
                 "a remote URL is refused: {remote:?}"
             );
+
+            // Attach an in-process terminal orchestrator to the same hermetic
+            // mailbox so all 6 `gitpulse_terminal_*` tools (3 writers + 3 readers,
+            // including `gitpulse_terminal_list`'s `children` array budget probe)
+            // are validated end-to-end over the real Unix socket.
+            let term_state = std::sync::Arc::new(crate::terminal::TerminalSessions::default());
+            let term_ui =
+                std::sync::Arc::new(crate::terminal::orchestrate::tests::TestUiSink::default());
+            let parent_id = "term-99999-1";
+            let parent_token = term_state
+                .orchestration
+                .register_test_parent(parent_id, std::path::Path::new(&wt_repo));
+            {
+                let term_state = std::sync::Arc::clone(&term_state);
+                let term_ui = std::sync::Arc::clone(&term_ui);
+                owner.attach_terminal_orchestrate(std::sync::Arc::new(move |call| {
+                    crate::terminal::orchestrate::execute(&term_state, &*term_ui, call)
+                }));
+            }
+            let spawned_child = call_writer(
+                "gitpulse_terminal_spawn",
+                json!({
+                    "repo_path": wt_repo,
+                    "launcher": "shell",
+                    "title": "mcp-schema-child",
+                    "split": true,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            )
+            .expect("gitpulse_terminal_spawn succeeds");
+            let child_id = spawned_child["child_session_id"]
+                .as_str()
+                .expect("child_session_id")
+                .to_string();
+
+            call_writer(
+                "gitpulse_terminal_open_file",
+                json!({
+                    "repo_path": wt_repo,
+                    "path": "src/lib.rs",
+                    "line": 1,
+                    "column": 1,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+            call_writer(
+                "gitpulse_terminal_send",
+                json!({
+                    "repo_path": wt_repo,
+                    "child_session_id": child_id,
+                    "input": "printf 'MCP_SCHEMA_READY_77\\n'",
+                    "append_newline": true,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+
+            call_writer(
+                "gitpulse_terminal_wait",
+                json!({
+                    "repo_path": wt_repo,
+                    "child_session_id": child_id,
+                    "timeout_ms": 8000,
+                    "pattern": "MCP_SCHEMA_READY_77",
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+            call_writer(
+                "gitpulse_terminal_read",
+                json!({
+                    "repo_path": wt_repo,
+                    "child_session_id": child_id,
+                    "max_lines": 40,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+            call_writer(
+                "gitpulse_terminal_list",
+                json!({
+                    "repo_path": wt_repo,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+
+            let _ = crate::terminal::kill_session(&term_state, &child_id);
             drop(owner);
             crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
         }
@@ -8088,6 +8706,18 @@ mod tests {
                 json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
             ),
             (
+                "gitpulse_terminal_spawn",
+                json!({ "repo_path": repo, "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
+            ),
+            (
+                "gitpulse_terminal_open_file",
+                json!({ "repo_path": repo, "path": "README.md", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
+            ),
+            (
+                "gitpulse_terminal_send",
+                json!({ "repo_path": repo, "child_session_id": "term-1-2", "input": "pwd", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
+            ),
+            (
                 "gitpulse_inbox_post",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "body": "probe" }),
             ),
@@ -8968,6 +9598,12 @@ mod tests {
             ("gitpulse_worktree_release", WorktreeReleaseArgs),
             ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
             ("gitpulse_browser_open", BrowserOpenArgs),
+            ("gitpulse_terminal_spawn", TerminalSpawnArgs),
+            ("gitpulse_terminal_open_file", TerminalOpenFileArgs),
+            ("gitpulse_terminal_list", TerminalListArgs),
+            ("gitpulse_terminal_wait", TerminalWaitArgs),
+            ("gitpulse_terminal_read", TerminalReadArgs),
+            ("gitpulse_terminal_send", TerminalSendArgs),
             ("gitpulse_worktree_inbox", WorktreeInboxArgs),
             ("gitpulse_inbox_post", InboxPostArgs),
             ("gitpulse_inbox_read", InboxReadArgs),
@@ -9086,6 +9722,12 @@ mod tests {
                 ("gitpulse_worktree_release", WorktreeReleaseArgs),
                 ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
                 ("gitpulse_browser_open", BrowserOpenArgs),
+                ("gitpulse_terminal_spawn", TerminalSpawnArgs),
+                ("gitpulse_terminal_open_file", TerminalOpenFileArgs),
+                ("gitpulse_terminal_list", TerminalListArgs),
+                ("gitpulse_terminal_wait", TerminalWaitArgs),
+                ("gitpulse_terminal_read", TerminalReadArgs),
+                ("gitpulse_terminal_send", TerminalSendArgs),
                 ("gitpulse_worktree_inbox", WorktreeInboxArgs),
                 ("gitpulse_inbox_post", InboxPostArgs),
                 ("gitpulse_inbox_read", InboxReadArgs),

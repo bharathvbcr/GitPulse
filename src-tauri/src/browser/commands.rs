@@ -85,6 +85,14 @@ pub async fn cmd_browser_close(app: AppHandle, id: String) -> Result<(), String>
     imp::close(app, id).await
 }
 
+/// Captures a native PNG screenshot of session `id`'s viewport and writes it to
+/// an owner-only `0600` scratch file so local coding agents can inspect `@path`.
+#[tauri::command]
+pub async fn cmd_browser_snapshot(app: AppHandle, id: String) -> Result<String, String> {
+    validate_id(&id)?;
+    imp::snapshot(app, id).await
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::{self as browser, Bounds, BrowserError, EventSink, PaneEvent, EVENT};
@@ -161,6 +169,32 @@ mod imp {
         })
         .await
     }
+
+    pub async fn snapshot(app: AppHandle, id: String) -> Result<String, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        let pane_id = id.clone();
+        on_main_thread(app, move |_| {
+            browser::snapshot_png(
+                &pane_id,
+                Box::new(move |outcome| {
+                    let _ = sender.send(outcome);
+                }),
+            )
+            .map_err(text)
+        })
+        .await?;
+
+        crate::commands::off_thread(move || {
+            let bytes = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| format!("browser snapshot timed out: {e}"))??;
+            let path =
+                crate::terminal::scratch_media::write_scratch_png("browser", &id, &bytes)?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .await
+        .map_err(|e| e.message)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -186,6 +220,9 @@ mod imp {
     }
     pub async fn close(_: AppHandle, _: String) -> Result<(), String> {
         Ok(())
+    }
+    pub async fn snapshot(_: AppHandle, _: String) -> Result<String, String> {
+        Err(UNSUPPORTED.into())
     }
 }
 

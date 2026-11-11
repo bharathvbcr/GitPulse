@@ -80,6 +80,7 @@ describe("the commands", () => {
     await browserIpc.navigate("t1", "http://localhost:3000/b");
     await browserIpc.go("t1", "back");
     await browserIpc.close("t1");
+    await browserIpc.snapshot("t1");
     expect(invoke.mock.calls).toEqual([
       ["cmd_browser_open", { id: "t1", url: "http://localhost:3000/", bounds }],
       ["cmd_browser_set_bounds", { id: "t1", bounds }],
@@ -87,6 +88,7 @@ describe("the commands", () => {
       ["cmd_browser_navigate", { id: "t1", url: "http://localhost:3000/b" }],
       ["cmd_browser_go", { id: "t1", to: "back" }],
       ["cmd_browser_close", { id: "t1" }],
+      ["cmd_browser_snapshot", { id: "t1" }],
     ]);
   });
 });

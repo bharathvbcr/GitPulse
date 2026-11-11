@@ -39,11 +39,14 @@
   let {
     filePath,
     blob,
+    repoPathOverride = null,
     draftContent = null,
     dirty = false,
     onSave,
     onDraftChange,
     onRequestDiscard,
+    revealTarget = null,
+    onSendSelectionToAgent,
   }: {
     filePath: string;
     blob: {
@@ -57,11 +60,14 @@
       disk_base?: string | null;
       eol?: LineEnding | null;
     };
+    repoPathOverride?: string | null;
     draftContent?: string | null;
     dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
+    revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
+    onSendSelectionToAgent?: (reference: string) => void;
   } = $props();
 
   export type MarkDevViewMode = "rendered" | "split" | "raw";
@@ -74,7 +80,7 @@
    * the raw CodeViewer collects it.
    */
   $effect(() => {
-    const wanted = $revealRequest?.path === filePath;
+    const wanted = $revealRequest?.path === filePath || (revealTarget !== null && revealTarget?.line !== null);
     // Raw and Split already mount a CodeViewer that collects the request; only
     // the rendered page needs to give way, and the user's choice stands.
     if (wanted && untrack(() => viewMode) === "rendered") viewMode = "raw";
@@ -98,7 +104,7 @@
    * object each time, which re-rendered the page (re-encoding its pictures)
    * and refetched the backlinks on every publish.
    */
-  const repoPath = $derived($currentRepoPath);
+  const repoPath = $derived(repoPathOverride ?? $currentRepoPath);
   let note = $derived<MarkdownNote | null>(
     repoPath && filePath ? { repoPath, path: filePath } : null,
   );
@@ -171,7 +177,7 @@
   }
 
   async function openInMarkDev() {
-    const repo = $repoStore.currentPath;
+    const repo = repoPath;
     if (!repo) return;
     // Was `${repo}/${filePath}` with no containment check and a silent catch:
     // the one call site that could walk out of the worktree, and the one that
@@ -418,6 +424,8 @@
           {onSave}
           {onDraftChange}
           {onRequestDiscard}
+          {revealTarget}
+          {onSendSelectionToAgent}
         />
       </div>
     {:else if viewMode === "split"}
@@ -436,6 +444,8 @@
             {onSave}
             {onDraftChange}
             {onRequestDiscard}
+            {revealTarget}
+            {onSendSelectionToAgent}
           />
         </div>
 

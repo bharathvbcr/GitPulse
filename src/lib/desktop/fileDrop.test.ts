@@ -69,6 +69,8 @@ describe("nativeShell file-drop wiring", () => {
     const source = readFileSync(new URL("./nativeShell.ts", import.meta.url), "utf8");
     expect(source).toContain("reduceFileDrop");
     expect(source).toContain("decision.dropped");
+    expect(source).toContain("terminalDropZones.dropAtCssPoint");
+    expect(source).toContain("terminalDropZones.hoverCssPoint");
     expect(source).not.toContain('event.payload.type === "enter" || event.payload.type === "over"');
   });
 });

@@ -20,7 +20,7 @@
  * made to repaint and a shell shows its next prompt.
  */
 
-import { get } from "svelte/store";
+import { get, writable, type Readable } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
@@ -40,6 +40,45 @@ type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>
 type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;
 
 const KEY_PREFIX = "detached:";
+const adoptionSettledStore = writable(false);
+const adoptedDrops = new Map<string, () => void>();
+
+/**
+ * Reactive latch set once `adoptDetachedSessions` finishes its cold-boot scan
+ * of `gitpulse-ptyd`, so split-layout hydration never prunes or deletes saved
+ * panes before detached sessions have been listed.
+ */
+export const detachedAdoptionSettled: Readable<boolean> = {
+  subscribe: adoptionSettledStore.subscribe,
+};
+
+/**
+ * Claims an adopted detached session directly into a split tab (releasing the
+ * `detached:` placeholder slot and its exit watcher without queueing a second
+ * task-terminal launch). Returns the adopted record's metadata when claimed.
+ */
+export function reclaimAdoptedSession(
+  sessionId: string,
+  registry: ReturnType<typeof createSessionRegistry> = terminalSessions,
+): { sessionId: string; repoPath: string; launcher: LauncherKind; title?: string } | null {
+  const adopted = get(registry).find(
+    (record) =>
+      isAdoptedSession(record) &&
+      record.sessionId === sessionId &&
+      Boolean(record.reveal) &&
+      !record.taskRunId,
+  );
+  if (!adopted || !adopted.sessionId) return null;
+  const drop = adoptedDrops.get(adopted.sessionId);
+  drop?.();
+  const launcher = LAUNCHERS.find((l) => l.kind === adopted.launcher)?.kind ?? "shell";
+  return {
+    sessionId: adopted.sessionId,
+    repoPath: adopted.repoPath,
+    launcher,
+    ...(adopted.title ? { title: adopted.title } : {}),
+  };
+}
 
 /**
  * Whether a record is an adopted session rather than a tab's own. Its
@@ -86,11 +125,13 @@ export function parseListing(raw: unknown): TerminalListing | null {
   const optional = (value: unknown) => value === null || text(value, 128);
   if (!text(row.id, 128) || !text(row.shell) || !text(row.cwd) || !text(row.repo)) return null;
   if (!optional(row.launcher) || !optional(row.run_id) || typeof row.detached !== "boolean") return null;
+  if (row.parent_session_id !== undefined && row.parent_session_id !== null && !text(row.parent_session_id, 128)) return null;
   return {
     id: row.id as string, shell: row.shell as string, cwd: row.cwd as string, repo: row.repo as string,
     launcher: (row.launcher as string | null) ?? null, run_id: (row.run_id as string | null) ?? null,
     detached: row.detached,
     ...(row.ending === true ? { ending: true } : {}),
+    ...(typeof row.parent_session_id === "string" ? { parent_session_id: row.parent_session_id } : {}),
   };
 }
 
@@ -163,10 +204,12 @@ function listDetached(
     drop();
   }
   function drop() {
+    adoptedDrops.delete(listing.id);
     unsubscribe?.(); unsubscribe = null;
     slot?.release(); slot = null;
   }
   slot.identify(listing.id);
+  adoptedDrops.set(listing.id, drop);
   unsubscribe = bus.subscribe(listing.id, {
     onOutput() {},
     onExit(event) {
@@ -240,22 +283,28 @@ export async function adoptDetachedSessions(deps: {
   const bus = deps.bus ?? tauriBus;
   const confirm = deps.confirm ?? askConfirm;
   const registry = deps.registry ?? terminalSessions;
-  const raw = await invoke<unknown>("cmd_terminal_sessions");
-  if (!Array.isArray(raw)) throw new Error("The terminal host returned an invalid session list.");
-  let adopted = 0;
-  for (const listing of raw.map(parseListing)) {
-    if (!listing?.detached) continue;
-    // Adopting twice must not list a session twice.
-    if (get(registry).some((record) => record.sessionId === listing.id)) continue;
-    // An attempt's terminal is re-opened as a task tab, which any checkout of
-    // its repository can host; a plain session is taken over in its own.
-    const family = listing.run_id && deps.familyOf ? await deps.familyOf(listing.repo).catch(() => null) : null;
-    if (get(registry).some((record) => record.sessionId === listing.id)) continue;
-    // Adopted past the limit if need be: the host holds the process either
-    // way, and a refused reserve aborted the loop, leaving every session after
-    // the first over-limit one running and unlisted.
-    listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
-    adopted += 1;
+  try {
+    const raw = await invoke<unknown>("cmd_terminal_sessions");
+    if (!Array.isArray(raw)) throw new Error("The terminal host returned an invalid session list.");
+    let adopted = 0;
+    for (const listing of raw.map(parseListing)) {
+      if (!listing?.detached) continue;
+      // Adopting twice must not list a session twice.
+      if (get(registry).some((record) => record.sessionId === listing.id)) continue;
+      // An attempt's terminal is re-opened as a task tab, which any checkout of
+      // its repository can host; a plain session is taken over in its own.
+      const family = listing.run_id && deps.familyOf ? await deps.familyOf(listing.repo).catch(() => null) : null;
+      if (get(registry).some((record) => record.sessionId === listing.id)) continue;
+      // Adopted past the limit if need be: the host holds the process either
+      // way, and a refused reserve aborted the loop, leaving every session after
+      // the first over-limit one running and unlisted.
+      listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
+      adopted += 1;
+    }
+    return adopted;
+  } finally {
+    if (!deps.registry || deps.registry === terminalSessions) {
+      adoptionSettledStore.set(true);
+    }
   }
-  return adopted;
 }

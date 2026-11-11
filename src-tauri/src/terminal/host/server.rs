@@ -327,6 +327,12 @@ impl Host {
                     reason: format!("this host could not open its transcript store: {why}"),
                 },
             }),
+            Request::Telemetry { session } => json(engine::session_telemetry(&self.engine, &session)),
+            Request::SetAgentMeta { session, meta } => {
+                self.engine.record_agent_meta_local(&session, meta);
+                json(())
+            }
+            Request::OrchestrationSnapshot => json(engine::hosted_session_snapshot(&self.engine)),
             Request::Wakeups { session } => json(engine::reader_wakeups(&self.engine, &session)),
             Request::Size { session } => json(engine::pty_size(&self.engine, &session)?),
             Request::Hold { session } => {
@@ -476,6 +482,9 @@ fn operation_label(request: &Request) -> &'static str {
         Request::Attach { .. } | Request::AttachTracked { .. } => "host_attach",
         Request::Context { .. } => "host_context",
         Request::Transcript { .. } => "host_transcript",
+        Request::Telemetry { .. } => "host_telemetry",
+        Request::SetAgentMeta { .. } => "host_agent_meta",
+        Request::OrchestrationSnapshot => "host_orchestration_snapshot",
         Request::List => "host_list",
         _ => "host_control",
     }

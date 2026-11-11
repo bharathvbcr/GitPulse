@@ -15,15 +15,19 @@
   import { explorerLens } from "../../files/explorerLens";
 
   let {
+    repoPath = null,
     selectedFile = null,
     revealRequest = null,
     onSelectFile,
     onPinFile,
+    onSelectMatch,
   }: {
+    repoPath?: string | null;
     selectedFile?: string | null;
     revealRequest?: { path: string; nonce: number } | null;
     onSelectFile?: (path: string) => void;
     onPinFile?: (path: string) => void;
+    onSelectMatch?: (path: string, line: number | null, column: number | null) => void;
   } = $props();
 
   const rail = $derived($explorerLens.rail);
@@ -36,7 +40,7 @@
 
 <div class="h-full flex flex-col min-h-0 overflow-hidden" data-explorer-rail={rail}>
   <div class="flex-1 min-h-0 flex flex-col" class:hidden={rail !== "files"}>
-    <FileTreePanel {selectedFile} {revealRequest} {onSelectFile} {onPinFile} />
+    <FileTreePanel {repoPath} {selectedFile} {revealRequest} {onSelectFile} {onPinFile} />
   </div>
   {#if searchMounted}
     <div
@@ -47,7 +51,7 @@
            compact layout the editor comes forward) — including a hit in the
            file already selected, which a bare store selection would not
            announce. -->
-      <ContentSearch onOpen={onSelectFile} />
+      <ContentSearch {repoPath} onOpen={onSelectFile} {onSelectMatch} />
     </div>
   {/if}
 </div>

@@ -216,6 +216,7 @@ pub async fn cmd_session_alerts_save(
         // has to actually remove the socket, or "off" would mean "still bound,
         // ignoring you".
         crate::alerts::bridge::apply(bridge);
+        crate::workbench::agy_plugin::apply_from_settings();
         Ok(SessionAlertsView {
             settings: crate::tool_config::session_alerts(),
             status: crate::alerts::status(),

@@ -856,3 +856,63 @@ describe("notify routes", () => {
     expect(problems(copy)).toContain("EVENTS has session_ended, which nothing routes");
   });
 });
+
+
+describe("gitpulse-terminal plugin skill contract", () => {
+  const skillMd = readFileSync(
+    path.join(PLUGIN, "skills", "gitpulse-terminal", "SKILL.md"),
+    "utf8",
+  );
+  const mcpModRs = readFileSync(path.join(ROOT, "src-tauri", "src", "mcp", "mod.rs"), "utf8");
+  const alertsBridgeRs = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "alerts", "bridge.rs"),
+    "utf8",
+  );
+  const terminalModRs = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "terminal", "mod.rs"),
+    "utf8",
+  );
+  const orchestrateRs = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "terminal", "orchestrate.rs"),
+    "utf8",
+  );
+
+  it("documents exact session capability environment variable names without drift", () => {
+    expect(skillMd).not.toContain("GITPULSE_TERMINAL_TOKEN");
+    expect(terminalModRs).toContain('TERMINAL_SESSION_ENV: &str = "GITPULSE_TERMINAL_SESSION"');
+    expect(alertsBridgeRs).toContain('SESSION_ENV: &str = "GITPULSE_SESSION_ID"');
+    expect(orchestrateRs).toContain('SESSION_TOKEN_ENV: &str = "GITPULSE_SESSION_TOKEN"');
+
+    expect(skillMd).toContain("GITPULSE_TERMINAL_SESSION");
+    expect(skillMd).toContain("GITPULSE_SESSION_ID");
+    expect(skillMd).toContain("GITPULSE_SESSION_TOKEN");
+  });
+
+  it("stays in lockstep with every gitpulse_terminal_* MCP tool registered in Rust", () => {
+    const mcpTools = new Set(
+      Array.from(mcpModRs.matchAll(/"(gitpulse_terminal_[a-z_]+)"/g), (m) => m[1]),
+    );
+    const skillTools = new Set(
+      Array.from(skillMd.matchAll(/`(gitpulse_terminal_[a-z_]+)`/g), (m) => m[1]),
+    );
+    expect(mcpTools.size).toBeGreaterThanOrEqual(6);
+    expect(Array.from(skillTools).sort()).toEqual(Array.from(mcpTools).sort());
+  });
+
+  it("names real Rust response fields on spawn, wait, read, send, and list", () => {
+    for (const field of [
+      "child_session_id",
+      "baseline_seq",
+      "matched_reason",
+      "timed_out",
+      "event_seq",
+      "lines_returned",
+      "total_lines",
+      "gate_checked",
+      "gate_notice",
+    ]) {
+      expect(orchestrateRs).toMatch(new RegExp(`(?:pub ${field}:|"${field}":)`));
+      expect(skillMd).toContain(`\`${field}\``);
+    }
+  });
+});

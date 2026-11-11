@@ -80,6 +80,12 @@ export function createSessionLifecycle(options: {
   hooks: SessionHooks;
   /** Native spawn reconnects this durable attempt; it can never create a successor. */
   singleAttempt?: boolean;
+  /**
+   * True when this start attaches to an already-running backend PTY rather than
+   * spawning a new process, so the registry adopts it without double-counting
+   * against the session ceiling.
+   */
+  adopting?: () => boolean;
   /** Panel-owned "bring this tab on screen"; see `TerminalSessionRecord.reveal`. */
   reveal?: () => void;
   /** Panel-owned question before a close; see `TerminalSessionRecord.confirmClose`. */
@@ -248,16 +254,17 @@ export function createSessionLifecycle(options: {
     let timedOut = false;
     try {
       if (!slot) {
+        const record = {
+          key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
+          ...(options.checkout ? { checkout: options.checkout } : {}),
+          ...(options.launcher ? { launcher: options.launcher } : {}),
+          reveal: options.reveal, confirmClose: options.confirmClose,
+          ...(options.title ? { title: options.title } : {}),
+          ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
+          ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
+        };
         try {
-          slot = registry.reserve({
-            key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
-            ...(options.checkout ? { checkout: options.checkout } : {}),
-            ...(options.launcher ? { launcher: options.launcher } : {}),
-            reveal: options.reveal, confirmClose: options.confirmClose,
-            ...(options.title ? { title: options.title } : {}),
-            ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
-            ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
-          });
+          slot = options.adopting?.() ? registry.adopt(record) : registry.reserve(record);
         } catch (error) {
           // Every slot is taken. A caller that can wait for one takes the
           // refusal back (nothing started, nothing to report); anyone else

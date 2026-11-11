@@ -385,3 +385,54 @@ fn the_entry_point_serves_only_sessions_gitpulse_launched() {
     assert!(matches!(run(&stop(SESSION)), Ok(ref output) if output.is_silent()));
     assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
 }
+
+#[test]
+fn antigravity_stop_claims_immediately_without_blocking_and_respects_user_cancel() {
+    let (_dir, mailbox) = mailbox();
+    let mut agy_stop = HookInput {
+        hook_event_name: "Stop".into(),
+        session_id: SESSION.into(),
+        is_agy: true,
+        termination_reason: "NO_TOOL_CALL".into(),
+        ..HookInput::default()
+    };
+
+    // Empty mailbox: returns immediately (0 ms poll) even when `wait` is 30 s.
+    let began = Instant::now();
+    let empty = run_in(&mailbox, &agy_stop, Duration::from_secs(30)).unwrap();
+    assert!(empty.is_silent(), "{empty:?}");
+    assert!(
+        began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+        "Antigravity synchronous Stop hook blocked on an empty mailbox"
+    );
+    assert_eq!(
+        empty.render_for_invocation("deliver", &agy_stop),
+        Some("{}".to_string())
+    );
+
+    // User-canceled turn leaves any pending message untouched in the mailbox.
+    mailbox
+        .deposit(SESSION, "r-agy", "Check the split diff", SystemTime::now())
+        .unwrap();
+    agy_stop.termination_reason = "USER_CANCELED".into();
+    let canceled = run_in(&mailbox, &agy_stop, Duration::from_secs(30)).unwrap();
+    assert!(canceled.is_silent(), "{canceled:?}");
+    assert_eq!(mailbox.pending(SESSION), 1);
+
+    // Normal turn completion claims the message once and emits Antigravity's
+    // `{"decision":"continue","reason":...}` JSON with exit code 0 (`Ok(...)`).
+    agy_stop.termination_reason = "NO_TOOL_CALL".into();
+    let claimed = run_in(&mailbox, &agy_stop, Duration::from_secs(30)).unwrap();
+    let rendered = claimed
+        .render_for_invocation("deliver", &agy_stop)
+        .expect("continue JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(parsed["decision"], "continue");
+    assert!(
+        parsed["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("Check the split diff")),
+        "{parsed}"
+    );
+    assert_eq!(mailbox.pending(SESSION), 0);
+}

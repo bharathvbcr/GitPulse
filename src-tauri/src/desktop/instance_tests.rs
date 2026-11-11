@@ -125,6 +125,12 @@ fn requests_are_bounded_before_anything_acts_on_them() {
             repo: "/r".into(),
             url: "http://localhost:5173/".into(),
         },
+        Request::AgentSessionMeta {
+            terminal_id: "term-123-1".into(),
+            agent: "agy".into(),
+            conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
+            artifact_dir: Some("/Users/dev/.gemini/antigravity/brain/ec33ebf9".into()),
+        },
     ];
     for request in ok {
         assert_eq!(request.validate(), Ok(()), "{request:?}");
@@ -180,6 +186,30 @@ fn requests_are_bounded_before_anything_acts_on_them() {
                 "http://localhost/{}",
                 "x".repeat(crate::browser::MAX_URL_CHARS)
             ),
+        },
+        Request::AgentSessionMeta {
+            terminal_id: String::new(),
+            agent: "agy".into(),
+            conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
+            artifact_dir: None,
+        },
+        Request::AgentSessionMeta {
+            terminal_id: "term-123-1".into(),
+            agent: "unknown".into(),
+            conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
+            artifact_dir: None,
+        },
+        Request::AgentSessionMeta {
+            terminal_id: "term-123-1".into(),
+            agent: "agy".into(),
+            conversation_id: "not-a-uuid".into(),
+            artifact_dir: None,
+        },
+        Request::AgentSessionMeta {
+            terminal_id: "term-123-1".into(),
+            agent: "agy".into(),
+            conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
+            artifact_dir: Some("relative/artifacts".into()),
         },
     ];
     for request in refused {
@@ -1316,7 +1346,7 @@ fn the_pool_never_starts_more_threads_than_the_mailbox_admits() {
     let pool = HandlerPool::new(shared.clone());
     let release = Arc::new(AtomicBool::new(false));
     let ran = Arc::new(AtomicUsize::new(0));
-    let jobs = MAX_HANDLERS + MAX_GATE_HANDLERS + 6;
+    let jobs = HandlerPool::MAX_WORKERS + 6;
     for _ in 0..jobs {
         let (release, ran) = (release.clone(), ran.clone());
         pool.submit(Box::new(move || {
@@ -1330,7 +1360,7 @@ fn the_pool_never_starts_more_threads_than_the_mailbox_admits() {
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
         shared.handler_threads.load(Ordering::Relaxed),
-        MAX_HANDLERS + MAX_GATE_HANDLERS
+        HandlerPool::MAX_WORKERS
     );
     release.store(true, Ordering::Release);
     let waited = Instant::now();
@@ -1998,4 +2028,49 @@ fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
     for worker in held {
         assert!(worker.join().unwrap().is_ok());
     }
+}
+
+#[test]
+fn terminal_orchestrate_roundtrips_over_the_mailbox_and_refuses_when_unattached() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let token = crate::terminal::orchestrate::mint_session_token().expect("token");
+    let call = crate::terminal::orchestrate::OrchestrateCall::List {
+        repo_path: "/repo".into(),
+        caller_session_id: "term-100-1".into(),
+        caller_token: token.clone(),
+    };
+
+    // Before `attach_terminal_orchestrate`, the owner fails closed with an explicit reason.
+    let unattached = secondary(dir.path()).orchestrate("req-unattached", call.clone());
+    assert!(
+        unattached
+            .as_ref()
+            .is_err_and(|e| e.contains("terminal orchestration is not attached")),
+        "unattached: {unattached:?}"
+    );
+
+    owner.attach_terminal_orchestrate(Arc::new(move |incoming| match incoming {
+        crate::terminal::orchestrate::OrchestrateCall::List {
+            repo_path,
+            caller_session_id,
+            caller_token,
+        } => {
+            assert_eq!(repo_path, "/repo");
+            assert_eq!(caller_session_id, "term-100-1");
+            assert_eq!(caller_token, token);
+            Ok(serde_json::json!({
+                "parent_session_id": caller_session_id,
+                "children": [],
+                "total": 0
+            }))
+        }
+        other => Err(format!("unexpected call: {other:?}")),
+    }));
+
+    let reply = secondary(dir.path())
+        .orchestrate("req-attached", call)
+        .expect("attached orchestrate succeeds");
+    assert_eq!(reply["total"], 0);
+    assert_eq!(reply["parent_session_id"], "term-100-1");
 }

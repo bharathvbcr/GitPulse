@@ -216,6 +216,8 @@ export interface TerminalListing {
   detached: boolean;
   /** Its terminal has closed but its process has not been reaped; it can be stopped, not shown. */
   ending?: boolean;
+  /** Parent session id when spawned as an Option A child session. */
+  parent_session_id?: string;
 }
 
 /**
@@ -249,4 +251,15 @@ export interface TerminalExitPayload {
    * outside. Mirrors `terminal::TerminalExitPayload::ended_by_gitpulse`.
    */
   ended_by_gitpulse: boolean;
+}
+
+/**
+ * Companion plan/task artifact read for an active Antigravity session
+ * (`cmd_terminal_read_agent_artifact`). Mirrors `terminal::AgentArtifactRead`.
+ */
+export interface AgentArtifactRead {
+  title: string;
+  absolute_path: string;
+  repo_relative_path: string | null;
+  content: string;
 }

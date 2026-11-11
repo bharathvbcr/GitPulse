@@ -2,6 +2,7 @@ import * as tauriEvent from "@tauri-apps/api/event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dispatchNativeMenu as _dispatchNativeMenu } from "./nativeActions";
 import { subscribeNativeShell, syncRecentMenu, takePendingOpen } from "./nativeShell";
+import { terminalDropZones } from "../terminal/dropZoneRegistry";
 
 type NativeListener = (event: any) => unknown;
 
@@ -202,6 +203,28 @@ describe("native shell integration", () => {
     await dragDropListener?.({ payload: { type: "enter", paths: ["/repo/error"] } });
     await dragDropListener?.({ payload: { type: "drop", paths: ["", "/repo/error"] } });
     expect(handlers.openError).toHaveBeenCalledWith("not-a-git-repo");
+  });
+
+  it("routes drops inside a registered terminal drop zone before falling back to openRepo", async () => {
+    const onDrop = vi.fn(() => true);
+    const unregister = terminalDropZones.register({
+      id: "pane-1",
+      getRect: () => ({ left: 100, top: 100, width: 300, height: 200 }),
+      isVisible: () => true,
+      onDrop,
+    });
+    try {
+      const handlers = buildHandlers();
+      await subscribeNativeShell(handlers);
+      await dragDropListener?.({ payload: { type: "enter", paths: ["/repo/src/a.ts"] } });
+      await dragDropListener?.({
+        payload: { type: "drop", paths: ["/repo/src/a.ts"], position: { x: 250, y: 200 } },
+      });
+      expect(onDrop).toHaveBeenCalledWith(["/repo/src/a.ts"], "center");
+      expect(handlers.openRepo).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
   });
 
   it("disposes already-mounted listeners when registration fails", async () => {

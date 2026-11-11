@@ -355,7 +355,11 @@ function driveOf(path: string): string | null {
  * comparing resolved segments says neither is. An absolute path on a
  * different Windows drive is refused for the same reason.
  */
-export function resolveRepoFile(repoPath: string, target: FileTarget): ResolvedFile | null {
+export function resolveRepoFile(
+  repoPath: string,
+  target: FileTarget,
+  cwdSubdir?: string | null,
+): ResolvedFile | null {
   if (!repoPath) return null;
   const rootSegments = normalizeSegments(repoPath);
   if (!rootSegments) return null;
@@ -372,6 +376,14 @@ export function resolveRepoFile(repoPath: string, target: FileTarget): ResolvedF
       if (segments[i] !== rootSegments[i]) return null;
     }
     segments = segments.slice(rootSegments.length);
+  } else if (cwdSubdir) {
+    if (isAbsolute(cwdSubdir)) return null;
+    const subSegments = normalizeSegments(cwdSubdir);
+    if (!subSegments) return null;
+    const combined =
+      subSegments.length > 0 ? `${subSegments.join("/")}/${target.path}` : target.path;
+    segments = normalizeSegments(combined);
+    if (!segments || segments.length === 0) return null;
   } else {
     segments = normalizeSegments(target.path);
     // `normalizeSegments` returns null exactly when `..` climbed out.
@@ -584,8 +596,23 @@ export function linksForRow(buffer: LinkBuffer, row: number): PositionedLink[] {
 
 export type LinkAction =
   | { kind: "url"; url: string }
-  | { kind: "file"; path: string; line: number | null; column: number | null }
+  | {
+      kind: "file";
+      path: string;
+      line: number | null;
+      column: number | null;
+      fallbackPath?: string;
+    }
   | { kind: "refused"; reason: string };
+
+function isExplicitCwdRelativePath(rawPath: string): boolean {
+  return (
+    rawPath.startsWith("./") ||
+    rawPath.startsWith(".\\") ||
+    rawPath.startsWith("../") ||
+    rawPath.startsWith("..\\")
+  );
+}
 
 /**
  * The single place that decides what clicking a link span is allowed to do.
@@ -601,7 +628,11 @@ export type LinkAction =
  * A refusal carries its reason so the UI can say why nothing happened.
  * Silence would be indistinguishable from a click that missed.
  */
-export function resolveLinkAction(text: string, repoPath: string): LinkAction {
+export function resolveLinkAction(
+  text: string,
+  repoPath: string,
+  cwdSubdir?: string | null,
+): LinkAction {
   const trimmed = text.trim();
   if (!trimmed) return { kind: "refused", reason: "Empty link." };
   // A path can never carry an http(s) scheme, so asking the URL question
@@ -609,8 +640,16 @@ export function resolveLinkAction(text: string, repoPath: string): LinkAction {
   if (isOpenableUrl(trimmed)) return { kind: "url", url: trimmed };
   const target = parseFileTarget(trimmed);
   if (target) {
-    const resolved = resolveRepoFile(repoPath, target);
-    if (resolved) return { kind: "file", ...resolved };
+    const resolved = resolveRepoFile(repoPath, target, cwdSubdir);
+    if (resolved) {
+      if (cwdSubdir && !isAbsolute(target.path) && !isExplicitCwdRelativePath(target.path)) {
+        const rootCandidate = resolveRepoFile(repoPath, target, null);
+        if (rootCandidate && rootCandidate.path !== resolved.path) {
+          return { kind: "file", ...resolved, fallbackPath: rootCandidate.path };
+        }
+      }
+      return { kind: "file", ...resolved };
+    }
     return {
       kind: "refused",
       reason: `${target.path} is outside this repository — GitPulse only opens files inside it.`,

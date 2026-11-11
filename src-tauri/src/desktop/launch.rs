@@ -152,6 +152,14 @@ pub fn establish() -> Launch {
 /// while this one was starting are delivered first.
 pub fn attach(app: &tauri::AppHandle) {
     if let Some(primary) = PRIMARY.get() {
+        let orchestrate_app = app.clone();
+        primary.attach_terminal_orchestrate(std::sync::Arc::new(move |call| {
+            use tauri::Manager as _;
+            let terminals = orchestrate_app.state::<crate::terminal::TerminalSessions>();
+            let ui =
+                crate::terminal::orchestrate::AppOrchestrateUiSink::new(orchestrate_app.clone());
+            crate::terminal::orchestrate::execute(&terminals, &ui, call)
+        }));
         let app = app.clone();
         primary.attach(move |request| super::answer_forwarded(&app, request));
     }

@@ -348,3 +348,45 @@ pub async fn cmd_manvi_run_action(
     })
     .await
 }
+
+/// Decodes a base64 PNG pasted from the user's clipboard into an owner-only
+/// (`0600`) scratch file so multimodal terminal agents (`claude`, `agy`, `codex`)
+/// can inspect it via `@path`.
+#[tauri::command(async)]
+pub async fn cmd_terminal_save_clipboard_image(
+    tab_id: String,
+    png_base64: String,
+) -> Result<String, IpcError> {
+    const MAX_BASE64_LEN: usize = 24 * 1024 * 1024;
+    if png_base64.is_empty() {
+        return Err("Clipboard image payload is empty.".into());
+    }
+    if png_base64.len() > MAX_BASE64_LEN {
+        return Err("Clipboard image exceeds 16 MiB.".into());
+    }
+    off_thread(move || {
+        use base64::Engine as _;
+        let trimmed = png_base64.trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .map_err(|e| CommandError::plain(format!("Invalid clipboard PNG base64: {e}")))?;
+        let path = crate::terminal::scratch_media::write_scratch_png("clipboard", &tab_id, &bytes)
+            .map_err(CommandError::plain)?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Reads the highest-priority Markdown plan or artifact from the artifact
+/// directory reported by an agent (`agy` / `claude`) running inside `session_id`.
+#[tauri::command(async)]
+pub async fn cmd_terminal_read_agent_artifact(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    hint_artifact_dir: Option<String>,
+) -> Result<crate::terminal::AgentArtifactRead, String> {
+    crate::terminal::control_async(&state, "terminal_read_agent_artifact", move |state| {
+        crate::terminal::read_agent_artifact(state, &session_id, hint_artifact_dir.as_deref())
+    })
+    .await
+}

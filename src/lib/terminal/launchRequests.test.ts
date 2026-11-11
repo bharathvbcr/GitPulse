@@ -157,3 +157,13 @@ it("retains the exact agent tab across page changes, updates its status, and for
   for (let i = 0; i < 30; i++) requests.remember({ id: `c${i}`, repoPath: "/c", launcher: "codex", status: "starting", reveal: revealA });
   expect(get(requests.sessions)).toHaveLength(16);
 });
+
+it("enqueues repository-contained file split requests and rejects traversal paths", async () => {
+  const requests = createTerminalLaunchRequests();
+  await expect(requests.requestFile("/repo", "../secret.txt")).rejects.toThrow("repository-relative");
+  const pending = requests.requestFile("/repo", "./src/lib/tabs.ts", 25, 3);
+  const claimed = requests.take("/repo");
+  expect(claimed).toMatchObject({ launcher: "file", filePath: "src/lib/tabs.ts", line: 25, column: 3 });
+  claimed?.complete();
+  await expect(pending).resolves.toBeUndefined();
+});

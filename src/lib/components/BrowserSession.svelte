@@ -25,7 +25,7 @@
    */
   import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
-  import { AlertCircle, ArrowLeft, ArrowRight, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { AlertCircle, ArrowLeft, ArrowRight, Camera, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
   import { pageZoom } from "../ui/uiScale";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -54,9 +54,10 @@
     onTitle,
     initialUrl,
     onUrl,
+    onSendToAgent,
   }: {
     tabId: string;
-    /** This tab's pane is the one (or one of the split two) on screen. */
+    /** This tab's pane is the one (or one of the split panes) on screen. */
     onscreen?: boolean;
     /** The page's title, for the tab strip. */
     onTitle?: (title: string) => void;
@@ -64,11 +65,14 @@
     initialUrl?: string;
     /** The address the page last loaded, for the tab (`setTabUrl`). */
     onUrl?: (url: string) => void;
+    /** Attaches a captured viewport PNG (`@path`) to the active coding agent. */
+    onSendToAgent?: (reference: string) => void;
   } = $props();
 
   let address = $state(lastAddress());
   let editing = $state(false);
   let loading = $state(false);
+  let capturing = $state(false);
   let error = $state<string | null>(null);
   let opened = $state(false);
   let occluded = $state(false);
@@ -304,6 +308,22 @@
     }
   }
 
+  /** Captures a native WKWebView PNG screenshot and attaches `@path` to the active agent. */
+  async function snapshotToAgent() {
+    if (!opened || capturing || !onSendToAgent) return;
+    capturing = true;
+    error = null;
+    try {
+      const pngPath = await browserIpc.snapshot(tabId);
+      const formattedPath = /\s/.test(pngPath) ? `"${pngPath}"` : pngPath;
+      onSendToAgent(`@${formattedPath} `);
+    } catch (cause) {
+      if (!disposed) error = `Could not capture snapshot: ${formatError(cause)}`;
+    } finally {
+      if (!disposed) capturing = false;
+    }
+  }
+
   export function reveal() {
     schedule();
     if (!opened) addressInput?.focus();
@@ -341,6 +361,18 @@
       onkeydown={onAddressKey}
     />
     <button type="submit" class="gp-btn py-0! text-[11px]!">{opened ? "Go" : "Open"}</button>
+    {#if onSendToAgent}
+      <button
+        type="button"
+        class="gp-icon-btn"
+        aria-label="Snapshot to agent"
+        title="Capture viewport screenshot and attach to active agent"
+        disabled={!opened || capturing}
+        onclick={() => void snapshotToAgent()}
+      >
+        {#if capturing}<LoaderCircle size={13} class="animate-spin" />{:else}<Camera size={13} />{/if}
+      </button>
+    {/if}
     <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
   {#if error}

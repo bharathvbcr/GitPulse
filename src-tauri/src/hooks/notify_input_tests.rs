@@ -27,7 +27,8 @@ fn the_walk_reads_what_a_whole_parse_reads() {
     for field in KEPT_FIELDS {
         let value = match field {
             "tool_input" => json!({"command": "ls", "file_path": "/a/b", "old_string": "q"}),
-            "workspace_roots" | "workspaceRoots" => json!(["/ws/one"]),
+            "toolCall" => json!({"name": "run_command", "args": {"CommandLine": "ls"}}),
+            "workspace_roots" | "workspaceRoots" | "workspacePaths" => json!(["/ws/one"]),
             "cursor_version" => json!("1.2.3"),
             _ => json!(format!("v-{field}")),
         };

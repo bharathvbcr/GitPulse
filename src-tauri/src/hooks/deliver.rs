@@ -121,6 +121,37 @@ pub(super) fn run_in(
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
         return Ok(HookOutput::silent());
     }
+    if input.is_agy {
+        // Antigravity runs hooks synchronously and blocks the agent loop until
+        // the hook exits (`docs/hooks.md`), so `deliver` must poll with a zero
+        // wait rather than holding the turn open for `DELIVER_WAIT`. A user
+        // cancellation or execution error is never overridden with a forced
+        // continuation; any queued message stays in the mailbox for the next
+        // normal stop.
+        if matches!(
+            input.termination_reason.as_str(),
+            "USER_CANCELED"
+                | "ERROR"
+                | "MAX_INVOCATIONS"
+                | "MAX_FORCED_INVOCATIONS"
+                | "MAX_TOKEN_BUDGET_EXCEEDED"
+                | "TERMINAL_CUSTOM_HOOK"
+        ) {
+            return Ok(HookOutput::silent());
+        }
+        return match mailbox.wait(&input.session_id, Duration::ZERO) {
+            Ok(Wait::Message(claim)) => Ok(HookOutput::stop_continue(reminder(&claim.text))),
+            Ok(Wait::TimedOut) => Ok(HookOutput::silent()),
+            Ok(Wait::Declined(why)) => {
+                log::debug!(target: "hook", "deliver did not wait: {why}");
+                Ok(HookOutput::silent())
+            }
+            Err(error @ (MailboxError::Insecure(_) | MailboxError::Io(_))) => Err(
+                HookError::Failed(format!("deliver could not use the mailbox: {error}")),
+            ),
+            Err(error) => Err(HookError::Failed(format!("deliver: {error}"))),
+        };
+    }
     // Every stop waits, `stop_hook_active` or not; see the module documentation.
     match mailbox.wait(&input.session_id, wait) {
         Ok(Wait::Message(claim)) => Err(HookError::Wake(reminder(&claim.text))),

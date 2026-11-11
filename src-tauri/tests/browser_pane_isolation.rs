@@ -960,6 +960,7 @@ mod mac {
                 gitpulse_lib::browser::commands::cmd_browser_navigate,
                 gitpulse_lib::browser::commands::cmd_browser_go,
                 gitpulse_lib::browser::commands::cmd_browser_close,
+                gitpulse_lib::browser::commands::cmd_browser_snapshot,
             ])
             .setup(move |app| {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;

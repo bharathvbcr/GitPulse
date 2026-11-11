@@ -102,6 +102,18 @@
     const keys = Object.keys(a);
     return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
   }
+
+  /**
+   * Whether a hex colour produced by `hexColor` carries sub-opaque alpha, so
+   * xterm only enables `allowTransparency` when the surface actually uses it
+   * (preserving the opaque WebGL fast-path on solid dark/light themes).
+   */
+  export function isTranslucentHexColor(value: string | undefined): boolean {
+    if (!value) return false;
+    if (/^#[0-9a-f]{4}$/i.test(value)) return value[4].toLowerCase() !== "f";
+    if (/^#[0-9a-f]{8}$/i.test(value)) return value.slice(7, 9).toLowerCase() !== "ff";
+    return false;
+  }
 </script>
 
 <script lang="ts">
@@ -112,10 +124,11 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
+  import { SerializeAddon } from "@xterm/addon-serialize";
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
+  import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink, FileText } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
@@ -128,6 +141,8 @@
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
   import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createRafWriteQueue } from "../terminal/rafWriteQueue";
+  import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
   import { createSyncFrameWriter } from "../terminal/syncFrames";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
@@ -136,6 +151,7 @@
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
   import { AGY_CONTINUE_SENTINEL, conversationForStart, hostedClaude, resolveTranscriptAnswer, resumers, settleConversation, unindexedExitOffer, type ExitFacts, type ResumeOutcome } from "../terminal/hostedAgent";
+  import { agentEvents } from "../terminal/agentEvents";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
     effectiveMode,
@@ -156,7 +172,7 @@
     rememberEndedTail,
     shouldReleaseEndedBuffer,
   } from "../terminal/endedBuffer";
-  import type { TerminalSpawned } from "../terminal/runResult";
+  import type { AgentArtifactRead, TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
   import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
@@ -173,8 +189,20 @@
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
   import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
+  import { clipboardImageToPngBase64, extractClipboardImageFile } from "../terminal/clipboardImage";
   import {
-    clampTerminalFontSize, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
+    createCommandBlockTracker,
+    extractBlockOutput,
+    extractLoopbackServerUrl,
+    parseOsc133,
+    parseOsc7501,
+    parseOsc7Path,
+    resolveOsc7Subdir,
+    type AgentOscStatus,
+  } from "../terminal/commandBlocks";
+  import { formatDroppedPathsForSession } from "../terminal/dropFormatting";
+  import {
+    agentPromptKeymap, clampTerminalFontSize, commandJumpChord, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
     terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
@@ -214,6 +242,9 @@
     onRefused,
     revealSelf,
     confirmCloseSelf,
+    onOpenFileSplit,
+    onOpenSnippetSplit,
+    onAgentStatus,
     title,
   }: {
     /** The repository tab hosting this session: its slot, its Sessions row, its close. */
@@ -262,6 +293,12 @@
     revealSelf?: () => void;
     /** The panel's question before a close; see `TerminalSessionRecord.confirmClose`. */
     confirmCloseSelf?: () => Promise<boolean>;
+    /** Opens a repository-relative file inside a split `TerminalFilePane` beside this terminal. */
+    onOpenFileSplit?: (path: string, line: number | null, column: number | null, fallbackPath?: string) => boolean;
+    /** Opens a read-only Markdown/text snippet inside a split `TerminalFilePane` beside this terminal. */
+    onOpenSnippetSplit?: (title: string, content: string) => boolean;
+    /** Reports Herdr-compatible OSC 7501 agent status updates for the tab badge. */
+    onAgentStatus?: (status: AgentOscStatus | null) => void;
     /** What this session is about (a task title), for the Sessions list. */
     title?: string;
   } = $props();
@@ -322,14 +359,45 @@
   let opened = $state(false);
   /** How this session draws now; on the container as `data-renderer`. */
   let renderer = $state<GpuState>("dom");
+  /** Live repository-relative directory from OSC 7 (`""` for root, `null` when outside repo or unknown). */
+  let activeCwdSubdir = $state<string | null>(untrack(() => startDir ?? null));
+  /** Latest loopback dev-server URL observed in this session's output. */
+  let devServerUrl = $state<string | null>(null);
+  let dismissedDevServerUrl = $state<string | null>(null);
+  /** Live artifact directory reported by Antigravity `SessionStart`, when present. */
+  let agentArtifactDir = $state<string | null>(null);
+  let lastExitCode = $state<number | null>(null);
+  const commandBlocks = createCommandBlockTracker();
+  const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+
+  async function openAgentArtifact() {
+    if (!nativeSessionId) return;
+    try {
+      const artifact = await invoke<AgentArtifactRead>("cmd_terminal_read_agent_artifact", {
+        sessionId: nativeSessionId,
+        hintArtifactDir: agentArtifactDir ?? hostedClaude.byTerminal(nativeSessionId)?.artifactDir ?? null,
+      });
+      if (artifact.repo_relative_path && onOpenFileSplit?.(artifact.repo_relative_path, 1, null)) {
+        return;
+      }
+      if (onOpenSnippetSplit?.(artifact.title, artifact.content)) {
+        return;
+      }
+      warning = "Could not open agent plan beside this terminal.";
+    } catch (err) {
+      warning = `Could not open agent plan: ${formatError(err)}`;
+    }
+  }
 
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
   let gpu: GpuRenderer | null = null;
+  let stopAgentMeta: (() => void) | null = null;
   /** Frame pacing on request from the program in this terminal (OSC 7700). */
   const frameProbe = createFrameProbe();
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
+  let serializeAddon: SerializeAddon | null = null;
   let searchKey: string | null = null;
   let linkProvider: { dispose(): void } | null = null;
   let stopResize: (() => void) | null = null;
@@ -365,6 +433,7 @@
     if (sameTheme(appliedTheme, next)) return;
     appliedTheme = next;
     term.options.theme = next;
+    gpu?.clearAtlas();
   }
 
   /**
@@ -414,29 +483,42 @@
    * reason is the only thing that tells the user the output asked for
    * something GitPulse will not do.
    */
-  async function activateLink(text: string) {
+  function resolveLinkInSession(text: string) {
+    if (activeCwdSubdir) {
+      const subAction = resolveLinkAction(text, workPath, activeCwdSubdir);
+      if (subAction.kind !== "refused") return subAction;
+    }
+    return resolveLinkAction(text, workPath);
+  }
+
+  async function activateLink(text: string, event?: MouseEvent) {
     const action = resolveLinkAction(text, workPath);
-    if (action.kind === "refused") {
-      warning = action.reason;
+    const resolved = activeCwdSubdir && action.kind !== "url" ? resolveLinkInSession(text) : action;
+    if (resolved.kind === "refused") {
+      warning = resolved.reason;
       return;
     }
-    if (action.kind === "url") {
+    if (resolved.kind === "url") {
       // A local dev server opens in a browser session beside this terminal,
       // where an agent can be pointed at it; anything else, or a session that
       // cannot open, goes to the system browser as before.
-      if (opensInBrowserSession(action.url)) {
+      if (opensInBrowserSession(resolved.url)) {
         try {
-          await terminalLaunchRequests.requestBrowser(repoPath, action.url);
+          await terminalLaunchRequests.requestBrowser(repoPath, resolved.url);
           return;
         } catch (err) {
-          warning = `${action.url} opened in your browser: a browser session could not (${formatError(err)}).`;
+          warning = `${resolved.url} opened in your browser: a browser session could not (${formatError(err)}).`;
         }
       }
       try {
-        await openExternal(action.url);
+        await openExternal(resolved.url);
       } catch (err) {
-        warning = `Could not open ${action.url}: ${formatError(err)}`;
+        warning = `Could not open ${resolved.url}: ${formatError(err)}`;
       }
+      return;
+    }
+    const jumpToCodeView = Boolean(event?.metaKey || event?.ctrlKey);
+    if (!jumpToCodeView && onOpenFileSplit?.(resolved.path, resolved.line, resolved.column, resolved.fallbackPath)) {
       return;
     }
     // `selectFilePath` acts on whichever repository tab is active, so a click
@@ -450,7 +532,7 @@
       let ready = false;
       const opened = await repoStore.openRepo(checkout, { onReady: () => { ready = true; } });
       if (!opened || !ready) {
-        warning = `Could not open ${checkout.split(/[\\/]/).pop()} to show ${action.path}.`;
+        warning = `Could not open ${checkout.split(/[\\/]/).pop()} to show ${resolved.path}.`;
         return;
       }
     } else if (!checkout && activePath !== repoPath) {
@@ -460,8 +542,8 @@
     // Recorded before the selection, so the request is already waiting when
     // the viewer mounts and reads the file. A reference with no line simply
     // opens the file, which is why an unusable request is not an error here.
-    requestReveal(action.path, action.line, action.column);
-    repoStore.selectFilePath(action.path);
+    requestReveal(resolved.path, resolved.line, resolved.column);
+    repoStore.selectFilePath(resolved.path);
     repoStore.setActiveTab("code");
   }
 
@@ -472,7 +554,7 @@
 
   /** Hover text for a link, so the target is readable before it is clicked. */
   function linkTitle(text: string): string {
-    const action = resolveLinkAction(text, workPath);
+    const action = resolveLinkInSession(text);
     if (action.kind === "url") {
       return opensInBrowserSession(action.url)
         ? `Open ${action.url} in a browser session (the address bar's ↗ opens it in your browser)`
@@ -480,7 +562,9 @@
     }
     if (action.kind === "file") {
       const at = action.line === null ? "" : ` (line ${action.line}${action.column === null ? "" : `, column ${action.column}`})`;
-      return `Open ${action.path}${at}`;
+      return onOpenFileSplit
+        ? `Open ${action.path}${at} beside terminal (${platformChord("⌘-click", "Ctrl+click", $hostPlatform.os)} for Code view)`
+        : `Open ${action.path}${at}`;
     }
     return action.reason;
   }
@@ -508,7 +592,7 @@
       // renderer, which an on-screen session now uses (`gpuRenderer.ts`); the
       // DOM renderer a hidden or lost session falls back to draws the
       // background as a plain CSS colour.
-      allowTransparency: true,
+      allowTransparency: isTranslucentHexColor(termTheme().background),
       scrollback: sessionScrollback(),
       // Wheel feel: see `terminal/scrollFeel.ts` and docs/PERFORMANCE.md (2026-11-06).
       ...scrollFeelOptions(get(interfaceStore).terminalSmoothWheel),
@@ -522,7 +606,7 @@
        * detected-span path, and only one of the two is a GitPulse decision.
        */
       linkHandler: {
-        activate: (_event, text) => { void activateLink(text); },
+        activate: (event, text) => { void activateLink(text, event); },
         allowNonHttpProtocols: false,
       },
     });
@@ -539,6 +623,8 @@
     created.loadAddon(fitAddon);
     searchAddon = new SearchAddon({ highlightLimit: SEARCH_HIGHLIGHT_LIMIT });
     created.loadAddon(searchAddon);
+    serializeAddon = new SerializeAddon();
+    created.loadAddon(serializeAddon);
     searchAddon.onDidChangeResults((result) => {
       resultIndex = result.resultIndex;
       resultCount = result.resultCount;
@@ -560,11 +646,11 @@
           // already decided against, and a user who clicks twice learns to
           // distrust the underline rather than the output.
           const found = linksForRow(linkBuffer(created), bufferLineNumber)
-            .filter((link) => resolveLinkAction(link.text, workPath).kind !== "refused");
+            .filter((link) => resolveLinkInSession(link.text).kind !== "refused");
           callback(found.length ? found.map((link) => ({
             range: link.range,
             text: link.text,
-            activate: (_event, text) => { void activateLink(text); },
+            activate: (event, text) => { void activateLink(text, event); },
             hover: () => { hoveredLink = linkTitle(link.text); },
             leave: () => { hoveredLink = null; },
           })) : undefined);
@@ -599,6 +685,30 @@
     created.parser.registerOscHandler(FRAME_PROBE_OSC, (payload) => {
       const reply = handleFrameProbeCommand(frameProbe, payload);
       if (reply) created.input(reply, false);
+      return true;
+    });
+    created.parser.registerOscHandler(7, (payload) => {
+      const oscPath = parseOsc7Path(payload);
+      if (oscPath) {
+        activeCwdSubdir = resolveOsc7Subdir(workPath, oscPath);
+      }
+      return true;
+    });
+    created.parser.registerOscHandler(133, (payload) => {
+      const mark = parseOsc133(payload);
+      if (mark) {
+        commandBlocks.onMark(mark, () => created.registerMarker(0));
+        if (mark.kind === "command_finished") {
+          lastExitCode = mark.exitCode;
+        } else if (mark.kind === "command_executed") {
+          lastExitCode = null;
+        }
+      }
+      return true;
+    });
+    created.parser.registerOscHandler(7501, (payload) => {
+      const parsed = parseOsc7501(payload);
+      if (parsed) onAgentStatus?.(parsed.state === "clear" ? null : parsed);
       return true;
     });
     created.onResize(({ cols, rows }) => {
@@ -646,6 +756,21 @@
   }
 
   /**
+   * Frame-budgeted write coalescer: merges whole DEC ?2026-safe chunks emitted
+   * inside one animation frame into a single `term.write` call (with a 16 ms
+   * backstop timer so hidden windows still return PTY output credit).
+   */
+  const rafWrites = createRafWriteQueue({
+    write(bytes, written) {
+      if (!term || disposed) throw new Error("the terminal is closed");
+      term.write(bytes, written);
+    },
+    onError(err) {
+      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+    },
+  });
+
+  /**
    * Every byte the emulator is given as output goes through here, so each
    * write ends outside a DEC 2026 block (see `syncFrames.ts`: xterm drops the
    * paint of a frame whose successor has opened by the time its animation
@@ -654,7 +779,7 @@
   const syncFrames = createSyncFrameWriter({
     write(bytes, written) {
       if (!term || disposed) throw new Error("the terminal is closed");
-      term.write(bytes, written);
+      rafWrites.enqueue(bytes, written);
     },
     onError(err) {
       lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
@@ -876,6 +1001,7 @@
     return createSessionLifecycle({
       key: tabId, repoPath, ...(checkout ? { checkout } : {}), label: launcherLabel(launcher), launcher, bus: ptyBus, registry: terminalSessions,
       singleAttempt: !!taskRunId,
+      adopting: () => !taskRunId && attachPending !== null,
       reveal: revealSelf,
       confirmClose: confirmCloseSelf,
       title,
@@ -954,8 +1080,17 @@
       hooks: {
         state(status, message) {
           spawning = status === "starting";
-          if (spawning) withdrawOffer();
+          if (spawning) {
+            withdrawOffer();
+            onAgentStatus?.(null);
+            devServerUrl = null;
+            dismissedDevServerUrl = null;
+            agentArtifactDir = null;
+            stopAgentMeta?.();
+            stopAgentMeta = null;
+          }
           exited = status === "exited";
+          if (exited) onAgentStatus?.(null);
           error = status === "error" ? message ?? "Terminal failed" : null;
           onStatus(status);
           if (taskRunId) reportAttemptStart(taskRunId, status, message);
@@ -973,6 +1108,30 @@
             hostedClaude.bind(hostedId, spawned.id);
             hostedLive = true;
           }
+          const rememberedMeta = hostedClaude.byTerminal(spawned.id);
+          if (rememberedMeta?.artifactDir) {
+            agentArtifactDir = rememberedMeta.artifactDir;
+          }
+          stopAgentMeta?.();
+          stopAgentMeta = agentEvents.subscribeAgentMeta(spawned.id, (meta) => {
+            if (disposed || nativeSessionId !== spawned.id) return;
+            if (meta.artifact_dir) agentArtifactDir = meta.artifact_dir;
+            if ((launcher === "claude" || launcher === "agy") && !taskRunId) {
+              const bound = hostedClaude.bindAgentMeta({
+                terminalId: spawned.id,
+                sessionId: meta.conversation_id,
+                provider: meta.agent === "agy" || launcher === "agy" ? "agy" : "claude",
+                repoPath: workPath,
+                startDir: startDir ?? null,
+                mode: permissionMode,
+                artifactDir: meta.artifact_dir ?? null,
+              });
+              if (bound) {
+                hostedId = bound.sessionId;
+                hostedLive = true;
+              }
+            }
+          });
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
           // A session taken over after a reload was already recorded as
@@ -1001,11 +1160,21 @@
             lifecycle?.fail(decision.failure, true);
           }
           if (!disposed) {
+            if ($hostPlatform.browser_sessions && bytes.length > 0 && bytes.length <= 16_384) {
+              const decoded = outputTextDecoder.decode(bytes, { stream: true });
+              const readyUrl = extractLoopbackServerUrl(decoded);
+              if (readyUrl && readyUrl !== devServerUrl) {
+                devServerUrl = readyUrl;
+              }
+            }
             sessionActivity.output(sessionId);
             if (!active) onActivity();
           }
         },
         exit(event) {
+          stopAgentMeta?.();
+          stopAgentMeta = null;
+          agentEvents.forgetAgentMeta(event.id);
           // GitPulse's own Close does reach here when its exit event lands
           // before the close is acknowledged, and it says so
           // (`ended_by_gitpulse`): only a signal from outside leaves a
@@ -1013,6 +1182,7 @@
           settleHosted(event, event.id);
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
           syncFrames.flush();
+          rafWrites.flushSync();
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
         // The close was acknowledged; its exit event may not come at all.
@@ -1021,6 +1191,7 @@
           return new Promise<void>((resolve) => {
             if (!term || disposed) { resolve(); return; }
             syncFrames.flush();
+            rafWrites.flushSync();
             term.write("", () => {
               if (!disposed) { term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
               resolve();
@@ -1035,6 +1206,7 @@
         skipped() {
           if (!term || disposed) return;
           syncFrames.flush();
+          rafWrites.flushSync();
           syncFrames.push(CAN, () => {});
         },
         admitted() { onAdmitted?.(); },
@@ -1158,13 +1330,77 @@
     warning = await copyText(retainedOutput()) ? null : "Could not copy retained terminal output.";
   }
 
+  export function lastCommandOutput(): { output: string; exitCode: number | null } | null {
+    const buffer = term?.buffer.normal;
+    if (!buffer) return null;
+    const block = commandBlocks.lastCompletedBlock();
+    if (!block) return null;
+    const output = extractBlockOutput(buffer, block);
+    return { output, exitCode: block.exitCode };
+  }
+
+  export async function copyLastCommandOutput(): Promise<boolean> {
+    const last = lastCommandOutput();
+    if (!last || !last.output.trim()) {
+      warning = "No completed command output recorded yet.";
+      return false;
+    }
+    const ok = await copyText(last.output);
+    warning = ok ? null : "Could not copy last command output.";
+    return ok;
+  }
+
   export async function exportOutput() {
     try { await invoke<boolean>("cmd_terminal_export", { data: retainedOutput() }); }
     catch (err) { if (!disposed) warning = formatError(err); }
   }
 
+  export function serializeVisualOutput(): string {
+    try {
+      return serializeAddon?.serialize() ?? retainedOutput();
+    } catch {
+      return retainedOutput();
+    }
+  }
+
+  /** Suppresses intermediate SIGWINCH storms while a dock or split sash is actively dragged. */
+  export function setDragging(dragging: boolean) {
+    fits.setDragging(dragging);
+  }
+
+  /** Injects text (file `@path` reference, selection range, or dropped paths) into the live PTY. */
+  export function insertText(text: string, options?: { focus?: boolean }): boolean {
+    if (!text || disposed || exited) return false;
+    if (term) {
+      if (launcher === "shell" && term.modes.bracketedPasteMode) {
+        term.paste(planPaste(text, true).text);
+      } else {
+        term.input(text, true);
+      }
+      if (options?.focus !== false) term.focus();
+      return true;
+    }
+    if (lifecycle) {
+      lifecycle.write(text);
+      return true;
+    }
+    return false;
+  }
+
+  export function isLive(): boolean {
+    return !disposed && !exited;
+  }
+
+  export function backendSessionId(): string | null {
+    return nativeSessionId || null;
+  }
+
   /** Called by the panel when this tab becomes visible again. */
   export function reveal() {
+    // Measure immediately if the pane already has a layout box so the first
+    // visible frame paints the real grid rather than a 1-frame stale size;
+    // `fits.settle()` then confirms on the next animation frame.
+    fitNow();
     // After the layout that shows this pane (next frame, before it paints),
     // once: the box has its real size by then, and the observer's own fit for
     // the same change finds the grid already right.
@@ -1256,6 +1492,20 @@
 
   export function handleViewChord(event: KeyboardEvent): boolean {
     if (!active || event.defaultPrevented) return false;
+    const jump = commandJumpChord(
+      event,
+      $hostPlatform.os,
+      term?.buffer.active.type === "alternate",
+    );
+    if (jump && term) {
+      const targetLine = commandBlocks.jumpTarget(term.buffer.active.viewportY, jump);
+      if (targetLine !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        term.scrollToLine(targetLine);
+        return true;
+      }
+    }
     const chord = terminalViewChord(event, $hostPlatform.os);
     if (!chord) return false;
     event.preventDefault();
@@ -1268,6 +1518,7 @@
 
   export function clearScrollback() {
     searchAddon?.clearDecorations();
+    commandBlocks.clear();
     term?.clear();
     if (findOpen) runFind(false, true);
     else if (active) term?.focus();
@@ -1337,9 +1588,34 @@
      */
     const onPasteCapture = (event: Event) => {
       if (!(event instanceof ClipboardEvent) || !host || !(event.target instanceof Node) || !host.contains(event.target)) return;
-      const raw = event.clipboardData?.getData("text/plain");
       const current = term;
-      if (raw === undefined || !current) return;
+      if (!current) return;
+      const imageFile = extractClipboardImageFile(event.clipboardData);
+      if (imageFile) {
+        event.preventDefault();
+        event.stopPropagation();
+        void clipboardImageToPngBase64(imageFile)
+          .then((pngBase64) =>
+            invoke<string>("cmd_terminal_save_clipboard_image", {
+              tabId,
+              pngBase64,
+            }),
+          )
+          .then((savedPath) => {
+            if (disposed || term !== current) return;
+            const formatted = formatDroppedPathsForSession([savedPath], {
+              launcher,
+              repoPath: workPath,
+            });
+            insertText(formatted, { focus: true });
+          })
+          .catch((err) => {
+            if (!disposed) warning = `Could not paste clipboard image: ${formatError(err)}`;
+          });
+        return;
+      }
+      const raw = event.clipboardData?.getData("text/plain");
+      if (raw === undefined) return;
       event.preventDefault();
       event.stopPropagation();
       const plan = planPaste(raw, current.modes.bracketedPasteMode);
@@ -1364,9 +1640,12 @@
           return;
         }
         // Before the erase guard: ⌘⌫ is a Backspace keydown, and the guard
-        // would send it as a single DEL.
+        // would send it as a single DEL. Shift+Enter sends ESC CR for
+        // multi-line prompts in coding agent TUIs and normal-screen shells.
+        const alternateScreen = term?.buffer.active.type === "alternate";
         const edit = event.type === "keydown"
-          ? macLineEditing(event, $hostPlatform.os, term?.buffer.active.type === "alternate")
+          ? (macLineEditing(event, $hostPlatform.os, alternateScreen) ??
+             agentPromptKeymap(event, launcher, alternateScreen))
           : null;
         if (edit !== null) {
           target.value = "";
@@ -1488,11 +1767,14 @@
       withdrawOffer();
       if (hostedId && !hostedLive) hostedClaude.forget(hostedId);
       syncFrames.discard();
+      rafWrites.discard();
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       // Before `lifecycle` goes: nothing owed waits for a frame this view
       // will not see, and a failure is still reported against the session.
       acks.flush();
       if (nativeSessionId) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
+      stopAgentMeta?.();
+      stopAgentMeta = null;
       lifecycle?.dispose();
       lifecycle = null;
       linkProvider?.dispose();
@@ -1507,10 +1789,12 @@
       gpu?.dispose();
       gpu = null;
       frameProbe.stop();
+      commandBlocks.clear();
       term?.dispose();
       term = null;
       fitAddon = null;
       searchAddon = null;
+      serializeAddon = null;
     };
   });
 
@@ -1570,6 +1854,7 @@
         // hidden dock was fitted to a sliver would discard the wrapped rows
         // above that sliver, which reflow back onto the last screen.
         if (endedReleased) return;
+        if (serializeAddon) scrollbackSnapshots.capture(id, () => serializeAddon!.serialize());
         const tail = clipEndedTail(retainedOutput());
         if (tail) rememberEndedTail(id, tail);
         endedReleased = true;
@@ -1582,8 +1867,13 @@
       endedReleased = false;
       // A restart or resume cleared the screen on purpose; the old tail is not
       // this session's output.
+      const visual = scrollbackSnapshots.take(id);
       if (!exited) { forgetEndedTail(id); return; }
       if (retainedOutput().trim()) return;
+      if (visual) {
+        current.write(visual);
+        return;
+      }
       const tail = endedTail(id);
       // convertEol is off, and retainedOutput joins lines with a bare \n.
       if (tail) current.write(tail.replace(/\r?\n/g, "\r\n"));
@@ -1823,8 +2113,48 @@
         <ExternalLink size={11} class="text-accent shrink-0" aria-hidden="true" />
         <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
-        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
+        {@const liveSubdir = activeCwdSubdir ?? startDir ?? ""}
+        <span class="w-1.5 h-1.5 rounded-full {lastExitCode !== null && lastExitCode !== 0 ? 'bg-rose-400' : 'bg-emerald-400'} shrink-0" aria-hidden="true"></span>
+        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Working directory ${liveSubdir ? `${workPath}/${liveSubdir}` : (startedIn || workPath)}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{liveSubdir ? `/${liveSubdir}` : ""}</span>
+        {#if lastExitCode !== null && lastExitCode !== 0}
+          <span class="text-[10px] font-mono text-rose-300 shrink-0" title="Last command exit status">exit {lastExitCode}</span>
+        {/if}
+        {#if devServerUrl && devServerUrl !== dismissedDevServerUrl && $hostPlatform.browser_sessions}
+          {@const previewPort = (() => { try { return new URL(devServerUrl).port; } catch { return ""; } })()}
+          <span class="inline-flex items-center gap-0.5 shrink-0">
+            <button
+              type="button"
+              class="gp-btn py-0! px-1.5! text-[10px]! text-accent border-accent/40 bg-accent/10 flex items-center gap-1"
+              data-testid="terminal-dev-server-preview"
+              title={`Open ${devServerUrl} in a split browser session`}
+              onclick={() => devServerUrl && void terminalLaunchRequests.requestBrowser(repoPath, devServerUrl)}
+            >
+              <ExternalLink size={10} />
+              <span>Preview {previewPort ? `:${previewPort}` : "app"}</span>
+            </button>
+            <button
+              type="button"
+              class="gp-icon-btn p-0.5!"
+              aria-label="Dismiss preview suggestion"
+              title="Dismiss preview suggestion"
+              onclick={() => { dismissedDevServerUrl = devServerUrl; }}
+            >
+              <X size={10} />
+            </button>
+          </span>
+        {/if}
+        {#if agentArtifactDir}
+          <button
+            type="button"
+            class="gp-btn py-0! px-1.5! text-[10px]! text-accent border-accent/40 bg-accent/10 flex items-center gap-1 shrink-0"
+            data-testid="terminal-open-agent-plan"
+            title="Open this agent's active Markdown plan or artifact beside the terminal"
+            onclick={() => void openAgentArtifact()}
+          >
+            <FileText size={10} />
+            <span>Open plan</span>
+          </button>
+        {/if}
       {/if}
       {#if renderer === "reset" || renderer === "lost"}
         <!-- A lost WebGL context is not blank (the DOM renderer is already

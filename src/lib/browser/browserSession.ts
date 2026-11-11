@@ -36,6 +36,7 @@ export const browserIpc = {
   navigate: (id: string, url: string) => invoke<void>("cmd_browser_navigate", { id, url }),
   go: (id: string, to: HistoryStep) => invoke<void>("cmd_browser_go", { id, to }),
   close: (id: string) => invoke<void>("cmd_browser_close", { id }),
+  snapshot: (id: string) => invoke<string>("cmd_browser_snapshot", { id }),
 };
 
 /** The longest page text taken from an event; the backend caps it too. */

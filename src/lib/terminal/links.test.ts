@@ -579,4 +579,39 @@ describe("logicalLineAt / linksForRow", () => {
       { x: 1, y: 2 }, { x: 2, y: 2 }, { x: 3, y: 2 },
     ]);
   });
+
+  it("resolves relative paths against OSC 7 cwdSubdir while still refusing escapes above repoPath", () => {
+    expect(resolveLinkAction("./Button.svelte:18", "/Users/dev/repo", "packages/ui/src")).toEqual({
+      kind: "file",
+      path: "packages/ui/src/Button.svelte",
+      line: 18,
+      column: null,
+    });
+    expect(
+      resolveLinkAction("src/lib/main.rs:42", "/Users/dev/repo", "packages/ui"),
+    ).toEqual({
+      kind: "file",
+      path: "packages/ui/src/lib/main.rs",
+      fallbackPath: "src/lib/main.rs",
+      line: 42,
+      column: null,
+    });
+    expect(resolveLinkAction("../../../README.md:4", "/Users/dev/repo", "packages/ui/src")).toEqual({
+      kind: "file",
+      path: "README.md",
+      line: 4,
+      column: null,
+    });
+    expect(
+      resolveLinkAction("../../../../etc/passwd:1", "/Users/dev/repo", "packages/ui/src").kind,
+    ).toBe("refused");
+    expect(
+      resolveLinkAction("/Users/dev/repo/Cargo.toml:2", "/Users/dev/repo", "packages/ui/src"),
+    ).toEqual({
+      kind: "file",
+      path: "Cargo.toml",
+      line: 2,
+      column: null,
+    });
+  });
 });
