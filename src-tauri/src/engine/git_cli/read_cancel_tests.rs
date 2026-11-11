@@ -72,10 +72,14 @@ impl Drop for Reaper {
 
 struct Rig {
     gate: &'static SpawnGate,
+    // Fields drop in declaration order. The reaper reads the pids file, which
+    // lives in `_dir`, so it has to run first: declared after `_dir` it found
+    // the directory already gone, killed nothing, and every child a test left
+    // running lived on until its read's own deadline.
+    _reaper: Reaper,
     _dir: tempfile::TempDir,
     cwd: PathBuf,
     pids: PathBuf,
-    _reaper: Reaper,
 }
 
 impl Rig {
@@ -411,6 +415,13 @@ fn a_cancel_racing_the_reads_end_loses_cleanly() {
 #[test]
 fn a_burst_of_superseded_clicks_leaves_one_child_running() {
     const CLICKS: usize = 8;
+    // An uncancelled child must outlive the whole burst plus the window the
+    // test watches it for. Both stretch with host load (`gone_within` is
+    // relaxed by up to 4x, and each spawn records itself through `ps`), so a
+    // fixed `sleep 20` ran out inside the window on a busy host and the
+    // "nothing cancelled it" arm saw a child leave on its own. The children
+    // are reaped by pid when the rig drops, so a long life costs nothing.
+    let lifetime = (gone_within() * 4 + Duration::from_secs(120)).as_secs();
     let arm = |cancellable: bool| {
         let rig = Rig::new(CLICKS + 2);
         let began = Instant::now();
@@ -419,7 +430,7 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
             let id = format!("rc-burst-{cancellable}-{click}");
             readers.push(rig.read(
                 cancellable.then_some(id.as_str()),
-                rig.script(&format!("click{click}"), "exec sleep 20"),
+                rig.script(&format!("click{click}"), &format!("exec sleep {lifetime}")),
             ));
             rig.wait_started(click + 1);
             if click > 0 && cancellable {
