@@ -717,6 +717,7 @@
                     <div class="subtask-add-row" data-testid="task-subtask-add-row">
                       <input
                         class="gp-field subtask-add-input"
+                        data-size="sm"
                         data-testid="task-subtask-add-input"
                         bind:value={newSubtask}
                         disabled={enhancementBusy}
@@ -925,7 +926,7 @@
   .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs)}
   .subtask-remove:hover{color:rgb(var(--c-text))}
   .subtask-add-row{display:flex;gap:6px;align-items:center}
-  .subtask-add-input{flex:1;font-size:var(--text-meta);padding:5px 8px}
+  .subtask-add-input{flex:1;font-size:var(--text-meta)}
   
   .criteria-raw-label{margin-bottom:0}
 </style>

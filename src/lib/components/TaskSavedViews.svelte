@@ -112,7 +112,7 @@
         </div>
       {/each}
       <form class="save" onsubmit={save}>
-        <input class="gp-field" aria-label="View name" placeholder="Name this view" maxlength={MAX_VIEW_NAME} bind:value={name} />
+        <input class="gp-field" data-size="sm" aria-label="View name" placeholder="Name this view" maxlength={MAX_VIEW_NAME} bind:value={name} />
         <button type="submit" class="gp-btn">Save</button>
       </form>
       <p class="note" role="status" class:failed>{message}</p>
@@ -128,7 +128,7 @@
   .apply[aria-pressed="true"]{color:rgb(var(--c-accent));font-weight:600}
   .apply:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
   .save{display:flex;gap:4px;padding-top:6px}
-  .save input{flex:1;min-width:0;font-size:var(--text-meta);padding:3px 6px}
+  .save input{flex:1;min-width:0;font-size:var(--text-meta)}
   .note{margin:0;padding:0 6px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
   .note.failed{color:rgb(var(--c-danger))}
 </style>

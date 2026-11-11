@@ -577,7 +577,7 @@
                   type="button"
                   class="gp-btn subtask-title"
                   data-variant="ghost"
-                  data-size="sm"
+                  data-size="inline"
                   onclick={() => requestTaskOpen(sub.id)}
                   title="Open subtask {sub.title}"
                 >
@@ -752,7 +752,7 @@
   li{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
   .subtask-card,.linked-thread-item{flex-direction:column;align-items:stretch;gap:6px;padding:6px 8px}
   .subtask-row-top{display:flex;align-items:center;gap:6px;min-width:0}
-  .subtask-title{flex:1;min-width:0;justify-content:flex-start;white-space:normal;text-align:left;padding-inline:0;overflow-wrap:anywhere;color:inherit}
+  .subtask-title{flex:1;min-width:0;color:inherit}
   .kickoff-mode-row,.kickoff-pills,.breakdown-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .compact-select{width:auto}
   .breakdown-area{font-size:var(--text-meta)}

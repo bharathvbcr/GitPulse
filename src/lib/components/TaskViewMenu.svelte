@@ -166,6 +166,7 @@
           <span class="flex-1 text-textPrimary">{STATUS_LABELS[status]}</span>
           <input
             class="gp-field"
+            data-size="sm"
             type="number"
             inputmode="numeric"
             min="1"
@@ -227,6 +228,6 @@
   .view-panel{max-height:min(70vh,36rem);overflow:hidden auto}
   .note{margin:0;padding:0 6px 4px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted))}
   .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:var(--text-meta)}
-  .limit input{width:4.5rem;padding:2px 6px;font-size:var(--text-meta)}
+  .limit input{width:4.5rem;font-size:var(--text-meta)}
   .row:disabled:hover{background:transparent}
 </style>

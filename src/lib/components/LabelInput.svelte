@@ -54,7 +54,7 @@
     </span>
   {/each}
   <input
-    class="gp-field draft"
+    class="draft"
     value={draft}
     {disabled}
     {placeholder}
@@ -75,5 +75,5 @@
 <style>
   .label-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;padding:4px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6)}
   .label-input.disabled{opacity:.5}
-  .draft{flex:1;min-width:7rem;border:0 !important;background:transparent !important;padding:4px !important;margin:0}
+  .draft{flex:1;min-width:7rem;border:0;background:transparent;padding:4px;margin:0;color:rgb(var(--c-text));-webkit-text-fill-color:rgb(var(--c-text));font-size:var(--text-xs);outline:none}.draft::placeholder{-webkit-text-fill-color:rgb(var(--c-text-faint))}.label-input:focus-within{border-color:rgb(var(--c-accent) / 0.65);box-shadow:var(--ring-focus)}
 </style>

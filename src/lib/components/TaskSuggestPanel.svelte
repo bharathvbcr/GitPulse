@@ -96,7 +96,7 @@
   {#if result && result.blocked.length > 0}
     <ul class="blocked" data-testid="task-suggest-blocked-list" aria-label="Tasks blocked by an open task">
       {#each result.blocked as item (item.id)}
-        <li><button type="button" class="gp-btn blocked-open" data-variant="ghost" data-size="sm" data-task-id={item.id} onclick={() => onOpen(item.id)}>{item.title}</button> <span class="muted">blocked by {item.blocked_by.join(", ")}</span></li>
+        <li><button type="button" class="gp-btn blocked-open" data-variant="ghost" data-size="inline" data-task-id={item.id} onclick={() => onOpen(item.id)}>{item.title}</button> <span class="muted">blocked by {item.blocked_by.join(", ")}</span></li>
       {/each}
       {#if blockedHidden > 0}<li class="muted">and {blockedHidden} more</li>{/if}
     </ul>
@@ -117,5 +117,4 @@
   .note,.foot{font-size:var(--text-meta);margin:0;color:rgb(var(--c-text-muted))}
   .blocked{list-style:none;margin:0;padding:0 8px;display:flex;flex-direction:column;gap:2px;font-size:var(--text-meta)}
   .blocked .muted{color:rgb(var(--c-text-muted))}
-  .blocked-open{white-space:normal;text-align:left;padding-inline:0}
 </style>

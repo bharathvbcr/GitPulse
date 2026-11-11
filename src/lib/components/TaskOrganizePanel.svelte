@@ -75,7 +75,7 @@
           {@const outcome = outcomes[change.id]}
           {@const skipped = rejected.includes(change.id)}
           <li class="row gp-row" data-testid="task-organize-change" data-task-id={change.id} data-rule={change.rule}>
-            <button type="button" class="gp-btn row-title" data-variant="ghost" data-size="sm" onclick={() => onOpen(change.id)}>{change.title}</button>
+            <button type="button" class="gp-btn row-title" data-variant="ghost" data-size="inline" onclick={() => onOpen(change.id)}>{change.title}</button>
             <span class="chips">
               <span class="gp-chip" data-tone={change.from === 0 ? "danger" : "neutral"}>{PRIORITY_LABELS[change.from] ?? priorityLabel(change.from)}</span>
               <span class="arrow" aria-hidden="true">→</span>
@@ -111,7 +111,7 @@
   h2{margin:0;flex:1}
   .list,.groups{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
   .row{flex-wrap:wrap;gap:6px 8px;padding-block:6px;height:auto}
-  .row-title{white-space:normal;text-align:left;padding-inline:0;font-size:var(--text-xs);font-weight:500;overflow-wrap:anywhere}
+  .row-title{font-size:var(--text-xs);font-weight:500}
   .chips{display:flex;gap:4px;align-items:center;flex-shrink:0}
   .reason,.note,.groups,.outcome{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .note,.groups{margin:0}

@@ -73,7 +73,7 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     check(`${mode}: cards do not stack filters`, [...document.querySelectorAll("[data-task-card]")].every(node => blur(node) === "none"));
 
     if (document.querySelector(".navigator")) {
-      const scopes = [...document.querySelectorAll<HTMLButtonElement>(".navigator .gp-seg-btn")];
+      const scopes = [...document.querySelectorAll<HTMLButtonElement>(".navigator .nav-scope")];
       for (const scope of [...scopes, ...scopes].reverse()) {
         scope.click();
         await new Promise(resolve => requestAnimationFrame(resolve));

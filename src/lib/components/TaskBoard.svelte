@@ -2534,7 +2534,7 @@
   {@const health = checkouts.get(repo.id)}
   {@const selected = scope.kind === "repository" && scope.id === repo.id}
   <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}>
-    <button type="button" class="gp-seg-btn nav-scope" class:selected aria-pressed={selected} data-active={selected} onclick={() => chooseScope({ kind: "repository", id: repo.id })} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
+    <button type="button" class="gp-row nav-scope" class:selected aria-pressed={selected} data-active={selected} onclick={() => chooseScope({ kind: "repository", id: repo.id })} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
       {@render scopeSelection(selected)}<span class="nav-name">{repo.name}</span>{#if health?.state === "missing"}<span class="nav-meta checkout-mark" data-testid="repository-checkout-missing"><AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="nav-meta" data-testid="repository-remote-only">Remote only</span>{:else if health?.state === "unknown"}<span class="nav-meta" data-testid="repository-checkout-unknown">Not checked</span>{/if}
     </button>
     <span class="nav-trail">
@@ -2563,14 +2563,14 @@
     {/if}
     <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
     <div class="nav-heading gp-label">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="gp-icon-btn" data-size="sm" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="gp-icon-btn" data-size="sm" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
-    <div class="nav-row"><button type="button" class="gp-seg-btn nav-scope" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => chooseScope({ kind: "global" })}>{@render scopeSelection(scope.kind === "global")}<span class="nav-name">All</span></button></div>
+    <div class="nav-row"><button type="button" class="gp-row nav-scope" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => chooseScope({ kind: "global" })}>{@render scopeSelection(scope.kind === "global")}<span class="nav-name">All</span></button></div>
     {#each orderedWorkspaces as group, index (group.id)}
       {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
       {#if navShowsWorkspace(group)}
         {@const selected = scope.kind === "workspace" && scope.id === group.id}
         {@const meta = [group.repository_count === 0 ? "Empty" : "", group.archived ? "Archived" : ""].filter(Boolean).join(" · ")}
         <div class="nav-row" data-workspace-row={group.id}>
-          <button type="button" class="gp-seg-btn nav-scope" aria-pressed={selected} data-active={selected} class:selected aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => chooseScope({ kind: "workspace", id: group.id })} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(selected)}<span class="nav-name">{group.icon} {group.name}</span>{#if meta}<span class="nav-meta">{meta}</span>{/if}</button>
+          <button type="button" class="gp-row nav-scope" aria-pressed={selected} data-active={selected} class:selected aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => chooseScope({ kind: "workspace", id: group.id })} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(selected)}<span class="nav-name">{group.icon} {group.name}</span>{#if meta}<span class="nav-meta">{meta}</span>{/if}</button>
           <span class="nav-trail">
             <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={12} /></button>
             <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={12} /></button>
@@ -2635,7 +2635,7 @@
     {#if hiddenRepositories.length}
       {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
       <div class="nav-heading gp-label" data-testid="task-hidden-repositories">
-        <button type="button" class="gp-btn nav-disclosure" data-variant="ghost" data-size="sm" data-testid="task-hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
+        <button type="button" class="gp-btn nav-disclosure" data-variant="ghost" data-size="inline" data-testid="task-hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
         <button type="button" class="gp-icon-btn" data-size="sm" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
       </div>
       {#if expanded}
@@ -3247,7 +3247,7 @@
   .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
   .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
   .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
-  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:var(--gp-r-sm);font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
+  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;position:relative;text-align:left;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
   .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
   .navigator.nav-liquid .nav-scope.selected{background:transparent}
@@ -3269,7 +3269,7 @@
   .nav-heading > button,.heading-actions>button{flex-shrink:0}
   .heading-actions{display:inline-flex}
   .navigator .nav-more{display:block;width:100%;text-align:left}
-  .navigator .nav-disclosure{display:inline-flex;align-items:center;justify-content:flex-start;gap:2px;width:auto;min-width:0;flex:1;padding:0;overflow:hidden;font:inherit;color:inherit;text-align:left}
+  .navigator .nav-disclosure{gap:2px;width:auto;min-width:0;flex:1;overflow:hidden;font:inherit;color:inherit}
   .navigator .nav-disclosure :global(svg){flex-shrink:0}
   /* Portaled: `fixed` + the popover owner set left/top. Width and height are
      viewport-capped so a long path or a long registered list cannot grow the

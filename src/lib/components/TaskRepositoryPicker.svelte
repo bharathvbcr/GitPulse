@@ -289,7 +289,7 @@
   legend{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   /* A field, not a pill: it holds chips and sits in a column of inputs, so it
      takes the same geometry as the fields around it. */
-  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;border-radius:var(--gp-r-full);padding:6px 12px;min-height:38px;background:rgb(var(--c-bg) / 0.6)}
+  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;background:rgb(var(--c-bg) / 0.6)}
   .repo-chips{display:flex;flex-wrap:wrap;gap:5px;flex:1;min-width:0;align-items:center}
   .repo-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* The primary is the one that decides where an agent runs, so it is the one

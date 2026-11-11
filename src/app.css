@@ -211,6 +211,16 @@
     @apply justify-center py-0;
     min-height: 28px;
   }
+  /* A link-button that sits in running text or is a list item's title: no
+     pill padding, it wraps and starts at the left. Pairs with
+     `data-variant="ghost"`. Callers used to strip the padding with scoped
+     rules, which beat the layered primitive (design-lint rule 12). */
+  &[data-size="inline"] {
+    @apply justify-start p-0 text-left;
+    min-height: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 
   &[data-variant="primary"] {
     @apply border-transparent font-semibold text-white;
@@ -810,6 +820,11 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   &[aria-disabled="true"] {
     @apply cursor-not-allowed opacity-40;
   }
+  /* The compact field, the height of a `data-size="sm"` button (§8). */
+  &[data-size="sm"] {
+    @apply py-0 px-2.5;
+    min-height: 24px;
+  }
 }
 
 @utility gp-field-multi {
@@ -948,6 +963,12 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   &:focus-visible {
     @apply border-accent/65 outline-hidden;
     box-shadow: var(--ring-focus);
+  }
+
+  /* The compact select, the height of a `data-size="sm"` button and field. */
+  &[data-size="sm"] {
+    @apply py-0 pl-2.5;
+    min-height: 24px;
   }
 }
 

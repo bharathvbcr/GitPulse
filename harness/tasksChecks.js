@@ -1273,7 +1273,7 @@ if (params.has("check")) {
     check("the Hidden group lists the repository with a way to show it again",
       navRow("repo-1")?.dataset.hidden === "true" && Boolean(navRow("repo-1").querySelector('[data-testid="repository-show"]')));
     {
-      const nameEl = navRow("repo-1")?.querySelector(".gp-seg-btn span");
+      const nameEl = navRow("repo-1")?.querySelector(".nav-scope span");
       const showEl = navRow("repo-1")?.querySelector('[data-testid="repository-show"]');
       const nameWidth = nameEl?.getBoundingClientRect().width ?? 0;
       const showWidth = showEl?.getBoundingClientRect().width ?? 0;
@@ -3919,7 +3919,7 @@ if (params.has("check")) {
 
       try {
         step = "scope labels";
-        const navButtons = [...scopesNav().querySelectorAll("button.gp-seg-btn")];
+        const navButtons = [...scopesNav().querySelectorAll("button.nav-scope")];
         const label = btn => btn.querySelector(":scope > span:not(.gp-liquid-selection)");
         check("every scope button keeps its name in a label span, with no loose text beside it",
           navButtons.length >= 3 && navButtons.every(btn => label(btn)?.textContent.trim() && [...btn.childNodes].filter(node => node.nodeType === 3).every(node => !node.textContent.trim())));

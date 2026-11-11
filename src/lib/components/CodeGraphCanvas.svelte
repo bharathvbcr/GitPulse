@@ -20,7 +20,7 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
-  import { Filter, Network } from "@lucide/svelte";
+  import { Filter, Minus, Network, Plus } from "@lucide/svelte";
   import Checkbox from "./Checkbox.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -535,10 +535,10 @@
     {/if}
 
     <div class="map-zoom" aria-label="Graph view controls">
-      <button type="button" aria-label="Zoom out" onclick={() => zoomAt(1 / 1.2)} disabled={scale <= 0.000001}>−</button>
+      <button type="button" class="gp-icon-btn zoom-step" data-size="md" aria-label="Zoom out" onclick={() => zoomAt(1 / 1.2)} disabled={scale <= 0.000001}><Minus size={14} aria-hidden="true" /></button>
       <span>{scale < 0.01 ? "<1" : Math.round(scale * 100)}%</span>
-      <button type="button" aria-label="Zoom in" onclick={() => zoomAt(1.2)} disabled={scale >= 5}>+</button>
-      <button type="button" class="fit-button gp-btn" data-size="sm" onclick={resetView} title="Fit filtered nodes into the view (0)">Fit view</button>
+      <button type="button" class="gp-icon-btn zoom-step" data-size="md" aria-label="Zoom in" onclick={() => zoomAt(1.2)} disabled={scale >= 5}><Plus size={14} aria-hidden="true" /></button>
+      <button type="button" class="fit-button gp-btn ml-1" data-size="md" onclick={resetView} title="Fit filtered nodes into the view (0)">Fit view</button>
     </div>
     <div class="map-help">Drag to explore <span>·</span> Scroll to zoom <span>·</span> Select to trace connections</div>
   </div>
@@ -606,10 +606,7 @@
   .map-results .map-pagination button, .map-pagination button { width: auto; padding: 5px; }
   .map-stage { overflow: hidden; background-image: radial-gradient(circle, rgb(var(--c-text-muted) / 0.08) .65px, transparent .65px); background-size: 22px 22px; }
   .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: 9px; background: var(--map-panel); box-shadow: var(--shadow-card); }
-  .map-zoom button { width: 28px; height: 28px; border-radius: 5px; font-size: var(--text-lg); }
-  .map-zoom button:hover { background: var(--map-hover); }
   .map-zoom span { width: 42px; text-align: center; font-size: var(--text-micro); color: var(--map-muted); font-variant-numeric: tabular-nums; }
-  .map-zoom .gp-btn { width: auto; padding: 0 10px; margin-left: 4px; font-size: var(--text-meta); }
   .map-help { position: absolute; bottom: 25px; left: 20px; font-size: var(--text-micro); color: var(--map-muted); pointer-events: none; }
   .map-help span { padding: 0 6px; opacity: .4; }
   .map-results { position: absolute; top: 8px; left: 16px; width: min(310px, calc(100% - 32px)); max-height: 60%; overflow-y: auto; padding: 6px; border-radius: 10px; border: 1px solid var(--map-border); background: var(--map-panel); box-shadow: var(--shadow-float); }
