@@ -730,7 +730,11 @@ mod tests {
             let all = bound_accelerators(macos);
             // A parser that resolved nothing would pass the check below while
             // examining nothing.
-            assert!(all.len() >= 7 + 9 + 3, "only {} accelerators resolved", all.len());
+            assert!(
+                all.len() >= 7 + 9 + 3,
+                "only {} accelerators resolved",
+                all.len()
+            );
             let mut seen = std::collections::HashMap::new();
             for (owner, chord) in &all {
                 if let Some(first) = seen.insert(chord.clone(), owner.clone()) {
