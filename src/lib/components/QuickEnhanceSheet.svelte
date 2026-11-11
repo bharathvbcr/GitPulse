@@ -142,7 +142,7 @@
     </header>
 
     <div class="flex-1 overflow-auto px-[18px] py-4 space-y-4">
-      {#if loading}<div role="status" aria-label="Loading task"><Skeleton variant="text" count={3} /></div>{/if}
+      {#if loading}<div role="status" aria-label="Loading task"><Skeleton variant="text" count={3} hold={false} /></div>{/if}
       {#if error}<p role="alert" class="text-danger">{error}</p>{/if}
       {#if task}
         <div>

@@ -80,7 +80,7 @@
   <p>{rows.length} shown / {total} requests</p>
   {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
   {#if pending}<div class="gp-notice" data-tone="unknown" role="status"><span class="min-w-0 flex-1">Couldn't confirm the save. Try again with this exact decision before choosing another.</span><button class="gp-btn shrink-0" data-size="sm" type="button" onclick={() => { if (pending) void decide(pending.source, pending.input.decision); }} disabled={busy}>Try again</button></div>{/if}
-  {#if !rows.length && loading}<Skeleton variant="text" count={3} />
+  {#if !rows.length && loading}<Skeleton variant="text" count={3} hold={false} />
   {:else if !rows.length && !error}<EmptyState compact icon={MessageSquare} title="No agent requests" hint="Terminal handoffs ask in the provider’s terminal." />{/if}
   {#each rows as item (item.id)}
     <article>

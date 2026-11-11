@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
@@ -23,6 +23,35 @@ describe("Skeleton", () => {
     expect(source).toContain("startSkeletonGate(");
     expect(source).toContain("out:holdThenLeave|global");
     expect(source).toContain("gate?.holdRemainingMs()");
+  });
+
+  it("leaves at once wherever its replacement mounts in the same flow, which is every caller (tmp/overhaul/L/skeleton-audit.md)", () => {
+    // A held outro keeps the skeleton's DOM in place while the content that
+    // replaces it mounts, so the content lands one skeleton lower for up to
+    // 400 ms (measured: content top 72 px with hold, 20 px without). The hold
+    // is right only for a skeleton swapped into the same box (absolutely
+    // positioned, or stacked in one grid cell). Name such a caller here, with
+    // the reason, rather than leaving the default on by omission.
+    const HOLD_KEPT: Record<string, string> = {};
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const offenders: string[] = [];
+    let seen = 0;
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(".svelte") && entry.name !== "Skeleton.svelte") {
+          const text = readFileSync(full, "utf8");
+          for (const tag of text.matchAll(/<Skeleton\b[^>]*?\/>/gs)) {
+            seen += 1;
+            if (!tag[0].includes("hold={false}") && !HOLD_KEPT[relative(root, full)]) offenders.push(`${relative(root, full)}: ${tag[0].replace(/\s+/g, " ")}`);
+          }
+        }
+      }
+    };
+    walk(root);
+    expect(seen).toBeGreaterThan(40);
+    expect(offenders).toEqual([]);
   });
 
   it("supports card, tree-row, and rect variants", () => {

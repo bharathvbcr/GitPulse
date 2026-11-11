@@ -461,7 +461,7 @@
       <div class="col-span-2 p-3 font-mono text-xs overflow-auto bg-surface flex flex-col">
         {#if diffLoading}
           <div class="flex-1" aria-label="Reading the diff…">
-            <Skeleton variant="code-lines" count={8} />
+            <Skeleton variant="code-lines" count={8} hold={false} />
           </div>
         {:else if diffFailure}
           <div class="flex flex-1 items-center justify-center px-4 font-sans">

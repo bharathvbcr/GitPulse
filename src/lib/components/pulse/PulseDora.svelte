@@ -94,7 +94,7 @@
     <div class="flex flex-col gap-3">
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {#each [0, 1, 2, 3] as slot (slot)}
-          <Skeleton variant="rect" height="6rem" />
+          <Skeleton variant="rect" height="6rem" hold={false} />
         {/each}
       </div>
       <p class="m-0 text-xs text-textMuted">Analyzing release tags and commit ancestry…</p>

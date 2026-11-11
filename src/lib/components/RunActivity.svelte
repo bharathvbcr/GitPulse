@@ -86,7 +86,7 @@
   <summary>
     Activity{#if timeline && summary} · <span class="spent" data-testid="agent-activity-summary">{summary}</span>{/if}
   </summary>
-  {#if loading && !timeline}<Skeleton variant="text" count={3} />{/if}
+  {#if loading && !timeline}<Skeleton variant="text" count={3} hold={false} />{/if}
   {#if error}<div class="gp-notice" data-tone="danger" role="alert" data-testid="agent-activity-error">{error}</div>{/if}
   {#if timeline}
     {#if timeline.segments.length}

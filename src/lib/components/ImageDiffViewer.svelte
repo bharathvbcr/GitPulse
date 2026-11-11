@@ -79,7 +79,7 @@
   >
     {#if status === "loading"}
       <div class="flex flex-col items-center gap-2 text-textMuted">
-        <Skeleton variant="rect" width="20rem" height="20rem" />
+        <Skeleton variant="rect" width="20rem" height="20rem" hold={false} />
         <span>Loading images…</span>
       </div>
     {:else if status === "failed"}

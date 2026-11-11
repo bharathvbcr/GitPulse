@@ -102,7 +102,7 @@
       in:scale={cardScale()} out:scale={cardScaleOut()}>
       {#if compact}<div class="settings-heading"><strong>Automatic suggestions</strong><button class="gp-icon-btn" type="button" aria-label="Close automatic settings" data-size="sm" disabled={saving || pending !== null} onclick={() => dismiss(true)}><X size={12} aria-hidden="true" /></button></div>{/if}
       <p>Applies to this GitPulse profile across all workspaces and repositories. Saved title and description changes are queued after one second; moving cards does not generate suggestions.</p>
-      {#if loading}<div role="status" aria-label="Loading settings"><Skeleton variant="text" count={2} /></div>{/if}
+      {#if loading}<div role="status" aria-label="Loading settings"><Skeleton variant="text" count={2} hold={false} /></div>{/if}
       {#if settings}
         <fieldset disabled={loading || saving || pending !== null}>
           <Checkbox label="Suggest clearer task titles and descriptions automatically" checked={enabled} onchange={(next) => { enabled = next; }} />

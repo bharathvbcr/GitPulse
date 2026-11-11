@@ -2101,7 +2101,7 @@
           >
             <span>Reading the diff…</span>
             <div class="w-full max-w-md" aria-hidden="true">
-              <Skeleton variant="code-lines" count={8} />
+              <Skeleton variant="code-lines" count={8} hold={false} />
             </div>
           </div>
         {:else if diffError}

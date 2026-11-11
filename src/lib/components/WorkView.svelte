@@ -697,9 +697,9 @@
     </div>
   {:else if loading && !projection}
     <div class="w-full space-y-2">
-      <Skeleton />
-      <Skeleton />
-      <Skeleton />
+      <Skeleton hold={false} />
+      <Skeleton hold={false} />
+      <Skeleton hold={false} />
     </div>
   {:else if narrowedToNothing}
     <!-- A filter hiding every row is not the same screen as a repository with

@@ -54,7 +54,7 @@
   {#if error}
     <div class="gp-notice" data-tone="danger" role="alert" data-testid="task-organize-error">{error}</div>
   {:else if result === null}
-    {#if loading}<Skeleton variant="text" count={3} />{/if}
+    {#if loading}<Skeleton variant="text" count={3} hold={false} />{/if}
     <p class={loading ? "sr-only" : "note"} role="status">{loading ? "Reading the open board…" : "Nothing asked yet."}</p>
   {:else}
     <p class="note" data-testid="task-organize-order">{result.order_note}</p>

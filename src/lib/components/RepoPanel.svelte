@@ -552,7 +552,7 @@
                     class="gp-input min-w-0 flex-1 font-mono text-meta!"
                     bind:value={editUrl}
                     aria-label="New URL for {remote.name}"
-                    placeholder="https://github.com/owner/repo.git"
+                    placeholder="https://github.com/owner/repository.git"
                   />
                   {#if remote.has_credentials}
                     <label class="flex w-full items-center gap-1.5 text-meta text-textMuted">
@@ -619,7 +619,7 @@
             class="gp-input min-w-0 flex-1 font-mono text-meta!"
             bind:value={addUrl}
             aria-label="Remote URL"
-            placeholder="https://github.com/owner/repo.git"
+            placeholder="https://github.com/owner/repository.git"
           />
           <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={busy !== null}>
             {#if busy === "remote-add"}<Loader2 size={11} class="animate-spin" />{/if}

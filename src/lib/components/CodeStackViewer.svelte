@@ -496,7 +496,7 @@
       </p>
     </div>
   {:else if isLoading}
-    <Skeleton variant="card" count={2} class="max-w-3xl" />
+    <Skeleton variant="card" count={2} class="max-w-3xl" hold={false} />
     <p class="sr-only">Loading stack hierarchy…</p>
   {:else if !loadError}
     <div class="flex-1 flex">

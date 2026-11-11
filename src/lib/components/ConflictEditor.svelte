@@ -563,7 +563,7 @@
           {#if diagnostics.length}<div class="error-notice" role="alert"><span>{diagnostics.join(" · ")}. Repair these markers externally and refresh the source, or choose a complete side.</span></div>{/if}
         {/if}
         {#if isLoading}
-          <div class="editor-state" role="status"><Skeleton variant="code-lines" count={6} class="max-w-md" /><h3>Loading conflicts…</h3><p>Reading the selected file.</p></div>
+          <div class="editor-state" role="status"><Skeleton variant="code-lines" count={6} class="max-w-md" hold={false} /><h3>Loading conflicts…</h3><p>Reading the selected file.</p></div>
         {:else if loadError}
           <div class="editor-state" role="alert"><AlertTriangle size={24} /><h3>Couldn't load this file</h3><p>{loadError}</p><button class="gp-btn" data-size="md" onclick={() => retryRevision += 1}><RotateCcw size={13} />Try again</button></div>
         {:else if parsedDoc}

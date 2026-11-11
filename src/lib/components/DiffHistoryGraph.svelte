@@ -627,7 +627,7 @@
         </div>
       {:else if loadingMore}
         <p class="px-2.5 py-1.5 text-meta text-textMuted" role="status">Loading older history…</p>
-        <Skeleton variant="tree-row" count={2} />
+        <Skeleton variant="tree-row" count={2} hold={false} />
       {:else if !hasMore && rows.length > 0}
         <p class="px-2.5 py-1.5 text-micro text-textMuted">Start of the loaded history.</p>
       {/if}

@@ -2997,7 +2997,7 @@
     {#each relinks as entry (entry.taskId)}<div class="banner error gp-notice gp-notice-error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
     <div class="sr-only" role="status" aria-live="polite">{announce}</div>
     {#if !initialized && loading}
-      <div class="pad"><Skeleton variant="card" count={4} /></div>
+      <div class="pad"><Skeleton variant="card" count={4} hold={false} /></div>
     {:else if initialized && error && loadedKey !== boardKey}
       <EmptyState icon={Inbox} title="Tasks unavailable" hint="Try again to load this scope." action={{label:"Try again",onClick:()=>void loadBoard(),variant:"secondary"}} />
     {:else if initialized && !loading && listCards.length === 0 && !filtering && (hiddenRepositoryReport?.tasks ?? 0) > 0}

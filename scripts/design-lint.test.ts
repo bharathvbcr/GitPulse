@@ -8,12 +8,14 @@ import {
   DEFAULT_BASELINE_FILE,
   RULES,
   buildBaseline,
+  classifyViolations,
   compareToBaseline,
   countViolations,
   lintRepo,
   lintSource,
   main,
   readBaseline,
+  readGateConfig,
   type Violation,
 } from "./design-lint.mjs";
 
@@ -85,13 +87,40 @@ describe("design-lint rules: one positive and one negative fixture each", () => 
     expect(lintSource("src/lib/ui/transitions.ts", fixture("rule-10.positive.ts.txt")).filter((v) => v.rule === 10)).toEqual([]);
   });
 
+  it("rule 9 flags arbitrary animations and layout transitions written as arbitrary values, and stays silent on the compositor ones", () => {
+    const found = hits(9, "rule-09-arbitrary.positive.svelte");
+    expect(found.map((v) => v.message.split(": ")[0])).toEqual([
+      "animate-[gp-slide_200ms_ease-out]",
+      "animate-[gp-slide_var(--gp-dur-base)_var(--gp-ease-out)]",
+      "[animation:gp-slide_var(--gp-dur-base)]",
+      "transition-[max-height_var(--gp-dur-base)]",
+      "transition-[opacity,width]",
+      "[transition:height_var(--gp-dur-base)]",
+      "[transition-property:margin-inline-start,padding-inline]",
+      "transition-[inline-size]",
+    ]);
+    expect(hits(9, "rule-09-arbitrary.negative.svelte")).toEqual([]);
+  });
+
+  it("rule 9 reads class strings in TypeScript too", () => {
+    const ts = lintSource("src/lib/x.ts", 'export const c = "transition-[width] animate-[x_var(--gp-dur-base)] transition-[opacity]";\n').filter((v) => v.rule === 9);
+    expect(ts.map((v) => v.message.split(": ")[0])).toEqual(["transition-[width]", "animate-[x_var(--gp-dur-base)]"]);
+  });
+
+  it("rule 10 flags a duration or easing literal inside an arbitrary animation or transition, and not a token", () => {
+    const literal = lintSource("src/lib/x.svelte", '<div class="animate-[gp-slide_200ms_ease-out] [transition:opacity_0.2s] transition-[opacity_150ms_linear]"></div>\n').filter((v) => v.rule === 10);
+    expect(literal).toHaveLength(3);
+    const tokens = lintSource("src/lib/x.svelte", '<div class="animate-[gp-slide_var(--gp-dur-base)_var(--gp-ease-out)] [transition:opacity_var(--gp-dur-fast)_var(--gp-ease-out)]"></div>\n').filter((v) => v.rule === 10);
+    expect(tokens).toEqual([]);
+  });
+
   it("rule 3 reads the copy vocabulary like any other file: it holds no palette class", () => {
     const real = readFileSync(fileURLToPath(new URL("../src/lib/ui/copy/vocabulary.ts", import.meta.url)), "utf8");
     expect(lintSource("src/lib/ui/copy/vocabulary.ts", real).filter((v) => v.rule === 3)).toEqual([]);
     expect(lintSource("src/lib/ui/copy/vocabulary.ts", 'export const n = "border-red-500/60!";\n').filter((v) => v.rule === 3)).toHaveLength(1);
   });
 
-  it("TypeScript files run no rule but 3 and 10", () => {
+  it("TypeScript files run no rule but 3, 9 and 10", () => {
     const ts = lintSource("src/lib/x.ts", 'export const c = "text-[10px] border-t z-50 rounded-3xl text-amber-400 uppercase tracking-wide";\n');
     expect([...new Set(ts.map((v) => v.rule))]).toEqual([3]);
   });
@@ -414,6 +443,161 @@ describe("design-lint CLI against a scratch repository", () => {
     write("src/f.ts", 'export const c = "text-amber-400";\n');
     const { violations } = lintRepo({ root: dir });
     expect(violations.filter((x) => x.rule === 3).map((x) => x.file)).toEqual(["src/f.ts"]);
+  });
+});
+
+describe("design-lint gate (--strict) against a scratch repository", () => {
+  let dir = "";
+  let logs: string[] = [];
+
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: dir, encoding: "utf8" }).trim();
+  const write = (rel: string, body: string) => {
+    mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    writeFileSync(path.join(dir, rel), body);
+  };
+  const config = (body: object) => write("scripts/design-lint.config.json", JSON.stringify(body));
+  const run = (...args: string[]) => {
+    logs = [];
+    const code = main(["--root", dir, ...args]);
+    return { code, out: logs.join("\n") };
+  };
+  const BRAND = '<svg><stop stop-color="#ff8800" /></svg>\n';
+  const allowBrand = { rule: 4, file: "src/brand.svelte", reason: "Brand art with no token." };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "design-lint-gate-"));
+    logs = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
+    git("init", "-q");
+    write("src/brand.svelte", BRAND);
+    write("src/clean.svelte", '<p class="text-xs">ok</p>\n');
+    git("add", "-A");
+    git("commit", "-q", "-m", "seed");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("fails on a violation that is in the baseline but not allow-listed, which the ratchet alone lets through", () => {
+    run("--baseline");
+    expect(run().code).toBe(0);
+    const strict = run("--strict");
+    expect(strict.code).toBe(1);
+    expect(strict.out).toContain("outside the allow-list");
+    expect(strict.out).toContain("src/brand.svelte:1:");
+  });
+
+  it("reports an allow-listed violation as allowed, with its reason, and passes", () => {
+    config({ allow: [allowBrand] });
+    run("--baseline");
+    const r = run("--strict");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("allowed (1");
+    expect(r.out).toContain("rule  4  src/brand.svelte x1");
+    expect(r.out).toContain("Brand art with no token.");
+    const json = JSON.parse((run("--strict", "--json"), logs.join("")));
+    expect(json.ok).toBe(true);
+    expect(json.allowed).toHaveLength(1);
+    expect(json.open).toEqual([]);
+  });
+
+  it("holds an allow-listed file to the ratchet: it may not gain a violation", () => {
+    config({ allow: [allowBrand] });
+    run("--baseline");
+    write("src/brand.svelte", `${BRAND}<svg><stop stop-color="#001122" /></svg>\n`);
+    const r = run("--strict");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("rule 4  src/brand.svelte: 1 -> 2");
+  });
+
+  it("allows one rule of one file only: another rule in the same file is open", () => {
+    config({ allow: [allowBrand] });
+    write("src/brand.svelte", `${BRAND}<p class="text-[10px]">x</p>\n`);
+    git("add", "-A");
+    run("--baseline", "--allow-dirty");
+    const r = run("--strict");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("rule 1");
+  });
+
+  it("fails on an allow entry that no longer matches a violation, so an exemption cannot outlive its cause", () => {
+    config({ allow: [allowBrand] });
+    run("--baseline");
+    write("src/brand.svelte", '<svg><stop stop-color="var(--c-accent)" /></svg>\n');
+    const r = run("--strict");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("stale config entry");
+    expect(r.out).toContain("rule 4 src/brand.svelte no longer has a violation");
+  });
+
+  it("passes a deferred file under the ratchet and reports it as deferred, and fails when its count rises", () => {
+    config({ deferred: [{ file: "src/brand.svelte", rules: [4], owner: "lane X", reason: "being rewritten" }] });
+    run("--baseline");
+    const ok = run("--strict");
+    expect(ok.code).toBe(0);
+    expect(ok.out).toContain("deferred (1");
+    expect(ok.out).toContain("lane X");
+    write("src/brand.svelte", `${BRAND}<svg><stop stop-color="#001122" /></svg>\n`);
+    expect(run("--strict").code).toBe(1);
+  });
+
+  it("is not a gate without --strict: the same tree passes the ratchet", () => {
+    run("--baseline");
+    expect(run().code).toBe(0);
+    expect(run("--strict").code).toBe(1);
+  });
+
+  it("refuses a config entry without a reason, with exit 2 rather than silently allowing", () => {
+    config({ allow: [{ rule: 4, file: "src/brand.svelte", reason: "  " }] });
+    run("--baseline");
+    const r = run("--strict");
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("non-empty reason");
+  });
+
+  it("classifies each violation into exactly one bucket", () => {
+    const v = (rule: number, file: string) => ({ rule, file, line: 1, col: 1, message: "m" });
+    const verdict = classifyViolations([v(4, "a"), v(4, "b"), v(3, "c"), v(1, "a")], {
+      allow: [{ rule: 4, file: "a", reason: "r" }],
+      deferred: [{ file: "c", rules: [3], owner: "o", reason: "r" }],
+    });
+    expect(verdict.allowed.map((x) => x.file)).toEqual(["a"]);
+    expect(verdict.deferred.map((x) => x.file)).toEqual(["c"]);
+    expect(verdict.open.map((x) => `${x.rule}:${x.file}`)).toEqual(["4:b", "1:a"]);
+    expect(verdict.stale).toEqual([]);
+  });
+});
+
+describe("the committed gate config", () => {
+  const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const configFile = path.join(repoRoot, "scripts", "design-lint.config.json");
+
+  it("names a reason for every entry, and its files exist", () => {
+    const cfg = readGateConfig(configFile);
+    for (const e of cfg.allow) {
+      expect(e.reason.length).toBeGreaterThan(20);
+      expect(existsSync(path.join(repoRoot, e.file))).toBe(true);
+    }
+    for (const e of cfg.deferred) expect(e.owner).not.toBe("");
+  });
+
+  it("allow-lists nothing but the brand marks, for rule 4", () => {
+    const cfg = readGateConfig(configFile);
+    expect(cfg.allow.map((e) => `${e.rule}:${e.file}`)).toEqual(["4:src/lib/components/Logo.svelte", "4:src/lib/components/files/MarkDevLogo.svelte"]);
+  });
+
+  it("passes the strict gate on this tree", () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
+    try {
+      expect(main(["--strict"])).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(logs.join("\n")).toContain("allowed (");
   });
 });
 

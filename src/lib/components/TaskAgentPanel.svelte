@@ -794,7 +794,7 @@
     {#if total}<span class="meta">{runs.length} of {total} loaded</span>{/if}
   </div>
   {#if !runs.length}
-    {#if loading}<Skeleton variant="text" count={2} />
+    {#if loading}<Skeleton variant="text" count={2} hold={false} />
     {:else}<p>{historyError ? "Runs could not be read." : "No runs yet."}</p>{/if}
   {:else if !ended.length}<p>No ended runs{cursor ? " loaded yet" : ""}.</p>{/if}
   <div class="run-list" data-testid="agents-history">

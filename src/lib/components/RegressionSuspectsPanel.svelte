@@ -264,7 +264,7 @@
     {#if loading}
       <div class="flex flex-col gap-2" role="status">
         <span class="text-micro text-textMuted">Walking the cone and blaming the lines it reaches…</span>
-        <Skeleton variant="tree-row" count={3} />
+        <Skeleton variant="tree-row" count={3} hold={false} />
       </div>
     {/if}
 

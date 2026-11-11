@@ -164,7 +164,7 @@
       <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => void load()}>Try again</button>
     </div>
   {:else if !detail}
-    <Skeleton variant="text" count={2} />
+    <Skeleton variant="text" count={2} hold={false} />
   {:else}
     <div class="flex flex-wrap gap-x-3 gap-y-1 text-meta text-textMuted font-mono">
       <span>by {detail.author || "unknown"}</span>

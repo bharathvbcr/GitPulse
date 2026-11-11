@@ -507,7 +507,7 @@
         <div class="flex-1 overflow-y-auto min-h-60 max-h-96 flex flex-col gap-0.5">
           {#if loading}
             <div class="p-6" aria-busy="true">
-              <Skeleton variant="tree-row" count={5} />
+              <Skeleton variant="tree-row" count={5} hold={false} />
               <p class="mt-3 text-center text-xs text-textMuted">Scanning branches and squash-merges…</p>
             </div>
           {:else if !scanResult && actionBanner}
