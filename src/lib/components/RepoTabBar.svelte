@@ -61,6 +61,7 @@
   import { headerAgentPlane } from "../agents/headerPlane";
   import { repoAgentPill, type RepoAgentPill } from "../agents/repoAttention";
   import { tabCardRows } from "../repos/tabCard";
+  import { markEnter, markExit, popupEnter, popupExit, tabEnter, tabExit } from "../ui/headerMotion";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import WorkspaceActions from "./WorkspaceActions.svelte";
@@ -937,7 +938,7 @@
   // more than a path and could not be placed or styled.
   const CARD_INTENT_MS = 500;
   const CARD_GRACE_MS = 120;
-  const NO_AGENTS: RepoAgentPill = { state: "none", live: 0, reason: null, tone: null, phrase: "" };
+  const NO_AGENTS: RepoAgentPill = { state: "none", live: 0, reason: null, tone: null, phrase: "", why: "" };
 
   let card = $state<{ id: string; anchor: HTMLElement } | null>(null);
   let cardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -973,17 +974,14 @@
   const cardRows = $derived.by(() => {
     const tab = cardTab;
     if (!tab) return [];
-    // Ahead/behind and the last fetch are read for the repository on screen
-    // only; any other tab says "Not read" rather than guess.
-    const current = tab.isActive;
-    const branch = current
-      ? $repoStore.branches.find((item) => item.is_current || item.name === $repoStore.currentBranch)
-      : undefined;
-    const fetchedMs = $repoStore.fetchedAt;
+    // Ahead/behind and the last fetch come from the hovered tab's own session
+    // (projected onto the tab), so any tab that has been read answers; one
+    // that has not says "Not read yet" instead of leaving the row out.
+    const fetchedMs = tab.fetchedAt;
     return tabCardRows({
       tab,
-      sync: branch ? { ahead: branch.ahead_count ?? 0, behind: branch.behind_count ?? 0 } : null,
-      fetchedAt: current ? (fetchedMs === null ? null : Math.floor(fetchedMs / 1000)) : undefined,
+      sync: tab.sync ?? null,
+      fetchedAt: fetchedMs === undefined ? undefined : fetchedMs === null ? null : Math.floor(fetchedMs / 1000),
       terminals: terminalCounts.get(tab.path) ?? 0,
       agents: agentStates.get(tab.path) ?? NO_AGENTS,
     });
@@ -1448,6 +1446,8 @@
           <span
             class="shrink-0 inline-flex items-center {ask.tone === 'danger' ? 'text-danger' : ask.tone === 'info' ? 'text-info' : 'text-warn'}"
             data-agent-mark={ask.reason}
+            in:markEnter
+            out:markExit
           >
             <BellRing size={10} aria-hidden="true" />
             <span class="sr-only">, agent: {ask.phrase.toLowerCase()}</span>
@@ -1588,6 +1588,8 @@
             <span
               class="shrink-0 inline-flex items-center {ask.tone === 'danger' ? 'text-danger' : ask.tone === 'info' ? 'text-info' : 'text-warn'}"
               data-agent-mark={ask.reason}
+              in:markEnter
+              out:markExit
             >
               <BellRing size={10} aria-hidden="true" />
               <span class="sr-only">, agent: {ask.phrase.toLowerCase()}</span>
@@ -1700,13 +1702,19 @@
         oncontextmenu={onStripContext}
       >
         {#each tabLayout.visibleItems as item (`${item.kind}:${item.id}`)}
-          {#if item.kind === "group-header"}
-            {@render groupHead(item)}
-          {:else if item.kind === "stack-header"}
-            {@render stackHead(item)}
-          {:else}
-            {@render repoTab(item)}
-          {/if}
+          <!-- The wrapper is the keyed item's own element, so its transition
+               belongs to the each block and plays when a tab opens or closes,
+               not when an ancestor block changes. It is a plain flex box (not
+               display: contents, which cannot be animated). -->
+          <div class="flex shrink-0 items-center" data-tab-motion in:tabEnter out:tabExit>
+            {#if item.kind === "group-header"}
+              {@render groupHead(item)}
+            {:else if item.kind === "stack-header"}
+              {@render stackHead(item)}
+            {:else}
+              {@render repoTab(item)}
+            {/if}
+          </div>
         {/each}
       </div>
       <ScrollCue target={scroller} axis="x" diffuse />
@@ -1916,7 +1924,9 @@
     aria-label="{cardTab.label} details"
     onpointerenter={onCardEnter}
     onpointerleave={onTabLeave}
-    class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu gp-pop p-2.5 text-meta text-textPrimary"
+    in:popupEnter
+    out:popupExit
+    class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu p-2.5 text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
     <p class="truncate text-xs font-medium">{cardTab.label}</p>
@@ -1946,7 +1956,9 @@
     aria-label="Repositories scrolled out of view"
     tabindex="-1"
     onkeydown={handlePopupKeydown}
-    class="fixed w-64 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(24rem,calc(100vh-7.5rem))] shadow-float text-meta text-textPrimary"
+    in:popupEnter
+    out:popupExit
+    class="fixed w-64 max-w-[calc(100vw-1rem)] gp-menu flex flex-col max-h-[min(24rem,calc(100vh-7.5rem))] shadow-float text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
     <div class="overflow-y-auto min-h-0 flex-1 overscroll-contain">

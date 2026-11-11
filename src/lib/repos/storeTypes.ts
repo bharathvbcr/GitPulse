@@ -167,6 +167,17 @@ export interface OpenRepoTab {
    * not a clean bill of health for a parked tab restore never read.
    */
   countsKnown?: boolean;
+  /**
+   * Ahead and behind for the current branch, from this tab's own session (not
+   * only the active one). Null when the session has not been read or has no
+   * current branch to measure; absent in fixtures that predate it.
+   */
+  sync?: { ahead: number; behind: number } | null;
+  /**
+   * FETCH_HEAD mtime in epoch ms from this tab's own session: null when it
+   * records no fetch, undefined when the session has not been read yet.
+   */
+  fetchedAt?: number | null;
 }
 
 /**

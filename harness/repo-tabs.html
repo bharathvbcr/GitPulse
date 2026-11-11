@@ -110,7 +110,14 @@
 
       const { results, check, stopped } = createChecks();
       const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
-      const settle = async () => { await tick(); await wait(); await tick(); };
+      // Also waits out the header's finite entrance and exit animations (70 and
+      // 140 ms): an element that has left the model stays in the DOM until its
+      // exit ends, and a measurement taken sooner would count it twice.
+      const finite = () => document.getAnimations().filter((a) => (a.playState === "running" || a.playState === "pending") && a.effect?.getComputedTiming().iterations !== Infinity);
+      const settle = async () => {
+        await tick(); await wait(); await tick();
+        for (let i = 0; i < 30 && finite().length > 0; i += 1) await wait(20);
+      };
       const $ = (selector, root = document) => root.querySelector(selector);
       const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
       // The one tablist: surfaces and repositories (aria-label "Workspace").
@@ -460,8 +467,11 @@
           check("after the intent delay a card opens, portaled to the body, with the path and the branch", () =>
             cardShown && cardEl().parentElement === document.body && cardEl().textContent.includes(WT_B) &&
             cardEl().textContent.includes(BRANCH[WT_B]));
-          check("the card says Not read, never a quiet answer, for what a background tab has not loaded", () =>
-            /Last fetch\s*Not read/.test(words(cardEl())) && /Agents\s*Not read/.test(words(cardEl())));
+          // A background tab answers from its own session (sync and last fetch
+          // included); only what nothing has read says so, never a quiet answer.
+          check("the card reads a background tab's own fetch and sync, and says Not read yet for the agents nothing has swept", () =>
+            /Last fetch\s*(?!Not read)\S/.test(words(cardEl())) && /Branch\s*\S+\s*·\s*(?!Not read)\S/.test(words(cardEl())) &&
+            /Agents\s*Not read yet/.test(words(cardEl())));
           check("the card sits inside the window", () => {
             const box = cardEl().getBoundingClientRect();
             return box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight;
@@ -483,8 +493,29 @@
           // ---- labels render in full, in a plate, with Open beside them ----
           const LONG = "/code/long/a-remarkably-long-repository-name-that-used-to-clip";
           BRANCH[LONG] = "feature/an-equally-long-branch-name-that-used-to-clip";
+          // §6: a tab opening plays on the compositor properties only. Svelte
+          // plays a transition with element.animate, so the call is recorded.
+          const played = [];
+          const nativeAnimate = Element.prototype.animate;
+          Element.prototype.animate = function (keyframes, options) {
+            // The transition is on the keyed item's wrapper; the tab is inside it.
+            const animation = nativeAnimate.call(this, keyframes, options);
+            const entry = { id: this.matches?.("[data-tab-motion]") ? this.querySelector("[data-tab-id]")?.getAttribute("data-tab-id") ?? null : null, keyframes, options, animation, duration: null };
+            requestAnimationFrame(() => { entry.duration = animation.effect?.getTiming().duration ?? null; });
+            played.push(entry);
+            return animation;
+          };
           await repoStore.openRepo(LONG, { activate: false });
           await settle();
+          Element.prototype.animate = nativeAnimate;
+          const entrance = played.filter((call) => call.id !== null && call.id === shellOf(LONG)?.getAttribute("data-tab-id"));
+          const entranceProps = entrance.flatMap((call) => (Array.isArray(call.keyframes) ? call.keyframes.flatMap((k) => Object.keys(k)) : Object.keys(call.keyframes ?? {})));
+          // Svelte creates the animation and then sets its timing, so the
+          // duration is read from the animation, not from the options.
+          check("a tab opening plays an opacity and transform entrance and nothing else", () =>
+            entrance.length > 0 && entrance.some((call) => call.duration === 140) &&
+            entranceProps.every((p) => ["opacity", "transform", "offset", "easing", "composite"].includes(p)) &&
+            entranceProps.includes("opacity") && entranceProps.includes("transform"));
           const longName = LONG.split("/").pop();
           const spanWith = (root, text) => [...root.querySelectorAll("span")].find((el) => el.textContent.trim() === text);
           const label = spanWith(tabBtn(LONG), longName);
@@ -857,6 +888,7 @@
           const lastUnitId = lastUnit.dataset.overflowUnit.split(":")[1];
           lastUnit.click();
           await settle(); await wait(60);
+          for (let i = 0; i < 40 && overflowMenu(); i += 1) await wait(25);
           check("choosing one activates it, closes the menu and scrolls it into view", () => {
             const target = get(repoStore).openTabs.find((t) => t.id === lastUnitId);
             return !overflowMenu() && target?.isActive === true && get(interfaceStore).globalSurface === "repository";
@@ -864,6 +896,8 @@
           overflowTrigger.click();
           await settle(); await wait(20);
           await press(overflowMenu(), { key: "Escape" });
+          // The menu leaves over its 70ms exit, not in the same frame.
+          for (let i = 0; i < 40 && overflowMenu(); i += 1) await wait(25);
           check("Escape closes it and returns focus to its trigger", () =>
             !overflowMenu() && document.activeElement === $('[data-testid="repo-overflow"]'));
 

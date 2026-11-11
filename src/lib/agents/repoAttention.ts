@@ -15,6 +15,7 @@
 
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import type { AttentionKind } from "../terminal/sessionActivity";
+import type { AgentRepoTarget } from "./store";
 import {
   ATTENTION_REASONS,
   scopeToRepository,
@@ -55,6 +56,11 @@ export interface RepoAgentPill {
   tone: RepoAgentTone | null;
   /** The word that goes with the reason, short enough for a pill. */
   phrase: string;
+  /**
+   * Why the pill says "unknown", for its tooltip. Empty for every other state.
+   * "Not read yet" is a state with a cause, never a shrug.
+   */
+  why: string;
 }
 
 const PHRASE: Partial<Record<AttentionReason, string>> = {
@@ -126,6 +132,56 @@ function countLive(rows: readonly AgentRow[]): number {
 }
 
 /**
+ * The probe that read `repoPath`: the one for its own path, or the one for the
+ * repository it is a worktree of (a sweep reads each repository once, at its
+ * family root, and lists the other checkouts in the snapshot).
+ */
+export function probeFor(
+  probes: readonly PlaneProbe[],
+  repoPath: string,
+  paths: PathIdentityOptions,
+): PlaneProbe | undefined {
+  const key = identityKey(repoPath, paths);
+  return probes.find((candidate) =>
+    identityKey(candidate.path, paths) === key ||
+    (candidate.snapshot?.worktrees?.items ?? []).some((item) => identityKey(item.path, paths) === key));
+}
+
+const asked = new Set<string>();
+
+/**
+ * Starts the Agents read for a repository no read has covered, once.
+ *
+ * The read is the shared sweep (`agentPlaneStore`), the same one the Agents
+ * surface starts; this only asks for it when row 2 mounts on a repository
+ * that has no probe, so the pill does not stay "not read" until someone opens
+ * Agents. It asks once per repository: a read that was skipped or failed is
+ * reported by the pill with its cause, not retried in a loop. Returns whether
+ * it started one.
+ */
+export function ensurePlaneRead(input: {
+  store: { refresh(targets: readonly AgentRepoTarget[]): Promise<void> };
+  state: { probes: readonly PlaneProbe[]; scanning: boolean };
+  repoPath: string;
+  targets: readonly AgentRepoTarget[];
+  paths: PathIdentityOptions;
+}): boolean {
+  const { store, state, repoPath, targets, paths } = input;
+  if (!repoPath || state.scanning || targets.length === 0) return false;
+  if (probeFor(state.probes, repoPath, paths)) return false;
+  const key = identityKey(repoPath, paths);
+  if (asked.has(key)) return false;
+  asked.add(key);
+  void store.refresh(targets);
+  return true;
+}
+
+/** Forgets what `ensurePlaneRead` asked for. Tests only. */
+export function resetPlaneReadRequests(): void {
+  asked.clear();
+}
+
+/**
  * The header's answer for `repoPath`.
  *
  * `probes` is what the last sweep read; it decides unknown from none, because
@@ -137,25 +193,40 @@ export function repoAgentPill(input: {
   probes: readonly PlaneProbe[];
   repoPath: string;
   paths: PathIdentityOptions;
+  /** True while the shared sweep is reading: an unread repository is then "reading", not "never read". */
+  scanning?: boolean;
 }): RepoAgentPill {
-  const { plane, probes, repoPath, paths } = input;
+  const { plane, probes, repoPath, paths, scanning = false } = input;
   const rows = scopeToRepository(plane.roots, repoPath, paths);
   const live = countLive(rows);
   const reason = mostUrgent(rows, ASKS);
   if (reason) {
-    return { state: "attention", live, reason, tone: toneOf(reason), phrase: PHRASE[reason] ?? "Needs you" };
+    return { state: "attention", live, reason, tone: toneOf(reason), phrase: PHRASE[reason] ?? "Needs you", why: "" };
   }
   const key = identityKey(repoPath, paths);
-  const probe = probes.find((candidate) => identityKey(candidate.path, paths) === key);
+  const probe = probeFor(probes, repoPath, paths);
   const gap = plane.gaps.some((entry) => entry.repoPath !== "" && identityKey(entry.repoPath, paths) === key);
   const unread = mostUrgent(rows, UNREAD) !== null;
   if (!probe || probe.skipped || Boolean(probe.error) || gap || unread) {
-    return { state: "unknown", live, reason: null, tone: null, phrase: "Not read" };
+    const why = !probe
+      ? scanning
+        ? "The agents read for this repository is running now."
+        : "The agents read has not covered this repository yet."
+      : probe.skipped
+        ? probe.skipReason === "cap"
+          ? "The agents read skipped this repository: more are open than one read covers."
+          : "The agents read ran out of time before reaching this repository."
+        : probe.error
+          ? `The agents read failed: ${probe.error}`
+          : gap
+            ? "The agents read reported a gap for this repository."
+            : "Part of the agents read for this repository could not be measured.";
+    return { state: "unknown", live, reason: null, tone: null, phrase: !probe && scanning ? "Reading" : "Not read", why };
   }
   // Agent checkouts on disk are not running agents: only a live terminal makes
   // the pill appear when nothing asks for the reader.
   if (live > 0) {
-    return { state: "active", live, reason: null, tone: null, phrase: "Running" };
+    return { state: "active", live, reason: null, tone: null, phrase: "Running", why: "" };
   }
-  return { state: "none", live: 0, reason: null, tone: null, phrase: "" };
+  return { state: "none", live: 0, reason: null, tone: null, phrase: "", why: "" };
 }

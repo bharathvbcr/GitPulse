@@ -29,6 +29,7 @@
   import { popover } from "../ui/popover";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
+  import { markEnter, markExit } from "../ui/headerMotion";
   import { CloudDownload, AlertTriangle, CircleCheck, X } from "@lucide/svelte";
 
   let running = $state<"fetch" | "pull" | null>(null);
@@ -154,7 +155,7 @@
     {#if running && progress}
       <!-- While a sweep runs, the button becomes its own pill: a progress ring,
            the count and Stop. -->
-      <div class="gp-chip shrink-0 gap-1.5 pr-1" data-tone="accent" role="group" aria-label={runLabel}>
+      <div class="gp-chip shrink-0 gap-1.5 pr-1" data-tone="accent" role="group" aria-label={runLabel} in:markEnter out:markExit>
         <svg
           viewBox="0 0 14 14"
           width="14"

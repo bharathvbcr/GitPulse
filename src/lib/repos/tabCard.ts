@@ -4,7 +4,7 @@
  * A tab only carries what every open repository carries: path, branch, the
  * uncommitted count and its terminals. Sync with the upstream and the last
  * fetch are read for the repository on screen only; for any other tab the card
- * says "Not read" rather than leaving the row out or guessing, so a missing
+ * says "Not read yet" rather than leaving the row out or guessing, so a missing
  * answer never reads as a quiet one.
  */
 
@@ -15,7 +15,7 @@ import type { OpenRepoTab } from "./storeTypes";
 export interface TabCardRow {
   label: string;
   value: string;
-  /** True when the value is "Not read": the card does not know. */
+  /** True when the value is "Not read yet": the card does not know. */
   unknown?: boolean;
 }
 
@@ -33,7 +33,7 @@ export interface TabCardInput {
   nowSec?: number;
 }
 
-const NOT_READ = "Not read";
+const NOT_READ = "Not read yet";
 
 function syncText(sync: TabCardInput["sync"]): string {
   if (!sync) return NOT_READ;

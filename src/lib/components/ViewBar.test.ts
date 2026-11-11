@@ -45,7 +45,9 @@ describe("ViewBar", () => {
     expect(agents).toBeLessThan(body.indexOf('data-testid="terminal-pill"'));
     const tag = /<button\b[^>]*data-testid="viewbar-agents"[^>]*>/.exec(body)?.[0] ?? "";
     expect(tag).toContain('data-agents-state="unknown"');
-    expect(tag).toContain("not read yet");
+    // The tooltip names the cause, not just the state.
+    expect(tag).toContain("not read");
+    expect(tag).toContain("has not covered this repository");
     expect(tag).toContain('data-tone="unknown"');
   });
 

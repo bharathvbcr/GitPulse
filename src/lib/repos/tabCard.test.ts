@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { tabCardRows, type TabCardInput } from "./tabCard";
 
-const QUIET = { state: "none", live: 0, reason: null, tone: null, phrase: "" } as const;
+const QUIET = { state: "none", live: 0, reason: null, tone: null, phrase: "", why: "" } as const;
 
 const input = (over: Partial<TabCardInput> = {}): TabCardInput => ({
   tab: { path: "/code/app", currentBranch: "main", changedCount: 0, conflictedCount: 0, countsKnown: true, isDirty: false },
@@ -26,13 +26,13 @@ describe("tabCardRows", () => {
 
   it("says Not read, never zero or in sync, for a repository whose sync was never loaded", () => {
     const rows = tabCardRows(input({ sync: null, fetchedAt: undefined }));
-    expect(value(rows, "Branch")).toMatchObject({ value: "main · Not read", unknown: true });
-    expect(value(rows, "Last fetch")).toMatchObject({ value: "Not read", unknown: true });
+    expect(value(rows, "Branch")).toMatchObject({ value: "main · Not read yet", unknown: true });
+    expect(value(rows, "Last fetch")).toMatchObject({ value: "Not read yet", unknown: true });
   });
 
   it("does not turn an unread uncommitted count into None", () => {
     const rows = tabCardRows(input({ tab: { ...input().tab, countsKnown: false } }));
-    expect(value(rows, "Uncommitted")).toMatchObject({ value: "Not read", unknown: true });
+    expect(value(rows, "Uncommitted")).toMatchObject({ value: "Not read yet", unknown: true });
   });
 
   it("counts files and conflicts", () => {
@@ -41,10 +41,10 @@ describe("tabCardRows", () => {
   });
 
   it("reports agents by the pill's own state and keeps unknown unknown", () => {
-    const attention = tabCardRows(input({ agents: { state: "attention", live: 1, reason: "needs-you", tone: "warn", phrase: "Needs you" } }));
+    const attention = tabCardRows(input({ agents: { state: "attention", live: 1, reason: "needs-you", tone: "warn", phrase: "Needs you", why: "" } }));
     expect(value(attention, "Agents")?.value).toBe("Needs you · 1 running");
-    const unknown = tabCardRows(input({ agents: { state: "unknown", live: 0, reason: null, tone: null, phrase: "Not read" } }));
-    expect(value(unknown, "Agents")).toMatchObject({ value: "Not read", unknown: true });
+    const unknown = tabCardRows(input({ agents: { state: "unknown", live: 0, reason: null, tone: null, phrase: "Not read", why: "never read" } }));
+    expect(value(unknown, "Agents")).toMatchObject({ value: "Not read yet", unknown: true });
     expect(value(tabCardRows(input()), "Agents")?.value).toBe("None");
   });
 

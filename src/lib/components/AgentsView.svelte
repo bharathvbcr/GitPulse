@@ -37,6 +37,7 @@
   import { openTaskForRun, requestTaskOpen } from "../workbench/taskOpen";
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentDirectories } from "../agents/cwd";
+  import { planeTerminals } from "../agents/repoAttention";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
   import { isMacOS } from "../platform";
   import { gapGroupTitle, gapsBlockReading, groupGaps, type GapNote } from "../agents/gapGroups";
@@ -81,24 +82,9 @@
   let activeView = $state<"plane" | "inbox">("plane");
   const activeRepoPath = $derived($agentsRepositoryScope || $repoStore.currentPath || "");
 
-  const terminals = $derived($terminalSessions.map((record) => {
-    const activity = record.sessionId ? $sessionActivity.get(record.sessionId) : undefined;
-    return {
-      key: record.key,
-      repoPath: record.repoPath,
-      label: record.label,
-      title: activity?.title || record.title || record.label,
-      status: record.status,
-      sessionId: record.sessionId ?? "",
-      taskRunId: record.taskRunId ?? "",
-      continuesRunId: record.continuesRunId ?? "",
-      // Unknown stays unknown. The registry has no directory, and a failed
-      // context read must not be filled in with the repository root. The tab
-      // chip counts from this same sweep (`agentDirectories`).
-      cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
-      attention: activity?.attention?.kind ?? null,
-    };
-  }));
+  // The one mapping the header shares (`repoAttention.ts`): unknown stays
+  // unknown there, and the tab chip counts from this same sweep.
+  const terminals = $derived(planeTerminals($terminalSessions, $sessionActivity, $agentDirectories));
 
   const repoPaths = $derived(repositoryPaths($registered, $repoStore.openTabs, pathOpts));
 

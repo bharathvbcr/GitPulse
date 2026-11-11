@@ -16,7 +16,7 @@
    * the workspace below never jumps. Widths are container queries on this
    * element, not the window, so a narrow stage behaves like a narrow window.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { fade } from "svelte/transition";
   import { Bot, FileDiff, RefreshCw } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
@@ -25,9 +25,11 @@
   import { headerAgentPlane } from "../agents/headerPlane";
   import { plural } from "../agents/plane";
   import { setAgentsRepositoryScope } from "../agents/scope";
-  import { repoAgentPill } from "../agents/repoAttention";
+  import { ensurePlaneRead, repoAgentPill } from "../agents/repoAttention";
+  import { agentPlaneStore, sweepTargets } from "../agents/store";
   import { LAYERS } from "../ui/layers";
   import { backdropFade, backdropFadeOut } from "../ui/transitions";
+  import { swapRow } from "../ui/headerMotion";
   import { registerContextSlot, reportViewBarWidth } from "../ui/headerSlots";
   import ScrollCue from "./ScrollCue.svelte";
   import TerminalPill from "./TerminalPill.svelte";
@@ -53,14 +55,51 @@
       probes: $headerAgentPlane.probes,
       repoPath,
       paths: pathOpts,
+      scanning: $agentPlaneStore.scanning,
     }),
   );
+
+  // Row 2 mounting on a repository the Agents read has not covered asks the
+  // shared sweep for it (once per repository). Nothing here polls: after this
+  // the plane is read when the Agents surface asks, as before.
+  const readTargets = $derived(sweepTargets($repoStore.openTabs));
+  $effect(() => {
+    const path = repoPath;
+    const state = $agentPlaneStore;
+    if (!path || !onRepository) return;
+    const targets = untrack(() => readTargets);
+    untrack(() => {
+      ensurePlaneRead({ store: agentPlaneStore, state, repoPath: path, targets, paths: pathOpts });
+    });
+  });
   const agentsLabel = $derived.by(() => {
-    if (agents.state === "unknown") return "Agents, not read yet. Open Agents for this repository";
+    if (agents.state === "unknown") return `Agents, ${agents.phrase.toLowerCase()}. ${agents.why} Open Agents for this repository`;
     const live = agents.live > 0 ? `, ${plural(agents.live, "agent running", "agents running")}` : "";
     return agents.state === "attention"
       ? `Agents, ${agents.phrase.toLowerCase()}${live}`
       : `Agents${live}`;
+  });
+
+  // Row 2's controls fade (opacity only) when a global surface takes over and
+  // when the repository comes back; `concealed` is the final `visibility`, set
+  // after the fade out and before the fade in, so the row is never half-hidden.
+  let controls: HTMLDivElement | undefined = $state();
+  let concealed = $state(!untrack(() => onRepository));
+  let swapped: boolean | null = null;
+  let swapping: Animation | null = null;
+  $effect(() => {
+    const show = onRepository;
+    const el = controls;
+    if (!el || swapped === show) return;
+    const first = swapped === null;
+    swapped = show;
+    if (first) return;
+    // A swap interrupted by the next one settles first, so the last word is the newest.
+    swapping?.cancel();
+    if (show) concealed = false;
+    swapping = swapRow(el, show, () => {
+      concealed = !show;
+    });
   });
 
   const dirty = $derived($repoStore.statuses.length);
@@ -107,7 +146,8 @@
   {/if}
 
   <div
-    class="flex h-full min-w-0 flex-1 items-center gap-2 px-2 {onRepository ? '' : 'invisible'}"
+    bind:this={controls}
+    class="flex h-full min-w-0 flex-1 items-center gap-2 px-2 {concealed ? 'invisible' : ''}"
     inert={!onRepository}
     data-viewbar-controls
   >
@@ -140,9 +180,11 @@
         onclick={openAgents}
       >
         <Bot size={12} aria-hidden="true" />
-        <span class="hidden @min-[1100px]:inline">{agents.state === "attention" ? agents.phrase : "Agents"}</span>
+        <span class="hidden @min-[1100px]:inline">{agents.state === "attention" || agents.state === "unknown" ? agents.phrase : "Agents"}</span>
         {#if agents.state === "unknown"}
-          <span aria-hidden="true">?</span>
+          <!-- Narrow rows keep the icon: the "?" stands for the word, and the
+               tooltip carries the cause. -->
+          <span class="@min-[1100px]:hidden" aria-hidden="true">?</span>
         {:else if agents.live > 0}
           <span class="font-mono tabular-nums" aria-hidden="true">{agents.live}</span>
         {/if}

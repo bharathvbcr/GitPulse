@@ -177,6 +177,9 @@
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",
+        // Row 2 asks the shared agents sweep for the repository on screen when
+        // it mounts (once); the answer here is none, so the pill says why.
+        "cmd_insights_snapshot",
       ]);
       // The code-graph service is not installed in this fixture, which is what
       // a refused call means to its callers.
@@ -612,8 +615,19 @@
             const row2Box = row2.getBoundingClientRect();
             const controls = () => $("[data-viewbar-controls]", row2);
             check("header: on the repository surface row 2's controls are live", () => !controls().inert);
+            const insightsReads = calls.filter((call) => call.cmd === "cmd_insights_snapshot");
+            const agentsPill = $('[data-testid="viewbar-agents"]', row2);
+            // A repository no read covered asks the shared sweep once, and a sweep
+            // reads every open repository, so a repository opened after the first
+            // read costs one more sweep (alpha twice here), never a poll.
+            check("header: mounting row 2 asked the shared agents sweep for the repository, a bounded number of times, and an unreadable answer is named, not a bare question mark", () =>
+              insightsReads.some((call) => call.repo === ALPHA) && insightsReads.length <= 4 &&
+              !!agentsPill && agentsPill.dataset.agentsState === "unknown" &&
+              /The agents read (failed|has not covered)/.test(agentsPill.getAttribute("title") ?? ""));
             interfaceStore.setGlobalSurface("fleet");
             await settle();
+            // The controls fade out over the 70ms exit before they are hidden.
+            for (let i = 0; i < 40 && getComputedStyle(controls()).visibility !== "hidden"; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             const underBox = row2.getBoundingClientRect();
             check("header: under Fleet row 2 stays mounted at the same height, its controls inert and hidden, the surface named", () =>
               row2.isConnected && Math.abs(underBox.height - row2Box.height) < 0.5 && Math.abs(underBox.top - row2Box.top) < 0.5 &&
