@@ -14,7 +14,7 @@ const source = readFileSync(
 describe("Sidebar", () => {
   it("labels its icon-only controls for screen readers", () => {
     const { body } = render(Sidebar);
-    // Gold standard (FilterBar): every icon-only button carries an explicit
+    // Gold standard (the view bar search field): every icon-only button carries an explicit
     // aria-label alongside its title.
     expect(body).toContain('aria-label="Collapse sidebar"');
     expect(body).toContain('aria-label="Float sidebar over the workspace"');

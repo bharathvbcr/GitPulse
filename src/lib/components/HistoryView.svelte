@@ -7,7 +7,12 @@
 
   /** Named once: the tab and its panel must agree on the id. */
   const view = "history" as const;
-  import FilterBar from "./FilterBar.svelte";
+  import { filterStore } from "../stores/filterStore";
+  import {
+    providePageSearchScope,
+    registerPageSearch,
+    registerStandingFilter,
+  } from "../search/pageSearch.svelte";
   import CommitTable from "./CommitTable.svelte";
   import GraphNotices from "./GraphNotices.svelte";
   import CommitDetails from "./CommitDetails.svelte";
@@ -54,24 +59,49 @@
 
   const section = $derived(activeSectionFor("history", $repoStore.viewSections));
   const list = $derived($repoStore.historyList);
+
+  // The view bar's search field. On Graph it is the commit filter; the Diff
+  // section's viewer (mounted inside this scope) makes it a find instead.
+  providePageSearchScope("history:diff");
+  $effect(() =>
+    registerPageSearch("history:graph", {
+      kind: "filter",
+      label: "Filter commits",
+      placeholder: "Filter commits by message, author or path (author:alice, feat:)…",
+      query: () => $filterStore.searchQuery,
+      setQuery: (next) => filterStore.setSearch(next),
+      chip: () =>
+        $filterStore.selectedBranch
+          ? { label: $filterStore.selectedBranch, title: "Clear branch filter", clear: () => filterStore.selectBranch(null) }
+          : null,
+    }),
+  );
+  // The filter narrows every section's commits: the graph walk, the diff's
+  // commit list and the reflog's loaded entries (the branch cannot apply to
+  // HEAD's log). Where the field is a find, the applied filter stays in view.
+  $effect(() =>
+    registerStandingFilter("history", () => {
+      const { searchQuery, selectedBranch } = $filterStore;
+      if (!searchQuery && !selectedBranch) return null;
+      const parts = [searchQuery && `“${searchQuery}”`, selectedBranch].filter(Boolean).join(" · ");
+      return { label: `Commits: ${parts}`, title: "The commit filter applied in Graph. Clear it", clear: () => filterStore.clear() };
+    }),
+  );
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewContextBar label="Commit filter">
-    {#if section === "graph"}
+  {#if section === "graph"}
+    <!-- Graph's two lists. The commit filter that used to sit beside them is
+         the view bar's search field now. -->
+    <ViewContextBar label="Graph list">
       <SettingSegment
         ariaLabel="Graph list"
         options={HISTORY_LISTS}
         value={list}
         onselect={(next) => repoStore.setHistoryList(next)}
       />
-    {/if}
-    <!-- The filter applies to every section here: the graph walk and the
-         diff's commit list are drawn from it, and the reflog list narrows
-         its loaded entries by the same text (the branch chip cannot apply to
-         HEAD's log). -->
-    <FilterBar />
-  </ViewContextBar>
+    </ViewContextBar>
+  {/if}
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane

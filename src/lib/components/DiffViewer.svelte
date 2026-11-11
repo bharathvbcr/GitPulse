@@ -98,6 +98,7 @@
   } from "@lucide/svelte";
   import LazyMount from "./LazyMount.svelte";
   import FindField from "./FindField.svelte";
+  import { pageSearchScope, registerPageSearch } from "../search/pageSearch.svelte";
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
   const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
@@ -255,7 +256,13 @@
   let isDragging = $state(false);
   let copiedPatch = $state(false);
 
-  let searchOpen = $state(false);
+  /**
+   * Mounted as a page's own pane (History's Diff section), the view bar's
+   * search field is this diff's find: the viewer registers as its provider
+   * and draws no Find of its own. Mounted anywhere else it keeps its own.
+   */
+  const searchScope = pageSearchScope();
+  let searchOpen = $state(searchScope !== null);
   let searchQuery = $state("");
   let searchCase = $state(false);
   let searchRegex = $state(false);
@@ -544,10 +551,27 @@
   }
 
   function closeSearch(): void {
-    searchOpen = false;
+    searchOpen = searchScope !== null;
     searchQuery = "";
     searchIndex = 0;
   }
+
+  $effect(() => {
+    if (!searchScope) return;
+    return registerPageSearch(searchScope, {
+      kind: "find",
+      label: "Find in this diff",
+      placeholder: "Find in this diff…",
+      query: () => searchQuery,
+      setQuery: (next) => (searchQuery = next),
+      caseSensitive: () => searchCase,
+      setCaseSensitive: (next) => (searchCase = next),
+      regex: () => searchRegex,
+      setRegex: (next) => (searchRegex = next),
+      status: () => ({ text: matchLabel(search, searchIndex), invalid: search.invalid, hasMatches: search.matches.length > 0 }),
+      step: stepSearch,
+    });
+  });
 
   // Re-anchor on the visible row whenever the result set changes, so typing
   // another character does not throw the reader back to match one.
@@ -1085,12 +1109,13 @@
     const onControl =
       target?.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"]') != null;
 
-    if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
+    // As a page's pane, ⌘F is the view bar field's (App routes it there).
+    if (!searchScope && (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
       event.preventDefault();
       openSearch();
       return;
     }
-    if (event.key === "Escape" && searchOpen && (nothingFocused || inPane)) {
+    if (event.key === "Escape" && searchOpen && !searchScope && (nothingFocused || inPane)) {
       event.preventDefault();
       closeSearch();
       return;
@@ -1769,6 +1794,7 @@
       </button>
     {/if}
 
+    {#if !searchScope}
     <FindField
       bind:open={searchOpen}
       bind:query={searchQuery}
@@ -1784,6 +1810,7 @@
       onstep={stepSearch}
       onclose={closeSearch}
     />
+    {/if}
 
     <div class="flex items-center gap-1">
       <button

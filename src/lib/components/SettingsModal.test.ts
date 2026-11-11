@@ -122,7 +122,7 @@ describe("SettingsModal", () => {
     expect(body).toContain("System");
     expect(body).toContain("Light");
     expect(body).toContain("Dark");
-    // Density options (sole owner since the FilterBar control moved here).
+    // Density options (sole owner since the commit filter bar dropped its control).
     expect(body).toContain("Spacious");
     expect(body).toContain("Comfortable");
     expect(body).toContain("Compact");

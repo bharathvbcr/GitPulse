@@ -7,7 +7,7 @@
    * header on every view, holding the lens tabs plus whatever the current
    * section added at the right. The tabs moved into the header switcher
    * (`ViewSectionTabs`, beside the view that owns them), so what is left is
-   * the per-view content: History's commit filter, Blame's file path, Work's
+   * the per-view content: History's list segment, Blame's file path, Work's
    * conflict count. A view with none of that renders no row at all, and its
    * pane gets the height back — callers wrap this in the condition that says
    * whether there is anything to show.

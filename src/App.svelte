@@ -47,9 +47,10 @@
   import RepoPaneRecovery from "./lib/components/RepoPaneRecovery.svelte";
   import InsightsView from "./lib/components/InsightsView.svelte";
   import {
-    FOCUS_COMMIT_SEARCH_EVENT,
+    COMMIT_FILTER_SECTION,
+    FOCUS_PAGE_SEARCH_EVENT,
+    fieldOwnsFindChord,
     isCommitSearchChord,
-    ownsCommitSearchChord,
     tabForCommitSearch,
   } from "./lib/views/commitFilter";
   import { activeSectionFor } from "./lib/views/viewRegistry";
@@ -339,18 +340,27 @@
   }
 
   /**
-   * Native "Search Commits" and ⌘F (except Files, which owns in-file search).
-   * Switching first is what makes the chord work on Work: FilterBar is not
-   * mounted there, so dispatching the focus event alone was a silent no-op.
+   * ⌘F: the view bar's search field, on whatever page is showing. The page
+   * decides what the field does (filter commits, find in a diff or a file,
+   * search the repository), so nothing switches view first.
+   */
+  function focusPageSearch() {
+    window.dispatchEvent(new CustomEvent(FOCUS_PAGE_SEARCH_EVENT));
+  }
+
+  /**
+   * Native "Search Commits": the commit filter specifically, so it lands on
+   * History's graph first, where the field filters commits.
    */
   async function focusCommitSearch() {
     const tab = $repoStore.activeTab;
     const target = tabForCommitSearch(tab);
-    if (target !== tab) {
-      repoStore.setActiveTab(target);
+    const section = activeSectionFor(target, $repoStore.viewSections);
+    if (target !== tab || section !== COMMIT_FILTER_SECTION) {
+      repoStore.setActiveTab(target, COMMIT_FILTER_SECTION);
       await tick();
     }
-    window.dispatchEvent(new CustomEvent(FOCUS_COMMIT_SEARCH_EVENT));
+    focusPageSearch();
   }
 
   let exitRequestPending = false;
@@ -594,6 +604,12 @@
     track(() => window.removeEventListener("gitpulse:settings", openSettings));
     window.addEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog);
     track(() => window.removeEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog));
+    // The view bar's search runs the palette inline, outside this component:
+    // its Clone and Rebase commands reach these dialogs by event.
+    window.addEventListener("gitpulse:clone", openCloneDialog);
+    track(() => window.removeEventListener("gitpulse:clone", openCloneDialog));
+    window.addEventListener("gitpulse:rebase", openRebaseDialog);
+    track(() => window.removeEventListener("gitpulse:rebase", openRebaseDialog));
     const openToolsSetup = () => openSetupWizard("devmap", "explain");
     window.addEventListener("gitpulse:setup-tools", openToolsSetup);
     track(() => window.removeEventListener("gitpulse:setup-tools", openToolsSetup));
@@ -644,9 +660,17 @@
         repoStore.toggleTerminal();
         return;
       }
-      if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))) {
+      if (
+        isCommitSearchChord(e) &&
+        !isImeComposition(e) &&
+        fieldOwnsFindChord({
+          hasRepository: Boolean($repoStore.currentPath),
+          onRepositorySurface: $interfaceStore.globalSurface === "repository",
+          defaultPrevented: e.defaultPrevented,
+        })
+      ) {
         e.preventDefault();
-        void focusCommitSearch();
+        focusPageSearch();
         return;
       }
       // ⌥1…⌥n selects a section of the ACTIVE view. The consolidation left

@@ -35,6 +35,7 @@
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import FindField from "../FindField.svelte";
+  import { pageSearchScope, registerPageSearch } from "../../search/pageSearch.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
@@ -96,6 +97,12 @@
 
   // In-file search state
   let isSearchOpen = $state(false);
+  /**
+   * Mounted as the Code view's file pane, the view bar's search field is
+   * this file's find: the viewer registers as its provider and draws no Find
+   * of its own. Mounted anywhere else (a stash preview) it keeps its own.
+   */
+  const searchScope = pageSearchScope();
   let searchQuery = $state("");
   let isCaseSensitive = $state(false);
   let isRegex = $state(false);
@@ -234,6 +241,29 @@
     scrollToMatch(next);
   }
 
+  // A file opened as a page's own pane finds through the view bar's field;
+  // anywhere else (a stash preview) the toolbar Find above stays.
+  $effect(() => {
+    if (!searchScope) return;
+    return registerPageSearch(searchScope, {
+      kind: "find",
+      label: "Find in file",
+      placeholder: "Find in file…",
+      query: () => searchQuery,
+      setQuery: (next) => (searchQuery = next),
+      caseSensitive: () => isCaseSensitive,
+      setCaseSensitive: (next) => (isCaseSensitive = next),
+      regex: () => isRegex,
+      setRegex: (next) => (isRegex = next),
+      status: () => ({
+        text: matchLabel(searchResult, currentMatchIdx),
+        invalid: searchResult.invalid,
+        hasMatches: matchCount > 0,
+      }),
+      step: (delta) => (delta === 1 ? nextMatch() : prevMatch()),
+    });
+  });
+
   function scrollToMatch(idx: number) {
     const match = searchMatches[idx];
     if (!match) return;
@@ -347,7 +377,8 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    // As the page's pane, ⌘F is the view bar field's (App routes it there).
+    if (!searchScope && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
       isSearchOpen = true;
       setTimeout(() => searchInputEl?.focus(), 50);
@@ -370,7 +401,7 @@
         goToLineOpen = false;
         return;
       }
-      if (isSearchOpen) {
+      if (isSearchOpen && !searchScope) {
         isSearchOpen = false;
         searchQuery = "";
         return;
@@ -502,6 +533,7 @@
         <span class="text-micro font-semibold text-warn" role="status">Unsaved</span>
       {/if}
 
+      {#if !searchScope}
       <div class="ml-2 flex min-w-0 items-center">
         <FindField
           bind:open={isSearchOpen}
@@ -518,6 +550,7 @@
           onstep={(delta) => (delta === 1 ? nextMatch() : prevMatch())}
         />
       </div>
+      {/if}
 
       <button
         type="button"

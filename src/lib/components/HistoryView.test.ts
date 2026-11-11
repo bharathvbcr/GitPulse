@@ -12,7 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const read = (name: string) => readFileSync(join(here, name), "utf8");
 const history = read("HistoryView.svelte");
 const sectionBar = read("ViewSectionTabs.svelte");
-const filterBar = read("FilterBar.svelte");
+const viewBar = read("ViewBar.svelte");
 const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
 
 describe("HistoryView", () => {
@@ -67,9 +67,21 @@ describe("HistoryView", () => {
     expect(history).not.toContain("{#key section}");
   });
 
-  it("carries the commit filter in its own header", () => {
-    expect(history).toContain("<FilterBar />");
-    expect(history).toContain("<ViewContextBar");
+  it("gives the view bar's field its commit filter, and its diff a find", () => {
+    // Graph registers the filter; the Diff section's viewer registers inside
+    // the scope History provides. The branch rides in the field as a chip.
+    expect(history).toContain('registerPageSearch("history:graph"');
+    expect(history).toContain('kind: "filter"');
+    expect(history).toContain("filterStore.setSearch(next)");
+    expect(history).toContain("filterStore.selectBranch(null)");
+    expect(history).toContain('providePageSearchScope("history:diff")');
+    // The list segment keeps its own context bar, on Graph only.
+    expect(history).toContain('<ViewContextBar label="Graph list">');
+  });
+
+  it("keeps the commit filter in sight on every section it narrows", () => {
+    expect(history).toContain('registerStandingFilter("history"');
+    expect(history).toContain("filterStore.clear()");
   });
 });
 
@@ -131,14 +143,13 @@ describe("ViewSectionTabs", () => {
   });
 });
 
-describe("the commit filter stopped being a full-width strip", () => {
-  it("no longer owns a row of its own", () => {
-    expect(filterBar).not.toContain('class="h-10 bg-surface/60 border-b');
-    expect(filterBar).toContain('class="flex-1 min-w-0 flex items-center');
-  });
-
-  it("is mounted by History, not by App", () => {
+describe("the commit filter stopped being a bar of its own", () => {
+  it("is the view bar's field, mounted once, not by App or History", () => {
+    // It was a full-width strip under the header, then a pill in History's
+    // section bar. It is the one search field in row 2 now.
     expect(app).not.toContain("<FilterBar");
-    expect(history).toContain("<FilterBar />");
+    expect(history).not.toContain("<FilterBar");
+    expect(history).not.toContain("<PageSearch");
+    expect(viewBar.match(/<PageSearch \/>/g)).toHaveLength(1);
   });
 });

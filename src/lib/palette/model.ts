@@ -1,8 +1,10 @@
 import type { Search } from "@lucide/svelte";
 import { fuzzyMatch } from "../branches/groupBranches";
 import { isRecord } from "../record";
+import { MAX_QUERY_LENGTH } from "./modes";
 
-export type PaletteMode = "commands" | "files" | "repositories" | "commits" | "branches" | "symbols" | "workspace" | "help";
+export { MAX_QUERY_LENGTH, PALETTE_MODES, parsePaletteQuery, hasPalettePrefix, type PaletteMode } from "./modes";
+
 export interface PaletteItem {
   id: string;
   label: string;
@@ -20,35 +22,6 @@ export interface PaletteItem {
 }
 
 export const PAGE_SIZE = 50;
-export const MAX_QUERY_LENGTH = 256;
-export const PALETTE_MODES: ReadonlyArray<{ mode: PaletteMode; prefix: string; label: string; hint: string }> = [
-  { mode: "commands", prefix: ">", label: "Commands", hint: "Search actions, settings and views" },
-  { mode: "files", prefix: "/", label: "Files", hint: "Search repository file names and paths" },
-  { mode: "repositories", prefix: "%", label: "Repositories", hint: "Switch tabs or open a recent repository" },
-  { mode: "commits", prefix: "#", label: "Commits", hint: "Search loaded history by hash, message or author" },
-  { mode: "branches", prefix: "@", label: "Branches", hint: "Search local and remote branches" },
-  { mode: "symbols", prefix: ":", label: "Symbols", hint: "Search the active repository's code map" },
-  { mode: "workspace", prefix: "::", label: "Workspace", hint: "Search registered repositories; append ~ for TF-IDF name ranking" },
-  { mode: "help", prefix: "?", label: "Help", hint: "Discover search modes and keyboard shortcuts" },
-];
-
-export function parsePaletteQuery(query: string) {
-  const trimmed = query.trim().slice(0, MAX_QUERY_LENGTH);
-  let mode: PaletteMode = "commands";
-  let prefix = "";
-  if (trimmed.startsWith("::")) { mode = "workspace"; prefix = "::"; }
-  else if (trimmed.startsWith("#")) { mode = "commits"; prefix = "#"; }
-  else if (trimmed.startsWith("@")) { mode = "branches"; prefix = "@"; }
-  else if (trimmed.startsWith(":")) { mode = "symbols"; prefix = ":"; }
-  else if (trimmed.startsWith("?")) { mode = "help"; prefix = "?"; }
-  else if (trimmed.startsWith("/")) { mode = "files"; prefix = "/"; }
-  else if (trimmed.startsWith("%")) { mode = "repositories"; prefix = "%"; }
-  else if (trimmed.startsWith(">")) prefix = ">";
-  let text = trimmed.slice(prefix.length).trim();
-  const semantic = mode === "workspace" && text.endsWith("~");
-  if (semantic) text = text.slice(0, -1).trim();
-  return { mode, text, semantic };
-}
 
 export interface Usage { count: number; lastUsed: number }
 export type Frecency = ReadonlyMap<string, Usage>;

@@ -1,7 +1,7 @@
 /**
  * Where a view's own toolbar may sit when the view bar has room for it.
  *
- * `ViewContextBar` is drawn by the views (History's commit filter, Work's
+ * `ViewContextBar` is drawn by the views (History's list segment, Work's
  * conflict count), which the header does not own. At the widest layout the
  * header's second row has spare width, so the bar hands its node to a slot the
  * view bar registers here instead of costing the pane a 40px row of its own.

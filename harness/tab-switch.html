@@ -819,7 +819,7 @@
             check("switcher: the open panel names a section tab that exists", () =>
               !!panel && !!document.getElementById(panel.getAttribute("aria-labelledby")));
             check("switcher: a view with per-view content keeps its row, labelled", () =>
-              !!$('[role="group"][aria-label="Commit filter"]'));
+              !!$('[role="group"][aria-label="Graph list"]'));
             const heights = $$("[data-view-group]").map((g) => g.getBoundingClientRect().height);
             check("switcher: the expanded group is as tall as the collapsed ones", () =>
               heights.length >= 4 && Math.max(...heights) - Math.min(...heights) < 1);
@@ -931,54 +931,124 @@
                 !below.some((s) => /0px 1px 0px 0px inset/.test(s)) && below.some((s) => /0px -1px 0px 0px inset/.test(s)) &&
                 getComputedStyle(row1).backgroundImage === "none" && getComputedStyle(row2).backgroundImage === "none";
             });
-            // From 1600px the view's own row folds into row 2's slot. History's search
-            // used to stay input-sized there (about 180px) beside an empty drag band;
-            // it now shares the free width with the drag zone, which keeps its floor.
-            // The shell is sized by the viewport, so the page cannot widen row 2; it
-            // sends the fold signal the bar's ResizeObserver sends, then the real width.
+            // Row 2's search is one field for every page (search/pageSearch.svelte.ts):
+            // History's graph filters commits through it, its Diff section finds in
+            // the diff, and a page with nothing of its own searches the repository
+            // through the palette, whose results drop down under the field.
             const { reportViewBarWidth, FOLD_MIN_WIDTH } = await import("../src/lib/ui/headerSlots.ts");
+            const { filterStore } = await import("../src/lib/stores/filterStore.ts");
             const viewBefore = get(repoStore).activeTab;
-            repoStore.setActiveTab("history");
-            reportViewBarWidth(FOLD_MIN_WIDTH);
-            await sleepUntil(() => !!$("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement, 5000);
+            const field = () => $("[data-page-search]", row2);
+            const fieldInput = () => $("#gitpulse-page-search", row2);
+            const typeInField = async (value) => {
+              fieldInput().value = value;
+              fieldInput().dispatchEvent(new Event("input", { bubbles: true }));
+              await settle();
+            };
+            const keyInField = async (key) => {
+              fieldInput().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+              await settle();
+            };
+            check("search: row 2 holds one search field and it fits: no overflow at this width, the field at least 160px", () => {
+              const width = field()?.getBoundingClientRect().width ?? -1;
+              if ($$("[data-page-search]").length === 1 && width >= 160 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`fields ${$$("[data-page-search]").length}, field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
+            });
+            // 900px is the window's minimum (tauri.conf.json). Row 2 spans the window,
+            // so a 900px row is the narrowest it gets: the switcher scrolls, the field
+            // keeps its floor, and nothing spills out of the row.
+            row2.style.maxWidth = "900px";
             await settle();
-            const foldedSearch = $("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement;
+            check("search: at the 900px minimum window row 2 still fits, the field keeps its 160px floor and the switcher scrolls instead", () => {
+              const width = field()?.getBoundingClientRect().width ?? -1;
+              if (width >= 159.5 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
+            });
+            row2.style.maxWidth = "";
+            await settle();
+            repoStore.setActiveTab("history", "graph");
+            await sleepUntil(() => field()?.dataset.pageSearch === "filter", 5000);
+            check("search: on History's graph the field is the commit filter", () =>
+              field()?.dataset.pageSearch === "filter" && /^Filter commits/.test(fieldInput().placeholder));
+            // From 1600px the view's own row folds into row 2's slot: History's list
+            // segment lands there, before the field. The shell is sized by the
+            // viewport, so the page sends the fold signal the bar's ResizeObserver sends.
+            reportViewBarWidth(FOLD_MIN_WIDTH);
+            await sleepUntil(() => !!$('[data-viewbar-context] [aria-label="Graph list"]', row2), 5000);
+            await settle();
+            check("search: folded, History's list segment sits in row 2's slot, before the one field", () => {
+              const segment = $('[data-viewbar-context] [aria-label="Graph list"]', row2);
+              return !!segment && $$("[data-page-search]").length === 1 &&
+                segment.getBoundingClientRect().right <= field().getBoundingClientRect().left + 0.5;
+            });
+            // With the switcher hidden the row has free width; the claim is where it
+            // goes: to the field, with the drag zone at its floor share.
             const dragZone = $("[data-viewbar-controls] > [data-tauri-drag-region]:not([data-viewbar-context])", row2);
-            // At this 1400px row the view switcher fills most of it, and an
-            // input-sized pill already beats a squeezed drag zone. The switcher is
-            // hidden for the measurement, so the free width is wide and the claim
-            // is about where it goes: to the search, with the zone at its floor share.
             const switcher = $("[data-viewbar-controls] > .relative", row2);
             switcher.style.display = "none";
             await settle();
-            check("header: folded into row 2 with free width, History's search takes it (over 400px, more than twice the drag zone) and the zone keeps its 48px floor", () => {
-              const searchWidth = foldedSearch?.getBoundingClientRect().width ?? -1;
+            check("search: with free width the field takes it (over 400px, more than twice the drag zone) and the zone keeps its 48px floor", () => {
+              const searchWidth = field()?.getBoundingClientRect().width ?? -1;
               const zoneWidth = dragZone?.getBoundingClientRect().width ?? -1;
               if (searchWidth > 400 && searchWidth > 2 * zoneWidth && zoneWidth >= 48 && row2.scrollWidth <= row2.clientWidth + 1) return true;
-              throw new Error(`search ${searchWidth}px, drag zone ${zoneWidth}px, row 2 ${row2.clientWidth}px wide / ${row2.scrollWidth}px content, active view ${get(repoStore).activeTab}`);
+              throw new Error(`search ${searchWidth}px, drag zone ${zoneWidth}px, row 2 ${row2.clientWidth}px wide / ${row2.scrollWidth}px content`);
             });
             switcher.style.display = "";
-            // Typing in the search must not paint it: no accent edge or ring on the
-            // pill, and no global input:focus-visible ring on the input inside it.
-            const filterInput = $("#gitpulse-filter", row2);
-            const pillEdge = getComputedStyle(foldedSearch).borderTopColor;
-            filterInput.focus();
-            filterInput.value = "fix";
-            filterInput.dispatchEvent(new Event("input", { bubbles: true }));
-            await settle();
-            check("header: typing in History's search draws no ring or accent edge on the input or its pill", () => {
-              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
-              const shadows = [getComputedStyle(filterInput).boxShadow, getComputedStyle(foldedSearch).boxShadow];
-              const edge = getComputedStyle(foldedSearch).borderTopColor;
-              if (document.activeElement === filterInput && shadows.every(noShadow) && edge === pillEdge) return true;
-              throw new Error(`focused ${document.activeElement === filterInput}, shadows ${JSON.stringify(shadows)}, edge ${pillEdge} -> ${edge}`);
-            });
-            filterInput.value = "";
-            filterInput.dispatchEvent(new Event("input", { bubbles: true }));
-            filterInput.blur();
             reportViewBarWidth(row2.getBoundingClientRect().width);
+            await settle();
+            // Typing must not paint it: no accent edge or ring on the pill, and no
+            // global focus ring on the input inside it.
+            const pillEdge = getComputedStyle(field()).borderTopColor;
+            fieldInput().focus();
+            await typeInField("fix");
+            check("search: typing in it draws no ring or accent edge on the input or its pill", () => {
+              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
+              const shadows = [getComputedStyle(fieldInput()).boxShadow, getComputedStyle(field()).boxShadow];
+              const edge = getComputedStyle(field()).borderTopColor;
+              if (document.activeElement === fieldInput() && shadows.every(noShadow) && edge === pillEdge) return true;
+              throw new Error(`focused ${document.activeElement === fieldInput()}, shadows ${JSON.stringify(shadows)}, edge ${pillEdge} -> ${edge}`);
+            });
+            check("search: what is typed on the graph is the commit filter", () => get(filterStore).searchQuery === "fix");
+            fieldInput().blur();
+            await settle();
+            check("search: the filter stays applied, and shown, after the field loses focus", () =>
+              fieldInput().value === "fix" && get(filterStore).searchQuery === "fix");
+            repoStore.setActiveTab("history", "diff");
+            await sleepUntil(() => field()?.dataset.pageSearch === "find", 5000);
+            check("search: on History's Diff section the field is the diff's find, empty, with the applied commit filter shown in it", () =>
+              field()?.dataset.pageSearch === "find" && fieldInput().value === "" && /Commits: “fix”/.test(text(field())));
+            [...field().querySelectorAll("button")].find((el) => /Commits:/.test(text(el)))?.click();
+            await settle();
+            check("search: that chip clears the commit filter from the Diff section", () =>
+              get(filterStore).searchQuery === "" && !/Commits:/.test(text(field())));
+            // Work has no search of its own (its conflict count is not a list to filter).
+            repoStore.setActiveTab("work");
+            await sleepUntil(() => field()?.dataset.pageSearch === "palette", 5000);
+            check("search: on a page with nothing of its own the field searches the repository", () =>
+              /^Search this repository/.test(fieldInput().placeholder));
+            fieldInput().focus();
+            await typeInField(">");
+            await sleepUntil(() => $$('#page-palette-listbox [role="option"]').length > 0, 10000);
+            check("search: typed with a palette prefix, the palette's results drop down under the field as the listbox it controls", () => {
+              const card = $("[data-page-palette]");
+              const options = $$('#page-palette-listbox [role="option"]');
+              const fieldBox = field().getBoundingClientRect();
+              const cardBox = card?.getBoundingClientRect();
+              if (card && options.length > 0 && fieldInput().getAttribute("aria-expanded") === "true" &&
+                fieldInput().getAttribute("aria-controls") === "page-palette-listbox" &&
+                cardBox.top >= fieldBox.bottom - 1 && !$('[role="dialog"] #command-palette-listbox')) return true;
+              throw new Error(`card ${!!card}, options ${options.length}, expanded ${fieldInput().getAttribute("aria-expanded")}, card top ${cardBox?.top} under field bottom ${fieldBox.bottom}`);
+            });
+            await keyInField("ArrowDown");
+            check("search: the arrow keys move the highlighted result, announced through the field", () => {
+              const id = fieldInput().getAttribute("aria-activedescendant");
+              return !!id && document.getElementById(id)?.getAttribute("role") === "option" && document.activeElement === fieldInput();
+            });
+            await keyInField("Escape");
+            await sleepUntil(() => !$("[data-page-palette]"), 3000);
+            check("search: Escape closes the results, empties the field and leaves it", () =>
+              !$("[data-page-palette]") && fieldInput().value === "" && document.activeElement !== fieldInput());
             repoStore.setActiveTab(viewBefore);
-            await sleepUntil(() => !$("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement, 5000);
             await settle();
             // The Tasks surface, mounted in the real App on this page's fixture. A
             // list the fixture answered in the wrong shape made it say "Couldn't

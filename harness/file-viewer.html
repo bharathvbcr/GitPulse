@@ -114,6 +114,40 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("Escape folds it back to the Find pill", () => !!trigger() && !field());
   }
 
+  // --- find through the view bar ----------------------------------------------
+  // As the Code view's file pane the viewer has no Find of its own: the view
+  // bar's one search field becomes this file's find.
+  {
+    await unmount(app); await tick();
+    repoStore.setActiveTab("code", "explorer");
+    const ScopedSearchHost = (await import("./ScopedSearchHost.svelte")).default;
+    app = mount(ScopedSearchHost, { target: host, props: { scope: "code:explorer", viewer: Viewer } });
+    await until(() => !!host.querySelector("[data-scoped-bar] [data-page-search=find]"), "the scoped file registers its find");
+    const bar = host.querySelector("[data-scoped-bar]");
+    const pill = () => bar.querySelector("[data-page-search]");
+    const input = () => bar.querySelector("#gitpulse-page-search");
+    const status = () => bar.querySelector("[data-find-status]")?.textContent.trim() ?? "";
+    await until(() => pill()?.dataset.pageSearch === "find", "the field becomes the file's find");
+    check("as Code's file pane the viewer draws no Find of its own, and the view bar's field is its find", () => {
+      const own = host.querySelectorAll("[data-find-trigger],[data-find-field]").length;
+      if (own === 0 && input().placeholder === "Find in file…") return true;
+      throw new Error(`own find controls ${own}, placeholder ${input()?.placeholder}`);
+    });
+    input().focus(); input().value = "o"; input().dispatchEvent(new Event("input", { bubbles: true }));
+    await until(() => / of /.test(status()), "match count in the field");
+    check("a query typed in the field reaches the file: its match count shows in the field", () => /^1 of [1-9]/.test(status()));
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await tick();
+    check("Enter in the field steps to the file's next match", () => /^2 of /.test(status()));
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await tick();
+    check("Escape clears the file's find and leaves the field", () => input().value === "" && document.activeElement !== input() && !bar.querySelector("[data-find-status]"));
+    // Back to the viewer on its own, on the line the checks below start from.
+    await unmount(app); await tick();
+    app = mount(Viewer, { target: host });
+    await until(() => button("Edit"), "the plain viewer is back");
+    requestReveal(file, 2, 1);
+    await until(() => host.textContent.includes("Ln 2, Col 1"), "back on line 2");
+  }
+
   // A reload of the open file (a status change, an agent's edit) swaps the
   // blob in place. Tag the live viewer, then reload it while the read is held.
   const lnSpan = () => [...host.querySelectorAll("span")].find(el => /^Ln \d+, Col 1$/.test(el.textContent.trim()));

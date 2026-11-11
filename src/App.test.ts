@@ -204,32 +204,45 @@ describe("App overlay wiring", () => {
   it("no longer strips the commit-search bar across every view", () => {
     // It used to be a full-width row App stacked above the sidebar whenever
     // `showsCommitFilter` said so — one of four horizontal bands before any
-    // content. The bar lives inside History's section bar now, which is the
-    // only view it filters, so App must not mount it at all.
+    // content. The search is the view bar's field now, so App must not mount
+    // a bar of its own at all.
     expect(source).not.toContain("<FilterBar");
+    expect(source).not.toContain("<PageSearch");
     expect(source).not.toContain("showsCommitFilter");
   });
 
-  it("switches to Graph before focusing commit search when the bar is unmounted", () => {
+  it("lands native Search Commits on History's graph before focusing the field", () => {
+    // The field filters commits only on Graph; elsewhere it finds or runs the
+    // palette. Switching the view alone left History's Diff section showing,
+    // where the menu item focused a find instead of the commit filter.
     const fn = source.slice(
       source.indexOf("async function focusCommitSearch"),
       source.indexOf("onMount(() => {"),
     );
     expect(fn).toContain("tabForCommitSearch");
-    expect(fn).toContain("repoStore.setActiveTab(target)");
-    expect(fn).toContain("FOCUS_COMMIT_SEARCH_EVENT");
+    expect(fn).toContain("repoStore.setActiveTab(target, COMMIT_FILTER_SECTION)");
+    expect(fn).toContain("focusPageSearch()");
     expect(source).toContain("focusFilter: () => void focusCommitSearch()");
   });
 
-  it("asks the chord owner about the section, not only about the view", () => {
-    // History's Diff section reads a file's lines and owns ⌘F for finding
-    // inside them; its Graph section (commits or HEAD moves) is a list and
-    // hands the chord to the filter that narrows it. Passing only the view made
-    // ⌘F focus the commit filter over an open diff.
-    expect(source).toContain(
-      "ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))",
-    );
-    expect(source).toContain('import { activeSectionFor } from "./lib/views/viewRegistry"');
+  it("sends ⌘F to the field on every page, never by view or section", () => {
+    // History's Diff and Code used to keep the chord for toolbar find bars of
+    // their own. Those panes find through the field now, so ⌘F switches
+    // nothing: it focuses the field, and the page decides what the field does.
+    const handler = source.slice(source.indexOf("isCommitSearchChord(e) &&"));
+    const branch = handler.slice(0, handler.indexOf("return;"));
+    expect(branch).toContain("fieldOwnsFindChord({");
+    expect(branch).toContain('onRepositorySurface: $interfaceStore.globalSurface === "repository"');
+    expect(branch).toContain("defaultPrevented: e.defaultPrevented");
+    expect(branch).toContain("focusPageSearch();");
+    expect(branch).not.toContain("focusCommitSearch");
+  });
+
+  it("opens Clone and Rebase for the palette the view bar runs inline", () => {
+    // The field's palette is mounted outside App, so its Clone and Rebase
+    // commands cannot call App's openers directly.
+    expect(source).toContain('window.addEventListener("gitpulse:clone", openCloneDialog)');
+    expect(source).toContain('window.addEventListener("gitpulse:rebase", openRebaseDialog)');
   });
 
   it("keeps PromptModal and DiagnosticsModal in separate crash boundaries", () => {

@@ -22,11 +22,38 @@
   import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
   import { emptySearch, scheduleSearch, workspaceRoot } from "../palette/search";
 
-  let { openSignal = 0, onClone, onRebase }: { openSignal?: number } & PaletteHostActions = $props();
+  /**
+   * The view bar's search field shows this same palette inline, as a results
+   * card under the field, instead of a dialog with its own input. The field
+   * owns the text and the open state; the engine below (modes, prefixes,
+   * remote searches, frecency, paging, running) is the dialog's, unchanged.
+   */
+  interface DropdownHost {
+    /** The field's text box: the card lines up under its pill, and keys typed in it drive the list. */
+    input: HTMLInputElement;
+    anchor: HTMLElement;
+    query: string;
+    open: boolean;
+    setQuery: (next: string) => void;
+    onclose: () => void;
+    /** The highlighted option's id, for the field's aria-activedescendant. */
+    onactive?: (id: string | undefined) => void;
+  }
+
+  let { openSignal = 0, onClone, onRebase, dropdown = null }: { openSignal?: number; dropdown?: DropdownHost | null } & PaletteHostActions = $props();
+  /** Ids differ per presentation: the inline card and the ⌘K dialog can both be on screen. */
+  const idp = untrack(() => (dropdown ? "page-palette" : "palette"));
+  const listboxId = untrack(() => (dropdown ? "page-palette-listbox" : "command-palette-listbox"));
   let servedSignal = 0;
   let openEpoch = 0;
-  let isOpen = $state(false);
-  let query = $state("");
+  let dialogOpen = $state(false);
+  let dialogQuery = $state("");
+  const isOpen = $derived(dropdown ? dropdown.open : dialogOpen);
+  const query = $derived(dropdown ? dropdown.query : dialogQuery);
+  function setQuery(next: string) {
+    if (dropdown) dropdown.setQuery(next);
+    else dialogQuery = next;
+  }
   let highlighted = $state(0);
   let page = $state(0);
   let pendingAction = $state<string | null>(null);
@@ -70,9 +97,9 @@
   });
 
   function changeMode(next: PaletteMode) {
-    query = PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">";
+    setQuery(PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">");
     actionError = null;
-    inputEl?.focus();
+    focusInput();
   }
 
   function selectFile(path: string) {
@@ -145,8 +172,9 @@
    * synchronously). Otherwise the restore would land on top of the new dialog.
    */
   let handingOff = $state(false);
-  function close() { handingOff = false; isOpen = false; }
-  function closeForHandoff() { handingOff = true; isOpen = false; }
+  function focusInput() { (dropdown ? dropdown.input : inputEl)?.focus(); }
+  function close() { handingOff = false; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
+  function closeForHandoff() { handingOff = true; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
 
   async function run(index: number) {
     const command = filteredCommands[index];
@@ -179,20 +207,23 @@
     if (modalOccupied()) return;
     openEpoch += 1;
     history = readFrecency(storage());
-    query = ""; page = 0; highlighted = 0; actionError = null;
-    isOpen = true;
+    dialogQuery = ""; page = 0; highlighted = 0; actionError = null;
+    dialogOpen = true;
     inputEl?.focus();
   }
 
   function changePage(next: number) {
     page = Math.max(0, Math.min(next, pageCount - 1));
     highlighted = 0;
-    inputEl?.focus();
+    focusInput();
   }
 
   function handleKeyDown(event: KeyboardEvent) {
     if (isImeComposition(event)) return;
-    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+    // Inline, the card answers only keys typed in the field it hangs from;
+    // ⌘K stays the dialog's, and every other key is the page's.
+    if (dropdown && event.target !== dropdown.input) return;
+    if (!dropdown && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
       // Ctrl+K typed into a terminal is readline's kill-line, not the palette.
       if (shellOwnsKey(event)) return;
       if (modalOccupied()) return;
@@ -205,7 +236,7 @@
       event.preventDefault(); event.stopImmediatePropagation(); close(); return;
     }
     // Buttons (mode chips, Retry, paging) keep native Enter/Space behavior.
-    if (event.target !== inputEl || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.target !== (dropdown ? dropdown.input : inputEl) || event.metaKey || event.ctrlKey || event.altKey) return;
     if (!["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp", "Enter"].includes(event.key)) return;
     event.preventDefault(); event.stopImmediatePropagation();
     if (event.key === "ArrowDown") highlighted = Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1));
@@ -223,17 +254,108 @@
       untrack(requestOpen);
     }
   });
+  // Inline, each opening is a fresh session, as `requestOpen` is for the
+  // dialog: a new epoch (a late action result from the last one is dropped),
+  // the current frecency, the first page.
+  $effect(() => {
+    if (!dropdown?.open) return;
+    untrack(() => {
+      openEpoch += 1;
+      history = readFrecency(storage());
+      page = 0; highlighted = 0; actionError = null;
+    });
+  });
+  // The field carries the combobox; it names the highlighted option.
+  $effect(() => {
+    dropdown?.onactive?.(isOpen && activeCommand ? `${idp}-option-${highlighted}` : undefined);
+  });
   onMount(() => {
     window.addEventListener("keydown", handleKeyDown, true);
-    window.addEventListener("gitpulse:palette", requestOpen);
+    if (!dropdown) window.addEventListener("gitpulse:palette", requestOpen);
     return () => {
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("gitpulse:palette", requestOpen);
     };
   });
+
+  /** Inline, the card hangs from the field's pill, at least wide enough to read a result. */
+  let cardBox = $state<{ top: number; left: number; width: number } | null>(null);
+  function placeCard() {
+    if (!dropdown) return;
+    const box = dropdown.anchor.getBoundingClientRect();
+    const width = Math.min(Math.max(box.width, 440), window.innerWidth - 16);
+    const left = Math.max(8, Math.min(box.left, window.innerWidth - width - 8));
+    cardBox = { top: box.bottom + 6, left, width };
+  }
+  $effect(() => {
+    if (!dropdown?.open) return;
+    untrack(placeCard);
+    window.addEventListener("resize", placeCard);
+    return () => window.removeEventListener("resize", placeCard);
+  });
 </script>
 
-{#if isOpen}
+{#snippet modesNav()}
+  <nav class="palette-modes" aria-label="Search mode">
+    {#each PALETTE_MODES as entry}<button type="button" aria-pressed={mode === entry.mode} title={entry.hint} onclick={() => changeMode(entry.mode)}><span>{entry.label}</span><kbd>{entry.prefix}</kbd></button>{/each}
+  </nav>
+{/snippet}
+
+<!-- Everything under the header, shared by the dialog and the inline card. -->
+{#snippet cardBody()}
+  <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="{idp}-status" role="status" aria-live="polite">{resultSummary}</span></div>
+  {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
+  {#if searchNote || historyNote}
+    <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
+      <p>{searchNote ?? historyNote}</p>
+      {#if isRemoteSearch}
+        <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>
+        {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { closeForHandoff(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
+      {/if}
+      {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
+    </div>
+  {/if}
+  <div bind:this={listEl} id={listboxId} class="palette-results scroll-py-8" use:scrollEdgeFade role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
+    {#if searchResult.loading && isRemoteSearch}
+      <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
+    {:else}
+      {#each filteredCommands as cmd, i (cmd.id)}
+        <button id={`${idp}-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`${idp}-description-${i}`}
+          tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
+          onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
+          <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
+          <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`${idp}-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
+          <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
+        </button>
+      {/each}
+      {#if filteredCommands.length === 0}
+        <div class="palette-empty"><Search size={24} /><strong>{unavailable ? "Choose a repository to start" : !effectiveSearchText && (mode === "symbols" || mode === "workspace") ? "Start with a symbol name" : searchResult.failed ? "Search needs attention" : "No matching results"}</strong><span>{searchResult.failed ? "Use the recovery actions above to try again." : "Try another search or choose a mode above."}</span></div>
+      {/if}
+    {/if}
+  </div>
+  {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
+  <div id="{idp}-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
+  <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
+    {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
+  </footer>
+{/snippet}
+
+{#if isOpen && dropdown}
+  <!-- Inline: the results card under the view bar's field. No scrim, no
+       input of its own and no focus trap: focus stays in the field, which
+       carries the combobox. -->
+  {#if cardBox}
+    <!-- Pointer-down keeps focus in the field: the field closes the card when
+         it loses focus, and a click on a result would otherwise blur it first. -->
+    <div data-page-palette role="region" aria-label="Repository search results" in:scale={cardScale()} out:scale={cardScaleOut()}
+      onpointerdown={(event) => event.preventDefault()}
+      class="palette-card palette-inline gp-card bg-surface text-textPrimary border border-edgeStrong shadow-float"
+      style="position: fixed; top: {cardBox.top}px; left: {cardBox.left}px; width: {cardBox.width}px; z-index: {LAYERS.MENU}">
+      <div class="palette-header palette-header-inline">{@render modesNav()}</div>
+      {@render cardBody()}
+    </div>
+  {/if}
+{:else if isOpen}
   <div role="dialog" aria-modal="true" aria-labelledby="command-palette-title" data-command-palette tabindex="-1"
     onclick={event => { if (event.target === event.currentTarget) close(); }}
     onkeydown={event => event.stopPropagation()}
@@ -246,51 +368,15 @@
           <button type="button" class="palette-close" onclick={close} aria-label="Close command palette"><X size={15} /></button>
         </div>
         <div class="palette-search"><Search size={20} class="text-accent shrink-0" />
-          <input bind:this={inputEl} bind:value={query} type="text" maxlength={MAX_QUERY_LENGTH} autocomplete="off" spellcheck="false"
+          <input bind:this={inputEl} bind:value={dialogQuery} type="text" maxlength={MAX_QUERY_LENGTH} autocomplete="off" spellcheck="false"
             placeholder={currentMode.hint} aria-label="Search commands and repositories" role="combobox" aria-expanded="true" aria-autocomplete="list"
-            aria-controls="command-palette-listbox" aria-describedby="palette-status palette-detail"
-            aria-activedescendant={activeCommand ? `palette-option-${highlighted}` : undefined} />
-          {#if query}<button type="button" class="palette-clear" onclick={() => { query = ""; inputEl?.focus(); }} aria-label="Clear search"><X size={14} /></button>{/if}
+            aria-controls={listboxId} aria-describedby="{idp}-status {idp}-detail"
+            aria-activedescendant={activeCommand ? `${idp}-option-${highlighted}` : undefined} />
+          {#if query}<button type="button" class="palette-clear" onclick={() => { dialogQuery = ""; inputEl?.focus(); }} aria-label="Clear search"><X size={14} /></button>{/if}
         </div>
-        <nav class="palette-modes" aria-label="Search mode">
-          {#each PALETTE_MODES as entry}<button type="button" aria-pressed={mode === entry.mode} title={entry.hint} onclick={() => changeMode(entry.mode)}><span>{entry.label}</span><kbd>{entry.prefix}</kbd></button>{/each}
-        </nav>
+        {@render modesNav()}
       </header>
-      <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="palette-status" role="status" aria-live="polite">{resultSummary}</span></div>
-      {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
-      {#if searchNote || historyNote}
-        <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
-          <p>{searchNote ?? historyNote}</p>
-          {#if isRemoteSearch}
-            <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>
-            {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { closeForHandoff(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
-          {/if}
-          {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
-        </div>
-      {/if}
-      <div bind:this={listEl} id="command-palette-listbox" class="palette-results scroll-py-8" use:scrollEdgeFade role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
-        {#if searchResult.loading && isRemoteSearch}
-          <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
-        {:else}
-          {#each filteredCommands as cmd, i (cmd.id)}
-            <button id={`palette-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`palette-description-${i}`}
-              tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
-              onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
-              <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
-              <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`palette-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
-              <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
-            </button>
-          {/each}
-          {#if filteredCommands.length === 0}
-            <div class="palette-empty"><Search size={24} /><strong>{unavailable ? "Choose a repository to start" : !effectiveSearchText && (mode === "symbols" || mode === "workspace") ? "Start with a symbol name" : searchResult.failed ? "Search needs attention" : "No matching results"}</strong><span>{searchResult.failed ? "Use the recovery actions above to try again." : "Try another search or choose a mode above."}</span></div>
-          {/if}
-        {/if}
-      </div>
-      {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
-      <div id="palette-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
-      <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
-        {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
-      </footer>
+      {@render cardBody()}
     </div>
   </div>
 {/if}
@@ -299,6 +385,8 @@
   .palette-scrim { display:flex; align-items:flex-start; justify-content:center; padding: min(12vh, 100px) 16px 20px; }
   .palette-card { width: min(680px, 100%); max-height: calc(100dvh - min(12vh, 100px) - 20px); display:flex; flex-direction:column; overflow:hidden; border-radius: var(--gp-r-xl); }
   .palette-header { padding:16px 18px 0; flex-shrink:0; }
+  .palette-inline { max-height: min(560px, calc(100dvh - 120px)); }
+  .palette-header-inline { padding:10px 12px 0; }
   .palette-heading,.palette-brand,.palette-repo,.palette-search,.palette-meta,.palette-footer,.palette-pages { display:flex; align-items:center; }
   .palette-heading { gap:12px; color:var(--color-textMuted); font-size:var(--text-meta); }
   .palette-brand { gap:7px; flex:1; }

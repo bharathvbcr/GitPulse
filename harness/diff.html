@@ -197,6 +197,45 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
   input.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));await until(()=>!field(),"find closed");
   check("Escape folds it back to the Find pill",()=>!!trigger()&&!field());
  }
+ // --- find through the view bar --------------------------------------------
+ // As History's Diff section the pane has no Find of its own: the view bar's
+ // one search field becomes this diff's find.
+ {
+  await unmount(view);preview.replaceChildren();
+  answer={text:twoHunks(),truncated:false};
+  await repoStore.openRepo(root);
+  repoStore.setActiveTab("history","diff");
+  const ScopedSearchHost=(await import("./ScopedSearchHost.svelte")).default;
+  view=mount(ScopedSearchHost,{target:preview,props:{scope:"history:diff",viewer:DiffViewer}});
+  await repoStore.selectFileDiff("src/other.ts",false);
+  await repoStore.selectFileDiff(FILE,false);
+  await until(()=>text().includes("new two"),"scoped diff drawn");
+  const bar=preview.querySelector("[data-scoped-bar]");
+  const pill=()=>bar.querySelector("[data-page-search]");
+  const input=()=>bar.querySelector("#gitpulse-page-search");
+  const status=()=>bar.querySelector("[data-find-status]")?.textContent.trim()??"";
+  await until(()=>pill()?.dataset.pageSearch==="find","the field becomes the diff's find");
+  check("as History's Diff section the pane draws no Find of its own, and the view bar's field is its find",()=>{
+   const own=preview.querySelectorAll("[data-find-trigger],[data-find-field]").length;
+   if(own===0&&pill().dataset.pageSearch==="find"&&input().placeholder==="Find in this diff…"&&!!bar.querySelector('[aria-label="Next match"]'))return true;
+   throw new Error(`own find controls ${own}, field ${pill()?.dataset.pageSearch}, placeholder ${input()?.placeholder}`);
+  });
+  input().focus();input().value="two";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>/ of /.test(status()),"match count in the field");
+  check("a query typed in the field reaches the diff: its match count shows in the field",()=>/^1 of [1-9]/.test(status()));
+  key(input(),{key:"Enter"});await tick();
+  check("Enter in the field steps the diff to its next match",()=>/^2 of /.test(status()));
+  key(input(),{key:"Enter",shiftKey:true});await tick();
+  check("Shift+Enter steps back",()=>/^1 of /.test(status()));
+  input().value="TWO";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>/ of /.test(status()),"case-insensitive match");
+  bar.querySelector('[title="Match case"]').click();
+  await until(()=>!/ of /.test(status()),"case-sensitive miss");
+  check("Aa in the field makes the diff's find case-sensitive: TWO no longer matches",()=>bar.querySelector('[title="Match case"]').getAttribute("aria-pressed")==="true"&&!/ of /.test(status()));
+  bar.querySelector('[title="Match case"]').click();await tick();
+  key(input(),{key:"Escape"});await tick();
+  check("Escape clears the diff's find and leaves the field, which stays its find",()=>input().value===""&&document.activeElement!==input()&&!bar.querySelector("[data-find-status]")&&pill().dataset.pageSearch==="find");
+ }
  // --- staging -------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
  check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Unstage hunk").length===0);

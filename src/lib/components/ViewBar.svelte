@@ -32,6 +32,7 @@
   import { swapRow } from "../ui/headerMotion";
   import { registerContextSlot, reportViewBarWidth } from "../ui/headerSlots";
   import ScrollCue from "./ScrollCue.svelte";
+  import PageSearch from "./PageSearch.svelte";
   import TerminalPill from "./TerminalPill.svelte";
   import ViewTabBar from "./ViewTabBar.svelte";
 
@@ -163,19 +164,20 @@
       <ScrollCue target={scroller} axis="x" diffuse />
     </div>
 
-    <!-- The view's own toolbar lands here from 1600px (ViewContextBar). It
-         takes three shares of the free width to the drag spacer's one, so
-         History's search pill grows into the bar instead of staying
-         input-sized beside an empty band; the spacer keeps a 48px floor so
-         the window can always be grabbed. The slot's own background is a
-         drag region too: the bare attribute starts a drag only on a direct
-         hit, so the controls inside keep their clicks. -->
+    <!-- The view's own toolbar lands here from 1600px (ViewContextBar):
+         History's list segment, Work's conflict count. -->
     <div
       bind:this={slot}
-      class="flex min-w-0 flex-[3] items-center gap-3 empty:hidden"
+      class="flex min-w-0 items-center gap-3 empty:hidden"
       data-viewbar-context
       data-tauri-drag-region
     ></div>
+
+    <!-- The one search field, for whatever page is on screen
+         (search/pageSearch.svelte.ts). It takes three shares of the free
+         width to the drag spacer's one; the spacer keeps a 48px floor so the
+         window can always be grabbed. -->
+    <PageSearch />
 
     <div class="h-full min-w-12 flex-1" data-tauri-drag-region></div>
 

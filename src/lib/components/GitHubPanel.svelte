@@ -690,7 +690,7 @@
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
       // Post-mutation reload keeps the visible filter context: a bare
-      // loadGraph(repo) reset the graph to query=""/HEAD while FilterBar
+      // loadGraph(repo) reset the graph to query=""/HEAD while the search field
       // still showed the selection. The backend applies every query term,
       // so the reload answers exactly what the scheduler keys on.
       await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);

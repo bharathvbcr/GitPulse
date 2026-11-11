@@ -7,6 +7,7 @@
   const view = "code" as const;
   import FileViewer from "./FileViewer.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
+  import { providePageSearchScope } from "../search/pageSearch.svelte";
 
   /**
    * Code: the working tree, under whichever lens the question needs.
@@ -28,6 +29,9 @@
   } = $props();
 
   const section = $derived(activeSectionFor("code", $repoStore.viewSections));
+
+  // The open file's viewer finds through the view bar's search field.
+  providePageSearchScope("code:explorer");
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
