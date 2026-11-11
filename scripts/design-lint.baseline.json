@@ -1,15 +1,14 @@
 {
   "schema": 1,
-  "commit": "bc9ddc05b2bf69d7215fa58c25edb55aee23c048",
+  "commit": "c8fa8ec3464cf82b535fe5ea1b5bda518f0b9fbb",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 92,
+      "total": 91,
       "files": {
         "src/app.css": 9,
         "src/lib/components/AttentionInbox.svelte": 1,
-        "src/lib/components/AutomaticEnhancements.svelte": 1,
         "src/lib/components/CommandPalette.svelte": 17,
         "src/lib/components/NativeNotificationBridge.svelte": 2,
         "src/lib/components/NativeNotificationSettings.svelte": 1,
@@ -181,15 +180,12 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 21,
+      "total": 11,
       "files": {
         "src/App.svelte": 1,
         "src/lib/components/AgentDefaultsSettings.svelte": 1,
         "src/lib/components/AgentLimitSetting.svelte": 1,
         "src/lib/components/AgentModelSettings.svelte": 2,
-        "src/lib/components/DiffViewer.svelte": 2,
-        "src/lib/components/RepoMapPanel.svelte": 1,
-        "src/lib/components/RepoPanel.svelte": 7,
         "src/lib/components/RepoTabBar.svelte": 1,
         "src/lib/components/TaskArchive.svelte": 1,
         "src/lib/components/ViewBar.svelte": 1,
