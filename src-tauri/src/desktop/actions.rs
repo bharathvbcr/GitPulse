@@ -65,6 +65,28 @@ pub const CLOSE_TAB: &str = "close-tab";
 pub const NEXT_REPO_TAB: &str = "next-repo-tab";
 pub const PREV_REPO_TAB: &str = "prev-repo-tab";
 pub const REOPEN_REPO_TAB: &str = "reopen-repo-tab";
+pub const REPO_TAB_1: &str = "repo-tab-1";
+pub const REPO_TAB_2: &str = "repo-tab-2";
+pub const REPO_TAB_3: &str = "repo-tab-3";
+pub const REPO_TAB_4: &str = "repo-tab-4";
+pub const REPO_TAB_5: &str = "repo-tab-5";
+pub const REPO_TAB_6: &str = "repo-tab-6";
+pub const REPO_TAB_7: &str = "repo-tab-7";
+pub const REPO_TAB_8: &str = "repo-tab-8";
+/// Digit 9 selects the LAST repository tab, as in a browser, however many are open.
+pub const REPO_TAB_LAST: &str = "repo-tab-9";
+/// Jump-to-repository-tab ids in digit order: `REPO_TAB_IDS[n - 1]` is digit `n`.
+pub const REPO_TAB_IDS: [&str; 9] = [
+    REPO_TAB_1,
+    REPO_TAB_2,
+    REPO_TAB_3,
+    REPO_TAB_4,
+    REPO_TAB_5,
+    REPO_TAB_6,
+    REPO_TAB_7,
+    REPO_TAB_8,
+    REPO_TAB_LAST,
+];
 
 /// Native projection of viewRegistry.ts, checked in both directions by
 /// view-menu-contract.test.ts. Parsing and menu construction share this list.
@@ -167,6 +189,9 @@ pub enum NativeAction {
     NextRepoTab,
     PrevRepoTab,
     ReopenRepoTab,
+    /// Jump to repository tab N (1–8) or the last one (9). Carries its id so
+    /// `event_id` needs no index arithmetic, as `Section` does.
+    RepoTab(&'static str),
 }
 
 impl NativeAction {
@@ -240,6 +265,15 @@ impl NativeAction {
             NEXT_REPO_TAB => Self::NextRepoTab,
             PREV_REPO_TAB => Self::PrevRepoTab,
             REOPEN_REPO_TAB => Self::ReopenRepoTab,
+            REPO_TAB_1 => Self::RepoTab(REPO_TAB_1),
+            REPO_TAB_2 => Self::RepoTab(REPO_TAB_2),
+            REPO_TAB_3 => Self::RepoTab(REPO_TAB_3),
+            REPO_TAB_4 => Self::RepoTab(REPO_TAB_4),
+            REPO_TAB_5 => Self::RepoTab(REPO_TAB_5),
+            REPO_TAB_6 => Self::RepoTab(REPO_TAB_6),
+            REPO_TAB_7 => Self::RepoTab(REPO_TAB_7),
+            REPO_TAB_8 => Self::RepoTab(REPO_TAB_8),
+            REPO_TAB_LAST => Self::RepoTab(REPO_TAB_LAST),
             RECENT_EMPTY => return None,
             _ => return None,
         })
@@ -302,6 +336,7 @@ impl NativeAction {
             Self::NextRepoTab => NEXT_REPO_TAB,
             Self::PrevRepoTab => PREV_REPO_TAB,
             Self::ReopenRepoTab => REOPEN_REPO_TAB,
+            Self::RepoTab(id) => id,
         }
     }
 
@@ -468,5 +503,20 @@ mod tests {
         assert_eq!(NativeAction::NextRepoTab.event_id(), NEXT_REPO_TAB);
         assert_eq!(NativeAction::PrevRepoTab.event_id(), PREV_REPO_TAB);
         assert_eq!(NativeAction::ReopenRepoTab.event_id(), REOPEN_REPO_TAB);
+    }
+
+    #[test]
+    fn repo_tab_jumps_round_trip_in_digit_order() {
+        assert_eq!(REPO_TAB_IDS.len(), 9);
+        for (index, id) in REPO_TAB_IDS.iter().enumerate() {
+            assert_eq!(*id, format!("repo-tab-{}", index + 1));
+            let action = NativeAction::parse(id).expect("repository tab jump is actionable");
+            assert_eq!(action, NativeAction::RepoTab(id));
+            assert_eq!(action.event_id(), *id);
+            assert_eq!(action.path(), None);
+        }
+        for id in ["repo-tab-0", "repo-tab-10", "repo-tab-", "repo-tab"] {
+            assert_eq!(NativeAction::parse(id), None);
+        }
     }
 }

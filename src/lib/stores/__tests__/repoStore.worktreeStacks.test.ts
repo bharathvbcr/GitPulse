@@ -509,6 +509,23 @@ describe("shortcuts step through the strip as drawn", () => {
     expect(active(store)).toBe(MAIN);
   });
 
+  it("maps a digit key to the nth stop, and 9 to the last stop as the strip is drawn", async () => {
+    const store = await opened();
+    // The strip draws two stops here (the folded stack and OTHER), not the
+    // four tabs open, which is what the menu's tab-count enabling over-counts.
+    await store.activateTabByDigit(2);
+    expect(active(store)).toBe(OTHER);
+    await store.activateTabByDigit(1);
+    expect(active(store)).toBe(MAIN);
+    await store.activateTabByDigit(9);
+    expect(active(store)).toBe(OTHER);
+    // Past the end is nothing, not a clamp.
+    await store.activateTabByDigit(5);
+    expect(active(store)).toBe(OTHER);
+    await store.activateTabByDigit(0);
+    expect(active(store)).toBe(OTHER);
+  });
+
   it("falls back to every tab in stored order with stacking turned off", async () => {
     const store = await opened();
     interfaceStore.setStackWorktreeTabs(false);

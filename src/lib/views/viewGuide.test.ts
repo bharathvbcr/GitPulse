@@ -53,7 +53,10 @@ describe("destination guides", () => {
 
   it("keeps Work's F10 and Code's digit chord on the view cards", () => {
     expect(destinationGuide("work")?.shortcut).toBe("F10");
-    expect(destinationGuide("code")?.shortcut).toBe("⌘1");
+    expect(destinationGuide("code")?.shortcut).toBe("⌥⌘1");
+    // Windows and Linux bind Ctrl+Shift, not a translation of the macOS chord.
+    expect(destinationGuide("code", "windows")?.shortcut).toBe("Ctrl+Shift+1");
+    expect(destinationGuide("work", "linux")?.shortcut).toBe("F10");
     expect(destinationGuide("work:overview")?.shortcut).toBe("⌥1");
     expect(destinationGuide("work:resolve")?.shortcut).toBe("⌥2");
   });

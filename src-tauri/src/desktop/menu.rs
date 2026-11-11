@@ -5,7 +5,8 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Runtime};
 
-/// File-menu accelerators for repository tabs. CmdOrCtrl+1–9 stay on View tabs.
+/// File-menu accelerators for repository tabs. CmdOrCtrl+1–9 jump to a
+/// repository tab (`REPO_TAB_BINDINGS`); the views take a different chord.
 const CLOSE_REPO_TAB_ACCEL: &str = "CmdOrCtrl+Shift+W";
 const REOPEN_REPO_TAB_ACCEL: &str = "CmdOrCtrl+Shift+Y";
 const NEXT_REPO_TAB_ACCEL: &str = "Ctrl+Tab";
@@ -28,15 +29,59 @@ const FLEET_ACCEL: &str = "CmdOrCtrl+Shift+F";
 /// claim it, and it sits beside Fleet rather than on a reserved chord.
 const AGENTS_ACCEL: &str = "CmdOrCtrl+Shift+A";
 
-/// View-menu digit shortcuts. Repository tab actions must not reuse these.
-const VIEW_TAB_BINDINGS: &[(&str, &str, &str)] = &[
-    (actions::TAB_CODE, "Code", "CmdOrCtrl+1"),
-    (actions::TAB_HISTORY, "History", "CmdOrCtrl+2"),
-    (actions::TAB_INSIGHTS, "Insights", "CmdOrCtrl+3"),
+/// File-menu digit shortcuts: ⌘1–⌘8 select repository tab 1–8 and ⌘9 the last
+/// one, as a browser does. The same on every OS, and a native accelerator so it
+/// works while focus is in the terminal or an editor. The views must not reuse
+/// these digits on the same modifier.
+const REPO_TAB_BINDINGS: &[(&str, &str, &str)] = &[
+    (actions::REPO_TAB_1, "Repository Tab 1", "CmdOrCtrl+1"),
+    (actions::REPO_TAB_2, "Repository Tab 2", "CmdOrCtrl+2"),
+    (actions::REPO_TAB_3, "Repository Tab 3", "CmdOrCtrl+3"),
+    (actions::REPO_TAB_4, "Repository Tab 4", "CmdOrCtrl+4"),
+    (actions::REPO_TAB_5, "Repository Tab 5", "CmdOrCtrl+5"),
+    (actions::REPO_TAB_6, "Repository Tab 6", "CmdOrCtrl+6"),
+    (actions::REPO_TAB_7, "Repository Tab 7", "CmdOrCtrl+7"),
+    (actions::REPO_TAB_8, "Repository Tab 8", "CmdOrCtrl+8"),
+    (actions::REPO_TAB_LAST, "Last Repository Tab", "CmdOrCtrl+9"),
 ];
+const _: () = assert!(REPO_TAB_BINDINGS.len() == 9);
+
+/// View-menu digit shortcuts on macOS: ⌥⌘1–3. Never ⌘⇧3, ⌘⇧4 or ⌘⇧5, which
+/// are the system screenshot shortcuts, and never plain ⌥1–3, which are the
+/// section chords the webview owns.
+const VIEW_TAB_BINDINGS_MACOS: &[(&str, &str, &str)] = &[
+    (actions::TAB_CODE, "Code", "CmdOrCtrl+Alt+1"),
+    (actions::TAB_HISTORY, "History", "CmdOrCtrl+Alt+2"),
+    (actions::TAB_INSIGHTS, "Insights", "CmdOrCtrl+Alt+3"),
+];
+
+/// View-menu digit shortcuts on Windows and Linux: Ctrl+Shift+1–3. Not
+/// Ctrl+Alt+digit, which is AltGr on many keyboard layouts and so types a
+/// character instead of reaching the menu; not Alt+digit, which the webview
+/// owns for sections. Ctrl+Shift is also the off-macOS convention the
+/// terminal's own find and text-size chords use.
+const VIEW_TAB_BINDINGS_OTHER: &[(&str, &str, &str)] = &[
+    (actions::TAB_CODE, "Code", "Ctrl+Shift+1"),
+    (actions::TAB_HISTORY, "History", "Ctrl+Shift+2"),
+    (actions::TAB_INSIGHTS, "Insights", "Ctrl+Shift+3"),
+];
+
 /// Nine digits are available; consolidation frees them as views merge, and
-/// the list must never claim more than exist.
-const _: () = assert!(VIEW_TAB_BINDINGS.len() <= 9);
+/// the list must never claim more than exist. Both tables name the same views
+/// in the same order: only the chord differs per host.
+const _: () = assert!(VIEW_TAB_BINDINGS_MACOS.len() <= 9);
+const _: () = assert!(VIEW_TAB_BINDINGS_MACOS.len() == VIEW_TAB_BINDINGS_OTHER.len());
+
+/// The view chords this host binds. Both tables are always compiled (the
+/// choice is a value, not a `#[cfg]`), so the tests can check every host's
+/// table from any host.
+fn view_tab_bindings() -> &'static [(&'static str, &'static str, &'static str)] {
+    if cfg!(target_os = "macos") {
+        VIEW_TAB_BINDINGS_MACOS
+    } else {
+        VIEW_TAB_BINDINGS_OTHER
+    }
+}
 
 fn item<R: Runtime>(
     app: &AppHandle<R>,
@@ -207,6 +252,17 @@ pub fn build_native_menu<R: Runtime>(
         "Previous Repository Tab",
         Some(PREV_REPO_TAB_ACCEL),
     )?;
+    // Built from REPO_TAB_BINDINGS for the same reason as the view items: the
+    // table is the one place the digits are listed.
+    let repo_tab_items: Vec<MenuItemKind<R>> = REPO_TAB_BINDINGS
+        .iter()
+        .map(|(id, title, accel)| item(app, id, title, Some(accel)))
+        .collect::<tauri::Result<_>>()?;
+    let repo_tab_refs: Vec<&dyn IsMenuItem<R>> = repo_tab_items
+        .iter()
+        .map(|entry| entry as &dyn IsMenuItem<R>)
+        .collect();
+    let go_to_tab_menu = Submenu::with_items(app, "Go to Repository Tab", true, &repo_tab_refs)?;
     let close_window_item = PredefinedMenuItem::close_window(app, Some("Close Window"))?;
     let file_sep_tabs = PredefinedMenuItem::separator(app)?;
     let file_sep_close = PredefinedMenuItem::separator(app)?;
@@ -228,6 +284,7 @@ pub fn build_native_menu<R: Runtime>(
         &reopen_tab_item,
         &next_tab_item,
         &prev_tab_item,
+        &go_to_tab_menu,
         &file_sep_close,
         &close_window_item,
     ];
@@ -253,11 +310,11 @@ pub fn build_native_menu<R: Runtime>(
         ],
     )?;
 
-    // Built from VIEW_TAB_BINDINGS rather than nine hand-unrolled indexes.
+    // Built from the view table rather than nine hand-unrolled indexes.
     // The unrolled form silently required the list to be exactly nine long:
     // shortening it by one panics at startup, and lengthening it drops the
     // extra view from the menu with nothing to say so.
-    let view_tab_items: Vec<MenuItemKind<R>> = VIEW_TAB_BINDINGS
+    let view_tab_items: Vec<MenuItemKind<R>> = view_tab_bindings()
         .iter()
         .map(|(id, title, accel)| item(app, id, title, Some(accel)))
         .collect::<tauri::Result<_>>()?;
@@ -560,12 +617,78 @@ mod tests {
         assert_eq!(recent_label("gitpulse"), "gitpulse");
     }
 
-    fn is_view_digit_accelerator(accel: &str) -> bool {
+    /// Hosts whose chords differ. Windows and Linux share one table.
+    const HOSTS: [bool; 2] = [true, false];
+
+    fn is_plain_digit_accelerator(accel: &str) -> bool {
         (1..=9).any(|digit| {
             accel == format!("CmdOrCtrl+{digit}")
                 || accel == format!("Cmd+{digit}")
                 || accel == format!("Ctrl+{digit}")
         })
+    }
+
+    /// An accelerator as the host resolves it: modifiers sorted, `CmdOrCtrl`
+    /// expanded to Command on macOS and Control elsewhere, so `CmdOrCtrl+W`
+    /// and `Ctrl+W` are one chord off macOS and two on it.
+    fn resolved(accel: &str, macos: bool) -> String {
+        let (modifiers, key) = accel.rsplit_once('+').expect("accelerator has a key");
+        let mut mods: Vec<&str> = modifiers
+            .split('+')
+            .map(|token| match token.to_ascii_lowercase().as_str() {
+                "cmdorctrl" | "cmdorcontrol" | "commandorcontrol" | "commandorctrl" => {
+                    if macos {
+                        "cmd"
+                    } else {
+                        "ctrl"
+                    }
+                }
+                "cmd" | "command" | "super" | "meta" => "cmd",
+                "ctrl" | "control" => "ctrl",
+                "alt" | "option" => "alt",
+                "shift" => "shift",
+                other => panic!("unknown modifier {other:?} in {accel}"),
+            })
+            .collect();
+        mods.sort_unstable();
+        format!("{}+{}", mods.join("+"), key.to_ascii_uppercase())
+    }
+
+    fn view_table(macos: bool) -> &'static [(&'static str, &'static str, &'static str)] {
+        if macos {
+            VIEW_TAB_BINDINGS_MACOS
+        } else {
+            VIEW_TAB_BINDINGS_OTHER
+        }
+    }
+
+    /// Every accelerator the tables and constants here bind on `macos` or off
+    /// it, resolved. Inline literals elsewhere in the builder are covered by
+    /// `scripts/view-menu-contract.test.ts`, which reads the whole file.
+    fn bound_accelerators(macos: bool) -> Vec<(String, String)> {
+        let mut all: Vec<(String, String)> = [
+            ("close tab", CLOSE_REPO_TAB_ACCEL),
+            ("reopen tab", REOPEN_REPO_TAB_ACCEL),
+            ("next tab", NEXT_REPO_TAB_ACCEL),
+            ("previous tab", PREV_REPO_TAB_ACCEL),
+            ("settings", SETTINGS_ACCEL),
+            ("fleet", FLEET_ACCEL),
+            ("agents", AGENTS_ACCEL),
+        ]
+        .into_iter()
+        .map(|(owner, accel)| (owner.to_string(), resolved(accel, macos)))
+        .collect();
+        all.extend(
+            REPO_TAB_BINDINGS
+                .iter()
+                .map(|(id, _, accel)| ((*id).to_string(), resolved(accel, macos))),
+        );
+        all.extend(
+            view_table(macos)
+                .iter()
+                .map(|(id, _, accel)| ((*id).to_string(), resolved(accel, macos))),
+        );
+        all
     }
 
     /// Shift+F10 is the platform "open the context menu" key, and two
@@ -589,7 +712,11 @@ mod tests {
                 "{accel} takes the context-menu key"
             );
         }
-        for (_, _, accel) in VIEW_TAB_BINDINGS {
+        for (_, _, accel) in REPO_TAB_BINDINGS
+            .iter()
+            .chain(VIEW_TAB_BINDINGS_MACOS)
+            .chain(VIEW_TAB_BINDINGS_OTHER)
+        {
             assert!(
                 !accel.eq_ignore_ascii_case("Shift+F10"),
                 "{accel} takes the context-menu key"
@@ -598,30 +725,89 @@ mod tests {
     }
 
     #[test]
-    fn fleet_does_not_collide_with_another_accelerator() {
-        let mut all = vec![
-            CLOSE_REPO_TAB_ACCEL,
-            REOPEN_REPO_TAB_ACCEL,
-            NEXT_REPO_TAB_ACCEL,
-            PREV_REPO_TAB_ACCEL,
-            SETTINGS_ACCEL,
-            FLEET_ACCEL,
-            AGENTS_ACCEL,
-        ];
-        all.extend(VIEW_TAB_BINDINGS.iter().map(|(_, _, accel)| *accel));
-        let before = all.len();
-        all.sort_unstable();
-        all.dedup();
-        assert_eq!(before, all.len(), "two menu items share an accelerator");
+    fn no_two_bound_accelerators_collide_on_any_host() {
+        for macos in HOSTS {
+            let all = bound_accelerators(macos);
+            // A parser that resolved nothing would pass the check below while
+            // examining nothing.
+            assert!(all.len() >= 7 + 9 + 3, "only {} accelerators resolved", all.len());
+            let mut seen = std::collections::HashMap::new();
+            for (owner, chord) in &all {
+                if let Some(first) = seen.insert(chord.clone(), owner.clone()) {
+                    panic!(
+                        "{chord} is bound by both {first} and {owner} (macos: {macos}); \
+                         one of them silently never fires"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn repo_tab_accelerators_do_not_steal_view_digits() {
+    fn repository_tab_chords_and_view_chords_are_disjoint_on_every_host() {
+        for macos in HOSTS {
+            let repo: std::collections::HashSet<String> = REPO_TAB_BINDINGS
+                .iter()
+                .map(|(_, _, accel)| resolved(accel, macos))
+                .collect();
+            assert_eq!(repo.len(), 9);
+            for (id, _, accel) in view_table(macos) {
+                let chord = resolved(accel, macos);
+                assert!(
+                    !repo.contains(&chord),
+                    "{id} ({accel}) shares a chord with a repository tab (macos: {macos})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn view_chords_avoid_altgr_and_the_macos_screenshot_shortcuts() {
+        for (_, _, accel) in VIEW_TAB_BINDINGS_OTHER {
+            let chord = resolved(accel, false);
+            // Ctrl+Alt is AltGr on many layouts: the keystroke types a
+            // character and never reaches the menu.
+            assert!(
+                !(chord.contains("ctrl") && chord.contains("alt")),
+                "{accel} is AltGr on some layouts"
+            );
+            // Plain Alt+digit is the webview's section chord.
+            assert!(
+                chord.contains("ctrl") && chord.contains("shift"),
+                "{accel} must be Ctrl+Shift+digit off macOS"
+            );
+        }
+        for (_, _, accel) in VIEW_TAB_BINDINGS_MACOS {
+            let chord = resolved(accel, true);
+            assert_eq!(chord.split('+').count(), 3, "{accel} is not Cmd+Alt+digit");
+            assert!(
+                chord.starts_with("alt+cmd+"),
+                "{accel} must be Option+Command+digit"
+            );
+            for screenshot in ["cmd+shift+3", "cmd+shift+4", "cmd+shift+5"] {
+                assert_ne!(chord.to_ascii_lowercase(), screenshot);
+            }
+        }
+        // And no macOS accelerator at all may be ⌘⇧3/4/5.
+        for (owner, chord) in bound_accelerators(true) {
+            for digit in 3..=5 {
+                assert_ne!(
+                    chord,
+                    format!("cmd+shift+{digit}"),
+                    "{owner} takes a macOS screenshot shortcut"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repo_tab_accelerators_take_the_digits_and_nothing_else_does() {
         assert_eq!(CLOSE_REPO_TAB_ACCEL, "CmdOrCtrl+Shift+W");
         assert_eq!(REOPEN_REPO_TAB_ACCEL, "CmdOrCtrl+Shift+Y");
         assert_eq!(NEXT_REPO_TAB_ACCEL, "Ctrl+Tab");
         assert_eq!(PREV_REPO_TAB_ACCEL, "Ctrl+Shift+Tab");
 
+        // The other File-menu tab accelerators stay off the digits.
         for accel in [
             CLOSE_REPO_TAB_ACCEL,
             REOPEN_REPO_TAB_ACCEL,
@@ -629,9 +815,21 @@ mod tests {
             PREV_REPO_TAB_ACCEL,
         ] {
             assert!(
-                !is_view_digit_accelerator(accel),
-                "{accel} must not bind Cmd/Ctrl+1–9; those are view tabs"
+                !is_plain_digit_accelerator(accel),
+                "{accel} must not bind Cmd/Ctrl+1–9; those select repository tabs"
             );
+        }
+        // Repository tabs are CmdOrCtrl+1…9 in order, 9 being the last tab.
+        let digits: Vec<String> = REPO_TAB_BINDINGS
+            .iter()
+            .map(|(_, _, accel)| (*accel).to_string())
+            .collect();
+        let expected: Vec<String> = (1..=9).map(|digit| format!("CmdOrCtrl+{digit}")).collect();
+        assert_eq!(digits, expected);
+        let ids: Vec<&str> = REPO_TAB_BINDINGS.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, actions::REPO_TAB_IDS);
+        for (id, _, _) in REPO_TAB_BINDINGS {
+            assert!(NativeAction::parse(id).is_some(), "{id} has no action");
         }
     }
 
@@ -642,25 +840,31 @@ mod tests {
         // every time while checking nothing that matters. What matters is that
         // the digits start at 1, have no gap, and no two views share one — a
         // gap or a duplicate is a shortcut that silently does the wrong thing.
-        let digits: Vec<String> = VIEW_TAB_BINDINGS
-            .iter()
-            .map(|(_, _, accel)| (*accel).to_string())
-            .collect();
-        let expected: Vec<String> = (1..=VIEW_TAB_BINDINGS.len())
-            .map(|digit| format!("CmdOrCtrl+{digit}"))
-            .collect();
-        assert_eq!(digits, expected);
-        assert_eq!(VIEW_TAB_BINDINGS[0].0, actions::TAB_CODE);
-        assert_eq!(VIEW_TAB_BINDINGS[1].0, actions::TAB_HISTORY);
-        // Retired views must not linger in the binding list: a menu item for
-        // a view the frontend cannot resolve is inert, and looks like a bug
-        // in the app rather than a stale table here.
-        for (id, _, _) in VIEW_TAB_BINDINGS {
-            assert!(
-                NativeAction::parse(id).is_some(),
-                "{id} has a digit shortcut but no action"
-            );
+        for macos in HOSTS {
+            let table = view_table(macos);
+            let digits: Vec<String> = table
+                .iter()
+                .map(|(_, _, accel)| accel.rsplit('+').next().unwrap_or_default().to_string())
+                .collect();
+            let expected: Vec<String> = (1..=table.len()).map(|digit| digit.to_string()).collect();
+            assert_eq!(digits, expected, "macos: {macos}");
+            assert_eq!(table[0].0, actions::TAB_CODE);
+            assert_eq!(table[1].0, actions::TAB_HISTORY);
+            // Retired views must not linger in the binding list: a menu item
+            // for a view the frontend cannot resolve is inert, and looks like a
+            // bug in the app rather than a stale table here.
+            for (id, _, _) in table {
+                assert!(
+                    NativeAction::parse(id).is_some(),
+                    "{id} has a digit shortcut but no action"
+                );
+            }
         }
+        // Both hosts bind the same views in the same order; only the chord moves.
+        fn ids(table: &'static [(&'static str, &'static str, &'static str)]) -> Vec<&'static str> {
+            table.iter().map(|(id, _, _)| *id).collect()
+        }
+        assert_eq!(ids(VIEW_TAB_BINDINGS_MACOS), ids(VIEW_TAB_BINDINGS_OTHER));
     }
 
     #[test]
@@ -676,7 +880,7 @@ mod tests {
             SETTINGS_ACCEL, "CmdOrCtrl+,",
             "Settings accelerator must stay ⌘,"
         );
-        assert!(!is_view_digit_accelerator(SETTINGS_ACCEL));
+        assert!(!is_plain_digit_accelerator(SETTINGS_ACCEL));
         // tauri 2.x exposes no public Accelerator parse API (the type lives in
         // the internal muda crate); guard the accelerator shape here instead
         // and rely on the menu builder to reject malformed strings at runtime.

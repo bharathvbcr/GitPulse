@@ -37,6 +37,24 @@ describe("terminal guide shortcuts", () => {
     expect(terminalViewChord({ ...chord, key: "f", ctrlKey: true }, "windows")).toBeNull();
   });
 
+  it("lists the repository-tab digits as the host's command key, and the terminal claims no such chord", () => {
+    const row = (os: "macos" | "windows" | "linux") =>
+      terminalGuideShortcuts(os).find((entry) => entry.description.startsWith("Jump to a repository tab"));
+    expect(row("macos")?.keys).toEqual(["⌘", "1–9"]);
+    expect(row("windows")?.keys).toEqual(["Ctrl", "1–9"]);
+    expect(row("linux")?.keys).toEqual(["Ctrl", "1–9"]);
+    // The native accelerator is consumed before xterm, but the terminal's own
+    // classifiers must not claim the chord either, or the two would race in a
+    // browser build: Command+digit on macOS, Control+digit elsewhere.
+    for (let digit = 1; digit <= 9; digit += 1) {
+      const key = String(digit);
+      expect(terminalTabChord({ ...chord, key, metaKey: true })).toBeNull();
+      expect(terminalTabChord({ ...chord, key, ctrlKey: true })).toBeNull();
+      expect(terminalViewChord({ ...chord, key, metaKey: true }, "macos")).toBeNull();
+      expect(terminalViewChord({ ...chord, key, ctrlKey: true }, "windows")).toBeNull();
+    }
+  });
+
   it("keeps macOS line editing off other hosts", () => {
     expect(terminalGuideShortcuts("macos").some((row) => row.description === "Start of the line")).toBe(true);
     expect(terminalGuideShortcuts("linux").some((row) => row.description === "Start of the line")).toBe(false);

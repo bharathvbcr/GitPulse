@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import { createRepoStore, type RepoState } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
-import { blockedWhilePrompting, buildMenuState, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
+import { blockedWhilePrompting, buildMenuState, canDispatchMenuEvent, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
 import { MENU_LIMITS } from "./menuContract";
 import type { AttentionKind, SessionActivity } from "../terminal/sessionActivity";
 
@@ -251,6 +251,41 @@ describe("agents waiting on the reader", () => {
     expect(waiting(2.9)).toBe(2);
     expect(waiting(Number.NaN)).toBe(0);
     expect(waiting(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+});
+
+describe("repository-tab digit items", () => {
+  const tab = (n: number) => ({
+    id: String(n), path: `/r/${n}`, name: `r${n}`, label: `r${n}`, pinned: false, isActive: n === 1,
+    isBare: false, isDirty: false, isLoading: false, error: null, currentBranch: "main",
+    conflictedCount: 0, changedCount: 0,
+  });
+  const withTabs = (count: number) => ({
+    ...loaded(),
+    openTabs: Array.from({ length: count }, (_, i) => tab(i + 1)),
+  });
+
+  it("enables digit n only when an nth tab is open, and the ninth for any open tab", () => {
+    const three = model(withTabs(3));
+    for (let digit = 1; digit <= 3; digit += 1) expect(menuActionEnabled(three, `repo-tab-${digit}`), `digit ${digit}`).toBe(true);
+    for (let digit = 4; digit <= 8; digit += 1) expect(menuActionEnabled(three, `repo-tab-${digit}`), `digit ${digit}`).toBe(false);
+    // Nine selects the LAST tab, so it needs one tab, not nine.
+    expect(menuActionEnabled(three, "repo-tab-9")).toBe(true);
+    const none = model(withTabs(0));
+    for (let digit = 1; digit <= 9; digit += 1) expect(menuActionEnabled(none, `repo-tab-${digit}`)).toBe(false);
+    const twelve = model(withTabs(12));
+    for (let digit = 1; digit <= 9; digit += 1) expect(menuActionEnabled(twelve, `repo-tab-${digit}`)).toBe(true);
+  });
+
+  it("is held while a prompt is open and runs in any repository, like next and previous tab", () => {
+    for (let digit = 1; digit <= 9; digit += 1) {
+      expect(blockedWhilePrompting(`repo-tab-${digit}`)).toBe(true);
+    }
+    const repo = withTabs(3);
+    const state = model(repo);
+    // Workspace-wide: the payload's repository need not be the active one.
+    expect(canDispatchMenuEvent({ id: "repo-tab-2", repo_path: "/elsewhere" }, state, repo)).toBe(true);
+    expect(canDispatchMenuEvent({ id: "repo-tab-5", repo_path: "/r/1" }, state, repo)).toBe(false);
   });
 });
 

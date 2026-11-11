@@ -6,7 +6,7 @@ import { actionLabel, blocksOtherMutations, headline } from "../repos/operation"
 import type { NativeEvent } from "./nativeActions";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { asksForReader, type SessionActivity } from "../terminal/sessionActivity";
-import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES } from "./menuContract";
+import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES, REPO_TAB_JUMP_IDS } from "./menuContract";
 import {
   identityKey,
   isCaseInsensitiveFs,
@@ -219,6 +219,11 @@ export function buildMenuState(
   allow("next-repo-tab", repo.openTabs.length > 1);
   allow("prev-repo-tab", repo.openTabs.length > 1);
   allow("reopen-repo-tab", repo.lastClosed.length > 0);
+  // ⌘n needs an nth tab; ⌘9 only needs one, because it selects the last. The
+  // count is open tabs, not strip stops: a folded worktree stack draws one stop
+  // for several tabs, so an item can be enabled while its stop is absent, and
+  // `activateTabByDigit` then does nothing, as ⌘5 does in a browser with four.
+  REPO_TAB_JUMP_IDS.forEach((id, index) => allow(id, repo.openTabs.length >= (index === 8 ? 1 : index + 1)));
   for (const id of ["copy-repo-path", "reveal-repo", "terminal-dock", "focus-filter"]) allow(id, hasRepo);
   allow("copy-branch", loaded && !!repo.currentBranch);
   allow("copy-commit", loaded);
@@ -490,6 +495,7 @@ const HELD_WHILE_PROMPTING: ReadonlySet<string> = new Set([
   "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone",
   "create-branch", "rename-branch", "quick-commit", "stash", "stash-pop",
   "operation-continue", "operation-abort", "operation-skip",
+  ...REPO_TAB_JUMP_IDS,
 ]);
 
 /**
@@ -529,6 +535,6 @@ export function canDispatchMenuEvent(
   }
   if (!menuActionEnabled(state, event.id)) return false;
   const global = GLOBAL_ACTIONS.includes(event.id) || ["zoom-in", "zoom-out", "reset-zoom", "check-updates",
-    "clear-recents", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab"].includes(event.id);
+    "clear-recents", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", ...REPO_TAB_JUMP_IDS].includes(event.id);
   return global || sameRepo(event.repo_path ?? "", repo.currentPath ?? "", options);
 }

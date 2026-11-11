@@ -22,7 +22,7 @@ describe("RepoTabBar", () => {
     // Escape still closes the tab menus; every switch happens after the guard.
     expect(guard).toBeGreaterThan(handler.indexOf('e.key === "Escape"'));
     expect(guard).toBeLessThan(handler.indexOf("switch (classifyShortcut(e))"));
-    expect(guard).toBeLessThan(handler.indexOf("repoStore.activateTabAt"));
+    expect(guard).toBeLessThan(handler.indexOf("repoStore.activateTabByDigit"));
     expect(guard).toBeLessThan(handler.indexOf("repoStore.closeActiveTab"));
     expect(guard).toBeLessThan(handler.indexOf("onOpen?.()"));
   });
@@ -128,9 +128,21 @@ describe("RepoTabBar", () => {
     expect(source).toContain("use:portal={\"body\"}");
   });
 
-  it("jumps to a repository with Ctrl+Alt+1-9, and 9 is the last, because Cmd+1-9 belong to the views", () => {
+  it("jumps to a repository with Cmd/Ctrl+1-9 through the store, which makes 9 the last", () => {
     const handler = source.slice(source.indexOf("function handleKey"), source.indexOf("onMount("));
-    expect(handler).toContain("wanted === 9 ? activationStops(tabLayout).length - 1 : wanted - 1");
+    // The digit-to-stop rule lives in `jumpTargetIndex`, shared with the native
+    // menu's repository-tab items; this handler only forwards the digit.
+    expect(handler).toContain("repoStore.activateTabByDigit(Number(digit[1]))");
+    expect(handler).not.toContain("activationStops");
+    // A key a terminal or editor already consumed is not a tab jump.
+    const jump = handler.slice(handler.indexOf('case "jumpToTab"'), handler.indexOf('case "cycleTabs"'));
+    expect(jump).toContain("if (e.defaultPrevented) return;");
+  });
+
+  it("hints the digit that reaches a tab, and none for a stop no digit reaches", () => {
+    expect(source).toContain("jumpDigitFor(stops.indexOf(cardTab.id), stops.length)");
+    expect(source).toContain("shortcutTextLabel(`⌘${jumpDigit}`, $hostPlatform.os)");
+    expect(source).not.toContain("⌃⌥");
   });
 
   it("marks a background tab whose agent asks for the reader, and never marks an unread one", () => {
