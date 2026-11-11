@@ -111,6 +111,7 @@ let failConfiguration = false, blankConfiguration = false, loseEnhancement = fal
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
 const relinkCalls = [], repoCommandCalls = [];
 const missingCheckouts = new Set(), uncheckableCheckouts = new Set();
+let uncheckableProbes = 0;
 // What `repoStore.openRepo` asks the host for, answered the way an empty,
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
@@ -125,7 +126,7 @@ const fixtureRepoCommands = {
   // `uncheckableCheckouts` fails for a reason that says nothing about it.
   cmd_resolve_git_root: a => {
     if (missingCheckouts.has(a.path)) throw `Not a Git repository: ${a.path}`;
-    if (uncheckableCheckouts.has(a.path)) throw `Operation not permitted (os error 1): ${a.path}`;
+    if (uncheckableCheckouts.has(a.path)) { uncheckableProbes += 1; throw `Operation not permitted (os error 1): ${a.path}`; }
     return a.path;
   },
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
@@ -3071,6 +3072,13 @@ if (params.has("check")) {
       check("a checkout that could not be checked says so instead of passing or failing",
         row("repo-0").textContent.includes("Not checked") && !chip("task-1")
         && (root.querySelector('[data-testid="checkout-unchecked"]')?.textContent ?? "").includes("Operation not permitted"));
+      // Rescan on that notice bumps `checkoutToken`, which reruns the checkout read.
+      const probesBefore = uncheckableProbes;
+      const rescan = [...root.querySelectorAll('[data-testid="checkout-unchecked"] button')].find(b => b.textContent.trim() === "Rescan");
+      check("the unchecked-checkout notice is a gp-notice, tone unknown, with a Rescan action", root.querySelector('[data-testid="checkout-unchecked"]')?.dataset.tone === "unknown" && Boolean(rescan));
+      rescan?.click();
+      await wait(() => uncheckableProbes > probesBefore);
+      check("Rescan reruns the checkout read, and a check that still cannot run stays unknown", uncheckableProbes > probesBefore && Boolean(root.querySelector('[data-testid="checkout-unchecked"]')));
       uncheckableCheckouts.clear();
       guardStep = "checkouts: relink";
       pickFolderResult = "/relocated/Manvi";

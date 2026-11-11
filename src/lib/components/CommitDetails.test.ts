@@ -112,7 +112,7 @@ describe("CommitDetails single current commit", () => {
     expect(source).toContain("{#if detailsFailure}");
     expect(source).toContain('detailsStatus === "error" ? describeFailure');
     expect(source).toContain('{ verb: "load", object: "commit details" }');
-    expect(source).toContain("{detailsFailure.headline}");
+    expect(source).toContain("{failureLine(detailsFailure)}");
     expect(source).toContain("Try again</button>");
     expect(source).toContain("onclick={retryDetails}");
     expect(source).toContain("graphStore.selectCommit(selectedCommit)");
@@ -132,7 +132,7 @@ describe("CommitDetails single current commit", () => {
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(preview).toContain("Reading the diff…");
-    expect(preview).toContain("{diffFailure.headline}");
+    expect(preview).toContain("{failureLine(diffFailure)}");
     expect(source).toContain('{ verb: "read", object: "this diff" }');
     expect(source).toContain('{ verb: "explain", object: "this commit" }');
     expect(preview).toContain("No changes in this commit");

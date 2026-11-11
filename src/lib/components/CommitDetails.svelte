@@ -91,6 +91,10 @@
       ($repoStore.selectedDiff === null && !$repoStore.selectedDiffError),
   );
   let diffError = $derived($repoStore.selectedDiffError);
+  /** Headline, then the reason, as one line. A space written between block tags is trimmed, so it is joined here. */
+  function failureLine(copy: FailureCopy): string {
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
   let detailsFailure = $derived(
     detailsStatus === "error" ? describeFailure({ verb: "load", object: "commit details" }, detailsError) : null,
   );
@@ -352,7 +356,7 @@
         {#if detailsFailure}
           <div class="px-2 py-1">
             <div class="gp-notice" data-tone="danger" role="alert">
-              <span class="min-w-0 flex-1 break-words text-meta">{detailsFailure.headline}{#if detailsFailure.detail} {detailsFailure.detail}{/if}</span>
+              <span class="min-w-0 flex-1 break-words text-meta">{failureLine(detailsFailure)}</span>
               <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDetails}>Try again</button>
             </div>
           </div>
@@ -388,7 +392,7 @@
           </button>
 
           {#if explainFailure}
-            <div class="mt-1.5 text-meta text-danger">{explainFailure.headline}{#if explainFailure.detail} {explainFailure.detail}{/if}</div>
+            <div class="mt-1.5 text-meta text-danger">{failureLine(explainFailure)}</div>
           {/if}
 
           {#if explanation && explanationFor === currentCommitId}
@@ -462,7 +466,7 @@
         {:else if diffFailure}
           <div class="flex flex-1 items-center justify-center px-4 font-sans">
             <div class="gp-notice" data-tone="danger" role="alert">
-              <span class="min-w-0 flex-1 break-words text-meta">{diffFailure.headline}{#if diffFailure.detail} {diffFailure.detail}{/if}</span>
+              <span class="min-w-0 flex-1 break-words text-meta">{failureLine(diffFailure)}</span>
               <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDiff}>Try again</button>
             </div>
           </div>
