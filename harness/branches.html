@@ -342,7 +342,9 @@ if(params.has("check")) {
     copyFailed=false;repoStore.setError(null);
     const sourceRow=[...document.querySelectorAll("button")].find(b=>b.title.startsWith("feature/branch-selection\n"));
     sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
-    await click("Fast-forward merge…");
+    // The merge dialog is its own chunk now, so its first open lands after the
+    // import resolves. Wait on the dialog itself (bounded by waitFor), not a sleep.
+    await click("Fast-forward merge…");await waitFor(()=>dialog());
     check("context menu opens review without merging",merges.length===0&&dialog());
     check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[name="merge-mode"]:checked')?.value==="ff-only");
     await dismiss("Cancel");

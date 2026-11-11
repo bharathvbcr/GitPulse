@@ -1,3 +1,10 @@
+<script module lang="ts">
+  // The merge dialog (22 KB) is reachable only from a branch's Merge action, yet
+  // sat in the startup chunk. Module scope: the loader identity is LazyMount's
+  // cache key.
+  const loadMergeBranchDialog = () => import("./MergeBranchDialog.svelte");
+</script>
+
 <script lang="ts">
   import type { AiGeneration } from "../stores/harnessStore";
   import { onMount, untrack } from "svelte";
@@ -12,7 +19,7 @@
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
-  import MergeBranchDialog from "./MergeBranchDialog.svelte";
+  import LazyMount from "./LazyMount.svelte";
   import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
@@ -1370,7 +1377,11 @@
 </div>
 
 {#if mergeRequest}
-  <MergeBranchDialog request={mergeRequest} onClose={() => { mergeRequest = null; }} />
+  <LazyMount
+    load={loadMergeBranchDialog}
+    name="The merge dialog"
+    props={{ request: mergeRequest, onClose: () => { mergeRequest = null; } }}
+  />
 {/if}
 
 {#if menu}

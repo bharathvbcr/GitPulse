@@ -62,7 +62,6 @@
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
   import {
     dismissFirstRun,
     onboardingStore,
@@ -76,6 +75,7 @@
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
   import LazyMount from "./lib/components/LazyMount.svelte";
+  import type { ViewTab } from "./lib/repos/persist";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
   import Splash from "./lib/components/Splash.svelte";
 
@@ -127,6 +127,10 @@
   // Opened from the first-run card, the tools panels and the palette, never
   // at startup; it renders nothing until `onboardingStore.wizard.open`.
   const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
+  // The first-run walkthrough: 19 KB that only the first launch, or a replay from
+  // Settings, ever draws. It is mounted at startup (it decides for itself whether
+  // to open) but its code no longer rides in the entry chunk.
+  const loadProductTour = () => import("./lib/components/onboarding/ProductTour.svelte");
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewBar from "./lib/components/ViewBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -1299,13 +1303,18 @@
   {/if}
   </div>
 
-  <ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}
-    onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}
-    onTasks={() => interfaceStore.setTasksOpen(true)}
-    onView={(view) => { interfaceStore.setGlobalSurface("repository"); repoStore.setActiveTab(view); }}
-    repositoryPath={$repoStore.currentPath} activeView={$repoStore.activeTab}
-    repositoryVisible={$interfaceStore.globalSurface === "repository"}
-    tasksOpen={$interfaceStore.globalSurface === "tasks"} settingsOpen={isSettingsModalOpen} />
+  <LazyMount load={loadProductTour} name="The walkthrough" props={{
+    onOpenRepository: () => repoStore.pickAndOpenRepo(),
+    onSettings: () => (isSettingsModalOpen = true),
+    onTools: () => openSetupWizard("devmap", "explain"),
+    onTasks: () => interfaceStore.setTasksOpen(true),
+    onView: (view: ViewTab) => { interfaceStore.setGlobalSurface("repository"); repoStore.setActiveTab(view); },
+    repositoryPath: $repoStore.currentPath,
+    activeView: $repoStore.activeTab,
+    repositoryVisible: $interfaceStore.globalSurface === "repository",
+    tasksOpen: $interfaceStore.globalSurface === "tasks",
+    settingsOpen: isSettingsModalOpen,
+  }} />
   {#if setupWizardMounted}
     <LazyMount load={loadSetupWizard} name="The setup wizard" />
   {/if}
