@@ -819,11 +819,26 @@
           interfaceStore.setStackWorktreeTabs(true);
           await settle();
           // A few tabs, so the strip does not overflow and there is free space
-          // between the last tab and the bar's end. Open, its menu and the
-          // workspace actions are pinned to the right edge across that space;
-          // the tab list itself must not grow into it, or its overflow cue
-          // would sit over empty space instead of the last tab.
-          check("Open follows the tab list; the drag zone then the workspace actions fill to the bar's edge", () => {
+          // between the last tab and the bar's end. The drag zone fills that
+          // space, then Open, its menu and the workspace actions are pinned
+          // to the right edge; the tab list itself must not grow into it, or
+          // its overflow cue would sit over empty space instead of the last
+          // tab.
+          const openLeft = () => $('[data-testid="open-repo-tab"]').getBoundingClientRect().left;
+          // The point of pinning Open: opening or closing a tab must not move
+          // it. A browser's new-tab control moves; this one must not.
+          const openAtRest = openLeft();
+          const PROBE = "/code/fixed-position/probe";
+          await repoStore.openRepo(PROBE, { activate: false });
+          await settle(); await wait(20);
+          const openAfterOpen = openLeft();
+          const probeShown = !!$(`[role="tab"][data-tab-id="${CSS.escape(rec(PROBE).id)}"]`, strip());
+          await repoStore.closeTab(rec(PROBE).id);
+          await settle(); await wait(20);
+          const openAfterClose = openLeft();
+          check("Open's left edge does not move when a tab is opened, nor when it is closed (within 1px)", () =>
+            probeShown && Math.abs(openAfterOpen - openAtRest) <= 1 && Math.abs(openAfterClose - openAtRest) <= 1);
+          check("the drag zone sits between the tab list and Open, then Open, its menu and the workspace actions reach the bar's edge", () => {
             const openBtn = $('[data-testid="open-repo-tab"]');
             const menuBtn = $('[data-testid="open-repo-menu"]');
             const zone = $("[data-drag-zone]");
@@ -831,16 +846,21 @@
             const barBox = bar.getBoundingClientRect();
             const listEnd = strip().getBoundingClientRect().right;
             const zoneBox = zone.getBoundingClientRect();
+            const openBox = openBtn.getBoundingClientRect();
             const rightmost = Math.max(...[...bar.children]
               .filter((el) => !el.classList.contains("sr-only") && el.getBoundingClientRect().width > 0)
               .map((el) => el.getBoundingClientRect().right));
             return scroller().scrollWidth <= scroller().clientWidth + 1
-              // Open sits against the list, like a browser's new-tab control...
-              && openBtn.getBoundingClientRect().left - listEnd < 16
-              // ...the zone after it is wide and drags...
-              && zoneBox.left >= menuBtn.getBoundingClientRect().right - 1 && zoneBox.width >= 48 && zone.hasAttribute("data-tauri-drag-region")
+              // The zone follows the list, is wide, and drags...
+              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 48 && zone.hasAttribute("data-tauri-drag-region")
+              // ...Open sits right of the zone, its menu arrow against it...
+              && openBox.left >= zoneBox.right - 1 && menuBtn.getBoundingClientRect().left >= openBox.right - 8
               // ...and the last control sits at the bar's own right edge.
               && Math.abs(barBox.right - rightmost) < 1.5;
+          });
+          check("the DOM order is the visual order: the tab list, the drag zone, Open, its menu", () => {
+            const order = [strip(), $("[data-drag-zone]"), $('[data-testid="open-repo-tab"]'), $('[data-testid="open-repo-menu"]')];
+            return order.every((el, i) => i === 0 || !!(order[i - 1].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
           });
 
           // ---- many more repositories than the watch pool ----------------
@@ -992,8 +1012,8 @@
             return rm.parentElement === document.body && getComputedStyle(rm).position === "fixed" &&
               Number.isFinite(z) && z > Number(getComputedStyle(pane).zIndex);
           });
-          check("it opens beside its trigger, not at the window's far edge", () =>
-            Math.abs(rbox.left - recentsTrigger.getBoundingClientRect().left) < 300 &&
+          check("it opens under its trigger, its right edge on the trigger's end edge", () =>
+            Math.abs(rbox.right - recentsTrigger.getBoundingClientRect().right) <= 1 &&
             rbox.top >= recentsTrigger.getBoundingClientRect().bottom - 1);
           check("the dropdown paints above a workspace pane drawn beneath the bar", () => {
             const hit = document.elementFromPoint(rbox.left + rbox.width / 2, rbox.top + Math.min(rbox.height / 2, 60));
@@ -1007,6 +1027,32 @@
           $('[data-testid="clone-repo-item"]').click();
           await settle();
           check("choosing Clone runs the clone action once and closes the menu", () => cloneCalls === 1 && !recentsMenu());
+
+          // Open sits near the window's right edge, so the menu must stay
+          // inside the window. The stage stands in for the window: at each
+          // width the bar fills it, and the menu must lie inside it (and the
+          // real window) however far right the trigger sits.
+          const stageEl = $("#stage");
+          const stageWidthWas = stageEl.style.width;
+          for (const width of [1400, 900]) {
+            stageEl.style.width = `${width}px`;
+            await settle(); await wait(40);
+            const trigger = $('[data-testid="open-repo-menu"]');
+            trigger.click();
+            await settle(); await wait(40);
+            const menuEl = recentsMenu();
+            const box = menuEl?.getBoundingClientRect();
+            const stageBox = stageEl.getBoundingClientRect();
+            const triggerBox = trigger.getBoundingClientRect();
+            check(`at ${width}px the recents menu opens fully inside the window, under its trigger`, () =>
+              !!box && box.left >= 0 && box.right <= Math.min(stageBox.right, innerWidth) + 0.5 &&
+              box.top >= triggerBox.bottom - 1 && box.bottom <= innerHeight &&
+              triggerBox.right <= stageBox.right && box.width > 0);
+            await press(menuEl, { key: "Escape" });
+            check(`at ${width}px Escape closes it again`, () => !recentsMenu());
+          }
+          stageEl.style.width = stageWidthWas;
+          await settle();
 
           // ---- the diffuse edge's frame time while the strip scrolls -----------
           // HEADER_SPEC section 5: ship the backdrop strips only if they add no

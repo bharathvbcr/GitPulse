@@ -19,10 +19,11 @@ One `role="tablist" aria-label="Workspace"` holds the surfaces and the repositor
 | 2 | Fleet · Agents n · Tasks n | global | Become `role="tab"` in the same tab shell as repositories; close × stays beside the tab. `data-testid`s unchanged |
 | 3 | `gp-separator` | — | The one sanctioned hairline |
 | 4 | Repository tabs | per tab | All behaviour unchanged: pin, groups, stacks, dirty dot, conflicts, terminal count, preview, close, drag, keys, context menus, parked. Adds the overflow menu (§5) |
-| 5 | + Open ▾ | global | Split pill: Open / Clone or recent |
-| 6 | Fetch all · workspace status | global | `WorkspaceActions`, still hidden with one tab or fewer |
-| 7 | Manvi chip | host-wide | `HarnessBadge` collapses to one `gp-chip` (tone = permission mode). Click opens a `gp-menu` holding the model `<select>` and the refresh-AI button. A `blocked` or `unchecked` verdict stays inline: a fired rule must never hide behind a click |
-| 8 | Diagnostics + error badge | host-wide | Last, so the badge sits at the window corner |
+| 5 | Window-drag spacer | — | `data-drag-zone`, `flex-1`, 48 px minimum (E3). Open no longer follows the last tab, so the free space sits before it |
+| 6 | + Open ▾ | global | Split pill: Open / Clone or recent. The first item of the global cluster, so its position is fixed (decision D4). Its recents menu aligns to the trigger's end edge |
+| 7 | Fetch all · workspace status | global | `WorkspaceActions`, still hidden with one tab or fewer |
+| 8 | Manvi chip | host-wide | `HarnessBadge` collapses to one `gp-chip` (tone = permission mode). Click opens a `gp-menu` holding the model `<select>` and the refresh-AI button. A `blocked` or `unchecked` verdict stays inline: a fired rule must never hide behind a click |
+| 9 | Diagnostics + error badge | host-wide | Last, so the badge sits at the window corner |
 
 ## 3. Row 2: the view bar (lenses on the selected repository), `<nav aria-label="Views">`, 36 px
 
@@ -64,7 +65,7 @@ Collapse order as the window narrows: context-bar fold → Manvi model → tab b
 
 ### Edge-to-edge tabs with a diffuse blur edge
 
-The tab strip runs edge to edge between the surfaces and + Open. Where it hides tabs, the edge goes soft and then disappears, rather than clipping hard.
+The tab strip runs edge to edge between the surfaces and the drag spacer, which sits before + Open. Where it hides tabs, the edge goes soft and then disappears, rather than clipping hard.
 - **Base, already shipped:** `ScrollCue` writes `data-gp-fade` and the scroller masks its own edge over 2rem (app.css `[data-gp-fade]`). Kept.
 - **New, the diffuse layer:** on each edge that still hides content, `ScrollCue` (new opt-in prop `diffuse`) renders two stacked strips with `backdrop-filter`: a light blur over 40 px and a heavier one over the outer 20 px, each masked from opaque at the edge to transparent inward. Together they form a progressive blur, with the opacity mask on top. Strips enter at 140 ms and exit at 70 ms (opacity) when the overflow state changes, and stay static while scrolling.
 - **Settings:** strength follows the float-blur setting from lane S. Blur at 0 px, Reduce Transparency, or `transparency: reduced` leaves only the mask fade.
@@ -77,7 +78,7 @@ Scroll with the existing `ScrollCue`, plus a trailing "N more ▾" menu listing 
 
 - **E1 Attention on background tabs.** A repository tab shows a "needs you" mark when one of its agents is waiting (same derivation as the row-2 Agents pill), so an agent in a repository you are not looking at still reaches you. The mark is a different shape from the dirty dot, and the overflow menu lists it. Unknown stays unknown.
 - **E2 Tab hover card.** After the 500 ms intent delay, a card (positioned by `ui/popover.ts`) shows path, branch with ahead/behind, uncommitted count, agents and terminals with their attention, and last fetch. It replaces the native `title` tooltip.
-- **E3 A window-drag zone that cannot be squeezed out.** The spacer between + Open and the global cluster is the drag region with a 48 px minimum; the tab strip scrolls before it shrinks. Empty space in row 2 drags too.
+- **E3 A window-drag zone that cannot be squeezed out.** The spacer between the tab strip and + Open is the drag region with a 48 px minimum; the tab strip scrolls before it shrinks. Empty space in row 2 drags too.
 - **E4 Jump to repository N.** ⌘1–⌘9 (Ctrl elsewhere) select repository tab N; ⌘9 selects the last, as browsers do. Next/previous repository already exist in the menu (`next-repo-tab`, `prev-repo-tab`). Labels come from `platformCopy`; check for a clash with existing shortcuts before assigning. Settled (lane K): these are native File-menu accelerators (`repo-tab-1`…`repo-tab-9`), so they work with a terminal or editor focused, and the views moved off ⌘1–3 to ⌥⌘1–3 on macOS and Ctrl+Shift+1–3 on Windows and Linux (Ctrl+Alt+digit is AltGr on many layouts; ⌘⇧3/4/5 are the macOS screenshot shortcuts).
 - **E5 Fetch-all progress in its own pill.** A progress ring and Stop inside the pill while it runs; the result reads in the workspace status popover, not a toast.
 - **E6 A slimmer status bar.** With the terminal moved to row 2, the status bar carries branch, sync and cadence only. Hiding it (`statusBarMode`) no longer hides the terminal control.
@@ -97,7 +98,7 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
 ## 8. Contracts to rewrite in the same commit (never delete)
 
 - `harness/tab-switch.html`: boot selectors, same-node probes, exactly one tablist whose label ends in "sections" (so the new one is "Workspace"), flyout intent/grace and unchanged group lefts, ArrowDown/Up into sections, the commit-filter group.
-- `harness/repo-tabs.html`: no scroll or cue when it fits; close controls outside tabs with one roving stop; whole names; Open is a labelled pill at 1400 px; `tasks-tab-close` lifecycle.
+- `harness/repo-tabs.html`: no scroll or cue when it fits; close controls outside tabs with one roving stop; whole names; Open is a labelled pill at 1400 px, pinned right (the drag zone between the tab list and Open, its left edge unmoved when a tab opens or closes, its recents menu inside the window at 1400 and 900 px); `tasks-tab-close` lifecycle.
 - `RepoTabBar.test.ts` (testids, Fleet-before-Agents order), `App.test.ts` (the `<RepoTabBar …/>` literal and the title-bar scroller row), `scripts/mac-material-contract.test.ts` (`.gp-glass.gp-repo-tabs` and its reduced-transparency override; the view row needs its own measured fill), `Sidebar.test.ts` if decision D3 retires the sidebar's Open.
 - Both rows' `border-b` separators go (rule 7).
 
@@ -106,6 +107,7 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
 - **D1 Native window tabs.** `tabbingIdentifier` (tauri.conf.json) lets macOS draw a second, native tab bar under the repository row when "prefer tabs" is on. Decided: remove `tabbingIdentifier` from tauri.conf.json (lane I).
 - **D2 Wordmark.** Drop "GitPulse" from the title bar (the menu bar and window title already say it; the welcome card keeps it). Decided: drop.
 - **D3 Sidebar Open.** With Open in the title row, the sidebar's Open icon is a third copy. Decided: retire it, rewriting the Sidebar.test.ts pin in the same commit.
+- **D4 Open placement.** + Open ▾ followed the last tab like a browser's new-tab control, so it moved whenever a tab opened or closed. Decided 2026-11-10 by the user: Open pinned right for a fixed position. It is the first control of the global cluster, after the drag spacer.
 
 ## 10. Unverified until the app runs
 
