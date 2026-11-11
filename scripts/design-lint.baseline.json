@@ -1,33 +1,22 @@
 {
   "schema": 1,
-  "commit": "365729b7684a05732db143ff0d7aac5ea054d303",
+  "commit": "41d273d95f9a6f5b41d668369a73f5e1ab915993",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 54,
-      "files": {
-        "src/lib/components/StatusBar.svelte": 6,
-        "src/lib/components/TerminalDock.svelte": 1,
-        "src/lib/components/TerminalPanel.svelte": 27,
-        "src/lib/components/TerminalSession.svelte": 20
-      }
+      "total": 0,
+      "files": {}
     },
     "2": {
       "name": "weight-and-case",
-      "total": 6,
-      "files": {
-        "src/lib/components/TerminalPanel.svelte": 6
-      }
+      "total": 0,
+      "files": {}
     },
     "3": {
       "name": "palette-colors",
-      "total": 56,
+      "total": 11,
       "files": {
-        "src/lib/components/RepoTabBar.svelte": 1,
-        "src/lib/components/StatusBar.svelte": 2,
-        "src/lib/components/TerminalPanel.svelte": 35,
-        "src/lib/components/TerminalSession.svelte": 7,
         "src/lib/files/syntaxHighlight.ts": 11
       }
     },
@@ -52,30 +41,18 @@
     },
     "7": {
       "name": "hairlines",
-      "total": 17,
-      "files": {
-        "src/lib/components/TerminalDock.svelte": 2,
-        "src/lib/components/TerminalPanel.svelte": 11,
-        "src/lib/components/TerminalSession.svelte": 4
-      }
+      "total": 0,
+      "files": {}
     },
     "8": {
       "name": "border-opacity",
-      "total": 32,
-      "files": {
-        "src/lib/components/StatusBar.svelte": 3,
-        "src/lib/components/TerminalDock.svelte": 1,
-        "src/lib/components/TerminalPanel.svelte": 24,
-        "src/lib/components/TerminalSession.svelte": 4
-      }
+      "total": 0,
+      "files": {}
     },
     "9": {
       "name": "layout-transitions",
-      "total": 2,
-      "files": {
-        "src/lib/components/Sidebar.svelte": 1,
-        "src/lib/components/TerminalPanel.svelte": 1
-      }
+      "total": 0,
+      "files": {}
     },
     "10": {
       "name": "motion-literals",
@@ -98,19 +75,15 @@
     },
     "13": {
       "name": "ascii-ellipsis",
-      "total": 1,
-      "files": {
-        "src/lib/components/TerminalPanel.svelte": 1
-      }
+      "total": 0,
+      "files": {}
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 16,
+      "total": 9,
       "files": {
         "src/lib/components/FirebasePanel.svelte": 7,
-        "src/lib/components/RepoPanel.svelte": 2,
-        "src/lib/components/TerminalPanel.svelte": 5,
-        "src/lib/components/TerminalSession.svelte": 2
+        "src/lib/components/RepoPanel.svelte": 2
       }
     },
     "15": {
