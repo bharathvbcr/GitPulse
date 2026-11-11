@@ -85,7 +85,7 @@ describe("CommitDetails explain error scope", () => {
     const untrackStart = source.indexOf("untrack(() => {", start);
     const block = source.slice(untrackStart, source.indexOf("});\n  });", untrackStart));
     expect(block).toContain("explainGuard?.cancel();");
-    expect(block).toContain("explainError = null;");
+    expect(block).toContain("explainFailure = null;");
   });
 
   it("holds the copied-flash timers and clears them when the pane unmounts", () => {
@@ -109,8 +109,10 @@ describe("CommitDetails single current commit", () => {
   });
 
   it("tells a failed details read apart from an empty commit and offers Try again", () => {
-    expect(source).toContain('{#if detailsStatus === "error"}');
-    expect(source).toContain("Couldn't load commit details. {detailsError}");
+    expect(source).toContain("{#if detailsFailure}");
+    expect(source).toContain('detailsStatus === "error" ? describeFailure');
+    expect(source).toContain('{ verb: "load", object: "commit details" }');
+    expect(source).toContain("{failureLine(detailsFailure)}");
     expect(source).toContain("Try again</button>");
     expect(source).toContain("onclick={retryDetails}");
     expect(source).toContain("graphStore.selectCommit(selectedCommit)");
@@ -122,7 +124,7 @@ describe("CommitDetails single current commit", () => {
     const preview = source.slice(start);
     const order = [
       "{#if diffLoading}",
-      "{:else if diffError}",
+      "{:else if diffFailure}",
       "{:else if previewLines.length > 0}",
       "{:else if currentCommitId !== null}",
       "{:else}",
@@ -130,7 +132,9 @@ describe("CommitDetails single current commit", () => {
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(preview).toContain("Reading the diff…");
-    expect(preview).toContain("Couldn't read this diff. {diffError}");
+    expect(preview).toContain("{failureLine(diffFailure)}");
+    expect(source).toContain('{ verb: "read", object: "this diff" }');
+    expect(source).toContain('{ verb: "explain", object: "this commit" }');
     expect(preview).toContain("No changes in this commit");
     expect(preview).toContain("No changes in this file");
     // "No commit selected" is reserved for having no commit at all.

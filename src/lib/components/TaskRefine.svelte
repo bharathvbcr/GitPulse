@@ -14,6 +14,8 @@
   import { untrack } from "svelte";
   import { get } from "svelte/store";
   import { Sparkles } from "@lucide/svelte";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Checkbox from "./Checkbox.svelte";
   import { explainError, getRefinement, getTask, newID, WorkbenchError, type RefinePart, type Task } from "../workbench/client";
   import { applyConflict, applyRefine, confirmReviewed, dismissRefine, refineDiff, requestRefine, selectableParts, type ApplyHeld, type RefineResult } from "../workbench/proposals";
   import { effectiveSelection } from "../workbench/taskModel";
@@ -54,6 +56,15 @@
   const nothingPicked = $derived(chosen.length === 0);
   const blocked = $derived(applying || disabled || nothingPicked || Boolean(diff?.stale));
 
+  /** The hook `tasksChecks.js` and `proposalsUi.test.ts` select a part's checkbox by. */
+  const partTestId = (part: RefinePart): string => `task-refine-part-${part}`;
+
+  /** "Couldn't <verb> <object>. <What to do>. <Reason>." — the reason is the store's own wording and comes last. */
+  function failure(verb: string, object: string, cause: unknown, next = ""): string {
+    const copy = describeFailure({ verb, object }, explainError(cause));
+    return [copy.headline, next, copy.detail].filter(Boolean).join(" ");
+  }
+
   async function ask() {
     if (!task || asking || disabled) return;
     asking = true; error = ""; message = "";
@@ -63,7 +74,7 @@
       result = next; picked = defaultParts(next); held = null; reviewed = [];
     } catch (cause) {
       result = null;
-      error = explainError(cause);
+      error = failure("get", "refinements from Manvi", cause);
     } finally { asking = false; }
   }
 
@@ -95,7 +106,7 @@
       message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in the inbox.`;
       result = null;
       try { onApplied(await getTask(reviewedProposal.task_id)); }
-      catch (reread) { message += ` The task could not be re-read (${explainError(reread)}); refresh it to see the result.`; }
+      catch (reread) { message += ` ${failure("re-read", "the task", reread, "Refresh it to see the result.")}`; }
     } catch (cause) {
       if (cause instanceof WorkbenchError && cause.code === "revision_conflict") {
         // Refused, nothing written. Say which side moved, show the task as it is now, and ask again against it.
@@ -104,9 +115,9 @@
         const current = freshTask.status === "fulfilled" ? freshTask.value : null;
         error = applyConflict(reviewedProposal, current, stored.status === "fulfilled" ? stored.value : null).message;
         if (current) onApplied(current);
-        else error += ` (The task could not be re-read: ${freshTask.status === "rejected" ? explainError(freshTask.reason) : "no reply"}.)`;
+        else error += ` ${failure("re-read", "the task", freshTask.status === "rejected" ? freshTask.reason : "no reply")}`;
       } else {
-        error = explainError(cause);
+        error = failure("apply", "the refinements", cause);
       }
     } finally { applying = false; }
   }
@@ -146,7 +157,7 @@
 
       {#if diff.criteria.length > 0}
         <h4 class="gp-label">Acceptance criteria</h4>
-        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-acceptance_criteria" checked={chosen.includes("acceptance_criteria")} disabled={locked.includes("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} /> Add these to the task{#if locked.includes("acceptance_criteria")} <em>(locked on this task)</em>{/if}</label>
+        <Checkbox testId={partTestId("acceptance_criteria")} label="Add these to the task" description={locked.includes("acceptance_criteria") ? "Locked on this task." : ""} checked={chosen.includes("acceptance_criteria")} disabled={locked.includes("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} />
         <ul class="rows">
           {#each diff.criteria as row}
             <li class:present={row.state === "present"}>
@@ -159,7 +170,7 @@
 
       {#if diff.duplicates.length > 0}
         <h4 class="gp-label">Possible duplicates</h4>
-        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-duplicate_of" checked={chosen.includes("duplicate_of")} disabled={locked.includes("duplicate_of")} onchange={() => toggle("duplicate_of")} /> Link these as the original</label>
+        <Checkbox testId={partTestId("duplicate_of")} label="Link these as the original" description={locked.includes("duplicate_of") ? "Locked on this task." : ""} checked={chosen.includes("duplicate_of")} disabled={locked.includes("duplicate_of")} onchange={() => toggle("duplicate_of")} />
         <ul class="rows">
           {#each diff.duplicates as row}
             <li class:present={row.state === "present"}>
@@ -171,7 +182,7 @@
 
       {#if diff.splits.length > 0}
         <h4 class="gp-label">Split into</h4>
-        <label class="part"><input type="checkbox" class="gp-check" data-testid="task-refine-part-split_into" checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} /> Create these as new inbox tasks</label>
+        <Checkbox testId={partTestId("split_into")} label="Create these as new inbox tasks" description={locked.includes("split_into") ? "Locked on this task." : ""} checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} />
         <ul class="rows">
           {#each diff.splits as part, index}
             <li data-testid="task-refine-split-{index}">
@@ -222,7 +233,6 @@
   .present{opacity:.65}
   .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-danger))}
   .held p,.held ul{margin:0}
-  .part{display:flex;align-items:center;gap:6px}
   ins{text-decoration:none;color:rgb(var(--c-accent))}
   .cites{display:block;font-size:.625rem;color:rgb(var(--c-text-muted))}
   pre{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem}

@@ -29,7 +29,7 @@ import {
 export const SWIMLANES = ["none", "status", "owner", "label"] as const;
 export type Swimlane = (typeof SWIMLANES)[number];
 export const SWIMLANE_LABELS: Record<Swimlane, string> = {
-  none: "No lanes",
+  none: "No grouping",
   status: "Status",
   owner: "Owner",
   label: "Label",

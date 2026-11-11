@@ -57,6 +57,7 @@
   import {
     PROVIDER_LABELS,
     canRelease,
+    RUN_START_FAILED_LABEL,
     runExpired,
     runHoldsCheckout,
     runStatusLabel,
@@ -625,7 +626,7 @@
                would not open, the host refused the spawn (a missing or old
                CLI), a managed start failed. Without it, a spawn refused in a
                hidden tab read as a quiet "not connected". -->
-          <li data-phase="failed" data-tone="error" data-testid="agent-session-failed"><span class="dot" aria-hidden="true"></span><span class="glance"><span class="headline">Did not start</span><span class="cause">{row.failure}</span></span></li>
+          <li data-phase="failed" data-tone="error" data-testid="agent-session-failed"><span class="dot" aria-hidden="true"></span><span class="glance"><span class="headline">{RUN_START_FAILED_LABEL}</span><span class="cause">{row.failure}</span></span></li>
         {/if}
         {#if row.disconnected}
           <!-- The store says it runs; no session in this window is attached

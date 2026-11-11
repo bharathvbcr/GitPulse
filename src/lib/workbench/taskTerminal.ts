@@ -42,6 +42,7 @@ import { focusTerminalSession } from "../terminal/sessionFocus";
 import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
 import { explainError, findConversation, launchManagedRun, WorkbenchError, type TaskRun } from "./client";
 import { resolveGitRoot } from "../desktop/nativeShell";
+import { describeFailure } from "../ui/copy/describeFailure";
 import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
 import { relativeStartDir } from "../terminal/tabs";
 import { agentPromptArgs } from "../terminal/launchRequests";
@@ -114,6 +115,18 @@ export async function startTaskTerminal(run: RunRef): Promise<AttemptStart> {
  * checkout may open in a moment. A refusal for capacity will not resolve by
  * waiting, so the request is withdrawn and the reason is the answer.
  */
+/** "Couldn't open <checkout>. <Reason>." for a checkout the host would not open. */
+function openFailure(checkout: string, reason: string): string {
+  const copy = describeFailure({ verb: "open", object: checkoutLabel(checkout) }, reason);
+  return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+}
+
+/** "Couldn't start <object>. <Reason>." — the headline is the house template, the reason is the host's own wording. */
+function startFailure(object: string, reason: unknown): string {
+  const copy = describeFailure({ verb: "start", object }, reason);
+  return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+}
+
 function afterOpen(run: Pick<TaskRun, "id">, root: string, opened: boolean, success: "opened" | "started"): AttemptStart {
   const refused = openRefusal(root);
   if (refused) {
@@ -280,14 +293,14 @@ export async function showAttemptTerminal(run: RunRef): Promise<AttemptStart> {
  */
 export async function showTaskTerminal(run: RunRef): Promise<TaskTerminalOutcome> {
   const outcome = await showAttemptTerminal(run);
-  if (outcome.kind === "failed") throw new Error(`Could not open ${checkoutLabel(outcome.checkout)}: ${outcome.reason}`);
+  if (outcome.kind === "failed") throw new Error(openFailure(outcome.checkout, outcome.reason));
   return outcome.kind === "waiting" ? "queued" : outcome.kind;
 }
 
 /** What a row says about an outcome that is not "on screen" or "starting". */
 export function attemptStartNote(outcome: AttemptStart): string | null {
   switch (outcome.kind) {
-    case "failed": return `Could not open ${checkoutLabel(outcome.checkout)}: ${outcome.reason}`;
+    case "failed": return openFailure(outcome.checkout, outcome.reason);
     case "waiting": return outcome.reason === "trust"
       ? `Waiting for you to trust ${checkoutLabel(outcome.checkout)}. It opened without asking; trust it and the agent starts.`
       : `Waiting for ${checkoutLabel(outcome.checkout)} to open.`;
@@ -358,7 +371,7 @@ export async function resumeTaskConversation(
   // `startDir` carries when that is below the root.
   const place = await hostFor(await checkoutFor(conversation.cwd));
   const refused = place.host ? null : openRefusal(place.root);
-  if (refused) return { outcome: "unavailable", reason: `Could not open ${checkoutLabel(place.root)}: ${refused}` };
+  if (refused) return { outcome: "unavailable", reason: openFailure(place.root, refused) };
   const request: TaskTerminalRequest = {
     runId: run.id,
     repoPath: place.root,
@@ -539,7 +552,7 @@ async function startManaged(
     }
     return { ok: true, run: started };
   } catch (cause) {
-    const error = `Managed ${label} did not start: ${explainError(cause)} Start or recover managed launch retries this same attempt.`;
+    const error = `${startFailure(`managed ${label}`, explainError(cause))} Start or recover managed run retries this same run.`;
     noteAttempt(run.id, "failed", error, deps.now());
     deps.toast.error(error);
     return { ok: false, run, error };
@@ -628,7 +641,7 @@ function watch(run: TaskRun, label: string, showAction: ToastAction, deps: Prepa
       if (done) return;
       if (hasTaskTerminalRequest(run.id)) {
         consumeTaskTerminal(run.id);
-        noteAttempt(run.id, "failed", "This attempt expired before its terminal could start, so it no longer holds its checkout. Prepare a new attempt.", deps.now());
+        noteAttempt(run.id, "failed", "This run expired before its terminal could start, so it no longer holds its checkout. Prepare a new run.", deps.now());
         return;
       }
       const left = began + MAX_WATCH_MS - deps.now();
@@ -649,7 +662,7 @@ function watch(run: TaskRun, label: string, showAction: ToastAction, deps: Prepa
       // Show terminal retries a start — except on a preparation that has
       // expired, which no start can claim.
       const retryable = run.state !== "prepared" || run.expires_at * 1000 > deps.now();
-      deps.toast.error(`${label} did not start: ${notice.text}`, retryable ? showAction : undefined);
+      deps.toast.error(startFailure(label, notice.text), retryable ? showAction : undefined);
     }
   });
   if (done) unsubscribe();

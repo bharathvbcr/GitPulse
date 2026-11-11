@@ -93,7 +93,7 @@ describe("closing a terminal with a job in it", () => {
     }
     const attempt = closeQuestion(known(leaderIsTheAgent), "Fix the importer", { ...claude, taskAttempt: true });
     expect(attempt?.title).toBe("Close Fix the importer?");
-    expect(attempt?.message).toContain("ends this attempt");
+    expect(attempt?.message).toContain("ends this run");
     expect(attempt?.message).toContain("resumed");
   });
 

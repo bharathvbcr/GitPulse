@@ -100,7 +100,7 @@
   import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
   import Checkbox from "./Checkbox.svelte";
-  import { describeFailure } from "../ui/copy/describeFailure";
+  import { describeFailure, unknownState } from "../ui/copy/describeFailure";
 
   let { repositoryPath = null, active = true, acceptsOpenRequests = false }: {
     repositoryPath?: string | null;
@@ -599,7 +599,7 @@
   }
   function laneAria(group: TaskLane): string {
     const by = swimlane === "label" ? "first label" : swimlane;
-    return `${group.label} — ${plural(group.cards.length, "task")}, lane by ${by}`;
+    return `${group.label} — ${plural(group.cards.length, "task")}, grouped by ${by}`;
   }
   /** Put a saved view back: the layout preferences, then this board's filters. */
   function applyView(view: SavedTaskView) {
@@ -1005,9 +1005,14 @@
   const statedFailure = $derived(catalogError || error);
   /** A read note's cause, or a pointer to the notice above when it says the same thing. */
   function noteCause(reason: string): string {
-    return reason === statedFailure ? "the same failure as above" : reason;
+    return reason === statedFailure ? "The same failure as above." : reason;
   }
-  const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error || uncheckedCheckouts.length));
+  /** A read-note line: "Couldn't read <object>. <What the board does instead>. <Reason>." */
+  function readNote(object: string, reason: string, consequence: string): string {
+    const copy = describeFailure({ verb: "read", object }, noteCause(reason));
+    return [copy.headline, consequence, copy.detail].filter(Boolean).join(" ");
+  }
+  const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error));
   $effect(() => {
     checkoutToken;
     void checkoutKey;
@@ -2972,13 +2977,20 @@
       <ul class="read-notes gp-notice gp-notice-warn" aria-label="Board details not read" data-testid="board-read-notes">
         <!-- Cards carry no agent marks while this stands: an old reading would
              claim agents nobody checked. -->
-        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read verification verdicts, so cards show none: {noteCause(verdictError)}</span></li>{/if}
-        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read subtask progress, so cards show none: {noteCause(lineageError)}</span></li>{/if}
-        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't read which agents are working on these tasks: {noteCause($boardAgents.error)}</span></li>{/if}
-        <!-- A check that could not run is said, not shown as a healthy checkout:
-             those rows and cards carry no mark either way. -->
-        {#if uncheckedCheckouts.length}<li class="agents-unread" role="status" data-testid="checkout-unchecked"><CircleAlert size={12} aria-hidden="true" /><span>Couldn't check {plural(uncheckedCheckouts.length, "checkout")}, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</span></li>{/if}
+        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("verification verdicts", verdictError, "Cards show none.")}</span></li>{/if}
+        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("subtask progress", lineageError, "Cards show none.")}</span></li>{/if}
+        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("which agents are working on these tasks", $boardAgents.error, "")}</span></li>{/if}
       </ul>
+    {/if}
+    <!-- A check that could not run is said, not shown as a healthy checkout:
+         those rows and cards carry no mark either way. -->
+    {#if uncheckedCheckouts.length}
+      {@const unknown = unknownState(plural(uncheckedCheckouts.length, "checkout"), `Whether ${uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. ${uncheckedCheckouts[0].detail}`)}
+      <div class="gp-notice" data-tone="unknown" role="status" data-testid="checkout-unchecked">
+        <CircleAlert size={12} aria-hidden="true" />
+        <span class="min-w-0 flex-1">{unknown.title}. {unknown.reason}</span>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => { checkoutToken += 1; }}>{unknown.actionLabel}</button>
+      </div>
     {/if}
     <!-- Its own banner, not part of `error`: a board reload clears `error`,
          and the issue would still exist with nothing on screen to link it. -->

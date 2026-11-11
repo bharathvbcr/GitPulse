@@ -31,6 +31,7 @@ import { asAgentProvider, PERMISSION_MODES, PROVIDER_LABELS, supportsManaged, ty
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
 import { writable, type Readable } from "svelte/store";
+import { describeFailure } from "../ui/copy/describeFailure";
 import type { RunPreparation } from "./client";
 import { HANDOFF_MODEL_CHOICES, MODEL_FIELDS, MODEL_FIELDS_BY_LAUNCHER, isEffortLevel, isModelId, type ModelChoice } from "../terminal/agentDefaults";
 
@@ -535,13 +536,20 @@ export function runStatusLabel(
   return runStateLabel(run.state);
 }
 
+/**
+ * What a run whose process never started is called: the house headline
+ * ("Couldn't start the run.") without its stop, because it fills a status chip
+ * whose siblings are "Running" and "Exited". The reason is shown beside it.
+ */
+export const RUN_START_FAILED_LABEL: string = describeFailure({ verb: "start", object: "the run" }, "").headline.replace(/\.$/, "");
+
 export function runStateLabel(state: string): string {
   switch (state) {
     case "prepared": return "Prepared";
     case "starting": return "Starting";
     case "running": return "Running";
     case "exited": return "Exited";
-    case "failed": return "Failed to start";
+    case "failed": return RUN_START_FAILED_LABEL;
     case "cancelled": return "Cancelled";
     case "unresolved": return "Unresolved";
     default: return state;

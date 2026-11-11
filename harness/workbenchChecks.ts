@@ -29,7 +29,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
     while (true) {
       try { if (condition()) return; }
       catch (error) { lastError = error instanceof Error ? error.message : String(error); }
-      if (Date.now() >= deadline) throw new Error(`UI did not reach the expected state: ${lastError}; ${document.querySelector("aside")?.textContent}`);
+      if (Date.now() >= deadline) throw new Error(`UI did not reach the expected state: ${lastError}; waiting for ${condition.toString().slice(0, 200)}; ${document.querySelector("aside")?.textContent}`);
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
@@ -61,7 +61,16 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", title);
   fill("Description", "textarea", description);
   fill("Acceptance criteria", "textarea", "Both repository checks remain available");
-  check("GitPulse").click();
+  // The repository picker is a popover portaled to <body>, so its rows are outside the editor.
+  const repoSummary = editor().querySelector<HTMLElement>('[data-testid="task-repo-summary"]');
+  if (!repoSummary) throw new Error("Missing repository picker trigger");
+  repoSummary.click();
+  await wait(() => Boolean(document.querySelector('[data-testid="task-repo-popup"]')));
+  const repoPopup = document.querySelector('[data-testid="task-repo-popup"]');
+  if (!repoPopup) throw new Error("Missing repository picker popup");
+  check("GitPulse", repoPopup).click();
+  repoSummary.click();
+  await wait(() => !document.querySelector('[data-testid="task-repo-popup"]'));
   await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "1");
@@ -86,7 +95,16 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   results.push("Generation leaves saved task fields unchanged");
   button("Edit suggestion", editor()).click();
   await wait(() => button("Accept selected fields", editor()).matches(":disabled"));
-  assert(button("Close task details").disabled, "Suggestion draft can be closed without saving");
+  // Since cb4ab882 closing mid-edit is not blocked: the button stays enabled and asks first (TaskEditor `leave`).
+  assert(!button("Close task details").disabled, "Close must stay available while a suggestion is being edited");
+  button("Close task details").click();
+  const prompt = () => document.querySelector<HTMLElement>('[role="dialog"][aria-modal="true"]');
+  await wait(() => prompt()?.textContent?.includes("Keep editing") === true);
+  assert(prompt()?.textContent?.includes("will be lost") === true, "The close confirmation does not say what is lost");
+  button("Keep editing", prompt() ?? document).click();
+  await wait(() => prompt() === null);
+  assert(Boolean(editor()), "Cancelling the close confirmation closed the editor");
+  assert(button("Accept selected fields", editor()).matches(":disabled"), "Cancelling the close confirmation lost the suggestion edit state");
   const revisedTitle = `${title} after review`;
   fill("Revised title", "textarea", revisedTitle);
   await wait(() => !button("Save suggestion edits", editor()).matches(":disabled"));
@@ -108,6 +126,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   assert(field("Acceptance criteria", "textarea").value === "Both repository checks remain available", "Acceptance criteria changed");
   assert(check("Title", review()).checked && !check("Description", review()).checked, "Accepted review marks an unaccepted field as accepted");
   results.push("Lost acceptance reply reconciles once and displays only accepted fields");
+  await wait(() => !button("Undo accepted fields", editor()).matches(":disabled"));
   button("Undo accepted fields", editor()).click();
   await wait(() => editor().dataset.taskRevision === "3" && state("Undone"));
   assert(field("Title", "input").value === title && field("Description", "textarea").value === description, "Undo did not restore the selected field");
@@ -148,10 +167,15 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", automaticTitle);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "5");
-  await wait(() => [...editor().querySelectorAll(".history button")].some((entry) => entry.textContent?.includes("Ready for review") && entry.textContent.includes("Task revision 5") && entry.textContent.includes("Automatic")));
-  const automaticEntry = [...editor().querySelectorAll<HTMLButtonElement>(".history button")].find((entry) => entry.textContent?.includes("Task revision 5") && entry.textContent.includes("Automatic"));
+  // The suggestion history is a <select> (W1), not a list of buttons.
+  const history = () => editor().querySelector<HTMLSelectElement>('[data-testid="task-assist-history"]');
+  await wait(() => Boolean([...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic"))) && ([...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic")))?.textContent?.includes("Ready for review") === true);
+  const automaticEntry = [...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic"));
   if (!automaticEntry) throw new Error("Automatic suggestion was not exposed for review");
-  automaticEntry.click();
+  const picker = history();
+  if (!picker) throw new Error("Suggestion history picker is missing");
+  picker.value = automaticEntry.value;
+  picker.dispatchEvent(new Event("change", { bubbles: true }));
   await wait(() => state("Ready for review") && review().textContent?.includes("source revision 5") === true);
   assert(field("Title", "input").value === automaticTitle && field("Description", "textarea").value === description, "Automatic inference changed saved fields");
   assert(review().querySelectorAll('input[type="checkbox"]').length === 1, "Automatic generation ignored the saved field lock");

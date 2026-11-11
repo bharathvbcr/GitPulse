@@ -144,4 +144,9 @@ describe("TaskManviAssist", () => {
     expect(source).toContain("return createAdaptiveTimer(() => { void poll(id); }, 1000);");
     expect(source).toContain("return createAdaptiveTimer(() => { if (!acting && !editing) void follow(id); }, 2000);");
   });
+
+  it("keeps typing in a revised suggestion from marking the task sheet dirty", () => {
+    // The sheet marks itself dirty from any input inside its form, and dirty blocks Accept.
+    expect(source).toContain("<label oninput={(event) => event.stopPropagation()} onchange={(event) => event.stopPropagation()}>Revised {field}<textarea");
+  });
 });
