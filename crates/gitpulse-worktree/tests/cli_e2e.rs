@@ -384,12 +384,11 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
     );
 }
 
-#[test]
-fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
-    // An explicit GITPULSE_DEVMAP_BIN names the build under test (a gate run
-    // against a devmap newer than the installed one); otherwise the installed
-    // binary, as before.
-    let real_devmap = std::env::var_os("GITPULSE_DEVMAP_BIN")
+/// The real `devmap` the zero-copy tests drive. An explicit, existing
+/// GITPULSE_DEVMAP_BIN names the build under test (a gate run against a devmap
+/// newer than the installed one); otherwise the installed binary.
+fn real_devmap_binary() -> PathBuf {
+    std::env::var_os("GITPULSE_DEVMAP_BIN")
         .map(PathBuf::from)
         .filter(|p| p.is_file())
         .or_else(|| {
@@ -406,7 +405,90 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
                     .expect("installed devmap binary")
                     .path,
             )
-        });
+        })
+}
+
+/// The production shape of a zero-copy lane, end to end: the donor is indexed
+/// by a real `devmap build` (the parsing frontend), and the lane is provisioned
+/// and synced by this binary, which links devmap with the parsing frontend off.
+/// Every other stacked test writes its donor generation by hand in the same
+/// build that checks it, so none of them would notice the two builds
+/// disagreeing about whether a donor is fresh (payload identities, content
+/// hashes or the discovery inventory). Before devmap answered that question
+/// without `parse`, `create --zero-copy` refused here outright.
+#[test]
+fn cli_zero_copy_lane_from_a_donor_indexed_by_a_real_devmap_build() {
+    let real_devmap = real_devmap_binary();
+    let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_devmap, devmap_stub_path(home.path())).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(&real_devmap, devmap_stub_path(home.path())).unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("donor");
+    fs::create_dir_all(anchor.join("src")).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    fs::write(anchor.join(".gitignore"), ".devmap/\n.devcouncil/\n").unwrap();
+    fs::write(
+        anchor.join("src/lib.rs"),
+        "pub fn callee() -> u8 { 1 }\npub fn caller() -> u8 { callee() }\n",
+    )
+    .unwrap();
+    fs::write(anchor.join("src/util.py"), "def helper():\n    return 2\n").unwrap();
+    git(&anchor, &["add", "-A"]);
+    git(&anchor, &["commit", "-q", "-m", "donor"]);
+
+    let build = Command::new(&real_devmap)
+        .arg("build")
+        .current_dir(&anchor)
+        .envs(profile_env(home.path()))
+        .output_locked()
+        .expect("spawn devmap build");
+    assert!(
+        build.status.success(),
+        "devmap build failed: {}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    approve_in_isolated_home(&anchor, home.path());
+
+    let lane = workspace.path().join("lane");
+    let created = run_cli_json_ok(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/real-donor",
+            "--target",
+            lane.to_str().unwrap(),
+            "--zero-copy",
+            "--agent",
+            "claude-real",
+        ],
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    assert_eq!(created["zero_copy_devmap"], true, "{created}");
+
+    fs::write(
+        lane.join("src/lib.rs"),
+        "pub fn callee() -> u8 { 1 }\npub fn caller() -> u8 { callee() + 1 }\n",
+    )
+    .unwrap();
+    let overlay = run_cli_json_ok(
+        home.path(),
+        &["compile-overlay", "--worktree", lane.to_str().unwrap()],
+    );
+    assert_eq!(overlay["report"]["modified_files"], 1, "{overlay}");
+}
+
+#[test]
+fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
+    let real_devmap = real_devmap_binary();
 
     let home = tempfile::tempdir().unwrap();
     #[cfg(unix)]
