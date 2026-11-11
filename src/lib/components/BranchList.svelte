@@ -809,10 +809,10 @@
   {#if withGlyph}{@render branchGlyph(branch)}{/if}
   {@render highlightedLabel(leaf, debouncedQuery)}
   {#if branch.is_default}
-    <span class="gp-chip font-mono shrink-0" data-tone="neutral">default</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="neutral">default</span>
   {/if}
   {#if branch.is_gone}
-    <span class="gp-chip font-mono shrink-0" data-tone="danger">gone</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="danger">gone</span>
   {/if}
   <!-- The multi-line rows print the actual commit age and tint it when
        stale, so a separate "stale" chip would say the same thing twice and
@@ -820,7 +820,7 @@
        branch name its width. The one-line row has no age to tint, so it
        keeps the chip. -->
   {#if showStale && isStaleBranch(branch.last_commit_timestamp)}
-    <span class="gp-chip font-mono shrink-0" data-tone="neutral">stale</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="neutral">stale</span>
   {/if}
 {/snippet}
 
@@ -854,10 +854,10 @@
     </span>
   {/if}
   {#if branch.ahead_count > 0}
-    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-tone="ok" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
+    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-size="inline" data-tone="ok" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
   {/if}
   {#if branch.behind_count > 0}
-    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-tone="warn" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
+    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-size="inline" data-tone="warn" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
   {/if}
   {#if branch.commits_ahead_of_base > 0 && !branch.is_current}
     <span

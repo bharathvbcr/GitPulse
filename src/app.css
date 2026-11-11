@@ -885,6 +885,17 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     @apply text-xs;
     padding-inline-end: 2px;
   }
+  /* A tag set inside a line of text (a branch row's `default`, `↑14`) is
+     sized by that line, not by the 20px standalone metric: the row heights
+     the virtual list computes assume a 13px line. Declared after data-kind
+     so a count chip set inline keeps its tabular digits but not its 20px
+     floor. */
+  &[data-size="inline"] {
+    @apply text-micro;
+    min-height: 0;
+    min-width: 0;
+    padding-inline: 4px;
+  }
 
   &[data-tone="neutral"] {
     background-color: var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)));
