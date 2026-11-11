@@ -48,6 +48,8 @@
   import { onMount, untrack } from "svelte";
   import { Archive, ExternalLink } from "@lucide/svelte";
   import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createLiveLoader } from "../workbench/liveLoader";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -242,7 +244,7 @@
 <section id="task-archive-dock" class="archive gp-glass bg-surface" aria-label="Archive" data-testid="task-archive">
   <header>
     <strong><Archive size={13} aria-hidden="true" /> Archive</strong>
-    <div class="gp-seg" role="group" aria-label="Show">
+    <div class="gp-segmented" role="group" aria-label="Show">
       <button type="button" class="gp-seg-btn" data-active={view === "archived"} aria-pressed={view === "archived"} data-testid="task-archive-view-archived" onclick={() => { view = "archived"; }}>Archived</button>
       <button type="button" class="gp-seg-btn" data-active={view === "deleted"} aria-pressed={view === "deleted"} data-testid="task-archive-view-deleted" onclick={() => { view = "deleted"; }}>Deleted</button>
     </div>
@@ -264,7 +266,7 @@
     {#if summary.partial}<span class="more-note">Load more to see the rest.</span>{/if}
     {#if (parsed.terms.length || localWords) && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
     <!-- Deferring the query while the window is in the background is the
-         Inbox's behaviour too, and worth the saved round trips. Leaving the
+         Inbox's behavior too, and worth the saved round trips. Leaving the
          reader to guess why the panel is blank is not. -->
     {#if summary.pending && !visible && !error}<span class="more-note">Paused while this window is in the background.</span>{/if}
   </p>
@@ -285,9 +287,19 @@
   <!-- Gated on a successful read, not on an empty list: "nothing here" is a
        finding, and a dock that has not run its query has not found it. -->
   {#if summary.pending}
-    <p class="empty">{error ? "Couldn't read the archive. Try again with Refresh." : "Reading tasks…"}</p>
+    {#if error}
+      <p class="empty">Couldn't read the archive. Try again with Refresh.</p>
+    {:else}
+      <div class="empty" aria-label="Reading tasks" role="status"><Skeleton count={3} /></div>
+    {/if}
   {:else if rows.length === 0}
-    <p class="empty">{query.trim() ? `No ${view} tasks match this search.` : view === "archived" ? `Nothing here yet. ${ARCHIVE_RULE}` : "No deleted tasks in this scope."}</p>
+    {#if query.trim()}
+      <EmptyState compact icon={Archive} title="No {view} tasks match this search" />
+    {:else if view === "archived"}
+      <EmptyState compact icon={Archive} title="Nothing here yet" hint={ARCHIVE_RULE} />
+    {:else}
+      <EmptyState compact icon={Archive} title="No deleted tasks in this scope" />
+    {/if}
   {:else}
     <!-- A row above the scroller, never a bar floating inside it. Why, and
          what was tried first, is in the component note at the top. -->
@@ -344,7 +356,7 @@
      window so short that the panel's own chrome exceeds the cap: it degrades
      to a scrolling panel rather than clipping the actions off. In normal use
      `.entries` absorbs the shrink and this never engages. */
-  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:12px;color:rgb(var(--c-text))}
+  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:var(--text-xs);color:rgb(var(--c-text))}
   /* Every row but the list keeps its natural height and never shrinks, so
      the whole of an over-tall panel is taken out of the row list and the
      action bar cannot be the part that goes off screen. */

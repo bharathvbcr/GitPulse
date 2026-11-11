@@ -277,7 +277,7 @@
 
 <style>
   .due{position:relative;min-width:0}
-  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:12px;cursor:pointer;min-width:0}
+  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:var(--text-xs);cursor:pointer;min-width:0}
   .due-trigger:hover:not(:disabled){border-color:rgb(var(--c-accent))}
   .due-trigger:disabled{opacity:.5;cursor:not-allowed}
   /* Muted until there is a deadline, so "No due date" reads as the absence it
@@ -286,16 +286,16 @@
   .due-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .due-relative{flex-shrink:0}
 
-  .due-popup{position:fixed;width:min(286px,92vw);padding:10px;font-size:12px;color:rgb(var(--c-text))}
+  .due-popup{position:fixed;width:min(286px,92vw);padding:10px;font-size:var(--text-xs);color:rgb(var(--c-text))}
   .phrase-row{display:flex;align-items:center;gap:6px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);padding:5px 8px;margin-bottom:9px}
-  .phrase{flex:1;min-width:0;border:0;background:none;color:inherit;font:inherit;font-size:12px;outline:none}
+  .phrase{flex:1;min-width:0;border:0;background:none;color:inherit;font:inherit;font-size:var(--text-xs);outline:none}
   .phrase::placeholder{color:rgb(var(--c-text-muted) / 0.7)}
   /* The reading is a button, not a label: seeing what was understood and
      accepting it are the same gesture. */
   .reading{flex-shrink:0;font-size:.625rem;color:rgb(var(--c-accent));white-space:nowrap}
 
   .cal-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px}
-  .cal-title{font-size:12px;font-weight:600}
+  .cal-title{font-size:var(--text-xs);font-weight:600}
   .cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
   .dow{text-align:center;font-size:.625rem;color:rgb(var(--c-text-muted));padding-bottom:3px}
   .day{border:1px solid transparent;background:none;border-radius:8px;padding:6px 0;font:inherit;font-size:.6875rem;color:rgb(var(--c-text));cursor:pointer}

@@ -207,17 +207,17 @@
 {/snippet}
 
 <style>
-  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;width:100%}
+  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);text-align:left;width:100%}
   .row:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
-  .reset{width:100%;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;color:rgb(var(--c-text-muted))}
+  .reset{width:100%;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);text-align:left;color:rgb(var(--c-text-muted))}
   .reset:hover:not(:disabled){color:rgb(var(--c-text));background:rgb(var(--c-surface-hover) / 0.7)}
   .reset:disabled{opacity:.5}
   .row:disabled{opacity:.55;cursor:default}
   /* Lanes and limits made the panel taller than a short window; it scrolls rather than run off it. */
   .view-panel{max-height:min(70vh,36rem);overflow:hidden auto}
-  .note{margin:0;padding:0 6px 4px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted))}
-  .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:11px}
-  .limit input{width:4.5rem;padding:2px 6px;font-size:11px}
+  .note{margin:0;padding:0 6px 4px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted))}
+  .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:var(--text-meta)}
+  .limit input{width:4.5rem;padding:2px 6px;font-size:var(--text-meta)}
   .row:disabled:hover{background:transparent}
 </style>

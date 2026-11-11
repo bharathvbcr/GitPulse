@@ -148,14 +148,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/AttentionInbox.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/AutomaticEnhancements.svelte",
       "rules": [
         1
@@ -254,14 +246,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/ScanProposals.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/SessionAlertSettings.svelte",
       "rules": [
         14
@@ -294,31 +278,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/TaskArchive.svelte",
-      "rules": [
-        1,
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskDuePicker.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskEditor.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/TaskHandoffForm.svelte",
       "rules": [
         1
@@ -336,22 +295,6 @@
     },
     {
       "file": "src/lib/components/TaskMergeDialog.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskSavedViews.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskViewMenu.svelte",
       "rules": [
         1
       ],
@@ -381,30 +324,6 @@
       ],
       "owner": "Wave 5 fixing lane that owns this file",
       "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/WavePanel.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/WorkView.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/WorkspaceEditor.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
       "file": "src/lib/components/onboarding/ProductTour.svelte",

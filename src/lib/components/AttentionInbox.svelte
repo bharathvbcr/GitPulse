@@ -126,7 +126,7 @@
 </section>
 
 <style>
-  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:12px;color:rgb(var(--c-text))}
+  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:var(--text-xs);color:rgb(var(--c-text))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
   /* Lips tuck under the card by its padding only, so the title never sits on another card. */
