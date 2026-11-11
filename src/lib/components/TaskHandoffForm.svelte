@@ -587,7 +587,7 @@
 </div>
 
 <style>
-  .handoff-form{display:flex;flex-direction:column;gap:12px;font-size:12px;min-width:0}
+  .handoff-form{display:flex;flex-direction:column;gap:12px;font-size:0.75rem;min-width:0}
   .pair{display:flex;gap:8px;flex-wrap:wrap}
   .model{border:0;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
   .model .pair > *{flex:1 1 8rem;width:auto}

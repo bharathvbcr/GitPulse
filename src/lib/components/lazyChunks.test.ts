@@ -24,7 +24,21 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-const DEFERRED = ["onboarding/ProductTour", "MergeBranchDialog", "ViewGuideArt"];
+// The tour, the merge dialog and the guide art left the entry chunk to get it
+// under budget. The dialogs after them were already deferred by App.svelte's
+// own loaders and are pinned here so that stays true: none is on screen at
+// first paint, and Settings alone is 134 kB of the app.
+const DEFERRED = [
+  "onboarding/ProductTour",
+  "MergeBranchDialog",
+  "ViewGuideArt",
+  "SettingsModal",
+  "CommandPalette",
+  "ShortcutsModal",
+  "DiagnosticsModal",
+  "onboarding/SetupWizard",
+  "NativeNotificationBridgeView",
+];
 const files = sourceFiles(src).map((path) => ({ path, text: readFileSync(path, "utf8") }));
 
 describe("entry-chunk budget: components kept out of the startup bundle", () => {

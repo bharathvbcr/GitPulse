@@ -62,11 +62,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "agents",
     label: "Agents",
-    summary: "MCP for agents, and installing the devmap / manvi CLIs.",
+    summary: "MCP for agents, and installing the DevMap and Manvi CLIs.",
   },
   {
     id: "hygiene",
-    label: "Repo hygiene",
+    label: "Repository hygiene",
     summary:
       "Defaults every repository inherits, and the scheduled cleaner's own roots, limits and history.",
   },

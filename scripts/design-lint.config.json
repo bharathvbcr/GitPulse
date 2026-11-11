@@ -46,36 +46,12 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/AgentDefaultsSettings.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/AgentInbox.svelte",
       "rules": [
         1
       ],
       "owner": "Wave 5 residue",
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/AgentLimitSetting.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/AgentModelSettings.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
       "file": "src/lib/components/AttentionInbox.svelte",
@@ -104,11 +80,10 @@
     {
       "file": "src/lib/components/CommandPalette.svelte",
       "rules": [
-        1,
-        14
+        1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/ConflictComparison.svelte",
@@ -127,45 +102,20 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/DiagnosticsModal.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/HostLoadSetting.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/LappiSettings.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/NativeNotificationBridge.svelte",
+      "file": "src/lib/components/NativeNotificationBridgeView.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/NativeNotificationSettings.svelte",
       "rules": [
-        1,
-        14
+        1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/RunActivity.svelte",
@@ -192,36 +142,20 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/SessionAlertSettings.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/SessionNotificationBridge.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/SettingsModal.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskActionDialog.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskAgentPanel.svelte",
@@ -268,16 +202,16 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskHandoffSheet.svelte",
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskManviAssist.svelte",
@@ -292,8 +226,8 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/TaskOrganizePanel.svelte",
@@ -388,16 +322,8 @@
       "rules": [
         1
       ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/onboarding/SetupWizard.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
+      "owner": "Wave 5 residue",
+      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
       "file": "src/lib/components/pulse/PulseCodeAge.svelte",
@@ -454,30 +380,6 @@
       ],
       "owner": "Wave 5 fixing lane that owns this file",
       "reason": "Found when design-lint widened its scope (lane L2): rule 3 palette colours. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/palette/catalog.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/ui/settingsCatalog.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/ui/settingsSections.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     }
   ]
 }

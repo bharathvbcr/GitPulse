@@ -182,7 +182,7 @@
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
         "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
         "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
-        "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
+        "cmd_catch_up", "cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",
@@ -382,6 +382,16 @@
               $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
               await sleepUntil(() => !!$('[role="dialog"]'), 3000);
             }
+            // `settings` opens Settings (`settings-layout` on its Layout panel);
+            // `icons` sets Header button labels to Icons only first.
+            if (words.includes("icons")) interfaceStore.setHeaderLabels("icons");
+            if (words.some((w) => w.startsWith("settings"))) {
+              window.dispatchEvent(new CustomEvent("gitpulse:settings"));
+              await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
+              // `settings-<panel>` (layout, views, agents, ...) opens that panel.
+              const panelWord = words.find((w) => w.startsWith("settings-"))?.slice(9);
+              if (panelWord) $$('[role="tab"]').find((t) => text(t).toLowerCase() === panelWord)?.click();
+            }
             for (const surface of ["fleet", "agents", "tasks"]) {
               if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
             }
@@ -576,6 +586,67 @@
           }).map((el) => text(el).slice(0, 48));
           check(`the shortcuts sheet draws every description in full at ${window.innerWidth}px${clippedDescriptions.length ? ` (clipped: ${clippedDescriptions.join(" | ")})` : ""}`, () =>
             window.innerWidth >= 1280 && descriptions.length > 20 && clippedDescriptions.length === 0);
+          // A dialog body is a scroller with a hard clip. Scrolled to its end, the
+          // last row has to be whole, and while more is hidden below, the body
+          // fades its own edge (data-gp-fade) instead of slicing a row in half.
+          const scrollEnd = async (dialog) => {
+            const body = dialog && $("[data-dialog-body]", dialog);
+            if (!body) return { found: false };
+            body.scrollTop = 0; await settle();
+            const fadeAtTop = body.dataset.gpFade ?? "";
+            body.scrollTop = body.scrollHeight; await settle(); await wait(120);
+            const box = body.getBoundingClientRect();
+            const rows = [...body.querySelectorAll("*")].filter((el) => el.getClientRects().length && el.children.length === 0 && !el.closest("[hidden]"));
+            const last = rows.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
+            const lastBox = last?.getBoundingClientRect();
+            return {
+              found: true, overflows: body.scrollHeight > body.clientHeight + 1, fadeAtTop, fadeAtEnd: body.dataset.gpFade ?? "",
+              atEnd: Math.abs(body.scrollTop + body.clientHeight - body.scrollHeight) <= 1,
+              lastInside: !!lastBox && lastBox.bottom <= box.bottom + 0.5 && lastBox.top >= box.top - 0.5,
+              last: text(last).slice(0, 40),
+            };
+          };
+          const shortcutsEnd = await scrollEnd($('[role="dialog"][aria-label="Keyboard Shortcuts"]'));
+          check(`the shortcuts sheet scrolls to a whole last row, and fades the edge that still hides rows (${JSON.stringify(shortcutsEnd)})`, () =>
+            shortcutsEnd.found && shortcutsEnd.overflows && shortcutsEnd.atEnd && shortcutsEnd.lastInside
+            && shortcutsEnd.fadeAtTop === "y-end" && !shortcutsEnd.fadeAtEnd.includes("end"));
+          $$("button").find((b) => text(b) === "Done")?.click();
+          await sleepUntil(() => !$('[role="dialog"]'), 3000);
+
+          // Settings is a lazy chunk with its own scroller. Its panels differ in
+          // length, so the check runs on the longest one it can reach here.
+          window.dispatchEvent(new CustomEvent("gitpulse:settings"));
+          await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
+          await wait(300);
+          const settingsEnds = [];
+          for (const tab of ["Appearance", "Layout", "Commit graph"]) {
+            $$('[role="tab"]').find((t) => text(t) === tab)?.click();
+            await settle();
+            settingsEnds.push({ tab, ...(await scrollEnd($('[role="dialog"][aria-labelledby="settings-modal-title"]'))) });
+          }
+          check(`Settings scrolls each panel to a whole last control, with no mask once nothing is hidden below (${JSON.stringify(settingsEnds)})`, () =>
+            settingsEnds.every((end) => end.found && (!end.overflows || (end.atEnd && end.lastInside && !end.fadeAtEnd.includes("end"))))
+            && settingsEnds.some((end) => end.overflows && end.fadeAtTop === "y-end"));
+
+          // Header button labels: Icons only holds the narrow rendering at every
+          // width. This window is wider than the 1100 px tier, so Automatic shows
+          // the Open label and Icons only hides it, along with every other label
+          // the header tiers.
+          const headerLabels = () => $$('.gp-repo-tabs [class*="@min-[1100px]:inline"]').filter((el) => text(el));
+          const shown = (els) => els.filter((el) => getComputedStyle(el).display !== "none").length;
+          const openLabel = () => $('[data-testid="open-repo-tab"] span');
+          check("header labels: Automatic shows the Open label at this width", () => window.innerWidth >= 1280 && text(openLabel()) === "Open" && getComputedStyle(openLabel()).display !== "none" && shown(headerLabels()) > 0);
+          const settingsTab = () => $$('[role="tab"]').find((t) => text(t) === "Layout");
+          settingsTab()?.click(); await settle();
+          $('[data-setting="header-labels"] button[title^="Keep header buttons"]')?.click();
+          await settle();
+          check("header labels: Icons only hides every header label and stamps the document", () =>
+            document.documentElement.getAttribute("data-header-labels") === "icons" && getComputedStyle(openLabel()).display === "none" && headerLabels().length > 0 && shown(headerLabels()) === 0);
+          check("header labels: the buttons keep their accessible names without the words", () => $('[data-testid="open-repo-tab"]')?.getAttribute("aria-label") === "Open repository");
+          $('[data-setting="header-labels"] button[title^="Show words"]')?.click();
+          await settle();
+          check("header labels: Automatic gives the words back", () =>
+            !document.documentElement.hasAttribute("data-header-labels") && getComputedStyle(openLabel()).display !== "none" && shown(headerLabels()) > 0);
           $$("button").find((b) => text(b) === "Done")?.click();
           await sleepUntil(() => !$('[role="dialog"]'), 3000);
 

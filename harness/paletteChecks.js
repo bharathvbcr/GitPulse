@@ -49,9 +49,11 @@ mount(PromptModal, { target: promptRoot });
 const settle = async () => { await tick(); await new Promise(resolve => setTimeout(resolve, 30)); await tick(); };
 const waitFor = async predicate => { for (let i=0;i<150;i++) { if(predicate()) return; await settle(); } throw Error("Timed out waiting for palette state"); };
 const input = () => root.querySelector("input");
+// The exit is a <=70 ms transition, so "closed" is a condition to wait on, bounded by waitFor.
+const closed = () => waitFor(() => !input()).catch(() => undefined);
 const check = (name, pass) => results.push({ name, pass: Boolean(pass) });
 const type = async value => { input().value = value; input().dispatchEvent(new Event("input", { bubbles: true })); await settle(); };
-const open = async () => { opener.focus(); opener.click(); await settle(); };
+const open = async () => { await new Promise(resolve => setTimeout(resolve, 90)); /* a palette closed just before is still on its <=70 ms exit */ opener.focus(); opener.click(); await settle(); };
 const key = async (value, opts = {}) => { (document.activeElement ?? window).dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true, cancelable: true, ...opts })); await settle(); };
 const option = text => [...root.querySelectorAll("[role=option]")].find(el => el.textContent.includes(text));
 window.addEventListener("error", e => crashes.push(e.message));
@@ -73,9 +75,9 @@ if (params.has("check")) {
   failWorkspace = false; await type("::working"); await waitFor(() => option("workspaceResult")); option("workspaceResult").click(); await settle();
   check("workspace hit opens the registered repository", get(repoStore).currentPath === "/fixture/other");
   check("workspace hit selects its file", get(repoStore).selectedFilePath === "src/workspaceResult.ts" && get(repoStore).viewSections.code === "explorer");
-  await open(); await key("Escape"); check("Escape restores the opener's focus", document.activeElement === opener && !input());
+  await open(); await key("Escape"); await closed(); check("Escape restores the opener's focus", document.activeElement === opener && !input());
   await key("k", { metaKey: true }); check("keyboard shortcut opens after first mount", Boolean(input()));
-  await key("k", { metaKey: true }); check("keyboard shortcut toggles closed exactly once", !input());
+  await key("k", { metaKey: true }); await closed(); check("keyboard shortcut toggles closed exactly once", !input());
   await open(); await type("Open Settings"); await key("Enter", { isComposing: true });
   check("IME Enter cannot execute a command", Boolean(input()));
   await type("@"); check("current branch is visibly unavailable", option("main")?.getAttribute("aria-disabled") === "true");
@@ -93,7 +95,7 @@ if (params.has("check")) {
   await type("/file-124.ts"); check("filtering searches the entire file inventory", Boolean(option("file-124.ts")) && root.textContent.includes("1–1 of 1 results"));
   check("file typing reuses the current inventory", calls.filter(c => c.cmd === "cmd_list_repo_files").length === 1);
   await type("/no-such-file"); check("empty results never reference a missing active descendant", !input().hasAttribute("aria-activedescendant") && root.textContent.includes("No matching results"));
-  await type("/file-124.ts"); await key("Enter"); check("file results open Explorer with the right path", !input() && get(repoStore).selectedFilePath === "src/file-124.ts");
+  await type("/file-124.ts"); await key("Enter"); await closed(); check("file results open Explorer with the right path", !input() && get(repoStore).selectedFilePath === "src/file-124.ts");
   await open(); await type(":closing"); await key("Escape"); await new Promise(resolve => setTimeout(resolve, 250));
   check("closing cancels a queued search", !pending.has("closing"));
   await open(); await type(":switch-mode"); await waitFor(() => pending.has("switch-mode")); await type("Open Settings");

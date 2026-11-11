@@ -228,9 +228,16 @@ export async function runHealthChecks(ctx) {
 
     // ---- Scan lifecycle: one scan per visit, cache, no foreign data -------------
     const visits = scanCalls("/fixture/Visit");
+    const secretVisits = secretsScans("/fixture/Visit");
     await switchTo("/fixture/Visit");
     await wait(400);
     check("opening a repository scans it exactly once", () => scanCalls("/fixture/Visit") === visits + 1, () => scanCalls("/fixture/Visit") - visits);
+    // The palette's "Scan dependencies and secrets" replaced two commands by
+    // opening this panel (palette/catalog.test.ts pins that it does), so opening
+    // the panel has to be what starts BOTH scans.
+    check("opening Health starts the secrets scan together with the dependency scan, once each", () =>
+      secretsScans("/fixture/Visit") === secretVisits + 1 && scanCalls("/fixture/Visit") === visits + 1,
+      () => `secrets ${secretsScans("/fixture/Visit") - secretVisits}, dependencies ${scanCalls("/fixture/Visit") - visits}`);
     knobs.scanDelay = 700;
     await switchTo("/fixture/Other");
     await switchTo(REPO);

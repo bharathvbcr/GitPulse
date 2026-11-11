@@ -100,8 +100,12 @@ describe("Claude settings files", () => {
     expect(sources).toContain("delete rest.claude_setting_sources");
     expect(sources).toContain("canonical === undefined ? rest");
     expect(sources).toContain("const rest = { ...view.defaults };");
-    // Unchecking the last source is refused here, not sent to be refused.
-    expect(sources).toMatch(/canonical === null\) \{[\s\S]*?input\.checked = true;[\s\S]*?return;/);
+    // Unchecking the last source is refused here, not sent to be refused. The
+    // boxes are `Checkbox`, which is controlled: a refusal that returns without
+    // saving leaves the box ticked, with no element to put back by hand.
+    expect(sources).toContain("<Checkbox");
+    expect(sources).not.toContain('type="checkbox"');
+    expect(sources).toMatch(/canonical === null\) \{[\s\S]*?error = "Claude Code needs at least one settings source\.";[\s\S]*?return;/);
   });
 });
 

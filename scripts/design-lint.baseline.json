@@ -1,21 +1,21 @@
 {
   "schema": 1,
-  "commit": "e7bfd4b4c4c74ca4e0b371e72221d96426f95655",
+  "commit": "2977852bcbb29c67826df760fee0cc486b12782a",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 214,
+      "total": 201,
       "files": {
         "src/lib/components/AgentDecisions.svelte": 1,
         "src/lib/components/AgentInbox.svelte": 16,
         "src/lib/components/AttentionInbox.svelte": 1,
         "src/lib/components/AutomaticEnhancements.svelte": 1,
         "src/lib/components/CodeGraphCanvas.svelte": 2,
-        "src/lib/components/CommandPalette.svelte": 17,
+        "src/lib/components/CommandPalette.svelte": 4,
         "src/lib/components/ConflictComparison.svelte": 4,
         "src/lib/components/ConflictEditor.svelte": 32,
-        "src/lib/components/NativeNotificationBridge.svelte": 2,
+        "src/lib/components/NativeNotificationBridgeView.svelte": 2,
         "src/lib/components/NativeNotificationSettings.svelte": 1,
         "src/lib/components/RunActivity.svelte": 5,
         "src/lib/components/ScanProposals.svelte": 5,
@@ -118,22 +118,11 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 26,
+      "total": 9,
       "files": {
         "src/lib/components/BrowserSession.svelte": 2,
-        "src/lib/components/CommandPalette.svelte": 1,
-        "src/lib/components/DiagnosticsModal.svelte": 2,
         "src/lib/components/FirebasePanel.svelte": 4,
-        "src/lib/components/HostLoadSetting.svelte": 1,
-        "src/lib/components/LappiSettings.svelte": 1,
-        "src/lib/components/NativeNotificationSettings.svelte": 2,
-        "src/lib/components/SessionAlertSettings.svelte": 2,
-        "src/lib/components/SettingsModal.svelte": 1,
-        "src/lib/components/onboarding/SetupWizard.svelte": 1,
-        "src/lib/palette/catalog.ts": 2,
         "src/lib/secrets/agentPrompt.ts": 1,
-        "src/lib/ui/settingsCatalog.ts": 2,
-        "src/lib/ui/settingsSections.ts": 2,
         "src/lib/workbench/taskCompose.ts": 2
       }
     },
@@ -149,12 +138,8 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 4,
-      "files": {
-        "src/lib/components/AgentDefaultsSettings.svelte": 1,
-        "src/lib/components/AgentLimitSetting.svelte": 1,
-        "src/lib/components/AgentModelSettings.svelte": 2
-      }
+      "total": 0,
+      "files": {}
     },
     "18": {
       "name": "unused-gp-class",

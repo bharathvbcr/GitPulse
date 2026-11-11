@@ -61,7 +61,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "dock accessory menu bar hide closed window", requires: "dockHiding" },
   { id: "status-icon-counts", section: "layout", label: "Show counts beside the icon",
     keywords: "tray title counts conflicts changed menu bar" },
-  { id: "launch-at-login", section: "layout", label: "Launch at login",
+  { id: "launch-at-login", section: "layout", label: "Open at login",
     keywords: "autostart launch agent login item startup background" },
   {
     id: "session-alerts",
@@ -253,6 +253,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "errors warnings header toolbar log troubleshoot",
   },
   {
+    id: "header-labels",
+    section: "layout",
+    label: "Header button labels",
+    keywords: "open clone title bar words icons text only automatic width narrow compact labels",
+  },
+  {
     id: "repo-tabs",
     section: "layout",
     label: "Hide repository tabs when alone",
@@ -286,7 +292,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "harness-badges",
     section: "layout",
     label: "Manvi status badges",
-    keywords: "manvi harness local model chips toolbar agents",
+    keywords: "manvi checks harness local model chips toolbar agents",
   },
   {
     id: "view-visibility",
@@ -384,8 +390,8 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   {
     id: "external-tools",
     section: "agents",
-    label: "devmap and manvi",
-    keywords: "devmap manvi install update cargo go harness code map cli binary toolchain",
+    label: "DevMap and Manvi",
+    keywords: "devmap manvi install update cargo go checks harness code map cli binary toolchain",
   },
   {
     id: "update-check",

@@ -17,6 +17,7 @@
   import { Merge, X } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
@@ -62,7 +63,7 @@
 <div use:portal class="merge-backdrop gp-scrim bg-black/50" role="presentation" style="z-index:{LAYERS.PROMPT}" in:fade={backdropFade()} out:fade={backdropFadeOut()}>
   <div class="merge-dialog gp-card gp-glass shadow-float" in:scale={cardScale()} out:scale={cardScaleOut()} role="dialog" aria-modal="true" aria-label="Merge tasks" tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}} data-testid="task-merge-dialog">
     <header><h2>Merge {cards.length} tasks</h2><button type="button" class="gp-icon-btn" data-size="md" aria-label="Close merge" disabled={busy} onclick={close}><X size={16} /></button></header>
-    <div class="body">
+    <div class="body" data-dialog-body use:scrollEdgeFade>
       {#if result === null}
         <p>The task you keep gets a section with each other task's description, their acceptance criteria, labels, checklist and links, and the most urgent priority, severity and due date. The others are deleted; they stay in history and can be restored from the archive's Deleted view.</p>
         <fieldset>
@@ -100,7 +101,7 @@
   .merge-dialog{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
   header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}
   h2{font-size:0.9375rem;font-weight:600;margin:0}
-  .body{padding:0 20px;overflow:auto;font-size:12px}
+  .body{padding:0 20px;overflow:auto;scroll-padding-block:2rem;font-size:0.75rem}
   p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}
   fieldset{border:0;padding:0;margin:0 0 12px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
   legend{font-weight:600;margin-bottom:6px}

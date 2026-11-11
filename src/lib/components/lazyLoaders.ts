@@ -10,6 +10,7 @@ import type { MountLoader } from "./LazyMount.svelte";
  */
 export const loadProductTour: MountLoader = () => import("./onboarding/ProductTour.svelte");
 export const loadMergeBranchDialog: MountLoader = () => import("./MergeBranchDialog.svelte");
+export const loadNativeNotificationBridge: MountLoader = () => import("./NativeNotificationBridgeView.svelte");
 export const loadViewGuideArt: MountLoader = () => import("./ViewGuideArt.svelte");
 
 /**

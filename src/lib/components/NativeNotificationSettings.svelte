@@ -1,5 +1,6 @@
 <script lang="ts">
   import { formatClockMinutes, parseClockMinutes } from "../format";
+  import Checkbox from "./Checkbox.svelte";
   import { onMount } from "svelte";
   import { isTauri } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
@@ -85,21 +86,21 @@
   {#if native && supported}<p>{systemSettingsName($hostPlatform.os)} permission: {native.authorization.replaceAll("_", " ")}{native.error ? ` · ${native.error}` : ""}</p>{/if}
   {#if draft && supported}
     <fieldset disabled={busy || !!pending}>
-      <label><input type="checkbox" bind:checked={draft.enabled} /> Enable desktop notifications</label>
-      <label><input type="checkbox" bind:checked={draft.sound} /> Play a sound</label>
-      <label><input type="checkbox" bind:checked={draft.background} /> Notify while GitPulse is hidden or minimized</label>
-      <label><input type="checkbox" bind:checked={quiet} /> Quiet hours in this computer’s local time</label>
+      <Checkbox label="Enable desktop notifications" checked={draft.enabled} onchange={(next) => { if (draft) draft.enabled = next; }} />
+      <Checkbox label="Play a sound" checked={draft.sound} onchange={(next) => { if (draft) draft.sound = next; }} />
+      <Checkbox label="Notify while GitPulse is hidden or minimized" checked={draft.background} onchange={(next) => { if (draft) draft.background = next; }} />
+      <Checkbox label="Quiet hours in this computer’s local time" checked={quiet} onchange={(next) => (quiet = next)} />
       {#if quiet}<div class="times"><label>From <input class="gp-field" type="time" bind:value={start} /></label><label>Until <input class="gp-field" type="time" bind:value={end} /></label></div>{/if}
-      {#if taskID || scope.kind !== "global"}<label><input type="checkbox" checked={muted} onchange={toggleMute} /> Mute this {taskID ? "task" : scope.kind}</label>{/if}
+      {#if taskID || scope.kind !== "global"}<Checkbox label={`Mute this ${taskID ? "task" : scope.kind}`} checked={muted} onchange={toggleMute} />{/if}
       {#if draft && muteCount > 0}<div><p>{muteCount} saved scope mutes, including any deleted tasks or workspaces.</p><button class="gp-btn" type="button" onclick={() => { if (draft) draft = { ...draft, muted_workspace_ids: [], muted_repository_ids: [], muted_task_ids: [] }; }}>Clear saved scope mutes</button></div>{/if}
     </fieldset>
     <p>New activity only when enabled. Generic previews keep task content private. Submitted means {osDisplayName($hostPlatform.os)} accepted the request; Focus and system settings can suppress display.</p>
-    <button class="gp-btn" onclick={save} disabled={busy}>{pending ? "Retry saved settings" : "Save notification settings"}</button>
+    <button class="gp-btn" onclick={save} disabled={busy}>{pending ? "Try saving again" : "Save notification settings"}</button>
   {/if}
-  <button class="gp-btn" onclick={refresh} disabled={busy || !!pending}>Recheck settings</button>
+  <button class="gp-btn" onclick={refresh} disabled={busy || !!pending}>Refresh settings</button>
   {#if error}<p role="alert">{error}</p>{/if}
 </details>
 
 <style>
-  .native-settings{margin:12px 0;padding:10px;border:1px solid rgb(var(--c-border));border-radius:8px;font-size:12px}summary{cursor:pointer}fieldset{border:0;padding:12px 0;display:grid;gap:9px}label{display:flex;align-items:center;gap:7px}.times{display:flex;gap:12px}p{color:rgb(var(--c-text-muted));line-height:1.5}button,input[type=time]{font:inherit;color:rgb(var(--c-text));background:var(--mac-fill-surface,rgb(var(--c-surface)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}button{margin-right:8px;cursor:pointer}button:disabled{opacity:.5}input{accent-color:rgb(var(--c-accent))}[role=alert]{color:rgb(var(--c-danger))}
+  .native-settings{margin:12px 0;padding:10px;border:1px solid rgb(var(--c-border));border-radius:8px;font-size:0.75rem}summary{cursor:pointer}fieldset{border:0;padding:12px 0;display:grid;gap:9px}label{display:flex;align-items:center;gap:7px}.times{display:flex;gap:12px}p{color:rgb(var(--c-text-muted));line-height:1.5}button,input[type=time]{font:inherit;color:rgb(var(--c-text));background:var(--mac-fill-surface,rgb(var(--c-surface)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}button{margin-right:8px;cursor:pointer}button:disabled{opacity:.5}input{accent-color:rgb(var(--c-accent))}[role=alert]{color:rgb(var(--c-danger))}
 </style>

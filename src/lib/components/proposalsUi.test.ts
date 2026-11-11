@@ -119,7 +119,7 @@ describe("glass that floats over content is blurred", () => {
   // flow of the page sits on the shell's smooth field, where that is the design;
   // one that overlays other content needs the float tier or it is see-through.
   // Every user is listed: a new one must be placed in one of the two groups.
-  const FLOAT_TIER = ["TaskMergeDialog.svelte", "QuickEnhanceSheet.svelte", "TaskHandoffSheet.svelte", "TaskActionDialog.svelte", "NativeNotificationBridge.svelte"];
+  const FLOAT_TIER = ["TaskMergeDialog.svelte", "QuickEnhanceSheet.svelte", "TaskHandoffSheet.svelte", "TaskActionDialog.svelte", "NativeNotificationBridgeView.svelte"];
   const IN_FLOW = [
     "App.svelte", "StatusPopover.svelte", "TaskBoard.svelte", "StatusBar.svelte", "AttentionInbox.svelte", "RepoTabBar.svelte", "ViewBar.svelte",
     "TaskEditor.svelte", "TaskArchive.svelte", "Sidebar.svelte", "WorkspaceEditor.svelte",

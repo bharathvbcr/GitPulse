@@ -10,6 +10,8 @@
     cardScaleOut,
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
+  import Checkbox from "./Checkbox.svelte";
   import { LAYERS } from "../ui/layers";
   import {
     Settings,
@@ -62,6 +64,7 @@
   import type { RefScope } from "../graph/refScope";
   import type { StatusBarMode } from "../ui/statusBarMode";
   import type { DiagnosticsButtonMode } from "../ui/diagnosticsButton";
+  import type { HeaderLabelMode } from "../ui/headerLabels";
   import type { CodePercentageMode } from "../language/barStats";
   import {
     TAB_WIDTHS,
@@ -393,6 +396,15 @@
     { value: "hidden", label: "Hidden", title: "No status bar unless something needs attention" },
   ];
 
+  const HEADER_LABEL_OPTIONS: readonly {
+    value: HeaderLabelMode;
+    label: string;
+    title: string;
+  }[] = [
+    { value: "auto", label: "Automatic", title: "Show words on header buttons when the window is wide enough" },
+    { value: "icons", label: "Icons only", title: "Keep header buttons to their icons at every width" },
+  ];
+
   const DIAGNOSTICS_OPTIONS: readonly {
     value: DiagnosticsButtonMode;
     label: string;
@@ -546,7 +558,7 @@
           {/if}
         </div>
 
-        <div class="min-h-0 flex-1 overflow-y-auto min-w-0 p-4">
+        <div class="min-h-0 flex-1 overflow-y-auto min-w-0 p-4 scroll-py-8" data-dialog-body use:scrollEdgeFade>
           {#if noMatches}
             <p class="text-textMuted text-meta" role="status">
               Nothing on this page matches <span class="text-textPrimary">“{query}”</span>.
@@ -607,9 +619,9 @@
                     </div>
                     <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
                       <SettingToggle
-                        label="Launch at login"
+                        label="Open at login"
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
-                        ariaLabel="Launch GitPulse at login"
+                        ariaLabel="Open GitPulse at login"
                         checked={launchAtLogin.state === "on"}
                         disabled={launchRow.disabled}
                         onchange={(next) => void setLaunchAtLogin(next)}
@@ -647,6 +659,20 @@
                       value={$interfaceStore.diagnosticsButton}
                       onselect={(mode) => interfaceStore.setDiagnosticsButton(mode)}
                     />
+                  </div>
+
+                  <div data-setting="header-labels" hidden={!shown("header-labels")}>
+                    <div class="text-textMuted text-micro mb-1.5">Header button labels</div>
+                    <SettingSegment
+                      ariaLabel="Header button labels"
+                      options={HEADER_LABEL_OPTIONS}
+                      value={$interfaceStore.headerLabels}
+                      onselect={(mode) => interfaceStore.setHeaderLabels(mode)}
+                    />
+                    <p class="text-meta text-faint mt-1.5">
+                      Automatic shows words on the header's buttons from 1100 px of window width
+                      and icons below it.
+                    </p>
                   </div>
 
                   <div class="gp-separator" aria-hidden="true"></div>
@@ -738,22 +764,12 @@
                   <div class="grid grid-cols-2 gap-x-3 gap-y-0.5">
                     {#each VIEW_NAV as item (item.id)}
                       {@const shown = !hiddenViews.includes(item.id)}
-                      <label
-                        class="flex items-center gap-2 rounded-lg px-1.5 py-1 text-meta text-textPrimary hover:bg-surfaceHover/60 cursor-pointer"
-                      >
-                        <input
-                          type="checkbox"
-                          class="accent-accent"
-                          checked={shown}
-                          aria-label="Show {item.label} in the header"
-                          onchange={(e) =>
-                            interfaceStore.setViewHidden(
-                              item.id,
-                              !e.currentTarget.checked,
-                            )}
-                        />
-                        <span class="truncate">{item.label}</span>
-                      </label>
+                      <Checkbox
+                        label={item.label}
+                        ariaLabel="Show {item.label} in the header"
+                        checked={shown}
+                        onchange={(picked) => interfaceStore.setViewHidden(item.id, !picked)}
+                      />
                     {/each}
                   </div>
 

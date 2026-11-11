@@ -77,6 +77,6 @@
   />
   {#if error}
     <p class="text-warn">{error}</p>
-    <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
+    <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Try again</button>
   {/if}
 </div>

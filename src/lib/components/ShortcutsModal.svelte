@@ -4,6 +4,7 @@
   import { fade, scale } from "svelte/transition";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
   import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff, SquareTerminal } from "@lucide/svelte";
   import { terminalGuideShortcuts } from "../terminal/shortcutGuide";
@@ -237,7 +238,7 @@
       </div>
 
       <!-- Content -->
-      <div class="p-5 overflow-y-auto max-h-[60vh] space-y-6">
+      <div class="p-5 overflow-y-auto max-h-[60vh] space-y-6 scroll-py-8" data-dialog-body use:scrollEdgeFade>
         {#each filteredCategories as category (category.title)}
           {@const CatIcon = category.icon}
           <div>
