@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED, TERMINAL_SESSION_PENDING } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
+import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());

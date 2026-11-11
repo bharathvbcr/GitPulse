@@ -2,14 +2,12 @@ import { writable } from "svelte/store";
 import { isSessionId, type LauncherKind, type SessionKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
+import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
 /** The one text a canceled terminal start carries, so a caller that passes it on and a test that checks it cannot drift. */
 export const TERMINAL_SESSION_CANCELED = "Terminal session canceled";
-
-/** Refused while another terminal session is still waiting for the panel to claim it; exported so a test compares against the constant, not a copy. */
-export const TERMINAL_SESSION_PENDING = "Another terminal session is already starting";
 
 export const PROMPT_LAUNCHERS: readonly PromptLauncher[] = ["claude", "codex", "grok", "agy"];
 

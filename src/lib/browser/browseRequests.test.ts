@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { BROWSE_TERMINAL_STARTING, MAX_QUEUED_BROWSE, createBrowseQueue, parseBrowseRequest, type BrowseDeps } from "./browseRequests";
+import { MAX_QUEUED_BROWSE, createBrowseQueue, parseBrowseRequest, type BrowseDeps } from "./browseRequests";
+import { TERMINAL_SESSION_PENDING } from "../terminal/sessionMessages";
 import { isLoopbackUrl } from "./browserSession";
 import { createTerminalLaunchRequests } from "../terminal/launchRequests";
 import { browserTabFor, initialState, openBrowserTab, setTabUrl } from "../terminal/tabs";
@@ -74,7 +75,7 @@ describe("agents' browser session requests", () => {
     const queue = createBrowseQueue(fake.deps);
     queue.push({ repo: "/a", url: "http://localhost:1/" });
     await queue.settled();
-    expect(fake.failures[0]).toContain(BROWSE_TERMINAL_STARTING);
+    expect(fake.failures[0]).toContain(TERMINAL_SESSION_PENDING);
   });
 
   it("holds at most a bounded number of requests, and says so past it", async () => {
