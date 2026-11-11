@@ -464,7 +464,7 @@
               <p class="mt-1 truncate font-mono text-meta text-textMuted">
                 {remote.fetch_url ?? "no fetch URL"}
                 {#if remoteHost(remote.fetch_url)}
-                  <span class="text-textMuted/70"> · {remoteHost(remote.fetch_url)}</span>
+                  <span class="text-faint"> · {remoteHost(remote.fetch_url)}</span>
                 {/if}
               </p>
               {#if hasSplitUrls(remote)}

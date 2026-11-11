@@ -411,7 +411,7 @@
 
         <div class="space-y-1">
           {#if dirtyCount === 0}
-            <div class="flex items-center gap-1.5 text-textMuted/70" title="No uncommitted changes">
+            <div class="flex items-center gap-1.5 text-faint" title="No uncommitted changes">
               <CheckCircle2 size={12} class="text-ok/80 shrink-0" />
               <span>Working tree clean</span>
             </div>
@@ -574,7 +574,7 @@
         </div>
         {#if !sections.staged}
           {#if filteredStaged.length === 0}
-            <div class="text-meta text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-faint px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "No staged changes"}
             </div>
           {:else}
@@ -590,7 +590,7 @@
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-micro">{parts.dir}</span>
+                      <span class="text-faint text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
@@ -656,7 +656,7 @@
         </div>
         {#if !sections.unstaged}
           {#if filteredUnstaged.length === 0}
-            <div class="text-meta text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-faint px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "Working tree clean"}
             </div>
           {:else}
@@ -672,7 +672,7 @@
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-micro">{parts.dir}</span>
+                      <span class="text-faint text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>

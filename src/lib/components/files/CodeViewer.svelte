@@ -480,12 +480,12 @@
       <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
     <div class="flex items-center gap-2 shrink-0">
       <span class="text-meta font-mono text-textMuted">{rawLines.length}{linesTruncated ? "+" : ""} lines</span>
-      <span class="text-textMuted/40">•</span>
+      <span class="text-faint">•</span>
       <span class="text-meta font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
-      <span class="text-textMuted/40">•</span>
+      <span class="text-faint">•</span>
       <span class="text-micro font-mono uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">{language}</span>
       {#if eolLabel}
-        <span class="text-textMuted/40">•</span>
+        <span class="text-faint">•</span>
         <span
           class="text-meta font-mono {eol === 'mixed' ? 'text-warn font-semibold' : 'text-textMuted'}"
           title={eol === "mixed" ? editBlockedReason : `Line endings: ${eolLabel}, kept on save`}
@@ -776,7 +776,7 @@
                 <button
                   type="button"
                   onclick={(e) => handleLineClick(lineNum, e)}
-                  class="w-12 shrink-0 self-stretch text-right pr-3 pl-1 select-none text-meta font-mono text-textMuted/60 hover:text-textPrimary transition-colors cursor-pointer"
+                  class="w-12 shrink-0 self-stretch text-right pr-3 pl-1 select-none text-meta font-mono text-faint hover:text-textPrimary transition-colors cursor-pointer"
                 >
                   {lineNum}
                 </button>

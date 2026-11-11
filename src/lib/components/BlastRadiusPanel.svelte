@@ -133,7 +133,7 @@
                       <span class="min-w-0 truncate" title={label.path ?? node}>
                         <span class="font-mono text-textSecondary">{label.symbol}</span>
                         {#if label.file}
-                          <span class="text-textMuted/70">{label.file}</span>
+                          <span class="text-faint">{label.file}</span>
                         {/if}
                       </span>
                     {/each}

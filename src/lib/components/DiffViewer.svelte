@@ -2078,7 +2078,7 @@
           {#if currentHunk}
             <span class="shrink-0 font-mono opacity-70">{currentHunk.header}</span>
             {#if currentHunkSymbol}
-              <span class="min-w-0 truncate font-mono text-accent/80">{currentHunkSymbol}</span>
+              <span class="min-w-0 truncate font-mono text-accent">{currentHunkSymbol}</span>
             {:else if currentHunk.heading}
               <span class="min-w-0 truncate font-mono opacity-60">{currentHunk.heading}</span>
             {/if}

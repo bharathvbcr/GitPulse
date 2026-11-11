@@ -1081,7 +1081,7 @@
       <ChevronDown size={12} class="shrink-0" />
     {/if}
     {@render highlightedLabel(row.folder.label, debouncedQuery)}
-    <span class="text-textMuted/70 font-normal text-micro">({countFolder(row.folder)})</span>
+    <span class="text-faint font-normal text-micro">({countFolder(row.folder)})</span>
   </button>
 {/snippet}
 
@@ -1109,7 +1109,7 @@
       <GitBranch size={11} class="shrink-0" />
     {/if}
     <span class="truncate">{row.section.label}</span>
-    <span class="font-normal text-textMuted/70">({row.section.branchCount})</span>
+    <span class="font-normal text-faint">({row.section.branchCount})</span>
   </button>
 {/snippet}
 

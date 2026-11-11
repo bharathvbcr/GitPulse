@@ -244,7 +244,7 @@
   <button
     type="button"
     onclick={handleCopySha}
-    class="font-mono text-accent/80 hover:text-accent shrink-0 tracking-tight flex items-center gap-1 group/sha {isCompact ? 'text-micro w-16' : 'text-meta w-20'}"
+    class="font-mono text-accent hover:text-accent shrink-0 tracking-tight flex items-center gap-1 group/sha {isCompact ? 'text-micro w-16' : 'text-meta w-20'}"
     title="Click to copy full SHA ({row.id})"
     aria-label="Copy full SHA {row.id}"
   >

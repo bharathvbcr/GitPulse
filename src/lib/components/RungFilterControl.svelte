@@ -56,7 +56,7 @@
       {/each}
     </select>
     {#if filteredOut > 0}
-      <span class="shrink-0 tabular-nums text-textMuted/80">
+      <span class="shrink-0 tabular-nums text-faint">
         −{filteredOut.toLocaleString()}
       </span>
     {/if}

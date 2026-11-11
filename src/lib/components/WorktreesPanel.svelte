@@ -790,7 +790,7 @@
   {/if}
 
   {#if isLoading && worktrees.length === 0}
-    <div class="text-meta text-textMuted/60 px-2 py-1 italic">Loading…</div>
+    <div class="text-meta text-faint px-2 py-1 italic">Loading…</div>
   {:else}
     {#if onlyMain && !showAddForm}
       <div class="mx-1 mb-1 px-2 py-1.5 rounded-xl bg-surface/50 text-micro text-textMuted" data-testid="worktrees-empty">
@@ -1040,7 +1040,7 @@
               ⚡ {aiSummaries[wt.path]}
             </div>
           {:else if loadingSummaries[wt.path]}
-            <div class="text-micro text-textMuted/60 italic mt-0.5">Summarizing diff…</div>
+            <div class="text-micro text-faint italic mt-0.5">Summarizing diff…</div>
           {/if}
 
           <!--
