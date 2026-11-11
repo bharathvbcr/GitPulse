@@ -250,7 +250,7 @@
            view button inside is the control, and the keyboard needs no flyout. -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
-        class="gp-view-group gp-segmented"
+        class="gp-segmented"
         class:gp-liquid-tabs={macos}
         data-view-group={item.id}
         data-active={active ? "true" : "false"}

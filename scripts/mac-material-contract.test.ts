@@ -262,14 +262,15 @@ describe("macOS material", () => {
     }
   });
 
-  it("presses every gp-btn alias the same way, success included", () => {
-    // gp-btn-success was missing from all four press and reduced rules, so it
-    // never pressed on macOS and never stopped pressing under reduced motion.
+  it("presses every gp-btn alias the same way", () => {
+    // An alias missing from a press rule never pressed on macOS and never
+    // stopped pressing under reduced motion. The success button is now only
+    // `gp-btn[data-variant="success"]`, which `.gp-btn` already covers.
     // Three :active rules: the live press, and the reduced-motion twin on each trigger.
     const press = [...css.matchAll(/:is\(([^)]*\.gp-btn[^)]*)\)(?::active)/g)].map((match) => match[1]);
     expect(press.length).toBeGreaterThanOrEqual(3);
     for (const group of press) {
-      for (const name of [".gp-btn", ".gp-btn-primary", ".gp-btn-success", ".gp-btn-danger", ".gp-icon-btn"]) {
+      for (const name of [".gp-btn", ".gp-btn-primary", ".gp-btn-danger", ".gp-icon-btn"]) {
         expect(group, `${name} missing from a press rule`).toContain(name);
       }
     }
@@ -812,7 +813,8 @@ describe("macOS material", () => {
     const viewBar = readFileSync(new URL("../src/lib/components/ViewBar.svelte", import.meta.url), "utf8");
     const header = app.slice(app.indexOf("<header"), app.indexOf("<header") + 400);
     expect(header).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
-    expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b[^"]*\bgp-viewbar\b/);
+    expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
+    expect(viewBar).toMatch(/<nav[^>]*\bdata-viewbar\b/s);
     expect(css).toMatch(
       /html\.macos\[data-transparency="reduced"\] \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
     );

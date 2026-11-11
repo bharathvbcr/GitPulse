@@ -1088,7 +1088,7 @@
          lives on the row inside it: the tiers (1100, 1280, 1440, 1600) are then
          the window's own width, as HEADER_SPEC section 4 states them. -->
     <header
-    class="@container gp-glass gp-titlebar gp-repo-tabs relative bg-surface shrink-0 select-none min-w-0 {macos
+    class="@container gp-glass gp-repo-tabs relative bg-surface shrink-0 select-none min-w-0 {macos
       ? 'h-12'
       : 'h-10'}"
     style:z-index={LAYERS.SCROLL_CUE}

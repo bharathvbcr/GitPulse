@@ -87,7 +87,7 @@
    */
   let handedOff = $state(false);
   let failure = $state<string | null>(null);
-  /** Bumped by Retry to re-run the load effect for the same loader. */
+  /** Bumped by Try again to re-run the load effect for the same loader. */
   let attempt = $state(0);
 
   $effect(() => {
@@ -145,7 +145,7 @@
          transient fetch failure is the common case, and retrying in place
          keeps the rest of the session (open tabs, terminal, selection). -->
     <button type="button" class="gp-btn mt-1" onclick={() => { failure = null; attempt += 1; }}>
-      Retry
+      Try again
     </button>
   </div>
 {:else}
