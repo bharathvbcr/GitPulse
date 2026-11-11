@@ -155,6 +155,11 @@ if(params.has("check")) {
     const declaredHeight = sidebarRowHeight("branch","spacious","two-line");
     check("each branch row is exactly as tall as the window math believes",
       branchRows().every(r => Math.round(r.getBoundingClientRect().height)===declaredHeight));
+    // The 28px the metrics comment documents: two 13px lines and a 2px gap,
+    // inside 6px of padding a side (12px in all) at spacious density.
+    check("the two-line content stack is the 28px the metrics document, with 12px of padding",
+      branchRows().every(r => Math.round(r.querySelector(".flex-col").getBoundingClientRect().height)===28
+        && Math.round(r.getBoundingClientRect().height - r.querySelector(".flex-col").getBoundingClientRect().height)===12));
     check("headers stay one line while branch rows grow",
       [...document.querySelectorAll(".gp-cv-row")]
         .filter(r => !r.querySelector('[aria-label^="Copy branch name"]'))

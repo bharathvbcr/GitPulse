@@ -87,10 +87,10 @@ export function branchRowLines(layout: BranchRowLayout): 1 | 2 | 3 {
  * Measured, not chosen round. The row's content stack renders at exactly
  * 28px — two 13px lines (the micro type's 1.3 line height) and a 2px gap —
  * so these are that 28px plus the vertical breathing room each density
- * wants: 6px a side spacious, 3px a side compact. (This comment used to say
- * 25px with ~7.5px and ~4.5px a side; the harness measures 28, and the
- * totals were right either way.) 44px was the first guess and left the pair
- * looking unmoored in the middle of the row.
+ * wants: 6px a side spacious, 3px a side compact. The meta line is 13px, not
+ * its 10px of type, because `--text-micro--line-height` is 1.3; the harness
+ * holds the 28px so a change to that token fails there. 44px was the first
+ * guess and left the pair looking unmoored in the middle of the row.
  *
  * The values live here because BranchList's window math, the row's inline
  * `height`, and `contain-intrinsic-size` all have to agree — that is the
