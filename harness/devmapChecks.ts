@@ -1,8 +1,15 @@
 import { tick } from "svelte";
 import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
 
+/** Records one named assertion. The page passes `createChecks().check` so a
+ * failed assertion is a row in the verdict; the thunk runs inside it, so a
+ * throw is attributed to the check that caused it. */
+export type DevmapCheck = (name: string, assertion: () => unknown) => void;
+
+const textOf = (selector: string): string => document.querySelector(selector)?.textContent ?? "";
+
 /** Real client-runtime regression: a same-size/same-generation payload must repaint. */
-export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => void): Promise<string> {
+export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => void, check: DevmapCheck): Promise<string> {
   const payload: GraphVizPayload = {
     level: "file", generation_id: 7,
     nodes: [
@@ -17,57 +24,74 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
       await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     }
   };
-  setLoad({available: true, kind: "code_graph", payload});
-  await settle();
-  const canvas = document.querySelector("canvas");
-  if (!canvas) throw new Error("Canvas did not mount");
-  const before = canvas.toDataURL();
-  setLoad({available: true, kind: "code_graph", payload: {
-    ...payload, nodes: payload.nodes.map((n,i) => ({...n, x: (n.x ?? 0) + (i ? 180 : 0)})),
-  }});
-  await settle();
-  if (before === canvas.toDataURL()) throw new Error("Same-count payload did not repaint");
-  // A lost context comes back blank; the restore event must repaint it.
-  const painted = canvas.toDataURL();
-  const lost = new Event("contextlost", { cancelable: true });
-  canvas.dispatchEvent(lost);
-  if (!lost.defaultPrevented) throw new Error("contextlost was not claimed, so the browser will not restore the context");
-  canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
-  if (canvas.toDataURL() === painted) throw new Error("Harness could not blank the canvas");
-  canvas.dispatchEvent(new Event("contextrestored"));
-  await settle();
-  if (canvas.toDataURL() !== painted) throw new Error("contextrestored did not repaint the graph");
-  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload});
-  await settle();
-  const search = document.querySelector<HTMLInputElement>('input[aria-label="Find a file or symbol"]');
-  if (!search) throw new Error("Search did not mount");
-  search.value = "Alpha";
-  search.dispatchEvent(new Event("input",{bubbles:true}));
-  await settle();
-  search.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
-  await settle();
-  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Alpha")) throw new Error("Search did not select Alpha");
-  const selectedZoom = document.querySelector('.map-zoom')?.textContent;
-  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload:{...payload,nodes:payload.nodes.map(n=>({...n,name:`Updated ${n.name}`}))}});
-  await settle();
-  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Updated Alpha")) throw new Error("Same-repository refresh lost selection");
-  if (document.querySelector('.map-zoom')?.textContent !== selectedZoom) throw new Error("Same-repository refresh lost zoom");
-  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-b",payload});
-  await settle();
-  if (document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Alpha")) throw new Error("Repository switch retained the previous selection");
+  const selection = () => textOf('[data-testid="code-graph-selection"]');
+  const filterCount = () => textOf('[data-testid="graph-filter-count"]');
+  const zoom = () => textOf(".map-zoom");
   const click = async (selector: string) => {
     const element = document.querySelector<HTMLButtonElement>(selector);
     if (!element) throw new Error(`Missing control: ${selector}`);
     element.click(); await settle();
   };
+  /** The canvas the page holds now. The component owns it and may replace it
+   * when the load is cleared, so a reference taken earlier can be detached. */
+  const liveCanvas = (): HTMLCanvasElement => {
+    const found = document.querySelector("canvas");
+    if (!found) throw new Error("Canvas is not mounted");
+    return found;
+  };
+  /** Click the middle of the canvas, where a fitted single node lands. */
+  const clickCentre = async () => {
+    const target = liveCanvas();
+    const bounds = target.getBoundingClientRect();
+    target.dispatchEvent(new MouseEvent("click", { clientX: bounds.left + bounds.width / 2, clientY: bounds.top + bounds.height / 2, bubbles: true }));
+    await settle();
+  };
+
+  setLoad({available: true, kind: "code_graph", payload});
+  await settle();
+  const canvas = liveCanvas();
+  check("the canvas mounts", () => canvas.isConnected);
+  const before = canvas.toDataURL();
+  setLoad({available: true, kind: "code_graph", payload: {
+    ...payload, nodes: payload.nodes.map((n,i) => ({...n, x: (n.x ?? 0) + (i ? 180 : 0)})),
+  }});
+  await settle();
+  check("a same-count payload repaints", () => before !== canvas.toDataURL());
+  // A lost context comes back blank; the restore event must repaint it.
+  const painted = canvas.toDataURL();
+  const lost = new Event("contextlost", { cancelable: true });
+  canvas.dispatchEvent(lost);
+  check("contextlost is claimed, so the browser can restore the context", () => lost.defaultPrevented);
+  canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+  check("the harness can blank the canvas", () => canvas.toDataURL() !== painted);
+  canvas.dispatchEvent(new Event("contextrestored"));
+  await settle();
+  check("contextrestored repaints the graph", () => canvas.toDataURL() === painted);
+  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload});
+  await settle();
+  const search = document.querySelector<HTMLInputElement>('input[aria-label="Find a file or symbol"]');
+  check("search mounts", () => !!search);
+  if (!search) return "";
+  search.value = "Alpha";
+  search.dispatchEvent(new Event("input",{bubbles:true}));
+  await settle();
+  search.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+  await settle();
+  check("search selects Alpha", () => selection().includes("Alpha"));
+  const selectedZoom = zoom();
+  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload:{...payload,nodes:payload.nodes.map(n=>({...n,name:`Updated ${n.name}`}))}});
+  await settle();
+  check("a same-repository refresh keeps the selection", () => selection().includes("Updated Alpha"));
+  check("a same-repository refresh keeps the zoom", () => zoom() === selectedZoom);
+  setLoad({available:true,kind:"code_graph",path:"/fixture/repo-b",payload});
+  await settle();
+  check("a repository switch drops the previous selection", () => !selection().includes("Alpha"));
   setLoad({available:true,kind:"code_graph",path:"/fixture/far",payload:{nodes:[{id:"far",name:"Far away",kind:"file",x:10000,y:10000}],links:[]}});
   await settle();
   for (let i=0;i<10;i++) canvas.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
   await settle(); await click('.fit-button');
-  const bounds = canvas.getBoundingClientRect();
-  canvas.dispatchEvent(new MouseEvent('click',{clientX:bounds.left+bounds.width/2,clientY:bounds.top+bounds.height/2,bubbles:true}));
-  await settle();
-  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Far away")) throw new Error("Fit view did not bring supplied coordinates into view");
+  await clickCentre();
+  check("Fit view brings supplied coordinates into view", () => selection().includes("Far away"));
   const fixtureNodes = [
     {id:"root",name:"Main",kind:"file",path:"main.swift"},
     {id:"dependency",name:"Dependency",kind:"file",path:"core/lib.rs"},
@@ -80,37 +104,39 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
   ]}};
   setLoad(explorer); await settle();
   await click('.map-languages button:nth-child(3)'); // Swift, after Rust's larger count.
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "2 of 36 match filters") throw new Error("Language filter lost Swift nodes");
+  check("the language filter keeps the Swift nodes", () => filterCount() === "2 of 36 match filters");
   await click('.map-filters input[type="checkbox"]');
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 36 match filters") throw new Error("Test and language filters do not compose");
+  check("the test and language filters compose", () => filterCount() === "1 of 36 match filters");
   setLoad({...explorer,payload:{...explorer.payload!,generation_id:8}}); await settle();
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 36 match filters") throw new Error("Refresh lost filters");
+  check("a refresh keeps the filters", () => filterCount() === "1 of 36 match filters");
   await click('.map-filters button');
   await click('.map-filters input[aria-label="Hide generated/vendor"]');
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "35 of 36 match filters") throw new Error("Generated path filter failed");
+  check("the generated path filter hides generated files", () => filterCount() === "35 of 36 match filters");
   await click('.map-filters input[aria-label="Connected only"]');
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 36 match filters") throw new Error("Connected-only filter retained isolated nodes");
+  check("connected-only drops the isolated nodes", () => filterCount() === "3 of 36 match filters");
   await click('.map-filters button');
   await click('.map-actions > button');
   await click('button[aria-label="Next nodes"]');
-  if (!document.querySelector('.result-heading')?.textContent?.includes("31–36 shown")) throw new Error("Node browser cannot reach later pages");
+  check("the node browser reaches later pages", () => textOf(".result-heading").includes("31–36 shown"));
   const currentSearch = document.querySelector<HTMLInputElement>('input[aria-label="Find a file or symbol"]');
-  if (!currentSearch) throw new Error("Search did not survive refresh");
+  check("search survives a refresh", () => !!currentSearch);
+  if (!currentSearch) return "";
   currentSearch.value = "Main";
   currentSearch.dispatchEvent(new Event("input",{bubbles:true})); await settle();
   currentSearch.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true})); await settle();
   canvas.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true})); await settle();
-  if (document.querySelector('[data-testid="opened-file"]')?.textContent !== "main.swift") throw new Error("Keyboard activation did not open root Swift file");
+  check("keyboard activation opens the root Swift file", () => textOf('[data-testid="opened-file"]') === "main.swift");
   const direction = document.querySelector<HTMLSelectElement>('select[aria-label="Trace direction"]');
-  if (!direction) throw new Error("Connections did not mount");
+  check("the connections control mounts", () => !!direction);
+  if (!direction) return "";
   direction.value = "outgoing"; direction.dispatchEvent(new Event("change",{bubbles:true})); await settle();
-  if (!document.querySelector('.neighbor-list')?.textContent?.includes("Dependency") || document.querySelector('.neighbor-list')?.textContent?.includes("Caller")) throw new Error("Outgoing connections contain incoming callers");
+  check("outgoing connections list dependencies and no callers", () => textOf(".neighbor-list").includes("Dependency") && !textOf(".neighbor-list").includes("Caller"));
   direction.value = "incoming"; direction.dispatchEvent(new Event("change",{bubbles:true})); await settle();
-  if (!document.querySelector('.neighbor-list')?.textContent?.includes("Caller") || document.querySelector('.neighbor-list')?.textContent?.includes("Dependency")) throw new Error("Incoming connections contain dependencies");
+  check("incoming connections list callers and no dependencies", () => textOf(".neighbor-list").includes("Caller") && !textOf(".neighbor-list").includes("Dependency"));
   await click('.neighbor-list button');
-  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Caller")) throw new Error("Neighbor activation failed");
+  check("activating a neighbour selects it", () => selection().includes("Caller"));
   setLoad({...explorer,payload:{nodes:fixtureNodes.filter(n=>n.id!=="caller"),links:[]}}); await settle();
-  if (document.querySelector('.map-neighbors')) throw new Error("Removed selection retained a stale inspector");
+  check("a removed selection leaves no stale inspector", () => !document.querySelector(".map-neighbors"));
   const notes: GraphVizLoad = {available:true,kind:"code_graph",path:"/fixture/notes",payload:{nodes:[
     {id:"code",name:"Code",path:"notes/editor.ts",documentation:false},
     {id:"note",name:"Note",path:"README.md",documentation:true},
@@ -118,35 +144,29 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
   ],links:[{source:"code",target:"note"}]}};
   setLoad(notes); await settle();
   await click('input[aria-label="Hide notes & Markdown"]');
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 3 match filters") throw new Error("Notes filter did not hide documentation");
+  check("the notes filter hides documentation", () => filterCount() === "1 of 3 match filters");
   await click('.map-actions > button');
-  if (document.querySelector('.map-results')?.textContent?.includes("README.md")) throw new Error("Hidden Markdown remained in node browser");
+  check("hidden Markdown is absent from the node browser", () => !textOf(".map-results").includes("README.md"));
   await click('.map-results button');
-  if (document.querySelector('.neighbor-list')?.textContent?.includes("Note")) throw new Error("Hidden note remained in connections");
+  check("a hidden note is absent from the connections", () => !textOf(".neighbor-list").includes("Note"));
   setLoad({...notes,payload:{...notes.payload!,nodes:notes.payload!.nodes.map(n=>({...n,documentation:true}))}}); await settle();
-  if (document.querySelector('.map-neighbors')) throw new Error("Refresh retained a newly hidden selection");
-  if (!document.querySelector('.map-empty')?.textContent?.includes("No nodes match")) throw new Error("All-documentation filter left an unexplained blank canvas");
+  check("a refresh drops a selection the filter now hides", () => !document.querySelector(".map-neighbors"));
+  check("an all-documentation filter explains the blank canvas", () => textOf(".map-empty").includes("No nodes match"));
   await click('.map-filters button');
-  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 3 match filters") throw new Error("Clear filters did not restore documents");
+  check("clearing the filters restores the documents", () => filterCount() === "3 of 3 match filters");
   await click('input[aria-label="Hide notes & Markdown"]');
   setLoad({...notes,path:"/fixture/notes-other"}); await settle();
-  if (document.querySelector<HTMLInputElement>('input[aria-label="Hide notes & Markdown"]')?.checked) throw new Error("Repository switch retained notes filter");
+  check("a repository switch resets the notes filter", () => !document.querySelector<HTMLInputElement>('input[aria-label="Hide notes & Markdown"]')?.checked);
   setLoad({available: true, kind: "code_graph", payload: JSON.parse('{"nodes":[null,{"id":"a","name":12,"language":{}},{"id":"b","name":"B"},{"id":"bad"},{"id":"bad"}],"links":[null,{"source":"a","target":"b"},{"source":"bad","target":"b"}]}')});
   await settle();
-  if (!document.querySelector('[data-testid="code-graph-nodes-label"]')?.textContent?.includes("2 of 5")) {
-    throw new Error("Malformed payload did not retain an honest rendered-node count");
-  }
-  if (!document.querySelector(".code-map")?.textContent?.includes("invalid or ambiguous")) {
-    throw new Error("Malformed payload omissions were not explained");
-  }
+  check("a malformed payload keeps an honest rendered-node count", () => textOf('[data-testid="code-graph-nodes-label"]').includes("2 of 5"));
+  check("a malformed payload explains what it omitted", () => textOf(".code-map").includes("invalid or ambiguous"));
   setLoad({available: true, kind: "code_graph", payload: {nodes: [], links: []}});
   await settle();
-  if (!document.querySelector(".map-empty")) throw new Error("Empty payload has no visible explanation");
+  check("an empty payload has a visible explanation", () => !!document.querySelector(".map-empty"));
   setLoad({available: false, kind: "code_graph", reason: "Fixture index unavailable"});
   await settle();
-  if (!document.querySelector('[data-testid="code-graph-legend"]')?.textContent?.includes("Fixture index unavailable")) {
-    throw new Error("Unavailable payload lost its reason");
-  }
+  check("an unavailable payload keeps its reason", () => textOf('[data-testid="code-graph-legend"]').includes("Fixture index unavailable"));
   // The panel's order on a view switch: the scope changes while the model is
   // still empty (load cleared), and the payload lands later under that scope.
   // The first payload must be fitted without the user pressing Fit.
@@ -156,10 +176,10 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => vo
   await settle();
   setLoad({available:true,kind:"code_graph",payload:{nodes:[{id:"first-fit",name:"First fit",kind:"file",x:10000,y:10000}],links:[]}});
   await settle();
-  const fitBounds = canvas.getBoundingClientRect();
-  canvas.dispatchEvent(new MouseEvent('click',{clientX:fitBounds.left+fitBounds.width/2,clientY:fitBounds.top+fitBounds.height/2,bubbles:true}));
-  await settle();
-  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("First fit")) throw new Error("First payload after a scope change was not fitted");
+  // The payload also changes the toolbar (legend, group and language rows), so
+  // the stage is resized after the fit; the fitted node must still be centred.
+  await clickCentre();
+  check("the first payload after a scope change is fitted", () => selection().includes("First fit"));
   return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
 }
 

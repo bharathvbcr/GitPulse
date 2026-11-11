@@ -1,5 +1,6 @@
 <script lang="ts">
   import { runDevmapChecks, stressDevmap } from "./devmapChecks";
+  import { createChecks, type CheckRow } from "./checks";
   import { onMount } from "svelte";
   import CodeGraphCanvas from "../src/lib/components/CodeGraphCanvas.svelte";
   import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
@@ -20,39 +21,55 @@
   let show = $state(true);
   let verdict = $state("");
   let checking = $state(false);
-  async function runChecks(stress = false) {
+  /** Run the runtime checks (or the stress pass) and return the rows. A failed
+   * check ends the run with a row naming where it stopped, so the verdict never
+   * reads as a shorter list of passes. */
+  async function runChecks(stress = false): Promise<{ rows: CheckRow[]; errors: string[] }> {
     checking = true;
     const errors: string[] = [];
     const onError = (event: ErrorEvent) => errors.push(event.message);
     const onRejection = (event: PromiseRejectionEvent) => errors.push(String(event.reason));
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
+    const { results, check, stopped } = createChecks();
     try {
-      const result = await (stress ? stressDevmap : runDevmapChecks)(next => load = next);
+      const summary = stress
+        ? await stressDevmap(next => load = next)
+        : await runDevmapChecks(next => load = next, check);
       for (let i=0;i<3;i++) await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
-      if (errors.length) throw new Error(`Browser runtime errors: ${errors.join("; ")}`);
-      verdict = result;
+      if (!stress) check("no unhandled runtime errors", () => errors.length === 0);
+      verdict = summary;
     }
-    catch (error) { verdict = `FAIL: ${String(error)}`; }
+    catch (error) { verdict = `FAIL: ${stopped(error)}`; }
     finally {
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejection);
       checking = false;
     }
+    return { rows: results, errors };
+  }
+  /** `?check=1&report=…` is how the regression gate drives a page: run, publish
+   * the verdict on the document element, and POST the page back. */
+  async function reportToGate(report: string) {
+    const { rows, errors } = await runChecks();
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results: rows, errors }));
+    if (report.startsWith("/__gp_result/")) await fetch(report, { method: "POST", body: document.documentElement.outerHTML });
   }
   onMount(async () => {
-    themeStore.setTheme(new URLSearchParams(location.search).get("theme") === "light" ? "light" : "dark");
-    if (new URLSearchParams(location.search).has("real")) {
+    const params = new URLSearchParams(location.search);
+    themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+    if (params.has("real")) {
       const response = await fetch("./.devmap-preview.json");
       if (!response.ok) throw new Error(`Preview fixture: ${response.status}`);
       load = {available: true, kind: "code_graph", payload: await response.json()};
     }
+    if (params.get("check") === "1") await reportToGate(params.get("report") ?? "");
   });
 </script>
 <div style="display:flex;gap:8px;align-items:center;padding:24px 20px 8px;background:#10151f;color:#9baac0;font:11px system-ui">
   <span style="flex:1">DevMap · browser verification</span>
-  <button onclick={() => runChecks()} disabled={checking || !show}>Run runtime checks</button>
-  <button onclick={() => runChecks(true)} disabled={checking || !show}>Run stress checks</button>
+  <button onclick={() => void runChecks()} disabled={checking || !show}>Run runtime checks</button>
+  <button onclick={() => void runChecks(true)} disabled={checking || !show}>Run stress checks</button>
   <span role="status" data-testid="runtime-verdict">{verdict}</span>
   <button onclick={() => themeStore.toggle()}>Toggle theme</button>
   <button onclick={() => { load = {available: true, kind: "code_graph", payload: {...fixture, nodes: fixture.nodes.map(n => ({...n, name: `Updated ${n.name}`}))}}; }}>Replace same-count payload</button>
