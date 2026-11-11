@@ -8,7 +8,8 @@
  * - The branch's pull request and its CI: the last `cmd_github_context` a
  *   panel read for this repository (github/pullRequestReads.ts).
  * - Files changed in another worktree too: the collision facet of the
- *   insights snapshot the Agents pill's sweep already took.
+ *   insights snapshot the Agents pill's sweep already took. That sweep is not
+ *   polled, so the chip names the age of the read, as the pull request does.
  *
  * Each returns null when there is nothing to say, and never a zero it did not
  * measure: a stash list or collision scan that did not finish shows its count
@@ -37,7 +38,13 @@ function count(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-/** "now", "12m", "5h", "3d": the age in the fewest characters that stay true. */
+/**
+ * "now", "12m", "5h", "3d": the age in the fewest characters that stay true.
+ * Not `formatAge` in metrics/freshness.ts: that one counts seconds, which the
+ * glance's once-a-minute clock cannot keep true, and it rounds up, so a fetch
+ * 59 minutes old would read "1h" a minute early. This one floors, and keeps
+ * hours to two days, where "26h" says more than "1d".
+ */
 export function compactAge(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 1) return "now";
@@ -94,7 +101,7 @@ export function pullRequestGlance(
   pr: PullRequestInfo | null,
   readAt: number,
   now: number,
-): (Glance & { url: string }) | null {
+): Glance | null {
   if (!pr) return null;
   const ci = CI[pr.ci_status.toLowerCase()] ?? { tone: "neutral" as const, words: "checks unknown" };
   const draft = pr.is_draft ? "Draft pull request" : "Pull request";
@@ -102,12 +109,15 @@ export function pullRequestGlance(
     text: `#${pr.number}`,
     label: `${draft} #${pr.number}, ${ci.words}, as of ${formatAge(readAt, now)}: ${pr.title}`,
     tone: ci.tone,
-    url: pr.url,
   };
 }
 
 /** Files with uncommitted changes in two or more of this repository's worktrees. */
-export function overlapGlance(facet: CollisionRisk | null | undefined): Glance | null {
+export function overlapGlance(
+  facet: CollisionRisk | null | undefined,
+  readAt: number | null,
+  now: number,
+): Glance | null {
   if (!facet || !facet.ok || facet.overlapping_files <= 0) return null;
   const floor = facet.truncated || facet.unscanned_worktrees > 0 || facet.failed_worktrees > 0;
   const n = facet.overlapping_files;
@@ -115,7 +125,7 @@ export function overlapGlance(facet: CollisionRisk | null | undefined): Glance |
   const others = facet.worktrees_involved > 1 ? ` across ${facet.worktrees_involved} worktrees` : "";
   return {
     text: floor ? `${n}+` : String(n),
-    label: `${files} changed in more than one worktree${others}. Open Agents`,
+    label: `${files} changed in more than one worktree${others}${readAt === null ? "" : `, as of ${formatAge(readAt, now)}`}. Open Agents`,
     tone: "warn",
   };
 }

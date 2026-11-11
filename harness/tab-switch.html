@@ -107,7 +107,7 @@
         ],
         truncated: false, scanned_files: 520, candidate_files: 520,
       });
-      const glanceFacts = { on: false, fetchedAt: 0 };
+      const glanceFacts = { on: false, fetchedAt: 0, agentsOk: true };
       const glanceStash = [0, 1].map((index) => ({
         index, selector: `stash@{${index}}`, oid: `abcd${index}`, subject: `WIP ${index}`, message: `WIP ${index}`, branch: "main", timestamp: 1_700_000_000,
       }));
@@ -115,7 +115,7 @@
       const glanceSnapshot = (repoPath) => ({
         repo_path: repoPath, branch: "main", branch_ok: true, deadline_expired: false, duration_ms: 1,
         worktrees: { ok: true, error: "", count: 1, scanned: 1, dirty: 0, dirty_unknown: 0, blocked: 0, blocked_unknown: 0, truncated: false, items: [] },
-        agents: { ok: true, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
+        agents: { ok: glanceFacts.agentsOk, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
         changes: { ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0, additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false },
         collisions: {
           ok: true, error: "", overlapping_files: 2, worktrees_involved: 2, scanned_worktrees: 2, unscanned_worktrees: 0, failed_worktrees: 0,
@@ -156,6 +156,8 @@
         cmd_get_language_stats: () => langStats(),
         cmd_apple_intelligence_status: () => ({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "Not in this build." }),
         cmd_commit: () => null,
+        // The glance's fetch chip; answered as cmd_commit is.
+        cmd_fetch: () => null,
         // The wire shape of `AiStatus` (src/lib/stores/harnessStore.ts). Answered
         // with nothing, the store read `ai.harness` off null and the header badge
         // showed "Cannot read properties of null (reading 'harness')": a fixture
@@ -386,6 +388,8 @@
         $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
       };
       let diagnostics = "";
+      // What the glance showed at each width, carried into the diagnostics line.
+      let glanceWidths = "";
 
       // A run that hangs is reported, not timed out: the runner hands back only
       // the verdict, so a hang would otherwise say nothing about where.
@@ -1182,37 +1186,68 @@
               const glanceScroller = $("[data-viewbar-controls] .gp-header-scroll", row2);
               const glanceSqueezed = [];
               const glanceMeasured = [];
-              for (const width of [1400, 1280]) {
-                row2.style.maxWidth = width + "px";
-                for (const view of ["work", "code", "history"]) {
-                  repoStore.setActiveTab(view);
-                  await settle();
-                  const { shown, torn } = glanceShown();
-                  const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
-                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
-                  glanceMeasured.push(row);
-                  // Code and History leave room for every chip at 1400px.
-                  const roomy = width === 1400 && view !== "work";
-                  if (glanceScroller.scrollWidth > glanceScroller.clientWidth + 1 || row2.scrollWidth > row2.clientWidth + 1 ||
-                    torn.length || !prefix || (roomy && shown.length !== 4)) glanceSqueezed.push(row);
+              // Measured twice: with no Agents pill (the sweep read no agents) and
+              // with it up (the agents facet could not be read, so the pill says
+              // so), since the pill shares the row and a repository with agents
+              // has it.
+              for (const agentsOk of [true, false]) {
+                glanceFacts.agentsOk = agentsOk;
+                await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+                await settle();
+                for (const width of [1400, 1280]) {
+                  row2.style.maxWidth = width + "px";
+                  for (const view of ["work", "code", "history"]) {
+                    repoStore.setActiveTab(view);
+                    await settle();
+                    const pill = !!$('[data-testid="viewbar-agents"]', row2);
+                    const { shown, torn } = glanceShown();
+                    const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
+                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
+                    glanceMeasured.push(row);
+                    // With no pill, Code and History leave room for every chip at 1400px.
+                    const roomy = agentsOk && width === 1400 && view !== "work";
+                    if (glanceScroller.scrollWidth > glanceScroller.clientWidth + 1 || row2.scrollWidth > row2.clientWidth + 1 ||
+                      torn.length || !prefix || (roomy && shown.length !== 4) || pill === agentsOk) glanceSqueezed.push(row);
+                  }
                 }
               }
+              glanceFacts.agentsOk = true;
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
               row2.style.maxWidth = "";
               await settle();
-              check("glance: with four chips to show, at 1400 and 1280px every view's switcher shows in full, row 2 does not overflow, and a chip that does not fit is hidden whole, inert, the last first", () => {
+              check("glance: with four chips to show, with and without the Agents pill, at 1400 and 1280px every view's switcher shows in full, row 2 does not overflow, and a chip that does not fit is hidden whole, inert, the last first", () => {
                 if (!glanceSqueezed.length) return true;
                 throw new Error(`squeezed: ${glanceSqueezed.join("; ")}; all: ${glanceMeasured.join("; ")}`);
               });
+              glanceWidths = glanceMeasured.join("; ");
+              // Each chip's click, in the live row. The page is put back after:
+              // Work's section and the Agents scope these clicks change are read by
+              // the checks below.
+              const workSectionBefore = get(repoStore).viewSections.work;
+              const { agentsRepositoryScope, setAgentsRepositoryScope } = await import("../src/lib/agents/scope.ts");
+              const agentsScopeBefore = get(agentsRepositoryScope);
               repoStore.setActiveTab("history", "graph");
               await settle();
               glanceChip("pull-request")?.click();
               await settle();
-              check("glance: the pull request chip opens Work's Remote section, where the branch's pull request is listed", () =>
+              check("glance: the pull request chip opens Work's Remote section", () =>
                 get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "remote");
+              repoStore.setActiveTab("history", "graph");
+              await settle();
               glanceChip("overlap")?.click();
               await settle();
-              check("glance: the overlap chip opens Agents", () => get(interfaceStore).globalSurface === "agents");
+              check("glance: the overlap chip opens Agents, narrowed to this repository", () =>
+                get(interfaceStore).globalSurface === "agents" && get(agentsRepositoryScope) === glancePath);
               interfaceStore.setGlobalSurface("repository");
+              await settle();
+              const fetchesBefore = calls.filter((call) => call.cmd === "cmd_fetch").length;
+              glanceChip("fetch")?.click();
+              await sleepUntil(() => calls.filter((call) => call.cmd === "cmd_fetch").length > fetchesBefore, 3000);
+              await settle();
+              check("glance: the fetch chip fetches this repository", () =>
+                calls.filter((call) => call.cmd === "cmd_fetch").slice(fetchesBefore).some((call) => call.repo === glancePath));
+              setAgentsRepositoryScope(agentsScopeBefore);
+              if (workSectionBefore) repoStore.setActiveTab("work", workSectionBefore);
               await settle();
               // Off again: the stash and fetch go with their facts, the overlap with
               // the scan, and a later read with no pull request for the branch takes
@@ -1367,7 +1402,7 @@
             const sorted = [...series].sort((a, b) => a - b);
             return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
           };
-          diagnostics = `${idleNotes.join("; ")}; ${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          diagnostics = `${idleNotes.join("; ")}; ${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}${glanceWidths ? `; glance: ${glanceWidths}` : ""}`;
           // ---- the graph keeps rows for a bounded number of repositories ---------
           // The real App, its real graph scheduler and the real graph store, with
           // a backend that answers the commit graph. After 8 repositories have

@@ -97,7 +97,7 @@ describe("branchPullRequest", () => {
 describe("pullRequestGlance", () => {
   it("names the number, its checks as a tone, and the age of the read it comes from", () => {
     const glance = pullRequestGlance(pr(), NOW - 5 * MIN, NOW);
-    expect(glance).toMatchObject({ text: "#42", tone: "ok", url: "https://example.test/pr/42" });
+    expect(glance).toMatchObject({ text: "#42", tone: "ok" });
     expect(glance?.label).toBe("Pull request #42, checks passed, as of 5m ago: Cache the graph");
   });
 
@@ -118,21 +118,24 @@ describe("pullRequestGlance", () => {
 
 describe("overlapGlance", () => {
   it("shows nothing for no facet, a failed scan, or no overlap", () => {
-    expect(overlapGlance(null)).toBeNull();
-    expect(overlapGlance(undefined)).toBeNull();
-    expect(overlapGlance(collisions({ ok: false, error: "boom", overlapping_files: 4 }))).toBeNull();
-    expect(overlapGlance(collisions())).toBeNull();
+    expect(overlapGlance(null, NOW, NOW)).toBeNull();
+    expect(overlapGlance(undefined, NOW, NOW)).toBeNull();
+    expect(overlapGlance(collisions({ ok: false, error: "boom", overlapping_files: 4 }), NOW, NOW)).toBeNull();
+    expect(overlapGlance(collisions(), NOW, NOW)).toBeNull();
   });
 
-  it("counts files changed in more than one worktree and opens Agents", () => {
-    const glance = overlapGlance(collisions({ overlapping_files: 2, worktrees_involved: 3 }));
+  it("counts files changed in more than one worktree, names the age of the read, and opens Agents", () => {
+    const glance = overlapGlance(collisions({ overlapping_files: 2, worktrees_involved: 3 }), NOW - 20 * MIN, NOW);
     expect(glance).toMatchObject({ text: "2", tone: "warn" });
-    expect(glance?.label).toBe("2 files changed in more than one worktree across 3 worktrees. Open Agents");
+    expect(glance?.label).toBe("2 files changed in more than one worktree across 3 worktrees, as of 20m ago. Open Agents");
+    // No sweep has finished: nothing to date it by, so no age is claimed.
+    expect(overlapGlance(collisions({ overlapping_files: 1, worktrees_involved: 2 }), null, NOW)?.label)
+      .toBe("1 file changed in more than one worktree across 2 worktrees. Open Agents");
   });
 
   it("is a floor when the scan was capped, skipped worktrees or lost one", () => {
     for (const partial of [{ truncated: true }, { unscanned_worktrees: 1 }, { failed_worktrees: 1 }]) {
-      const glance = overlapGlance(collisions({ overlapping_files: 1, worktrees_involved: 2, ...partial }));
+      const glance = overlapGlance(collisions({ overlapping_files: 1, worktrees_involved: 2, ...partial }), NOW, NOW);
       expect(glance?.text).toBe("1+");
       expect(glance?.label).toMatch(/^At least 1 file /);
     }

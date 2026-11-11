@@ -16,7 +16,7 @@
   import { onMount } from "svelte";
   import { Archive, CloudDownload, GitPullRequest, Layers } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
-  import { headerAgentPlane } from "../agents/headerPlane";
+  import { agentPlaneStore } from "../agents/store";
   import { probeFor } from "../agents/repoAttention";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { pullRequestReads } from "../github/pullRequestReads";
@@ -37,8 +37,14 @@
   let now = $state(Date.now());
 
   const repoPath = $derived($repoStore.currentPath ?? "");
+  // The Agents sweep's own probes and the time it finished: the same read
+  // the Agents pill shows, dated, since nothing polls it.
   const overlap = $derived(
-    overlapGlance(repoPath ? probeFor($headerAgentPlane.probes, repoPath, pathOpts)?.snapshot?.collisions : null),
+    overlapGlance(
+      repoPath ? probeFor($agentPlaneStore.probes, repoPath, pathOpts)?.snapshot?.collisions : null,
+      $agentPlaneStore.readAt,
+      now,
+    ),
   );
   const pullRequest = $derived.by(() => {
     const read = repoPath ? $pullRequestReads.get(repoPath) : undefined;

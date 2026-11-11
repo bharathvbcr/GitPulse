@@ -122,11 +122,11 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
   - Not in v1: Work's conflict list and the code map keep their own controls.
 
 - **D8 A glance in row 2 (2026-11-11, user).** "Make this space useful with some info, instead of blank: cool at-a-glance." Four facts the app already holds, drawn by `ViewBarGlance.svelte` from `ui/viewBarGlance.ts`:
-  - Overlap: the collision facet of the insights snapshot the Agents pill's sweep already took. Shown only when the scan found overlap; a partial scan shows its count as a floor (`2+`), and a failed one shows nothing, because the Agents pill already turns unknown for it.
+  - Overlap: the collision facet of the insights snapshot the Agents pill's sweep already took. Shown only when the scan found overlap; a partial scan shows its count as a floor (`2+`), and a failed one shows nothing, because the Agents pill already turns unknown for it. The sweep is not polled (row 2 asks once per repository; Agents asks when it opens), so the chip names the read's age (`AgentPlaneState.readAt`), as the pull request chip does.
   - Pull request: the last `cmd_github_context` any panel read for this repository (`github/pullRequestReads.ts`, fed by Work's load, the Remote panel and the Policy panel; a failed read never replaces a good one). The chip names the age of that read. No panel has read it: no chip, and no `gh` call of its own.
   - Last fetch: the metadata facet's `cmd_last_fetch_at`; neutral under a day, warn from a day. No fetch recorded: no chip.
   - Stash: the metadata facet's stash list; a capped list is a floor, a failed read no chip (the sidebar says why).
-  - Width: Work's switcher is the longest. With four chips to show, Work keeps three at a 1400 px row and two at 1280 px; Code and History keep all four. The strip's flex-shrink outweighs the switcher's a thousandfold, and a ResizeObserver hides the chips its width does not hold.
+  - Width: Work's switcher is the longest. Measured in `harness/tab-switch.html` with four chips to show: with no Agents pill, Work keeps three at a 1400 px row and two at 1280 px, Code and History all four; with the Agents pill up in its widest (labelled, unknown) state, Work keeps only the overlap chip at both widths, Code all four, History all four at 1400 px and three at 1280 px. The strip's flex-shrink outweighs the switcher's a thousandfold, and a ResizeObserver hides the chips its width does not hold. Every run's widths are in the page's diagnostics line.
   - Cost: its own 4.6 kB chunk, loaded when row 2 mounts; the entry chunk would not hold it under the 640,000-byte gate.
 
 ## 10. Unverified until the app runs

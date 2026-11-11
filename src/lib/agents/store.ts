@@ -76,6 +76,12 @@ export function sweepTargets(tabs: readonly SweepTab[]): AgentRepoTarget[] {
 export interface AgentPlaneState {
   readonly probes: readonly PlaneProbe[];
   readonly scanning: boolean;
+  /**
+   * When the sweep that produced `probes` finished (epoch ms); null before the
+   * first. The sweep is not polled (row 2 asks once per repository, Agents
+   * asks when it opens), so a reader showing a probe's facts names this age.
+   */
+  readonly readAt: number | null;
 }
 
 export interface AgentPlaneStore extends Readable<AgentPlaneState> {
@@ -91,7 +97,7 @@ export interface AgentPlaneStoreDeps {
   readonly paths?: PathIdentityOptions;
 }
 
-const INITIAL: AgentPlaneState = { probes: [], scanning: false };
+const INITIAL: AgentPlaneState = { probes: [], scanning: false, readAt: null };
 
 function skip(target: AgentRepoTarget, reason: "deadline" | "cap"): PlaneProbe {
   return {
@@ -179,6 +185,7 @@ export function createAgentPlaneStore(deps: AgentPlaneStoreDeps = {}): AgentPlan
     store.set({
       probes: [...finished, ...overflow.map((target) => skip(target, "cap"))],
       scanning: false,
+      readAt: now(),
     });
   }
 

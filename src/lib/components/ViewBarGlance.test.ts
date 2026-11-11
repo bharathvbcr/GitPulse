@@ -20,14 +20,14 @@ const { repo, plane } = await vi.hoisted(async () => {
   const facts: RepoFacts = {
     currentPath: "/r/glance", currentBranch: "feat/cache", stashEntries: [], stashTruncated: false, stashFailed: false, fetchedAt: null,
   };
-  const probes: { probes: unknown[] } = { probes: [] };
+  const probes: { probes: unknown[]; scanning: boolean; readAt: number | null } = { probes: [], scanning: false, readAt: null };
   return { repo: writable(facts), plane: writable(probes) };
 });
 
 vi.mock("../stores/repoStore", () => ({
   repoStore: { subscribe: repo.subscribe, setActiveTab: vi.fn(), fetch: vi.fn() },
 }));
-vi.mock("../agents/headerPlane", () => ({ headerAgentPlane: { subscribe: plane.subscribe } }));
+vi.mock("../agents/store", () => ({ agentPlaneStore: { subscribe: plane.subscribe } }));
 
 const { default: ViewBarGlance } = await import("./ViewBarGlance.svelte");
 const { notePullRequests } = await import("../github/pullRequestReads");
@@ -45,7 +45,7 @@ function context(prs: GitHubContext["pull_requests"]): GitHubContext {
 
 beforeEach(() => {
   repo.update((s) => ({ ...s, currentPath: "/r/glance", currentBranch: "feat/cache", stashEntries: [], stashTruncated: false, stashFailed: false, fetchedAt: null }));
-  plane.set({ probes: [] });
+  plane.set({ probes: [], scanning: false, readAt: null });
 });
 
 describe("ViewBarGlance", () => {
@@ -91,8 +91,10 @@ describe("ViewBarGlance", () => {
     expect(source).toContain('repoStore.setActiveTab("work", "remote")');
   });
 
-  it("shows overlapping files from the snapshot the Agents sweep already took, opening Agents", () => {
+  it("shows overlapping files from the snapshot the Agents sweep already took, dated by that sweep, opening Agents", () => {
     plane.set({
+      scanning: false,
+      readAt: Date.now() - 12 * 60_000,
       probes: [{
         path: "/r/glance", label: "glance", error: "", skipped: false,
         snapshot: {
@@ -106,7 +108,7 @@ describe("ViewBarGlance", () => {
     });
     const tag = chip(glance(), "overlap");
     expect(tag).toContain('data-tone="warn"');
-    expect(tag).toContain("3 files changed in more than one worktree");
+    expect(tag).toContain("3 files changed in more than one worktree across 2 worktrees, as of 12m ago");
     expect(source).toContain("onclick={onOpenAgents}");
   });
 
