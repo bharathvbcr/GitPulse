@@ -212,6 +212,9 @@
         cmd_terminal_backend: () => ({ backend: "in-process", trouble: [] }),
         cmd_ledger_tail: () => [],
         cmd_get_file_content: () => "export {};\n",
+        // The search checks visit Code, whose explorer lists the repository's
+        // files when it mounts (FileTreePanel); its changed files stand in.
+        cmd_list_repo_files: (a) => (DATA[a.repoPath]?.statuses ?? []).map((entry) => entry.path),
         cmd_workbench_request: (a) => workbenchFixture(a),
       };
       // The workbench answers with a JSON string, and `page()` in
