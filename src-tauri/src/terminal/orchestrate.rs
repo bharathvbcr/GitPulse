@@ -41,6 +41,8 @@ pub const CHILD_SPAWNED_EVENT: &str = "terminal-child-spawned";
 /// Emitted when an authenticated session asks the UI to open a repository file
 /// in a terminal split pane.
 pub const OPEN_FILE_REQUEST_EVENT: &str = "terminal-open-file-request";
+/// Emitted when an authenticated parent session closes one of its spawned children.
+pub const CHILD_CLOSED_EVENT: &str = "terminal-child-closed";
 
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 25_000;
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
@@ -61,8 +63,7 @@ const CREDENTIAL_REFUSAL: &str = "invalid or expired terminal session credential
 const LINEAGE_REFUSAL: &str = "child terminal session is not owned by this caller";
 
 /// Allowed child launchers for `Spawn`.
-pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] =
-    ["shell", "claude", "agy", "codex", "manvi", "grok"];
+pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
 
 /// Metadata attached when [`spawn_at`] spawns an orchestrated child.
 #[derive(Debug, Clone)]
@@ -97,10 +98,20 @@ pub struct TerminalOpenFileRequestPayload {
     pub column: Option<u32>,
 }
 
+/// Event payload emitted on [`CHILD_CLOSED_EVENT`]. Matches
+/// `TerminalChildClosedPayload` in `src/lib/terminal/agentEvents.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalChildClosedPayload {
+    pub id: String,
+    pub parent_session_id: String,
+    pub repo_path: String,
+}
+
 /// Abstraction over UI event emission so real runs emit Tauri events while unit
 /// tests inspect emitted payloads without constructing a Tauri `AppHandle`.
 pub trait OrchestrateUiSink: Send + Sync {
     fn child_spawned(&self, payload: TerminalChildSpawnedPayload);
+    fn child_closed(&self, payload: TerminalChildClosedPayload);
     fn open_file_requested(&self, payload: TerminalOpenFileRequestPayload);
     fn session_events(&self, state: &TerminalSessions) -> std::sync::Arc<dyn SessionEvents>;
 }
@@ -121,6 +132,13 @@ impl<R: tauri::Runtime> OrchestrateUiSink for AppOrchestrateUiSink<R> {
         use tauri::Emitter as _;
         if let Err(error) = self.app.emit(CHILD_SPAWNED_EVENT, payload) {
             log::warn!(target: "terminal", "could not announce spawned child terminal: {error}");
+        }
+    }
+
+    fn child_closed(&self, payload: TerminalChildClosedPayload) {
+        use tauri::Emitter as _;
+        if let Err(error) = self.app.emit(CHILD_CLOSED_EVENT, payload) {
+            log::warn!(target: "terminal", "could not announce closed child terminal: {error}");
         }
     }
 
@@ -665,6 +683,12 @@ pub enum OrchestrateCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         append_newline: Option<bool>,
     },
+    Close {
+        repo_path: String,
+        caller_session_id: String,
+        caller_token: String,
+        child_session_id: String,
+    },
 }
 
 impl OrchestrateCall {
@@ -744,7 +768,9 @@ impl OrchestrateCall {
                 }
                 if let Some(t) = title {
                     if t.len() > MAX_CHILD_TITLE_BYTES || t.chars().any(char::is_control) {
-                        return Err("orchestrate title exceeds 120 bytes or has control chars".into());
+                        return Err(
+                            "orchestrate title exceeds 120 bytes or has control chars".into()
+                        );
                     }
                 }
                 Ok(())
@@ -844,6 +870,15 @@ impl OrchestrateCall {
                 }
                 Ok(())
             }
+            Self::Close {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id,
+            } => {
+                check_common(repo_path, caller_session_id, caller_token)?;
+                check_child(child_session_id)
+            }
         }
     }
 }
@@ -863,9 +898,7 @@ fn validate_child_input_bytes(input: &str) -> Result<(), String> {
                 )
             }
             0x1a => {
-                return Err(
-                    "Ctrl+Z suspend (0x1a) is not permitted in child terminal input".into(),
-                )
+                return Err("Ctrl+Z suspend (0x1a) is not permitted in child terminal input".into())
             }
             _ => {}
         }
@@ -1085,7 +1118,10 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
     }
 }
 
-fn render_redacted_screen(record: &OrchestratedRecord, max_lines: usize) -> (String, usize, usize, bool) {
+fn render_redacted_screen(
+    record: &OrchestratedRecord,
+    max_lines: usize,
+) -> (String, usize, usize, bool) {
     let mut logical_lines: Vec<String> = Vec::new();
     if let Some(parser) = record.parser.as_ref() {
         let mut screen = parser.screen().clone();
@@ -1228,7 +1264,9 @@ pub fn execute(
                 None => repo_buf.clone(),
             };
             if !resolved_cwd.is_dir() {
-                return Err("requested child cwd is not an existing directory inside repo_path".into());
+                return Err(
+                    "requested child cwd is not an existing directory inside repo_path".into(),
+                );
             }
             let resolved_cwd_str = resolved_cwd.to_string_lossy().into_owned();
 
@@ -1249,17 +1287,15 @@ pub fn execute(
                 } else {
                     if command.is_some() {
                         return Err(
-                            "command applies only to shell launcher; pass prompt for agent launchers"
-                                .into(),
-                        );
+                        "command applies only to shell launcher; pass prompt for agent launchers"
+                            .into(),
+                    );
                     }
                     let agent_args = build_agent_child_args(&launcher, prompt.as_deref())?;
                     (Some(launcher.clone()), agent_args, None, true, None)
                 };
 
-            let clean_title = title
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty());
+            let clean_title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
             let want_split = split.unwrap_or(true);
             let pty_rows = rows.unwrap_or(28);
             let pty_cols = cols.unwrap_or(100);
@@ -1342,7 +1378,10 @@ pub fn execute(
             let trimmed = path.trim().trim_start_matches("./");
             let joined = sandbox_join_canonical(&repo_buf, trimmed)?;
             if !joined.is_file() {
-                return Err(format!("'{}' is not an existing file in the repository", trimmed));
+                return Err(format!(
+                    "'{}' is not an existing file in the repository",
+                    trimmed
+                ));
             }
             let rel = joined
                 .strip_prefix(&repo_buf)
@@ -1467,9 +1506,51 @@ pub fn execute(
                 since_seq.unwrap_or(rec.baseline_event_seq)
             };
 
+            let mut last_port_probe: Option<Instant> = None;
             loop {
                 #[cfg(unix)]
                 refresh_detached_host_screen(state, &child_session_id);
+
+                if wait_idle
+                    && last_port_probe.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+                {
+                    last_port_probe = Some(Instant::now());
+                    let needs_port = {
+                        let inner = state.orchestration.lock();
+                        inner.sessions.get(&child_session_id).is_some_and(|rec| {
+                            !rec.ended
+                                && rec
+                                    .telemetry
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .dev_server_url
+                                    .is_none()
+                        })
+                    };
+                    if needs_port {
+                        if let Ok(ports) =
+                            crate::terminal::session_listening_ports(state, &child_session_id)
+                        {
+                            if let Some(&port) = ports.first() {
+                                let inner = state.orchestration.lock();
+                                if let Some(rec) = inner.sessions.get(&child_session_id) {
+                                    let mut guard = rec
+                                        .telemetry
+                                        .0
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if guard.dev_server_url.is_none() {
+                                        guard.dev_server_url =
+                                            Some(format!("http://localhost:{port}"));
+                                        guard.event_seq = guard.event_seq.saturating_add(1);
+                                        guard.last_dev_event_seq = guard.event_seq;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let mut inner = state.orchestration.lock();
                 let rec = authorize_child(
@@ -1522,12 +1603,9 @@ pub fn execute(
 
                 if let Some(reason) = matched_reason {
                     if let Some(rec_mut) = inner.sessions.get_mut(&child_session_id) {
-                        rec_mut.baseline_event_seq =
-                            rec_mut.baseline_event_seq.max(tel.event_seq);
+                        rec_mut.baseline_event_seq = rec_mut.baseline_event_seq.max(tel.event_seq);
                     }
-                    let matched = pattern
-                        .as_deref()
-                        .map_or(true, |_| reason == "pattern");
+                    let matched = pattern.as_deref().is_none_or(|_| reason == "pattern");
                     return Ok(json!({
                         "ok": true,
                         "child_session_id": child_session_id,
@@ -1702,6 +1780,56 @@ pub fn execute(
                 "gate_notice": gate_notice,
             }))
         }
+
+        OrchestrateCall::Close {
+            repo_path,
+            caller_session_id,
+            caller_token,
+            child_session_id,
+        } => {
+            let repo_buf = canonical_trusted_repo(&repo_path)?;
+            let canonical_repo = repo_buf.to_string_lossy().into_owned();
+            authorize_caller(
+                &state.orchestration,
+                &caller_session_id,
+                &caller_token,
+                &canonical_repo,
+            )?;
+
+            let already_ended = {
+                let inner = state.orchestration.lock();
+                let rec = authorize_child(
+                    &inner,
+                    &caller_session_id,
+                    &child_session_id,
+                    &canonical_repo,
+                )?;
+                let tel_ended = rec
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ended;
+                rec.ended || tel_ended
+            };
+
+            if !already_ended {
+                crate::terminal::kill_session(state, &child_session_id)?;
+                state.orchestration.mark_ended(&child_session_id, None);
+            }
+
+            ui.child_closed(TerminalChildClosedPayload {
+                id: child_session_id.clone(),
+                parent_session_id: caller_session_id,
+                repo_path: canonical_repo,
+            });
+
+            Ok(json!({
+                "ok": true,
+                "child_session_id": child_session_id,
+                "already_ended": already_ended,
+            }))
+        }
     }
 }
 
@@ -1725,12 +1853,17 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct TestUiSink {
         pub(crate) spawned: Mutex<Vec<TerminalChildSpawnedPayload>>,
+        pub(crate) closed: Mutex<Vec<TerminalChildClosedPayload>>,
         pub(crate) opened: Mutex<Vec<TerminalOpenFileRequestPayload>>,
     }
 
     impl OrchestrateUiSink for TestUiSink {
         fn child_spawned(&self, payload: TerminalChildSpawnedPayload) {
             self.spawned.lock().unwrap().push(payload);
+        }
+
+        fn child_closed(&self, payload: TerminalChildClosedPayload) {
+            self.closed.lock().unwrap().push(payload);
         }
 
         fn open_file_requested(&self, payload: TerminalOpenFileRequestPayload) {
@@ -1787,7 +1920,10 @@ pub(crate) mod tests {
         assert!(is_well_formed_token(&a));
         assert!(is_well_formed_token(&b));
         assert!(ct_eq_32(&hash_token(&a).unwrap(), &hash_token(&a).unwrap()));
-        assert!(!ct_eq_32(&hash_token(&a).unwrap(), &hash_token(&b).unwrap()));
+        assert!(!ct_eq_32(
+            &hash_token(&a).unwrap(),
+            &hash_token(&b).unwrap()
+        ));
 
         let sample = format!(
             "TOKEN={a}\nbare_token={b}\nplain {a} inline\nANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret"
@@ -2201,16 +2337,27 @@ pub(crate) mod tests {
         for idx in 1..=120 {
             payload.push_str(&format!("SCROLL_ROW_{idx:03}\r\n"));
         }
-        state.orchestration.observe_output(child, payload.as_bytes());
+        state
+            .orchestration
+            .observe_output(child, payload.as_bytes());
 
         let inner = state.orchestration.lock();
         let rec = inner.sessions.get(child).unwrap();
         let (text, lines_returned, total_lines, truncated) = render_redacted_screen(rec, 120);
-        assert_eq!(total_lines, 120, "expected 120 lines across scrollback + viewport, got {total_lines}");
+        assert_eq!(
+            total_lines, 120,
+            "expected 120 lines across scrollback + viewport, got {total_lines}"
+        );
         assert_eq!(lines_returned, 120);
         assert!(!truncated);
-        assert!(text.contains("SCROLL_ROW_001"), "missing earliest scrollback row: {text}");
-        assert!(text.contains("SCROLL_ROW_120"), "missing newest viewport row: {text}");
+        assert!(
+            text.contains("SCROLL_ROW_001"),
+            "missing earliest scrollback row: {text}"
+        );
+        assert!(
+            text.contains("SCROLL_ROW_120"),
+            "missing newest viewport row: {text}"
+        );
         assert_eq!(rec.parser.as_ref().unwrap().screen().scrollback(), 0);
     }
 
@@ -2255,7 +2402,8 @@ pub(crate) mod tests {
                 caller_session_id: parent.into(),
                 caller_token: token.clone(),
                 child_session_id: child.clone(),
-                input: r#"printf '\033]7501;status;idle;Ready\007http://%s:4321/\n' localhost"#.into(),
+                input: r#"printf '\033]7501;status;idle;Ready\007http://%s:4321/\n' localhost"#
+                    .into(),
                 append_newline: Some(true),
             },
         )
@@ -2373,5 +2521,169 @@ pub(crate) mod tests {
         assert_eq!(listed["total"], 1);
         assert_eq!(listed["children"][0]["child_session_id"], child_id);
         assert_eq!(listed["children"][0]["title"], "adopted-child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_terminates_owned_child_frees_parent_slot_is_idempotent_and_refuses_foreign_sessions() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+
+        let user_shell = spawn_at(
+            &state,
+            Place::Repo {
+                repo_path: repo.clone(),
+                start_dir: None,
+            },
+            24,
+            80,
+            None,
+            None,
+            None,
+            discard_sink(),
+            Arc::new(RecordingEvents),
+            None,
+            None,
+        )
+        .expect("user shell");
+
+        let parent_a = "term-90006-1";
+        let token_a = state
+            .orchestration
+            .register_test_parent(parent_a, Path::new(&repo));
+        let parent_b = "term-90006-2";
+        let token_b = state
+            .orchestration
+            .register_test_parent(parent_b, Path::new(&repo));
+
+        let mut children_a = Vec::new();
+        for idx in 0..MAX_CHILDREN_PER_PARENT {
+            let spawned = execute(
+                &state,
+                &ui,
+                OrchestrateCall::Spawn {
+                    repo_path: repo.clone(),
+                    caller_session_id: parent_a.into(),
+                    caller_token: token_a.clone(),
+                    launcher: Some("shell".into()),
+                    cwd: None,
+                    command: None,
+                    prompt: None,
+                    title: Some(format!("worker-{idx}")),
+                    split: Some(false),
+                    rows: Some(24),
+                    cols: Some(80),
+                },
+            )
+            .expect("spawn child within cap");
+            children_a.push(spawned["child_session_id"].as_str().unwrap().to_string());
+        }
+
+        // At MAX_CHILDREN_PER_PARENT = 8, spawning a 9th child is refused.
+        let ninth_err = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: parent_a.into(),
+                caller_token: token_a.clone(),
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("overflow".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            ninth_err.contains("already has 8 active child sessions (limit 8)"),
+            "unexpected error: {ninth_err}"
+        );
+
+        // Option A: Parent B cannot close Parent A's child, and Parent A cannot close user_shell or itself.
+        for (caller_id, caller_tok, target) in [
+            (parent_b, &token_b, children_a[0].as_str()),
+            (parent_a, &token_a, user_shell.id.as_str()),
+            (parent_a, &token_a, parent_a),
+            (parent_a, &token_a, "term-90006-missing"),
+        ] {
+            let err = execute(
+                &state,
+                &ui,
+                OrchestrateCall::Close {
+                    repo_path: repo.clone(),
+                    caller_session_id: caller_id.into(),
+                    caller_token: caller_tok.clone(),
+                    child_session_id: target.into(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err, LINEAGE_REFUSAL, "target {target}");
+        }
+
+        // Closing one owned child terminates it, emits child_closed, and frees the slot immediately.
+        let closed_first = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Close {
+                repo_path: repo.clone(),
+                caller_session_id: parent_a.into(),
+                caller_token: token_a.clone(),
+                child_session_id: children_a[0].clone(),
+            },
+        )
+        .expect("close owned child");
+        assert_eq!(closed_first["ok"], true);
+        assert_eq!(closed_first["already_ended"], false);
+        assert_eq!(ui.closed.lock().unwrap().len(), 1);
+        assert_eq!(ui.closed.lock().unwrap()[0].id, children_a[0]);
+
+        // Re-closing an already-ended child is idempotent.
+        let closed_again = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Close {
+                repo_path: repo.clone(),
+                caller_session_id: parent_a.into(),
+                caller_token: token_a.clone(),
+                child_session_id: children_a[0].clone(),
+            },
+        )
+        .expect("idempotent close");
+        assert_eq!(closed_again["already_ended"], true);
+
+        // Parent A can immediately spawn another child in the freed slot.
+        let replacement = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo,
+                caller_session_id: parent_a.into(),
+                caller_token: token_a,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("replacement".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .expect("spawn replacement in freed slot");
+        let replacement_id = replacement["child_session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let _ = crate::terminal::kill_session(&state, &user_shell.id);
+        let _ = crate::terminal::kill_session(&state, &replacement_id);
+        for cid in children_a.iter().skip(1) {
+            let _ = crate::terminal::kill_session(&state, cid);
+        }
     }
 }

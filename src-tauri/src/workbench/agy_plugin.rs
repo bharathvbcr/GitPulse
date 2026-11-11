@@ -87,7 +87,10 @@ fn resolve_helper_binary(env_var: &str, name: &str, exe: Option<&Path>) -> Resul
     let beside = exe.and_then(Path::parent).map(|dir| dir.join(&bin_name));
     match beside {
         Some(path) if is_executable_file(&path) => Ok(path),
-        Some(path) => Err(format!("{bin_name} is not found beside executable at {}", path.display())),
+        Some(path) => Err(format!(
+            "{bin_name} is not found beside executable at {}",
+            path.display()
+        )),
         None => Err("current executable path could not be determined".into()),
     }
 }
@@ -96,18 +99,23 @@ fn ensure_non_symlink_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                return Err(format!("refusing to traverse symlink at {}", path.display()));
+                return Err(format!(
+                    "refusing to traverse symlink at {}",
+                    path.display()
+                ));
             }
             if !meta.is_dir() {
                 return Err(format!("expected directory at {}", path.display()));
             }
             Ok(())
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(path)
-                .map_err(|e| format!("could not create {}: {e}", path.display()))
-        }
-        Err(err) => Err(format!("could not inspect {}: {e}", path.display(), e = err)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)
+            .map_err(|e| format!("could not create {}: {e}", path.display())),
+        Err(err) => Err(format!(
+            "could not inspect {}: {e}",
+            path.display(),
+            e = err
+        )),
     }
 }
 
@@ -143,7 +151,9 @@ fn rewrite_agy_hooks(raw_hooks_json: &str, wrapper_hook_path: &Path) -> Result<S
     let root = parsed
         .get_mut("gitpulse")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| "plugins/gitpulse/hooks.json missing top-level 'gitpulse' object".to_owned())?;
+        .ok_or_else(|| {
+            "plugins/gitpulse/hooks.json missing top-level 'gitpulse' object".to_owned()
+        })?;
 
     for (_event, entries) in root.iter_mut() {
         let Some(arr) = entries.as_array_mut() else {
@@ -212,10 +222,7 @@ fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!(
-            "could not inspect {}: {err}",
-            plugin_dir.display()
-        )),
+        Err(err) => Err(format!("could not inspect {}: {err}", plugin_dir.display())),
     }
 }
 
@@ -275,7 +282,9 @@ pub(crate) fn sync_under_home(
     }
 
     let (Some(mcp_bin), Some(hook_bin)) = (mcp_bin, hook_bin) else {
-        return Err("missing gitpulse-mcp or gitpulse-hook binary path for Antigravity plugin sync".into());
+        return Err(
+            "missing gitpulse-mcp or gitpulse-hook binary path for Antigravity plugin sync".into(),
+        );
     };
 
     let _already_owned = verify_owned_or_absent(&plugin_dir)?;
@@ -297,7 +306,11 @@ pub(crate) fn sync_under_home(
     write_regular_file(&wrapper_mcp, build_mcp_wrapper(mcp_bin).as_bytes(), true)?;
     write_regular_file(&wrapper_hook, build_hook_wrapper(hook_bin).as_bytes(), true)?;
 
-    write_regular_file(&plugin_dir.join("plugin.json"), PLUGIN_JSON.as_bytes(), false)?;
+    write_regular_file(
+        &plugin_dir.join("plugin.json"),
+        PLUGIN_JSON.as_bytes(),
+        false,
+    )?;
 
     let mut mcp_json = serde_json::to_string_pretty(&json!({
         "mcpServers": {
@@ -418,7 +431,9 @@ mod tests {
         assert!(plugin_dir.join("plugin.json").is_file());
         assert!(plugin_dir.join("bin/gitpulse-mcp").is_file());
         assert!(plugin_dir.join("bin/gitpulse-hook").is_file());
-        assert!(plugin_dir.join("skills/gitpulse-terminal/SKILL.md").is_file());
+        assert!(plugin_dir
+            .join("skills/gitpulse-terminal/SKILL.md")
+            .is_file());
 
         let mcp_json: Value =
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("mcp.json")).unwrap())
@@ -440,6 +455,7 @@ mod tests {
         );
 
         // If `agy` is installed on the host, run `agy plugin validate --strict --json`.
+        use crate::procguard::LockedSpawn;
         if let Ok(output) = std::process::Command::new("agy")
             .args([
                 "plugin",
@@ -448,7 +464,7 @@ mod tests {
                 "--strict",
                 "--json",
             ])
-            .output()
+            .output_locked()
         {
             assert!(
                 output.status.success(),

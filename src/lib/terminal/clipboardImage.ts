@@ -10,6 +10,37 @@ export interface ClipboardDataLike {
   getData: (format: string) => string;
   items?: ArrayLike<ClipboardItemLike> | null;
   files?: ArrayLike<File> | null;
+  types?: ArrayLike<string> | null;
+}
+
+/**
+ * Returns `true` when a `paste` event might represent files copied in Finder
+ * (`public.file-url` on macOS `NSPasteboard`) rather than ordinary plain text:
+ * - Finder sets `text/plain` to the bare filename(s) alongside `Files` items; or
+ * - A pasteboard writer placed `public.file-url` with no `text/plain`.
+ *
+ * Ordinary text copies from editors/terminals/browsers have non-empty `text/plain`
+ * and zero file items, so they stay 100% synchronous with zero IPC overhead.
+ */
+export function clipboardMayHoldFiles(
+  data: ClipboardDataLike | null | undefined,
+  plainText?: string,
+): boolean {
+  if (!data) return false;
+  const plain = plainText ?? data.getData("text/plain");
+  if (!plain) return true;
+  if (data.files && data.files.length > 0) return true;
+  if (data.items) {
+    for (let i = 0; i < data.items.length; i++) {
+      if (data.items[i]?.kind === "file") return true;
+    }
+  }
+  if (data.types) {
+    for (let i = 0; i < data.types.length; i++) {
+      if (data.types[i] === "Files") return true;
+    }
+  }
+  return false;
 }
 
 /**

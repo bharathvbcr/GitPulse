@@ -11,6 +11,7 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
+import { bytesToBase64, MAX_CLIPBOARD_IMAGE_BYTES } from "../terminal/clipboardImage";
 
 /** Where a pane sits, in window points from the content area's top-left. */
 export interface PaneBounds {
@@ -18,6 +19,33 @@ export interface PaneBounds {
   y: number;
   width: number;
   height: number;
+}
+
+/** Scratch screenshot path paired with an inline PNG data URL for element-picker overlays. */
+export interface BrowserSnapshotPreview {
+  path: string;
+  data_url: string;
+}
+
+/** Bounding box of a picked DOM element in the child webview's CSS viewport coordinates. */
+export interface BrowserElementRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Metadata returned by `cmd_browser_inspect_point` for the element at `(x, y)`. */
+export interface BrowserElementPick {
+  selector: string;
+  tag: string;
+  id: string;
+  classes: string[];
+  text: string;
+  url: string;
+  rect: BrowserElementRect;
+  viewport_width: number;
+  viewport_height: number;
 }
 
 /** What a session's page did, as `src-tauri/src/browser` reports it. */
@@ -37,6 +65,15 @@ export const browserIpc = {
   go: (id: string, to: HistoryStep) => invoke<void>("cmd_browser_go", { id, to }),
   close: (id: string) => invoke<void>("cmd_browser_close", { id }),
   snapshot: (id: string) => invoke<string>("cmd_browser_snapshot", { id }),
+  snapshotPreview: (id: string) => invoke<BrowserSnapshotPreview>("cmd_browser_snapshot_preview", { id }),
+  inspectPoint: (id: string, x: number, y: number, viewportWidth: number, viewportHeight: number) =>
+    invoke<BrowserElementPick>("cmd_browser_inspect_point", {
+      id,
+      x,
+      y,
+      viewportWidth,
+      viewportHeight,
+    }),
 };
 
 /** The longest page text taken from an event; the backend caps it too. */
@@ -237,14 +274,140 @@ export function paneShown(state: {
   opened: boolean;
   onscreen: boolean;
   occluded: boolean;
+  picking?: boolean;
   bounds: PaneBounds | null;
 }): boolean {
   return (
     state.opened &&
     state.onscreen &&
     !state.occluded &&
+    !state.picking &&
     state.bounds !== null &&
     state.bounds.width >= 1 &&
     state.bounds.height >= 1
   );
+}
+
+function sanitizeInlineToken(raw: string, maxChars: number): string {
+  return raw
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxChars);
+}
+
+/**
+ * Formats an inspected DOM element and its cropped screenshot path into a
+ * single-line multimodal `@path` prompt reference for `claude` / `agy`.
+ */
+export function formatPickedElementReference(pngPath: string, pick: BrowserElementPick): string {
+  const cleanPath = pngPath.replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  const formattedPath = /\s/.test(cleanPath) ? `"${cleanPath}"` : cleanPath;
+  const cleanUrl = sanitizeInlineToken(pick.url, 512).replace(/[\[\]]/g, "");
+  const cleanSelector = (sanitizeInlineToken(pick.selector || pick.tag || "element", 128) || "element")
+    .replace(/[<>[\]]/g, "");
+  const cleanText = sanitizeInlineToken(pick.text, 140).replace(/"/g, "'");
+  const textPart = cleanText ? ` "${cleanText}"` : "";
+  const urlPart = cleanUrl ? `${cleanUrl} ` : "";
+  return `@${formattedPath} [${urlPart}<${cleanSelector}>${textPart}] `;
+}
+
+export interface ElementCropBox {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+}
+
+/**
+ * Maps an element's CSS viewport rectangle onto pixel coordinates inside a
+ * native snapshot PNG (accounting for Retina BackingScaleFactor and clamping a
+ * small context border to the image bounds).
+ */
+export function computeElementCropBox(
+  rect: BrowserElementRect,
+  viewportWidth: number,
+  viewportHeight: number,
+  imageWidth: number,
+  imageHeight: number,
+  paddingCssPx = 8,
+): ElementCropBox | null {
+  if (
+    !Number.isFinite(rect.x) ||
+    !Number.isFinite(rect.y) ||
+    !Number.isFinite(rect.width) ||
+    !Number.isFinite(rect.height) ||
+    rect.width < 1 ||
+    rect.height < 1 ||
+    !Number.isFinite(viewportWidth) ||
+    !Number.isFinite(viewportHeight) ||
+    viewportWidth < 1 ||
+    viewportHeight < 1 ||
+    !Number.isFinite(imageWidth) ||
+    !Number.isFinite(imageHeight) ||
+    imageWidth < 1 ||
+    imageHeight < 1
+  ) {
+    return null;
+  }
+  const scaleX = imageWidth / viewportWidth;
+  const scaleY = imageHeight / viewportHeight;
+  const padX = Math.max(0, paddingCssPx) * scaleX;
+  const padY = Math.max(0, paddingCssPx) * scaleY;
+  const x0 = Math.max(0, Math.floor(rect.x * scaleX - padX));
+  const y0 = Math.max(0, Math.floor(rect.y * scaleY - padY));
+  const x1 = Math.min(imageWidth, Math.ceil((rect.x + rect.width) * scaleX + padX));
+  const y1 = Math.min(imageHeight, Math.ceil((rect.y + rect.height) * scaleY + padY));
+  const sw = x1 - x0;
+  const sh = y1 - y0;
+  if (sw < 1 || sh < 1) return null;
+  return { sx: x0, sy: y0, sw, sh };
+}
+
+/**
+ * Crops `dataUrl` around `pick.rect` onto an offscreen 2D canvas and returns
+ * PNG base64, or `null` if cropping is unavailable so callers can fall back to
+ * the full-viewport snapshot file.
+ */
+export async function cropSnapshotToElementBase64(
+  dataUrl: string,
+  pick: BrowserElementPick,
+): Promise<string | null> {
+  if (typeof document === "undefined" || typeof fetch !== "function" || typeof createImageBitmap !== "function") {
+    return null;
+  }
+  try {
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const box = computeElementCropBox(
+        pick.rect,
+        pick.viewport_width,
+        pick.viewport_height,
+        bitmap.width,
+        bitmap.height,
+        8,
+      );
+      if (!box) return null;
+      const canvas = document.createElement("canvas");
+      canvas.width = box.sw;
+      canvas.height = box.sh;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(bitmap, box.sx, box.sy, box.sw, box.sh, 0, 0, box.sw, box.sh);
+      const pngBlob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((out) => resolve(out), "image/png");
+      });
+      if (!pngBlob || pngBlob.size === 0 || pngBlob.size > MAX_CLIPBOARD_IMAGE_BYTES) {
+        return null;
+      }
+      const buf = await pngBlob.arrayBuffer();
+      return bytesToBase64(new Uint8Array(buf));
+    } finally {
+      bitmap.close();
+    }
+  } catch {
+    return null;
+  }
 }

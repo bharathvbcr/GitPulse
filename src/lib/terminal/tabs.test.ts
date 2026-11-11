@@ -477,4 +477,63 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
     expect(refused.id).toBeNull();
     expect(refused.state).toBe(full);
   });
+
+  it("records parentSessionId on attached child tabs, filters live children per parent, and builds pair handoff prompts", async () => {
+    const mod = await import("./tabs");
+    const base = initialState("claude");
+    const adoptedA = openAttachedChildTab(base, {
+      sessionId: "term-parent-child-1",
+      parentSessionId: "term-parent-1",
+      launcher: "shell",
+      title: "worker-1",
+    });
+    const adoptedB = openAttachedChildTab(adoptedA.state, {
+      sessionId: "term-parent-child-2",
+      parentSessionId: "term-parent-1",
+      launcher: "agy",
+      title: "worker-2",
+    });
+    const otherParent = openAttachedChildTab(adoptedB.state, {
+      sessionId: "term-other-child",
+      parentSessionId: "term-parent-2",
+      launcher: "shell",
+    });
+
+    const childTabs = mod.childTabsForParent(otherParent.state, "term-parent-1", {
+      [adoptedA.id!]: "running",
+      [adoptedB.id!]: "exited",
+    });
+    expect(childTabs.map((t: { id: string }) => t.id)).toEqual([adoptedA.id]);
+
+    const handoff = mod.buildPairHandoffPrompt({
+      fromLauncher: "claude",
+      openFilePath: "src/lib/app.ts",
+      openFileLine: 42,
+      terminalTail: "\x1b[32mPASS\x1b[0m src/lib/app.test.ts\nNeeds UI polish in Header\n",
+    });
+    expect(handoff).toContain("Handoff from Claude");
+    expect(handoff).toContain("@src/lib/app.ts#L42");
+    expect(handoff).toContain("PASS src/lib/app.test.ts");
+    expect(handoff).not.toContain("\x1b[");
+  });
+
+  it("validates worktree slugs and opens checkout-bound agent tabs without fake taskRunIds", async () => {
+    const mod = await import("./tabs");
+    expect(mod.sanitizeWorktreeSlug("  Feature_42 / Fix  ")).toBe("feature_42-fix");
+    expect(mod.sanitizeWorktreeSlug("..")).toBeNull();
+    expect(mod.sanitizeWorktreeSlug("   ")).toBeNull();
+
+    const wtOpened = mod.openCheckoutTab(initialState("shell"), "claude", {
+      checkout: "/Users/dev/repo.wt-agent-1",
+      name: "Claude · agent-1",
+    });
+    expect(wtOpened.id).toBeTruthy();
+    const created = wtOpened.state.tabs.find((t: { id: string }) => t.id === wtOpened.id)!;
+    expect(created).toMatchObject({
+      launcher: "claude",
+      checkout: "/Users/dev/repo.wt-agent-1",
+      name: "Claude · agent-1",
+    });
+    expect(created.taskRunId).toBeUndefined();
+  });
 });

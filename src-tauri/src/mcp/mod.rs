@@ -1089,6 +1089,27 @@ tool_args! {
 }
 
 tool_args! {
+    struct TerminalCloseArgs {
+        repo_path: String = repo_spec(),
+        child_session_id: String = Spec::bytes(
+            "Child terminal session id previously spawned by this parent session",
+            1,
+            64,
+        ),
+        caller_session_id: Option<String> = Spec::bytes(
+            "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+            1,
+            64,
+        ),
+        caller_token: Option<String> = Spec::bytes(
+            "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+            1,
+            128,
+        ),
+    }
+}
+
+tool_args! {
     struct WorktreeInboxArgs {
         repo_path: String = repo_spec(),
         agent_id: Option<String> = Spec::bytes(
@@ -2300,6 +2321,23 @@ fn build_tools() -> Vec<Value> {
             }),
             false,
         )),
+        open_world(mutating_tool(
+            "gitpulse_terminal_close",
+            "Close an owned child terminal session",
+            "Terminate a child terminal session spawned by this parent, release its per-parent concurrency slot immediately, and close its split pane in the GitPulse window",
+            TerminalCloseArgs::properties(),
+            &TerminalCloseArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "child_session_id": { "type": "string" },
+                    "already_ended": { "type": "boolean" }
+                },
+                "required": ["ok", "child_session_id", "already_ended"]
+            }),
+            false,
+        )),
         tool(
             "gitpulse_worktree_inbox",
             "Read agent coordination inbox",
@@ -3120,8 +3158,10 @@ fn ask_app_to_orchestrate(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = call;
-        Err("Terminal orchestration over the desktop mailbox is available on macOS only for now"
-            .to_string())
+        Err(
+            "Terminal orchestration over the desktop mailbox is available on macOS only for now"
+                .to_string(),
+        )
     }
 }
 
@@ -3992,6 +4032,17 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 child_session_id: a.child_session_id,
                 input: a.input,
                 append_newline: a.append_newline,
+            })
+        }
+        "gitpulse_terminal_close" => {
+            let a: TerminalCloseArgs = parse(name, arguments)?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_orchestrate_context(&a.repo_path, a.caller_session_id, a.caller_token)?;
+            ask_app_to_orchestrate(crate::terminal::orchestrate::OrchestrateCall::Close {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id: a.child_session_id,
             })
         }
         "gitpulse_worktree_inbox" => {
@@ -5315,6 +5366,7 @@ mod tests {
                             | "gitpulse_terminal_spawn"
                             | "gitpulse_terminal_open_file"
                             | "gitpulse_terminal_send"
+                            | "gitpulse_terminal_close"
                             | "gitpulse_worktree_overlay_sync"
                             | "gitpulse_inbox_post"
                             | "gitpulse_inbox_withdraw"
@@ -6147,17 +6199,15 @@ mod tests {
             "gitpulse_terminal_open_file",
             "one open-file split receipt, no list",
         ),
-        (
-            "gitpulse_terminal_wait",
-            "one child wait outcome, no list",
-        ),
+        ("gitpulse_terminal_wait", "one child wait outcome, no list"),
         (
             "gitpulse_terminal_read",
             "one rendered screen snapshot, no list",
         ),
+        ("gitpulse_terminal_send", "one gated input receipt, no list"),
         (
-            "gitpulse_terminal_send",
-            "one gated input receipt, no list",
+            "gitpulse_terminal_close",
+            "one child session close receipt, no list",
         ),
         (
             "gitpulse_worktree_switch",
@@ -6767,6 +6817,16 @@ mod tests {
                 "gitpulse_terminal_list",
                 json!({
                     "repo_path": wt_repo,
+                    "caller_session_id": parent_id,
+                    "caller_token": parent_token,
+                }),
+                &mut validated,
+            );
+            call_writer(
+                "gitpulse_terminal_close",
+                json!({
+                    "repo_path": wt_repo,
+                    "child_session_id": child_id,
                     "caller_session_id": parent_id,
                     "caller_token": parent_token,
                 }),
@@ -8718,6 +8778,10 @@ mod tests {
                 json!({ "repo_path": repo, "child_session_id": "term-1-2", "input": "pwd", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
             ),
             (
+                "gitpulse_terminal_close",
+                json!({ "repo_path": repo, "child_session_id": "term-1-2", "caller_session_id": "term-1-1", "caller_token": "gpst_probe" }),
+            ),
+            (
                 "gitpulse_inbox_post",
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "thread_key": "t-untrusted", "body": "probe" }),
             ),
@@ -9604,6 +9668,7 @@ mod tests {
             ("gitpulse_terminal_wait", TerminalWaitArgs),
             ("gitpulse_terminal_read", TerminalReadArgs),
             ("gitpulse_terminal_send", TerminalSendArgs),
+            ("gitpulse_terminal_close", TerminalCloseArgs),
             ("gitpulse_worktree_inbox", WorktreeInboxArgs),
             ("gitpulse_inbox_post", InboxPostArgs),
             ("gitpulse_inbox_read", InboxReadArgs),
@@ -9728,6 +9793,7 @@ mod tests {
                 ("gitpulse_terminal_wait", TerminalWaitArgs),
                 ("gitpulse_terminal_read", TerminalReadArgs),
                 ("gitpulse_terminal_send", TerminalSendArgs),
+                ("gitpulse_terminal_close", TerminalCloseArgs),
                 ("gitpulse_worktree_inbox", WorktreeInboxArgs),
                 ("gitpulse_inbox_post", InboxPostArgs),
                 ("gitpulse_inbox_read", InboxReadArgs),

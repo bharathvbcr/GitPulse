@@ -131,6 +131,18 @@ fn requests_are_bounded_before_anything_acts_on_them() {
             conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
             artifact_dir: Some("/Users/dev/.gemini/antigravity/brain/ec33ebf9".into()),
         },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "/Users/dev/repo".into(),
+            path: "src/lib/app.ts".into(),
+            artifact: false,
+        },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "/Users/dev/repo".into(),
+            path: "implementation_plan.md".into(),
+            artifact: true,
+        },
     ];
     for request in ok {
         assert_eq!(request.validate(), Ok(()), "{request:?}");
@@ -210,6 +222,36 @@ fn requests_are_bounded_before_anything_acts_on_them() {
             agent: "agy".into(),
             conversation_id: "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
             artifact_dir: Some("relative/artifacts".into()),
+        },
+        Request::AgentTouchedFile {
+            terminal_id: String::new(),
+            repo: "/Users/dev/repo".into(),
+            path: "src/lib/app.ts".into(),
+            artifact: false,
+        },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "relative/repo".into(),
+            path: "src/lib/app.ts".into(),
+            artifact: false,
+        },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "/Users/dev/repo".into(),
+            path: "/etc/passwd".into(),
+            artifact: false,
+        },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "/Users/dev/repo".into(),
+            path: "../escape.ts".into(),
+            artifact: false,
+        },
+        Request::AgentTouchedFile {
+            terminal_id: "term-123-1".into(),
+            repo: "/Users/dev/repo".into(),
+            path: "src/\0bad.ts".into(),
+            artifact: false,
         },
     ];
     for request in refused {

@@ -899,7 +899,7 @@ describe("gitpulse-terminal plugin skill contract", () => {
     expect(Array.from(skillTools).sort()).toEqual(Array.from(mcpTools).sort());
   });
 
-  it("names real Rust response fields on spawn, wait, read, send, and list", () => {
+  it("names real Rust response fields on spawn, wait, read, send, close, and list", () => {
     for (const field of [
       "child_session_id",
       "baseline_seq",
@@ -910,6 +910,7 @@ describe("gitpulse-terminal plugin skill contract", () => {
       "total_lines",
       "gate_checked",
       "gate_notice",
+      "already_ended",
     ]) {
       expect(orchestrateRs).toMatch(new RegExp(`(?:pub ${field}:|"${field}":)`));
       expect(skillMd).toContain(`\`${field}\``);

@@ -84,6 +84,9 @@ pub enum Request {
     Context {
         session: String,
     },
+    ListeningPorts {
+        session: String,
+    },
     Background {
         sessions: Vec<String>,
     },

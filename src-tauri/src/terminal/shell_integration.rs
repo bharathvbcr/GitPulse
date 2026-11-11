@@ -245,8 +245,7 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("could not create {}: {e}", dir.display()))
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))
     }
 }
 
@@ -397,7 +396,13 @@ mod tests {
     fn skips_agent_launchers_and_honors_opt_out_env() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut agent_cmd = CommandBuilder::new("/usr/local/bin/claude");
-        apply_to_default_shell_in(&mut agent_cmd, "/usr/local/bin/claude", false, false, tmp.path());
+        apply_to_default_shell_in(
+            &mut agent_cmd,
+            "/usr/local/bin/claude",
+            false,
+            false,
+            tmp.path(),
+        );
         assert!(agent_cmd.get_env("ZDOTDIR").is_none());
 
         let mut opted_out = CommandBuilder::new("/bin/zsh");
@@ -437,10 +442,14 @@ mod tests {
             vec![
                 "/bin/bash".to_string(),
                 "--rcfile".to_string(),
-                root.join("bash/gitpulse.bash").to_string_lossy().into_owned(),
+                root.join("bash/gitpulse.bash")
+                    .to_string_lossy()
+                    .into_owned(),
                 "-i".to_string(),
             ]
         );
+
+        use crate::procguard::LockedSpawn;
 
         let cafe = tmp.path().join("caf\u{00e9}");
         std::fs::create_dir_all(&cafe).expect("mkdir cafe");
@@ -450,7 +459,7 @@ mod tests {
             .env("GITPULSE_ZSH_SHIM_DIR", root.join("zsh"))
             .env(USER_ZDOTDIR_ENV, tmp.path())
             .args(["-i", "-c", "__gitpulse_precmd"])
-            .output()
+            .output_locked()
             .expect("run zsh");
         let zsh_raw = String::from_utf8_lossy(&zsh_out.stdout);
         assert!(
@@ -472,13 +481,16 @@ mod tests {
                 "-c",
                 "__gitpulse_precmd",
             ])
-            .output()
+            .output_locked()
             .expect("run bash");
         let bash_raw = String::from_utf8_lossy(&bash_out.stdout);
         assert!(
             bash_raw.contains("caf%C3%A9") || bash_raw.contains("cafe%CC%81"),
             "bash OSC 7 did not UTF-8 percent-encode non-ASCII path: {bash_raw:?}"
         );
-        assert!(!bash_raw.contains("-%"), "bash produced signed-char hex: {bash_raw:?}");
+        assert!(
+            !bash_raw.contains("-%"),
+            "bash produced signed-char hex: {bash_raw:?}"
+        );
     }
 }

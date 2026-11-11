@@ -292,3 +292,117 @@ pub fn snapshot_png(
         )),
     }
 }
+
+/// Evaluates [`super::inspect_point_script`] at normalized coordinates `(norm_x, norm_y)`
+/// inside `WKContentWorld.defaultClientWorld` (an isolated client JS world that neither
+/// installs a `WKUserScript` nor exposes `window.ipc` / page globals), falling back to
+/// `wry::WebView::evaluate_script_with_callback` if `WKContentWorld` is unavailable.
+///
+/// Main thread only.
+pub fn inspect_point(
+    id: &str,
+    norm_x: f64,
+    norm_y: f64,
+    done: Box<dyn FnOnce(Result<String, String>) + Send>,
+) -> Result<(), BrowserError> {
+    use block2::RcBlock;
+    use objc2::exception::catch;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSError, NSString};
+    use std::ffi::CStr;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::Mutex;
+    use wry::WebViewExtMacOS as _;
+
+    let script = super::inspect_point_script(norm_x, norm_y);
+
+    if let Some(world_cls) = AnyClass::get(c"WKContentWorld") {
+        let raw_webview = with_webview(id, |webview| {
+            objc2::rc::Retained::as_ptr(&webview.webview()) as *mut AnyObject
+        })?;
+        if raw_webview.is_null() {
+            return Err(BrowserError::Native("webview handle is null".into()));
+        }
+
+        let slot = Mutex::new(Some(done));
+        let block = RcBlock::new(move |result: *mut AnyObject, error: *mut NSError| {
+            let Some(deliver) = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            else {
+                return;
+            };
+            let parsed = catch(AssertUnwindSafe(|| -> Result<String, String> {
+                if !error.is_null() {
+                    let desc = unsafe { (&*error).localizedDescription() }.to_string();
+                    return Err(format!("element inspection failed: {desc}"));
+                }
+                if result.is_null() {
+                    return Err("no DOM element found at the selected point".into());
+                }
+                unsafe {
+                    let is_str: bool = msg_send![&*result, isKindOfClass: class!(NSString)];
+                    if !is_str {
+                        return Err("no DOM element found at the selected point".into());
+                    }
+                    let utf8: *const std::ffi::c_char = msg_send![&*result, UTF8String];
+                    if utf8.is_null() {
+                        return Err("element inspection returned invalid UTF-8".into());
+                    }
+                    Ok(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+                }
+            }));
+            let outcome = match parsed {
+                Ok(res) => res,
+                Err(Some(exc)) => Err(format!(
+                    "Objective-C exception reading inspected element: {exc:?}"
+                )),
+                Err(None) => Err("Unknown Objective-C exception reading inspected element".into()),
+            };
+            deliver(outcome);
+        });
+
+        let js_ns = NSString::from_str(&script);
+        let dispatched = catch(AssertUnwindSafe(|| unsafe {
+            let client_world: *mut AnyObject = msg_send![world_cls, defaultClientWorld];
+            if client_world.is_null() {
+                return Err("WKContentWorld.defaultClientWorld returned null".to_owned());
+            }
+            let null_frame: *const AnyObject = std::ptr::null();
+            let _: () = msg_send![
+                &*raw_webview,
+                evaluateJavaScript: &*js_ns,
+                inFrame: null_frame,
+                inContentWorld: &*client_world,
+                completionHandler: &*block
+            ];
+            Ok(())
+        }));
+        return match dispatched {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(why)) => Err(BrowserError::Native(why)),
+            Err(Some(exc)) => Err(BrowserError::Native(format!(
+                "Objective-C exception inspecting element: {exc:?}"
+            ))),
+            Err(None) => Err(BrowserError::Native(
+                "Unknown Objective-C exception inspecting element".into(),
+            )),
+        };
+    }
+
+    let slot = Mutex::new(Some(done));
+    with_webview(id, |webview| {
+        webview.evaluate_script_with_callback(&script, move |raw| {
+            if let Some(deliver) = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                deliver(Ok(raw));
+            }
+        })
+    })?
+    .map_err(|e| BrowserError::Native(format!("could not inspect element: {e}")))
+}

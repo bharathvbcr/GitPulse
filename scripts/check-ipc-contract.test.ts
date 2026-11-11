@@ -327,14 +327,20 @@ describe("annotated but unregistered commands", () => {
     // cmd_get_accessibility_display (the system Reduce Transparency setting,
     // which WKWebView cannot read), and 313 with cmd_cancel_read (a read whose
     // callers have all gone is stopped), and 316 with cmd_browser_snapshot,
-    // cmd_terminal_save_clipboard_image, and cmd_terminal_read_agent_artifact;
+    // cmd_terminal_save_clipboard_image, and cmd_terminal_read_agent_artifact,
+    // and 320 with cmd_browser_snapshot_preview, cmd_browser_inspect_point,
+    // cmd_terminal_clipboard_files, and cmd_terminal_listening_ports;
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(316);
+    expect(found.size).toBe(320);
     expect(found.has("cmd_browser_snapshot")).toBe(true);
+    expect(found.has("cmd_browser_snapshot_preview")).toBe(true);
+    expect(found.has("cmd_browser_inspect_point")).toBe(true);
     expect(found.has("cmd_terminal_save_clipboard_image")).toBe(true);
+    expect(found.has("cmd_terminal_clipboard_files")).toBe(true);
     expect(found.has("cmd_terminal_read_agent_artifact")).toBe(true);
+    expect(found.has("cmd_terminal_listening_ports")).toBe(true);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

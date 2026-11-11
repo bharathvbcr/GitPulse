@@ -18,6 +18,11 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, 
 /// Upper bound on any single scratch PNG (16 MiB).
 pub const MAX_SCRATCH_PNG_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum number of copied Finder file paths returned on a single paste.
+pub const MAX_CLIPBOARD_FILES: usize = 32;
+
+const MAX_CLIPBOARD_PATH_BYTES: usize = 4096;
+
 const SCRATCH_DIR_NAME: &str = "gitpulse-terminal-captures";
 const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TOKEN_LEN: usize = 48;
@@ -158,6 +163,185 @@ pub fn write_scratch_png(prefix: &str, owner_id: &str, bytes: &[u8]) -> Result<P
     write_scratch_png_in(&dir, prefix, owner_id, bytes)
 }
 
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_utf8(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_nibble(bytes[idx + 1])?;
+            let lo = hex_nibble(bytes[idx + 2])?;
+            out.push((hi << 4) | lo);
+            idx += 3;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn clean_local_posix_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_CLIPBOARD_PATH_BYTES
+        || !trimmed.starts_with('/')
+        || trimmed.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
+    {
+        return None;
+    }
+    // Reject unresolved macOS file-reference URLs (`/.file/id=...`) if NSURL failed to map them.
+    if trimmed.starts_with("/.file/") {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in trimmed.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        Some("/".to_owned())
+    } else {
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+/// Decodes a `file:///...` or `file://localhost/...` URL into a normalized local POSIX path.
+pub fn parse_file_url_path(raw_url: &str) -> Option<String> {
+    let trimmed = raw_url.trim();
+    let rest = trimmed.strip_prefix("file://")?;
+    let encoded_path: std::borrow::Cow<'_, str> = if rest.starts_with('/') {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        let after_host = rest.strip_prefix("localhost/")?;
+        std::borrow::Cow::Owned(format!("/{after_host}"))
+    };
+    let raw_encoded = encoded_path.as_ref();
+    let without_query = raw_encoded
+        .split_once(['?', '#'])
+        .map_or(raw_encoded, |(head, _)| head);
+    let decoded = percent_decode_utf8(without_query)?;
+    clean_local_posix_path(&decoded)
+}
+
+/// Normalizes, validates, deduplicates, and caps a list of raw clipboard file URLs or POSIX paths.
+pub fn normalize_clipboard_file_paths<I, S>(candidates: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in candidates {
+        let raw = item.as_ref();
+        let resolved = if raw.trim_start().starts_with("file://") {
+            parse_file_url_path(raw)
+        } else {
+            clean_local_posix_path(raw)
+        };
+        let Some(clean) = resolved else {
+            continue;
+        };
+        if seen.insert(clean.clone()) {
+            out.push(clean);
+            if out.len() >= MAX_CLIPBOARD_FILES {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Reads copied local file paths from `NSPasteboard.generalPasteboard` (`public.file-url`),
+/// resolving Finder `file:///.file/id=...` reference URLs via `NSURL.filePathURL`.
+///
+/// Must be called on the AppKit main thread on macOS.
+#[cfg(target_os = "macos")]
+pub fn read_clipboard_file_paths() -> Vec<String> {
+    use objc2::exception::catch;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+    use std::ffi::CStr;
+    use std::panic::AssertUnwindSafe;
+
+    let raw_candidates = catch(AssertUnwindSafe(|| -> Vec<String> {
+        unsafe {
+            let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            if pb.is_null() {
+                return Vec::new();
+            }
+            let items: *mut AnyObject = msg_send![&*pb, pasteboardItems];
+            if items.is_null() {
+                return Vec::new();
+            }
+            let count: usize = msg_send![&*items, count];
+            if count == 0 {
+                return Vec::new();
+            }
+            let uti = NSString::from_str("public.file-url");
+            let limit = count.min(MAX_CLIPBOARD_FILES * 2);
+            let mut found = Vec::with_capacity(limit.min(MAX_CLIPBOARD_FILES));
+            for idx in 0..limit {
+                let item: *mut AnyObject = msg_send![&*items, objectAtIndex: idx];
+                if item.is_null() {
+                    continue;
+                }
+                let raw_url_ns: *mut AnyObject = msg_send![&*item, stringForType: &*uti];
+                if raw_url_ns.is_null() {
+                    continue;
+                }
+                let nsurl: *mut AnyObject = msg_send![class!(NSURL), URLWithString: &*raw_url_ns];
+                if !nsurl.is_null() {
+                    let file_url: *mut AnyObject = msg_send![&*nsurl, filePathURL];
+                    let target_url = if !file_url.is_null() { file_url } else { nsurl };
+                    let path_ns: *mut AnyObject = msg_send![&*target_url, path];
+                    if !path_ns.is_null() {
+                        let utf8: *const std::ffi::c_char = msg_send![&*path_ns, UTF8String];
+                        if !utf8.is_null() {
+                            found.push(CStr::from_ptr(utf8).to_string_lossy().into_owned());
+                            continue;
+                        }
+                    }
+                }
+                let raw_utf8: *const std::ffi::c_char = msg_send![&*raw_url_ns, UTF8String];
+                if !raw_utf8.is_null() {
+                    found.push(CStr::from_ptr(raw_utf8).to_string_lossy().into_owned());
+                }
+            }
+            found
+        }
+    }))
+    .unwrap_or_default();
+
+    normalize_clipboard_file_paths(raw_candidates)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_clipboard_file_paths() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +398,36 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!stale.exists());
         assert!(fresh_note.exists());
+    }
+
+    #[test]
+    fn parses_and_normalizes_clipboard_file_urls_and_paths() {
+        assert_eq!(
+            parse_file_url_path("file:///Users/dev/My%20Project/caf%C3%A9.rs").as_deref(),
+            Some("/Users/dev/My Project/café.rs")
+        );
+        assert_eq!(
+            parse_file_url_path("file://localhost/tmp/screen%201.png").as_deref(),
+            Some("/tmp/screen 1.png")
+        );
+        assert!(parse_file_url_path("https://example.com/a.png").is_none());
+        assert!(parse_file_url_path("file://evil.example.com/etc/passwd").is_none());
+        assert!(parse_file_url_path("file:///tmp/bad%00name.png").is_none());
+
+        let mut many: Vec<String> = vec![
+            "file:///repo/src/./main.rs".into(),
+            "/repo/src/main.rs".into(), // duplicate after normalization
+            "https://not-a-local-file.test/x".into(),
+            "relative/path.rs".into(),
+            "/bad/\0/null.rs".into(),
+            "file:///repo/docs/spec%20v2.md/".into(),
+        ];
+        for idx in 0..40 {
+            many.push(format!("/repo/extra/file-{idx}.ts"));
+        }
+        let normalized = normalize_clipboard_file_paths(many);
+        assert_eq!(normalized.len(), MAX_CLIPBOARD_FILES);
+        assert_eq!(normalized[0], "/repo/src/main.rs");
+        assert_eq!(normalized[1], "/repo/docs/spec v2.md");
     }
 }

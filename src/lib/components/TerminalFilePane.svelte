@@ -17,12 +17,22 @@
   import { formatError } from "../ui/formatError";
   import { askConfirm } from "../stores/modalStore";
   import type { FileBlob, SavedFile } from "../files/types";
+  import type { DiffPayload } from "../repos/storeTypes";
+  import { parseUnifiedDiff, type AnnotatedDiffLine } from "../diff/wordDiff";
   import type { Guarded } from "../stores/harnessStore";
   import { recordEditorDrafts } from "../files/editorDraftRegistry";
   import { editorFileSaveQueue, fileSaveKey } from "../files/serialSave";
   import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
   import { overwriteNote } from "../files/overwriteNote";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
+  import { getNeighbors, symbolsForFile } from "../codeintel/client";
+  import type { CodeintelFileSymbol } from "../codeintel/types";
+  import {
+    extractDirectCallers,
+    formatSymbolLensForAgent,
+    pickEnclosingSymbol,
+    type DirectCallerEntry,
+  } from "../terminal/symbolQuickLens";
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
@@ -43,6 +53,7 @@
     revealLine = null,
     revealColumn = null,
     revealSeq = 0,
+    initialViewMode = "code",
     onscreen = false,
     onSelectFile,
     onResolvedPath,
@@ -57,6 +68,7 @@
     revealLine?: number | null;
     revealColumn?: number | null;
     revealSeq?: number;
+    initialViewMode?: "code" | "diff";
     onscreen?: boolean;
     onSelectFile?: (path: string, line?: number | null, column?: number | null) => void;
     onResolvedPath?: (resolvedPath: string) => void;
@@ -68,9 +80,20 @@
 
   // Start with the explorer open when opened without a target path or snippet, or compact when opened from a link click / snippet.
   let explorerOpen = $state(untrack(() => !filePath && !snippet));
+  let viewMode = $state<"code" | "diff">(untrack(() => initialViewMode));
   let activeBlob = $state<FileBlob | null>(null);
   let isLoading = $state(false);
   let loadError = $state<string | null>(null);
+  let diffPayload = $state<DiffPayload | null>(null);
+  let diffSource = $state<"unstaged" | "staged">("unstaged");
+  let diffLoading = $state(false);
+  let diffError = $state<string | null>(null);
+  let diffInflight: AsyncGuard | null = null;
+  let loadedDiffKey = "";
+  let quickLensSymbol = $state<CodeintelFileSymbol | null>(null);
+  let quickLensCallers = $state<DirectCallerEntry[]>([]);
+  let quickLensTotalCallers = $state(0);
+  let lensInflight: AsyncGuard | null = null;
   let copiedPath = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
   let inflight: AsyncGuard | null = null;
@@ -87,6 +110,9 @@
   );
   const revealTarget = $derived(
     revealSeq > 0 ? { line: revealLine, column: revealColumn, seq: revealSeq } : null,
+  );
+  const diffLines = $derived<AnnotatedDiffLine[]>(
+    diffPayload?.text ? parseUnifiedDiff(diffPayload.text).filter((r) => r.type !== "meta") : [],
   );
   const snippetBlob = $derived<FileBlob | null>(
     !filePath && snippet
@@ -157,12 +183,123 @@
     }
   }
 
+  async function loadDiff(targetPath: string | undefined, force = false) {
+    if (!repoPath || !targetPath) {
+      diffInflight?.cancel();
+      diffPayload = null;
+      diffError = null;
+      loadedDiffKey = "";
+      return;
+    }
+    const key = `${repoPath}\0${targetPath}`;
+    if (!force && key === loadedDiffKey && diffPayload !== null) return;
+    diffInflight?.cancel();
+    const guard = createAsyncGuard();
+    diffInflight = guard;
+    diffLoading = true;
+    diffError = null;
+    try {
+      let res = await invoke<DiffPayload>("cmd_get_file_diff", {
+        repoPath,
+        filePath: targetPath,
+        isStaged: false,
+        ignoreWhitespace: false,
+      });
+      if (!guard.isLive()) return;
+      let source: "unstaged" | "staged" = "unstaged";
+      if (!res.text.trim()) {
+        const stagedRes = await invoke<DiffPayload>("cmd_get_file_diff", {
+          repoPath,
+          filePath: targetPath,
+          isStaged: true,
+          ignoreWhitespace: false,
+        });
+        if (!guard.isLive()) return;
+        if (stagedRes.text.trim()) {
+          res = stagedRes;
+          source = "staged";
+        }
+      }
+      diffPayload = res;
+      diffSource = source;
+      loadedDiffKey = key;
+    } catch (err: unknown) {
+      if (!guard.isLive()) return;
+      diffError = formatError(err);
+      diffPayload = null;
+    } finally {
+      if (guard.isLive()) diffLoading = false;
+    }
+  }
+
   $effect(() => {
     const target = filePath;
     const repo = repoPath;
+    const mode = viewMode;
     void repo;
     untrack(() => {
       void loadBlob(target);
+      if (mode === "diff" && target) {
+        void loadDiff(target);
+      }
+    });
+  });
+
+  async function loadQuickLens(
+    repo: string,
+    targetPath: string | undefined,
+    line: number | null,
+    mode: "code" | "diff",
+  ) {
+    lensInflight?.cancel();
+    if (!repo || !targetPath || mode !== "code" || typeof line !== "number" || line < 1) {
+      quickLensSymbol = null;
+      quickLensCallers = [];
+      quickLensTotalCallers = 0;
+      return;
+    }
+    const guard = createAsyncGuard();
+    lensInflight = guard;
+    try {
+      const headSha = await invoke<string>("cmd_get_head_id", { repoPath: repo });
+      if (!guard.isLive() || !headSha) return;
+      const page = await symbolsForFile(repo, targetPath, headSha);
+      if (!guard.isLive()) return;
+      if (!page.available || page.items.length === 0) {
+        quickLensSymbol = null;
+        quickLensCallers = [];
+        quickLensTotalCallers = 0;
+        return;
+      }
+      const enclosing = pickEnclosingSymbol(page.items, line);
+      if (!enclosing) {
+        quickLensSymbol = null;
+        quickLensCallers = [];
+        quickLensTotalCallers = 0;
+        return;
+      }
+      quickLensSymbol = enclosing;
+      const targetSym = enclosing.qualified_name || enclosing.symbol_name;
+      const neighbors = await getNeighbors(repo, [targetSym], 4000, "high");
+      if (!guard.isLive()) return;
+      const { callers, total } = extractDirectCallers(neighbors, 5);
+      quickLensCallers = callers;
+      quickLensTotalCallers = total;
+    } catch {
+      if (!guard.isLive()) return;
+      quickLensSymbol = null;
+      quickLensCallers = [];
+      quickLensTotalCallers = 0;
+    }
+  }
+
+  $effect(() => {
+    const repo = repoPath;
+    const target = filePath;
+    const line = revealLine;
+    const mode = viewMode;
+    untrack(() => {
+      void loadQuickLens(repo, target, line, mode);
     });
   });
 
@@ -279,6 +416,30 @@
     saveRefusal = null;
     activeBlob = null;
     await loadBlob(filePath, true);
+    if (viewMode === "diff") {
+      await loadDiff(filePath, true);
+    }
+  }
+
+  export function setViewMode(mode: "code" | "diff") {
+    viewMode = mode;
+    if (mode === "diff" && filePath) {
+      void loadDiff(filePath, true);
+    }
+  }
+
+  /**
+   * Refreshes the open file or working-tree diff from disk when Follow Agent
+   * observes an edit, preserving any unsaved user draft in `drafts`.
+   */
+  export function reloadIfClean() {
+    if (!filePath) return;
+    if (!drafts[filePath]) {
+      void loadBlob(filePath, true);
+    }
+    if (viewMode === "diff") {
+      void loadDiff(filePath, true);
+    }
   }
 
   async function overwriteCurrent() {
@@ -336,6 +497,8 @@
 
   export async function close(): Promise<void> {
     inflight?.cancel();
+    diffInflight?.cancel();
+    lensInflight?.cancel();
     drafts = {};
     if (repoPath) recordEditorDrafts(repoPath, [], draftOwner);
   }
@@ -354,6 +517,8 @@
 
   onDestroy(() => {
     inflight?.cancel();
+    diffInflight?.cancel();
+    lensInflight?.cancel();
     if (copiedTimer) clearTimeout(copiedTimer);
     if (repoPath) recordEditorDrafts(repoPath, [], draftOwner);
   });
@@ -364,7 +529,7 @@
   class="h-full w-full flex flex-col min-h-0 min-w-0 bg-background text-xs font-sans overflow-hidden"
   data-terminal-file-pane={tabId}
 >
-  <div class="shrink-0 flex items-center justify-between gap-1.5 px-2 h-8 border-b border-border/60 gp-section-edge bg-surface/50 select-none">
+  <div class="shrink-0 flex items-center justify-between gap-1.5 px-2 h-8 bg-surface/60 select-none">
     <div class="flex items-center gap-1.5 min-w-0">
       <button
         type="button"
@@ -379,25 +544,55 @@
       </button>
       {#if filePath}
         <LanguageLogo filePath={filePath} size={13} />
-        <span class="font-mono text-[11px] text-textPrimary truncate" title={filePath}>{filePath}</span>
+        <span class="font-mono text-meta text-textPrimary truncate" title={filePath}>{filePath}</span>
         {#if isDirty}
-          <span class="text-[10px] font-semibold text-amber-300 shrink-0" role="status">Unsaved</span>
+          <span class="text-micro font-semibold text-warn shrink-0" role="status">Unsaved</span>
         {/if}
       {:else if snippet}
         <FileText size={13} class="text-accent shrink-0" />
-        <span class="font-mono text-[11px] text-textPrimary truncate" title={snippet.title}>{snippet.title}</span>
-        <span class="text-[10px] text-textMuted shrink-0">Read-only</span>
+        <span class="font-mono text-meta text-textPrimary truncate" title={snippet.title}>{snippet.title}</span>
+        <span class="text-micro text-textMuted shrink-0">Read-only</span>
       {:else}
         <FileText size={13} class="text-textMuted shrink-0" />
-        <span class="text-[11px] text-textMuted truncate">Select a file</span>
+        <span class="text-meta text-textMuted truncate">Select a file</span>
       {/if}
     </div>
 
     <div class="flex items-center gap-1 shrink-0">
+      {#if filePath}
+        <div
+          class="inline-flex items-center rounded border border-border/65 bg-background/70 p-0.5 text-micro"
+          role="group"
+          aria-label="File pane view mode"
+        >
+          <button
+            type="button"
+            class="px-1.5 py-0.5 rounded-sm transition-colors {viewMode === 'code'
+              ? 'bg-accent/15 text-accent font-medium'
+              : 'text-textMuted hover:text-textPrimary'}"
+            aria-pressed={viewMode === "code"}
+            data-testid="terminal-file-code-toggle"
+            onclick={() => setViewMode("code")}
+          >
+            Code
+          </button>
+          <button
+            type="button"
+            class="px-1.5 py-0.5 rounded-sm transition-colors {viewMode === 'diff'
+              ? 'bg-accent/15 text-accent font-medium'
+              : 'text-textMuted hover:text-textPrimary'}"
+            aria-pressed={viewMode === "diff"}
+            data-testid="terminal-file-diff-toggle"
+            onclick={() => setViewMode("diff")}
+          >
+            Diff
+          </button>
+        </div>
+      {/if}
       {#if filePath && onSendToAgent}
         <button
           type="button"
-          class="gp-btn py-0! px-1.5! text-[10px]! flex items-center gap-1"
+          class="gp-btn py-0! px-1.5! text-micro! flex items-center gap-1"
           title="Insert @path into the active agent terminal"
           data-testid="terminal-file-send-path"
           onclick={() => filePath && onSendToAgent(`@${filePath} `)}
@@ -414,7 +609,7 @@
           title="Copy command output"
           onclick={() => void handleCopyPath()}
         >
-          {#if copiedPath}<Check size={12} class="text-emerald-400" />{:else}<Copy size={12} />{/if}
+          {#if copiedPath}<Check size={12} class="text-ok" />{:else}<Copy size={12} />{/if}
         </button>
       {/if}
       {#if filePath}
@@ -425,7 +620,7 @@
           title="Copy relative path"
           onclick={() => void handleCopyPath()}
         >
-          {#if copiedPath}<Check size={12} class="text-emerald-400" />{:else}<Copy size={12} />{/if}
+          {#if copiedPath}<Check size={12} class="text-ok" />{:else}<Copy size={12} />{/if}
         </button>
         <button
           type="button"
@@ -434,7 +629,7 @@
           title="Reload file from disk"
           onclick={() => void reloadFromDisk()}
         >
-          <RotateCw size={12} class={isLoading ? "animate-spin" : ""} />
+          <RotateCw size={12} class={isLoading || diffLoading ? "animate-spin" : ""} />
         </button>
         {#if onOpenInCodeView}
           <button
@@ -466,7 +661,7 @@
 
   {#if loadError}
     <div
-      class="shrink-0 px-3 py-1.5 border-b border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-start gap-1.5"
+      class="shrink-0 px-3 py-1.5 bg-danger/10 text-danger text-meta flex items-start gap-1.5"
       role="alert"
       data-testid="terminal-file-pane-error"
     >
@@ -478,7 +673,7 @@
 
   <div class="flex-1 min-h-0 flex overflow-hidden">
     {#if explorerOpen && onscreen}
-      <div class="w-56 max-w-[45%] shrink-0 h-full border-r border-border/60 bg-surface/30 min-h-0 overflow-hidden">
+      <div class="w-56 max-w-[45%] shrink-0 h-full bg-surface/40 min-h-0 overflow-hidden">
         <ExplorerRail
           {repoPath}
           selectedFile={filePath ?? null}
@@ -503,23 +698,168 @@
           <FileText size={18} />
           <span>Choose a file from the explorer, or click any file path in a terminal session.</span>
         </div>
+      {:else if viewMode === "diff"}
+        <div class="h-full w-full flex flex-col min-h-0 overflow-hidden" data-testid="terminal-file-diff-view">
+          {#if isDirty}
+            <div class="shrink-0 px-2.5 py-1 bg-warn/10 text-warn text-micro">
+              Showing working-tree diff on disk (unsaved editor draft is preserved in Code mode).
+            </div>
+          {/if}
+          {#if diffPayload?.truncated}
+            <div class="shrink-0 px-2.5 py-1 bg-warn/10 text-warn text-micro">
+              Diff truncated{diffPayload.truncation_reason ? `: ${diffPayload.truncation_reason}` : "."}
+            </div>
+          {/if}
+          {#if diffSource === "staged" && diffLines.length > 0}
+            <div class="shrink-0 px-2.5 py-1 bg-surface/50 text-textMuted text-micro">
+              Showing staged diff (working tree matches index).
+            </div>
+          {/if}
+          {#if diffError}
+            <div class="p-3 text-danger text-meta" role="alert">{diffError}</div>
+          {:else if diffLoading && !diffPayload}
+            <div class="h-full flex items-center justify-center text-textMuted text-xs">
+              Loading diff for {filePath}…
+            </div>
+          {:else if diffLines.length === 0}
+            <div class="h-full flex flex-col items-center justify-center gap-1.5 p-4 text-center text-textMuted text-xs">
+              <span>No uncommitted working-tree or staged changes in <code class="font-mono text-textPrimary">{filePath}</code>.</span>
+              <button
+                type="button"
+                class="gp-btn py-0.5! px-2! text-micro!"
+                onclick={() => setViewMode("code")}
+              >
+                View full file
+              </button>
+            </div>
+          {:else}
+            <div class="flex-1 min-h-0 overflow-auto font-mono text-meta leading-5">
+              {#each diffLines as row}
+                {#if row.type === "hdr"}
+                  <div class="px-2.5 py-0.5 bg-accent/10 text-accent select-text">
+                    {row.content}
+                  </div>
+                {:else if row.type === "binary"}
+                  <div class="px-2.5 py-1 text-textMuted italic">{row.content}</div>
+                {:else if row.newNo}
+                  <button
+                    type="button"
+                    class="w-full text-left flex items-stretch select-text cursor-pointer hover:brightness-110 {row.type === 'add'
+                      ? 'bg-ok/12 text-ok'
+                      : 'text-textPrimary/90'}"
+                    title={`Jump to line ${row.newNo} in Code view`}
+                    onclick={() => {
+                      if (row.newNo && filePath) {
+                        setViewMode("code");
+                        chooseFile(filePath, row.newNo, 1);
+                      }
+                    }}
+                  >
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/30">
+                      {row.oldNo ?? ""}
+                    </span>
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/40">
+                      {row.newNo ?? ""}
+                    </span>
+                    <span class="w-4 shrink-0 text-center select-none text-textMuted">
+                      {row.type === "add" ? "+" : " "}
+                    </span>
+                    <pre class="m-0 pr-3 whitespace-pre">{row.content}</pre>
+                  </button>
+                {:else}
+                  <div
+                    class="flex items-stretch select-text {row.type === 'del'
+                      ? 'bg-danger/12 text-danger'
+                      : 'text-textPrimary/90'}"
+                  >
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/30">
+                      {row.oldNo ?? ""}
+                    </span>
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/40">
+                      {row.newNo ?? ""}
+                    </span>
+                    <span class="w-4 shrink-0 text-center select-none text-textMuted">
+                      {row.type === "del" ? "-" : " "}
+                    </span>
+                    <pre class="m-0 pr-3 whitespace-pre">{row.content}</pre>
+                  </div>
+                {/if}
+              {/each}
+            </div>
+          {/if}
+        </div>
       {:else if isLoading && !activeBlob}
         <div class="h-full flex items-center justify-center text-textMuted text-xs">
           Loading {filePath}…
         </div>
       {:else if activeBlob}
-        <MediaViewer
-          {filePath}
-          blob={activeBlob}
-          {repoPath}
-          draftContent={currentDraft?.content ?? null}
-          dirty={isDirty}
-          onSave={(content) => saveFile(content)}
-          onDraftChange={handleDraftChange}
-          onRequestDiscard={requestDiscardCurrent}
-          {revealTarget}
-          onSendSelectionToAgent={onSendToAgent}
-        />
+        <div class="h-full w-full flex flex-col min-h-0 overflow-hidden">
+          {#if quickLensSymbol && filePath && !activeBlob.is_binary && !activeBlob.is_image}
+            <div
+              class="shrink-0 flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/50 text-micro"
+              data-testid="terminal-file-quick-lens"
+            >
+              <div class="flex items-center gap-1.5 min-w-0 overflow-x-auto">
+                <span class="font-mono font-medium text-accent shrink-0">
+                  {quickLensSymbol.symbol_name}
+                </span>
+                <span class="text-textMuted shrink-0">
+                  L{quickLensSymbol.span_start_line}–{quickLensSymbol.span_end_line}
+                </span>
+                {#if quickLensCallers.length > 0}
+                  <span class="text-textMuted shrink-0">· Callers ({quickLensTotalCallers}):</span>
+                  {#each quickLensCallers as caller}
+                    <button
+                      type="button"
+                      class="px-1.5 py-0.5 rounded bg-background/80 border border-border/65 font-mono text-textPrimary hover:border-accent/65 hover:text-accent shrink-0"
+                      title={`Open caller ${caller.qualifiedSymbol} (${caller.filePath})`}
+                      onclick={() => chooseFile(caller.filePath, null, null)}
+                    >
+                      {caller.symbol}
+                    </button>
+                  {/each}
+                {:else}
+                  <span class="text-textMuted shrink-0">· 0 indexed direct callers</span>
+                {/if}
+              </div>
+              {#if onSendToAgent}
+                <button
+                  type="button"
+                  class="gp-btn py-0! px-1.5! text-micro! shrink-0"
+                  title="Send symbol span and direct callers to active agent"
+                  data-testid="terminal-file-send-symbol-lens"
+                  onclick={() =>
+                    filePath &&
+                    quickLensSymbol &&
+                    onSendToAgent(
+                      formatSymbolLensForAgent({
+                        filePath,
+                        symbol: quickLensSymbol,
+                        callers: quickLensCallers,
+                        totalCallers: quickLensTotalCallers,
+                      }),
+                    )}
+                >
+                  @symbol
+                </button>
+              {/if}
+            </div>
+          {/if}
+          <div class="flex-1 min-h-0 overflow-hidden">
+            <MediaViewer
+              {filePath}
+              blob={activeBlob}
+              {repoPath}
+              draftContent={currentDraft?.content ?? null}
+              dirty={isDirty}
+              onSave={(content) => saveFile(content)}
+              onDraftChange={handleDraftChange}
+              onRequestDiscard={requestDiscardCurrent}
+              {revealTarget}
+              onSendSelectionToAgent={onSendToAgent}
+            />
+          </div>
+        </div>
       {/if}
     </div>
   </div>

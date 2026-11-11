@@ -177,6 +177,7 @@
   import { observeResize } from "../dom/observeResize";
   import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
   import { createFitScheduler } from "../terminal/fitSchedule";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { createScrollFeel, isScrolledBack, scrollFeelOptions, type ScrollFeel } from "../terminal/scrollFeel";
   import { wheelDiagnostic } from "../terminal/wheelDiagnostic";
   import { openExternal } from "../desktop/openExternal";
@@ -189,11 +190,15 @@
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
   import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
-  import { clipboardImageToPngBase64, extractClipboardImageFile } from "../terminal/clipboardImage";
+  import { clipboardImageToPngBase64, clipboardMayHoldFiles, extractClipboardImageFile } from "../terminal/clipboardImage";
   import {
     createCommandBlockTracker,
+    createCommandDecorationRing,
+    extractBlockCommand,
     extractBlockOutput,
     extractLoopbackServerUrl,
+    formatCommandDuration,
+    formatFailedCommandForAgent,
     parseOsc133,
     parseOsc7501,
     parseOsc7Path,
@@ -244,6 +249,7 @@
     confirmCloseSelf,
     onOpenFileSplit,
     onOpenSnippetSplit,
+    onSendToAgent,
     onAgentStatus,
     title,
   }: {
@@ -297,6 +303,8 @@
     onOpenFileSplit?: (path: string, line: number | null, column: number | null, fallbackPath?: string) => boolean;
     /** Opens a read-only Markdown/text snippet inside a split `TerminalFilePane` beside this terminal. */
     onOpenSnippetSplit?: (title: string, content: string) => boolean;
+    /** Sends a reference or formatted failing-command payload to the active/paired agent session. */
+    onSendToAgent?: (text: string) => void;
     /** Reports Herdr-compatible OSC 7501 agent status updates for the tab badge. */
     onAgentStatus?: (status: AgentOscStatus | null) => void;
     /** What this session is about (a task title), for the Sessions list. */
@@ -368,9 +376,10 @@
   let agentArtifactDir = $state<string | null>(null);
   let lastExitCode = $state<number | null>(null);
   const commandBlocks = createCommandBlockTracker();
+  const commandDecorations = createCommandDecorationRing(64);
   const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
 
-  async function openAgentArtifact() {
+  export async function openAgentArtifact() {
     if (!nativeSessionId) return;
     try {
       const artifact = await invoke<AgentArtifactRead>("cmd_terminal_read_agent_artifact", {
@@ -700,6 +709,102 @@
         commandBlocks.onMark(mark, () => created.registerMarker(0));
         if (mark.kind === "command_finished") {
           lastExitCode = mark.exitCode;
+          const detail = commandBlocks.lastFinishedDetail();
+          if (detail && created.buffer.active.type !== "alternate" && detail.promptMarker.line >= 0) {
+            const cursorAbs = created.buffer.active.baseY + created.buffer.active.cursorY;
+            const decMarker = created.registerMarker(detail.promptMarker.line - cursorAbs);
+            if (decMarker) {
+              const decoration = created.registerDecoration({
+                marker: decMarker,
+                anchor: "right",
+                width: 1,
+              });
+              if (!decoration) {
+                decMarker.dispose();
+              } else {
+                commandDecorations.push({ marker: decMarker, decoration });
+                decoration.onRender((el) => {
+                  if (el.dataset.gpOsc133 === "1") return;
+                  el.dataset.gpOsc133 = "1";
+                  el.style.width = "auto";
+                  el.style.right = "6px";
+                  el.style.left = "auto";
+                  el.style.zIndex = "6";
+                  el.style.pointerEvents = "auto";
+                  el.style.display = "inline-flex";
+                  el.style.alignItems = "center";
+                  el.style.gap = "4px";
+                  el.style.padding = "0 5px";
+                  el.style.borderRadius = "4px";
+                  el.style.fontSize = "10px";
+                  el.style.lineHeight = "16px";
+                  el.classList.add("font-mono");
+                  const failed = detail.exitCode !== null && detail.exitCode !== 0;
+                  el.style.background = failed ? "rgba(244, 63, 94, 0.16)" : "rgba(16, 185, 129, 0.14)";
+                  el.style.border = failed ? "1px solid rgba(244, 63, 94, 0.35)" : "1px solid rgba(16, 185, 129, 0.3)";
+                  el.style.color = failed ? "#fda4af" : "#6ee7b7";
+
+                  const badge = document.createElement("span");
+                  const dur = detail.durationMs !== null ? ` ${formatCommandDuration(detail.durationMs)}` : "";
+                  badge.textContent = failed
+                    ? `✕ exit ${detail.exitCode}${dur}`
+                    : `✓${dur || " ok"}`;
+                  el.appendChild(badge);
+
+                  if (failed) {
+                    const askBtn = document.createElement("button");
+                    askBtn.type = "button";
+                    askBtn.setAttribute("data-testid", "terminal-osc133-ask-agent");
+                    askBtn.textContent = "Ask agent";
+                    askBtn.title = "Send failing command and output to active agent terminal";
+                    askBtn.style.marginLeft = "2px";
+                    askBtn.style.padding = "0 4px";
+                    askBtn.style.borderRadius = "3px";
+                    askBtn.style.background = "rgba(244, 63, 94, 0.22)";
+                    askBtn.style.color = "#ffe4e6";
+                    askBtn.style.cursor = "pointer";
+                    askBtn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+                    askBtn.addEventListener("click", (ev) => {
+                      ev.preventDefault();
+                      ev.stopPropagation();
+                      if (disposed || !term || detail.promptMarker.isDisposed) return;
+                      const cmd = extractBlockCommand(term.buffer.active, {
+                        promptLine: detail.promptMarker.line,
+                        outputStartLine: detail.outputStartMarker && !detail.outputStartMarker.isDisposed
+                          ? detail.outputStartMarker.line
+                          : null,
+                      });
+                      const out =
+                        detail.outputStartMarker &&
+                        !detail.outputStartMarker.isDisposed &&
+                        detail.outputEndMarker &&
+                        !detail.outputEndMarker.isDisposed
+                          ? extractBlockOutput(term.buffer.active, {
+                              outputStartLine: detail.outputStartMarker.line,
+                              outputEndLine: detail.outputEndMarker.line,
+                            })
+                          : "";
+                      const formatted = formatFailedCommandForAgent({
+                        command: cmd,
+                        exitCode: detail.exitCode,
+                        durationMs: detail.durationMs,
+                        cwd: activeCwdSubdir,
+                        output: out,
+                      });
+                      if (onSendToAgent) {
+                        onSendToAgent(`${formatted}\n`);
+                      } else {
+                        void copyText(formatted).then((ok) => {
+                          if (ok) toastStore.info("Copied failing command & output to clipboard");
+                        });
+                      }
+                    });
+                    el.appendChild(askBtn);
+                  }
+                });
+              }
+            }
+          }
         } else if (mark.kind === "command_executed") {
           lastExitCode = null;
         }
@@ -1193,7 +1298,7 @@
             syncFrames.flush();
             rafWrites.flushSync();
             term.write("", () => {
-              if (!disposed) { term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
+              if (!disposed) { commandDecorations.clear(); commandBlocks.clear(); term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
               resolve();
             });
           });
@@ -1518,6 +1623,7 @@
 
   export function clearScrollback() {
     searchAddon?.clearDecorations();
+    commandDecorations.clear();
     commandBlocks.clear();
     term?.clear();
     if (findOpen) runFind(false, true);
@@ -1581,6 +1687,35 @@
      * Captured on the host because the event does not bubble.
      */
     const onContextLost = (event: Event) => gpu?.lose(event.target);
+    const pastePlainText = (raw: string, current: XTerm) => {
+      const plan = planPaste(raw, current.modes.bracketedPasteMode);
+      if (!plan.question) { current.paste(plan.text); return; }
+      void askConfirm({ ...plan.question, confirmLabel: "Paste" }).then((confirmed) => {
+        if (disposed || term !== current) return;
+        if (confirmed) current.paste(plan.text);
+        current.focus();
+      });
+    };
+    const pasteImageFile = (imageFile: File, current: XTerm) => {
+      void clipboardImageToPngBase64(imageFile)
+        .then((pngBase64) =>
+          invoke<string>("cmd_terminal_save_clipboard_image", {
+            tabId,
+            pngBase64,
+          }),
+        )
+        .then((savedPath) => {
+          if (disposed || term !== current) return;
+          const formatted = formatDroppedPathsForSession([savedPath], {
+            launcher,
+            repoPath: workPath,
+          });
+          insertText(formatted, { focus: true });
+        })
+        .catch((err) => {
+          if (!disposed) warning = `Could not paste clipboard image: ${formatError(err)}`;
+        });
+    };
     /**
      * Every paste goes through `planPaste`: bracketed-paste markers inside the
      * clipboard are removed, and a paste that would run before it is read asks
@@ -1591,40 +1726,43 @@
       const current = term;
       if (!current) return;
       const imageFile = extractClipboardImageFile(event.clipboardData);
-      if (imageFile) {
+      const raw = event.clipboardData?.getData("text/plain");
+      const mayHoldFiles = clipboardMayHoldFiles(event.clipboardData, raw ?? "");
+      if (mayHoldFiles) {
         event.preventDefault();
         event.stopPropagation();
-        void clipboardImageToPngBase64(imageFile)
-          .then((pngBase64) =>
-            invoke<string>("cmd_terminal_save_clipboard_image", {
-              tabId,
-              pngBase64,
-            }),
-          )
-          .then((savedPath) => {
+        void invoke<string[]>("cmd_terminal_clipboard_files")
+          .catch(() => [] as string[])
+          .then((paths) => {
             if (disposed || term !== current) return;
-            const formatted = formatDroppedPathsForSession([savedPath], {
-              launcher,
-              repoPath: workPath,
-            });
-            insertText(formatted, { focus: true });
-          })
-          .catch((err) => {
-            if (!disposed) warning = `Could not paste clipboard image: ${formatError(err)}`;
+            if (paths.length > 0) {
+              const formatted = formatDroppedPathsForSession(paths, {
+                launcher,
+                repoPath: workPath,
+              });
+              insertText(formatted, { focus: true });
+              return;
+            }
+            if (imageFile) {
+              pasteImageFile(imageFile, current);
+              return;
+            }
+            if (raw) {
+              pastePlainText(raw, current);
+            }
           });
         return;
       }
-      const raw = event.clipboardData?.getData("text/plain");
+      if (imageFile) {
+        event.preventDefault();
+        event.stopPropagation();
+        pasteImageFile(imageFile, current);
+        return;
+      }
       if (raw === undefined) return;
       event.preventDefault();
       event.stopPropagation();
-      const plan = planPaste(raw, current.modes.bracketedPasteMode);
-      if (!plan.question) { current.paste(plan.text); return; }
-      void askConfirm({ ...plan.question, confirmLabel: "Paste" }).then((confirmed) => {
-        if (disposed || term !== current) return;
-        if (confirmed) current.paste(plan.text);
-        current.focus();
-      });
+      pastePlainText(raw, current);
     };
     const onEraseCapture = (event: Event) => {
       const target = event.target;
@@ -1789,6 +1927,7 @@
       gpu?.dispose();
       gpu = null;
       frameProbe.stop();
+      commandDecorations.clear();
       commandBlocks.clear();
       term?.dispose();
       term = null;
@@ -1831,6 +1970,46 @@
   $effect(() => {
     const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
     if (term && term.options.scrollback !== rows) term.options.scrollback = rows;
+  });
+
+  /**
+   * Silent kernel socket-table radar (`cmd_terminal_listening_ports`): catches
+   * loopback dev servers that omit URL stdout lines while onscreen, and stops
+   * immediately once `devServerUrl` is populated or the pane hides/exits.
+   */
+  $effect(() => {
+    const canProbe =
+      Boolean(onscreen) &&
+      !exited &&
+      !devServerUrl &&
+      Boolean(startedIn) &&
+      Boolean(nativeSessionId) &&
+      $hostPlatform.browser_sessions;
+    if (!canProbe) return;
+    const sessionId = nativeSessionId;
+    return untrack(() => {
+      let cancelled = false;
+      let inFlight = false;
+      const stopTimer = createAdaptiveTimer(() => {
+        if (cancelled || disposed || exited || devServerUrl || inFlight || nativeSessionId !== sessionId) return;
+        inFlight = true;
+        void invoke<number[]>("cmd_terminal_listening_ports", { sessionId })
+          .then((ports) => {
+            if (cancelled || disposed || exited || devServerUrl || nativeSessionId !== sessionId) return;
+            if (Array.isArray(ports) && ports.length > 0 && ports[0] > 0) {
+              devServerUrl = `http://localhost:${ports[0]}`;
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            inFlight = false;
+          });
+      }, 3_000);
+      return () => {
+        cancelled = true;
+        stopTimer();
+      };
+    });
   });
 
   /**
@@ -2114,17 +2293,17 @@
         <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
         {@const liveSubdir = activeCwdSubdir ?? startDir ?? ""}
-        <span class="w-1.5 h-1.5 rounded-full {lastExitCode !== null && lastExitCode !== 0 ? 'bg-rose-400' : 'bg-emerald-400'} shrink-0" aria-hidden="true"></span>
+        <span class="w-1.5 h-1.5 rounded-full {lastExitCode !== null && lastExitCode !== 0 ? 'bg-danger' : 'bg-ok'} shrink-0" aria-hidden="true"></span>
         <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Working directory ${liveSubdir ? `${workPath}/${liveSubdir}` : (startedIn || workPath)}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{liveSubdir ? `/${liveSubdir}` : ""}</span>
         {#if lastExitCode !== null && lastExitCode !== 0}
-          <span class="text-[10px] font-mono text-rose-300 shrink-0" title="Last command exit status">exit {lastExitCode}</span>
+          <span class="text-micro font-mono text-danger shrink-0" title="Last command exit status">exit {lastExitCode}</span>
         {/if}
         {#if devServerUrl && devServerUrl !== dismissedDevServerUrl && $hostPlatform.browser_sessions}
           {@const previewPort = (() => { try { return new URL(devServerUrl).port; } catch { return ""; } })()}
           <span class="inline-flex items-center gap-0.5 shrink-0">
             <button
               type="button"
-              class="gp-btn py-0! px-1.5! text-[10px]! text-accent border-accent/40 bg-accent/10 flex items-center gap-1"
+              class="gp-btn py-0! px-1.5! text-micro! text-accent border-accent/35 bg-accent/10 flex items-center gap-1"
               data-testid="terminal-dev-server-preview"
               title={`Open ${devServerUrl} in a split browser session`}
               onclick={() => devServerUrl && void terminalLaunchRequests.requestBrowser(repoPath, devServerUrl)}
@@ -2146,7 +2325,7 @@
         {#if agentArtifactDir}
           <button
             type="button"
-            class="gp-btn py-0! px-1.5! text-[10px]! text-accent border-accent/40 bg-accent/10 flex items-center gap-1 shrink-0"
+            class="gp-btn py-0! px-1.5! text-micro! text-accent border-accent/35 bg-accent/10 flex items-center gap-1 shrink-0"
             data-testid="terminal-open-agent-plan"
             title="Open this agent's active Markdown plan or artifact beside the terminal"
             onclick={() => void openAgentArtifact()}

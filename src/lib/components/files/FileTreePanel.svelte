@@ -247,7 +247,8 @@
   // flag and error. The repository key, this membership string and HEAD
   // (see `currentHeadTip`) compare by value, so the listing below reloads only
   // when the repository, the set of dirty paths, or HEAD changes.
-  const statusMembership = $derived(statusPathKey(effectiveStatuses));
+  const repoStatusKey = $derived(statusPathKey(statuses));
+  const statusMembership = $derived(isOverrideRepo ? "" : repoStatusKey);
 
   // A new repository starts with every folder expanded again.
   $effect(() => {

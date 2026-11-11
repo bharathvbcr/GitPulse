@@ -292,4 +292,31 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain("fallbackPath={tab.fallbackPath}");
     expect(source).toContain("!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES");
   });
+
+  it("exposes Follow Agent toggle, live-reveals or refreshes touched files and plan artifacts, and wires onSendToAgent to TerminalSession", () => {
+    expect(source).toContain('data-testid="terminal-follow-agent-toggle"');
+    expect(source).toContain("onTouchedFile: handleAgentTouchedFile");
+    expect(source).toContain("function handleAgentTouchedFile(payload: TerminalAgentTouchedFilePayload)");
+    expect(source).toContain("reloadIfClean()");
+    expect(source).toContain("onSendToAgent={sendReferenceToAgent}");
+  });
+
+  it("wires parent-child supervision (↳ badge, Stop children, onChildClosed) and 1-click Claude <-> Antigravity pair handoff", () => {
+    expect(source).toContain("onChildClosed: handleChildClosed");
+    expect(source).toContain("function handleChildClosed(payload: TerminalChildClosedPayload)");
+    expect(source).toContain('data-testid="terminal-tab-child-badge"');
+    expect(source).toContain('data-testid="terminal-stop-children-btn"');
+    expect(source).toContain('data-testid="terminal-pair-handoff-btn"');
+    expect(source).toContain("buildPairHandoffPrompt(");
+  });
+
+  it("offers all four Workspace Split Presets and delegates isolated worktree provisioning to the dock host", () => {
+    expect(source).toContain('data-testid="terminal-preset-agent-diff"');
+    expect(source).toContain('data-testid="terminal-pair-split-preset"');
+    expect(source).toContain('data-testid="terminal-preset-fullstack"');
+    expect(source).toContain('data-testid="terminal-preset-worktree-agent"');
+    expect(source).toContain("onCreateAgentWorktree");
+    expect(source).not.toContain('"cmd_add_worktree"');
+    expect(source).toContain("openCheckoutTab(");
+  });
 });

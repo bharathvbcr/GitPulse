@@ -61,8 +61,8 @@ mod pane;
 
 #[cfg(target_os = "macos")]
 pub use pane::{
-    close, close_all, is_open, open, open_count, set_bounds, set_visible, snapshot_png,
-    with_webview, EventSink,
+    close, close_all, inspect_point, is_open, open, open_count, set_bounds, set_visible,
+    snapshot_png, with_webview, EventSink,
 };
 
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,218 @@ pub fn cap(text: &str, max: usize) -> String {
     }
 }
 
+/// A viewport screenshot saved to scratch disk together with a `data:image/png;base64,...`
+/// preview URL so the frontend can display an interactive inspection overlay while hiding
+/// the native `WKWebView`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BrowserSnapshotPreview {
+    pub path: String,
+    pub data_url: String,
+}
+
+/// Bounding box of an inspected DOM element in the child webview's CSS viewport coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+pub struct BrowserElementRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Metadata for a DOM element picked at `(x, y)` inside a browser session.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct BrowserElementPick {
+    pub selector: String,
+    pub tag: String,
+    pub id: String,
+    pub classes: Vec<String>,
+    pub text: String,
+    pub url: String,
+    pub rect: BrowserElementRect,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+}
+
+/// Validates click coordinates `(x, y)` inside `viewport_width` x `viewport_height` and
+/// returns normalized `(norm_x, norm_y)` ratios in `[0.0, 1.0]`.
+pub fn validate_inspect_point(
+    x: f64,
+    y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> Result<(f64, f64), String> {
+    if ![x, y, viewport_width, viewport_height]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err("inspect coordinates must be finite numbers".into());
+    }
+    if !(1.0..=MAX_EXTENT).contains(&viewport_width)
+        || !(1.0..=MAX_EXTENT).contains(&viewport_height)
+    {
+        return Err("inspect viewport dimensions are out of range".into());
+    }
+    if x < 0.0 || y < 0.0 || x > viewport_width || y > viewport_height {
+        return Err("inspect coordinates fall outside the browser viewport".into());
+    }
+    Ok((x / viewport_width, y / viewport_height))
+}
+
+/// Builds a self-contained one-shot JavaScript IIFE that inspects the element at
+/// `(norm_x * innerWidth, norm_y * innerHeight)` without installing any globals.
+pub fn inspect_point_script(norm_x: f64, norm_y: f64) -> String {
+    let nx = norm_x.clamp(0.0, 1.0);
+    let ny = norm_y.clamp(0.0, 1.0);
+    format!(
+        r##"(() => {{
+  const vw = Math.max(1, Number(window.innerWidth || document.documentElement?.clientWidth || 1));
+  const vh = Math.max(1, Number(window.innerHeight || document.documentElement?.clientHeight || 1));
+  const px = Math.min(vw - 0.5, Math.max(0, {nx:.6} * vw));
+  const py = Math.min(vh - 0.5, Math.max(0, {ny:.6} * vh));
+  const el = document.elementFromPoint(px, py);
+  if (!el) return JSON.stringify(null);
+  const tag = String(el.tagName || "element").toLowerCase().slice(0, 48);
+  const rawId = typeof el.id === "string" ? el.id.trim().slice(0, 64) : "";
+  const classes = Array.from(el.classList || []).map((c) => String(c).trim()).filter(Boolean).slice(0, 6).map((c) => c.slice(0, 64));
+  const safeTok = (s) => s.replace(/[^A-Za-z0-9_-]/g, "");
+  let selector = safeTok(tag) || "element";
+  if (rawId && safeTok(rawId)) selector += "#" + safeTok(rawId);
+  for (const cls of classes.slice(0, 3)) {{
+    const tok = safeTok(cls);
+    if (tok) selector += "." + tok;
+  }}
+  const aria = typeof el.getAttribute === "function" ? (el.getAttribute("aria-label") || "") : "";
+  const inner = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+  const text = String(inner || aria || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const box = el.getBoundingClientRect();
+  return JSON.stringify({{
+    selector,
+    tag,
+    id: rawId,
+    classes,
+    text,
+    url: String(location.href || "").slice(0, 2048),
+    rect: {{
+      x: Number(box.left) || 0,
+      y: Number(box.top) || 0,
+      width: Math.max(0, Number(box.width) || 0),
+      height: Math.max(0, Number(box.height) || 0)
+    }},
+    viewport_width: vw,
+    viewport_height: vh
+  }});
+}})()"##
+    )
+}
+
+#[derive(Deserialize)]
+struct RawElementRect {
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+}
+
+#[derive(Deserialize)]
+struct RawElementPick {
+    #[serde(default)]
+    selector: String,
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    classes: Vec<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    url: String,
+    rect: RawElementRect,
+    #[serde(default)]
+    viewport_width: f64,
+    #[serde(default)]
+    viewport_height: f64,
+}
+
+fn finite_or_zero(val: f64) -> f64 {
+    if val.is_finite() {
+        val.clamp(-MAX_EXTENT, MAX_EXTENT)
+    } else {
+        0.0
+    }
+}
+
+/// Parses and bounds-caps the untrusted JSON returned by [`inspect_point_script`],
+/// accepting both direct JSON objects (`WKContentWorld`) and JSON-quoted strings (`wry`).
+pub fn parse_evaluated_element_pick(raw: &str) -> Result<BrowserElementPick, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Err("no DOM element found at the selected point".into());
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("invalid element inspection payload: {e}"))?;
+    let obj_val = match val {
+        serde_json::Value::Null => {
+            return Err("no DOM element found at the selected point".into());
+        }
+        serde_json::Value::String(inner) => {
+            let inner_trimmed = inner.trim();
+            if inner_trimmed.is_empty() || inner_trimmed == "null" {
+                return Err("no DOM element found at the selected point".into());
+            }
+            serde_json::from_str::<serde_json::Value>(inner_trimmed)
+                .map_err(|e| format!("invalid inner element inspection payload: {e}"))?
+        }
+        other => other,
+    };
+    if obj_val.is_null() {
+        return Err("no DOM element found at the selected point".into());
+    }
+    let parsed: RawElementPick = serde_json::from_value(obj_val)
+        .map_err(|e| format!("malformed element inspection payload: {e}"))?;
+    let tag = cap(&parsed.tag.trim().to_ascii_lowercase(), 48);
+    let selector = cap(parsed.selector.trim(), 128);
+    let classes: Vec<String> = parsed
+        .classes
+        .into_iter()
+        .take(8)
+        .map(|c| cap(c.trim(), 64))
+        .filter(|c| !c.is_empty())
+        .collect();
+    Ok(BrowserElementPick {
+        selector: if selector.is_empty() {
+            if tag.is_empty() {
+                "element".into()
+            } else {
+                tag.clone()
+            }
+        } else {
+            selector
+        },
+        tag: if tag.is_empty() {
+            "element".into()
+        } else {
+            tag
+        },
+        id: cap(parsed.id.trim(), 64),
+        classes,
+        text: cap(parsed.text.trim(), 160),
+        url: cap(parsed.url.trim(), MAX_URL_CHARS),
+        rect: BrowserElementRect {
+            x: finite_or_zero(parsed.rect.x),
+            y: finite_or_zero(parsed.rect.y),
+            width: finite_or_zero(parsed.rect.width).max(0.0),
+            height: finite_or_zero(parsed.rect.height).max(0.0),
+        },
+        viewport_width: finite_or_zero(parsed.viewport_width).max(1.0),
+        viewport_height: finite_or_zero(parsed.viewport_height).max(1.0),
+    })
+}
+
 /// What a pane's page did, for the session's address bar and tab title.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -316,5 +528,42 @@ mod tests {
             serde_json::to_value(&event).unwrap(),
             serde_json::json!({ "id": "t1", "kind": "title", "title": "Home" })
         );
+    }
+
+    #[test]
+    fn inspect_point_validates_coordinates_and_caps_untrusted_dom_payloads() {
+        assert!(validate_inspect_point(120.0, 80.0, 640.0, 480.0).is_ok());
+        assert!(validate_inspect_point(-1.0, 80.0, 640.0, 480.0).is_err());
+        assert!(validate_inspect_point(f64::NAN, 80.0, 640.0, 480.0).is_err());
+        assert!(validate_inspect_point(10.0, 20.0, 0.0, 480.0).is_err());
+        assert!(validate_inspect_point(700.0, 20.0, 640.0, 480.0).is_err());
+
+        let raw_json = serde_json::json!({
+            "selector": "button#deploy.cta.primary",
+            "tag": "BUTTON",
+            "id": "deploy",
+            "classes": ["cta", "primary", "x".repeat(300)],
+            "text": format!("Deploy now {}", "z".repeat(400)),
+            "url": "http://localhost:5173/dashboard",
+            "rect": { "x": 12.5, "y": 24.0, "width": 140.0, "height": 38.0 },
+            "viewport_width": 800.0,
+            "viewport_height": 600.0
+        })
+        .to_string();
+
+        let direct = parse_evaluated_element_pick(&raw_json).unwrap();
+        assert_eq!(direct.tag, "button");
+        assert_eq!(direct.selector, "button#deploy.cta.primary");
+        assert!(direct.text.chars().count() <= 160);
+        assert!(direct.classes[2].chars().count() <= 64);
+        assert_eq!(direct.rect.width, 140.0);
+
+        // wry's `evaluate_script_with_callback` wraps JS string results as JSON strings.
+        let wry_wrapped = serde_json::to_string(&raw_json).unwrap();
+        let unwrapped = parse_evaluated_element_pick(&wry_wrapped).unwrap();
+        assert_eq!(unwrapped, direct);
+
+        assert!(parse_evaluated_element_pick("null").is_err());
+        assert!(parse_evaluated_element_pick("\"null\"").is_err());
     }
 }

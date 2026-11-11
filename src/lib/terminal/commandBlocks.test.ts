@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   createCommandBlockTracker,
+  createCommandDecorationRing,
+  extractBlockCommand,
   extractBlockOutput,
   extractLoopbackServerUrl,
+  formatCommandDuration,
+  formatFailedCommandForAgent,
   parseOsc133,
   parseOsc7501,
   parseOsc7Path,
@@ -156,5 +160,72 @@ describe("commandBlocks", () => {
         running: false,
       },
     ]);
+  });
+
+  it("records command duration, extracts prompt command text, bounds decoration ring, and formats failed command payloads", () => {
+    const tracker = createCommandBlockTracker(4);
+    const makeAt = (line: number) => () => mockMarker(line);
+
+    tracker.onMark({ kind: "prompt_start" }, makeAt(1), 1000);
+    tracker.onMark({ kind: "command_executed" }, makeAt(1), 1100);
+    tracker.onMark({ kind: "command_finished", exitCode: 101 }, makeAt(4), 2450);
+
+    const detail = tracker.lastFinishedDetail();
+    expect(detail?.exitCode).toBe(101);
+    expect(detail?.durationMs).toBe(1350);
+    expect(formatCommandDuration(1350)).toBe("1.4s");
+    expect(formatCommandDuration(42)).toBe("42ms");
+    expect(formatCommandDuration(65_000)).toBe("1m 5s");
+
+    const rows = [
+      { text: "" },
+      { text: "user@mac repo % cargo test --lib" },
+      { text: "error[E0425]: cannot find value `x`" },
+      { text: "error: test failed" },
+      { text: "user@mac repo % " },
+    ];
+    const buffer = {
+      length: rows.length,
+      getLine(y: number) {
+        const r = rows[y];
+        if (!r) return undefined;
+        return { translateToString: () => r.text };
+      },
+    };
+    const cmd = extractBlockCommand(buffer, {
+      promptLine: detail!.promptMarker.line,
+      outputStartLine: detail!.outputStartMarker!.line,
+    });
+    expect(cmd).toBe("cargo test --lib");
+
+    const prompt = formatFailedCommandForAgent({
+      command: cmd,
+      exitCode: 101,
+      durationMs: 1350,
+      cwd: "src-tauri",
+      output: extractBlockOutput(buffer, {
+        outputStartLine: detail!.outputStartMarker!.line,
+        outputEndLine: detail!.outputEndMarker!.line,
+      }),
+    });
+    expect(prompt).toContain("Command failed (exit 101, 1.4s) in `src-tauri`:");
+    expect(prompt).toContain("$ cargo test --lib");
+    expect(prompt).toContain("error[E0425]: cannot find value `x`");
+
+    // Bounded decoration ring disposes oldest entry past capacity and clears all on reset.
+    const disposed: string[] = [];
+    const ring = createCommandDecorationRing(2);
+    const makeEntry = (label: string) => ({
+      marker: { line: 1, isDisposed: false, dispose: () => disposed.push(`m:${label}`) },
+      decoration: { isDisposed: false, dispose: () => disposed.push(`d:${label}`) },
+    });
+    ring.push(makeEntry("one"));
+    ring.push(makeEntry("two"));
+    ring.push(makeEntry("three"));
+    expect(ring.size()).toBe(2);
+    expect(disposed).toEqual(["d:one", "m:one"]);
+    ring.clear();
+    expect(ring.size()).toBe(0);
+    expect(disposed).toEqual(["d:one", "m:one", "d:three", "m:three", "d:two", "m:two"]);
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   bytesToBase64,
   clipboardImageToPngBase64,
+  clipboardMayHoldFiles,
   extractClipboardImageFile,
   type ClipboardDataLike,
 } from "./clipboardImage";
@@ -31,5 +32,31 @@ describe("clipboardImage", () => {
     const png = fakeImageFile("shot.png", "image/png", raw);
     const encoded = await clipboardImageToPngBase64(png);
     expect(encoded).toBe(bytesToBase64(raw));
+  });
+
+  it("detects when a paste event may represent copied Finder files vs plain text", () => {
+    const plainTextBoard: ClipboardDataLike = {
+      getData: (fmt) => (fmt === "text/plain" ? "git status" : ""),
+      items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+      files: [],
+      types: ["text/plain"],
+    };
+    expect(clipboardMayHoldFiles(plainTextBoard, "git status")).toBe(false);
+
+    const finderFileBoard: ClipboardDataLike = {
+      getData: (fmt) => (fmt === "text/plain" ? "main.rs" : ""),
+      items: [{ kind: "file", type: "text/plain", getAsFile: () => null }],
+      files: [fakeImageFile("main.rs", "text/plain", new Uint8Array([1]))],
+      types: ["text/plain", "Files"],
+    };
+    expect(clipboardMayHoldFiles(finderFileBoard, "main.rs")).toBe(true);
+
+    const fileUrlOnlyBoard: ClipboardDataLike = {
+      getData: () => "",
+      items: [],
+      files: [],
+      types: [],
+    };
+    expect(clipboardMayHoldFiles(fileUrlOnlyBoard, "")).toBe(true);
   });
 });

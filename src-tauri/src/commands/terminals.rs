@@ -107,6 +107,19 @@ pub async fn cmd_terminal_context(
     .await
 }
 
+/// Silent loopback TCP `LISTEN` ports owned by `session_id` and its descendants,
+/// queried directly via kernel socket tables without spawning `lsof`.
+#[tauri::command(async)]
+pub async fn cmd_terminal_listening_ports(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+) -> Result<Vec<u16>, String> {
+    crate::terminal::control_async(&state, "terminal_listening_ports", move |state| {
+        crate::terminal::session_listening_ports(state, &session_id)
+    })
+    .await
+}
+
 /// The newest `max_bytes` of a session's saved output (default and ceiling:
 /// `MAX_TRANSCRIPT_TAIL_BYTES`), for a session still running or one that has
 /// ended, including one that ended before the app or the terminal host
@@ -375,6 +388,25 @@ pub async fn cmd_terminal_save_clipboard_image(
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+/// Reads copied local file paths (`public.file-url`) from the native system
+/// clipboard so `⌘C` in Finder -> `⌘V` in a GitPulse terminal attaches `@path`
+/// or POSIX-escaped file arguments.
+#[tauri::command(async)]
+pub async fn cmd_terminal_clipboard_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::desktop::on_main_thread(app, |_| {
+            Ok(crate::terminal::scratch_media::read_clipboard_file_paths())
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(crate::terminal::scratch_media::read_clipboard_file_paths())
+    }
 }
 
 /// Reads the highest-priority Markdown plan or artifact from the artifact

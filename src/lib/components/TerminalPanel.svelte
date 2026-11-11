@@ -41,6 +41,7 @@
     ChevronRight,
     ChevronsUpDown,
     Globe,
+    Eye,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -51,7 +52,8 @@
   import BrowserSession from "./BrowserSession.svelte";
   import TerminalFilePane from "./TerminalFilePane.svelte";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
-  import { askConfirm } from "../stores/modalStore";
+  import { askConfirm, askText } from "../stores/modalStore";
+  import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { groupSessionsByRepository, sessionRow, summarizeCheckout, type CheckoutTab } from "../terminal/checkoutLabel";
   import { sessionCountLabel, sessionIsLive, sessionListCommand, sessionListNotice, sessionStatusLabel } from "../terminal/sessionList";
@@ -63,6 +65,8 @@
   import { classifyDropRegion, terminalDropZones, type DropRegion } from "../terminal/dropZoneRegistry";
   import {
     agentEvents,
+    type TerminalAgentTouchedFilePayload,
+    type TerminalChildClosedPayload,
     type TerminalChildSpawnedPayload,
     type TerminalOpenFileRequestPayload,
   } from "../terminal/agentEvents";
@@ -95,6 +99,8 @@
   import ScrollCue from "./ScrollCue.svelte";
   import {
     activateTab,
+    buildPairHandoffPrompt,
+    childTabsForParent,
     offeredSessionKind,
     sessionTypesFor,
     canOpenTab,
@@ -104,7 +110,9 @@
     initialState,
     launcherLabel,
     openAttachedChildTab,
+    openCheckoutTab,
     openTab,
+    sanitizeWorktreeSlug,
     tabFor,
     paneOnScreen,
     setTabStartDir,
@@ -122,6 +130,7 @@
     terminalTabChord,
     terminalTabDestination,
     type SessionKind,
+    type LauncherKind,
     type TabKind,
     type TabState,
   } from "../terminal/tabs";
@@ -149,6 +158,7 @@
     onToggleExpanded,
     onGoToSession,
     onOpenInCodeView,
+    onCreateAgentWorktree,
     checkouts = [],
   }: {
     repoPath?: string | null;
@@ -168,6 +178,15 @@
      */
     onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
     onOpenInCodeView?: (path: string, line: number | null) => void;
+    /**
+     * Provisions a sibling Git worktree on behalf of this panel's repository
+     * tab via the dock's `MutationTarget`, keeping this panel decoupled from
+     * the repository store.
+     */
+    onCreateAgentWorktree?: (
+      targetPath: string,
+      newBranch: string,
+    ) => Promise<{ ok: true; path: string } | { ok: false; error: string | null }>;
     /**
      * The open repository tabs, for naming the checkout each listed session
      * runs in (repository, checkout, agent worktree), and for deciding which
@@ -211,6 +230,7 @@
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   let adoptionTimedOut = $state(false);
+  let followAgent = $state(false);
 
   onMount(() => {
     inputEl?.focus();
@@ -224,7 +244,9 @@
       : null;
     const unsubAgentPanel = agentEvents.subscribePanelEvents({
       onChildSpawned: handleChildSpawned,
+      onChildClosed: handleChildClosed,
       onOpenFile: handleAgentOpenFile,
+      onTouchedFile: handleAgentTouchedFile,
     });
     return () => {
       unsubAgentPanel();
@@ -356,6 +378,7 @@
             if (reclaimed && repoPath && sameRepo(reclaimed.repoPath, repoPath, pathOpts)) {
               const attached = openAttachedChildTab(nextState, {
                 sessionId: reclaimed.sessionId,
+                parentSessionId: meta.parentSessionId,
                 launcher: reclaimed.launcher,
                 title: reclaimed.title ?? null,
                 focus: false,
@@ -397,6 +420,7 @@
         launcher: tab.launcher,
         slotIndex,
         ...(backendId ? { backendSessionId: backendId } : {}),
+        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
         ...(tab.filePath ? { filePath: tab.filePath } : {}),
         ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
         ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
@@ -440,6 +464,39 @@
   let tabAgentStatuses = $state<Record<string, AgentOscStatus | null>>({});
   let unread = $state(new Set<string>());
   const checkoutInfo = $derived(repoPath ? summarizeCheckout(repoPath, checkouts, pathOpts) : null);
+  const activeTab = $derived(tabState.tabs.find((tab) => tab.id === activeId));
+  const activeBackendSessionId = $derived.by(() => {
+    if (!activeTab) return null;
+    void tabStatuses[activeTab.id];
+    const reg = $terminalSessions.find(
+      (entry) =>
+        entry.key === activeTab.id &&
+        (!repoPath || sameRepo(entry.repoPath, repoPath, pathOpts)),
+    );
+    return (
+      reg?.sessionId ||
+      sessions[activeTab.id]?.backendSessionId?.() ||
+      activeTab.attachSessionId ||
+      null
+    );
+  });
+  const activeChildTabs = $derived(
+    childTabsForParent(tabState, activeBackendSessionId, tabStatuses),
+  );
+  const pairHandoffTarget = $derived.by(() => {
+    if (!splitRoot || !activeTab) return null;
+    if (activeTab.launcher !== "claude" && activeTab.launcher !== "agy") return null;
+    const wantedPartner = activeTab.launcher === "claude" ? "agy" : "claude";
+    return (
+      tabState.tabs.find(
+        (candidate) =>
+          candidate.id !== activeTab.id &&
+          visibleIds.includes(candidate.id) &&
+          candidate.launcher === wantedPartner &&
+          tabStatuses[candidate.id] !== "exited",
+      ) ?? null
+    );
+  });
   let collisionSummary = $state<CollisionRisk | null>(null);
 
   $effect(() => {
@@ -472,11 +529,11 @@
       case "working":
         return { label: "Working", cls: "text-accent" };
       case "blocked":
-        return { label: "Input", cls: "text-amber-300" };
+        return { label: "Input", cls: "text-warn" };
       case "done":
-        return { label: "Done", cls: "text-emerald-300" };
+        return { label: "Done", cls: "text-ok" };
       case "error":
-        return { label: "Failed", cls: "text-rose-300" };
+        return { label: "Failed", cls: "text-danger" };
       case "idle":
         return { label: "Idle", cls: "text-textMuted" };
       default:
@@ -642,6 +699,35 @@
     launcherMenuOpen = false;
   }
 
+  function preferredPresetAgent(): LauncherKind {
+    return isPromptLauncher(nextLauncher) ? nextLauncher : "claude";
+  }
+
+  function openAgentDiffPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    const agentKind = preferredPresetAgent();
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 1 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    mode = "shell";
+    const afterAgent = openTab(tabState, agentKind);
+    const agentId = afterAgent.activeId;
+    if (!agentId) return;
+    const afterFile = openFileTab(afterAgent, { reuseExisting: true, focus: false });
+    const fileId = afterFile.id;
+    if (!fileId || fileId === agentId) return;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    followAgent = true;
+    tabState = activateTab(afterFile.state, agentId);
+    splitRoot = splitPane(null, agentId, fileId, "row", "after", 0.5);
+  }
+
   function openPairSplit() {
     launcherMenuOpen = false;
     if (!repoPath) return;
@@ -662,6 +748,126 @@
     zoomedPaneId = null;
     tabState = activateTab(afterSecond, firstId);
     splitRoot = splitPane(null, firstId, secondId, "row", "after", 0.5);
+  }
+
+  function openFullStackPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    const agentKind = preferredPresetAgent();
+    const withBrowser = $hostPlatform.browser_sessions;
+    const neededTabs = withBrowser ? 3 : 2;
+    if (
+      tabState.tabs.length + neededTabs > MAX_STRIP_TABS ||
+      $terminalSessions.length + 2 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    mode = "shell";
+    const afterAgent = openTab(tabState, agentKind);
+    const agentId = afterAgent.activeId;
+    const afterShell = openTab(afterAgent, "shell");
+    const shellId = afterShell.activeId;
+    if (!agentId || !shellId || agentId === shellId) return;
+    let nextState = afterShell;
+    let tree = splitPane(null, agentId, shellId, "row", "after", 0.5);
+    if (withBrowser) {
+      const openedBrowser = openBrowserTab(nextState, undefined);
+      if (openedBrowser.id && openedBrowser.id !== shellId) {
+        nextState = openedBrowser.state;
+        tree = splitPane(tree, shellId, openedBrowser.id, "col", "after", 0.5);
+      }
+    }
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    tabState = activateTab(nextState, agentId);
+    splitRoot = tree;
+  }
+
+  let creatingWorktreePreset = $state(false);
+
+  async function openWorktreeAgentPreset() {
+    launcherMenuOpen = false;
+    const baseRepo = repoPath;
+    if (!baseRepo || !onCreateAgentWorktree || creatingWorktreePreset) return;
+    const agentKind = preferredPresetAgent();
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 1 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    const rawSlug = await askText({
+      title: "New Isolated Agent Worktree",
+      message:
+        "Creates a sibling worktree (<repo>.wt-<slug>) on branch wt/<slug> and opens an agent + live file split inside it.",
+      placeholder: "agent-1",
+      initialValue: "agent-1",
+      confirmLabel: "Create & Open",
+      validate: (value) =>
+        sanitizeWorktreeSlug(value)
+          ? null
+          : "Enter a valid slug using letters, numbers, dots, underscores, or hyphens.",
+    });
+    if (rawSlug === null) return;
+    const slug = sanitizeWorktreeSlug(rawSlug);
+    if (!slug || !repoPath || !sameRepo(repoPath, baseRepo, pathOpts)) return;
+
+    const trimmedRepo = baseRepo.replace(/[\\/]+$/, "");
+    const sep = trimmedRepo.includes("\\") ? "\\" : "/";
+    const lastSep = Math.max(trimmedRepo.lastIndexOf("/"), trimmedRepo.lastIndexOf("\\"));
+    if (lastSep <= 0) {
+      sessionError = "Could not resolve parent directory for sibling worktree.";
+      return;
+    }
+    const parentDir = trimmedRepo.slice(0, lastSep);
+    const repoBase = trimmedRepo.slice(lastSep + 1);
+    const targetPath = `${parentDir}${sep}${repoBase}.wt-${slug}`;
+    const newBranch = `wt/${slug}`;
+
+    creatingWorktreePreset = true;
+    try {
+      const outcome = await onCreateAgentWorktree(targetPath, newBranch);
+      if (!outcome.ok) {
+        if (outcome.error) {
+          if (visible && repoPath && sameRepo(repoPath, baseRepo, pathOpts)) {
+            sessionError = `Could not create isolated worktree: ${outcome.error}`;
+          } else {
+            toastStore.error(`Could not create isolated worktree: ${outcome.error}`);
+          }
+        }
+        return;
+      }
+      if (!repoPath || !sameRepo(repoPath, baseRepo, pathOpts)) return;
+
+      const checkoutPath = outcome.path;
+      mode = "shell";
+      const openedAgent = openCheckoutTab(tabState, agentKind, {
+        checkout: checkoutPath,
+        name: `${launcherLabel(agentKind)} · ${slug}`,
+      });
+      if (!openedAgent.id) {
+        sessionError = capacityTitleFor(agentKind);
+        return;
+      }
+      const openedFile = openFileTab(openedAgent.state, {
+        checkout: checkoutPath,
+        reuseExisting: true,
+        focus: false,
+      });
+      focusTabStrip = false;
+      zoomedPaneId = null;
+      followAgent = true;
+      tabState = activateTab(openedFile.state, openedAgent.id);
+      if (openedFile.id && openedFile.id !== openedAgent.id) {
+        splitRoot = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
+      }
+    } catch (err) {
+      sessionError = `Could not create isolated worktree: ${formatError(err)}`;
+    } finally {
+      creatingWorktreePreset = false;
+    }
   }
 
   function chooseSearchedTab(id: string) {
@@ -1159,6 +1365,7 @@
     const parentTabId = tabIdForBackendSession(payload.parent_session_id) ?? tabState.activeId;
     const result = openAttachedChildTab(tabState, {
       sessionId: payload.id,
+      parentSessionId: payload.parent_session_id,
       launcher: payload.launcher,
       title: payload.title,
       startDir: startDir && startDir !== "." ? startDir : null,
@@ -1182,6 +1389,54 @@
     }
   }
 
+  function handleChildClosed(payload: TerminalChildClosedPayload) {
+    if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
+    const childTabId = tabIdForBackendSession(payload.id);
+    if (!childTabId) return;
+    if (tabState.tabs.some((tab) => tab.id === childTabId)) {
+      dropTab(childTabId);
+    }
+  }
+
+  async function stopActiveChildren() {
+    const targets = [...activeChildTabs];
+    for (const child of targets) {
+      try {
+        await sessions[child.id]?.close();
+      } catch (error: unknown) {
+        sessionError = formatError(error);
+        continue;
+      }
+      if (tabState.tabs.some((candidate) => candidate.id === child.id)) {
+        dropTab(child.id);
+      }
+    }
+  }
+
+  function handOffToPairPartner() {
+    const partner = pairHandoffTarget;
+    if (!activeTab || !partner) return;
+    const visibleFileTab = tabState.tabs.find(
+      (tab) => tab.launcher === "file" && visibleIds.includes(tab.id) && tab.filePath,
+    );
+    const tail =
+      sessions[activeTab.id]?.retainedOutput() ||
+      sessions[activeTab.id]?.serializeVisualOutput() ||
+      "";
+    const prompt = buildPairHandoffPrompt({
+      fromLauncher: activeTab.launcher,
+      checkoutBranch: checkoutInfo?.currentBranch ?? null,
+      openFilePath: visibleFileTab?.filePath ?? null,
+      openFileLine: visibleFileTab?.revealLine ?? null,
+      terminalTail: tail,
+    });
+    selectTab(partner.id);
+    const inserted = sessions[partner.id]?.insertText(prompt, { focus: true }) ?? false;
+    if (!inserted) {
+      sessionError = `${launcherLabel(partner.launcher)} session is not ready to receive input yet.`;
+    }
+  }
+
   function handleAgentOpenFile(payload: TerminalOpenFileRequestPayload) {
     if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
     const anchorId = tabIdForBackendSession(payload.caller_session_id) ?? tabState.activeId ?? undefined;
@@ -1191,6 +1446,70 @@
       anchorId,
     });
     if (err) sessionError = err;
+  }
+
+  function handleAgentTouchedFile(payload: TerminalAgentTouchedFilePayload) {
+    if (!repoPath) return;
+    const sourceTabId = tabIdForBackendSession(payload.id);
+    const sourceTab = sourceTabId ? tabState.tabs.find((t) => t.id === sourceTabId) : undefined;
+    const matchesPanel =
+      sameRepo(payload.repo_path, repoPath, pathOpts) ||
+      Boolean(sourceTab?.checkout && sameRepo(payload.repo_path, sourceTab.checkout, pathOpts));
+    if (!matchesPanel) return;
+
+    // Always live-refresh any file pane already displaying this exact file on disk.
+    if (!payload.artifact) {
+      for (const tab of tabState.tabs) {
+        if (
+          tab.launcher === "file" &&
+          tab.filePath === payload.path &&
+          sameRepo(tab.checkout ?? repoPath, payload.repo_path, pathOpts)
+        ) {
+          filePanes[tab.id]?.reloadIfClean();
+        }
+      }
+    }
+
+    if (!followAgent) return;
+    if (sourceTabId && sourceTabId !== tabState.activeId && !visibleIds.includes(sourceTabId)) {
+      return;
+    }
+
+    if (payload.artifact) {
+      if (sourceTabId) {
+        void sessions[sourceTabId]?.openAgentArtifact();
+      }
+      return;
+    }
+
+    const checkout = sourceTab?.checkout;
+    const existingVisibleFile = tabState.tabs.find(
+      (t) =>
+        t.launcher === "file" &&
+        visibleIds.includes(t.id) &&
+        sameRepo(t.checkout ?? repoPath, payload.repo_path, pathOpts),
+    );
+    if (existingVisibleFile) {
+      if (existingVisibleFile.filePath !== payload.path) {
+        tabState = setTabFile(tabState, existingVisibleFile.id, payload.path, 1, null);
+      }
+      void tick().then(() => filePanes[existingVisibleFile.id]?.reloadIfClean());
+      return;
+    }
+
+    const err = openFileSplitFor(payload.path, 1, null, {
+      focus: false,
+      anchorId: sourceTabId ?? tabState.activeId ?? undefined,
+      checkout,
+    });
+    if (err) {
+      sessionError = err;
+      return;
+    }
+    void tick().then(() => {
+      const target = fileTabFor(tabState, payload.path, checkout);
+      if (target) filePanes[target.id]?.reloadIfClean();
+    });
   }
 
   function handleFileDropOnPane(paneId: string, paths: string[], region: DropRegion): boolean {
@@ -1812,7 +2131,7 @@
       </span>
       {#if checkoutInfo && (checkoutInfo.currentBranch || checkoutInfo.label.checkout)}
         <span
-          class="px-1.5 py-0.5 rounded border border-border/70 bg-surface font-mono text-[10px] text-textMuted truncate max-w-44"
+          class="px-1.5 py-0.5 rounded border border-border/65 bg-surface font-mono text-micro text-textMuted truncate max-w-44"
           data-testid="terminal-checkout-pill"
           title={`Checkout: ${checkoutInfo.label.repository}${checkoutInfo.label.checkout ? ` · ${checkoutInfo.label.checkout}` : ""}${checkoutInfo.currentBranch ? ` (${checkoutInfo.currentBranch})` : ""}`}
         >
@@ -1821,7 +2140,7 @@
       {/if}
       {#if checkoutInfo && checkoutInfo.conflictedCount > 0}
         <span
-          class="px-1.5 py-0.5 rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 text-[10px] shrink-0"
+          class="px-1.5 py-0.5 rounded border border-danger/35 bg-danger/10 text-danger text-micro shrink-0"
           data-testid="terminal-conflict-pill"
         >
           {checkoutInfo.conflictedCount} {checkoutInfo.conflictedCount === 1 ? "conflict" : "conflicts"}
@@ -1830,7 +2149,7 @@
       {#if collisionSummary}
         {#if !collisionSummary.ok}
           <span
-            class="px-1.5 py-0.5 rounded border border-border/70 bg-surface text-textMuted text-[10px] shrink-0"
+            class="px-1.5 py-0.5 rounded border border-border/65 bg-surface text-textMuted text-micro shrink-0"
             data-testid="terminal-collision-unverified"
             title={collisionSummary.error || "Cross-worktree collision check unavailable"}
           >
@@ -1838,7 +2157,7 @@
           </span>
         {:else if collisionSummary.overlapping_files > 0 || collisionSummary.shared_worktree_files > 0}
           <span
-            class="px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[10px] shrink-0"
+            class="px-1.5 py-0.5 rounded border border-warn/35 bg-warn/10 text-warn text-micro shrink-0"
             data-testid="terminal-collision-pill"
             title={collisionSummary.items.slice(0, 6).map((item) => item.path).join(", ") || "Concurrent dirty files across worktrees or live sessions"}
           >
@@ -2067,9 +2386,9 @@
           data-terminal-tab={tab.id}
           class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-[11px] shrink-0 transition-colors {tab.id ===
           tabState.activeId
-            ? 'bg-surface border-accent/50 text-textPrimary'
+            ? 'bg-surface border-accent/65 text-textPrimary'
             : splitRoot && visibleIds.includes(tab.id)
-              ? 'bg-surface/40 border-border/70 text-textPrimary'
+              ? 'bg-surface/40 border-border/65 text-textPrimary'
               : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
         >
           <button
@@ -2094,7 +2413,7 @@
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
           >
-            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-rose-300"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
+            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent/80 mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-rose-300"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
           <button
             type="button"
@@ -2112,7 +2431,35 @@
       </div>
 
       <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">
+        {#if activeChildTabs.length > 0}
+          <button
+            type="button"
+            class="gp-btn py-0! px-1.5! text-micro! text-danger border-danger/35"
+            data-testid="terminal-stop-children-btn"
+            title="Terminate and close child sessions spawned by this agent"
+            onclick={() => void stopActiveChildren()}
+          >Stop children ({activeChildTabs.length})</button>
+        {/if}
+        {#if pairHandoffTarget}
+          <button
+            type="button"
+            class="gp-btn py-0! px-1.5! text-micro!"
+            data-testid="terminal-pair-handoff-btn"
+            title={`Send bounded context handoff to ${launcherLabel(pairHandoffTarget.launcher)}`}
+            onclick={handOffToPairPartner}
+          >Hand off → {launcherLabel(pairHandoffTarget.launcher)}</button>
+        {/if}
         <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
+          aria-label={followAgent ? "Stop following agent edits" : "Follow agent file edits in split"}
+          aria-pressed={followAgent}
+          disabled={!repoPath}
+          data-testid="terminal-follow-agent-toggle"
+          title={followAgent ? "Following agent edits — live-opens or refreshes modified files & plans" : "Follow agent — auto-open modified files & plans in split pane"}
+          onclick={() => { followAgent = !followAgent; }}
+        ><Eye size={13} /></button>
         <button
           type="button"
           class="gp-icon-btn"
@@ -2141,7 +2488,7 @@
         {#if splitRoot}
           <button
             type="button"
-            class="gp-icon-btn px-1.5! text-[10px]!"
+            class="gp-icon-btn px-1.5! text-micro!"
             aria-label={zoomedPaneId ? "Restore split panes" : "Zoom active pane"}
             aria-pressed={Boolean(zoomedPaneId)}
             title={zoomedPaneId ? `Restore split panes (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})` : `Zoom active pane (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})`}
@@ -2149,7 +2496,7 @@
           >{zoomedPaneId ? "Unzoom" : "Zoom"}</button>
           <button
             type="button"
-            class="gp-icon-btn px-1.5! text-[10px]!"
+            class="gp-icon-btn px-1.5! text-micro!"
             aria-label="Close split view"
             title="Unsplit all panes (keeps tabs open)"
             onclick={toggleSplit}
@@ -2244,7 +2591,19 @@
             <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
         </div>
-        <div class="mt-1 pt-1 border-t border-border/60">
+        <div class="gp-menu-sep my-1"></div>
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Workspace split presets">
+          <span class="gp-label px-2.5 py-0.5">Split presets</span>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-agent-diff"
+            disabled={!repoPath || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
+            title="Open coding agent beside a live Follow-Agent file/diff split"
+            onclick={openAgentDiffPreset}
+          >
+            Agent + Live Diff
+          </button>
           <button
             type="button"
             class="gp-menu-item text-textMuted"
@@ -2254,6 +2613,26 @@
             onclick={openPairSplit}
           >
             Pair split: Claude + Antigravity
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-fullstack"
+            disabled={!repoPath || tabState.tabs.length + ($hostPlatform.browser_sessions ? 3 : 2) > MAX_STRIP_TABS || $terminalSessions.length + 2 > $terminalSessionLimit}
+            title="Open coding agent left with Shell + Browser stacked on the right"
+            onclick={openFullStackPreset}
+          >
+            Full-Stack: Agent + Shell + Browser
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-worktree-agent"
+            disabled={!repoPath || !onCreateAgentWorktree || creatingWorktreePreset || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
+            title="Provision a fresh sibling Git worktree (CoW caches + DevMap) and open an agent + live diff split inside it"
+            onclick={() => void openWorktreeAgentPreset()}
+          >
+            Isolated Worktree Agent Split…
           </button>
         </div>
       </div>
@@ -2431,6 +2810,7 @@
               onChord={handleChord}
               onOpenFileSplit={(path, line, column, fallbackPath) => Boolean(openFileSplitFor(path, line, column, { focus: false, anchorId: tab.id, checkout: tab.checkout, fallbackPath }) === undefined)}
               onOpenSnippetSplit={(title, content) => openSnippetSplitFor(title, content) === undefined}
+              onSendToAgent={sendReferenceToAgent}
               onAgentStatus={(st) => { tabAgentStatuses = { ...tabAgentStatuses, [tab.id]: st }; }}
               revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
               confirmCloseSelf={() => confirmClose(tab.id)}
@@ -2441,7 +2821,8 @@
             {/if}
             {#if tabDropHint?.paneId === tab.id}
               <div
-                class="pointer-events-none absolute bg-accent/20 border-2 border-accent/70 transition-all z-20"
+                class="pointer-events-none absolute bg-accent/20 border-2 border-accent/65 transition-opacity"
+                style:z-index={LAYERS.SCROLL_CUE}
                 style={tabDropHint.direction === "row"
                   ? (tabDropHint.position === "before" ? "left:0;top:0;width:50%;height:100%;" : "left:50%;top:0;width:50%;height:100%;")
                   : (tabDropHint.position === "before" ? "left:0;top:0;width:100%;height:50%;" : "left:0;top:50%;width:100%;height:50%;")}
@@ -2450,7 +2831,8 @@
             {#if fileDropHint?.paneId === tab.id}
               <div
                 data-testid={`terminal-file-drop-${fileDropHint.region}`}
-                class="pointer-events-none absolute flex items-center justify-center bg-accent/15 border-2 border-dashed border-accent/70 transition-all z-20"
+                class="pointer-events-none absolute flex items-center justify-center bg-accent/15 border-2 border-dashed border-accent/65 transition-opacity"
+                style:z-index={LAYERS.SCROLL_CUE}
                 style={fileDropHint.region === "center"
                   ? "left:6px;top:6px;right:6px;bottom:6px;border-radius:8px;"
                   : fileDropHint.region === "left"
@@ -2461,7 +2843,7 @@
                         ? "left:0;top:0;width:100%;height:50%;"
                         : "left:0;top:50%;width:100%;height:50%;"}
               >
-                <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/50 text-[11px] font-medium text-textPrimary shadow-sm">
+                <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/65 text-meta font-medium text-textPrimary shadow-sm">
                   {fileDropHint.region !== "center"
                     ? "Split & open file"
                     : isPromptLauncher(tab.launcher)
@@ -2487,7 +2869,8 @@
             aria-valuemin={15}
             aria-valuemax={85}
             data-split-sash={sash.branchId}
-            class="terminal-split-sash absolute z-10 flex items-center justify-center select-none group {sash.direction === 'row' ? '-ml-[3px] w-1.5 cursor-col-resize' : '-mt-[3px] h-1.5 cursor-row-resize'}"
+            class="terminal-split-sash absolute flex items-center justify-center select-none group {sash.direction === 'row' ? '-ml-[3px] w-1.5 cursor-col-resize' : '-mt-[3px] h-1.5 cursor-row-resize'}"
+            style:z-index={LAYERS.STICKY}
             style={sash.direction === "row"
               ? `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; height: ${(sash.box.height * 100).toFixed(4)}%;`
               : `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; width: ${(sash.box.width * 100).toFixed(4)}%;`}

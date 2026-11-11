@@ -17,7 +17,7 @@ Coding agents launched inside a GitPulse terminal automatically inherit session 
 
 ## Option A lineage boundary
 
-A parent session may **only** `list`, `wait`, `read`, or `send` child sessions that **it spawned itself** (`parent_session_id == caller_session_id`). At most 8 active child sessions may run concurrently per parent (`MAX_CHILDREN_PER_PARENT = 8`). User-opened shells (`parent_session_id == null`), the caller's own session, and sibling sessions owned by other parents are unreachable by design and return a uniform refusal.
+A parent session may **only** `list`, `wait`, `read`, `send`, or `close` child sessions that **it spawned itself** (`parent_session_id == caller_session_id`). At most 8 active child sessions may run concurrently per parent (`MAX_CHILDREN_PER_PARENT = 8`). User-opened shells (`parent_session_id == null`), the caller's own session, and sibling sessions owned by other parents are unreachable by design and return a uniform refusal.
 
 ## MCP tools (preferred)
 
@@ -26,9 +26,10 @@ Pass `repo_path` as an absolute filesystem path on every call. When the MCP serv
 | Tool | Purpose |
 | --- | --- |
 | `gitpulse_terminal_spawn` | Spawn a scoped child PTY (`launcher`: `"shell"` \| `"claude"` \| `"agy"` \| `"codex"` \| `"manvi"` \| `"grok"`). Optional `cwd` (sandboxed inside `repo_path`), `command` (for `"shell"`, gated through `signal_guard` + command policy), `prompt` (for agent launchers), `title`, `split` (defaults to `true`, opening a right-hand split pane beside the parent), `rows`, `cols`. Returns `child_session_id`, `gate_checked`, `gate_notice`, and `baseline_seq`. |
-| `gitpulse_terminal_wait` | Block until `child_session_id` exits, finishes an `OSC 133;D` shell command, reports `OSC 7501` `herdr_status` (`"idle"` / `"done"` / `"blocked"` / `"error"`), matches `pattern` on the rendered 2D screen, or prints a loopback `dev_server_url`, bounded by `timeout_ms` (default `10000`, max `25000`). Optional `since_seq` (defaults to the latest `baseline_seq` from `spawn` / `send` / `wait`) ensures stale previous-turn statuses never wake a later wait early. Returns `matched`, `timed_out`, `matched_reason`, `event_seq`, `ended`, `exit_code`, `command_running`, `last_exit_code`, `herdr_status`, and `dev_server_url`. |
+| `gitpulse_terminal_wait` | Block until `child_session_id` exits, finishes an `OSC 133;D` shell command, reports `OSC 7501` `herdr_status` (`"idle"` / `"done"` / `"blocked"` / `"error"`), matches `pattern` on the rendered 2D screen, or opens/prints a loopback `dev_server_url` (detected both from stdout and silently via kernel socket-table inspection), bounded by `timeout_ms` (default `10000`, max `25000`). Optional `since_seq` (defaults to the latest `baseline_seq` from `spawn` / `send` / `wait`) ensures stale previous-turn statuses never wake a later wait early. Returns `matched`, `timed_out`, `matched_reason`, `event_seq`, `ended`, `exit_code`, `command_running`, `last_exit_code`, `herdr_status`, and `dev_server_url`. |
 | `gitpulse_terminal_read` | Read up to `max_lines` (default `80`, max `200`) across scrollback + viewport from the child's headless `vt100` 2D screen buffer (handling `\r` progress bars, cursor motion, wrapped lines, and alternate screen cleanly). Every returned line is scrubbed for secrets and `gpst_` capability tokens (`<redacted>`). Returns `text`, `lines_returned`, `total_lines`, `truncated`, `ended`, `exit_code`, `command_running`, `last_exit_code`, `herdr_status`, and `dev_server_url`. |
 | `gitpulse_terminal_send` | Send plain-text `input` (plus trailing newline unless `append_newline: false`) to `child_session_id`. Rejects NUL, `ESC` (`0x1b`), and `Ctrl+Z` (`0x1a`) bytes and runs every non-empty line through `signal_guard` + command policy with bypass disabled. Returns `child_session_id`, `bytes_sent`, `gate_checked`, `gate_notice`, and `baseline_seq`. |
+| `gitpulse_terminal_close` | Terminate `child_session_id`, immediately free its per-parent concurrency slot (`MAX_CHILDREN_PER_PARENT = 8`), and close its split pane in the GitPulse window. Idempotent on already-exited child sessions (`already_ended: true`). Returns `child_session_id` and `already_ended`. |
 | `gitpulse_terminal_list` | List active and recently ended child sessions spawned by this caller session, returning `total` and `children` (`child_session_id`, `launcher`, `cwd`, `title`, `ended`, `exit_code`, `command_running`, `last_exit_code`, `herdr_status`, `dev_server_url`). |
 | `gitpulse_terminal_open_file` | Open a repository-relative `path` (at optional 1-based `line` and `column`) in a right-hand `TerminalFilePane` split alongside the caller's terminal pane (`CodeViewer` or `MarkDevViewer`) without stealing keyboard focus. |
 
@@ -41,6 +42,7 @@ gitpulse-hook term spawn --launcher shell --command "cargo test" --title "Tests"
 gitpulse-hook term wait <child-session-id> --timeout-ms 15000
 gitpulse-hook term read <child-session-id> --max-lines 80
 gitpulse-hook term send <child-session-id> --input "npm run lint"
+gitpulse-hook term close <child-session-id>
 gitpulse-hook term list
 gitpulse-hook term open-file src/main.rs --line 42
 ```

@@ -62,6 +62,11 @@ describe("TerminalDock", () => {
     expect(source).toContain("checkouts: $repoStore.openTabs");
   });
 
+  it("routes isolated agent worktree creation through repoStore.addWorktree with the panel's MutationTarget", () => {
+    expect(source).toContain("repoStore.addWorktree(");
+    expect(source).toContain("addAgentWorktree({ tabId: tab.id, path: tab.path }, targetPath, newBranch)");
+  });
+
   it("a clicked session alert jumps through the same owner as Go to", () => {
     // It called `record.reveal()` directly: the tab was selected inside
     // whichever repository's panel held it, hidden if that was not the

@@ -266,6 +266,7 @@ Commands:
   wait        Wait on a child session (`OSC 133`, `OSC 7501`, pattern, or loopback port)
   read        Read secret-scrubbed `vt100` screen lines from a child session
   send        Send policy-gated plain-text input to a child session
+  close       Terminate and close a child session spawned by this caller session
 
 Common options:
   --repo <abs-path>           Repository root (defaults to git root of current working directory)
@@ -302,6 +303,9 @@ Send options:
   --child <session-id>        Child session id (or pass as positional arg)
   --input <text>              Plain-text input (ANSI escapes and NUL refused)
   --newline | --no-newline    Append trailing newline (default: true)
+
+Close options:
+  --child <session-id>        Child session id (or pass as positional arg)
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -457,7 +461,11 @@ fn parse_term_cli(
                         let v = next_flag_value(flag, inline, &mut iter)?;
                         cols = Some(parse_u16_flag(flag, &v)?);
                     }
-                    _ => return Err(format!("unknown option {raw:?} for `gitpulse-hook term spawn`")),
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term spawn`"
+                        ))
+                    }
                 }
             }
             let (repo_path, caller_session_id, caller_token) =
@@ -534,7 +542,11 @@ fn parse_term_cli(
                     "--caller-token" => {
                         tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
                     }
-                    _ => return Err(format!("unknown option {raw:?} for `gitpulse-hook term list`")),
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term list`"
+                        ))
+                    }
                 }
             }
             let (repo_path, caller_session_id, caller_token) =
@@ -586,7 +598,11 @@ fn parse_term_cli(
                     _ if !raw.starts_with('-') && child_session_id.is_none() => {
                         child_session_id = Some(raw.clone());
                     }
-                    _ => return Err(format!("unknown option {raw:?} for `gitpulse-hook term wait`")),
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term wait`"
+                        ))
+                    }
                 }
             }
             let child_session_id = child_session_id.ok_or_else(|| {
@@ -626,7 +642,11 @@ fn parse_term_cli(
                     _ if !raw.starts_with('-') && child_session_id.is_none() => {
                         child_session_id = Some(raw.clone());
                     }
-                    _ => return Err(format!("unknown option {raw:?} for `gitpulse-hook term read`")),
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term read`"
+                        ))
+                    }
                 }
             }
             let child_session_id = child_session_id.ok_or_else(|| {
@@ -673,15 +693,18 @@ fn parse_term_cli(
                     _ if !raw.starts_with('-') && child_session_id.is_none() => {
                         child_session_id = Some(raw.clone());
                     }
-                    _ => return Err(format!("unknown option {raw:?} for `gitpulse-hook term send`")),
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term send`"
+                        ))
+                    }
                 }
             }
             let child_session_id = child_session_id.ok_or_else(|| {
                 "`gitpulse-hook term send` requires --child <session-id>".to_string()
             })?;
-            let input = input.ok_or_else(|| {
-                "`gitpulse-hook term send` requires --input <text>".to_string()
-            })?;
+            let input = input
+                .ok_or_else(|| "`gitpulse-hook term send` requires --input <text>".to_string())?;
             let (repo_path, caller_session_id, caller_token) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Send {
@@ -693,9 +716,44 @@ fn parse_term_cli(
                 append_newline,
             }
         }
+        "close" => {
+            let mut child_session_id: Option<String> = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    _ if !raw.starts_with('-') && child_session_id.is_none() => {
+                        child_session_id = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term close`"
+                        ))
+                    }
+                }
+            }
+            let child_session_id = child_session_id.ok_or_else(|| {
+                "`gitpulse-hook term close` requires --child <session-id>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Close {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                child_session_id,
+            }
+        }
         other => {
             return Err(format!(
-                "unknown `gitpulse-hook term` command {other:?}; expected spawn, open-file, list, wait, read, or send"
+                "unknown `gitpulse-hook term` command {other:?}; expected spawn, open-file, list, wait, read, send, or close"
             ));
         }
     };
@@ -712,7 +770,8 @@ fn call_repo_path(call: &gitpulse_lib::terminal::orchestrate::OrchestrateCall) -
         | OrchestrateCall::List { repo_path, .. }
         | OrchestrateCall::Wait { repo_path, .. }
         | OrchestrateCall::Read { repo_path, .. }
-        | OrchestrateCall::Send { repo_path, .. } => repo_path,
+        | OrchestrateCall::Send { repo_path, .. }
+        | OrchestrateCall::Close { repo_path, .. } => repo_path,
     }
 }
 
@@ -740,8 +799,10 @@ fn dispatch_term_call(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = call;
-        Err("Terminal orchestration over the desktop mailbox is available on macOS only for now"
-            .to_string())
+        Err(
+            "Terminal orchestration over the desktop mailbox is available on macOS only for now"
+                .to_string(),
+        )
     }
 }
 
@@ -967,6 +1028,23 @@ mod tests {
                 append_newline: Some(false),
             })
         );
+
+        let close = parse_term_cli(
+            &vec_args(&["close", "term-100-2"]),
+            Some("/repo/root"),
+            Some("term-100-1"),
+            Some(SAMPLE_TOKEN),
+        )
+        .expect("close parse");
+        assert_eq!(
+            close,
+            TermCliOutcome::Call(OrchestrateCall::Close {
+                repo_path: "/repo/root".into(),
+                caller_session_id: "term-100-1".into(),
+                caller_token: SAMPLE_TOKEN.into(),
+                child_session_id: "term-100-2".into(),
+            })
+        );
     }
 
     #[test]
@@ -978,7 +1056,10 @@ mod tests {
             None,
         )
         .expect_err("missing token");
-        assert!(missing_tok.contains("GITPULSE_SESSION_TOKEN"), "{missing_tok}");
+        assert!(
+            missing_tok.contains("GITPULSE_SESSION_TOKEN"),
+            "{missing_tok}"
+        );
 
         let bad_flag = parse_term_cli(
             &vec_args(&["list", "--bogus"]),

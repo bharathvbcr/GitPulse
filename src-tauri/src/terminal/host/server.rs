@@ -314,6 +314,9 @@ impl Host {
             Request::StopAll => json(engine::shutdown_sessions(&self.engine)?),
             Request::List => json(engine::list_sessions(&self.engine)?),
             Request::Context { session } => json(engine::session_context(&self.engine, &session)?),
+            Request::ListeningPorts { session } => {
+                json(engine::session_listening_ports(&self.engine, &session)?)
+            }
             Request::Receipts => json(self.receipts.pending()),
             Request::Forget { session } => json(self.receipts.forget(&session)?),
             Request::Transcript {
@@ -327,7 +330,9 @@ impl Host {
                     reason: format!("this host could not open its transcript store: {why}"),
                 },
             }),
-            Request::Telemetry { session } => json(engine::session_telemetry(&self.engine, &session)),
+            Request::Telemetry { session } => {
+                json(engine::session_telemetry(&self.engine, &session))
+            }
             Request::SetAgentMeta { session, meta } => {
                 self.engine.record_agent_meta_local(&session, meta);
                 json(())

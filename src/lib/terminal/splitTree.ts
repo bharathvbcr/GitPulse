@@ -404,6 +404,7 @@ export interface PersistedSplitLeafMeta {
   readonly launcher: TabKind;
   readonly slotIndex: number;
   readonly backendSessionId?: string;
+  readonly parentSessionId?: string;
   readonly filePath?: string;
   readonly revealLine?: number | null;
   readonly revealColumn?: number | null;
@@ -489,6 +490,7 @@ export function parsePersistedSplitWorkspace(
         launcher: meta.launcher as TabKind,
         slotIndex: typeof meta.slotIndex === "number" && Number.isFinite(meta.slotIndex) ? meta.slotIndex : 0,
         ...(typeof meta.backendSessionId === "string" && meta.backendSessionId ? { backendSessionId: meta.backendSessionId } : {}),
+        ...(typeof meta.parentSessionId === "string" && meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
         ...(typeof meta.filePath === "string" && meta.filePath ? { filePath: meta.filePath } : {}),
         ...(typeof meta.revealLine === "number" ? { revealLine: meta.revealLine } : {}),
         ...(typeof meta.revealColumn === "number" ? { revealColumn: meta.revealColumn } : {}),

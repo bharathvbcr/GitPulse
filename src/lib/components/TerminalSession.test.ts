@@ -519,4 +519,31 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     // The text is in the node, not only in a tooltip.
     expect(alert).not.toContain("title=");
   });
+
+  it("falls back to native Finder file pasteboard URLs before raw filename text", () => {
+    expect(source).toContain("clipboardMayHoldFiles(");
+    expect(source).toContain('invoke<string[]>("cmd_terminal_clipboard_files")');
+    const pasteIdx = source.indexOf("const onPasteCapture =");
+    expect(pasteIdx).toBeGreaterThan(-1);
+    const pasteBody = source.slice(pasteIdx, source.indexOf("const onEraseCapture =", pasteIdx));
+    // DataTransfer must be read synchronously before any async IPC call neuters clipboardData.
+    expect(pasteBody.indexOf("extractClipboardImageFile(event.clipboardData)")).toBeLessThan(
+      pasteBody.indexOf('invoke<string[]>("cmd_terminal_clipboard_files")'),
+    );
+    expect(pasteBody).toContain("formatDroppedPathsForSession(paths, {");
+  });
+
+  it("registers bounded OSC 133 gutter decorations with 1-click Ask agent on non-zero exit and clears them on reset/unmount", () => {
+    expect(source).toContain("createCommandDecorationRing(");
+    expect(source).toContain("created.registerDecoration(");
+    expect(source).toContain("formatFailedCommandForAgent(");
+    expect(source).toContain("terminal-osc133-ask-agent");
+    expect(source).toContain("commandDecorations.clear()");
+  });
+
+  it("polls cmd_terminal_listening_ports via createAdaptiveTimer only while onscreen with no devServerUrl yet", () => {
+    expect(source).toContain("createAdaptiveTimer(");
+    expect(source).toContain('invoke<number[]>("cmd_terminal_listening_ports"');
+    expect(source).toContain("`http://localhost:${ports[0]}`");
+  });
 });

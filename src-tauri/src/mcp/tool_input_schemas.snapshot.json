@@ -1564,6 +1564,40 @@
     ],
     "type": "object"
   },
+  "gitpulse_terminal_close": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "child_session_id": {
+        "description": "Child terminal session id previously spawned by this parent session",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "child_session_id"
+    ],
+    "type": "object"
+  },
   "gitpulse_terminal_list": {
     "additionalProperties": false,
     "properties": {

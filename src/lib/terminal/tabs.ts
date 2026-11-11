@@ -90,6 +90,11 @@ export interface TerminalTab {
    */
   attachSessionId?: string;
   /**
+   * Parent backend PTY session ID when this tab is an Option A child session
+   * spawned via `gitpulse_terminal_spawn` / `gitpulse-hook term spawn`.
+   */
+  parentSessionId?: string;
+  /**
    * A browser tab's address: the one it was opened on, then whatever its page
    * last loaded (`setTabUrl`). What an agent's or a link's request for the
    * same address finds (`browserTabFor`) instead of opening another tab.
@@ -320,6 +325,7 @@ export function openAttachedChildTab(
   state: TabState,
   options: {
     sessionId: string;
+    parentSessionId?: string | null;
     launcher?: string | null;
     title?: string | null;
     startDir?: string | null;
@@ -328,10 +334,18 @@ export function openAttachedChildTab(
 ): { state: TabState; id: string | null; opened: boolean } {
   const sessionId = options.sessionId.trim();
   if (!sessionId) return { state, id: null, opened: false };
+  const parentId = options.parentSessionId?.trim() || undefined;
   const existing = state.tabs.find((tab) => tab.attachSessionId === sessionId);
   if (existing) {
+    const updatedTabs =
+      parentId && existing.parentSessionId !== parentId
+        ? state.tabs.map((tab) =>
+            tab.id === existing.id ? { ...tab, parentSessionId: parentId } : tab,
+          )
+        : state.tabs;
+    const nextBase = updatedTabs === state.tabs ? state : { ...state, tabs: updatedTabs };
     return {
-      state: options.focus ? activateTab(state, existing.id) : state,
+      state: options.focus ? activateTab(nextBase, existing.id) : nextBase,
       id: existing.id,
       opened: false,
     };
@@ -343,6 +357,7 @@ export function openAttachedChildTab(
     LAUNCHERS.find((candidate) => candidate.kind === options.launcher)?.kind ?? "shell";
   const tab = createTab(kind);
   tab.attachSessionId = sessionId;
+  if (parentId) tab.parentSessionId = parentId;
   if (options.title) {
     const cleaned = cleanTabName(options.title);
     if (cleaned) tab.name = cleaned;
@@ -356,6 +371,115 @@ export function openAttachedChildTab(
     },
     id: tab.id,
     opened: true,
+  };
+}
+
+/**
+ * Returns live child tabs owned by `parentSessionId` (`status !== "exited"`).
+ */
+export function childTabsForParent(
+  state: TabState,
+  parentSessionId: string | null | undefined,
+  statuses?: Readonly<Record<string, string | undefined>>,
+): TerminalTab[] {
+  const pid = parentSessionId?.trim();
+  if (!pid) return [];
+  return state.tabs.filter(
+    (tab) => tab.parentSessionId === pid && statuses?.[tab.id] !== "exited",
+  );
+}
+
+const ANSI_CSI_OR_OSC =
+  // eslint-disable-next-line no-control-regex
+  /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+
+/**
+ * Builds a bounded, ANSI-stripped handoff prompt for 1-click context transfer
+ * between paired Claude Code and Antigravity split panes.
+ */
+export function buildPairHandoffPrompt(options: {
+  fromLauncher: TabKind;
+  checkoutBranch?: string | null;
+  openFilePath?: string | null;
+  openFileLine?: number | null;
+  terminalTail?: string | null;
+}): string {
+  const sender = launcherLabel(options.fromLauncher);
+  const branchTag = options.checkoutBranch?.trim() ? ` (${options.checkoutBranch.trim()})` : "";
+  const parts: string[] = [`[Handoff from ${sender}${branchTag}]`];
+  const filePath = options.openFilePath?.trim();
+  if (filePath) {
+    const lineRef =
+      typeof options.openFileLine === "number" && options.openFileLine > 0
+        ? `#L${options.openFileLine}`
+        : "";
+    parts.push(`Context file: @${filePath}${lineRef}`);
+  }
+  const cleanedTail = (options.terminalTail ?? "")
+    .replace(ANSI_CSI_OR_OSC, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (cleanedTail.length > 0) {
+    let tailText = cleanedTail.slice(-20).join("\n");
+    if (tailText.length > 1600) {
+      tailText = `…${tailText.slice(tailText.length - 1600)}`;
+    }
+    parts.push(`Recent terminal context:\n\`\`\`\n${tailText}\n\`\`\``);
+  }
+  return `${parts.join("\n")}\n`;
+}
+
+/**
+ * Normalizes a user-supplied worktree slug into a safe `[a-z0-9._-]` segment,
+ * or returns `null` when empty or unsafe (`..`).
+ */
+export function sanitizeWorktreeSlug(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s/\\]+/g, "-")
+    .replace(/[^a-z0-9._-]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 48)
+    .replace(/[.-]+$/g, "");
+  if (!cleaned || cleaned.includes("..")) return null;
+  return cleaned;
+}
+
+/**
+ * Opens an interactive process tab bound to an explicit worktree `checkout`
+ * without fabricating a `taskRunId`.
+ */
+export function openCheckoutTab(
+  state: TabState,
+  launcher: LauncherKind,
+  options: {
+    checkout: string;
+    name?: string | null;
+    startDir?: string | null;
+    initialPrompt?: string;
+  },
+): { state: TabState; id: string | null } {
+  const checkout = options.checkout.trim();
+  if (!checkout || !canOpenTab(state, MAX_STRIP_TABS)) {
+    return { state, id: null };
+  }
+  const tab = createTab(launcher, options.initialPrompt);
+  tab.checkout = checkout;
+  if (options.name) {
+    const cleaned = cleanTabName(options.name);
+    if (cleaned) tab.name = cleaned;
+  }
+  const relDir = relativeStartDir(options.startDir);
+  if (relDir) tab.startDir = relDir;
+  return {
+    state: { tabs: [...state.tabs, tab], activeId: tab.id },
+    id: tab.id,
   };
 }
 

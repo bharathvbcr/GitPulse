@@ -25,6 +25,7 @@ mod ipc;
 #[cfg(unix)]
 mod jobs;
 pub mod orchestrate;
+pub mod port_probe;
 #[cfg(unix)]
 mod readiness;
 mod ring;
@@ -328,6 +329,16 @@ pub struct TerminalAgentMetaPayload {
     pub agent: String,
     pub conversation_id: String,
     pub artifact_dir: Option<String>,
+}
+
+pub const AGENT_TOUCHED_FILE_EVENT: &str = "terminal-agent-touched-file";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalAgentTouchedFilePayload {
+    pub id: String,
+    pub repo_path: String,
+    pub path: String,
+    pub artifact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,7 +885,9 @@ fn validate_hint_artifact_dir(hint: &str) -> Result<std::path::PathBuf, String> 
         let meta = std::fs::symlink_metadata(&cursor)
             .map_err(|e| format!("Could not inspect agent artifact directory: {e}"))?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
-            return Err("Agent artifact directory path contains a symlink or non-directory.".into());
+            return Err(
+                "Agent artifact directory path contains a symlink or non-directory.".into(),
+            );
         }
     }
     Ok(cursor)
@@ -963,8 +976,9 @@ pub fn read_agent_artifact(
         }
     }
 
-    let (_, _, chosen_path, title) = best
-        .ok_or_else(|| "No Markdown plan or artifact exists in the agent's artifact directory yet.".to_owned())?;
+    let (_, _, chosen_path, title) = best.ok_or_else(|| {
+        "No Markdown plan or artifact exists in the agent's artifact directory yet.".to_owned()
+    })?;
     let check_meta = std::fs::symlink_metadata(&chosen_path)
         .map_err(|e| format!("Could not verify artifact file: {e}"))?;
     if check_meta.file_type().is_symlink() || !check_meta.is_file() {
@@ -977,7 +991,9 @@ pub fn read_agent_artifact(
         .read_to_end(&mut bytes)
         .map_err(|e| format!("Could not read artifact '{title}': {e}"))?;
     if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
-        return Err(format!("Artifact '{title}' exceeds the 512 KiB viewer ceiling."));
+        return Err(format!(
+            "Artifact '{title}' exceeds the 512 KiB viewer ceiling."
+        ));
     }
     let content = String::from_utf8(bytes)
         .map_err(|e| format!("Artifact '{title}' is not UTF-8 Markdown: {e}"))?;
@@ -1448,6 +1464,8 @@ const OSC7501_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// Owned by the reader thread and touched by nothing else, so reading a
 /// terminal costs no lock. It holds the resumable scanner state plus the two
 /// strings a banner needs, resolved once at spawn.
+type ProbeReplyFn = Box<dyn FnMut(&[u8]) + Send>;
+
 struct SessionWatcher {
     key: String,
     label: String,
@@ -1460,7 +1478,7 @@ struct SessionWatcher {
     /// Where a notice goes: a banner in the app, a frame from the host.
     events: Arc<dyn SessionEvents>,
     telemetry: SharedSessionTelemetry,
-    probe_reply: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    probe_reply: Option<ProbeReplyFn>,
     last_probe_reply: Option<Instant>,
 }
 
@@ -2111,6 +2129,39 @@ pub fn session_context(
             ..TerminalContext::default()
         })
     }
+}
+
+/// Sorted, deduplicated loopback/wildcard TCP `LISTEN` ports owned by `session_id`
+/// and its live descendant/session processes, queried directly from OS kernel
+/// socket tables (`port_probe`) while holding the child lock against PID reuse.
+pub fn session_listening_ports(
+    state: &TerminalSessions,
+    session_id: &str,
+) -> Result<Vec<u16>, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.listening_ports(session_id);
+    }
+    let Some((child, closing)) = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|s| (s.child.clone(), s.closing.clone()))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if closing.load(Ordering::SeqCst) > 0 {
+        return Ok(Vec::new());
+    }
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(root) = child.process_id() else {
+        return Ok(Vec::new());
+    };
+    Ok(port_probe::listening_loopback_ports_for_root_pid(root))
 }
 
 /// The newest `max_bytes` of a session's saved output, live or finished. Only
@@ -3192,7 +3243,8 @@ pub(crate) fn start_session(
                         // torn down can still be asking for attention, and this
                         // costs one pass over bytes already in cache.
                         let telemetry_changed = watcher.observe(&buf[filled..filled + n]);
-                        thread_orchestration.observe_output(&sid_for_thread, &buf[filled..filled + n]);
+                        thread_orchestration
+                            .observe_output(&sid_for_thread, &buf[filled..filled + n]);
                         if telemetry_changed {
                             thread_orchestration.notify_changed();
                         }
@@ -9066,7 +9118,10 @@ mod tests {
         assert_eq!(snap.cwd.as_deref(), Some("/w/repo/src"));
         assert!(!snap.command_running);
         assert_eq!(snap.last_exit_code, Some(42));
-        assert_eq!(snap.dev_server_url.as_deref(), Some("http://localhost:5173/"));
+        assert_eq!(
+            snap.dev_server_url.as_deref(),
+            Some("http://localhost:5173/")
+        );
         assert_eq!(
             snap.herdr_status.as_ref().map(|s| s.state),
             Some(crate::alerts::scan::HerdrState::Blocked)

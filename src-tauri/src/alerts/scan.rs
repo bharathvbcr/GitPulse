@@ -650,11 +650,7 @@ fn osc7(payload: &[u8]) -> Option<String> {
     let slash = rest.find('/')?;
     let encoded = &rest[slash..];
     let decoded = percent_decode(encoded)?;
-    if decoded.is_empty()
-        || decoded
-            .bytes()
-            .any(|b| b == 0 || b < 0x20 || b == 0x7f)
-    {
+    if decoded.is_empty() || decoded.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
         return None;
     }
     // `/C:/repo` on Windows URI syntax normalizes to `C:/repo`.
@@ -839,7 +835,18 @@ fn extract_loopback_url(bytes: &[u8]) -> Option<String> {
                     c.is_whitespace()
                         || matches!(
                             c,
-                            ')' | ']' | '>' | '<' | '"' | '\'' | '`' | ',' | '\\' | '{' | '}' | '|' | '^'
+                            ')' | ']'
+                                | '>'
+                                | '<'
+                                | '"'
+                                | '\''
+                                | '`'
+                                | ','
+                                | '\\'
+                                | '{'
+                                | '}'
+                                | '|'
+                                | '^'
                         )
                 })
                 .unwrap_or(rest.len());

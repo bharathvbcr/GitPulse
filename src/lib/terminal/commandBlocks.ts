@@ -314,8 +314,18 @@ interface InternalBlock {
   promptMarker: BufferMarker;
   outputStartMarker: BufferMarker | null;
   outputEndMarker: BufferMarker | null;
+  startedAtMs: number | null;
+  durationMs: number | null;
   exitCode: number | null;
   running: boolean;
+}
+
+export interface CompletedCommandDetail {
+  promptMarker: BufferMarker;
+  outputStartMarker: BufferMarker | null;
+  outputEndMarker: BufferMarker | null;
+  exitCode: number | null;
+  durationMs: number | null;
 }
 
 function markerAlive(marker: BufferMarker | null): marker is BufferMarker {
@@ -329,10 +339,15 @@ function disposeBlock(block: InternalBlock): void {
 }
 
 export interface CommandBlockTracker {
-  onMark(event: ShellMarkEvent, createMarker: () => BufferMarker | undefined): void;
+  onMark(
+    event: ShellMarkEvent,
+    createMarker: () => BufferMarker | undefined,
+    nowMs?: number,
+  ): void;
   blocks(): CommandBlockSnapshot[];
   jumpTarget(currentViewportY: number, direction: "prev" | "next"): number | null;
   lastCompletedBlock(): CommandBlockSnapshot | null;
+  lastFinishedDetail(): CompletedCommandDetail | null;
   clear(): void;
 }
 
@@ -344,10 +359,12 @@ export interface CommandBlockTracker {
 export function createCommandBlockTracker(maxBlocks = MAX_COMMAND_BLOCKS): CommandBlockTracker {
   const cap = Math.max(1, Math.floor(maxBlocks));
   const items: InternalBlock[] = [];
+  let latestFinished: InternalBlock | null = null;
 
   function pruneDisposed(): void {
     for (let i = items.length - 1; i >= 0; i--) {
       if (!markerAlive(items[i].promptMarker)) {
+        if (latestFinished === items[i]) latestFinished = null;
         disposeBlock(items[i]);
         items.splice(i, 1);
       }
@@ -360,19 +377,24 @@ export function createCommandBlockTracker(maxBlocks = MAX_COMMAND_BLOCKS): Comma
       promptMarker: marker,
       outputStartMarker: null,
       outputEndMarker: null,
+      startedAtMs: null,
+      durationMs: null,
       exitCode: null,
       running: false,
     };
     items.push(block);
     while (items.length > cap) {
       const oldest = items.shift();
-      if (oldest) disposeBlock(oldest);
+      if (oldest) {
+        if (latestFinished === oldest) latestFinished = null;
+        disposeBlock(oldest);
+      }
     }
     return block;
   }
 
   return {
-    onMark(event, createMarker) {
+    onMark(event, createMarker, nowMs = Date.now()) {
       pruneDisposed();
       if (event.kind === "prompt_start") {
         const current = items[items.length - 1];
@@ -417,6 +439,8 @@ export function createCommandBlockTracker(maxBlocks = MAX_COMMAND_BLOCKS): Comma
         }
         target.outputStartMarker?.dispose();
         target.outputStartMarker = marker;
+        target.startedAtMs = Number.isFinite(nowMs) ? nowMs : null;
+        target.durationMs = null;
         target.running = true;
         return;
       }
@@ -426,8 +450,12 @@ export function createCommandBlockTracker(maxBlocks = MAX_COMMAND_BLOCKS): Comma
         if (!target) return;
         target.running = false;
         target.exitCode = event.exitCode;
+        if (target.startedAtMs !== null && Number.isFinite(nowMs) && nowMs >= target.startedAtMs) {
+          target.durationMs = Math.round(nowMs - target.startedAtMs);
+        }
         target.outputEndMarker?.dispose();
         target.outputEndMarker = createMarker() ?? null;
+        latestFinished = target;
       }
     },
 
@@ -486,7 +514,24 @@ export function createCommandBlockTracker(maxBlocks = MAX_COMMAND_BLOCKS): Comma
       return null;
     },
 
+    lastFinishedDetail() {
+      pruneDisposed();
+      if (!latestFinished || !markerAlive(latestFinished.promptMarker)) return null;
+      return {
+        promptMarker: latestFinished.promptMarker,
+        outputStartMarker: markerAlive(latestFinished.outputStartMarker)
+          ? latestFinished.outputStartMarker
+          : null,
+        outputEndMarker: markerAlive(latestFinished.outputEndMarker)
+          ? latestFinished.outputEndMarker
+          : null,
+        exitCode: latestFinished.exitCode,
+        durationMs: latestFinished.durationMs,
+      };
+    },
+
     clear() {
+      latestFinished = null;
       while (items.length > 0) {
         const item = items.pop();
         if (item) disposeBlock(item);
@@ -546,4 +591,141 @@ export function extractBlockOutput(
     joined = joined.slice(0, maxBytes);
   }
   return joined.replace(/\n+$/, "");
+}
+
+const MAX_COMMAND_LINE_CHARS = 2048;
+const MAX_FAILED_COMMAND_AGENT_BYTES = 12 * 1024;
+const SHELL_PROMPT_PREFIX_RE = /^.*?(?:[%$#❯➜›>])\s+/;
+
+export function formatCommandDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return "0ms";
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+  const mins = Math.floor(durationMs / 60_000);
+  const secs = Math.round((durationMs % 60_000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+/**
+ * Extracts the executed command string from the prompt block (`promptLine..outputStartLine`),
+ * stripping standard shell prompt prefixes when present.
+ */
+export function extractBlockCommand(
+  buffer: ReadableTerminalBuffer,
+  block: { promptLine: number; outputStartLine: number | null },
+): string {
+  if (block.promptLine < 0 || block.promptLine >= buffer.length) return "";
+  const end = Math.min(
+    buffer.length - 1,
+    block.outputStartLine !== null && block.outputStartLine >= block.promptLine
+      ? block.outputStartLine
+      : block.promptLine,
+  );
+  const parts: string[] = [];
+  for (let y = block.promptLine; y <= end; y++) {
+    const row = buffer.getLine(y);
+    if (!row) continue;
+    const nextRow = y + 1 <= end ? buffer.getLine(y + 1) : undefined;
+    const text = row.translateToString(!nextRow?.isWrapped);
+    if (row.isWrapped && parts.length > 0) {
+      parts[parts.length - 1] += text;
+    } else {
+      parts.push(text);
+    }
+    if (parts.join("\n").length >= MAX_COMMAND_LINE_CHARS) break;
+  }
+  if (parts.length === 0) return "";
+  parts[0] = parts[0].replace(SHELL_PROMPT_PREFIX_RE, "");
+  return parts.join("\n").trim().slice(0, MAX_COMMAND_LINE_CHARS);
+}
+
+export interface FailedCommandAgentContext {
+  command: string;
+  exitCode: number | null;
+  durationMs: number | null;
+  cwd?: string | null;
+  output: string;
+}
+
+export function formatFailedCommandForAgent(ctx: FailedCommandAgentContext): string {
+  const statusPart = ctx.exitCode !== null ? `exit ${ctx.exitCode}` : "failed";
+  const durationPart =
+    ctx.durationMs !== null && Number.isFinite(ctx.durationMs)
+      ? `, ${formatCommandDuration(ctx.durationMs)}`
+      : "";
+  const cwdPart = ctx.cwd && ctx.cwd.trim() ? ` in \`${ctx.cwd.trim()}\`` : "";
+  const cmdLine = ctx.command.trim() ? `$ ${ctx.command.trim()}\n` : "";
+  const trimmedOut =
+    ctx.output.length > MAX_FAILED_COMMAND_AGENT_BYTES
+      ? `${ctx.output.slice(0, MAX_FAILED_COMMAND_AGENT_BYTES)}\n… [truncated]`
+      : ctx.output;
+  const body = `${cmdLine}${trimmedOut}`.trimEnd();
+  return `Command failed (${statusPart}${durationPart})${cwdPart}:\n\`\`\`text\n${body}\n\`\`\``;
+}
+
+export interface DisposableDecorationEntry {
+  marker: { readonly isDisposed: boolean; dispose(): void };
+  decoration: { readonly isDisposed: boolean; dispose(): void };
+}
+
+export interface CommandDecorationRing {
+  push(entry: DisposableDecorationEntry): void;
+  size(): number;
+  clear(): void;
+}
+
+const DEFAULT_MAX_DECORATIONS = 64;
+
+/**
+ * Bounded ring of xterm `IDecoration` + `IMarker` pairs so long-running interactive
+ * shells never accumulate unbounded DOM/decoration listeners.
+ */
+export function createCommandDecorationRing(
+  maxDecorations = DEFAULT_MAX_DECORATIONS,
+): CommandDecorationRing {
+  const cap = Math.max(1, Math.floor(maxDecorations));
+  const entries: DisposableDecorationEntry[] = [];
+
+  function disposeEntry(entry: DisposableDecorationEntry): void {
+    try {
+      if (!entry.decoration.isDisposed) entry.decoration.dispose();
+    } catch {
+      /* ignore disposed xterm decoration */
+    }
+    try {
+      if (!entry.marker.isDisposed) entry.marker.dispose();
+    } catch {
+      /* ignore disposed xterm marker */
+    }
+  }
+
+  function pruneDisposed(): void {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].decoration.isDisposed || entries[i].marker.isDisposed) {
+        disposeEntry(entries[i]);
+        entries.splice(i, 1);
+      }
+    }
+  }
+
+  return {
+    push(entry) {
+      pruneDisposed();
+      entries.push(entry);
+      while (entries.length > cap) {
+        const oldest = entries.shift();
+        if (oldest) disposeEntry(oldest);
+      }
+    },
+    size() {
+      pruneDisposed();
+      return entries.length;
+    },
+    clear() {
+      while (entries.length > 0) {
+        const entry = entries.pop();
+        if (entry) disposeEntry(entry);
+      }
+    },
+  };
 }

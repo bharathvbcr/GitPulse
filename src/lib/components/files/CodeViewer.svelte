@@ -570,12 +570,12 @@
           type="button"
           onclick={sendSelectionToAgent}
           data-testid="code-send-to-agent"
-          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] border-accent/40 text-accent"
+          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta border-accent/35 text-accent"
           title="Send selected line range as @file#Lstart-Lend to the active terminal"
         >
           <Send size={11} />
           <span>{selectedLine !== null ? `Send L${Math.min(selectedLine, selectedLineEnd ?? selectedLine)}${selectedLineEnd && selectedLineEnd !== selectedLine ? `–${Math.max(selectedLine, selectedLineEnd)}` : ""}` : "Send @file"}</span>
-          <span class="gp-keycap text-[9px]!">{shortcutTextLabel("⌘L", $hostPlatform.os)}</span>
+          <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘L", $hostPlatform.os)}</span>
         </button>
       {/if}
     </div>

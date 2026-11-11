@@ -380,8 +380,7 @@ fn incoming_edit(value: &Value) -> Option<insights::IncomingEdit> {
             "old_string",
         )])),
         "edit_file" => Some(insights::IncomingEdit::Replacing(vec![string_at(
-            tool_args,
-            "Target",
+            tool_args, "Target",
         )])),
         "MultiEdit" => {
             let edits = input
@@ -1901,7 +1900,7 @@ pub fn run_command_gate(input: &HookInput) -> HookOutput {
 
 /// Judges a command an orchestrated child terminal is about to run (`spawn`
 /// initial `command`, or `send` input line) using the exact same [`signal_guard`]
-/// + [`command_gate_with`] path as interactive `PreToolUse` hooks, with bypass
+/// and [`command_gate_with`] path as interactive `PreToolUse` hooks, with bypass
 /// disabled. Both `Deny` and `Ask` refuse here because a background PTY write
 /// has no interactive approval prompt; any `system_message` notice (such as an
 /// absent harness or warning rung) is returned so callers surface non-checks
@@ -3037,6 +3036,129 @@ fn report_agent_session_meta(repo_root: &str, input: &HookInput) {
 #[cfg(not(target_os = "macos"))]
 fn report_agent_session_meta(_repo_root: &str, _input: &HookInput) {}
 
+/// Repo-relative edit or Antigravity plan artifact extracted from a successful
+/// file-modifying `PostToolUse` hook payload for live "Follow Agent" split panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TouchedFileReport {
+    pub repo: String,
+    pub path: String,
+    pub artifact: bool,
+}
+
+fn normalize_normal_relative(rel: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(seg) => {
+                let text = seg.to_str()?;
+                if text.is_empty() || text.contains('\0') {
+                    return None;
+                }
+                parts.push(text);
+            }
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+pub(crate) fn extract_touched_file_report(input: &HookInput) -> Option<TouchedFileReport> {
+    if input.incoming.is_none()
+        || input.hook_event_name == "PostToolUseFailure"
+        || !input.error.trim().is_empty()
+        || input.file_path.trim().is_empty()
+        || input.cwd.trim().is_empty()
+    {
+        return None;
+    }
+    let here = find_git_root(Path::new(&input.cwd))?;
+    let raw_file = if Path::new(&input.file_path).is_absolute() {
+        PathBuf::from(&input.file_path)
+    } else {
+        Path::new(&input.cwd).join(&input.file_path)
+    };
+    let file = canonical_enough(&raw_file).ok()?;
+
+    if !input.artifact_dir.trim().is_empty() && Path::new(&input.artifact_dir).is_absolute() {
+        if let Ok(canon_art) = canonical_enough(Path::new(&input.artifact_dir)) {
+            if let Ok(rel) = file.strip_prefix(&canon_art) {
+                if let Some(rel_slash) = normalize_normal_relative(rel) {
+                    return Some(TouchedFileReport {
+                        repo: here.to_string_lossy().into_owned(),
+                        path: rel_slash,
+                        artifact: true,
+                    });
+                }
+            }
+        }
+    }
+
+    match owning_checkout(&here, &file) {
+        Owner::Here(target) => Some(TouchedFileReport {
+            repo: here.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::Elsewhere { root, target, .. } => Some(TouchedFileReport {
+            repo: root.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::Unresolved {
+            nested_in_here: Some(target),
+            ..
+        } => Some(TouchedFileReport {
+            repo: here.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::NoRepo
+        | Owner::Unresolved {
+            nested_in_here: None,
+            ..
+        } => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn report_agent_touched_file(input: &HookInput) {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let Some(terminal_id) = session_env() else {
+        return;
+    };
+    if !crate::alerts::bridge::valid_key(&terminal_id) {
+        return;
+    }
+    let Some(report) = extract_touched_file_report(input) else {
+        return;
+    };
+    let Some(dir) = scan_profile(&report.repo) else {
+        return;
+    };
+    let request = Request::AgentTouchedFile {
+        terminal_id,
+        repo: report.repo,
+        path: report.path,
+        artifact: report.artifact,
+    };
+    if request.validate().is_err() {
+        return;
+    }
+    let _ = within_budget(Duration::from_millis(250), move || {
+        if let Some(owner) = reach_owner(&dir, Duration::from_millis(200)) {
+            let _ = owner.forward(&request);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn report_agent_touched_file(_input: &HookInput) {}
+
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
@@ -3159,7 +3281,11 @@ fn run_notify(
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
 ) -> Result<HookOutput, HookError> {
-    run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None)
+    let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
+    if argument == Some("tool_finished") {
+        report_agent_touched_file(input);
+    }
+    out
 }
 
 /// [`run_notify`] with the two things a test must be able to name: where an
@@ -9384,7 +9510,9 @@ done
                     hook_event_name: SESSION_START.to_string(),
                     permission_decision: None,
                     permission_decision_reason: None,
-                    additional_context: Some("GitPulse brief (session start)\nrepo: /Users/dev/Code/repo".into()),
+                    additional_context: Some(
+                        "GitPulse brief (session start)\nrepo: /Users/dev/Code/repo".into(),
+                    ),
                 }),
                 system_message: None,
             };
@@ -9420,7 +9548,9 @@ done
             assert_eq!(edit_call.file_path, "/Users/dev/Code/repo/src/main.rs");
             assert_eq!(
                 edit_call.incoming,
-                Some(insights::IncomingEdit::Replacing(vec!["fn old() {}".into()]))
+                Some(insights::IncomingEdit::Replacing(
+                    vec!["fn old() {}".into()]
+                ))
             );
             assert!(!edit_call.tool_subject.is_empty());
             assert_eq!(
@@ -9480,6 +9610,115 @@ done
             .unwrap();
             assert_eq!(unchecked_json["decision"], "ask");
             assert_eq!(unchecked_json["reason"], "collision check did NOT run");
+        }
+
+        #[test]
+        fn extracts_touched_file_reports_for_claude_and_antigravity_edits_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join("src/lib")).unwrap();
+            std::fs::write(repo.join("src/lib/app.ts"), "export const x = 1;\n").unwrap();
+            let canon_repo = std::fs::canonicalize(&repo).unwrap();
+
+            let artifact_dir = tmp
+                .path()
+                .join("brain/ec33ebf9-0cba-4100-8142-c61503f6c587");
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let plan_file = artifact_dir.join("implementation_plan.md");
+            std::fs::write(&plan_file, "# Plan\n").unwrap();
+
+            // 1. Claude Code Edit -> repo-relative touched file.
+            let claude_edit = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy(),
+                    "old_string": "1",
+                    "new_string": "2"
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&claude_edit),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "src/lib/app.ts".into(),
+                    artifact: false,
+                })
+            );
+
+            // 2. Antigravity write_file inside repo -> repo-relative touched file.
+            let agy_write = HookInput::from_value(&json!({
+                "hookEventName": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                "artifactDirectoryPath": artifact_dir.to_string_lossy(),
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {
+                        "Path": canon_repo.join("src/lib/new_file.ts").to_string_lossy(),
+                        "Content": "export const y = 2;\n"
+                    }
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&agy_write),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "src/lib/new_file.ts".into(),
+                    artifact: false,
+                })
+            );
+
+            // 3. Antigravity edit_file inside artifactDirectoryPath -> artifact: true.
+            let agy_plan = HookInput::from_value(&json!({
+                "hookEventName": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                "artifactDirectoryPath": artifact_dir.to_string_lossy(),
+                "toolCall": {
+                    "name": "edit_file",
+                    "args": {
+                        "Path": plan_file.to_string_lossy(),
+                        "Target": "# Plan",
+                        "Replacement": "# Updated Plan"
+                    }
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&agy_plan),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "implementation_plan.md".into(),
+                    artifact: true,
+                })
+            );
+
+            // 4. Non-editing Read / read_file tools are ignored.
+            let claude_read = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Read",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy()
+                }
+            }));
+            assert_eq!(extract_touched_file_report(&claude_read), None);
+
+            // 5. PostToolUseFailure is ignored even on an editing tool.
+            let failed_edit = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUseFailure",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Edit",
+                "error": "old_string not found",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy(),
+                    "old_string": "missing",
+                    "new_string": "2"
+                }
+            }));
+            assert_eq!(extract_touched_file_report(&failed_edit), None);
         }
     }
 }

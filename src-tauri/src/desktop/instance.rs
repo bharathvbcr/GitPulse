@@ -159,6 +159,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_dir: Option<String>,
     },
+    /// Reports a file or plan artifact an agent just modified inside a GitPulse PTY
+    /// (`PostToolUse` -> `gitpulse-hook notify tool_finished`) so "Follow Agent"
+    /// split panes live-open or refresh the active file/diff without polling.
+    AgentTouchedFile {
+        terminal_id: String,
+        repo: String,
+        path: String,
+        artifact: bool,
+    },
     /// An authenticated parent session orchestrating a scoped child terminal or
     /// requesting a terminal split file pane (`gitpulse_terminal_*` / `gitpulse-hook term`).
     TerminalOrchestrate {
@@ -298,11 +307,41 @@ impl Request {
                 }
                 Ok(())
             }
+            Request::AgentTouchedFile {
+                terminal_id,
+                repo,
+                path,
+                ..
+            } => {
+                if !crate::alerts::bridge::valid_key(terminal_id) {
+                    return Err("touched-file terminal_id is invalid".into());
+                }
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("touched-file repository must be an absolute path".into());
+                }
+                if path.is_empty()
+                    || path.len() > MAX_PATH_BYTES
+                    || path.contains('\0')
+                    || Path::new(path).is_absolute()
+                {
+                    return Err("touched-file path must be relative".into());
+                }
+                for component in Path::new(path).components() {
+                    if !matches!(component, std::path::Component::Normal(_)) {
+                        return Err(
+                            "touched-file path must contain only normal relative segments".into(),
+                        );
+                    }
+                }
+                Ok(())
+            }
             Request::TerminalOrchestrate { id, call } => {
                 if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
-                    return Err(
-                        "orchestrate request id is empty, too long or not printable".into(),
-                    );
+                    return Err("orchestrate request id is empty, too long or not printable".into());
                 }
                 call.validate()
             }

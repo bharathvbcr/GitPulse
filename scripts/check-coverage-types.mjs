@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 113 contracts over
- * 286 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 116 contracts over
+ * 294 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -323,6 +323,9 @@ export const CONTRACTS = Object.freeze([
   { label: "agent-bus", rustPath: rust("engine", "agent_bus.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["AgentLaneClaim", "AgentBusMessage", "AgentInboxThread"] },
   { label: "agent-inbox-ipc", rustPath: rust("commands", "worktrees.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxSnapshot", "InboxMessageReceipt"] },
   { label: "agent-inbox-decompose", rustPath: rust("workbench.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxDecomposeSubtask", "InboxDecomposeReceipt"] },
+  { label: "browser", rustPath: rust("browser", "mod.rs"), tsPath: ts("browser", "browserSession.ts"), structs: ["BrowserSnapshotPreview", "BrowserElementRect", "BrowserElementPick"] },
+  { label: "terminal-agent-events", rustPath: TERMINAL_RUST_SOURCE, tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalAgentMetaPayload", "TerminalAgentTouchedFilePayload"] },
+  { label: "terminal-orchestrate-events", rustPath: rust("terminal", "orchestrate.rs"), tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalChildSpawnedPayload", "TerminalChildClosedPayload", "TerminalOpenFileRequestPayload"] },
 ]);
 
 /**

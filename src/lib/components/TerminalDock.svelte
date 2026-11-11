@@ -5,6 +5,10 @@
   import { ChevronDown, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";
+  import type { MutationTarget } from "../repos/storeTypes";
+  import { reportFailure } from "../stores/mutationOutcome";
+  import { toastStore } from "../stores/toastStore";
+  import { worktreeSetupNotices } from "../branches/types";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import {
     TERMINAL_DOCK_MAX_HEIGHT,
@@ -112,6 +116,39 @@
     requestReveal(path, line, null);
     repoStore.selectFilePath(path);
     repoStore.setActiveTab("code");
+  }
+
+  async function addAgentWorktree(
+    target: MutationTarget,
+    targetPath: string,
+    newBranch: string,
+  ): Promise<{ ok: true; path: string } | { ok: false; error: string | null }> {
+    const outcome = await repoStore.addWorktree(
+      {
+        targetPath,
+        newBranch,
+        startPoint: null,
+        detach: false,
+        cowCaches: true,
+        runHooks: false,
+        zeroCopyDevmap: false,
+        seedDevmap: true,
+        sparsePaths: null,
+      },
+      target,
+      true,
+    );
+    if (!outcome.ok) {
+      if (outcome.refused) {
+        reportFailure(outcome, "Could not create isolated worktree");
+        return { ok: false, error: null };
+      }
+      return { ok: false, error: outcome.error ?? "it did not complete." };
+    }
+    for (const notice of worktreeSetupNotices(outcome.output ?? {}, "create")) {
+      toastStore.warning(notice);
+    }
+    return { ok: true, path: outcome.output?.path ?? targetPath };
   }
 
   let host: HTMLDivElement | undefined = $state();
@@ -281,6 +318,8 @@
               onToggleExpanded: () => (expanded = !expanded),
               onGoToSession: goToSession,
               onOpenInCodeView: openInCodeView,
+              onCreateAgentWorktree: (targetPath: string, newBranch: string) =>
+                addAgentWorktree({ tabId: tab.id, path: tab.path }, targetPath, newBranch),
               checkouts: $repoStore.openTabs,
             }}
           />

@@ -812,6 +812,7 @@ mod tests {
                 "gitpulse_terminal_spawn",
                 "gitpulse_terminal_open_file",
                 "gitpulse_terminal_send",
+                "gitpulse_terminal_close",
                 "gitpulse_inbox_post",
                 "gitpulse_inbox_withdraw",
                 "gitpulse_kickoff_agent",

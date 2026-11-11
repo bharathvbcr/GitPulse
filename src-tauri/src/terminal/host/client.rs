@@ -748,6 +748,16 @@ impl HostClient {
             .is_some_and(|proxy| proxy.viewed)
     }
 
+    /// Reads live loopback TCP `LISTEN` ports owned by `session` and its descendants.
+    pub fn listening_ports(&self, session: &str) -> Result<Vec<u16>, String> {
+        self.call(
+            Request::ListeningPorts {
+                session: session.to_owned(),
+            },
+            CALL_DEADLINE,
+        )
+    }
+
     /// Reads `session`'s authoritative OSC 7 / 133 / 7501 + loopback telemetry
     /// from `gitpulse-ptyd`'s `SessionWatcher`.
     pub fn telemetry(

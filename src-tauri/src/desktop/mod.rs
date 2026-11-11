@@ -497,6 +497,34 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
                 );
             }
         }
+        instance::Request::AgentTouchedFile {
+            terminal_id,
+            repo,
+            path,
+            artifact,
+        } => {
+            let sessions = handle.state::<crate::terminal::TerminalSessions>();
+            if crate::terminal::host::client::registry_holds(&sessions, &terminal_id) != Some(true)
+            {
+                log::debug!(
+                    target: "terminal",
+                    "ignoring touched-file event for unknown terminal {terminal_id}"
+                );
+                return;
+            }
+            let payload = crate::terminal::TerminalAgentTouchedFilePayload {
+                id: terminal_id,
+                repo_path: repo,
+                path,
+                artifact,
+            };
+            if let Err(error) = handle.emit(crate::terminal::AGENT_TOUCHED_FILE_EVENT, payload) {
+                log::warn!(
+                    target: "terminal",
+                    "could not emit terminal-agent-touched-file event: {error}"
+                );
+            }
+        }
         instance::Request::Notification { id, snooze } => {
             if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
                 log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");
