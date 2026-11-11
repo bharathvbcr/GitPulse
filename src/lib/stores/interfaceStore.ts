@@ -48,7 +48,11 @@ import {
   type TabWidth,
 } from "../ui/codeDisplay";
 import { isTimestampStyle, type TimestampStyle } from "../ui/timestampStyle";
-import { isBranchRowLayout, type BranchRowLayout } from "../sidebar/metrics";
+import {
+  DEFAULT_BRANCH_ROW_LAYOUT,
+  isBranchRowLayout,
+  type BranchRowLayout,
+} from "../sidebar/metrics";
 import {
   DEFAULT_TASK_CARD_FIELDS,
   isBoardLayout,
@@ -97,11 +101,21 @@ export interface InterfacePrefs extends AppearancePrefs {
   /** Whether commit times read as "3d ago" or as a `YYYY-MM-DD` date. */
   timestampStyle: TimestampStyle;
   /**
-   * Whether a sidebar branch gets one line or two. Two is the default: on a
-   * default-width sidebar the single line handed the name whatever the chips
-   * and buttons left over, which was often three characters.
+   * Whether a sidebar branch gets one, two or three lines. Three is the
+   * default: on a default-width sidebar the single line handed the name
+   * whatever the chips and buttons left over, which was often three
+   * characters, and two lines still packed the numbers and the attribution
+   * together.
    */
   branchRowLayout: BranchRowLayout;
+  /**
+   * Which default `branchRowLayout` was last reconciled against. Stored
+   * "two-line" was the old default far more often than a choice, so a read
+   * that finds it under an older revision moves it to three lines once;
+   * `BRANCH_ROW_LAYOUT_REV` is written back with every save, which is what
+   * lets a later, deliberate "two-line" stay.
+   */
+  branchRowLayoutRev: number;
   /** Layout a diff opens in; the toolbar still switches the one on screen. */
   diffLayout: DiffLayout;
   /** Whether a diff opens with long lines wrapped. */
@@ -370,12 +384,36 @@ export interface InterfacePrefs extends AppearancePrefs {
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
 
+/**
+ * Revision of the branch row layout default. Bumped to 1 when the default
+ * moved from two lines to three; see `branchRowLayoutRev`.
+ */
+export const BRANCH_ROW_LAYOUT_REV = 1;
+
+/**
+ * The layout to use for a stored value, reconciled once against the new
+ * default.
+ *
+ * - Not a layout (garbage, missing): the default.
+ * - "two-line" saved before revision 1: the old default rather than a
+ *   choice, so it becomes the new default. Made once: every save writes the
+ *   revision, so a "two-line" picked afterwards is kept.
+ * - Anything else, including "one-line" at any revision: as stored.
+ */
+export function migrateBranchRowLayout(stored: unknown, storedRev: unknown): BranchRowLayout {
+  if (!isBranchRowLayout(stored)) return DEFAULT_BRANCH_ROW_LAYOUT;
+  const reconciled = typeof storedRev === "number" && storedRev >= BRANCH_ROW_LAYOUT_REV;
+  if (stored === "two-line" && !reconciled) return DEFAULT_BRANCH_ROW_LAYOUT;
+  return stored;
+}
+
 const DEFAULTS: InterfacePrefs = {
   ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
   reduceMotion: false,
   timestampStyle: "relative",
-  branchRowLayout: "two-line",
+  branchRowLayout: DEFAULT_BRANCH_ROW_LAYOUT,
+  branchRowLayoutRev: BRANCH_ROW_LAYOUT_REV,
   diffLayout: "unified",
   diffWordWrap: false,
   diffSyntaxHighlight: true,
@@ -519,9 +557,8 @@ function readPrefs(): InterfacePrefs {
       timestampStyle: isTimestampStyle(parsed.timestampStyle)
         ? parsed.timestampStyle
         : DEFAULTS.timestampStyle,
-      branchRowLayout: isBranchRowLayout(parsed.branchRowLayout)
-        ? parsed.branchRowLayout
-        : DEFAULTS.branchRowLayout,
+      branchRowLayout: migrateBranchRowLayout(parsed.branchRowLayout, parsed.branchRowLayoutRev),
+      branchRowLayoutRev: BRANCH_ROW_LAYOUT_REV,
       diffLayout: isDiffLayout(parsed.diffLayout) ? parsed.diffLayout : DEFAULTS.diffLayout,
       diffWordWrap: bool(parsed.diffWordWrap, DEFAULTS.diffWordWrap),
       diffSyntaxHighlight: bool(

@@ -176,23 +176,58 @@ describe("BranchList two-line branch rows", () => {
       source.indexOf("{#snippet branchRow("),
       source.indexOf("{#snippet tagRow("),
     );
-    const twoLineBranch = row.indexOf("{#if twoLine}");
-    const oneLineBranch = row.indexOf("{:else}", twoLineBranch);
-    const twoLineBody = row.slice(twoLineBranch, oneLineBranch);
+    const multiLineBranch = row.indexOf("{#if multiLine}");
+    const oneLineBranch = row.indexOf("{:else}", multiLineBranch);
+    const multiLineBody = row.slice(multiLineBranch, oneLineBranch);
     // Line one renders identity only; the numbers snippet is on line two.
-    const numbersInTwoLine = twoLineBody.indexOf("branchNumbers(");
-    const identityInTwoLine = twoLineBody.indexOf("branchIdentity(");
-    expect(identityInTwoLine).toBeGreaterThan(-1);
-    expect(numbersInTwoLine).toBeGreaterThan(identityInTwoLine);
+    const numbersInMultiLine = multiLineBody.indexOf("branchNumbers(");
+    const identityInMultiLine = multiLineBody.indexOf("branchIdentity(");
+    expect(identityInMultiLine).toBeGreaterThan(-1);
+    expect(numbersInMultiLine).toBeGreaterThan(identityInMultiLine);
   });
 
-  it("renders the same number facts in both layouts from one owner", () => {
+  it("renders the same number facts in every layout from one owner", () => {
     // Two copies of this markup is how the dense list comes to show a count
-    // the two-line list does not, or the other way round.
+    // the other lists do not, or the other way round. The multi-line rows
+    // share one render of each; only the age and author are placed per
+    // layout, from one snippet.
     expect((source.match(/\{@render branchNumbers\(/g) ?? []).length).toBe(2);
     expect((source.match(/\{@render branchIdentity\(/g) ?? []).length).toBe(2);
     expect((source.match(/\{@render branchActions\(/g) ?? []).length).toBe(2);
     expect((source.match(/\{#snippet branchNumbers\(/g) ?? []).length).toBe(1);
+    expect((source.match(/\{#snippet branchAge\(/g) ?? []).length).toBe(1);
+    expect((source.match(/\{@render branchAge\(/g) ?? []).length).toBe(2);
+  });
+
+  it("puts the age and author on line three of the three-line row, line two of the two-line row", () => {
+    const row = source.slice(
+      source.indexOf("{#snippet branchRow("),
+      source.indexOf("{#snippet tagRow("),
+    );
+    const lineTwo = row.indexOf("{@render branchNumbers(branch, statsMissing)}");
+    const twoLineAge = row.indexOf("{#if rowLines === 2}", lineTwo);
+    const threeLineAge = row.indexOf("{#if rowLines === 3}", twoLineAge);
+    expect(twoLineAge).toBeGreaterThan(lineTwo);
+    expect(threeLineAge).toBeGreaterThan(twoLineAge);
+    // Each placement renders the one snippet, and nothing else sits between
+    // the guard and its render but whitespace and the line's own wrapper.
+    expect(row.slice(twoLineAge, threeLineAge)).toContain("{@render branchAge(branch)}");
+    expect(row.slice(threeLineAge)).toContain("{@render branchAge(branch)}");
+  });
+
+  it("reads one line count for the markup and the height, not two booleans", () => {
+    // `multiLine` and `rowLines` both come from `branchRowLines`, the same
+    // function `sidebarRowHeight` asks, so the markup and the window math
+    // cannot disagree about how many lines a layout has.
+    expect(source).toContain("let rowLines = $derived(branchRowLines(rowLayout));");
+    expect(source).toContain("let multiLine = $derived(rowLines > 1);");
+    expect(source).not.toContain("twoLine");
+  });
+
+  it("keeps line three's height when a branch has nothing to put there", () => {
+    expect(source).toContain(
+      '<span class="w-full flex items-center gap-1 min-w-0 min-h-lh text-micro overflow-hidden pr-2.5">',
+    );
   });
 
   it("clips line two instead of letting counts escape the row", () => {
@@ -241,9 +276,10 @@ describe("BranchList two-line branch rows", () => {
     expect(source).toContain("{#if branch.files_changed > 0}");
   });
 
-  it("offers the dense layout rather than forcing two lines on everyone", () => {
+  it("offers the denser layouts rather than forcing three lines on everyone", () => {
     expect(source).toContain('$interfaceStore.branchRowLayout');
-    expect(source).toContain('rowLayout === "two-line"');
+    expect(source).toContain("branchRowLines(rowLayout)");
+    expect(source).not.toContain('rowLayout === "two-line"');
   });
 });
 

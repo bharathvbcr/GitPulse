@@ -53,7 +53,12 @@
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
   import { repoScope } from "../repos/repoScope.svelte";
-  import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
+  import {
+    branchRowHeight,
+    branchRowLines,
+    sidebarRowHeight,
+    BRANCH_OVERSCAN,
+  } from "../sidebar/metrics";
   import { formatTimestamp, timestampTitle } from "../ui/timestampStyle";
   import { plural } from "../format";
   import { densityStore } from "../stores/densityStore";
@@ -102,9 +107,11 @@
   let rowLayout = $derived($interfaceStore.branchRowLayout);
   /** Section headers, folder headers and tag rows: always one line. */
   let HEADER_HEIGHT = $derived(branchRowHeight($densityStore));
-  /** Branch rows: two lines unless the reader asked for the dense list. */
+  /** Branch rows: three lines unless the reader asked for a denser list. */
   let BRANCH_HEIGHT = $derived(sidebarRowHeight("branch", $densityStore, rowLayout));
-  let twoLine = $derived(rowLayout === "two-line");
+  /** The same answer `sidebarRowHeight` reads, so markup and height agree. */
+  let rowLines = $derived(branchRowLines(rowLayout));
+  let multiLine = $derived(rowLines > 1);
   // Spacious mode breathes: slightly larger gaps between the chrome bands.
   // Compact stays genuinely tight. Class literals are spelled out in full so
   // Tailwind's scanner sees every variant.
@@ -143,7 +150,7 @@
   let filteredSections = $derived(filterBranchSections(groupedSections, debouncedQuery, activeTab));
   let allRows = $derived(flattenRows(filteredSections, isCollapsed));
 
-  // Virtual windowing over rows of DIFFERENT heights: a two-line branch row
+  // Virtual windowing over rows of DIFFERENT heights: a multi-line branch row
   // is taller than the headers around it, so `index * one height` is no
   // longer where row `index` starts. rowOffsets is the prefix-sum array every
   // position question is answered from — it rebuilds O(n) on the same
@@ -798,18 +805,18 @@
   {#if branch.is_gone}
     <span class="gp-chip text-micro! px-1! py-0! font-mono shrink-0" data-tone="danger">gone</span>
   {/if}
-  <!-- The two-line row prints the actual commit age on line two and tints it
-       when stale, so a separate "stale" chip would say the same thing twice
-       and less precisely — and it would say it in the one place that costs
-       the branch name its width. The one-line row has no age to tint, so it
+  <!-- The multi-line rows print the actual commit age and tint it when
+       stale, so a separate "stale" chip would say the same thing twice and
+       less precisely — and it would say it in the one place that costs the
+       branch name its width. The one-line row has no age to tint, so it
        keeps the chip. -->
   {#if showStale && isStaleBranch(branch.last_commit_timestamp)}
     <span class="gp-chip text-micro! px-1! py-0! font-mono shrink-0" data-tone="neutral">stale</span>
   {/if}
 {/snippet}
 
-<!-- Every measured number for one branch, in one owner, so the one-line and
-     two-line rows cannot drift into showing different facts. Each item stays
+<!-- Every measured number for one branch, in one owner, so the one-, two- and
+     three-line rows cannot drift into showing different facts. Each item stays
      shrink-0: these are the values the reader came for, and a half-rendered
      "+33" is worse than a name that had to give up a character. -->
 {#snippet branchNumbers(branch: BranchInfo, statsMissing: boolean)}
@@ -857,9 +864,11 @@
 <!--
   Who touched the branch and when — the two facts the sidebar already held on
   every row and showed on none of them, because the one-line layout had no
-  room left. Deliberately the LAST items on line two and the only shrinkable
-  ones, so a branch with a wide set of counts loses the author's surname
-  rather than a number.
+  room left. The age comes first and the author after it, and the author is
+  the only shrinkable item: whatever line this snippet lands on, a narrow
+  sidebar costs the author's surname before it costs the age. On the
+  three-line row it has line three to itself, so it is rarely asked to; on the
+  two-line row it trails the numbers and gives way to them.
 
   The age carries staleness itself: `isStaleBranch`'s verdict as a tint on the
   exact figure it was computed from, instead of a chip beside it.
@@ -868,11 +877,13 @@
   {@const stale = isStaleBranch(branch.last_commit_timestamp)}
   {@const age = formatTimestamp(branch.last_commit_timestamp, $interfaceStore.timestampStyle)}
   {@const author = branch.last_author?.trim() ?? ""}
-  <!-- The separator lives INSIDE the author span, at its end. The author is
-       the only shrinkable thing on the line, so on a busy row it clips to
-       nothing — and a separator owned by the age would survive that and read
-       as "· 3d ago", a dot joining the time to nothing. Clipped together,
-       the line degrades "Alex · 3d ago" → "Ale… 3d ago" → "3d ago". -->
+  <!-- The separator lives INSIDE the author span, at its start. The author
+       is the only shrinkable item, and it follows the age, so the separator
+       must belong to it: owned by the age it would survive the author's
+       removal and read as "3d ago ·", a dot joining the time to nothing.
+       Owned by the author it is clipped with it, and the ellipsis marks
+       whatever was cut: the line degrades "3d ago · Alex" → "3d ago · Al…"
+       → "3d ago" as the width goes. Having no age, the author starts bare. -->
   {#if age}
     <span
       class="shrink-0 text-micro font-mono {stale ? 'text-warn' : 'text-textMuted'}"
@@ -888,7 +899,7 @@
   {/if}
 {/snippet}
 
-<!-- Per-row buttons. Hover/focus revealed in the two-line row, where they sit
+<!-- Per-row buttons. Hover/focus revealed in the multi-line rows, where they sit
      in a right-edge rail over reserved space, so they never take width from
      the name and never shift the layout when they appear. -->
 {#snippet branchActions(branch: BranchInfo, reveal: boolean)}
@@ -928,7 +939,7 @@
     !branch.is_current &&
     !branch.is_default}
   <div
-    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {twoLine
+    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {multiLine
       ? 'rounded-2xl'
       : 'rounded-full pr-1'} {branch.is_current
       ? 'bg-accent/15 text-accent font-semibold ring-1 ring-accent/40'
@@ -962,13 +973,20 @@
       }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
       title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
-      class={twoLine
-        ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"
-        : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
+      class={rowLines === 3
+        ? "flex-1 min-w-0 flex items-start gap-1.5 text-left pr-1"
+        : rowLines === 2
+          ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"
+          : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
     >
-      {#if twoLine}
+      {#if multiLine}
+        <!-- The glyph sits level with the name. Beside two lines it centres
+             on the pair; beside three, centred would float it level with
+             line two, so the three-line button top-aligns it instead. -->
         {@render branchGlyph(branch)}
-        <span class="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+        <span
+          class="flex-1 min-w-0 flex flex-col justify-center {rowLines === 3 ? 'gap-1' : 'gap-0.5'}"
+        >
           <!-- Line one is the name's alone. Nothing after it can outgrow a
                chip, so the name truncates at the width of the sidebar rather
                than at whatever a row of buttons and counters left over.
@@ -980,7 +998,9 @@
           </span>
           <!-- Line two, flush left under the name, in descending order of
                what a reader would miss: churn, divergence, files, then the
-               attribution. An `ml-auto` here would right-align the tail,
+               freshness badge. On the two-line row the attribution follows
+               on this same line; on the three-line row it has line three.
+               An `ml-auto` here would right-align the tail,
                which on the common branch — no churn, no divergence — leaves
                it floating alone across an empty row. It runs the full width
                of the row: the action rail is on line one, so nothing here
@@ -994,22 +1014,35 @@
                the author's ellipsis — the normal way this line gives up
                width — ends before the fade and stays crisp. -->
           <span
-            class="w-full flex items-center gap-1 min-w-0 leading-none overflow-hidden pr-2.5"
+            class="w-full flex items-center gap-1 min-w-0 min-h-lh text-micro overflow-hidden pr-2.5"
             style="mask-image: linear-gradient(to right, black calc(100% - 10px), transparent); -webkit-mask-image: linear-gradient(to right, black calc(100% - 10px), transparent);"
           >
             {@render branchNumbers(branch, statsMissing)}
             <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
-            {@render branchAge(branch)}
+            {#if rowLines === 2}
+              {@render branchAge(branch)}
+            {/if}
           </span>
+          {#if rowLines === 3}
+            <!-- Line three: the last commit's age, then its author. It has the
+                 whole row, so the only thing that can give is the author's
+                 ellipsis. `min-h-lh` on a `text-micro` line keeps one line
+                 of height when a branch has nothing to show there (no
+                 churn on line two, no commit time on line three), so the
+                 stack is the same height on every row. -->
+            <span class="w-full flex items-center gap-1 min-w-0 min-h-lh text-micro overflow-hidden pr-2.5">
+              {@render branchAge(branch)}
+            </span>
+          {/if}
         </span>
       {:else}
         {@render branchIdentity(branch, leaf, true, true)}
       {/if}
     </button>
-    {#if twoLine}
+    {#if multiLine}
       <!-- Level with line one and clear of line two: 16px buttons (the copy
            button drops to the menu button's p-0.5 here) centred on the name,
-           y 5–21, above line two's top at ~21.5. At rest the status dots sit
+           y 5–21, above line two's top at ~21.5 (~24.5 on three lines). At rest the status dots sit
            at the row's right edge; on hover or focus they fade and the actions
            take their place, so neither ever pushes the name. -->
       <div class="absolute right-1 top-[5px] h-4 flex items-center">
