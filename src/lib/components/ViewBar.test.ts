@@ -111,6 +111,17 @@ describe("ViewBar", () => {
     expect(scroll).toBeGreaterThan(-1);
   });
 
+  it("loads the glance as its own chunk on mount, after the drag spacer and before the Agents pill", () => {
+    // A static import would put it in the entry chunk, which has no room for
+    // it (vite.config.ts MAX_PRODUCTION_CHUNK_BYTES).
+    expect(source).not.toMatch(/^\s*import\s+ViewBarGlance\b/m);
+    expect(source).toContain('import("./ViewBarGlance.svelte")');
+    expect(source).toContain('diagnostics.error("viewbar:glance", error)');
+    const glanceAt = source.indexOf("<Glance onOpenAgents={openAgents} />");
+    expect(glanceAt).toBeGreaterThan(source.indexOf('class="h-full min-w-12 flex-1"'));
+    expect(glanceAt).toBeLessThan(source.indexOf('data-testid="viewbar-agents"'));
+  });
+
   it("has no accessibility compiler warnings", () => {
     const { warnings } = compile(source, { generate: "client" });
     expect(warnings.filter(({ code }) => code.startsWith("a11y_"))).toEqual([]);

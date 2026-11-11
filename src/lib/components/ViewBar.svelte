@@ -6,9 +6,10 @@
    * Row 1 says which repository or workspace surface you are on; this row says
    * how you are looking at it, and what state it is in. Left to right: the view
    * switcher, the view's own toolbar when the row is wide enough to hold it
-   * (`ViewContextBar` hands its node to the slot below), then a drag zone, then
-   * the trailing cluster: this repository's Agents pill, the Terminal pill, the
-   * uncommitted chip and Refresh. The two "come here" controls sit nearest the
+   * (`ViewContextBar` hands its node to the slot below), the page search, a
+   * drag zone, the glance (`ViewBarGlance`), then the trailing cluster: this
+   * repository's Agents pill, the Terminal pill, the uncommitted chip and
+   * Refresh. The two "come here" controls sit nearest the
    * content; the passive state sits at the edge.
    *
    * Under Fleet, Agents or Tasks the row stays mounted at the same height with
@@ -35,6 +36,7 @@
   import PageSearch from "./PageSearch.svelte";
   import TerminalPill from "./TerminalPill.svelte";
   import ViewTabBar from "./ViewTabBar.svelte";
+  import { diagnostics } from "../diagnostics/diagnostics";
 
   let { conflictedCount = 0 }: { conflictedCount?: number } = $props();
 
@@ -110,6 +112,22 @@
     interfaceStore.setAgentsOpen(true);
   }
 
+  // The glance is its own chunk, loaded once the row is up: everything it
+  // shows arrives after the first paint anyway, and the entry chunk has no
+  // room for it (vite.config.ts MAX_PRODUCTION_CHUNK_BYTES).
+  let Glance = $state<(typeof import("./ViewBarGlance.svelte"))["default"] | null>(null);
+  onMount(() => {
+    import("./ViewBarGlance.svelte").then(
+      (module) => {
+        Glance = module.default;
+      },
+      (error: unknown) => {
+        // Only the glance is missing; every fact it shows has its own home.
+        diagnostics.error("viewbar:glance", error);
+      },
+    );
+  });
+
   onMount(() => {
     const dispose = slot ? registerContextSlot(slot) : () => {};
     let observer: ResizeObserver | undefined;
@@ -182,6 +200,10 @@
     <PageSearch />
 
     <div class="h-full min-w-12 flex-1" data-tauri-drag-region></div>
+
+    <!-- The glance: overlap with other worktrees, the branch's pull request,
+         the last fetch, the stash. Absent when there is nothing to say. -->
+    {#if Glance}<Glance onOpenAgents={openAgents} />{/if}
 
     {#if agents.state !== "none"}
       <button

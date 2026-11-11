@@ -7,6 +7,7 @@
     summarizeVelocity,
   } from "../github/prVelocity";
   import type { WorkflowsReport, GitHubContext } from "../github/types";
+  import { notePullRequests } from "../github/pullRequestReads";
 
 
 
@@ -417,6 +418,9 @@
     loading = true;
     try {
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
+      // Row 2's glance reads the branch's pull request from here; a failed
+      // read is not recorded (pullRequestReads.ts).
+      notePullRequests(repo, next);
       if (!guard.isLive()) return;
       // gh reports a rate limit or an outage as a context carrying `error`. On
       // a panel already showing a good read, that is a failed refresh, not the

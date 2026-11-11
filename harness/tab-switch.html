@@ -107,6 +107,23 @@
         ],
         truncated: false, scanned_files: 520, candidate_files: 520,
       });
+      const glanceFacts = { on: false, fetchedAt: 0 };
+      const glanceStash = [0, 1].map((index) => ({
+        index, selector: `stash@{${index}}`, oid: `abcd${index}`, subject: `WIP ${index}`, message: `WIP ${index}`, branch: "main", timestamp: 1_700_000_000,
+      }));
+      let ledgerStatusOf = null;
+      const glanceSnapshot = (repoPath) => ({
+        repo_path: repoPath, branch: "main", branch_ok: true, deadline_expired: false, duration_ms: 1,
+        worktrees: { ok: true, error: "", count: 1, scanned: 1, dirty: 0, dirty_unknown: 0, blocked: 0, blocked_unknown: 0, truncated: false, items: [] },
+        agents: { ok: true, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
+        changes: { ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0, additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false },
+        collisions: {
+          ok: true, error: "", overlapping_files: 2, worktrees_involved: 2, scanned_worktrees: 2, unscanned_worktrees: 0, failed_worktrees: 0,
+          truncated: false, items: [], shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
+        },
+        ledger: ledgerStatusOf({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
+        codeintel: { available: false, db_path: "" },
+      });
       const fixtures = {
         cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
         cmd_list_branches: (a) => DATA[a.repoPath]?.branches ?? [],
@@ -114,12 +131,14 @@
         cmd_get_status: (a) => DATA[a.repoPath]?.statuses ?? [],
         cmd_list_tags: () => ({ tags: [], truncated: false }),
         cmd_repo_operation: () => null,
-        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        // The glance checks turn these on (glanceFacts) for their own block; every
+        // other check sees the empty stash and unrecorded fetch it always did.
+        cmd_stash_list: () => (glanceFacts.on ? { entries: glanceStash, truncated: false } : { entries: [], truncated: false }),
         cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
         cmd_watch_repo: (a) => a.repoPath,
         cmd_unwatch_repo: () => null,
         cmd_set_recent_menu: () => null,
-        cmd_last_fetch_at: () => null,
+        cmd_last_fetch_at: () => (glanceFacts.on ? glanceFacts.fetchedAt : null),
         cmd_note_tab_activated: () => null,
         // Wire shape of `CommitGraphPayload` (src/lib/stores/graphStore.ts). The
         // old `nodes`/`edges` shape made History show a raw "reading 'map'"
@@ -198,6 +217,14 @@
         cmd_github_context: () => ({
           available: false, error: "", runs_error: "", warnings: [], pull_requests: [], workflow_runs: [], issues: [], releases: [],
         }),
+        // The glance's pull request chip opens Work's Remote section, whose
+        // panels ask for these when they mount (shapes from github-panel.html).
+        cmd_github_workflows: () => ({ available: false, cli_present: true, workflows: [], truncated: false, error: null }),
+        cmd_github_runs: () => ({ available: false, checked: false, cli_present: true, owner: "", repo: "", runs: [], truncated: false, error: null, went_red: [] }),
+        cmd_firebase_status: () => ({
+          configured: false, firebaserc_error: null, firebasejson_error: null, cli: { present: false, reason: "not installed" },
+          projects: [], projects_truncated: false, default_alias: null, has_apphosting_config: false,
+        }),
         cmd_grants_view: () => ({ available: false, error: "", grants: [] }),
         cmd_terminal_sessions: () => [],
         // Opening the dock spawns a shell and reads `.id` off the reply. Answered
@@ -214,6 +241,10 @@
         cmd_get_file_content: () => "export {};\n",
         // The search checks visit Code, whose explorer lists the repository's
         // files when it mounts (FileTreePanel); its changed files stand in.
+        // Row 2 asks the shared agents sweep for the repository on screen when
+        // it mounts (once); the answer here is none, so the pill says why. The
+        // glance checks answer with a snapshot whose collision scan found overlap.
+        cmd_insights_snapshot: (a) => (glanceFacts.on ? glanceSnapshot(a.repoPath) : null),
         cmd_list_repo_files: (a) => (DATA[a.repoPath]?.statuses ?? []).map((entry) => entry.path),
         cmd_workbench_request: (a) => workbenchFixture(a),
       };
@@ -246,9 +277,6 @@
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",
-        // Row 2 asks the shared agents sweep for the repository on screen when
-        // it mounts (once); the answer here is none, so the pill says why.
-        "cmd_insights_snapshot",
       ]);
       // The code-graph service is not installed in this fixture, which is what
       // a refused call means to its callers.
@@ -1084,6 +1112,118 @@
             await sleepUntil(() => !$("[data-page-palette]"), 3000);
             check("search: Escape closes the results, empties the field and leaves it", () =>
               !$("[data-page-palette]") && fieldInput().value === "" && document.activeElement !== fieldInput());
+
+            // ---- the glance: four facts from reads already made -------------------
+            // A stash, a fetch over a day old, a pull request a panel read for this
+            // branch, and a collision scan that found overlap, all turned on here
+            // and off again at the end, so no other check sees them.
+            {
+              ledgerStatusOf = (await import("../src/lib/ledger/types.ts")).ledgerStatus;
+              const { notePullRequests } = await import("../src/lib/github/pullRequestReads.ts");
+              const { agentPlaneStore, sweepTargets } = await import("../src/lib/agents/store.ts");
+              const glancePath = get(repoStore).currentPath;
+              const glanceBranch = get(repoStore).currentBranch;
+              const glanceContext = (prs) => ({
+                available: true, owner: "o", repo: "r", workflow_runs: [], releases: [], cli_present: true, host: "github.com",
+                html_url: "", pull_requests: prs, issues: [], issues_truncated: false,
+              });
+              glanceFacts.on = true;
+              // 26.5h: clear of the hour boundary the minute clock could round across.
+              glanceFacts.fetchedAt = Date.now() - 26.5 * 3_600_000;
+              notePullRequests(glancePath, glanceContext([{
+                number: 31, title: "Cache the graph", state: "OPEN", head_ref: glanceBranch, base_ref: "main", url: "https://example.test/pr/31",
+                is_draft: false, ci_status: "failure", created_at: "", updated_at: "", review_decision: "", first_review_at: "",
+              }]));
+              await repoStore.refresh();
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+              await sleepUntil(() => $$("[data-glance]", row2).length === 4, 5000);
+              await settle();
+              const glanceChip = (name) => $(`[data-glance="${name}"]`, row2);
+              check("glance: the overlap, the branch's pull request, the last fetch and the stash sit in row 2 in that order, after the drag zone and before the Terminal pill", () => {
+                const order = $$("[data-glance], [data-testid='terminal-pill']", row2).map((el) => el.dataset.glance ?? "terminal");
+                const spacer = $("[data-viewbar-controls] > [data-tauri-drag-region]:not([data-viewbar-context]):not([data-glance-strip])", row2);
+                const first = glanceChip("overlap");
+                if (order.join(",") === "overlap,pull-request,fetch,stash,terminal" && !!spacer && !!first &&
+                  (spacer.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING)) return true;
+                throw new Error(`order ${order.join(",")}, glance path ${glancePath}, branch ${glanceBranch}`);
+              });
+              check("glance: each chip says its fact, in its tone (overlap warns, failing checks are danger, a day-old fetch warns)", () => {
+                const facts = {
+                  overlap: [text(glanceChip("overlap")), glanceChip("overlap")?.dataset.tone, glanceChip("overlap")?.getAttribute("aria-label")],
+                  pr: [text(glanceChip("pull-request")), glanceChip("pull-request")?.dataset.tone, glanceChip("pull-request")?.getAttribute("aria-label")],
+                  stash: [text(glanceChip("stash")), glanceChip("stash")?.getAttribute("title")],
+                  fetch: [text(glanceChip("fetch")), glanceChip("fetch")?.dataset.tone, glanceChip("fetch")?.getAttribute("aria-label")],
+                };
+                if (/^2/.test(facts.overlap[0]) && facts.overlap[1] === "warn" && /2 files changed in more than one worktree/.test(facts.overlap[2]) &&
+                  facts.pr[0] === "#31" && facts.pr[1] === "danger" && /checks failing/.test(facts.pr[2]) &&
+                  /^2/.test(facts.stash[0]) && facts.stash[1] === "2 stash entries" &&
+                  facts.fetch[0] === "26h" && facts.fetch[1] === "warn" && facts.fetch[2] === "Last fetched 1d ago. Fetch now") return true;
+                throw new Error(JSON.stringify(facts));
+              });
+              // The chips come out of free width, never out of the switcher: at
+              // 1400 and 1280px every view's switcher still shows in full. A chip
+              // that does not fit is hidden whole and inert, the last first, so
+              // what shows is always a prefix of the priority order.
+              const GLANCE_ORDER = ["overlap", "pull-request", "fetch", "stash"];
+              const glanceShown = () => {
+                const strip = $("[data-glance-strip]", row2);
+                const box = strip.getBoundingClientRect();
+                const shown = [];
+                const torn = [];
+                for (const chip of $$("[data-glance]", strip)) {
+                  const at = chip.getBoundingClientRect();
+                  const hidden = chip.hasAttribute("data-glance-hidden");
+                  const inside = at.top >= box.top - 0.5 && at.bottom <= box.bottom + 0.5 && at.left >= box.left - 0.5 && at.right <= box.right + 0.5;
+                  if (hidden ? !(chip.inert && getComputedStyle(chip).visibility === "hidden") : !inside) torn.push(chip.dataset.glance);
+                  if (!hidden) shown.push(chip.dataset.glance);
+                }
+                return { shown, torn };
+              };
+              const glanceScroller = $("[data-viewbar-controls] .gp-header-scroll", row2);
+              const glanceSqueezed = [];
+              const glanceMeasured = [];
+              for (const width of [1400, 1280]) {
+                row2.style.maxWidth = width + "px";
+                for (const view of ["work", "code", "history"]) {
+                  repoStore.setActiveTab(view);
+                  await settle();
+                  const { shown, torn } = glanceShown();
+                  const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
+                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
+                  glanceMeasured.push(row);
+                  // Code and History leave room for every chip at 1400px.
+                  const roomy = width === 1400 && view !== "work";
+                  if (glanceScroller.scrollWidth > glanceScroller.clientWidth + 1 || row2.scrollWidth > row2.clientWidth + 1 ||
+                    torn.length || !prefix || (roomy && shown.length !== 4)) glanceSqueezed.push(row);
+                }
+              }
+              row2.style.maxWidth = "";
+              await settle();
+              check("glance: with four chips to show, at 1400 and 1280px every view's switcher shows in full, row 2 does not overflow, and a chip that does not fit is hidden whole, inert, the last first", () => {
+                if (!glanceSqueezed.length) return true;
+                throw new Error(`squeezed: ${glanceSqueezed.join("; ")}; all: ${glanceMeasured.join("; ")}`);
+              });
+              repoStore.setActiveTab("history", "graph");
+              await settle();
+              glanceChip("pull-request")?.click();
+              await settle();
+              check("glance: the pull request chip opens Work's Remote section, where the branch's pull request is listed", () =>
+                get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "remote");
+              glanceChip("overlap")?.click();
+              await settle();
+              check("glance: the overlap chip opens Agents", () => get(interfaceStore).globalSurface === "agents");
+              interfaceStore.setGlobalSurface("repository");
+              await settle();
+              // Off again: the stash and fetch go with their facts, the overlap with
+              // the scan, and a later read with no pull request for the branch takes
+              // that chip away.
+              glanceFacts.on = false;
+              notePullRequests(glancePath, glanceContext([]));
+              await repoStore.refresh();
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+              await sleepUntil(() => $$("[data-glance]", row2).length === 0, 5000);
+              check("glance: with nothing to say, no chip is drawn (never a zero)", () => $$("[data-glance]", row2).length === 0);
+            }
             repoStore.setActiveTab(viewBefore);
             await settle();
             // The Tasks surface, mounted in the real App on this page's fixture. A
@@ -1093,8 +1233,12 @@
             interfaceStore.setGlobalSurface("tasks");
             await sleepUntil(() => /Workspaces/.test(text(document.body)) || /Couldn't load tasks/.test(text(document.body)), 15000);
             await settle();
-            check("tasks: the surface renders its board with no load-error card", () =>
-              /Workspaces/.test(text(document.body)) && !/Couldn't load tasks|invalid response/.test(text(document.body)));
+            check("tasks: the surface renders its board with no load-error card", () => {
+              const body = text(document.body);
+              if (/Workspaces/.test(body) && !/Couldn't load tasks|invalid response/.test(body)) return true;
+              const card = body.match(/Couldn't load tasks[^.]*\.[^.]*\./)?.[0];
+              throw new Error(card ?? `no board after 15 s; surface ${get(interfaceStore).globalSurface}; on screen: ${body.slice(0, 300)}`);
+            });
             interfaceStore.setGlobalSurface("repository");
             await settle();
             // Full screen is stamped on <html>; the inset collapses with it.

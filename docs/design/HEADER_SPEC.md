@@ -32,16 +32,17 @@ One `role="tablist" aria-label="Workspace"` holds the surfaces and the repositor
 | 1 | View switcher | Four pills; the active one expands into its section tabs, inactive ones keep the hover flyout. DOM contract unchanged |
 | 2 | `ViewContextBar` content, folded inline | Only at ≥ 1600 px; below that it keeps its own 40 px row. History's list segment (Commits / HEAD moves) and Work's conflict count; the slot is content-sized and its own background drags the window |
 | 2a | **Page search** (`PageSearch.svelte`) | The one search field, for whatever page is on screen (decision D7). It takes three shares of the free width to the drag spacer's one (spacer floor 48 px), 56 rem cap. Its floor is 160 px from a 1400 px row and 96 px below, so at the default 1280 px window the view switcher keeps its full width (Work's is the widest). Focus does not repaint it; ⌘F focuses it from anywhere on the repository surface |
+| 2b | **Glance** (`ViewBarGlance.svelte`) | After the drag spacer, four chips, each absent when it has nothing to say (decision D8): files changed in more than one worktree (opens Agents), the branch's pull request and its checks (opens Work › Remote), the last fetch's age (warns past a day; click fetches), the stash count. Each comes from a read already made, so the glance asks the host nothing. It gives way before the switcher: a chip that does not fit is hidden whole and inert, the last first. Its own lazy chunk |
 | 3 | **Agents pill (this repository)** | Shows the most urgent attention among this repository's agents, ranked by the agent plane's `ATTENTION_REASONS` (needs-you › error › pending/blocked › finished), then the live count. Reads the plane through `scopeToRepository` and the per-session attention from `terminal/sessionActivity.ts` (`ATTENTION_EVENTS`); no second attention model. Click opens the Agents surface narrowed to this repository with `setAgentsRepositoryScope` (as Fleet's agent count already does). An unscanned or unprobed plane reads "unknown", never "0". Hidden when the repository has no agents and nothing unknown |
 | 4 | **Terminal pill** | The terminal toggle moves here from the status bar: the most-used control gets the most-seen row. It is the *same* control, not a copy: it renders `terminalPillView` (`terminal/statusPill.ts`, the session summary and hover menu another session is building in the main checkout right now) and calls `repoStore.toggleTerminal()`. Lane I relocates it after that work lands; it does not rebuild it. Shortcut label from `platformCopy` |
 | 5 | Uncommitted chip | Moves out of the switcher into the trailing cluster: the switcher says "where am I", the trailing cluster says "what state is this repository in" |
 | 6 | Refresh | Per repository, last |
 
-Trailing order, left to right: Agents, Terminal, uncommitted, Refresh, so the two "come here" controls sit nearest the content and the passive state sits at the edge.
+Trailing order, left to right: the glance, Agents, Terminal, uncommitted, Refresh, so the two "come here" controls sit nearest the content and the passive state sits at the edge.
 
 Under Fleet, Agents or Tasks the row stays mounted at the same height, with the switcher `hidden`/`inert` and the surface's name in its place, so the workspace never jumps. On the welcome screen (no repository) row 2 is not rendered.
 
-Branch and ahead/behind are not in the header. Readers: the status bar's branch pill; the tab's branch label at ≥ 1280 px; the sidebar pulse strip, which owns per-repository fetch/pull/push/stash.
+Branch and ahead/behind are not in the header. Readers: the status bar's branch pill; the tab's branch label at ≥ 1280 px; the sidebar pulse strip, which owns per-repository fetch/pull/push/stash. The glance shows the last fetch's age and the stash count as facts; only its fetch chip acts, and the stash's actions stay in the sidebar.
 
 ## 4. Windowed and full screen
 
@@ -98,7 +99,7 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
 
 ## 8. Contracts to rewrite in the same commit (never delete)
 
-- `harness/tab-switch.html`: boot selectors, same-node probes, exactly one tablist whose label ends in "sections" (so the new one is "Workspace"), flyout intent/grace and unchanged group lefts, ArrowDown/Up into sections, the Graph list group, and the page search (one field; filter on Graph, find on Diff with the standing filter chip, the palette's results under it on Work; it fits at 900 px).
+- `harness/tab-switch.html`: boot selectors, same-node probes, exactly one tablist whose label ends in "sections" (so the new one is "Workspace"), flyout intent/grace and unchanged group lefts, ArrowDown/Up into sections, the Graph list group, and the page search (one field; filter on Graph, find on Diff with the standing filter chip, the palette's results under it on Work; it fits at 900 px), and the glance (its order, tones and labels; at 1400 and 1280 px every view's switcher whole beside it, a chip that does not fit hidden whole and inert, the last first; its chips' destinations; no chip when there is nothing to say).
 - `harness/repo-tabs.html`: no scroll or cue when it fits; close controls outside tabs with one roving stop; whole names; Open is a labelled pill at 1400 px, pinned right (the drag zone between the tab list and Open, its left edge unmoved when a tab opens or closes, its recents menu inside the window at 1400 and 900 px); `tasks-tab-close` lifecycle.
 - `RepoTabBar.test.ts` (testids, Fleet-before-Agents order), `App.test.ts` (the `<RepoTabBar …/>` literal and the title-bar scroller row), `scripts/mac-material-contract.test.ts` (`.gp-glass.gp-repo-tabs` and its reduced-transparency override; the view row needs its own measured fill), `Sidebar.test.ts` if decision D3 retires the sidebar's Open.
 - Both rows' `border-b` separators go (rule 7).
@@ -119,6 +120,14 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
   - On a page with nothing of its own (Work, Insights, Code › Map, History › Suspects): the command palette for this repository, prefixes and all (`>` `/` `@` `#` `:` `%` `?`), its results dropping under the field from the palette's own engine, loaded on first use. Where the page has a search, typed text is that search, literally (`#include`, `// TODO`, `#123`); ⌘K opens the palette from every page. Entry cost: about 6.5 KB; the build gate read 636,823 of its 640,000 bytes at this change (the emitted file is about 6.9 KB larger than what the gate measures).
   - Each place keeps its own query, so a diff's find never becomes the commit filter. Where the field is not the commit filter but the filter narrows the list on screen (Diff, HEAD moves), the filter shows as a chip with its own clear.
   - Not in v1: Work's conflict list and the code map keep their own controls.
+
+- **D8 A glance in row 2 (2026-11-11, user).** "Make this space useful with some info, instead of blank: cool at-a-glance." Four facts the app already holds, drawn by `ViewBarGlance.svelte` from `ui/viewBarGlance.ts`:
+  - Overlap: the collision facet of the insights snapshot the Agents pill's sweep already took. Shown only when the scan found overlap; a partial scan shows its count as a floor (`2+`), and a failed one shows nothing, because the Agents pill already turns unknown for it.
+  - Pull request: the last `cmd_github_context` any panel read for this repository (`github/pullRequestReads.ts`, fed by Work's load, the Remote panel and the Policy panel; a failed read never replaces a good one). The chip names the age of that read. No panel has read it: no chip, and no `gh` call of its own.
+  - Last fetch: the metadata facet's `cmd_last_fetch_at`; neutral under a day, warn from a day. No fetch recorded: no chip.
+  - Stash: the metadata facet's stash list; a capped list is a floor, a failed read no chip (the sidebar says why).
+  - Width: Work's switcher is the longest. With four chips to show, Work keeps three at a 1400 px row and two at 1280 px; Code and History keep all four. The strip's flex-shrink outweighs the switcher's a thousandfold, and a ResizeObserver hides the chips its width does not hold.
+  - Cost: its own 4.6 kB chunk, loaded when row 2 mounts; the entry chunk would not hold it under the 640,000-byte gate.
 
 ## 10. Unverified until the app runs
 

@@ -5,6 +5,7 @@ import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
+import { notePullRequests } from "../github/pullRequestReads";
 import type { GrantView } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
 import { loadWorktreeTasks } from "../tasks/bindings";
@@ -219,6 +220,8 @@ export async function loadWork(
       github.v.runs_truncated ? "workflow run list truncated" : ""].filter(Boolean);
     sources.github = details.length ? failed(details.join("; ")) : { ...READ };
     input.pullRequests = github.v.pull_requests;
+    // Row 2's glance shows the branch's pull request from this read.
+    notePullRequests(repoPath, github.v);
     input.runs = github.v.workflow_runs;
   }
 

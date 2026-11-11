@@ -64,6 +64,7 @@
     type ManviPane,
   } from "../ui/manviFocus";
   import type { WorkflowRunInfo, GitHubContext } from "../github/types";
+  import { notePullRequests } from "../github/pullRequestReads";
 
 
   const ISSUE_REFRESH_MS = 60_000;
@@ -211,6 +212,7 @@
     }
     try {
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
+      notePullRequests(repo, next);
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;
