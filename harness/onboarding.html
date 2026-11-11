@@ -195,6 +195,7 @@
       const notice = { id: "event-7", revision: 1, updated_at: 1000, source_sequence: 7, task_id: "task-1", task_revision: 1, target_type: "run", target_id: "run-1", target_revision: 1, target_status: "task_deleted", kind: "run_exited", title: "Coding agent exited", created_at: 1000, read_at: null, dismissed_at: null, snoozed_until: null };
       let queued = true, acknowledged = 0, pendingReads = 0;
       const emptyPage = { ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null };
+      window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
       window.__TAURI_INTERNALS__ = {
         transformCallback: cb => cb,
         invoke: async (cmd, args) => {
@@ -220,7 +221,7 @@
       closeNotice.click();
       for (let i = 0; i < 40 && review(); i++) await settle();
       check("closing acknowledges it once and the activation is consumed", () => acknowledged === 1 && !review() && !queued);
-      await unmount(bridge); delete window.__TAURI_INTERNALS__; bridgeHost.remove();
+      await unmount(bridge); await settle(); delete window.__TAURI_INTERNALS__; delete window.__TAURI_EVENT_PLUGIN_INTERNALS__; bridgeHost.remove();
       check("no runtime errors", () => errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
     } catch (error) {
