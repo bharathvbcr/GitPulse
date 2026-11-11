@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "c7eefe3d1b1c31302d622b1fc91e7565621f7467",
+  "commit": "bc9ddc05b2bf69d7215fa58c25edb55aee23c048",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
@@ -107,7 +107,7 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 142,
+      "total": 143,
       "files": {
         "src/lib/agents/plane.ts": 11,
         "src/lib/branches/types.ts": 2,
@@ -128,7 +128,7 @@
         "src/lib/components/SessionAlertSettings.svelte": 2,
         "src/lib/components/SettingsModal.svelte": 1,
         "src/lib/components/onboarding/SetupWizard.svelte": 1,
-        "src/lib/coverage/report.ts": 1,
+        "src/lib/coverage/report.ts": 2,
         "src/lib/fleet/indexSweep.ts": 1,
         "src/lib/graph/graphLayout.ts": 2,
         "src/lib/harness/availability.ts": 4,

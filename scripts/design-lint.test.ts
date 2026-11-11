@@ -201,6 +201,13 @@ describe("design-lint widened scopes: <style> blocks, stylesheets and .ts string
     expect(rule14('"skips node_modules itself"')).toEqual([]);
   });
 
+  it("rule 14 reads a Markdown heading as copy and a #id or #hex as code", () => {
+    const rule14 = (text: string) => lintSource("src/lib/x.ts", `export const t = ${text};\n`).filter((v) => v.rule === 14).map((v) => v.term);
+    expect(rule14("\"## MANVI analysis\"")).toEqual(["MANVI"]);
+    expect(rule14("\"#add harness\"")).toEqual([]);
+    expect(rule14("\"#123 attempt\"")).toEqual([]);
+  });
+
   it("rule 14 flags a retired verb at the start of a label, and only there", () => {
     const found = hits(14, "rule-14-verbs.positive.svelte");
     expect(found.map((v) => `${v.line}:${v.term}`)).toEqual(["1:Retry", "2:Reload", "2:Reload", "3:Recheck", "4:Launch", "5:Retry", "6:Organise", "7:Retry", "7:Retry"]);

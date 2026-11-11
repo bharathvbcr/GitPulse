@@ -985,7 +985,7 @@ const DISPLAY_KEY = /(?:label|title|text|message|hint|description|heading|subtit
 const NOT_COPY_CALL =
   /(?:invoke|listen|once|emit|emitTo|addEventListener|removeEventListener|querySelector(?:All)?|getElementById|closest|matches|getItem|setItem|removeItem|classList\.\w+|setAttribute|getAttribute|hasAttribute|removeAttribute|RegExp|CustomEvent|Event|startsWith|endsWith|includes|indexOf|split|join|replace|replaceAll|match|require|import|test|has|get|set|delete|resolve|dirname|basename|extname|relative|new URL|fetch|Symbol|Reflect\.\w+)\s*(?:<[^>()]*>)?\(\s*$/;
 const NOT_COPY_KEY = /(?:keywords|aliases|synonyms|tags|selector|pattern|regex|command|cmd|argv|args|path|url|href|id|kind|type|key)["\x27]?\s*:\s*$/;
-const TS_CODE_WORDS = /^(?:[.#/\[<@$~]|[a-z]+:\/\/|\w+\(|--)/;
+const TS_CODE_WORDS = /^(?:[./\[<@$~]|#\w|[a-z]+:\/\/|\w+\(|--)/;
 
 /**
  * Whether a string literal of a `.ts` file is copy a person may read, for
