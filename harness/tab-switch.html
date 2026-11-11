@@ -381,10 +381,12 @@
             // `settings` opens Settings (`settings-layout` on its Layout panel);
             // `icons` sets Header button labels to Icons only first.
             if (words.includes("icons")) interfaceStore.setHeaderLabels("icons");
-            if (words.includes("settings") || words.includes("settings-layout")) {
+            if (words.some((w) => w.startsWith("settings"))) {
               window.dispatchEvent(new CustomEvent("gitpulse:settings"));
               await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
-              if (words.includes("settings-layout")) $$('[role="tab"]').find((t) => text(t) === "Layout")?.click();
+              // `settings-<panel>` (layout, views, agents, ...) opens that panel.
+              const panelWord = words.find((w) => w.startsWith("settings-"))?.slice(9);
+              if (panelWord) $$('[role="tab"]').find((t) => text(t).toLowerCase() === panelWord)?.click();
             }
             for (const surface of ["fleet", "agents", "tasks"]) {
               if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
