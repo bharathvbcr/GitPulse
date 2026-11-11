@@ -1,5 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { get } from "svelte/store";
+  import { hostPlatform } from "../stores/platformStore";
   import {
     tipGuideOf,
     tipTextOf,
@@ -90,7 +92,7 @@
     hide();
     activeEl = el;
     const key = tipGuideOf(el);
-    guide = key ? destinationGuide(key) : null;
+    guide = key ? destinationGuide(key, get(hostPlatform).os) : null;
     text = guide ? "" : tipTextOf(el);
     if (!guide && !text.trim()) return;
     timer = setTimeout(() => {

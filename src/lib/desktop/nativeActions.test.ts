@@ -59,6 +59,7 @@ function handlers(): NativeMenuHandlers & { calls: string[] } {
     nextRepoTab: () => calls.push("nextTab"),
     prevRepoTab: () => calls.push("prevTab"),
     reopenRepoTab: () => calls.push("reopenTab"),
+    jumpRepoTab: (digit) => calls.push(`jump:${digit}`),
     openError: (message) => calls.push(`error:${message}`),
     setDropActive: (active) => calls.push(`drop:${active}`),
   };
@@ -174,6 +175,19 @@ describe("dispatchNativeMenu", () => {
     expect(h.calls).toEqual(["closeTab", "nextTab", "prevTab", "reopenTab"]);
   });
 
+  it("routes each repository-tab digit to its own jump, the ninth meaning the last tab", () => {
+    // `jumpRepoTab` takes the digit, so it cannot sit in the no-argument route
+    // table below; the digit is what reaches the store, in order.
+    const h = handlers();
+    for (let digit = 1; digit <= 9; digit += 1) {
+      expect(dispatchNativeMenu({ id: `repo-tab-${digit}` }, h)).toBe(true);
+    }
+    expect(h.calls).toEqual(["jump:1", "jump:2", "jump:3", "jump:4", "jump:5", "jump:6", "jump:7", "jump:8", "jump:9"]);
+    for (const id of ["repo-tab-0", "repo-tab-10", "repo-tab-", "repo-tab"]) {
+      expect(dispatchNativeMenu({ id }, handlers()), id).toBe(false);
+    }
+  });
+
   it("returns false for unknown ids", () => {
     const h = handlers();
     expect(dispatchNativeMenu({ id: "not-a-command" }, h)).toBe(false);
@@ -265,7 +279,7 @@ describe("dispatchNativeMenu — every id reaches its own handler", () => {
     // A handler added without a route here would otherwise go unnoticed; the
     // path-taking and error handlers are routed separately below.
     const routed = new Set(ROUTES.map(([, handler]) => handler));
-    const exempt = new Set(["setTab", "activateRepo", "openRecent", "openRepo", "openError", "setDropActive"]);
+    const exempt = new Set(["setTab", "activateRepo", "openRecent", "openRepo", "openError", "setDropActive", "jumpRepoTab"]);
     const declared = Object.keys(handlers()).filter((k) => k !== "calls");
     const unrouted = declared.filter((k) => !routed.has(k) && !exempt.has(k));
     expect(unrouted).toEqual([]);

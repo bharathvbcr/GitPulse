@@ -8,6 +8,7 @@ import { isMacOS } from "../platform";
  *   - Cmd/Ctrl+Shift+W  → close active tab   (CLOSE_REPO_TAB_ACCEL)
  *   - Ctrl+Tab          → next tab           (NEXT_REPO_TAB_ACCEL)
  *   - Ctrl+Shift+Tab    → previous tab       (PREV_REPO_TAB_ACCEL)
+ *   - Cmd/Ctrl+1–9      → repository tab N   (REPO_TAB_BINDINGS; 9 is the last)
  * When both the menu accelerator and the window keydown listener fire, every
  * action happens twice (the historical double-close bug). `shouldSkipWebviewShortcut`
  * reports when JS must stand down because the native layer owns the chord.
@@ -34,12 +35,13 @@ export interface ShortcutKeyState {
 /** Families whose accelerators are also registered on the native Tauri menu. */
 const NATIVE_OWNED_FAMILIES: ReadonlySet<ShortcutFamily> = new Set([
   "closeActiveTab",
+  "jumpToTab",
   "cycleTabs",
   "zoom",
   "shortcuts",
 ]);
 
-export function classifyShortcut(e: ShortcutKeyState): ShortcutFamily | null {
+export function classifyShortcut(e: ShortcutKeyState, macOS = isMacOS()): ShortcutFamily | null {
   const meta = e.metaKey || e.ctrlKey;
   // Only the exact native accelerators stand down. Shift+= remains a
   // webview alias for zoom in, and plain '?' still opens the shortcuts sheet.
@@ -50,7 +52,12 @@ export function classifyShortcut(e: ShortcutKeyState): ShortcutFamily | null {
   if (meta && e.shiftKey && e.key.toLowerCase() === "w") {
     return "closeActiveTab";
   }
-  if (e.ctrlKey && e.altKey && !e.metaKey && /^Digit([1-9])$/.test(e.code)) {
+  // Repository tab N. The host's own command modifier only, with no alias:
+  // Control+digit on macOS belongs to the terminal, and the view chords
+  // (⌥⌘ digit on macOS, Ctrl+Shift+digit elsewhere) carry another modifier.
+  // Matched on `code` so a layout where the digit row needs Shift still works.
+  const command = macOS ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (command && !e.altKey && !e.shiftKey && /^Digit([1-9])$/.test(e.code)) {
     return "jumpToTab";
   }
   if (e.key === "Tab" && e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -72,7 +79,7 @@ export function shouldSkipWebviewShortcut(
   macOS = isMacOS(),
 ): boolean {
   if (!tauri) return false;
-  const family = classifyShortcut(event);
+  const family = classifyShortcut(event, macOS);
   if (family === null || !NATIVE_OWNED_FAMILIES.has(family)) return false;
   // Ctrl+Tab is Control everywhere. CmdOrCtrl resolves to Command on macOS
   // and Control elsewhere; the other modifier remains a webview alias.

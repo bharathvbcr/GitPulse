@@ -4,6 +4,8 @@ import {
   activationStops,
   canMoveUnit,
   cycleStop,
+  jumpDigitFor,
+  jumpTargetIndex,
   moveUnit,
   moveUnitToEdge,
   planDrop,
@@ -171,5 +173,45 @@ describe("activation stops", () => {
     expect(cycleStop(layout, "/code/C", 1)).toBe("/code/A");
     expect(cycleStop(layout, null, 1)).toBe("/code/A");
     expect(cycleStop(layoutOf([repoTab("/only")]), "/only", 1)).toBeNull();
+  });
+});
+
+describe("digit jumps", () => {
+  it("selects by position for 1-8 and the LAST stop for 9, however many there are", () => {
+    expect(jumpTargetIndex(1, 3)).toBe(0);
+    expect(jumpTargetIndex(3, 3)).toBe(2);
+    expect(jumpTargetIndex(8, 8)).toBe(7);
+    expect(jumpTargetIndex(9, 3)).toBe(2);
+    expect(jumpTargetIndex(9, 9)).toBe(8);
+    expect(jumpTargetIndex(9, 14)).toBe(13);
+    expect(jumpTargetIndex(9, 1)).toBe(0);
+  });
+
+  it("selects nothing past the end, with no stops, or for a non-digit", () => {
+    expect(jumpTargetIndex(5, 3)).toBeNull();
+    expect(jumpTargetIndex(1, 0)).toBeNull();
+    expect(jumpTargetIndex(9, 0)).toBeNull();
+    for (const digit of [0, 10, -1, 1.5, Number.NaN]) expect(jumpTargetIndex(digit, 12)).toBeNull();
+  });
+
+  it("names the digit that reaches a stop, and none for a stop no digit reaches", () => {
+    expect(jumpDigitFor(0, 3)).toBe(1);
+    expect(jumpDigitFor(7, 12)).toBe(8);
+    // The ninth of nine is also the last, so 9 reaches it.
+    expect(jumpDigitFor(8, 9)).toBe(9);
+    // The ninth of twelve is out of reach: 9 goes to the twelfth.
+    expect(jumpDigitFor(8, 12)).toBeNull();
+    expect(jumpDigitFor(11, 12)).toBe(9);
+    expect(jumpDigitFor(3, 3)).toBeNull();
+    expect(jumpDigitFor(-1, 3)).toBeNull();
+  });
+
+  it("agrees with jumpTargetIndex: a digit shown for a stop selects that stop", () => {
+    for (let count = 1; count <= 14; count += 1) {
+      for (let index = 0; index < count; index += 1) {
+        const digit = jumpDigitFor(index, count);
+        if (digit !== null) expect(jumpTargetIndex(digit, count), `${index} of ${count}`).toBe(index);
+      }
+    }
   });
 });

@@ -74,6 +74,7 @@ import {
   activationStops,
   canMoveUnit,
   cycleStop,
+  jumpTargetIndex,
   moveUnit,
   moveUnitToEdge,
   unitForTab,
@@ -2529,6 +2530,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const id = activationStops(drawnLayout())[index];
       if (id) await store.activateTab(id);
     },
+    // The digit keys: 1–8 select by position, 9 the last, as in a browser. One
+    // owner for the native menu's repository-tab items and the webview
+    // fallback, so the two cannot count the strip differently.
+    activateTabByDigit: async (digit: number) => {
+      const stops = activationStops(drawnLayout());
+      const index = jumpTargetIndex(digit, stops.length);
+      if (index !== null) await store.activateTab(stops[index]);
+    },
+    // How many stops the strip draws right now: what `activateTabByDigit`
+    // resolves against, and so what the native menu enables its digit items
+    // from. Open tabs are not stops (a folded worktree stack is one).
+    jumpStopCount: (): number => activationStops(drawnLayout()).length,
     // Moves step through the strip as drawn (see repos/stripNav.ts): a folded
     // worktree stack moves with every checkout in it, a group's tab stays in
     // its group, and a step never swaps with a tab the reader cannot see. The

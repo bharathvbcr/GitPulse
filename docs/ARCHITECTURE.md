@@ -117,7 +117,10 @@ The native menu is built in `src-tauri/src/desktop/menu.rs` during Tauri startup
 native projection of `viewRegistry.ts`, with a bidirectional ID/label contract
 test. It calls `setActiveTab(view, section)` and reveals the repository pane
 when Fleet is open. App and RepoTabBar share platform-aware native shortcut
-ownership in `webviewShortcuts.ts`. `menuStateStore.ts` derives availability,
+ownership in `webviewShortcuts.ts`. Cmd/Ctrl+1–9 select repository tabs
+(`REPO_TAB_BINDINGS`, nine `repo-tab-N` ids; 9 is the last tab), so the views
+take ⌥⌘1–3 on macOS and Ctrl+Shift+1–3 elsewhere (`VIEW_TAB_BINDINGS_MACOS` /
+`_OTHER`; Ctrl+Alt is AltGr on many layouts). `menuStateStore.ts` derives availability,
 checks, labels and optional status-icon contents from the existing stores.
 `menuSync.ts` serializes and coalesces updates to `cmd_set_menu_state`; Rust
 validates the payload and updates menu/tray objects on the GUI thread. Events

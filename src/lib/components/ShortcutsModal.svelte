@@ -10,6 +10,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { isDialogEscape } from "../keyboard/dialogEscape";
   import { isModalOccupied } from "../keyboard/modalOccupied";
+  import type { HostOS } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutKeyLabels, shortcutTextLabel } from "../ui/platformCopy";
 
@@ -34,7 +35,11 @@
     shortcuts: ShortcutItem[];
   }
 
-  const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
+  // A function of the host because the view chord is not the same words on
+  // every host (see viewShortcuts.ts); everything else is authored in macOS
+  // notation and mapped below.
+  function shortcutCategories(os: HostOS): ShortcutCategory[] {
+    return [
     {
       title: "Workspace & Tabs",
       icon: LayoutGrid,
@@ -45,7 +50,7 @@
         { keys: ["⌘", "⇧", "W"], description: "Close active repository tab" },
         { keys: ["Ctrl", "Tab"], description: "Cycle to next repository tab" },
         { keys: ["Ctrl", "⇧", "Tab"], description: "Cycle to previous repository tab" },
-        { keys: ["Ctrl", "Alt", "1–9"], description: "Jump to a repository tab; 9 is the last one" },
+        { keys: ["⌘", "1–9"], description: "Jump to a repository tab; 9 is the last one" },
         { keys: ["Ctrl", "⇧", "← / →"], description: "Move the focused repository tab left or right" },
       ],
     },
@@ -58,7 +63,7 @@
         // views ("Files, Graph, Diff, Resolve, Blame, Stack, GitHub, Coverage,
         // Health") for months after the app consolidated to four — from the
         // one screen whose entire job is to be right about this.
-        ...viewShortcutRows(),
+        ...viewShortcutRows(os),
         ...sectionShortcutRows(),
         { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
         { keys: ["⌘", "⇧", "A"], description: "Open the Agents plane" },
@@ -103,14 +108,15 @@
         { keys: ["?"], description: "Help and shortcuts preview" },
       ],
     },
-  ];
+    ];
+  }
 
   // The accelerators themselves are bound as CmdOrCtrl and already resolve to
   // Control off macOS; only this printed reference was wrong. Mapping happens
   // before filtering so that searching "ctrl" on Windows finds the rows whose
   // keys are authored as macOS glyphs.
   let platformCategories = $derived([
-    ...SHORTCUT_CATEGORIES.map((cat) => ({
+    ...shortcutCategories($hostPlatform.os).map((cat) => ({
       ...cat,
       shortcuts: cat.shortcuts.map((item) => ({
         ...item,

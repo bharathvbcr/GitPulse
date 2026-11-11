@@ -43,7 +43,7 @@ export interface MenuCommandDeps {
 export function defaultMenuCommandDeps(): MenuCommandDeps {
   return {
     repo: repoStore, state: () => get(repoStore), enabled: (id) => menuActionEnabled(get(nativeMenuState), id),
-    ready: (id) => menuActionEnabled(buildMenuState(get(repoStore), get(interfaceStore), themeStore.preference(), get(repoStore.mutationActivity), false), id),
+    ready: (id) => menuActionEnabled(buildMenuState(get(repoStore), get(interfaceStore), themeStore.preference(), get(repoStore.mutationActivity), false, undefined, undefined, undefined, repoStore.jumpStopCount()), id),
     quickCommit: () => promptQuickCommit(),
     askText, askConfirm, copy: copyText, reveal: revealRepository, open: openExternal,
     commitId: async (repoPath, ref) => ref === "HEAD" ? invoke<string>("cmd_get_head_id", { repoPath }) : ref,

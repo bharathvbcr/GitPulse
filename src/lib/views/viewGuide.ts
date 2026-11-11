@@ -1,3 +1,4 @@
+import type { HostOS } from "../platform";
 import { isViewTab, type ViewTab } from "../repos/persist";
 import { VIEW_REGISTRY, sectionsFor } from "./viewRegistry";
 import { sectionAccelerator, viewAccelerator } from "./viewShortcuts";
@@ -55,7 +56,7 @@ export function parseTipGuideKey(
  * The card for a `data-tip-guide` key, or null when the key names nothing
  * this build still offers.
  */
-export function destinationGuide(key: string): DestinationGuide | null {
+export function destinationGuide(key: string, os: HostOS = "macos"): DestinationGuide | null {
   const parsed = parseTipGuideKey(key);
   if (!parsed) return null;
   const { view, section } = parsed;
@@ -68,7 +69,7 @@ export function destinationGuide(key: string): DestinationGuide | null {
       section: null,
       title: registration.label,
       summary: registration.summary,
-      shortcut: viewAccelerator(view),
+      shortcut: viewAccelerator(view, os),
       chips: sections.map((entry) => ({
         id: entry.id,
         label: entry.label,

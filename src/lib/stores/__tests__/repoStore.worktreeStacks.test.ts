@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { get, writable } from "svelte/store";
 import { IpcError } from "../../ipc/invoke";
 import { createRepoStore, type InvokeFn } from "../repoStore";
+import { buildMenuState, menuActionEnabled } from "../../desktop/menuState";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
 import { memoryStorage } from "../../repos/persist";
@@ -507,6 +508,49 @@ describe("shortcuts step through the strip as drawn", () => {
     await store.activateTabAt(-1);
     await store.activateTabAt(1.5);
     expect(active(store)).toBe(MAIN);
+  });
+
+  it("counts stops, not tabs, and enables the menu's digit items from that count", async () => {
+    // Three open tabs, two of them one folded stack: two stops.
+    const store = makeStore();
+    for (const p of [MAIN, wt("a"), OTHER]) await store.openRepo(p);
+    expect(get(store).openTabs).toHaveLength(3);
+    expect(store.jumpStopCount()).toBe(2);
+    const menu = buildMenuState(get(store), get(interfaceStore), "system", {}, false, undefined, undefined, 0, store.jumpStopCount());
+    expect(menuActionEnabled(menu, "repo-tab-1")).toBe(true);
+    expect(menuActionEnabled(menu, "repo-tab-2")).toBe(true);
+    // The third tab is inside the stack: ⌘3 would reach nothing, so it is off.
+    expect(menuActionEnabled(menu, "repo-tab-3")).toBe(false);
+    expect(menuActionEnabled(menu, "repo-tab-9")).toBe(true);
+    // Unfolding the stack draws three stops, and ⌘3 then reaches one.
+    setStackExpanded(stackKeyFor(null, get(store).openTabs[0].family!), true);
+    expect(store.jumpStopCount()).toBe(3);
+    const unfolded = buildMenuState(get(store), get(interfaceStore), "system", {}, false, undefined, undefined, 0, store.jumpStopCount());
+    expect(menuActionEnabled(unfolded, "repo-tab-3")).toBe(true);
+    // Every enabled digit really moves the selection: enabled means it acts.
+    for (let digit = 1; digit <= 9; digit += 1) {
+      const enabled = menuActionEnabled(unfolded, `repo-tab-${digit}`);
+      const before = active(store);
+      await store.activateTabByDigit(digit);
+      if (!enabled) expect(active(store), `digit ${digit} is off but moved`).toBe(before);
+    }
+  });
+
+  it("maps a digit key to the nth stop, and 9 to the last stop as the strip is drawn", async () => {
+    const store = await opened();
+    // The strip draws two stops here (the folded stack and OTHER), not the
+    // four tabs open, which is what the menu's tab-count enabling over-counts.
+    await store.activateTabByDigit(2);
+    expect(active(store)).toBe(OTHER);
+    await store.activateTabByDigit(1);
+    expect(active(store)).toBe(MAIN);
+    await store.activateTabByDigit(9);
+    expect(active(store)).toBe(OTHER);
+    // Past the end is nothing, not a clamp.
+    await store.activateTabByDigit(5);
+    expect(active(store)).toBe(OTHER);
+    await store.activateTabByDigit(0);
+    expect(active(store)).toBe(OTHER);
   });
 
   it("falls back to every tab in stored order with stacking turned off", async () => {

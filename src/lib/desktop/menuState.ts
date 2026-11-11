@@ -4,9 +4,10 @@ import type { ThemePreference } from "../stores/themeStore";
 import { REGISTERED_VIEWS, resolveSection } from "../views/viewRegistry";
 import { actionLabel, blocksOtherMutations, headline } from "../repos/operation";
 import type { NativeEvent } from "./nativeActions";
+import { jumpTargetIndex } from "../repos/stripNav";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { asksForReader, type SessionActivity } from "../terminal/sessionActivity";
-import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES } from "./menuContract";
+import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES, REPO_TAB_JUMP_IDS } from "./menuContract";
 import {
   identityKey,
   isCaseInsensitiveFs,
@@ -189,6 +190,10 @@ export function buildMenuState(
   // `u32` outright and state.rs refuses one past its ceiling, and either
   // refusal freezes the menu bar, the tray and the popover together.
   agentsWaiting = 0,
+  // Stops the repository strip draws (`repoStore.jumpStopCount()`). Defaulted
+  // to none, which disables the digit items: an unknown count must not enable
+  // an item that may do nothing.
+  jumpStops = 0,
 ): MenuState {
   const enabled = new Set(GLOBAL_ACTIONS);
   const checked = new Set([`theme-${theme}`]);
@@ -219,6 +224,11 @@ export function buildMenuState(
   allow("next-repo-tab", repo.openTabs.length > 1);
   allow("prev-repo-tab", repo.openTabs.length > 1);
   allow("reopen-repo-tab", repo.lastClosed.length > 0);
+  // An item is enabled exactly when its digit reaches a stop, asked of the same
+  // `jumpTargetIndex` the jump itself resolves with: ⌘n needs an nth stop and
+  // ⌘9 needs any, because it selects the last. `jumpStops` counts stops as the
+  // strip draws them (a folded worktree stack is one), never open tabs.
+  REPO_TAB_JUMP_IDS.forEach((id, index) => allow(id, jumpTargetIndex(index + 1, jumpStops) !== null));
   for (const id of ["copy-repo-path", "reveal-repo", "terminal-dock", "focus-filter"]) allow(id, hasRepo);
   allow("copy-branch", loaded && !!repo.currentBranch);
   allow("copy-commit", loaded);
@@ -490,6 +500,7 @@ const HELD_WHILE_PROMPTING: ReadonlySet<string> = new Set([
   "activate-repo", "open", "open-recent", "open-repo", "close-tab", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", "clone",
   "create-branch", "rename-branch", "quick-commit", "stash", "stash-pop",
   "operation-continue", "operation-abort", "operation-skip",
+  ...REPO_TAB_JUMP_IDS,
 ]);
 
 /**
@@ -529,6 +540,6 @@ export function canDispatchMenuEvent(
   }
   if (!menuActionEnabled(state, event.id)) return false;
   const global = GLOBAL_ACTIONS.includes(event.id) || ["zoom-in", "zoom-out", "reset-zoom", "check-updates",
-    "clear-recents", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab"].includes(event.id);
+    "clear-recents", "next-repo-tab", "prev-repo-tab", "reopen-repo-tab", ...REPO_TAB_JUMP_IDS].includes(event.id);
   return global || sameRepo(event.repo_path ?? "", repo.currentPath ?? "", options);
 }

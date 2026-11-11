@@ -752,6 +752,10 @@
       nextRepoTab: () => void repoStore.nextTab(),
       prevRepoTab: () => void repoStore.prevTab(),
       reopenRepoTab: () => void repoStore.reopenLastClosed(),
+      jumpRepoTab: (digit) => {
+        interfaceStore.setGlobalSurface("repository");
+        void repoStore.activateTabByDigit(digit);
+      },
       openError: (message) => toastStore.error(message),
       setDropActive: (active) => {
         setDropOverlay(active);

@@ -193,3 +193,27 @@ export function cycleStop(layout: TabLayoutResult, activeId: string | null, step
   if (index < 0) return stops[0];
   return stops[(index + step + stops.length) % stops.length];
 }
+
+/**
+ * The stop a digit key (1–9) selects among `count` stops, or null for none.
+ *
+ * 1–8 are positions; 9 is the LAST stop however many there are, as in a
+ * browser, because there is no ninth to reach for once there are more. A digit
+ * past the end selects nothing rather than clamping.
+ */
+export function jumpTargetIndex(digit: number, count: number): number | null {
+  if (!Number.isInteger(digit) || digit < 1 || digit > 9 || count < 1) return null;
+  if (digit === 9) return count - 1;
+  return digit - 1 < count ? digit - 1 : null;
+}
+
+/**
+ * The digit that reaches the stop at `index` among `count`, or null when none
+ * does (the ninth of twelve is not reachable by ⌘9, which goes to the twelfth).
+ * The inverse of `jumpTargetIndex`, used for the hint on a tab's hover card.
+ */
+export function jumpDigitFor(index: number, count: number): number | null {
+  if (!Number.isInteger(index) || index < 0 || index >= count) return null;
+  if (index < 8) return index + 1;
+  return index === count - 1 ? 9 : null;
+}

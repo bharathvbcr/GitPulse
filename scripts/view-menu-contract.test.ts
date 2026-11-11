@@ -92,11 +92,11 @@ describe("every actionable native id has a frontend handler", () => {
     "utf8",
   );
 
-  const rustIds = [...actions.matchAll(/pub const [A-Z_]+: &str = "([a-z-]+)"/g)].map(
+  const rustIds = [...actions.matchAll(/pub const [A-Z0-9_]+: &str = "([a-z0-9-]+)"/g)].map(
     (m) => m[1],
   );
   const handled = new Set(
-    [...dispatcher.matchAll(/case "([a-z-]+)":/g)].map((m) => m[1]),
+    [...dispatcher.matchAll(/case "([a-z0-9-]+)":/g)].map((m) => m[1]),
   );
   const viewIds = new Set(REGISTERED_VIEWS.map((view) => nativeTabMenuId(view.id)));
 
@@ -220,6 +220,21 @@ function declaredAccelerators(): Accelerator[] {
     if (!/^(CmdOrCtrl|Cmd|Ctrl|Alt|Shift|F\d)/.test(value)) continue;
     found.push({ value, bucket: bucketAt(match.index) });
   }
+  // Table rows — `(actions::ID, "Title", "ACCEL")` — carry the repository-tab
+  // and view digits. The `Some(…)` scan above never saw them, so the view
+  // digits were outside this collision check until the tables were added here.
+  // A table's platform is its name: `…_MACOS` and `…_OTHER` are both compiled
+  // and one is chosen by `cfg!` at runtime, so no `#[cfg]` marks them.
+  for (const table of source.matchAll(/const\s+(\w+_BINDINGS\w*)\s*:[^=]*=\s*&\[([\s\S]*?)\n\];/g)) {
+    const bucket: CfgBucket = table[1].endsWith("_MACOS")
+      ? "macos"
+      : table[1].endsWith("_OTHER")
+        ? "not-macos"
+        : "always";
+    for (const row of table[2].matchAll(/\(\s*actions::\w+\s*,\s*"[^"]+"\s*,\s*"([^"]+)"\s*\)/g)) {
+      found.push({ value: row[1], bucket });
+    }
+  }
   return found;
 }
 
@@ -263,5 +278,44 @@ describe("no two native menu items claim the same accelerator", () => {
       `these accelerators are bound by more than one menu item, so one of them ` +
         `silently never fires: ${collisions.join("; ")}`,
     ).toEqual([]);
+  });
+
+  it("sees the repository-tab and per-host view digits in the tables", () => {
+    const byBucket = (bucket: CfgBucket) => accelerators.filter((a) => a.bucket === bucket).map((a) => a.value);
+    for (const digit of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+      expect(byBucket("always"), `repository tab ${digit}`).toContain(`CmdOrCtrl+${digit}`);
+    }
+    for (const digit of [1, 2, 3]) {
+      expect(byBucket("macos"), `macOS view ${digit}`).toContain(`CmdOrCtrl+Alt+${digit}`);
+      expect(byBucket("not-macos"), `Windows/Linux view ${digit}`).toContain(`Ctrl+Shift+${digit}`);
+    }
+  });
+
+  it("leaves no accelerator claimed twice on any host once CmdOrCtrl is resolved", () => {
+    // `CmdOrCtrl+X` and `Ctrl+X` are different strings and one chord off macOS,
+    // so the string comparison above cannot see that alias.
+    const resolve = (value: string, macos: boolean): string => {
+      const tokens = value.split("+");
+      const key = tokens.pop() ?? "";
+      const modifiers = tokens
+        .map((token) => {
+          const lower = token.toLowerCase();
+          if (lower === "cmdorctrl") return macos ? "cmd" : "ctrl";
+          if (lower === "ctrl" || lower === "control") return "ctrl";
+          if (lower === "cmd") return "cmd";
+          return lower;
+        })
+        .sort();
+      return `${modifiers.join("+")}+${key.toUpperCase()}`;
+    };
+    for (const macos of [true, false]) {
+      const seen = new Map<string, string>();
+      for (const { value, bucket } of accelerators) {
+        if (bucket === (macos ? "not-macos" : "macos")) continue;
+        const chord = resolve(value, macos);
+        expect(seen.get(chord), `${value} and ${seen.get(chord)} are one chord (macOS: ${macos})`).toBeUndefined();
+        seen.set(chord, value);
+      }
+    }
   });
 });

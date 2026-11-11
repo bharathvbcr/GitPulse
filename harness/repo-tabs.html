@@ -259,6 +259,60 @@
           check("the move is announced by its place on the strip", () =>
             announcement().textContent.includes("GitPulse to position 2 of 3"));
 
+          // ---- E4: Cmd/Ctrl+digit reaches the tabs as drawn, 9 the last ---------
+          // The host's own command key, no alias. Under Tauri the native menu owns
+          // these chords; this page has no Tauri, so the window listener does.
+          const hostMac = (await import("../src/lib/platform.ts")).isMacOS();
+          const digitKey = (n, init = {}) => window.dispatchEvent(new KeyboardEvent("keydown", {
+            key: String(n), code: `Digit${n}`, metaKey: hostMac, ctrlKey: !hostMac, bubbles: true, cancelable: true, ...init,
+          }));
+          // Repository tabs only: Fleet, Agents and Tasks are chips in the same tablist.
+          const drawnTabs = () => $$('[role="tab"]', strip()).filter((el) => !/^(Fleet|Agents|Tasks)\b/.test(el.getAttribute("aria-label") ?? ""));
+          const selectedTab = () => drawnTabs().find((el) => el.getAttribute("aria-selected") === "true");
+          // This page mocks Tauri, so the webview stands down for these chords as
+          // it does in the app: the native menu owns them. The webview path
+          // (browser builds) is exercised with the Tauri marker hidden.
+          const beforeTauri = selectedTab();
+          if ("__TAURI_INTERNALS__" in window) {
+            digitKey(3); await settle(); await wait(100);
+            check("under Tauri the webview leaves Cmd/Ctrl+digit to the native menu (no double jump)", () => selectedTab() === beforeTauri);
+          }
+          const asBrowser = async (fn) => {
+            const held = window.__TAURI_INTERNALS__;
+            const had = "__TAURI_INTERNALS__" in window;
+            delete window.__TAURI_INTERNALS__;
+            try { await fn(); } finally { if (had) window.__TAURI_INTERNALS__ = held; }
+          };
+          await asBrowser(async () => {
+            digitKey(3); await settle(); await wait(200);
+            check("Cmd/Ctrl+3 selects the third tab as drawn", () => selectedTab() === drawnTabs()[2]);
+            digitKey(1); await settle(); await wait(200);
+            check("Cmd/Ctrl+1 selects the first tab as drawn", () => selectedTab() === drawnTabs()[0]);
+            digitKey(2); await settle(); await wait(200);
+            check("Cmd/Ctrl+2 selects the second tab as drawn", () => selectedTab() === drawnTabs()[1]);
+            digitKey(9); await settle(); await wait(200);
+            check("Cmd/Ctrl+9 selects the last tab as drawn, however many are open", () =>
+              drawnTabs().length > 1 && selectedTab() === drawnTabs()[drawnTabs().length - 1]);
+            digitKey(1); await settle(); await wait(200);
+            const beforeOld = selectedTab();
+            // Six tabs are open but the folded stack makes them three stops, so a
+            // fourth digit reaches nothing, and the native menu says so by
+            // leaving that item off (it counts stops from the same owner).
+            digitKey(4); await settle(); await wait(100);
+            check("Cmd/Ctrl+4 does nothing: six open tabs are three stops with the stack folded", () =>
+              get(repoStore).openTabs.length > 3 && repoStore.jumpStopCount() === 3 && selectedTab() === beforeOld);
+            const { buildMenuState, menuActionEnabled } = await import("../src/lib/desktop/menuState.ts");
+            const nativeItems = buildMenuState(get(repoStore), get(interfaceStore), "system", {}, false, undefined, undefined, 0, repoStore.jumpStopCount());
+            check("the native menu enables digits 1-3 and 9 and leaves 4 off, counting stops not tabs", () =>
+              [1, 2, 3, 9].every((n) => menuActionEnabled(nativeItems, `repo-tab-${n}`)) && !menuActionEnabled(nativeItems, "repo-tab-4"));
+            digitKey(2, { metaKey: false, ctrlKey: true, altKey: true }); await settle(); await wait(50);
+            check("the old Ctrl+Alt+digit is no longer a jump (it is AltGr on many layouts)", () => selectedTab() === beforeOld);
+            digitKey(2, { metaKey: hostMac, ctrlKey: !hostMac, altKey: hostMac, shiftKey: !hostMac }); await settle(); await wait(50);
+            check("the view chord (Option+Cmd or Ctrl+Shift) is not a tab jump", () => selectedTab() === beforeOld);
+          });
+          await repoStore.activateTab(get(repoStore).openTabs.find((t) => t.path === MAIN).id);
+          await settle();
+
           // ---- unfold / fold ---------------------------------------------
           switcher("GitPulse").click();
           await settle();

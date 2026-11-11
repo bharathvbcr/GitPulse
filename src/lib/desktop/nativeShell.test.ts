@@ -109,6 +109,7 @@ function buildHandlers() {
     nextRepoTab: vi.fn(),
     prevRepoTab: vi.fn(),
     reopenRepoTab: vi.fn(),
+    jumpRepoTab: vi.fn(),
     openError: vi.fn(),
     setDropActive: vi.fn(),
   };

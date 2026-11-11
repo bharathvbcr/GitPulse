@@ -38,7 +38,7 @@
     type StackHeaderItem,
     type TabItem,
   } from "../repos/tabGroups";
-  import { activationStops, planDrop, unitForTab, unitIds, type StripUnit } from "../repos/stripNav";
+  import { activationStops, jumpDigitFor, planDrop, unitForTab, unitIds, type StripUnit } from "../repos/stripNav";
   import { checkoutName } from "../repos/repoFamily";
   import { expandedStacks, lastUsedCheckouts, setStackExpanded } from "../repos/stackState";
   import {
@@ -678,14 +678,17 @@
         void repoStore.closeActiveTab();
         return;
       case "jumpToTab": {
+        // The native menu owns this chord under Tauri (`shouldSkipWebviewShortcut`
+        // above); this is the browser and harness path. A key a terminal or
+        // editor already consumed is not ours.
+        if (e.defaultPrevented) return;
         const digit = e.code.match(/^Digit([1-9])$/);
         if (!digit) return;
         e.preventDefault();
         revealRepository();
         // 9 is the last repository however many are open, as in a browser:
         // there is no ninth to reach for once there are more than nine.
-        const wanted = Number(digit[1]);
-        void repoStore.activateTabAt(wanted === 9 ? activationStops(tabLayout).length - 1 : wanted - 1);
+        void repoStore.activateTabByDigit(Number(digit[1]));
         return;
       }
       case "cycleTabs": {
@@ -1912,7 +1915,8 @@
 {/snippet}
 
 {#if card && cardTab}
-  {@const stop = activationStops(tabLayout).indexOf(cardTab.id)}
+  {@const stops = activationStops(tabLayout)}
+  {@const jumpDigit = jumpDigitFor(stops.indexOf(cardTab.id), stops.length)}
   <!-- Justified: pointer enter/leave only keep the card open while it is under
        the pointer; it holds no controls. -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -1940,7 +1944,7 @@
       <p class="mt-1.5 text-textMuted">{PARKED_TITLE}</p>
     {/if}
     <p class="mt-1.5 text-micro text-textMuted">
-      Drag to reorder · P to {cardTab.pinned ? "unpin" : "pin"} · {shortcutTextLabel("⌃⇧←/→", $hostPlatform.os)} to move{stop >= 0 && stop < 9 ? ` · ${shortcutTextLabel(`⌃⌥${stop + 1}`, $hostPlatform.os)} to jump here` : ""}
+      Drag to reorder · P to {cardTab.pinned ? "unpin" : "pin"} · {shortcutTextLabel("⌃⇧←/→", $hostPlatform.os)} to move{jumpDigit !== null ? ` · ${shortcutTextLabel(`⌘${jumpDigit}`, $hostPlatform.os)} to jump here` : ""}
     </p>
   </div>
 {/if}

@@ -6,6 +6,11 @@
  * host (`terminalTabChord`), and find / text size are Command on macOS and
  * Control+Shift elsewhere (`terminalViewChord`) because plain Control belongs
  * to the shell. Nothing here is invented.
+ *
+ * One row is the app's, not the terminal's: the repository-tab digits are a
+ * native menu accelerator, consumed before xterm sees them, so they work with
+ * a shell focused. The terminal claims no Command/Control+digit of its own
+ * (`shortcutGuide.test.ts` holds both chord classifiers to that).
  */
 
 import type { HostOS } from "../platform";
@@ -27,6 +32,7 @@ export function terminalGuideShortcuts(os: HostOS): GuideShortcut[] {
     { keys: ["Ctrl", "Shift", "W"], description: "Close session — asks first when a job is running" },
     { keys: ["Ctrl", "Tab"], description: "Next terminal tab" },
     { keys: ["Ctrl", "Shift", "Tab"], description: "Previous terminal tab" },
+    { keys: [cmd, "1–9"], description: "Jump to a repository tab, from the terminal too; 9 is the last" },
     { keys: mac ? [cmd, "F"] : ["Ctrl", "Shift", "F"], description: "Find in the terminal" },
     { keys: ["Enter"], description: "Next match" },
     { keys: ["Shift", "Enter"], description: "Previous match" },
