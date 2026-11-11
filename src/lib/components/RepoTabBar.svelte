@@ -477,7 +477,7 @@
   async function copyPath(path: string) {
     closeMenu();
     if (!(await copyText(path))) {
-      repoStore.setError("Could not copy path to clipboard");
+      repoStore.setError("Couldn't copy path to clipboard");
     }
   }
 

@@ -59,7 +59,7 @@ export function mergeBlockedReason(
   if (state.isLoading) return "Waiting for repository information…";
   if (!state.currentBranch) return "Check out a local branch before merging.";
   if (state.currentBranch !== request.targetBranch) return "The checked-out branch changed. Close this dialog and review the new destination.";
-  if (state.operation.probeFailed) return "Could not check for an operation in progress. Refresh the repository and try again.";
+  if (state.operation.probeFailed) return "Couldn't check for an operation in progress. Refresh the repository and try again.";
   if (state.operation.operation) return "Finish or abort the operation in progress before starting another merge.";
   return null;
 }

@@ -82,7 +82,7 @@ describe("native repository commands", () => {
     h.deps.copy = vi.fn(async () => false);
     await h.commands.copyCommit();
     expect(h.deps.commitId).toHaveBeenLastCalledWith("/repo/a", "b".repeat(40));
-    expect(h.deps.error).toHaveBeenCalledWith("Could not copy to the clipboard.");
+    expect(h.deps.error).toHaveBeenCalledWith("Couldn't copy to the clipboard.");
   });
   it("cannot copy a stale result into another repository's context", async () => {
     const h = harness();

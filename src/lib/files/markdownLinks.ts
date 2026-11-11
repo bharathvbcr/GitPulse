@@ -206,7 +206,7 @@ export function handleMarkdownClick(event: MouseEvent, context: MarkdownClickCon
     }
     case "external":
       void context.openExternal(action.url).catch((error: unknown) => {
-        context.report(`Could not open ${action.url}: ${error instanceof Error ? error.message : String(error)}`);
+        context.report(`Couldn't open ${action.url}. ${error instanceof Error ? error.message : String(error)}`);
       });
       return;
     case "file":
@@ -226,7 +226,7 @@ async function copyCode(button: Element, context: MarkdownClickContext): Promise
   const text = block?.textContent ?? "";
   if (!text) return;
   if (!(await context.copy(text))) {
-    context.report("Could not copy to clipboard");
+    context.report("Couldn't copy to clipboard");
     return;
   }
   if (!button.isConnected) return;

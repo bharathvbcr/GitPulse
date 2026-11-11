@@ -5,6 +5,7 @@ import {
   OBJECT_MAX_CHARS,
   confirmDestructive,
   describeFailure,
+  failureLine,
   toOneLine,
   unknownState,
 } from "./describeFailure";
@@ -264,5 +265,22 @@ describe("toOneLine", () => {
 
   it("handles a cap of one", () => {
     expect(toOneLine("abc", 1)).toBe("…");
+  });
+});
+
+describe("failureLine", () => {
+  it("joins the headline and the reason as two sentences", () => {
+    expect(failureLine("Couldn't create the branch", "exists")).toBe("Couldn't create the branch. Exists.");
+    expect(failureLine("Couldn't create the branch.", "A branch named x already exists.")).toBe(
+      "Couldn't create the branch. A branch named x already exists.",
+    );
+  });
+  it("keeps a reason's own closing punctuation and flattens its lines", () => {
+    expect(failureLine("Couldn't push", "rejected:\n  non-fast-forward?")).toBe("Couldn't push. Rejected: non-fast-forward?");
+  });
+  it("says the action did not finish when no reason came back", () => {
+    for (const reason of [undefined, null, "", "  \n "]) {
+      expect(failureLine("Couldn't delete the tag", reason)).toBe("Couldn't delete the tag. It did not complete.");
+    }
   });
 });

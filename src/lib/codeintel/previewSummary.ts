@@ -309,7 +309,7 @@ export function summarizePreview(
   } else if (filesOmitted > 0) {
     headline = `Preview fan-out capped: ${filesOmitted} of ${filesTotal} file(s) not previewed — not a clean bill of health`;
   } else if (unavailableFiles === files.length) {
-    headline = "Could not preview staged changes — not a clean bill of health";
+    headline = "Couldn't preview staged changes — not a clean bill of health";
   } else if (unreliableFiles > 0 && brokenCallerTotal === 0) {
     headline = `${unreliableFiles} file(s) have an unreliable preview — do not treat as "nothing breaks"`;
   } else if (brokenCallerTotal > 0) {

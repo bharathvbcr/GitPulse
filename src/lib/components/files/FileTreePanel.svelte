@@ -523,7 +523,7 @@
   async function copyPath(path: string) {
     closeContextMenu();
     if (!(await copyText(path))) {
-      repoStore.setError("Could not copy path to clipboard");
+      repoStore.setError("Couldn't copy path to clipboard");
     }
   }
 
@@ -564,7 +564,7 @@
         refusal = typedError.message;
         continue;
       }
-      reportFailure(outcome, "Could not create the file");
+      reportFailure(outcome, "Couldn't create the file");
       return null;
     }
   }
@@ -633,7 +633,7 @@
     const to = answer?.trim().replace(/\/+$/, "");
     if (!to || to === row.path) return;
     const moved = await repoStore.movePath(row.path, to, target);
-    if (!reportFailure(moved, "Could not move it")) return;
+    if (!reportFailure(moved, "Couldn't move it")) return;
     // The mutation ran in the repository asked about; what follows reads the
     // one in front.
     if (repo !== $repoStore.currentPath) return;
@@ -664,7 +664,7 @@
     });
     if (!confirmed || repo !== $repoStore.currentPath) return;
     const deleted = await repoStore.deletePath(row.path, target);
-    if (!reportFailure(deleted, "Could not delete it")) return;
+    if (!reportFailure(deleted, "Couldn't delete it")) return;
     if (repo !== $repoStore.currentPath) return;
     const outcome = deleted.output;
     const selected = $repoStore.selectedFilePath;
@@ -698,7 +698,7 @@
     });
     if (!confirmed) return;
     const outcome = await repoStore.discardChanges(path, target);
-    reportFailure(outcome, "Could not discard the changes");
+    reportFailure(outcome, "Couldn't discard the changes");
   }
 
   async function openInSystem(filePath: string) {

@@ -312,7 +312,7 @@ describe("filing several tasks", () => {
     expect(results.map((r) => r.state)).toEqual(["unknown", "not_attempted"]);
     const { message } = summarizeTaskIssues(results, [], false);
     expect(message).not.toContain("Not created");
-    expect(message).toContain("Could not confirm whether “Alpha” was filed");
+    expect(message).toContain("Couldn't confirm whether “Alpha” was filed");
     expect(message).toContain("Check GitHub for an issue titled “Alpha”");
   });
 

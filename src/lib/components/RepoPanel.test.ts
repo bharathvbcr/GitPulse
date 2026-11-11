@@ -67,7 +67,7 @@ describe("RepoPanel section headers on a failed read", () => {
   // list empty and `*Loaded` true, so without an error arm the header would
   // state "No remotes configured" / "has no submodules" as fact.
   const header = (name: string) => {
-    const at = source.indexOf(`{${name}Error ? "Could not read ${name}"`);
+    const at = source.indexOf(`{${name}Error ? "Couldn't read ${name}"`);
     expect(at, `${name} header has no error arm`).toBeGreaterThan(-1);
     return source.slice(source.lastIndexOf("<span", at), source.indexOf("</span>", at));
   };

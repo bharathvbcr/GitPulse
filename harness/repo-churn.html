@@ -474,7 +474,7 @@
         const collisionFixture = fixtures.cmd_collision_risk;
         fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
         await show(WorkView);
-        await until(() => app.textContent.includes("Could not check overlapping files"));
+        await until(() => app.textContent.includes("Couldn't check overlapping files"));
         check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
           () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
         fixtures.cmd_collision_risk = collisionFixture;

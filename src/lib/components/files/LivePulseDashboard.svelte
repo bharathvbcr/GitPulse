@@ -130,7 +130,7 @@
     });
     if (!confirmed) return;
     const outcome = await repoStore.discardChanges(path, target);
-    reportFailure(outcome, "Could not discard the changes");
+    reportFailure(outcome, "Couldn't discard the changes");
   }
 
   // Load commit history & language detection when selectedFile changes

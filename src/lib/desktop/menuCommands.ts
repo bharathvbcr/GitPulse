@@ -104,7 +104,7 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
     const text = await value(state);
     if (!stillCurrent(state)) return;
     if (!text) throw new Error(`${label} is unavailable.`);
-    if (!await deps.copy(text)) throw new Error("Could not copy to the clipboard.");
+    if (!await deps.copy(text)) throw new Error("Couldn't copy to the clipboard.");
     deps.success(`${label} copied`);
   });
   return {

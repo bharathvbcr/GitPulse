@@ -207,7 +207,7 @@ export function restoreSummary(result: DeleteBatchResult): string {
     const first = result.failed[0];
     parts.push(result.failed.length > 1
       ? `${result.failed.length} failed (${first.code}: ${first.message}).`
-      : `Could not restore “${first.title}” (${first.code}: ${first.message}).`);
+      : `Couldn't restore “${first.title}” (${first.code}: ${first.message}).`);
   }
   if (result.skipped > 0) parts.push(`Held ${result.skipped} more — restore again to continue (cap ${MAX_DELETE_BATCH} per pass).`);
   return parts.length ? parts.join(" ") : "Nothing was restored.";
@@ -289,7 +289,7 @@ export function deleteSummary(result: DeleteBatchResult): string {
     parts.push(
       extra > 0
         ? `${result.failed.length} failed (${first.code}: ${first.message}).`
-        : `Could not delete “${first.title}” (${first.code}: ${first.message}).`,
+        : `Couldn't delete “${first.title}” (${first.code}: ${first.message}).`,
     );
   }
   if (result.skipped > 0) {

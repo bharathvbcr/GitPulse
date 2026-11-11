@@ -82,7 +82,7 @@
     if (!installSpec?.runnable || !installSpec.command) return;
     copyNote = (await copyText(installSpec.command))
       ? "Copied — paste into a terminal."
-      : "Could not copy. Select the command and copy it yourself.";
+      : "Couldn't copy. Select the command and copy it yourself.";
   }
 
   function runInstallInTerminal() {
@@ -134,7 +134,7 @@
 
 {#snippet readFailure()}
   <div class="space-y-1.5" role="alert" data-testid="setup-read-error">
-    <p class="text-danger text-meta">Could not read the install options: {$loadError}</p>
+    <p class="text-danger text-meta">Couldn't read the install options. {$loadError}</p>
     <button type="button" class="gp-btn text-meta" onclick={() => retryWizardLoad($wizard.tool)}>Try again</button>
   </div>
 {/snippet}

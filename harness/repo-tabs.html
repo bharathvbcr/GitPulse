@@ -489,7 +489,7 @@
           itemNamed(m, "Copy path").click();
           await settle(); await wait(20);
           check("a refused clipboard is reported on the store, and the menu is gone", () =>
-            writes[0] === WT_B && get(repoStore).error === "Could not copy path to clipboard" && !repoMenu());
+            writes[0] === WT_B && get(repoStore).error === "Couldn't copy path to clipboard" && !repoMenu());
           repoStore.setError(null);
           stubClipboard(async (text) => { writes.push(text); }, () => false);
           m = await openTabMenu(WT_B);

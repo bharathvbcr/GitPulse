@@ -2384,7 +2384,7 @@ if (params.has("check")) {
       await openMenu("task-27"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
       button("Create issue", issuePrompt()).click(); await settle(300);
       check(`a creation that hit its deadline is reported as unknown, with the title to look for (${boardAlert().slice(0, 200)})`,
-        boardAlert().includes("Could not confirm whether “Ready task 18” was filed")
+        boardAlert().includes("Couldn't confirm whether “Ready task 18” was filed")
         && boardAlert().includes("Check GitHub for an issue titled “Ready task 18”") && !boardAlert().includes("Not created"));
       issueFailure = "";
 

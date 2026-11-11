@@ -238,7 +238,7 @@
 
   async function executeClean() {
     if (selectedNames.size === 0 || actionInProgress) return;
-    const target = liveTarget(scanTarget, "Could not clean the branches");
+    const target = liveTarget(scanTarget, "Couldn't clean the branches");
     if (!target) return;
     actionInProgress = true;
     actionBanner = null;
@@ -247,7 +247,7 @@
     try {
       const outcome = await repoStore.deadbranchClean(branchesToClean, forceDelete, createBackup, target);
       const res = outcome.output;
-      if (!reportFailure(outcome, "Could not clean the branches") || !res) return;
+      if (!reportFailure(outcome, "Couldn't clean the branches") || !res) return;
       if (!showsHere(target, res.message, res.backup_path)) return;
 
       actionBanner = {
@@ -273,14 +273,14 @@
 
   async function executeRestore(backupPath: string) {
     if (actionInProgress) return;
-    const target = liveTarget(backupsTarget, "Could not restore the branches");
+    const target = liveTarget(backupsTarget, "Couldn't restore the branches");
     if (!target) return;
     actionInProgress = true;
     actionBanner = null;
     try {
       const outcome = await repoStore.deadbranchRestore(backupPath, target);
       const res = outcome.output;
-      if (!reportFailure(outcome, "Could not restore the branches") || !res) return;
+      if (!reportFailure(outcome, "Couldn't restore the branches") || !res) return;
       if (!showsHere(target, res.message, null)) return;
       actionBanner = {
         text: res.message,

@@ -209,7 +209,7 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   button("Restore all").click();
   await wait(300);
   check("Restore sends nothing for a backup that belongs to the repository left behind", () => sentTo("cmd_deadbranch_restore").length === 0);
-  check("and says the repository changed", () => toasts().filter(t => t.startsWith("error") && /Could not restore/.test(t) && /repository changed/.test(t)).length === 1);
+  check("and says the repository changed", () => toasts().filter(t => t.startsWith("error") && /Couldn't restore/.test(t) && /repository changed/.test(t)).length === 1);
   releaseAll(`backups:${B}`);
   await until(() => document.body.textContent.includes("b.json"), "B's backups land");
   await repoStore.activateTab(tabId(A));

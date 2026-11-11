@@ -300,7 +300,7 @@
     try {
       await openExternal(url);
     } catch (cause) {
-      error = `Could not open ${url} in your browser: ${formatError(cause)}`;
+      error = `Couldn't open ${url} in your browser. ${formatError(cause)}`;
     }
   }
 

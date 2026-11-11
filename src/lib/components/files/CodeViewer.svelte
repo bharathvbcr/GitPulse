@@ -342,7 +342,7 @@
   async function handleCopy() {
     const textToCopy = isEditing ? editDraft : content;
     if (!(await copyText(textToCopy))) {
-      repoStore.setError("Could not copy file content to clipboard");
+      repoStore.setError("Couldn't copy file content to clipboard");
       return;
     }
     copied = true;

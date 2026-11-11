@@ -234,7 +234,7 @@ export async function cancelInstall() {
   try {
     await cancelExternalToolInstall();
   } catch (e) {
-    actionError.set(`Could not cancel the install: ${formatError(e)}`);
+    actionError.set(`Couldn't cancel the install. ${formatError(e)}`);
   }
 }
 

@@ -392,7 +392,7 @@
           <Cloud size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Remotes</h2>
           <span class="truncate text-meta {remotesError ? 'text-danger' : 'text-textMuted'}">
-            {remotesError ? "Could not read remotes" : remotesLoaded ? describeRemotes(remotes) : null}{#if !remotesError && !remotesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
+            {remotesError ? "Couldn't read remotes" : remotesLoaded ? describeRemotes(remotes) : null}{#if !remotesError && !remotesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <button
@@ -644,7 +644,7 @@
           <Package size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Submodules</h2>
           <span class="truncate text-meta {submodulesError ? 'text-danger' : 'text-textMuted'}">
-            {submodulesError ? "Could not read submodules" : submodulesLoaded ? describeSubmodules(submodules) : null}{#if !submodulesError && !submodulesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
+            {submodulesError ? "Couldn't read submodules" : submodulesLoaded ? describeSubmodules(submodules) : null}{#if !submodulesError && !submodulesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">

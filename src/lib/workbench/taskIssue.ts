@@ -389,7 +389,7 @@ export function summarizeTaskIssues(
     } else if (r.state === "refused") {
       parts.push(`Not created — “${r.title}”: ${r.reason}`);
     } else if (r.state === "unknown") {
-      parts.push(`Could not confirm whether “${r.title}” was filed (${r.reason}). Check GitHub for an issue titled “${r.issueTitle}” before filing it again.`);
+      parts.push(`Couldn't confirm whether “${r.title}” was filed (${r.reason}). Check GitHub for an issue titled “${r.issueTitle}” before filing it again.`);
     }
   }
   const pending = results.filter((r) => r.state === "not_attempted").length;
