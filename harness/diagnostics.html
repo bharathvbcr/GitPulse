@@ -336,8 +336,8 @@
       host.show("diagnostics");await settle();
       check("diagnostics window identifies memory-only errors",target.textContent.includes("memory only")&&target.textContent.includes("Harness quota failure"));
     } finally {Storage.prototype.setItem=originalSetItem;}
-    await click("Retry saving");
-    check("diagnostics retry restores saved status",target.textContent.includes("App diagnostics saved locally")&&!target.textContent.includes("Retry saving"));
+    await click("Try saving again");
+    check("diagnostics retry restores saved status",target.textContent.includes("App diagnostics saved locally")&&!target.textContent.includes("Try saving again"));
     // A severity filter that leaves the list empty while the ring is not.
     // The ring holds exactly one warning and no error, so the Errors filter matches nothing.
     diagnostics.clear();

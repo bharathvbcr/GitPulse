@@ -68,6 +68,7 @@
     cardScaleOut,
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "../ipc/invoke";
@@ -328,7 +329,7 @@
         </div>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-y-auto p-2 space-y-2">
+      <div class="min-h-0 flex-1 overflow-y-auto p-2 space-y-2 scroll-py-8" data-dialog-body use:scrollEdgeFade>
         <section
           aria-label="Backend diagnostics"
           class="rounded-xl border border-edge bg-background px-3 py-2 space-y-2"
@@ -349,7 +350,7 @@
                 type="button"
                 class="gp-btn py-0.5! px-2! ml-auto"
                 onclick={() => void beginBackendLoad()}
-              >Retry</button>
+              >Try again</button>
             {/if}
           </div>
 
@@ -357,7 +358,7 @@
             <div class="flex items-center gap-2" role="status" aria-live="polite">
               <span>{diagnosticPersistenceLabel($diagnosticHealth)}</span>
               {#if $diagnosticHealth.persistence === "memory-only"}
-                <button type="button" class="gp-btn py-0.5! px-2! ml-auto" onclick={() => diagnostics.retryPersistence()}>Retry saving</button>
+                <button type="button" class="gp-btn py-0.5! px-2! ml-auto" onclick={() => diagnostics.retryPersistence()}>Try saving again</button>
               {/if}
             </div>
             {#if $diagnosticHealth.persistenceError}
@@ -485,7 +486,7 @@
               <span>Preparing…</span>
             {:else}
               <ClipboardCopy size={13} />
-              <span>Copy Report</span>
+              <span>Copy report</span>
             {/if}
           </button>
           <div class="flex gap-2">

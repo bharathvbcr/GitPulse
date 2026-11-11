@@ -51,7 +51,7 @@ describe("CommandPalette", () => {
 
   it("points help at Map docs / link candidates", () => {
     expect(source).toContain("help_map_docs");
-    expect(source).toContain("cross-repo link candidates");
+    expect(source).toContain("cross-repository link candidates");
   });
 
   it("keeps the hint footer unpainted so glass cannot composite a black bar", () => {

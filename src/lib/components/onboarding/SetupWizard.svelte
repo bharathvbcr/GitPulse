@@ -34,6 +34,8 @@
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { copyText } from "../../desktop/clipboard";
   import { t } from "../../i18n/translate";
+  import { fade, scale } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../../ui/transitions";
   import { trapFocus } from "../../ui/focusTrap";
   import { isImeComposition } from "../../keyboard/imeGuard";
 
@@ -133,7 +135,7 @@
 {#snippet readFailure()}
   <div class="space-y-1.5" role="alert" data-testid="setup-read-error">
     <p class="text-danger text-meta">Could not read the install options: {$loadError}</p>
-    <button type="button" class="gp-btn text-meta" onclick={() => retryWizardLoad($wizard.tool)}>Retry</button>
+    <button type="button" class="gp-btn text-meta" onclick={() => retryWizardLoad($wizard.tool)}>Try again</button>
   </div>
 {/snippet}
 
@@ -142,6 +144,8 @@
     class="gp-scrim fixed inset-0 flex items-center justify-center bg-black/40 p-4"
     style="z-index: {LAYERS.PROMPT}"
     role="presentation"
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
   >
     <div
       class="gp-card w-full max-w-lg rounded-2xl border border-border bg-surface shadow-float"
@@ -151,6 +155,8 @@
       tabindex="-1"
       onkeydown={onDialogKeydown}
       use:trapFocus
+      in:scale={cardScale()}
+      out:scale={cardScaleOut()}
     >
       <div class="flex items-center justify-between px-4 py-3">
         <div>

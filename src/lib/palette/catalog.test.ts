@@ -96,6 +96,18 @@ describe("command catalog and context", () => {
     await sections[0]?.action();
     expect(navigate).toHaveBeenLastCalledWith("insights", "health");
   });
+  it("finds the dependency scan under both of the words it replaced", () => {
+    // "Scan npm vulnerabilities and updates" and "Scan working tree for
+    // secrets" became this one command. The scans start when Health mounts
+    // (harness/healthChecks.js: "opening Health starts the secrets scan
+    // together with the dependency scan"), so the command is only honest while
+    // both old queries still rank it first among the Insights sections.
+    const commands = buildCommands(ready(), () => {});
+    for (const query of ["npm", "vulnerabilities", "outdated", "dependencies", "secrets", "working tree"]) {
+      const first = rankItems(commands, query).find(c => c.id.startsWith("insights:"));
+      expect(first?.id, `"${query}" should reach Health`).toBe("insights:health");
+    }
+  });
   it("reveals the repository surface when opening any view or view section from the palette", async () => {
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
     const commands = buildCommands(ready(), () => {});

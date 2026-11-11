@@ -3,6 +3,7 @@
   import { Trash2, X } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
@@ -50,7 +51,7 @@
 <div use:portal class="task-action-backdrop gp-scrim bg-black/50" role="presentation" style="z-index:{LAYERS.PROMPT}" in:fade={backdropFade()} out:fade={backdropFadeOut()}>
   <div class="task-action-dialog gp-card gp-glass shadow-float" in:scale={cardScale()} out:scale={cardScaleOut()} role="dialog" aria-modal="true" aria-label={deleting ? "Delete tasks" : "Update tasks"} tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}}>
     <header><h2>{deleting ? `Delete ${rows.length === 1 ? "task" : `${rows.length} tasks`}?` : "Update tasks"}</h2><button type="button" class="gp-icon-btn" data-size="md" aria-label="Close task action" disabled={busy || uncertain} onclick={close}><X size={16} /></button></header>
-    <div class="body">
+    <div class="body" data-dialog-body use:scrollEdgeFade>
       {#if !started}<p>{deleting ? deferring ? `Delete these tasks from every linked repository and workspace? Nothing is deleted for ${DEFERRED_DELETE_MS / 1000} seconds, and Undo on the board keeps them. After that, deletion cannot be undone here. History is retained. Running agents continue.` : "Delete these tasks from every linked repository and workspace? History is retained, but deletion cannot be undone here. Running agents continue." : "Apply this change to the selected tasks? Existing descriptions, links and other fields are preserved."}</p>{/if}
       <ul>{#each rows as row (row.id)}<li><span>{row.title}</span>{#if started}<small>{row.state === "done" ? deleting ? "Deleted" : "Updated" : row.state === "uncertain" ? "Needs confirmation" : row.state === "failed" ? "Not changed" : row.state === "running" ? "Working…" : "Waiting"}</small>{/if}{#if row.error}<p class="error">{row.error}</p>{/if}</li>{/each}</ul>
       {#if started}<p role="status">{done} of {rows.length} {deleting ? "deleted" : "updated"}{failures ? ` · ${failures} not changed` : ""}{stopped ? " · Paused" : ""}.</p>{/if}
@@ -69,7 +70,7 @@
   .task-action-dialog{width:min(480px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
   header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}
   h2{font-size:0.9375rem;font-weight:600;margin:0}
-  .body{padding:0 20px;overflow:auto;font-size:12px}
+  .body{padding:0 20px;overflow:auto;scroll-padding-block:2rem;font-size:0.75rem}
   p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}
   ul{list-style:none;padding:0;margin:0;max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:4px}
   li{padding:8px 0;display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between}

@@ -189,8 +189,12 @@ describe("SettingsModal layout options", () => {
     const layout = panel(body, "layout");
     expect(layout).toContain('aria-label="Status bar detail"');
     expect(layout).toContain('aria-label="Diagnostics button visibility"');
-    // Retired with the title bar's Open menu, the only control it labelled.
-    expect(layout).not.toContain('aria-label="Show labels on header action buttons"');
+    // Header button labels: Automatic follows the header's width, Icons only
+    // overrides it. Restored after the header rebuild dropped the choice.
+    expect(layout).toContain('data-setting="header-labels"');
+    expect(layout).toContain('aria-label="Header button labels"');
+    expect(layout).toContain(">Automatic");
+    expect(layout).toContain(">Icons only");
     expect(layout).toContain(
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
@@ -209,7 +213,7 @@ describe("SettingsModal layout options", () => {
 
   it("offers every status-bar and diagnostics choice, with the defaults selected", () => {
     const layout = panel(body, "layout");
-    for (const label of ["Full", "Compact", "Hidden", "Always", "When recorded"]) {
+    for (const label of ["Full", "Compact", "Hidden", "Always", "When recorded", "Automatic", "Icons only"]) {
       expect(layout, `missing option ${label}`).toContain(`>${label}`);
     }
     // *Which* options are pressed, not how many. A bare count agreed just as
@@ -221,7 +225,7 @@ describe("SettingsModal layout options", () => {
     const pressed = [...layout.matchAll(/aria-pressed="true"[^>]*>\s*([^<]*?)\s*</g)].map(
       (match) => match[1],
     );
-    expect(pressed.sort()).toEqual(["Always", "Full", "Only code files"]);
+    expect(pressed.sort()).toEqual(["Always", "Automatic", "Full", "Only code files"]);
   });
 });
 

@@ -35,7 +35,7 @@ describe("DiagnosticsModal", () => {
     expect(source).not.toContain(
       'onclick={copyReport} disabled={$diagnostics.length === 0}',
     );
-    const copyLabel = body.indexOf("<span>Copy Report</span>");
+    const copyLabel = body.indexOf("<span>Copy report</span>");
     const copyButton = body.lastIndexOf("<button", copyLabel);
     expect(copyLabel).toBeGreaterThan(copyButton);
     expect(body.slice(copyButton, copyLabel)).not.toContain("disabled");

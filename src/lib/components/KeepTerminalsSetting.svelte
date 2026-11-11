@@ -21,6 +21,7 @@
   import type { AgentDefaults } from "../terminal/agentDefaults";
   import { readTerminalBackend, type TerminalBackendStatus } from "../terminal/quitChoice";
   import { formatError } from "../ui/formatError";
+  import SettingToggle from "./SettingToggle.svelte";
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -60,8 +61,7 @@
   });
 
   /** Off is stored as absence, like every other default. */
-  async function choose(input: HTMLInputElement) {
-    const next = input.checked;
+  async function choose(next: boolean) {
     if (next === chosen) return;
     const rest: AgentDefaults = { ...view.defaults };
     delete rest.keep_terminals_running;
@@ -74,7 +74,6 @@
       readBackend();
     } catch (err) {
       error = formatError(err);
-      input.checked = chosen;
     } finally {
       busy = false;
     }
@@ -85,19 +84,12 @@
 </script>
 
 <div>
-  <div class="flex items-center gap-2">
-    <label class="text-textPrimary text-meta flex-1 min-w-0" for="gp-keep-terminals">
-      Keep terminals running when GitPulse quits
-    </label>
-    <input
-      id="gp-keep-terminals"
-      type="checkbox"
-      data-testid="keep-terminals"
-      disabled={busy}
-      checked={chosen}
-      onchange={(event) => void choose(event.currentTarget)}
-    />
-  </div>
+  <SettingToggle
+    label="Keep terminals running when GitPulse quits"
+    disabled={busy}
+    checked={chosen}
+    onchange={(next) => void choose(next)}
+  />
   <p class="text-textMuted text-micro leading-snug mt-1" data-testid="keep-terminals-note">
     Terminals and the agents in them run in a process of their own, so quitting GitPulse — or GitPulse crashing — does not end
     them. The next launch lists them, shows what they printed meanwhile, and records any that finished. Quitting asks whether to

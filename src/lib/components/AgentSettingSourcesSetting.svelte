@@ -24,6 +24,7 @@
     type ClaudeSettingSource,
   } from "../terminal/agentDefaults";
   import { formatError } from "../ui/formatError";
+  import Checkbox from "./Checkbox.svelte";
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -54,12 +55,12 @@
     }
   });
 
-  async function toggle(source: ClaudeSettingSource, input: HTMLInputElement) {
-    const next = input.checked ? [...chosen, source] : chosen.filter((s) => s !== source);
+  /** The boxes are controlled, so a refused or failed change leaves each one as it was. */
+  async function toggle(source: ClaudeSettingSource, picked: boolean) {
+    const next = picked ? [...chosen, source] : chosen.filter((s) => s !== source);
     const canonical = canonicalSettingSources(next);
     if (canonical === null) {
       error = "Claude Code needs at least one settings source.";
-      input.checked = true;
       return;
     }
     error = "";
@@ -70,7 +71,6 @@
       await saveAgentDefaults(canonical === undefined ? rest : { ...rest, claude_setting_sources: canonical });
     } catch (err) {
       error = formatError(err);
-      input.checked = chosen.includes(source);
     } finally {
       busy = false;
     }
@@ -81,20 +81,14 @@
   <legend class="text-textPrimary text-meta">Claude Code settings files</legend>
   <div class="mt-1.5 flex flex-col gap-1" data-testid="agent-setting-sources">
     {#each CLAUDE_SETTING_SOURCES as source (source)}
-      <label class="flex items-start gap-2 text-meta text-textPrimary">
-        <input
-          type="checkbox"
-          class="mt-0.5"
-          data-testid={`agent-setting-source-${source}`}
-          disabled={busy}
-          checked={chosen.includes(source)}
-          onchange={(event) => void toggle(source, event.currentTarget)}
-        />
-        <span class="min-w-0">
-          <span class="font-mono">{source}</span>
-          <span class="text-textMuted"> — {DESCRIPTIONS[source]}</span>
-        </span>
-      </label>
+      <Checkbox
+        label={source}
+        description={DESCRIPTIONS[source]}
+        testId={`agent-setting-source-${source}`}
+        disabled={busy}
+        checked={chosen.includes(source)}
+        onchange={(picked) => void toggle(source, picked)}
+      />
     {/each}
   </div>
   <p class="text-textMuted text-micro leading-snug mt-1" data-testid="agent-setting-sources-note">

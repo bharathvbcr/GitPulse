@@ -15,6 +15,17 @@ import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { PALETTE_MODES, type PaletteItem, type PaletteMode } from "./model";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
+
+/**
+ * Words a section's command answered to before it was merged into another's.
+ * "Scan dependencies and secrets" replaced "Scan npm vulnerabilities and
+ * updates" and "Scan working tree for secrets", and the palette matches on
+ * label, description and these keywords, so without them typing "npm" or
+ * "vulnerabilities" stopped finding the pane that runs those scans.
+ */
+const MERGED_COMMAND_WORDS: Readonly<Record<string, string>> = {
+  "insights:health": "npm vulnerabilities updates outdated audit advisories packages scan working tree secrets",
+};
 const dispatch = (event: string) => { window.dispatchEvent(new CustomEvent(event)); };
 
 export function repoUnavailable(state: RepoState): string | undefined {
@@ -60,7 +71,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     } },
     ...(view.sections ?? []).map(section => ({
       id: `${view.id}:${section.id}`, label: section.paletteCommand ?? `Open ${view.label} ${section.label}`,
-      description: `${view.label} → ${section.label} · ${section.summary}`, keywords: `${view.label} ${section.label}`, category: "Views", icon: icons[view.id], disabledReason: unavailable,
+      description: `${view.label} → ${section.label} · ${section.summary}`, keywords: `${view.label} ${section.label} ${MERGED_COMMAND_WORDS[`${view.id}:${section.id}`] ?? ""}`.trim(), category: "Views", icon: icons[view.id], disabledReason: unavailable,
       action: () => {
         interfaceStore.setGlobalSurface("repository");
         repoStore.setActiveTab(view.id, section.id);
@@ -188,7 +199,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "diagnostics", label: "Open Diagnostics", category: "Help", icon: Bug, closeBefore: true, action: () => dispatch("gitpulse:diagnostics") },
     { id: "settings", label: "Open Settings", category: "Settings", icon: Settings, shortcut: "⌘,", closeBefore: true, action: () => dispatch("gitpulse:settings") },
     { id: "mcp_setup", label: "Connect an agent (MCP 2.0 / Agent Plugins)", category: "Settings", icon: Plug, closeBefore: true, action: () => dispatch("gitpulse:settings") },
-    { id: "optional_tools_setup", label: "Set up optional tools (devmap / manvi)", category: "Settings", icon: Wrench, closeBefore: true, action: () => openSetupWizard("devmap", "explain") },
+    { id: "optional_tools_setup", label: "Set up optional tools (DevMap and Manvi)", category: "Settings", icon: Wrench, closeBefore: true, action: () => openSetupWizard("devmap", "explain") },
   ];
 }
 
@@ -196,6 +207,6 @@ export function helpCommands(changeMode: (mode: PaletteMode) => void): PaletteIt
   return [
     ...PALETTE_MODES.filter(entry => entry.mode !== "help").map(entry => ({ id: `help_${entry.mode}`, label: `Type ${entry.prefix} to search ${entry.label.toLowerCase()}`, description: entry.hint, category: "Search modes", icon: Search, keepOpen: true, action: () => changeMode(entry.mode) })),
     { id: "help_shortcuts", label: "View All Keyboard Shortcuts", category: "Help", icon: Keyboard, closeBefore: true, action: () => dispatch("gitpulse:shortcuts") },
-    { id: "help_map_docs", label: "Open Map for docs search, doc graph, and cross-repo link candidates", category: "Help", icon: FileCode, disabledReason: repoUnavailable(get(repoStore)), action: () => repoStore.setActiveTab("code", "map") },
+    { id: "help_map_docs", label: "Open Map for docs search, doc graph, and cross-repository link candidates", category: "Help", icon: FileCode, disabledReason: repoUnavailable(get(repoStore)), action: () => repoStore.setActiveTab("code", "map") },
   ];
 }

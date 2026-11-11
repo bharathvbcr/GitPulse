@@ -22,6 +22,11 @@ import {
   type DiagnosticsButtonMode,
 } from "../ui/diagnosticsButton";
 import {
+  installHeaderLabels,
+  readHeaderLabelMode,
+  type HeaderLabelMode,
+} from "../ui/headerLabels";
+import {
   clampTerminalDockHeight,
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
@@ -178,6 +183,12 @@ export interface InterfacePrefs extends AppearancePrefs {
   statusIconCounts: boolean;
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
+  /**
+   * Whether header buttons carry words. "auto" lets the header's width decide;
+   * "icons" holds the icon-only rendering at every width. Stored before the
+   * header rebuild as the boolean `showHeaderActionLabels`, which is still read.
+   */
+  headerLabels: HeaderLabelMode;
   /**
    * One exclusive application surface, independent of repository tab lifetime.
    *
@@ -449,6 +460,7 @@ const DEFAULTS: InterfacePrefs = {
   hideDockWhenClosed: true,
   statusIconCounts: false,
   diagnosticsButton: "always",
+  headerLabels: "auto",
   globalSurface: "repository",
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
@@ -618,6 +630,7 @@ function readPrefs(): InterfacePrefs {
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
+      headerLabels: readHeaderLabelMode(parsed, DEFAULTS.headerLabels),
       globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "agents" || parsed.globalSurface === "repository"
         ? parsed.globalSurface
         : parsed.fleetOpen === true ? "fleet" : "repository",
@@ -815,6 +828,7 @@ function createInterfaceStore() {
       patch((prefs) => ({ collapseInactiveIncludeShells: !prefs.collapseInactiveIncludeShells })),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
+    setHeaderLabels: (mode: HeaderLabelMode) => patch({ headerLabels: mode }),
     /** Adds or removes one view from the header's hidden list. */
     setViewHidden: (view: ViewTab, hidden: boolean) =>
       patch((prefs) => ({
@@ -973,3 +987,4 @@ export const interfaceStore = createInterfaceStore();
 // harness imported the store first; there is one subscription and it lives as
 // long as the page. It is a no-op without a document.
 installAppearance({ prefs: interfaceStore, theme: themeStore, platform: hostPlatform });
+installHeaderLabels(interfaceStore);

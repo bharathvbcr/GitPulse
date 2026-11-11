@@ -114,7 +114,7 @@
       check("remounted target is discovered", () => spot());
       await next();
       check("task step", () => text().includes("Turn an idea into a task"));
-      await click("Open Tasks");
+      await click("Open tasks");
       check("Tasks opens without dismissing tour", () => get(workspace).tasks && body());
       check("Tasks success uses host state", () => text().includes("Tasks is open."));
       await click("Set up optional tools");
@@ -132,7 +132,7 @@
       resetHostPlatformForTests({ os: "macos", dock_hiding: true }); await settle();
       check("mac permission recovery", () => text().includes("Files and Folders"));
       check("trust distinct from OS access", () => text().includes("does not override denied folder access"));
-      await click("Open Settings");
+      await click("Open settings");
       check("Settings callback retains active tour", () => settings === 1 && body() && get(tour).step === 4);
       check("Settings gets focus above tour", () => document.querySelector('[aria-label="Settings fixture"]').contains(document.activeElement));
       await click("Close Settings");

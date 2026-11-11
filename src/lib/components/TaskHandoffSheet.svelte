@@ -156,7 +156,7 @@
   .sheet{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
   header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:16px 20px 12px;flex-shrink:0}
   h2{display:flex;align-items:center;gap:6px;font-size:0.8125rem;font-weight:600;margin:0}
-  .title{margin:6px 0 2px;font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .title{margin:6px 0 2px;font-size:0.75rem;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .meta{margin:0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));line-height:1.5}
   .body{padding:14px 20px;overflow:auto}
   footer{display:flex;align-items:center;gap:10px;padding:12px 20px 16px;flex-shrink:0}

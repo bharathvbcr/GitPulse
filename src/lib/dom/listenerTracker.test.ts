@@ -76,7 +76,7 @@ const PRODUCTION_OWNERS = [
   "../../App.svelte",
   "../desktop/nativeShell.ts",
   "../desktop/statusConnection.ts",
-  "../components/NativeNotificationBridge.svelte",
+  "../components/NativeNotificationBridgeView.svelte",
   "../components/AttentionInbox.svelte",
   "../components/TaskBoard.svelte",
 ] as const;

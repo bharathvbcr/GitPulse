@@ -124,30 +124,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/AgentDefaultsSettings.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/AgentLimitSetting.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/AgentModelSettings.svelte",
-      "rules": [
-        17
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/AttentionInbox.svelte",
       "rules": [
         1
@@ -164,23 +140,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/CommandPalette.svelte",
-      "rules": [
-        1,
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/DiagnosticsModal.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/DiffViewer.svelte",
       "rules": [
         17
@@ -189,45 +148,12 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 17 undefined gp-* class. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/HostLoadSetting.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/LappiSettings.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/LazyView.svelte",
       "rules": [
         14
       ],
       "owner": "Wave 5 fixing lane that owns this file",
       "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/NativeNotificationBridge.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/NativeNotificationSettings.svelte",
-      "rules": [
-        1,
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale; rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
       "file": "src/lib/components/RepoMapPanel.svelte",
@@ -262,38 +188,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/SessionAlertSettings.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/SessionNotificationBridge.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/SettingsModal.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskActionDialog.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/components/TaskArchive.svelte",
       "rules": [
         1,
@@ -312,30 +206,6 @@
     },
     {
       "file": "src/lib/components/TaskEditor.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskHandoffForm.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskHandoffSheet.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/TaskMergeDialog.svelte",
       "rules": [
         1
       ],
@@ -407,22 +277,6 @@
       "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     },
     {
-      "file": "src/lib/components/onboarding/ProductTour.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/components/onboarding/SetupWizard.svelte",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
       "file": "src/lib/coverage/fileCoverage.ts",
       "rules": [
         1
@@ -488,14 +342,6 @@
     },
     {
       "file": "src/lib/health/summary.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/palette/catalog.ts",
       "rules": [
         14
       ],
@@ -608,22 +454,6 @@
     },
     {
       "file": "src/lib/ui/manviFocus.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/ui/settingsCatalog.ts",
-      "rules": [
-        14
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 14 banned terms and retired verbs. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/ui/settingsSections.ts",
       "rules": [
         14
       ],
