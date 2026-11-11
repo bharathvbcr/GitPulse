@@ -16,3 +16,6 @@
 .gp-keyword {
   font-size: x-large;
 }
+.gp-shorthand {
+  font: 500 0.75rem/1.2 var(--font-sans);
+}

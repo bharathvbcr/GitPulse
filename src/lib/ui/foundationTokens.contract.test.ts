@@ -145,6 +145,10 @@ describe("shape, space, density and edge tokens", () => {
     expect(themeBlock.get("--text-lg--line-height")).toBe("1.25");
     expect(themeBlock.get("--text-xs")).toBe("0.75rem");
     expect(themeBlock.get("--text-xs--line-height")).toBe("calc(1 / 0.75)");
+    // design-lint rule 1 allows a literal fallback in `var(--text-*, <literal>)` because every
+    // step, display included, is defined here and so the fallback is never reached.
+    expect(themeBlock.get("--text-display")).toBe("1.5rem");
+    expect(themeBlock.get("--text-display--line-height")).toBe("1.1");
   });
 });
 

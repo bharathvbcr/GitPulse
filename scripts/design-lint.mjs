@@ -54,8 +54,10 @@
  * RULES (matcher, then what it deliberately does not see)
  *   1  type scale: token `text-[Npx]` (also in a `@apply` and in a `.ts` string) and a literal
  *      `font-size` (px, rem, em, %, pt or a size keyword) in `<style>`, `style=` or a
- *      stylesheet. Not `text-[var(--x)]`, `text-[length:...]`, `var(--text-*)`, `inherit`,
- *      `calc()`, a token definition (`--text-sm: 0.8125rem`) or the `font` shorthand.
+ *      stylesheet, and the literal size inside a `font:` shorthand (`font: 0.6875rem/1.8 x`).
+ *      Not `text-[var(--x)]`, `text-[length:...]`, `var(--text-*)` (a literal fallback inside it,
+ *      `var(--text-xs, 0.75rem)`, is allowed: see `fontShorthandSize`), `inherit`, `calc()`, a
+ *      line-height, or a token definition (`--text-sm: 0.8125rem`).
  *   2  weight and case: tokens `font-thin|extralight|light|bold|extrabold|black`;
  *      `font-weight:` other than 400/500/600/normal/inherit/var(); a class
  *      source holding `uppercase` and `tracking-*` together; a CSS rule with
@@ -1319,6 +1321,47 @@ function applyAnimates(applied) {
  */
 const FONT_SIZE_LITERAL = /^(?:\d*\.?\d+(?:px|rem|em|%|pt|pc|ex|ch|vw|vh|vmin|vmax|cm|mm|in)|xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|smaller|larger)(?:\s*!important)?$/i;
 
+/**
+ * The size inside a `font:` shorthand when it is a literal: `font: 600 0.6875rem/1.8 var(--font-ui)`
+ * answers `0.6875rem`. A shorthand's size follows an optional style, variant, weight and stretch and
+ * precedes an optional `/line-height` and the family, so the scan walks the top-level words (a
+ * `var()` or `calc()` is one word), peels any `/line-height` off the end of a word and answers the
+ * first word that is a literal size. It stops without an answer at the first word that names a
+ * `--text-*` token, which is the size, and at a system-font keyword, which has none.
+ *
+ * A literal fallback inside the token, `var(--text-xs, 0.75rem)`, is allowed here and in `font-size`
+ * alike. It is one word that starts with `var(`, so it never matches a literal, and the fallback is
+ * unreachable: the token contract test (`src/lib/ui/foundationTokens.contract.test.ts`) keeps every
+ * `--text-*` step defined in `app.css`, so the browser never falls back. Flagging it would only push authors to drop
+ * the fallback that keeps an isolated page (a harness without `app.css`) legible.
+ *
+ * @param {string} value
+ * @returns {string | null}
+ */
+export function fontShorthandSize(value) {
+  /** @type {{ text: string, lineHeight: boolean }[]} */
+  const words = [];
+  let word = "", depth = 0, quote = "", slash = false;
+  const flush = () => { if (word) words.push({ text: word, lineHeight: slash }); word = ""; };
+  for (const ch of value.trim().replace(/\s*!important$/i, "")) {
+    if (quote) { word += ch; if (ch === quote) quote = ""; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; word += ch; continue; }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    if (depth === 0 && ch === "/") { flush(); slash = true; continue; }
+    if (depth === 0 && /\s/.test(ch)) { if (word) { flush(); slash = false; } continue; }
+    word += ch;
+  }
+  flush();
+  for (const { text, lineHeight } of words) {
+    if (lineHeight) continue;
+    if (/^(?:caption|icon|menu|message-box|small-caption|status-bar|inherit|initial|unset|revert|revert-layer)$/i.test(text)) return null;
+    if (/^var\(\s*--text-/.test(text)) return null;
+    if (FONT_SIZE_LITERAL.test(text)) return text;
+  }
+  return null;
+}
+
 /** @type {Rule[]} */
 export const RULES = [
   {
@@ -1335,6 +1378,10 @@ export const RULES = [
       });
       for (const d of m.decls) {
         if (d.prop === "font-size" && FONT_SIZE_LITERAL.test(d.value.trim())) report(d.start, `font-size: ${d.value}: use var(--text-micro|meta|xs|sm|base|lg|display), or inherit`);
+        if (d.prop === "font") {
+          const size = fontShorthandSize(d.value);
+          if (size) report(d.start, `font: ${d.value}: the size ${size} is not the type scale; use var(--text-micro|meta|xs|sm|base|lg|display)`);
+        }
       }
     },
   },

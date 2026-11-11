@@ -212,7 +212,7 @@
   .note{display:flex;flex-direction:column;gap:4px;color:rgb(var(--c-text-muted))}
   textarea{min-width:0;width:100%;font:inherit}
   .caption{margin:0;color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
-  .text{margin:0;padding:8px;border-radius:var(--gp-r-sm);background:var(--mac-fill-bg,rgb(var(--c-bg)));color:rgb(var(--c-text));font:0.6875rem ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
+  .text{margin:0;padding:8px;border-radius:var(--gp-r-sm);background:var(--mac-fill-bg,rgb(var(--c-bg)));color:rgb(var(--c-text));font:var(--text-meta) ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
   .route{display:flex;flex-direction:column;gap:2px;line-height:1.45;color:rgb(var(--c-text))}
   .route strong{font-weight:600}
   .route span{overflow-wrap:anywhere}

@@ -11,6 +11,7 @@ import {
   classifyViolations,
   compareToBaseline,
   countViolations,
+  fontShorthandSize,
   lintFiles,
   lintRepo,
   lintSource,
@@ -131,12 +132,34 @@ describe("design-lint widened scopes: <style> blocks, stylesheets and .ts string
   const messages = (rule: number, name: string, as?: string) => hits(rule, name, as).map((v) => v.message.split(": ")[0]);
 
   it("rule 1 reads a literal font-size (px, rem, em, %, keyword) and @apply text-[Npx] in a <style> block, and not a token, inherit, calc() or a comment", () => {
-    expect(messages(1, "rule-01-style.positive.svelte")).toEqual(["font-size", "font-size", "font-size", "font-size", "font-size", "font-size", "text-[10px]"]);
+    expect(messages(1, "rule-01-style.positive.svelte")).toEqual(["font-size", "font-size", "font-size", "font-size", "font-size", "font-size", "font", "font", "text-[10px]"]);
     expect(hits(1, "rule-01-style.negative.svelte")).toEqual([]);
   });
 
+  it("rule 1 reads the size inside a font: shorthand, whatever precedes it and with or without spaces around the slash", () => {
+    expect(fontShorthandSize("0.6875rem/1.8 var(--font-ui)")).toBe("0.6875rem");
+    expect(fontShorthandSize("600 0.6875rem / 1.8 var(--font-ui)")).toBe("0.6875rem");
+    expect(fontShorthandSize('italic small-caps 700 12px "Large Font", serif')).toBe("12px");
+    expect(fontShorthandSize("0.75rem ui-monospace,SFMono-Regular,Menlo,monospace")).toBe("0.75rem");
+    expect(fontShorthandSize("90% system-ui !important")).toBe("90%");
+    expect(fontShorthandSize("large serif")).toBe("large");
+  });
+
+  it("rule 1 lets a font: shorthand name a token, a literal fallback inside it, a literal line-height, a system font or a keyword", () => {
+    // The fallback is unreachable (the token contract test keeps every --text-* step defined) and
+    // keeps an isolated page legible, so a literal inside var(--text-*, …) is allowed.
+    expect(fontShorthandSize("600 var(--text-meta)/1.8 var(--font-ui)")).toBeNull();
+    expect(fontShorthandSize("var(--text-xs, 0.75rem)/1.5 system-ui")).toBeNull();
+    expect(fontShorthandSize("500 var(--text-sm, 0.8125rem) / 1.4 var(--font-ui)")).toBeNull();
+    expect(fontShorthandSize("var(--text-xs)/1.8rem system-ui")).toBeNull();
+    expect(fontShorthandSize("500 var(--fs)/1.8rem system-ui")).toBeNull();
+    expect(fontShorthandSize("menu")).toBeNull();
+    expect(fontShorthandSize("inherit")).toBeNull();
+    expect(fontShorthandSize("normal 400 calc(var(--text-xs) * 1.1) serif")).toBeNull();
+  });
+
   it("rule 1 reads a stylesheet, and exempts the token definitions in @theme and :root", () => {
-    expect(messages(1, "rule-01.positive.css")).toEqual(["font-size", "text-[10px]", "font-size", "font-size", "font-size", "font-size"]);
+    expect(messages(1, "rule-01.positive.css")).toEqual(["font-size", "text-[10px]", "font-size", "font-size", "font-size", "font-size", "font"]);
     expect(hits(1, "rule-01.negative.css")).toEqual([]);
   });
 

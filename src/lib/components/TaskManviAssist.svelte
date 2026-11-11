@@ -944,6 +944,6 @@
   .advanced-hidden{display:none}
   h3{font-size:var(--text-sm);font-weight:600;margin:14px 0 4px}
   h4{font-size:var(--text-xs);font-weight:600;margin:10px 0 6px}
-  pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;font:0.75rem/1.5 inherit;margin:4px 0 8px}
+  pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;font:var(--text-xs)/1.5 inherit;margin:4px 0 8px}
   .suggestion{border-left:3px solid rgb(var(--c-accent))}
 </style>
