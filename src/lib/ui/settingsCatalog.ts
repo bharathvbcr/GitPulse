@@ -10,7 +10,13 @@ import {
  * definition, and so the check is made once here instead of as a platform
  * conditional scattered through the modal's markup.
  */
-export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos" | "nativeMaterial";
+export type SettingRequirement =
+  | "dockHiding"
+  | "appleIntelligence"
+  | "macos"
+  | "nativeMaterial"
+  | "liquidGlass"
+  | "highRefresh";
 
 export interface SettingEntry {
   readonly id: string;
@@ -147,6 +153,20 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     label: "Transparency",
     keywords: "reduce transparency opaque translucent glass accessibility solid auto system",
     requires: "nativeMaterial",
+  },
+  {
+    id: "native-glass",
+    section: "appearance",
+    label: "Liquid Glass window",
+    keywords: "liquid glass native window material macos 26 tahoe nsglasseffectview translucent vibrancy private api",
+    requires: "liquidGlass",
+  },
+  {
+    id: "high-refresh",
+    section: "appearance",
+    label: "120 Hz rendering",
+    keywords: "120 hz 120hz refresh rate promotion frame rate fps 60 smooth animation display webkit private api",
+    requires: "highRefresh",
   },
   {
     id: "density",

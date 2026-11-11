@@ -115,6 +115,8 @@ describe("host OS identity", () => {
       expect(fallback.dock_hiding).toBe(false);
       expect(fallback.browser_sessions).toBe(false);
       expect(fallback.native_material).toBe(false);
+      expect(fallback.liquid_glass).toBe(false);
+      expect(fallback.high_refresh).toBe(false);
     });
   });
 
@@ -136,22 +138,50 @@ describe("host OS identity", () => {
 describe("host platform envelope", () => {
   it("reads the backend's snake_case capability fields", () => {
     expect(
-      parseHostPlatform({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false }),
+      parseHostPlatform({
+        os: "windows",
+        dock_hiding: false,
+        browser_sessions: false,
+        native_material: false,
+        liquid_glass: false,
+        high_refresh: false,
+      }),
     ).toEqual({
       os: "windows",
       dock_hiding: false,
       browser_sessions: false,
       native_material: false,
+      liquid_glass: false,
+      high_refresh: false,
     });
     expect(
-      parseHostPlatform({ os: "macos", dock_hiding: true, browser_sessions: true, native_material: true }),
+      parseHostPlatform({
+        os: "macos",
+        dock_hiding: true,
+        browser_sessions: true,
+        native_material: true,
+        liquid_glass: true,
+        high_refresh: true,
+      }),
     ).toEqual({
       os: "macos",
       dock_hiding: true,
       browser_sessions: true,
       native_material: true,
+      liquid_glass: true,
+      high_refresh: true,
     });
   });
+
+  it.each(["liquid_glass", "high_refresh"] as const)(
+    "reads %s as false unless the backend sent exactly true",
+    (field) => {
+      expect(parseHostPlatform({ os: "macos" })[field]).toBe(false);
+      expect(parseHostPlatform({ os: "macos", [field]: "yes" })[field]).toBe(false);
+      expect(parseHostPlatform({ os: "macos", [field]: 1 })[field]).toBe(false);
+      expect(parseHostPlatform({ os: "macos", [field]: true })[field]).toBe(true);
+    },
+  );
 
   /**
    * A check that could not run must never read like one that ran and passed.

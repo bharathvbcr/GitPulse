@@ -185,6 +185,10 @@
       // By capability: the glass tokens mean something only over a native
       // translucent window, which the backend reports; the OS name does not.
       nativeMaterial: $hostPlatform.native_material,
+      // The build has the code; whether this Mac's OS and WebKit allow it is
+      // answered when it is switched on, and shown on the row.
+      liquidGlass: $hostPlatform.liquid_glass,
+      highRefresh: $hostPlatform.high_refresh,
     }),
   );
   const filter = $derived(matchSettings(query, unsupported));

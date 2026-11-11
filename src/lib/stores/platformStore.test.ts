@@ -91,10 +91,24 @@ describe("host platform store inside Tauri", () => {
 
   it("reports a macOS host's dock capability", async () => {
     vi.doMock("@tauri-apps/api/core", () => ({
-      invoke: vi.fn().mockResolvedValue({ os: "macos", dock_hiding: true, browser_sessions: true, native_material: true }),
+      invoke: vi.fn().mockResolvedValue({
+        os: "macos",
+        dock_hiding: true,
+        browser_sessions: true,
+        native_material: true,
+        liquid_glass: true,
+        high_refresh: true,
+      }),
     }));
     const { loadHostPlatform } = await freshStore();
-    expect(await loadHostPlatform()).toEqual({ os: "macos", dock_hiding: true, browser_sessions: true, native_material: true });
+    expect(await loadHostPlatform()).toEqual({
+      os: "macos",
+      dock_hiding: true,
+      browser_sessions: true,
+      native_material: true,
+      liquid_glass: true,
+      high_refresh: true,
+    });
   });
 
   /**
@@ -150,7 +164,15 @@ describe("host platform store inside Tauri", () => {
     await loadHostPlatform();
     expect(hostPlatformNow().dock_hiding).toBe(true);
 
-    resetHostPlatformForTests({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false });
-    expect(hostPlatformNow()).toEqual({ os: "windows", dock_hiding: false, browser_sessions: false, native_material: false });
+    const windows = {
+      os: "windows",
+      dock_hiding: false,
+      browser_sessions: false,
+      native_material: false,
+      liquid_glass: false,
+      high_refresh: false,
+    } as const;
+    resetHostPlatformForTests(windows);
+    expect(hostPlatformNow()).toEqual(windows);
   });
 });
