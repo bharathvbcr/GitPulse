@@ -18,7 +18,8 @@
   /** Everything ProductTour takes, passed through as it is. */
   let props: ComponentProps<typeof ProductTour> = $props();
   // The store the tour reads: the app's, unless a host (the harness) hands one.
-  // Read once: a tour does not change stores while it is mounted.
+  // Justified: read once on purpose; a tour does not change stores while it is
+  // mounted, and `$tour` needs a plain store binding, not a reactive one.
   // svelte-ignore state_referenced_locally
   const tour = props.tour ?? productTour;
   // The saved progress decides whether the tour opens at launch (first run, or
