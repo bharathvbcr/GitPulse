@@ -185,12 +185,12 @@
   /* The one button (design language §9). With no `data-variant` it is the
      secondary pill, exactly what it has always been; `data-variant` picks
      primary | secondary | ghost | danger | success and `data-size` picks
-     sm (24px) | md (28px). The `gp-btn-primary/-success/-danger` classes below
+     sm (24px, also the unmarked height) | md (28px). The `gp-btn-primary/-success/-danger` classes below
      stay as working aliases until Wave 2 migrates their call sites and empties
      them. Only colors and the press transform animate. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-xs;
-  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
-  min-height: 28px;
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-0 text-xs font-medium text-textPrimary shadow-xs;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), the height of data-size="sm" with the wider pill padding; data-size="md" is the 28px opt-in. No vertical padding, so the line box cannot push it past 24. */
+  min-height: 24px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-instant);
@@ -324,10 +324,10 @@
 
 @utility gp-icon-btn {
   /* Round icon button (ghost). */
-  @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted;
-  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
-  min-height: 28px;
-  min-width: 28px;
+  @apply inline-flex select-none items-center justify-center rounded-full p-1 text-textMuted;
+  /* Unmarked, it is 24px square (DESIGN_LANGUAGE §8, the WCAG 2.2 minimum target), the same as data-size="sm"; data-size="md" is the 28px opt-in. */
+  min-height: 24px;
+  min-width: 24px;
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-fast);
   transition-timing-function: var(--gp-ease-effect);
@@ -797,9 +797,9 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
 
 @utility gp-field {
   /* Rounded input field. */
-  @apply rounded-full border border-edge bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-faint;
-  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
-  min-height: 28px;
+  @apply rounded-full border border-edge bg-background px-3 py-0 text-xs text-textPrimary placeholder:text-faint;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), a button's height; data-size="sm" keeps the height and narrows the padding. */
+  min-height: 24px;
   transition: color var(--gp-dur-fast) var(--gp-ease-effect), background-color var(--gp-dur-fast) var(--gp-ease-effect), border-color var(--gp-dur-fast) var(--gp-ease-effect);
   /* WKWebView ignores `color` on form controls when the page is a transparent
      window (macOSPrivateApi). The fill colour is what actually paints, so a
@@ -959,9 +959,9 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
    * A pill with the field's metrics: it is one line tall and sits beside
    * `gp-field` pills, so it is not the rounded rectangle it used to be.
    */
-  @apply cursor-pointer truncate rounded-full border bg-background py-1 pl-3 pr-7 text-xs text-textPrimary;
-  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
-  min-height: 28px;
+  @apply cursor-pointer truncate rounded-full border bg-background py-0 pl-3 pr-7 text-xs text-textPrimary;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), a button's and a field's height; data-size="sm" keeps the height and narrows the padding. */
+  min-height: 24px;
   border-color: var(--gp-edge);
   -webkit-text-fill-color: rgb(var(--c-text));
   appearance: none;

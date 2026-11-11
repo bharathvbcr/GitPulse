@@ -66,6 +66,23 @@ export async function checkPrimitives() {
     await tick();
     await idle();
 
+    // ---- Control heights ---------------------------------------------
+    // DESIGN_LANGUAGE §8: an unmarked control is 24px, the same as
+    // data-size="sm"; data-size="md" is 28px. Measured, not read from the
+    // stylesheet, because padding plus line height can outgrow a min-height.
+    const sized = [...document.querySelectorAll<HTMLElement>('[data-testid="sizes"] [data-control]')];
+    const heightOf = (el: HTMLElement) => Math.round(el.getBoundingClientRect().height * 10) / 10;
+    check("there is one control of each kind at each size to measure", () => sized.length === 10);
+    for (const el of sized) {
+      const want = el.dataset.sized === "md" ? 28 : 24;
+      const label = `${el.dataset.control}${el.dataset.sized ? ` data-size="${el.dataset.sized}"` : " unmarked"}`;
+      check(`${label} is ${want}px tall (measured ${heightOf(el)})`, () => heightOf(el) === want);
+    }
+    for (const el of sized.filter((c) => c.dataset.control === "icon-btn")) {
+      const want = el.dataset.sized === "md" ? 28 : 24;
+      check(`icon-btn ${el.dataset.sized || "unmarked"} is ${want}px wide, a round target`, () => Math.round(el.getBoundingClientRect().width) === want);
+    }
+
     // ---- Toggle --------------------------------------------------------
     const bare = q<HTMLButtonElement>('[data-testid="toggles"] button[role="switch"]');
     check("the Toggle is a native button with role=switch, so Space and Enter activate it", () =>

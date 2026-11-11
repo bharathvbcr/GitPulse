@@ -186,7 +186,13 @@ describe("the vocabulary utilities", () => {
     const select = blockOf("@utility gp-select {");
     expect(select).toMatch(/@apply [^;]*\brounded-full\b/);
     expect(select).not.toMatch(/\brounded-lg\b/);
-    expect(select).toMatch(/\bpy-1\b/);
+    // gp-field's metrics: no vertical padding and the same 24px floor, so an
+    // unmarked select and field stand exactly as tall as an unmarked button.
+    const field = blockOf("@utility gp-field {");
+    for (const block of [select, field, blockOf("@utility gp-btn {")]) {
+      expect(block).toMatch(/@apply [^;]*\bpy-0\b/);
+      expect(block).toMatch(/^\s*min-height: 24px;/m);
+    }
     expect(select).toMatch(/\bpl-3\b/);
   });
 
