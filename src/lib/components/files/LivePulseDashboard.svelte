@@ -466,7 +466,7 @@
 
           {#if isLoadingCommits}
             <div class="p-1">
-              <Skeleton variant="text" count={3} hold={false} />
+              <Skeleton variant="text" count={3} />
               <span class="sr-only">Loading file history…</span>
             </div>
           {:else if recentCommits.length === 0}

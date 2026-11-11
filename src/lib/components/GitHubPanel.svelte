@@ -1006,9 +1006,9 @@
 
   {#if (loading && !ctx) || (workflowsLoading && !workflows)}
     <div class="space-y-4 max-w-4xl">
-      <Skeleton variant="card" count={2} hold={false} />
+      <Skeleton variant="card" count={2} />
       <div class="space-y-2 pt-2">
-        <Skeleton variant="text" count={4} height="2.5rem" hold={false} />
+        <Skeleton variant="text" count={4} height="2.5rem" />
       </div>
     </div>
   {:else if ctx?.error}
@@ -1331,7 +1331,7 @@
             </div>
           {:else if !workflows}
             {#if workflowsLoading}
-              <Skeleton variant="text" count={2} height="2.5rem" hold={false} />
+              <Skeleton variant="text" count={2} height="2.5rem" />
             {:else}
               <EmptyState icon={Workflow} title="No Actions workflows" compact />
             {/if}

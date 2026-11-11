@@ -1114,7 +1114,7 @@
   >
     {#if isLoading && !hasLoaded}
       <div class="p-3 space-y-1 overflow-hidden h-full">
-        <Skeleton variant="tree-row" count={14} hold={false} />
+        <Skeleton variant="tree-row" count={14} />
       </div>
     {:else if errorMsg && !hasLoaded}
       <div class="h-full flex flex-col items-center justify-center gap-2 text-xs p-4 text-center">

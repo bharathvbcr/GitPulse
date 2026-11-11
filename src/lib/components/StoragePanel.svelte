@@ -387,10 +387,10 @@
     {#if loading && !report}
       <div class="space-y-4 max-w-4xl">
         <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
-          <Skeleton variant="card" count={4} hold={false} />
+          <Skeleton variant="card" count={4} />
         </div>
         <div class="space-y-2 pt-2">
-          <Skeleton variant="text" count={5} height="2rem" hold={false} />
+          <Skeleton variant="text" count={5} height="2rem" />
         </div>
       </div>
     {:else if errorMsg && failure}

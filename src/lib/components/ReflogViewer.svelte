@@ -189,7 +189,7 @@
 
   <div class="flex-1 min-h-0 flex flex-col">
     {#if loading && entries.length === 0}
-      <div class="p-4"><Skeleton variant="tree-row" count={6} hold={false} /></div>
+      <div class="p-4"><Skeleton variant="tree-row" count={6} /></div>
     {:else if errorMsg}
       <div class="p-4">
         <div class="gp-notice" data-tone="unknown" role="alert">

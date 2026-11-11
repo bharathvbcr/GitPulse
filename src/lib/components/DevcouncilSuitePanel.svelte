@@ -89,7 +89,7 @@
   {#if loadError}
     <div class="gp-notice" data-tone="unknown" role="status">{loadError}</div>
   {:else if !report}
-    <Skeleton variant="text" count={3} hold={false} />
+    <Skeleton variant="text" count={3} />
   {:else}
     <p
       class="text-micro leading-snug {report.suite.complete

@@ -341,7 +341,7 @@
          the spinner lives only inside the busy Rescan button above. -->
     <div class="space-y-2">
       <p class="text-textMuted">Scanning working tree…</p>
-      <Skeleton variant="text" count={3} height="1.5rem" hold={false} />
+      <Skeleton variant="text" count={3} height="1.5rem" />
     </div>
   {:else if errorMsg && !report}
     <div class="gp-notice" data-tone="danger" role="alert">

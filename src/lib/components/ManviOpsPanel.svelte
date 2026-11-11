@@ -849,7 +849,7 @@
           {#if cleanup}<span class="gp-chip" data-tone="neutral" data-kind="label">{cleanup.candidates.length} eligible / {cleanup.total_local_branches} local</span>{/if}
         </div>
         {#if busy === "branches" || busy === "clean"}
-          <div class="py-3" aria-label="Inspecting Git refs"><Skeleton variant="text" count={3} hold={false} /></div>
+          <div class="py-3" aria-label="Inspecting Git refs"><Skeleton variant="text" count={3} /></div>
         {:else if cleanup}
           {#if !cleanupInvariant}
             <div class="gp-notice mb-2" data-tone="danger" role="alert"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Cleanup coverage is inconsistent; deletion is disabled.</div>
@@ -895,7 +895,7 @@
           {#if tagPlan}<span class="gp-chip" data-tone="neutral" data-kind="label">{tagPlan.retained_count} holding work / {tagPlan.total_tags} tags</span>{/if}
         </div>
         {#if busy === "tags" || busy === "tag-clean"}
-          <div class="py-3" aria-label="Measuring tags against the base"><Skeleton variant="text" count={3} hold={false} /></div>
+          <div class="py-3" aria-label="Measuring tags against the base"><Skeleton variant="text" count={3} /></div>
         {:else if tagPlan}
           {#if !tagInvariant}
             <div class="gp-notice mb-2" data-tone="danger" role="alert"><AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" /> Tag coverage is inconsistent; deletion is disabled.</div>
@@ -963,7 +963,7 @@
           {#if review}<span class="gp-chip" data-tone={review.findings.length === 0 ? "ok" : "warn"} data-kind="label">{review.findings.length} findings</span>{/if}
         </div>
         {#if busy === "review"}
-          <div class="py-3" aria-label="Reviewing commit headers"><Skeleton variant="text" count={3} hold={false} /></div>
+          <div class="py-3" aria-label="Reviewing commit headers"><Skeleton variant="text" count={3} /></div>
         {:else if review}
           <p class="mb-2 text-textSecondary">{summarizeCommitReview(review)} <span class="font-mono text-textMuted">{review.range}</span></p>
           <div class="max-h-56 space-y-1 overflow-auto">

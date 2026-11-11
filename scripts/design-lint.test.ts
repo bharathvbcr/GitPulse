@@ -207,6 +207,33 @@ describe("design-lint rule 14: banned UI terms", () => {
     expect(rule14("<p>Reload now!</p>")).toEqual([]);
   });
 
+  it("accepts \"project\" qualified as the vendor's own term, and still fails a bare \"project\" that means repository", () => {
+    for (const ok of ["Firebase project", "Google Cloud project", "GCP project", "the project alias", "project aliases", "the project ID", "project IDs"]) {
+      expect(rule14(`<p>Use the ${ok} here</p>`), ok).toEqual([]);
+    }
+    for (const bad of ["Open the project", "Switch project", "This project has no commits", "project identity", "Select a project…"]) {
+      expect(rule14(`<p>${bad}</p>`), bad).toHaveLength(1);
+    }
+    expect(rule14('<span title="Open the project"></span>')).toHaveLength(1);
+  });
+
+  it("accepts \"repo\" as a URL path segment and still fails \"repo\" in prose", () => {
+    expect(rule14('<input placeholder="https://github.com/owner/repo.git" />')).toEqual([]);
+    expect(rule14('<input placeholder="git@github.com:owner/repo" />')).toEqual([]);
+    expect(rule14("<p>Open this repo</p>")).toHaveLength(1);
+    expect(rule14("<p>The repo.git file</p>")).toHaveLength(1);
+  });
+
+  it("records the term on a rule 14 hit, so an allow entry can excuse one word and not the rule", () => {
+    const hits = rule14("<p>Open the project and the repo</p>");
+    expect(hits.map((v) => v.term)).toEqual(["project", "repo"]);
+    const verdict = classifyViolations(hits, { allow: [{ rule: 14, file: "src/lib/x.svelte", term: "project", reason: "vendor term" }], deferred: [] });
+    expect(verdict.allowed.map((v) => v.term)).toEqual(["project"]);
+    expect(verdict.open.map((v) => v.term)).toEqual(["repo"]);
+    const stale = classifyViolations(hits, { allow: [{ rule: 14, file: "src/lib/x.svelte", term: "ticket", reason: "vendor term" }], deferred: [] });
+    expect(stale.stale).toHaveLength(1);
+  });
+
   it("names the hit, the listed term and the replacement, at the position of the match", () => {
     const [hit] = rule14("<p>\n  Last attempt</p>");
     expect(hit).toMatchObject({ rule: 14, line: 2, col: 8 });
@@ -584,9 +611,13 @@ describe("the committed gate config", () => {
     for (const e of cfg.deferred) expect(e.owner).not.toBe("");
   });
 
-  it("allow-lists nothing but the brand marks, for rule 4", () => {
+  it("allow-lists nothing but the brand marks (rule 4) and Firebase's own word \"project\" (rule 14)", () => {
     const cfg = readGateConfig(configFile);
-    expect(cfg.allow.map((e) => `${e.rule}:${e.file}`)).toEqual(["4:src/lib/components/Logo.svelte", "4:src/lib/components/files/MarkDevLogo.svelte"]);
+    expect(cfg.allow.map((e) => `${e.rule}:${e.file}${e.term ? `:${e.term}` : ""}`)).toEqual([
+      "4:src/lib/components/Logo.svelte",
+      "4:src/lib/components/files/MarkDevLogo.svelte",
+      "14:src/lib/components/FirebasePanel.svelte:project",
+    ]);
   });
 
   it("passes the strict gate on this tree", () => {

@@ -54,7 +54,7 @@
   {#if error}
     <div class="gp-notice" data-tone="danger" role="alert" data-testid="task-suggest-error">{error}</div>
   {:else if result === null}
-    {#if loading}<Skeleton variant="text" count={3} hold={false} />{/if}
+    {#if loading}<Skeleton variant="text" count={3} />{/if}
     <p class={loading ? "sr-only" : "note"} role="status">{loading ? "Ranking the open tasks…" : "Nothing asked yet."}</p>
   {:else if result.suggestions.length === 0}
     <p class="note" role="status" data-testid="task-suggest-empty">

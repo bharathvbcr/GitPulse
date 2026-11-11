@@ -25,14 +25,16 @@ describe("Skeleton", () => {
     expect(source).toContain("gate?.holdRemainingMs()");
   });
 
-  it("leaves at once wherever its replacement mounts in the same flow, which is every caller (tmp/overhaul/L/skeleton-audit.md)", () => {
-    // A held outro keeps the skeleton's DOM in place while the content that
-    // replaces it mounts, so the content lands one skeleton lower for up to
-    // 400 ms (measured: content top 72 px with hold, 20 px without). The hold
-    // is right only for a skeleton swapped into the same box (absolutely
-    // positioned, or stacked in one grid cell). Name such a caller here, with
-    // the reason, rather than leaving the default on by omission.
+  it("does not hold by default: the 400 ms minimum is opt-in, and every opt-in names its reason", () => {
+    // The hold is an outro, and an outgoing branch stays in the DOM while its
+    // replacement mounts, so content in the same flow lands one skeleton lower
+    // for up to 400 ms (measured in Chromium: content top 72 px with the hold,
+    // 20 px without). 46 of 46 callers needed it off, so off is the default.
+    // List a caller here, with the reason, only if it swaps the skeleton into
+    // the same box without taking flow space the replacement needs.
     const HOLD_KEPT: Record<string, string> = {};
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "Skeleton.svelte"), "utf8");
+    expect(source).toMatch(/hold = false,/);
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
     const offenders: string[] = [];
     let seen = 0;
@@ -44,7 +46,8 @@ describe("Skeleton", () => {
           const text = readFileSync(full, "utf8");
           for (const tag of text.matchAll(/<Skeleton\b[^>]*?\/>/gs)) {
             seen += 1;
-            if (!tag[0].includes("hold={false}") && !HOLD_KEPT[relative(root, full)]) offenders.push(`${relative(root, full)}: ${tag[0].replace(/\s+/g, " ")}`);
+            const holds = /\bhold\b(?!=\{false\})/.test(tag[0]);
+            if (holds && !HOLD_KEPT[relative(root, full)]) offenders.push(`${relative(root, full)}: ${tag[0].replace(/\s+/g, " ")}`);
           }
         }
       }

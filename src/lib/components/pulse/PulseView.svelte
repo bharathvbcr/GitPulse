@@ -437,11 +437,11 @@
     <div class="p-6 space-y-4">
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {#each [1, 2, 3, 4] as n (n)}
-          <Skeleton variant="rect" height="5rem" hold={false} />
+          <Skeleton variant="rect" height="5rem" />
         {/each}
       </div>
-      <Skeleton variant="rect" height="11rem" hold={false} />
-      <Skeleton variant="rect" height="12rem" hold={false} />
+      <Skeleton variant="rect" height="11rem" />
+      <Skeleton variant="rect" height="12rem" />
     </div>
   {:else if report && report.commits.length === 0}
     <div class="flex-1 flex items-center justify-center p-8">

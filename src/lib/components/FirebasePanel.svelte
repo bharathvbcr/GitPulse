@@ -590,15 +590,15 @@
       </div>
     {:else if status.projects.length === 0}
       <div class="gp-notice max-w-xl" data-tone="warn">
-        No alias is configured in .firebaserc, so there is nothing to query.
+        No project alias is configured in .firebaserc, so there is nothing to query.
       </div>
     {:else}
       {#if status.projects_truncated}
         <!-- `.firebaserc` is repository content, so its alias count is not
              ours to assume. A capped picker that looks complete would hide the
-             very alias the reader came to select. -->
+             very project the reader came to select. -->
         <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
-          .firebaserc names more aliases than are listed here. This is not complete
+          .firebaserc names more project aliases than are listed here. This is not complete
           coverage of the file.
         </div>
       {/if}
@@ -611,19 +611,19 @@
         <div class="mb-2 text-meta text-textMuted max-w-xl">
           firebase.json carries no <span class="font-mono">apphosting</span> key, so this
           checkout is not configured to deploy to App Hosting. Backends that already exist
-          on the selected alias are still listed below.
+          on the project are still listed below.
         </div>
       {/if}
 
       <div class="flex flex-wrap items-end gap-2 mb-2">
         <label class="flex flex-col gap-1 text-meta text-textMuted">
-          Alias
+          Project
           <select
             class="gp-select text-xs"
             value={selectedAlias}
             onchange={(event) => selectProject(event.currentTarget.value)}
           >
-            <option value="">Select an alias…</option>
+            <option value="">Select a project…</option>
             {#each keyedList(status.projects, (p) => p.alias) as { key, item } (key)}
               <option value={item.alias}>
                 {item.alias} — {item.project_id}{item.alias === status.default_alias ? " (default)" : ""}
@@ -687,8 +687,8 @@
       <p class="mb-3 text-meta text-textMuted max-w-xl">
         Listing backends or rollouts runs the Firebase CLI as your signed-in Google account.
         If the App Hosting API is not enabled on
-        <span class="font-mono">{selectedProjectId || "the selected alias"}</span>,
-        the CLI enables it — a change made in Google Cloud, outside this repository.
+        <span class="font-mono">{selectedProjectId || "the project"}</span>,
+        the CLI enables it — a change to your Google Cloud project.
       </p>
 
       {#if rolloutListing && !rolloutListing.available}

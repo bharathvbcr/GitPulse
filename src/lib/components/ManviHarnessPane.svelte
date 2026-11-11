@@ -903,7 +903,7 @@
         <div class="gp-notice" data-tone="warn" role="status">{ai.model_detail}</div>
       {/if}
     {:else}
-      <Skeleton variant="text" count={2} hold={false} />
+      <Skeleton variant="text" count={2} />
     {/if}
   </section>
 
@@ -956,7 +956,7 @@
         </span>
       </h3>
       {#if grantsLoading}
-        <div role="status" aria-label="Checking grant history"><Skeleton variant="text" count={2} hold={false} /></div>
+        <div role="status" aria-label="Checking grant history"><Skeleton variant="text" count={2} /></div>
       {:else}
         {#if grantsLoadError}
           <div class="gp-notice" data-tone="unknown" role="alert">

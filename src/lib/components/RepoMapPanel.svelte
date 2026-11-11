@@ -1020,9 +1020,9 @@
     </div>
   {:else if loading && !map}
     <div class="flex-1 p-4 flex flex-col gap-3" aria-busy="true">
-      <Skeleton variant="text" width="40%" height="1rem" hold={false} />
-      <Skeleton variant="card" hold={false} />
-      <Skeleton variant="text" count={5} hold={false} />
+      <Skeleton variant="text" width="40%" height="1rem" />
+      <Skeleton variant="card" />
+      <Skeleton variant="text" count={5} />
     </div>
   {:else if !map}
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">

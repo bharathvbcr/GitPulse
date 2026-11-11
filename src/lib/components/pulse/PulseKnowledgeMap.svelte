@@ -74,7 +74,7 @@
 
   {#if loading && !knowledge}
     <div class="flex flex-col gap-2 py-2">
-      <Skeleton variant="rect" count={3} height="4rem" hold={false} />
+      <Skeleton variant="rect" count={3} height="4rem" />
       <p class="gp-label text-center">Scanning blame across repository files…</p>
     </div>
   {:else if error && !knowledge}

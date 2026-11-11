@@ -83,8 +83,8 @@
 
   {#if loading && !knowledge}
     <div class="flex flex-col gap-2">
-      <Skeleton variant="rect" height="4rem" hold={false} />
-      <Skeleton variant="rect" height="0.75rem" hold={false} />
+      <Skeleton variant="rect" height="4rem" />
+      <Skeleton variant="rect" height="0.75rem" />
       <p class="m-0 text-xs text-textMuted">Calculating code age distribution…</p>
     </div>
   {:else if error && !knowledge}

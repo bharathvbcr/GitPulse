@@ -10,6 +10,12 @@
       "rule": 4,
       "file": "src/lib/components/files/MarkDevLogo.svelte",
       "reason": "Brand art: the MarkDev mark's gradient stops belong to another product's identity. No design token maps to them, and they must not follow the theme."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/components/FirebasePanel.svelte",
+      "term": "project",
+      "reason": "Vendor term: a Firebase project and a Google Cloud project are the vendor\u0027s own objects, not repositories. Backends live on a project and the App Hosting API is enabled on one, so the copy must say project. Only the bare uses remain here; the qualified ones (Firebase project, project alias, project ID) pass by shape."
     }
   ],
   "deferred": [

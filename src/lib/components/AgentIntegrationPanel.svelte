@@ -171,7 +171,7 @@
   {#if !repoPath}
     <p class="text-textMuted text-micro">Open a repository to check its agent integration.</p>
   {:else if loading && plans.size === 0}
-    <Skeleton variant="text" count={3} hold={false} />
+    <Skeleton variant="text" count={3} />
   {:else}
     <ul class="space-y-1.5">
       {#each rows as row (row.host)}

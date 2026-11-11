@@ -168,8 +168,8 @@ export const APP_CSS = "src/app.css";
  * @typedef {{ tag: number, tagName: string, name: string, nameStart: number, segs: Seg[] }} Attr
  * @typedef {{ text: string, start: number, css: boolean }} ColorRegion
  * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][] }} Model
- * @typedef {{ rule: number, file: string, line: number, col: number, message: string }} Violation
- * @typedef {(offset: number, message: string) => void} Report
+ * @typedef {{ rule: number, file: string, line: number, col: number, message: string, term?: string }} Violation
+ * @typedef {(offset: number, message: string, term?: string) => void} Report
  * @typedef {{ id: number, name: string, summary: string, svelte: boolean, ts: boolean, css: boolean, run: (m: Model, report: Report) => void }} Rule
  */
 
@@ -942,6 +942,25 @@ const GLOBAL_BANNED_TERMS = BANNED_UI_TERMS.map((t) => ({
   pattern: new RegExp(t.pattern.source, t.pattern.flags.includes("g") ? t.pattern.flags : `${t.pattern.flags}g`),
 }));
 
+/**
+ * Rule 14 false positives that are not a glossary breach, accepted by shape:
+ *   - "project" qualified as the vendor's own term: "Firebase project", "Google Cloud
+ *     project", "project alias", "project ID" (in Firebase and Google Cloud a project is
+ *     not a repository);
+ *   - "repo" as a URL path segment, the placeholder "github.com/owner/repo.git", which
+ *     is GitHub's own convention.
+ * A bare "project" or "repo" in prose still fails. A file whose bare uses are all the
+ * vendor's word is listed in design-lint.config.json (allow, rule 14, with a term and a reason).
+ * @param {string} term @param {string} text @param {number} at @param {number} len
+ */
+function isVendorTermUse(term, text, at, len) {
+  const before = text.slice(Math.max(0, at - 14), at);
+  const after = text.slice(at + len, at + len + 8);
+  if (term === "project") return /(?:Firebase|Google Cloud|GCP) $/i.test(before) || /^ (?:alias(?:es)?|IDs?)\b/i.test(after);
+  if (term === "repo") return before.endsWith("/") && (/^\.git\b/.test(after) || after === "" || after.startsWith("/"));
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Rule 15 helpers.
 // ---------------------------------------------------------------------------
@@ -1324,7 +1343,8 @@ export const RULES = [
       for (const s of m.copyStrings) {
         for (const term of GLOBAL_BANNED_TERMS) {
           for (const hit of s.text.matchAll(term.pattern)) {
-            report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`);
+            if (isVendorTermUse(term.term, s.text, hit.index ?? 0, hit[0].length)) continue;
+            report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`, term.term);
           }
         }
       }
@@ -1436,9 +1456,9 @@ export function lintSource(file, src, rules = RULES) {
   for (const rule of rules) {
     if (!(m.kind === "svelte" ? rule.svelte : m.kind === "ts" ? rule.ts : rule.css)) continue;
     /** @type {Report} */
-    const report = (offset, message) => {
+    const report = (offset, message, term) => {
       const { line, col } = lineCol(starts, offset);
-      out.push({ rule: rule.id, file, line, col, message });
+      out.push(term === undefined ? { rule: rule.id, file, line, col, message } : { rule: rule.id, file, line, col, message, term });
     };
     rule.run(m, report);
   }
@@ -1568,7 +1588,7 @@ export function readBaseline(file) {
 // ---------------------------------------------------------------------------
 
 /**
- * @typedef {{ rule: number, file: string, reason: string }} AllowEntry
+ * @typedef {{ rule: number, file: string, reason: string, term?: string }} AllowEntry
  * @typedef {{ file: string, rules: number[], owner: string, reason: string }} DeferredEntry
  * @typedef {{ allow: AllowEntry[], deferred: DeferredEntry[] }} GateConfig
  */
@@ -1581,7 +1601,8 @@ export const DEFAULT_CONFIG_FILE = path.join(REPO_ROOT, "scripts", "design-lint.
  * read must not quietly turn every exemption on or off.
  *
  * `allow` is permanent and every entry carries the reason it will never go
- * away (brand art with no token to map to). `deferred` is temporary: a file
+ * away (brand art with no token to map to; a vendor's own term). An entry may name a
+ * `term` (rule 14), so it excuses that one word and not the rest of the rule. `deferred` is temporary: a file
  * another lane is rewriting, held to the ratchet alone until that lane merges.
  * The strict gate fails on an entry that matches no violation, so an exemption
  * cannot outlive the thing it excused.
@@ -1598,7 +1619,8 @@ export function readGateConfig(file, rules = RULES) {
   const allow = [];
   for (const [i, e] of (parsed.allow ?? []).entries()) {
     if (!ids.has(e?.rule) || !nonEmpty(e?.file) || !nonEmpty(e?.reason)) throw new Error(`${file}: allow[${i}] needs a rule (1-${rules.length}), a file and a non-empty reason`);
-    allow.push({ rule: e.rule, file: e.file, reason: e.reason.trim() });
+    if (e.term !== undefined && !nonEmpty(e.term)) throw new Error(`${file}: allow[${i}].term must be a non-empty string when present`);
+    allow.push(e.term === undefined ? { rule: e.rule, file: e.file, reason: e.reason.trim() } : { rule: e.rule, file: e.file, reason: e.reason.trim(), term: e.term });
   }
   /** @type {DeferredEntry[]} */
   const deferred = [];
@@ -1623,7 +1645,7 @@ export function classifyViolations(violations, config) {
   const out = { open: [], allowed: [], deferred: [], stale: [] };
   const used = new Set();
   for (const v of violations) {
-    const a = config.allow.findIndex((e) => e.rule === v.rule && e.file === v.file);
+    const a = config.allow.findIndex((e) => e.rule === v.rule && e.file === v.file && (e.term === undefined || e.term === v.term));
     if (a >= 0) {
       used.add(`a${a}`);
       out.allowed.push({ ...v, reason: config.allow[a].reason });
@@ -1638,7 +1660,7 @@ export function classifyViolations(violations, config) {
     out.open.push(v);
   }
   config.allow.forEach((e, i) => {
-    if (!used.has(`a${i}`)) out.stale.push(`allow: rule ${e.rule} ${e.file} no longer has a violation; remove the entry`);
+    if (!used.has(`a${i}`)) out.stale.push(`allow: rule ${e.rule} ${e.file}${e.term === undefined ? "" : ` (${e.term})`} no longer has a violation; remove the entry`);
   });
   config.deferred.forEach((e, i) => {
     if (!used.has(`d${i}`)) out.stale.push(`deferred: ${e.file} (${e.owner}) no longer has a violation of rules ${e.rules.join(", ")}; remove the entry and retake the baseline`);
@@ -1815,7 +1837,7 @@ export function main(argv = process.argv.slice(2)) {
       console.log(`
 allowed (${verdict.allowed.length}, reported and never counted as failures):`);
       for (const line of tally(verdict.allowed)) console.log(`  ${line}`);
-      for (const e of config.allow) console.log(`  why: ${e.file} rule ${e.rule}: ${e.reason}`);
+      for (const e of config.allow) console.log(`  why: ${e.file} rule ${e.rule}${e.term === undefined ? "" : ` (${e.term})`}: ${e.reason}`);
     }
     if (verdict.deferred.length > 0) {
       console.log(`
