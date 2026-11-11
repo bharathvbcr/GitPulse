@@ -241,11 +241,10 @@
         {#each filteredCategories as category (category.title)}
           {@const CatIcon = category.icon}
           <div>
-            <div class="flex items-center gap-2 text-xs font-semibold text-textPrimary">
+            <div class="mb-2 flex items-center gap-2 text-xs font-semibold text-textPrimary">
               <CatIcon size={14} class="text-accent" />
               <span>{category.title}</span>
             </div>
-            <div class="gp-separator" aria-hidden="true"></div>
 
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {#each category.shortcuts as item}
