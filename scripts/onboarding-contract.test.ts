@@ -20,7 +20,7 @@ describe("onboarding integration and native permission purposes", () => {
     const app = read("src/App.svelte");
     // The tour rides its own chunk (19 KB the entry chunk was over budget for), so
     // App hands it the same actions as LazyMount props rather than as attributes.
-    expect(app).toContain('const loadProductTour = () => import("./lib/components/onboarding/ProductTour.svelte");');
+    expect(app).toContain('import { loadProductTour, warmLazyChunks } from "./lib/components/lazyLoaders";');
     expect(app).not.toContain('import ProductTour from');
     expect(app).toContain('<LazyMount load={loadProductTour} name="The walkthrough" props={{');
     expect(app).toContain('onOpenRepository: () => repoStore.pickAndOpenRepo(),');

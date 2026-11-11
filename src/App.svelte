@@ -75,6 +75,10 @@
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
   import LazyMount from "./lib/components/LazyMount.svelte";
+  // The first-run walkthrough is mounted at startup (it decides for itself whether
+  // to open) but its code is its own chunk; see lazyLoaders.ts for why the loader
+  // lives there.
+  import { loadProductTour, warmLazyChunks } from "./lib/components/lazyLoaders";
   import type { ViewTab } from "./lib/repos/persist";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
   import Splash from "./lib/components/Splash.svelte";
@@ -127,10 +131,6 @@
   // Opened from the first-run card, the tools panels and the palette, never
   // at startup; it renders nothing until `onboardingStore.wizard.open`.
   const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
-  // The first-run walkthrough: 19 KB that only the first launch, or a replay from
-  // Settings, ever draws. It is mounted at startup (it decides for itself whether
-  // to open) but its code no longer rides in the entry chunk.
-  const loadProductTour = () => import("./lib/components/onboarding/ProductTour.svelte");
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewBar from "./lib/components/ViewBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -493,6 +493,8 @@
 
   onMount(() => {
     applyPlatformClass();
+    // After first paint, fetch the chunks a hover or click would otherwise wait on.
+    warmLazyChunks();
     // HMR/unmount can tear the component down while the async subscription
     // chain is still awaiting; listeners tracked after dispose unlisten
     // immediately instead of leaking past the component.

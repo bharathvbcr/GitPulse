@@ -1,14 +1,9 @@
-<script module lang="ts">
-  // The schematic is 19 KB of SVG that only a hovered view tab ever draws. Module
-  // scope: the loader identity is LazyMount's cache key.
-  const loadViewGuideArt = () => import("./ViewGuideArt.svelte");
-</script>
-
 <script lang="ts">
   import type { DestinationGuide } from "../views/viewGuide";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import LazyMount from "./LazyMount.svelte";
+  import { loadViewGuideArt } from "./lazyLoaders";
 
   /**
    * The rich destination tooltip: schematic, title, shortcut, and the

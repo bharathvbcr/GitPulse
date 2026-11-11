@@ -10,7 +10,8 @@
 </script>
 <script lang="ts">
   import type { Writable } from "svelte/store";
-  import ProductTour from "../src/lib/components/onboarding/ProductTour.svelte";
+  import LazyMount from "../src/lib/components/LazyMount.svelte";
+  import { loadProductTour } from "../src/lib/components/lazyLoaders";
   import Logo from "../src/lib/components/Logo.svelte";
   import { VIEW_REGISTRY } from "../src/lib/views/viewRegistry";
   import type { ProductTourStore } from "../src/lib/tools/productTour";
@@ -47,9 +48,9 @@
     <h2 class="text-2xl font-semibold">{$workspace.tasks ? "Tasks" : $workspace.path ? VIEW_REGISTRY[$workspace.view].label : "Welcome to GitPulse"}</h2>
     <p class="mt-3 max-w-md text-textMuted">{$workspace.tasks ? "Capture ideas, connect repositories, and review work." : $workspace.path ? VIEW_REGISTRY[$workspace.view].summary : "Open a repository to explore the workspace. The walkthrough uses the same production component as the desktop app."}</p>
   </main>
-  <ProductTour {tour} onOpenRepository={openRepository} onSettings={openSettings} onTools={openTools}
-    onTasks={tasks} onView={view} repositoryPath={$workspace.path} activeView={$workspace.view}
-    repositoryVisible={!$workspace.tasks} tasksOpen={$workspace.tasks} settingsOpen={$workspace.settings} />
+  <LazyMount load={loadProductTour} name="The walkthrough" props={{ tour, onOpenRepository: openRepository, onSettings: openSettings, onTools: openTools,
+    onTasks: tasks, onView: view, repositoryPath: $workspace.path, activeView: $workspace.view,
+    repositoryVisible: !$workspace.tasks, tasksOpen: $workspace.tasks, settingsOpen: $workspace.settings }} />
   {#if $workspace.settings}
     <div class="fixed inset-0 bg-black/40 grid place-items-center" style:z-index={50}>
       <div role="dialog" aria-modal="true" aria-label="Settings fixture" class="gp-card rounded-xl p-8" use:trapFocus>

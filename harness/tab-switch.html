@@ -478,6 +478,8 @@
           await settle();
           $$('[role="menuitem"]').find((el) => text(el).includes("Merge into current"))?.click();
           await settle();
+          // The merge dialog is its own chunk: wait on the dialog itself, bounded.
+          await sleepUntil(() => !!$("#merge-branch-title"));
           check("branches (alpha): the merge dialog is open", () => !!$("#merge-branch-title"));
           await switchTo(BETA);
           check("branches: the merge dialog aimed at alpha says the repository changed and cannot merge", () => {
@@ -490,6 +492,13 @@
           check("…and closes from its own button", () => !$("#merge-branch-title"));
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
+          // The view-tab guide tooltip draws its schematic from a lazily loaded chunk.
+          const guideTab = $("[data-tip-guide]");
+          guideTab?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          await sleepUntil(() => !!$('[role="tooltip"] svg'), 5000);
+          check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$('[role="tooltip"] svg') && $$('[role="tooltip"] svg *').length > 3);
+          guideTab?.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
 
           // ---- 4. an answer in flight for the repository left does not land -----
           const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
