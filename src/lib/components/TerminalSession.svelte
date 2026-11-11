@@ -435,7 +435,7 @@
       try {
         await openExternal(action.url);
       } catch (err) {
-        warning = `Could not open ${action.url}: ${formatError(err)}`;
+        warning = `Couldn't open ${action.url}. ${formatError(err)}`;
       }
       return;
     }
@@ -450,7 +450,7 @@
       let ready = false;
       const opened = await repoStore.openRepo(checkout, { onReady: () => { ready = true; } });
       if (!opened || !ready) {
-        warning = `Could not open ${checkout.split(/[\\/]/).pop()} to show ${action.path}.`;
+        warning = `Couldn't open ${checkout.split(/[\\/]/).pop()} to show ${action.path}.`;
         return;
       }
     } else if (!checkout && activePath !== repoPath) {
@@ -1139,7 +1139,7 @@
   export async function copySelection() {
     const text = term?.getSelection() ?? "";
     if (!text) warning = "Select terminal text to copy.";
-    else warning = await copyText(text) ? null : "Could not copy terminal selection.";
+    else warning = await copyText(text) ? null : "Couldn't copy terminal selection.";
   }
 
   export function retainedOutput(): string {
@@ -1155,7 +1155,7 @@
   }
 
   export async function copyOutput() {
-    warning = await copyText(retainedOutput()) ? null : "Could not copy retained terminal output.";
+    warning = await copyText(retainedOutput()) ? null : "Couldn't copy retained terminal output.";
   }
 
   export async function exportOutput() {

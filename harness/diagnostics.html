@@ -139,21 +139,21 @@
     try {
       Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copiedLogs.push(text);}}});
       fixture.cmd_diagnostic_log_tail = () => ["now INFO [devmap] native build failure", "now INFO [git] unrelated git log"];
-      await click("Copy DevMap logs");
-      check("map copies native logs and retained failure context",copiedLogs.at(-1)?.includes("native build failure")&&copiedLogs.at(-1)?.includes("BUILD-FAILURE-DETAIL")&&!copiedLogs.at(-1)?.includes("unrelated git log")&&target.textContent.includes("DevMap logs copied."));
+      await click("Copy code map logs");
+      check("map copies native logs and retained failure context",copiedLogs.at(-1)?.includes("native build failure")&&copiedLogs.at(-1)?.includes("BUILD-FAILURE-DETAIL")&&!copiedLogs.at(-1)?.includes("unrelated git log")&&target.textContent.includes("Code map logs copied."));
       fixture.cmd_devmap_refresh = a => defer("build",a);
       await click("Refresh index");
       const building = take("build");
-      await click("Copy DevMap logs");
+      await click("Copy code map logs");
       check("map logs remain copyable during a running build",copiedLogs.at(-1)?.includes('"building": true'));
       building.resolve({ok:false,binary:"/fixture/devmap",lookup:"test_override",stdout:"",stderr:"BUILD-FAILURE-DETAIL",exit_code:1,timed_out:false});await settle();
       Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async()=>{throw Error("clipboard denied");}}});
       document.execCommand=()=>false;
-      await click("Copy DevMap logs");
-      check("clipboard denial is visible without claiming success",target.textContent.includes("Could not copy DevMap logs.")&&!target.textContent.includes("DevMap logs copied."));
+      await click("Copy code map logs");
+      check("clipboard denial is visible without claiming success",target.textContent.includes("Couldn't copy the code map logs.")&&!target.textContent.includes("Code map logs copied."));
       Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copiedLogs.push(text);}}});
       fixture.cmd_diagnostic_log_tail = a => defer("copy-log",a);
-      await click("Copy DevMap logs");
+      await click("Copy code map logs");
       const staleCopy = take("copy-log"), copiedBefore = copiedLogs.length;
       host.show("markdown");await settle();
       staleCopy.resolve(["now INFO [devmap] stale copy"]);await settle();
@@ -161,7 +161,7 @@
       fixture.cmd_devmap_status=()=>({available:false,reason:"DevMap missing",status:null});
       fixture.cmd_diagnostic_log_tail=()=>[];
       host.show("map");await settle();
-      await click("Copy DevMap logs");
+      await click("Copy code map logs");
       check("map logs remain copyable when DevMap is unavailable",copiedLogs.at(-1)?.includes("DevMap missing"));
     } finally {
       if(clipboardDescriptor)Object.defineProperty(navigator,"clipboard",clipboardDescriptor);else delete navigator.clipboard;

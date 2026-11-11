@@ -25,6 +25,8 @@ export const MAX_QUEUED_BROWSE = 8;
 
 /** How long a request waits for the launch channel to come free. */
 const CHANNEL_WAIT_MS = 10_000;
+/** What a request that waited the whole bound says. Compared by constant, never by prose. */
+export const BROWSE_TERMINAL_STARTING = "Another terminal session is already starting.";
 
 /** A `gitpulse-browse` payload, or null for anything that is not one. */
 export function parseBrowseRequest(payload: unknown): BrowseRequest | null {
@@ -57,10 +59,10 @@ export function createBrowseQueue(deps: BrowseDeps) {
 
   async function handle(request: BrowseRequest): Promise<void> {
     const repo = await deps.open(request.repo);
-    if (!repo) throw new Error(`${request.repo} could not be opened`);
+    if (!repo) throw new Error(`Couldn't open ${request.repo}.`);
     deps.showDock();
     for (let waited = 0; deps.busy(); waited += 100) {
-      if (waited >= CHANNEL_WAIT_MS) throw new Error("another terminal launch is still pending");
+      if (waited >= CHANNEL_WAIT_MS) throw new Error(BROWSE_TERMINAL_STARTING);
       await sleep(100);
     }
     await deps.launch(repo, request.url);

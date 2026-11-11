@@ -110,7 +110,7 @@
   {#if backendError}
     <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
-      <span data-testid="keep-terminals-backend-error">Could not read which process holds the terminals: {backendError}</span>
+      <span data-testid="keep-terminals-backend-error">Couldn't read which process holds the terminals. {backendError}</span>
     </div>
   {/if}
   {#each backend?.trouble ?? [] as trouble (trouble)}

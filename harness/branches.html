@@ -535,7 +535,7 @@ if(params.has("check")) {
     button("Copy branch name main").dispatchEvent(copyKey);
     check("row navigation does not consume copy button activation",!copyKey.defaultPrevented);
     copyFailed=true;await click("Copy branch name main");
-    check("copy denial is reported",get(repoStore).error==="Could not copy to clipboard");
+    check("copy denial is reported",get(repoStore).error==="Couldn't copy to clipboard");
     copyFailed=false;repoStore.setError(null);
     const sourceRow=[...document.querySelectorAll("button")].find(b=>b.title.startsWith("feature/branch-selection\n"));
     sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
@@ -732,7 +732,7 @@ if(params.has("check")) {
     check("repository switching invalidates review",button("Merge branch").disabled&&dialog().textContent.includes("repository changed"));
     await dismiss("Cancel");
     probeFailed=true;await repoStore.refresh();await settle();await click("Merge branches");
-    check("unavailable operation check is not idle",dialog().textContent.includes("Could not check for an operation"));
+    check("unavailable operation check is not idle",dialog().textContent.includes("Couldn't check for an operation"));
     await dismiss("Cancel");probeFailed=false;current=null;await repoStore.refresh();await settle();await click("Merge branches");
     check("detached HEAD explains the required action",dialog().textContent.includes("Check out a local branch")&&button("Merge branch").disabled);
     await dismiss("Cancel");current="main";branches=[branch("main")];await repoStore.refresh();await settle();await click("Merge branches");

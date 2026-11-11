@@ -30,7 +30,7 @@ export function createProductTour(storage: () => TourStorage) {
       publish({ ...progress, error: null });
       return true;
     } catch {
-      publish({ error: "Walkthrough progress could not be saved. Try again, or close without saving; it may appear next launch." });
+      publish({ error: "Walkthrough progress couldn't be saved. Try again, or close without saving; it may appear next time GitPulse opens." });
       return false;
     }
   }

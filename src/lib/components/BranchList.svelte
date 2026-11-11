@@ -573,7 +573,7 @@
   async function copyText(value: string) {
     closeMenu({ restoreFocus: true });
     if (!(await copyToClipboard(value))) {
-      repoStore.setError("Could not copy to clipboard");
+      repoStore.setError("Couldn't copy to clipboard");
     } else {
       toastStore.success(`Copied ${value}`);
     }
@@ -606,7 +606,7 @@
     const trimmed = name?.trim();
     if (!trimmed) return;
     const outcome = await repoStore.createTag(trimmed, at?.commitId, undefined, target);
-    reportFailure(outcome, "Could not create the tag");
+    reportFailure(outcome, "Couldn't create the tag");
   }
 
   async function runDeleteTag(tag: TagInfo) {
@@ -619,7 +619,7 @@
     });
     if (!ok) return;
     const outcome = await repoStore.deleteTag(tag.name, target);
-    reportFailure(outcome, "Could not delete the tag");
+    reportFailure(outcome, "Couldn't delete the tag");
   }
 
   async function runRename(branch: BranchInfo) {
@@ -634,7 +634,7 @@
     const trimmed = next?.trim();
     if (!trimmed || trimmed === branch.name) return;
     const outcome = await repoStore.renameBranch(branch.name, trimmed, target);
-    reportFailure(outcome, "Could not rename the branch");
+    reportFailure(outcome, "Couldn't rename the branch");
   }
 
   async function runDelete(branch: BranchInfo) {
@@ -662,7 +662,7 @@
     }
     const decision = escalateDeleteDecision(outcome.error ?? "", branch);
     if (!decision.canRetryForce || !decision.message) {
-      reportFailure(outcome, "Could not delete the branch");
+      reportFailure(outcome, "Couldn't delete the branch");
       return;
     }
     const forceOk = await askConfirm({
@@ -672,7 +672,7 @@
     });
     if (!forceOk) return;
     const forceOutcome = await repoStore.deleteBranch(branch.name, true, target);
-    if (!reportFailure(forceOutcome, "Could not force-delete the branch")) return;
+    if (!reportFailure(forceOutcome, "Couldn't force-delete the branch")) return;
     offerBranchUndo(`Force deleted branch "${branchName}"`, tips, target);
   }
 

@@ -163,7 +163,7 @@
 
   async function handleCopySource() {
     if (!(await copyText(rawContent))) {
-      repoStore.setError("Could not copy to clipboard");
+      repoStore.setError("Couldn't copy to clipboard");
       return;
     }
     copiedSource = true;

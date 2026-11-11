@@ -86,7 +86,11 @@
       };
 
       // ---- the fixture backend ------------------------------------------------
+      let spawnedShells = 0;
       const calls = [];
+      // Readable from outside the page, so a screenshot run can say which host
+      // commands a surface asked for.
+      window.__gpCalls = calls;
       // A held answer: `hold(cmd, repoPath)` makes the next such call wait until
       // `release()`. Calls are matched by command and by the repository asked.
       const holds = new Map();
@@ -133,6 +137,41 @@
         cmd_get_language_stats: () => langStats(),
         cmd_apple_intelligence_status: () => ({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "Not in this build." }),
         cmd_commit: () => null,
+        // The wire shape of `AiStatus` (src/lib/stores/harnessStore.ts). Answered
+        // with nothing, the store read `ai.harness` off null and the header badge
+        // showed "Cannot read properties of null (reading 'harness')": a fixture
+        // fault, since the host always answers with this object.
+        cmd_ai_status: () => ({
+          harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
+          endpoints: [], selected: null, model_info: null, model_detail: "", ready: false, detail: "No local model in this fixture.",
+        }),
+        // Settings -> Agents reads these two as objects (`view.settings.*`,
+        // `fresh.settings.*`); answered with nothing the panel crashed with
+        // "reading 'settings'" and took the dialog with it.
+        cmd_lappi_settings: () => ({
+          settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
+          collect_forced_off: false, socket: null, store: null, transport_supported: false,
+        }),
+        cmd_host_load_settings: () => ({ enabled: true, govern_launches: false }),
+        // The store's own defaults in the wire shape, so this answer cannot drift from them.
+        cmd_agent_defaults: async () => {
+          const { DEFAULT_AGENT_DEFAULTS_VIEW: view } = await import("../src/lib/stores/agentDefaultsStore.ts");
+          return {
+            defaults: view.defaults, modes: [...view.modes], launchers: [...view.launchers],
+            model_fields: view.modelFields, effort_levels: [...view.effortLevels], model_listing: {},
+          };
+        },
+        cmd_devmap_integration_survey: () => [],
+        cmd_session_alerts: () => ({
+          settings: { enabled: true, sound: false, shell_bell: false, configure_agents: true, hook_bridge: true, quiet_start: null, quiet_end: null },
+          status: {
+            running: false, delivered: 0, suppressed_disabled: 0, suppressed_not_agent: 0, suppressed_attended: 0, suppressed_quiet: 0,
+            coalesced: 0, resolved: 0, deferred: 0, displaced: 0, rate_limited: 0, dropped_queue: 0, dropped_scan: 0, failed: 0,
+            bridge_rejected: 0, stale: 0, hook_replies_missed: 0, hook_reply_missed_last: null, hook_drop_record_error: null,
+            bridge_listening: false, bridge_path: null, last_error: null,
+          },
+          bridge_supported: false,
+        }),
         cmd_ai_generate_commit_message: (a) => ({
           text: `generated for ${a.repoPath}`, model: "fixture-model", context_source: "staged diff", prompt_tokens: 0, elapsed_ms: 1,
           budget: { planned_by_harness: true }, warnings: [],
@@ -161,6 +200,15 @@
         }),
         cmd_grants_view: () => ({ available: false, error: "", grants: [] }),
         cmd_terminal_sessions: () => [],
+        // Opening the dock spawns a shell and reads `.id` off the reply. Answered
+        // with nothing, the dock showed "TypeError: Cannot read properties of null
+        // (reading 'id')": a fixture fault, as the host replies `{ id, cwd, shell }`.
+        cmd_terminal_spawn: async (a) => {
+          const { adoptOutput } = await import("./tauriMocks.ts");
+          const id = `fixture-shell-${++spawnedShells}`;
+          adoptOutput(id, a);
+          return { id, cwd: a.repoPath, shell: "/bin/zsh" };
+        },
         cmd_terminal_backend: () => ({ backend: "in-process", trouble: [] }),
         cmd_ledger_tail: () => [],
         cmd_get_file_content: () => "export {};\n",
@@ -173,16 +221,25 @@
       // window mounts, so answering it with nothing put an "invalid response"
       // card on screen: an empty page is the real shape of "none pending".
       const emptyWorkbenchPage = () => JSON.stringify({ ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null });
-      const workbenchFixture = (a) => (a.method === "notifications.native.pending" || a.method === "runs.list" ? emptyWorkbenchPage() : null);
+      // Every `*.list` the Tasks surface reads is a page in the same shape
+      // (`page()` in src/lib/workbench/client.ts). `repositories.list` and
+      // `workspaces.list` were answered with nothing, so the surface showed
+      // "Couldn't load tasks. Task storage returned an invalid response."
+      const EMPTY_PAGE_METHODS = new Set([
+        "notifications.native.pending", "runs.list", "repositories.list", "workspaces.list", "items.list", "events.list",
+      ]);
+      const workbenchFixture = (a) => (EMPTY_PAGE_METHODS.has(a.method) ? emptyWorkbenchPage() : null);
       // Answered with nothing, on purpose: the window's background services
       // (menus, alerts, tool discovery, the ledger, GitHub alerts) that a tab
       // switch neither starts nor waits for. Listed rather than defaulted so a
       // command this page has not met is still reported as unexpected.
       const QUIET = new Set([
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
-        "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
+        "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_external_tools_status",
         "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
-        "cmd_catch_up", "cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
+        // What an open dock asks after its shell spawns (a screenshot opens it).
+        "cmd_terminal_context", "cmd_terminal_resize", "cmd_session_alerts_visible",
+        "cmd_catch_up","cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",
@@ -194,7 +251,7 @@
       // a refused call means to its callers.
       const REFUSED = new Set(["cmd_devmap_preview_many", "cmd_codeintel_impact_layered_many"]);
       const handler = async (cmd, args) => {
-        calls.push({ cmd, repo: args?.repoPath ?? null, at: performance.now() });
+        calls.push({ cmd, repo: args?.repoPath ?? null, method: args?.method ?? null, at: performance.now() });
         const gate = holds.get(`${cmd}|${args?.repoPath}`);
         if (gate) await gate;
         if (cmd.startsWith("plugin:")) return 1;
@@ -390,7 +447,12 @@
               await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
               // `settings-<panel>` (layout, views, agents, ...) opens that panel.
               const panelWord = words.find((w) => w.startsWith("settings-"))?.slice(9);
-              if (panelWord) $$('[role="tab"]').find((t) => text(t).toLowerCase() === panelWord)?.click();
+              // Look inside the dialog only: the header's own surface tabs are
+              // `[role="tab"]` too (Fleet, Agents, Tasks...) and come first in the
+              // page, so `settings-agents` used to click the Agents *surface* and
+              // leave Settings on its first panel behind it.
+              const dialog = $('[role="dialog"][aria-labelledby="settings-modal-title"]');
+              if (panelWord) $$('[role="tab"]', dialog).find((t) => text(t).toLowerCase() === panelWord)?.click();
             }
             for (const surface of ["fleet", "agents", "tasks"]) {
               if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
@@ -460,25 +522,41 @@
           // ---- 2. nothing of the repository being left stays behind -------------
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
-          const scroller = bodyScroller();
+          // A switch settles after a fixed number of ticks, which a loaded host can
+          // beat: the sidebar's controls may not have mounted yet, and a bare
+          // `bodyScroller().scrollTop = 300` then threw "Cannot set properties of
+          // null" outside any check, so the run died with no row naming the step.
+          // `need` waits (bounded) for the element and records the wait as a check,
+          // so a control that never comes is a named failure, not a crash.
+          const need = async (label, find, ms = 15000) => {
+            await sleepUntil(() => !!find(), ms);
+            let found = null;
+            hardCheck(`${label} is on screen`, () => (found = find()));
+            return found;
+          };
+          // The scroller must also be tall enough to scroll: its rows arrive with
+          // the repository's data.
+          const scrollable = () => { const el = bodyScroller(); return !!el && el.scrollHeight - el.clientHeight > 150; };
+          await sleepUntil(scrollable, 15000);
+          const scroller = await need("alpha's sidebar body", bodyScroller);
           scroller.scrollTop = 300;
-          await wait(40);
+          await sleepUntil(() => scroller.scrollTop > 100, 2000);
           hardCheck("alpha's sidebar body can be scrolled", () => scroller.scrollTop > 100);
-          type(fileFilter(), "src/alpha");
-          type(branchFilter(), "feat");
+          type(await need("the file filter", fileFilter), "src/alpha");
+          type(await need("the branch filter", branchFilter), "feat");
           chip("Local")?.click();
-          $('button[aria-label="Create branch"]').click();
+          (await need("the create-branch button", () => $('button[aria-label="Create branch"]'))).click();
           await settle();
-          type(createInput(), "feat/half-typed");
-          worktreeAdd().click();
+          type(await need("the new-branch name input", createInput), "feat/half-typed");
+          (await need("the create-worktree button", worktreeAdd)).click();
           await settle();
-          type(worktreePath(), "/tmp/alpha-new-worktree");
-          includeUnstaged().click();
+          type(await need("the worktree path input", worktreePath), "/tmp/alpha-new-worktree");
+          (await need("the include-unstaged checkbox", includeUnstaged)).click();
           repoStore.commitDraft.set("alpha draft");
-          agentTrigger().click();
+          (await need("the agent commit menu trigger", agentTrigger)).click();
           await settle();
-          type(agentNote(), "note about alpha");
-          langTrigger().click();
+          type(await need("the agent note input", agentNote), "note about alpha");
+          (await need("the language trigger", langTrigger)).click();
           await settle();
           const row = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
           row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
@@ -803,6 +881,17 @@
             for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
               !controls().inert && !$("[data-viewbar-surface]", row2));
+            // The Tasks surface, mounted in the real App on this page's fixture. A
+            // list the fixture answered in the wrong shape made it say "Couldn't
+            // load tasks. Task storage returned an invalid response." in every
+            // shot=tasks picture, so the surface is checked here, not only looked at.
+            interfaceStore.setGlobalSurface("tasks");
+            await sleepUntil(() => /Workspaces/.test(text(document.body)) || /Couldn't load tasks/.test(text(document.body)), 15000);
+            await settle();
+            check("tasks: the surface renders its board with no load-error card", () =>
+              /Workspaces/.test(text(document.body)) && !/Couldn't load tasks|invalid response/.test(text(document.body)));
+            interfaceStore.setGlobalSurface("repository");
+            await settle();
             // Full screen is stamped on <html>; the inset collapses with it.
             const inset = $(".gp-traffic-inset");
             if (inset) {

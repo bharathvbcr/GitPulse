@@ -67,7 +67,7 @@ describe("MarkDevViewer", () => {
   it("copies the source and reports a failed copy", () => {
     expect(source).toContain("handleCopySource");
     expect(source).toContain("if (!(await copyText(rawContent)))");
-    expect(source).toContain('repoStore.setError("Could not copy to clipboard")');
+    expect(source).toContain(`repoStore.setError("Couldn't copy to clipboard")`);
   });
 
   it("never leaves the previous page up after a failed render", () => {

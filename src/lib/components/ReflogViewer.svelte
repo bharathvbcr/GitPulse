@@ -97,7 +97,7 @@
     const trimmed = name?.trim();
     if (!trimmed) return;
     const outcome = await repoStore.createBranch(trimmed, entry.commit_id, target);
-    if (!reportFailure(outcome, "Could not create the branch")) return;
+    if (!reportFailure(outcome, "Couldn't create the branch")) return;
     toastStore.success(`Created branch "${trimmed}" at ${shortHash(entry.commit_id)}`);
     void load();
   }
@@ -121,7 +121,7 @@
         target: entry.commit_id,
       });
     } catch (err) {
-      toastStore.error(`Could not preview the reset: ${formatError(err)}`);
+      toastStore.error(`Couldn't preview the reset. ${formatError(err)}`);
       return;
     }
     if (repo !== $repoStore.currentPath) return;
@@ -135,7 +135,7 @@
     if (!confirmed) return;
     // The peeled oid, not the name: what was previewed is what moves.
     const outcome = await repoStore.resetTo("keep", preview.target, target);
-    if (!reportFailure(outcome, "Could not reset")) return;
+    if (!reportFailure(outcome, "Couldn't reset")) return;
     toastStore.success(
       `${preview.branch ?? "HEAD"} reset to ${shortHash(preview.target)}` +
         (preview.leaving_total > 0 ? ` — ${plural(preview.leaving_total, "commit")} left the branch` : ""),

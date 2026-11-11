@@ -504,7 +504,7 @@
   async function copyActivePath() {
     if (!activeTabPath) return;
     if (!(await copyText(activeTabPath))) {
-      repoStore.setError("Could not copy path to clipboard");
+      repoStore.setError("Couldn't copy path to clipboard");
     }
   }
 

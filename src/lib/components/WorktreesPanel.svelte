@@ -385,7 +385,7 @@
       const outcome = wt.is_locked
         ? await repoStore.unlockWorktree(wt.path, target, true)
         : await repoStore.lockWorktree(wt.path, target, true);
-      if (!outcome.ok) return showFailure(outcome, wt.is_locked ? "Could not unlock the worktree" : "Could not lock the worktree", epoch);
+      if (!outcome.ok) return showFailure(outcome, wt.is_locked ? "Couldn't unlock the worktree" : "Couldn't lock the worktree", epoch);
       // `load()` reads the ACTIVE repository; after a switch that is not the
       // one this lock was for, and the new one has just loaded itself.
       if (!tabScope.isCurrent(epoch)) return;
@@ -401,7 +401,7 @@
     if (!target) return;
     const epoch = tabScope.epoch;
     const outcome = await repoStore.pruneWorktrees(target);
-    if (!reportFailure(outcome, "Could not prune worktrees")) return;
+    if (!reportFailure(outcome, "Couldn't prune worktrees")) return;
     // `load()` reads the ACTIVE repository; after a switch that is not the
     // one this prune was for.
     if (!tabScope.isCurrent(epoch)) return;
@@ -437,7 +437,7 @@
         target,
         true,
       );
-      if (!outcome.ok) return showFailure(outcome, "Could not create the worktree", epoch);
+      if (!outcome.ok) return showFailure(outcome, "Couldn't create the worktree", epoch);
       // Created, but not everything it was asked to do happened. Said now,
       // while the reader still knows which worktree they just made.
       for (const notice of worktreeSetupNotices(outcome.output ?? {}, "create")) toastStore.warning(notice);
@@ -497,18 +497,18 @@
     try {
       trusted = await repoStore.trustRepo(targetPath);
     } catch (cause) {
-      return showFailure({ ok: false, cause, error: String(cause) }, "Could not remove the worktree", epoch);
+      return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't remove the worktree", epoch);
     }
     if (!trusted) return;
     // The trust prompt can sit open while the reader goes elsewhere: the
     // removal runs only in the repository whose row was confirmed, and says so
     // when that is no longer in front.
     if (!repoStore.targetIsActive(target)) {
-      toastStore.error("Could not remove the worktree: the repository changed while it was waiting; nothing was run.");
+      toastStore.error("Couldn't remove the worktree. The repository changed while it was waiting; nothing was run.");
       return;
     }
     const outcome = await repoStore.removeWorktree(targetPath, force, target, true);
-    if (!outcome.ok) return showFailure(outcome, "Could not remove the worktree", epoch);
+    if (!outcome.ok) return showFailure(outcome, "Couldn't remove the worktree", epoch);
     // The worktree is gone; files that could not be deleted after it are a notice, not a failure.
     for (const notice of worktreeSetupNotices(outcome.output ?? {}, "remove")) toastStore.warning(notice);
     // T-F09: a tab on the removed directory is stranded on a deleted path,
@@ -575,14 +575,14 @@
       try {
         trusted = await repoStore.trustRepo(wt.path);
       } catch (cause) {
-        return showFailure({ ok: false, cause, error: String(cause) }, "Could not merge the worktree", epoch);
+        return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't merge the worktree", epoch);
       }
       if (!trusted) return;
       // The trust prompt can sit open while the reader goes elsewhere. The
       // merge is the destructive one: it runs only in the repository whose
       // row was confirmed, and says so when that is no longer in front.
       if (!repoStore.targetIsActive(target)) {
-        toastStore.error("Could not merge the worktree: the repository changed while it was waiting; nothing was run.");
+        toastStore.error("Couldn't merge the worktree. The repository changed while it was waiting; nothing was run.");
         return;
       }
       const outcome = await repoStore.worktreeMergeTeardown(
@@ -596,12 +596,12 @@
         target,
         true,
       );
-      if (!outcome.ok) return showFailure(outcome, "Could not merge the worktree", epoch);
+      if (!outcome.ok) return showFailure(outcome, "Couldn't merge the worktree", epoch);
       const merged = outcome.output;
       if (!merged) {
         // The host answered without saying what it did: never read as a clean
         // merge, never silent, and the rows are reloaded to show what is there.
-        showFailure({ ok: false, error: "The host did not report what the merge did; check the worktree list." }, "Could not confirm the merge", epoch);
+        showFailure({ ok: false, error: "The host did not report what the merge did; check the worktree list." }, "Couldn't confirm the merge", epoch);
         if (tabScope.isCurrent(epoch)) await load();
         return;
       }
@@ -645,7 +645,7 @@
     if (!target) return;
     const epoch = tabScope.epoch;
     const outcome = await repoStore.worktreeCowSync(wt.path, target);
-    if (!reportFailure(outcome, "Could not sync the build cache")) return;
+    if (!reportFailure(outcome, "Couldn't sync the build cache")) return;
     if (!tabScope.isCurrent(epoch)) return;
     await load();
   }

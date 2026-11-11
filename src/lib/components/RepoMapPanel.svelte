@@ -60,7 +60,8 @@
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
   import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
-  import { Loader2 } from "@lucide/svelte";
+  import { Loader2, Network } from "@lucide/svelte";
+  import EmptyState from "./EmptyState.svelte";
   import { requestReveal } from "../files/revealRequests";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -373,7 +374,7 @@
         if (mapResult.status === "fulfilled") {
           load = mapResult.value;
           if (!mapResult.value.available) {
-            errorMsg = mapResult.value.reason ?? "repo map unavailable";
+            errorMsg = mapResult.value.reason ?? "code map unavailable";
           } else if (selectedArea == null && mapResult.value.map?.subsystems[0]) {
             selectedArea = mapResult.value.map.subsystems[0].area;
           }
@@ -556,7 +557,7 @@
       if (!live()) return;
       if (!outcome.ok) {
         setNote(reportMapFailure(kind, repoPath,
-          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`)), "error");
+          buildFailureReason(outcome, outcome.stdout.trim() || `the code map ${kind} failed`)), "error");
       } else {
         setNote(`Map ${kind === "build" ? "built" : "refreshed"}.`, "ok");
       }
@@ -586,9 +587,9 @@
         liveIndex: liveIndex.get(repository),
         errors: [errorMsg, actionNote, docsError, brokenError, linksError],
       }, live);
-      if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
+      if (live()) copyLogsNote = result === "copied" ? "Code map logs copied." : "Couldn't copy the code map logs. Try again.";
     } catch (error) {
-      if (live()) copyLogsNote = `Could not copy DevMap logs: ${reportMapFailure("copy logs", repository, error)}`;
+      if (live()) copyLogsNote = `Couldn't copy the code map logs. ${reportMapFailure("copy logs", repository, error)}`;
     } finally {
       if (live()) copyingLogs = false;
     }
@@ -755,7 +756,7 @@
         disabled={copyingLogs || !currentRepo}
         onclick={() => void copyMapLogs()}
       >
-        {copyingLogs ? "Copying logs…" : "Copy DevMap logs"}
+        {copyingLogs ? "Copying logs…" : "Copy code map logs"}
       </button>
       <button
         type="button"
@@ -1025,33 +1026,31 @@
       <Skeleton variant="text" count={5} />
     </div>
   {:else if !map}
-    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
-      <p class="text-sm text-textPrimary">No repository map</p>
-      {#if indexBusy && indexActivity}
+    {#if indexBusy && indexActivity}
+      <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
+        <p class="text-sm text-textPrimary">Building the code map</p>
         <p class="text-meta text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
           <Loader2 size={12} class="animate-spin" aria-hidden="true" />
           {indexActivity}
         </p>
-      {:else}
-        <p class="text-meta text-textMuted max-w-md">
-          {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
-        </p>
-        <button
-          type="button"
-          class="gp-btn mt-2"
-          disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
-          title={buildBlockedReason ?? "Build the map index"}
-          aria-busy={building && buildKind === "build"}
-          onclick={() => void runBuild("build")}
-        >
-          {#if building && buildKind === "build"}
-            <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
-          {:else}
-            Build index
-          {/if}
-        </button>
-      {/if}
-    </div>
+      </div>
+    {:else}
+      <div class="flex-1 flex items-center justify-center" role="status">
+        <EmptyState
+          icon={Network}
+          title="No code map"
+          hint={mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
+          action={{
+            label: building && buildKind === "build" ? "Building…" : "Build index",
+            onClick: () => void runBuild("build"),
+            variant: "secondary",
+            disabled: building || !$repoStore.currentPath || buildBlockedReason != null,
+            title: buildBlockedReason ?? "Build the map index",
+            busy: building && buildKind === "build",
+          }}
+        />
+      </div>
+    {/if}
   {:else}
     {@const doc = map as RepoMapDocument}
     <div class="flex-1 flex min-h-0">

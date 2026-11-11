@@ -3,6 +3,7 @@
   import { get } from "svelte/store";
   import { hostPlatform } from "../stores/platformStore";
   import {
+    anchorOwnsOpenPopup,
     tipGuideOf,
     tipTextOf,
     TOOLTIP_ANCHOR_SELECTOR,
@@ -96,6 +97,9 @@
     text = guide ? "" : tipTextOf(el);
     if (!guide && !text.trim()) return;
     timer = setTimeout(() => {
+      // Decided when the delay ends, not when the pointer arrived: a pill that
+      // opens its menu on pointer-enter is expanded by now.
+      if (anchorOwnsOpenPopup(el)) { hide(); return; }
       visible = true;
       placed = false;
       void tick().then(reveal);

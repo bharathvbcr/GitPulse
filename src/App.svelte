@@ -383,7 +383,7 @@
       hosted: async () => (await readTerminalBackend()).managed?.hosted === true,
       listRuns: listAllLiveRuns,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if (managedRuns.cancelled) { cancelNativeExitRequest(); return; }
     // With the terminal host, sessions can outlive this app: a quit with any
@@ -393,12 +393,12 @@
     const decision = await decideQuitTerminals({
       ask: askChoice,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
     const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
     const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
@@ -476,7 +476,7 @@
       exitApproved = false;
       cancelNativeExitRequest();
       diagnostics.error("desktop:exit", error);
-      toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
+      toastStore.error(`Couldn't quit GitPulse. ${formatError(error)}`);
     }
   }
 
@@ -687,7 +687,7 @@
 
     const openHelpPage = (path: string) => {
       void openExternal(`https://github.com/bharathvbcr/GitPulse/${path}`).catch((error) => {
-        toastStore.error(`Could not open help: ${formatError(error)}`);
+        toastStore.error(`Couldn't open help. ${formatError(error)}`);
       });
     };
 

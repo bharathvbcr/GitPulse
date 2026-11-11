@@ -17,6 +17,13 @@ describe("Tooltip canvas hover", () => {
   });
 });
 
+describe("Tooltip beside an open popup", () => {
+  it("stays away from a control whose own menu is open, deciding when the delay ends", () => {
+    expect(source).toContain("anchorOwnsOpenPopup(el)");
+    expect(source.indexOf("anchorOwnsOpenPopup(el)")).toBeGreaterThan(source.indexOf("timer = setTimeout"));
+  });
+});
+
 describe("Tooltip destination guides", () => {
   it("renders ViewGuideCard when the anchor carries data-tip-guide", () => {
     expect(source).toContain("destinationGuide");

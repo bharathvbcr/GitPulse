@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "eda06b3ad9348c808b5e834291709f391cd34823",
+  "commit": "2586f31da2994dea1f84670fa0bf3f58c10db2fe",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
