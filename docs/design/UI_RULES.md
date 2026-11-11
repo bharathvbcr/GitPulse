@@ -89,7 +89,10 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 ## 3. Copy
 
 - **Voice.** Say what happened, then what the user can do. Name things the way the user does, never by module. Use one idea per label. Something that wasn't checked is "Couldn't check", never "clean", "none" or "0". No exclamation marks, "please", "oops" or "successfully".
-- **Sentence case** everywhere: buttons, menus, tabs, headings, tooltips. Proper nouns (GitPulse, GitHub, Manvi, DevMap) keep their case.
+- **Sentence case** everywhere: buttons, menus, tabs, headings, tooltips, and command-palette labels ("Fetch all remotes", "Stash working tree"). Proper nouns (GitPulse, GitHub, Manvi, DevMap) keep their case.
+  - **Surface names are proper nouns:** Settings, Tasks, Fleet, Agents, Work, Code, History and Insights. The glossary already writes Settings that way. So "Open Tasks", "Open Settings", "Open Fleet", never "Open tasks" when the words name the surface. A lowercase "tasks" is a plural noun: "Open tasks" in `aria-label="Open tasks"` on a strip of task tabs is correct.
+  - **The native macOS menu keeps Title Case** ("Stash Working Tree", "Interactive Rebase…"). That is the platform's convention (Apple's HIG), and `menu.rs` and `menuState.ts` follow it. Do not sentence-case a native menu item to match the palette.
+  - **The palette and the menu may differ in case, never in wording.** The same action has the same words in both: "Stash working tree" in the palette is "Stash Working Tree" in the menu. The palette may add a leading "Open " or "Use ", and may say more after the menu's words ("Fetch all remotes" for "Fetch"). `catalog.test.ts` ("palette labels agree with the native menu") reads `menu.rs` and fails when they diverge.
 - **US spelling**: color, organize, behavior.
 - **Ellipsis** `…` only when the control opens a further step, or for in-progress text.
 - **One verb per meaning:**

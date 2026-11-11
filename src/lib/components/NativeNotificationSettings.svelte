@@ -102,5 +102,5 @@
 </details>
 
 <style>
-  .native-settings{margin:12px 0;padding:10px;border:1px solid rgb(var(--c-border));border-radius:8px;font-size:0.75rem}summary{cursor:pointer}fieldset{border:0;padding:12px 0;display:grid;gap:9px}label{display:flex;align-items:center;gap:7px}.times{display:flex;gap:12px}p{color:rgb(var(--c-text-muted));line-height:1.5}button,input[type=time]{font:inherit;color:rgb(var(--c-text));background:var(--mac-fill-surface,rgb(var(--c-surface)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}button{margin-right:8px;cursor:pointer}button:disabled{opacity:.5}input{accent-color:rgb(var(--c-accent))}[role=alert]{color:rgb(var(--c-danger))}
+  .native-settings{margin:12px 0;padding:10px;border:1px solid rgb(var(--c-border));border-radius:8px;font-size: var(--text-xs)}summary{cursor:pointer}fieldset{border:0;padding:12px 0;display:grid;gap:9px}label{display:flex;align-items:center;gap:7px}.times{display:flex;gap:12px}p{color:rgb(var(--c-text-muted));line-height:1.5}button,input[type=time]{font:inherit;color:rgb(var(--c-text));background:var(--mac-fill-surface,rgb(var(--c-surface)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}button{margin-right:8px;cursor:pointer}button:disabled{opacity:.5}input{accent-color:rgb(var(--c-accent))}[role=alert]{color:rgb(var(--c-danger))}
 </style>

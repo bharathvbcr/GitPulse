@@ -9,6 +9,7 @@
   import { backdropFadeOut } from "../../ui/transitions";
   import { trapFocus } from "../../ui/focusTrap";
   import { LAYERS } from "../../ui/layers";
+  import { scrollEdgeFade } from "../../ui/scrollEdgeFade";
   import { VIEW_REGISTRY } from "../../views/viewRegistry";
   import type { ViewTab } from "../../repos/persist";
   import { isImeComposition } from "../../keyboard/imeGuard";
@@ -103,8 +104,8 @@
       <div class="flex gap-1" aria-hidden="true">
         {#each TOUR_STEPS as _, index}<span class="h-1 flex-1 rounded-full" class:bg-accent={index <= $tour.step} class:bg-border={index > $tour.step}></span>{/each}
       </div>
-      <div class="space-y-3 text-sm text-textMuted leading-relaxed">
-        <h1 id="product-tour-title" bind:this={heading} tabindex="-1" class="text-xl font-semibold text-textPrimary outline-none">
+      <div class="space-y-3 text-sm text-textMuted leading-relaxed min-h-0 overflow-y-auto scroll-py-8" data-dialog-body use:scrollEdgeFade>
+        <h1 id="product-tour-title" bind:this={heading} tabindex="-1" class="text-lg font-semibold text-textPrimary outline-none">
           {#if step === "welcome"}Your work, in one place
           {:else if step === "repository"}Start with a repository
           {:else if step === "views"}Find your way around
@@ -138,14 +139,14 @@
           <p class="text-xs">Find commands with <kbd class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</kbd>.</p>
         {:else if step === "tasks"}
           <p>Open the real task board to see where ideas, repositories, and acceptance criteria come together. You can explore without creating a task.</p>
-          <button class="gp-btn" onclick={onTasks}>Open tasks</button>
+          <button class="gp-btn" onclick={onTasks}>Open Tasks</button>
           {#if tasksOpen}<p role="status" class="tour-success"><Check size={15} /> Tasks is open. Explore the board, then continue here.</p>{/if}
           <p class="text-xs">The code map adds code intelligence; Manvi provides policy and agent workflows. Configure either when you need it.</p>
           <button class="gp-btn" onclick={leaveForTools}>Set up optional tools</button>
         {:else if step === "permissions"}
           <p>{repositoryAccessGuidance($hostPlatform.os)}</p>
           <p class="text-xs">Repository trust is a separate GitPulse decision; it does not override denied folder access. Opening GitPulse at login is optional in Settings.</p>
-          <button class="gp-btn" onclick={onSettings}>Open settings</button>
+          <button class="gp-btn" onclick={onSettings}>Open Settings</button>
           {#if settingsVisited}<p role="status" class="tour-success"><Check size={15} /> Settings opened. No permission grant is required to finish.</p>
           {:else}<p class="text-xs">Explore Settings, then close it to return to this step. The tour does not change permissions or credentials.</p>{/if}
         {:else}
@@ -175,12 +176,12 @@
 <style>
   .tour-modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: color-mix(in srgb, black 40%, transparent); }
   .tour-live { position: fixed; inset: 0; pointer-events: none; }
-  .tour-card { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; pointer-events: auto; }
+  .tour-card { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: hidden; padding: 24px; display: flex; flex-direction: column; gap: 16px; pointer-events: auto; }
   .tour-coach { position: absolute; width: min(380px, calc(100vw - 32px)); padding: 20px; }
   .tour-spotlight { position: fixed; border: 2px solid var(--color-accent); border-radius: 12px; box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 15%, transparent); pointer-events: none; }
   .tour-success { display: flex; align-items: flex-start; gap: 8px; color: var(--color-textPrimary); }
   .tour-success :global(svg) { flex-shrink: 0; margin-top: 3px; color: var(--color-accent); }
-  .tour-focus { font-size: 0.75rem; color: var(--color-accent); text-decoration: underline; text-underline-offset: 3px; }
+  .tour-focus { font-size: var(--text-xs); color: var(--color-accent); text-decoration: underline; text-underline-offset: 3px; }
   @media (prefers-reduced-motion: no-preference) { .tour-card { animation: tour-enter var(--gp-dur-fast) var(--gp-ease-effect); } }
   @keyframes tour-enter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 </style>

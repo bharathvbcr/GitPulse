@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { get } from "svelte/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { repoStore, type RepoState } from "../stores/repoStore";
@@ -255,7 +258,7 @@ describe("command catalog and context", () => {
     const commands = buildCommands(current, () => {});
     const startCreate = commands.find(command => command.id === "new_branch");
     let action = startCreate?.action();
-    expect(get(promptState)?.options.title).toBe("Create New Branch");
+    expect(get(promptState)?.options.title).toBe("Create branch");
     completePrompt(" feature/new "); await expect(action).resolves.toEqual({ ok: true });
     expect(create).toHaveBeenCalledWith("feature/new", undefined, TARGET);
     action = commands.find(command => command.id === "rename_branch")?.action();
@@ -340,5 +343,46 @@ describe("command catalog and context", () => {
     await commands.find(command => command.id === "move_tab_left")?.action(); expect(move).toHaveBeenLastCalledWith("b", -1);
     await commands.find(command => command.id === "move_tab_right")?.action(); expect(move).toHaveBeenLastCalledWith("b", 1);
     await helpCommands(() => {}).find(command => command.id === "help_map_docs")?.action(); expect(navigate).toHaveBeenLastCalledWith("code", "map");
+  });
+});
+
+describe("palette labels agree with the native menu", () => {
+  // The palette is sentence case (UI_RULES §3); the native menu keeps title
+  // case, which is the platform convention. They may differ in case and in a
+  // leading "Open " or "Use " (the palette is a flat list; the menu's
+  // submenus supply that context), and the palette may say more after the
+  // menu's words ("Fetch" and "Fetch all remotes"). They may not use other
+  // words for the same action. The Rust file is the menu's only table.
+  const menu = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "src-tauri", "src", "desktop", "menu.rs"), "utf8");
+  const menuLabel = (action: string): string => {
+    const found = new RegExp(`item\\(app, actions::${action}, "([^"]+)"`).exec(menu);
+    if (!found) throw new Error(`menu.rs has no item for actions::${action}`);
+    return found[1];
+  };
+  const words = (label: string): string => label.toLowerCase().replace(/…/g, "").replace(/\s+/g, " ").trim();
+  const bare = (label: string): string => words(label).replace(/^(open|use) /, "");
+  const SHARED: ReadonlyArray<readonly [paletteId: string, menuAction: string]> = [
+    ["open_repo", "OPEN"], ["quick_commit", "QUICK_COMMIT"], ["new_branch", "CREATE_BRANCH"], ["rename_branch", "RENAME_BRANCH"],
+    ["rebase", "REBASE"], ["stash", "STASH"], ["stash_pop", "STASH_POP"], ["fetch", "FETCH"], ["pull", "PULL"], ["push", "PUSH"],
+    ["refresh", "REFRESH"], ["theme_system", "THEME_SYSTEM"], ["theme_light", "THEME_LIGHT"], ["theme_dark", "THEME_DARK"],
+    ["zoom_in", "ZOOM_IN"], ["zoom_out", "ZOOM_OUT"], ["zoom_reset", "RESET_ZOOM"], ["settings", "SETTINGS"],
+    ["diagnostics", "DIAGNOSTICS"], ["optional_tools_setup", "SETUP_TOOLS"],
+  ];
+
+  it.each(SHARED)("%s says what the menu's %s item says", (paletteId, menuAction) => {
+    const command = buildCommands(ready(), () => {}).find(item => item.id === paletteId);
+    expect(command, `palette has no command ${paletteId}`).toBeDefined();
+    expect(bare(command?.label ?? "").startsWith(bare(menuLabel(menuAction)))).toBe(true);
+  });
+
+  it("is sentence case outside surface names, while the menu stays title case", () => {
+    const commands = buildCommands(ready(), () => {});
+    expect(commands.find(item => item.id === "fetch")?.label).toBe("Fetch all remotes");
+    expect(commands.find(item => item.id === "stash")?.label).toBe("Stash working tree");
+    expect(menuLabel("STASH")).toBe("Stash Working Tree");
+    const titleCased = commands
+      .map(item => item.label.split(" — ")[0])
+      .filter(label => /^[A-Z][a-z]+ [A-Z][a-z]+/.test(label) && !/^(Open|Toggle|New|Switch to) [A-Z]/.test(label));
+    expect(titleCased).toEqual([]);
   });
 });

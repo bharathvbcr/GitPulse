@@ -96,7 +96,7 @@
     right: 20px;
     max-width: 360px;
     padding: 12px;
-    font-size: 0.75rem;
+    font-size: var(--text-xs);
     color: rgb(var(--c-text));
   }
 </style>

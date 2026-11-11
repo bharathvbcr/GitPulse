@@ -13,6 +13,7 @@
   import { rebasePlanProblem, seedRebasePlan, shouldReseed, type RebaseStep } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { reportPanelError } from "../diagnostics/report";
   import { describeFailure } from "../ui/copy/describeFailure";
   import { GitMerge, Check, AlertCircle } from "@lucide/svelte";
@@ -164,7 +165,7 @@
         </div>
       {/if}
 
-      <div class="p-4 space-y-2 max-h-80 overflow-y-auto">
+      <div class="p-4 space-y-2 max-h-80 overflow-y-auto scroll-py-8" data-dialog-body use:scrollEdgeFade>
         {#each items as commit}
           <div class="flex items-center gap-3 p-2.5 bg-background rounded-xl text-xs">
             <span class="font-mono text-accent w-20 truncate" title={commit.id}>{commit.id.substring(0, 8)}</span>

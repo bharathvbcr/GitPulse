@@ -62,62 +62,6 @@
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
     },
     {
-      "file": "src/lib/components/AutomaticEnhancements.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/CodeGraphCanvas.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/CommandPalette.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/ConflictComparison.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/ConflictEditor.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/NativeNotificationBridgeView.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/NativeNotificationSettings.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
       "file": "src/lib/components/RunActivity.svelte",
       "rules": [
         1
@@ -135,14 +79,6 @@
     },
     {
       "file": "src/lib/components/SendToAgent.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/SessionNotificationBridge.svelte",
       "rules": [
         1
       ],
@@ -316,70 +252,6 @@
       ],
       "owner": "Wave 5 residue",
       "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/onboarding/ProductTour.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/pulse/PulseCodeAge.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/pulse/PulseDora.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/pulse/PulseHygiene.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/pulse/PulseKnowledgeMap.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/components/pulse/PulseRhythm.svelte",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 residue",
-      "reason": "Found when rule 1 widened to rem, em, % and keyword font sizes, and to text-xl and up (lane A): a literal size is not the type scale. Use var(--text-micro|meta|xs|sm|base|lg|display) in a <style> block, or the text-* class. Metric numerals take display. The residue pass clears it, then deletes this entry and retakes the baseline."
-    },
-    {
-      "file": "src/lib/coverage/fileCoverage.ts",
-      "rules": [
-        1
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 1 type scale. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
-    },
-    {
-      "file": "src/lib/coverage/format.ts",
-      "rules": [
-        3
-      ],
-      "owner": "Wave 5 fixing lane that owns this file",
-      "reason": "Found when design-lint widened its scope (lane L2): rule 3 palette colours. The Wave 5 lane that owns the file clears it, then deletes this entry and retakes the baseline. List them with design-lint --list --rule N."
     }
   ]
 }

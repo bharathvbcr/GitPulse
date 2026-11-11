@@ -20,7 +20,7 @@
       <CheckCircle2 size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{hygiene.conventionalPercentage}%</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{hygiene.conventionalPercentage}%</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
       {hygiene.conventionalCount} of {hygiene.totalCommits} standard
@@ -34,7 +34,7 @@
       <Scale size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{hygiene.medianChurn}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{hygiene.medianChurn}</span>
       <span class="text-xs text-textMuted font-normal">lines</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
@@ -49,7 +49,7 @@
       <KeyRound size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{hygiene.signedPercentage === null ? "—" : `${hygiene.signedPercentage}%`}</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{hygiene.signedPercentage === null ? "—" : `${hygiene.signedPercentage}%`}</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
       {hygiene.signedCount} signed, not verified{hygiene.signatureUnknownCount > 0 ? ` · ${hygiene.signatureUnknownCount} unread` : ""}
@@ -63,7 +63,7 @@
       <GitMerge size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{hygiene.mergePercentage}%</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{hygiene.mergePercentage}%</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
       {hygiene.mergeCount} branch merges
@@ -77,7 +77,7 @@
       <Users size={14} class="text-accent shrink-0" />
     </div>
     <div class="flex items-baseline gap-1.5 mt-1">
-      <span class="text-2xl font-semibold tracking-tight text-textPrimary">{hygiene.coAuthorPercentage}%</span>
+      <span class="text-display font-semibold tracking-tight text-textPrimary">{hygiene.coAuthorPercentage}%</span>
     </div>
     <div class="text-micro text-textMuted mt-1 truncate">
       Pair programming trailers

@@ -135,7 +135,7 @@
           <span class="gp-chip" data-tone={ratingTone(dora.deploy_rating)}>{dora.deploy_rating}</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-semibold text-textPrimary">{dora.deploy_frequency_per_week}</span>
+          <span class="text-display font-semibold text-textPrimary">{dora.deploy_frequency_per_week}</span>
           <span class="text-xs text-textMuted">/ week</span>
         </div>
         <p class="text-meta text-textMuted mt-2">
@@ -150,7 +150,7 @@
           <span class="gp-chip" data-tone={ratingTone(dora.lead_time_rating)}>{dora.lead_time_rating}</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-semibold text-textPrimary">{formatHours(dora.median_lead_time_hours)}</span>
+          <span class="text-display font-semibold text-textPrimary">{formatHours(dora.median_lead_time_hours)}</span>
         </div>
         <p class="text-meta text-textMuted mt-2">
           Commit authored → release tag
@@ -172,7 +172,7 @@
           </span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-semibold text-textPrimary">
+          <span class="text-display font-semibold text-textPrimary">
             {dora.cfr_sample_commits <= 0 ? "—" : `${dora.change_failure_rate_pct}%`}
           </span>
         </div>
@@ -203,7 +203,7 @@
           <span class="gp-chip" data-tone="neutral">Estimated</span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-semibold text-textPrimary">
+          <span class="text-display font-semibold text-textPrimary">
             {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "—" : formatHours(dora.mttr_hours)}
           </span>
         </div>

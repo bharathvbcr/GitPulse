@@ -44,8 +44,8 @@ describe("CommandPalette", () => {
   it("offers commands to move the active repository tab", () => {
     expect(source).toContain('id: "move_tab_left"');
     expect(source).toContain('id: "move_tab_right"');
-    expect(source).toContain("Move Repository Tab Left");
-    expect(source).toContain("Move Repository Tab Right");
+    expect(source).toContain("Move repository tab left");
+    expect(source).toContain("Move repository tab right");
     expect(source).toContain("repoStore.moveTabBy");
   });
 

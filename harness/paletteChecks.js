@@ -84,11 +84,13 @@ if (params.has("check")) {
   option("main").click(); await settle(); check("disabled rows keep the palette open", Boolean(input()) && !calls.some(c => c.cmd === "cmd_checkout_branch"));
   option("origin/remote-only").click(); await settle();
   check("a remote branch row keeps its remote when checked out, so a same-named local branch of another remote is never taken for it", calls.filter(c => c.cmd === "cmd_checkout_branch").map(c => c.args.branchName).join() === "origin/remote-only");
-  await open(); await type("qckcmt"); check("fuzzy aliases find Quick Commit", Boolean(option("Quick Commit")));
-  check("clean-tree Quick Commit explains why it cannot run", option("Quick Commit")?.textContent.includes("Nothing to commit"));
+  await open(); await type("qckcmt"); check("fuzzy aliases find Quick commit", Boolean(option("Quick commit")));
+  check("clean-tree Quick commit explains why it cannot run", option("Quick commit")?.textContent.includes("Nothing to commit"));
   files = Array.from({ length: 125 }, (_, i) => `src/file-${String(i).padStart(3,"0")}.ts`);
   await type("/"); await waitFor(() => option("file-000.ts"));
   check("large file lists render only the first page", root.querySelectorAll("[role=option]").length === 50 && root.textContent.includes("1–50 of 125 results"));
+  await waitFor(() => root.querySelector("[role=listbox]")?.hasAttribute("data-gp-fade")).catch(() => undefined);
+  check("a result list that overflows fades the edge it clips, with scroll padding for the active row", /^y-/.test(root.querySelector("[role=listbox]")?.getAttribute("data-gp-fade") ?? "") && parseFloat(getComputedStyle(root.querySelector("[role=listbox]")).scrollPaddingTop) >= 16);
   await key("PageDown"); check("PageDown reaches the next page", root.textContent.includes("51–100 of 125 results") && Boolean(option("file-050.ts")));
   await key("End"); check("End highlights the final visible option", input().getAttribute("aria-activedescendant") === "palette-option-49");
   await key("PageDown"); check("last result page remains reachable", Boolean(option("file-124.ts")) && root.querySelectorAll("[role=option]").length === 25);
@@ -112,14 +114,14 @@ if (params.has("check")) {
   check("partial workspace results retain coverage and failure notices", Boolean(option("workspaceResult")) && root.textContent.includes("unavailable-repo: Index missing"));
   partialWorkspace = false; failedRepo = true; option("workspaceResult").click(); await waitFor(() => root.querySelector("[role=alert]"));
   check("failed workspace activation leaves recovery in the palette", Boolean(input()) && get(repoStore).currentPath === "/fixture/different"); failedRepo = false;
-  await type("Refresh Repository Status");
+  await type("Refresh repository status");
   const realRefresh = repoStore.refresh; let finishRefresh; let refreshCalls = 0;
   repoStore.refresh = () => { refreshCalls++; return new Promise(resolve => { finishRefresh = resolve; }); };
   await key("Enter"); await key("Enter"); check("repeated Enter starts only one action", refreshCalls === 1 && root.textContent.includes("Action in progress"));
   finishRefresh({ok:false,error:"Fixture action refused"}); await settle();
   check("refused actions remain visible with an error", root.querySelector("[role=alert]")?.textContent.includes("Fixture action refused") && Boolean(input()));
   repoStore.refresh = realRefresh;
-  await type("Create New Branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
+  await type("Create branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
   check("follow-on prompts receive focus after the palette closes", !input() && document.activeElement === promptRoot.querySelector("input"));
   await key("k", { metaKey: true }); check("the palette cannot cover an active prompt", !input());
   cancelPrompt(); await waitFor(() => !promptRoot.querySelector('[aria-modal="true"]')); await open(); await waitFor(input);
@@ -128,7 +130,7 @@ if (params.has("check")) {
   // the branch is created in the repository the palette was built for, or not
   // at all, and never in the one now in front.
   const origin = get(repoStore).currentPath;
-  await type("Create New Branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
+  await type("Create branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
   const createsBefore = calls.filter(c => c.cmd === "cmd_create_branch").length;
   await repoStore.openRepo("/fixture/branch-prompt-other"); await settle();
   completePrompt("from-palette"); await settle(); await new Promise(resolve => setTimeout(resolve, 200)); await settle();
@@ -136,7 +138,7 @@ if (params.has("check")) {
   check("a branch named after the repository changed is never created in the one now in front", created.every(c => c.args.repoPath === origin) && !created.some(c => c.args.repoPath === "/fixture/branch-prompt-other"));
   check("and where it is created, it is the repository the palette was built for", created.length === 1 && created[0].args.branchName === "from-palette");
   await repoStore.openRepo(origin); await settle();
-  await open(); await type("Fetch All Remotes");
+  await open(); await type("Fetch all remotes");
   const fetchesBefore = calls.filter(c => c.cmd === "cmd_fetch").length;
   await key("Enter"); await settle(); await new Promise(resolve => setTimeout(resolve, 100));
   check("a palette command with no prompt runs in the repository in front, through the store", (f => f.length === 1 && f[0].args.repoPath === origin)(calls.filter(c => c.cmd === "cmd_fetch").slice(fetchesBefore)));
@@ -150,7 +152,7 @@ if (params.has("check")) {
   check("commit search never uses a different repository's history", root.querySelectorAll("[role=option]").length === 0 && root.textContent.includes("History has not loaded"));
   await key("Escape");
   while(get(repoStore).openTabs.length) await repoStore.closeActiveTab();
-  await open(); await type("Fetch All Remotes"); check("repository actions explain the no-repository state", option("Fetch All Remotes")?.getAttribute("aria-disabled") === "true" && root.textContent.includes("Open a repository first"));
+  await open(); await type("Fetch all remotes"); check("repository actions explain the no-repository state", option("Fetch all remotes")?.getAttribute("aria-disabled") === "true" && root.textContent.includes("Open a repository first"));
   await type("fleet"); check("workspace Fleet remains available without a repository", option("Open Fleet")?.getAttribute("aria-disabled") === "false");
   await type("/"); check("file search offers repository recovery", root.textContent.includes("Choose a repository"));
   check("no uncaught runtime errors", crashes.length === 0);

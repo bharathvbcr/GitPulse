@@ -118,7 +118,7 @@
       check("remounted target is discovered", () => spot());
       await next();
       check("task step", () => text().includes("Turn an idea into a task"));
-      await click("Open tasks");
+      await click("Open Tasks");
       check("Tasks opens without dismissing tour", () => get(workspace).tasks && body());
       check("Tasks success uses host state", () => text().includes("Tasks is open."));
       await click("Set up optional tools");
@@ -138,7 +138,7 @@
       resetHostPlatformForTests({ os: "macos", dock_hiding: true }); await settle();
       check("mac permission recovery", () => text().includes("Files and Folders"));
       check("trust distinct from OS access", () => text().includes("does not override denied folder access"));
-      await click("Open settings");
+      await click("Open Settings");
       check("Settings callback retains active tour", () => settings === 1 && body() && get(tour).step === 4);
       check("Settings gets focus above tour", () => document.querySelector('[aria-label="Settings fixture"]').contains(document.activeElement));
       await click("Close Settings");
@@ -186,6 +186,41 @@
       await unmount(app); window.dispatchEvent(new Event("resize")); await settle();
       for (let i = 0; i < 30; i++) { try { if (!spot() && !body()) break; } catch {} await settle(); } // exits are <=70 ms transitions
       check("unmount removes guide and observers safely", () => !spot() && !body());
+      // A desktop banner clicked before the notification bridge's chunk has loaded.
+      // The backend wrote the activation to the store (`notifications.activate`), and
+      // the `workbench-notification-open` wake it emitted found no listener. Nothing
+      // is emitted here: the lazily mounted bridge has to find the activation by
+      // reading it, on mount, or the click did nothing.
+      const delivery = { id: "event-7", revision: 2, updated_at: 1001, created_at: 1000, native_id: `gitpulse.${"a".repeat(32)}.event-7`, task_id: "task-1", state: "submitted", activated_at: 1001, acknowledged_at: null };
+      const notice = { id: "event-7", revision: 1, updated_at: 1000, source_sequence: 7, task_id: "task-1", task_revision: 1, target_type: "run", target_id: "run-1", target_revision: 1, target_status: "task_deleted", kind: "run_exited", title: "Coding agent exited", created_at: 1000, read_at: null, dismissed_at: null, snoozed_until: null };
+      let queued = true, acknowledged = 0, pendingReads = 0;
+      const emptyPage = { ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null };
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: cb => cb,
+        invoke: async (cmd, args) => {
+          if (cmd.startsWith("plugin:event|")) return 1;
+          if (cmd !== "cmd_workbench_request") throw Error(`Unconfigured command: ${cmd}`);
+          if (args.method === "notifications.native.pending") { pendingReads++; return JSON.stringify(queued ? { ...emptyPage, items: [delivery], shown: 1, total: 1 } : emptyPage); }
+          if (args.method === "attention.get") return JSON.stringify({ ok: true, item: notice });
+          if (args.method === "notifications.delivery.get") return JSON.stringify({ ok: true, item: queued ? delivery : { ...delivery, revision: 3, acknowledged_at: 1002 } });
+          if (args.method === "notifications.ack") { acknowledged++; queued = false; return JSON.stringify({ ok: true, item: { ...delivery, revision: 3, acknowledged_at: 1002 } }); }
+          throw Error(`Unconfigured workbench method: ${args.method}`);
+        },
+      };
+      const NativeNotificationBridge = (await import("../src/lib/components/NativeNotificationBridge.svelte")).default;
+      const bridgeHost = document.body.appendChild(document.createElement("div"));
+      check("nothing has consumed the queued activation before the bridge mounts", () => queued && pendingReads === 0);
+      const bridge = mount(NativeNotificationBridge, { target: bridgeHost });
+      const review = () => document.querySelector('[aria-label="Notification review"]');
+      for (let i = 0; i < 40 && !review(); i++) await settle();
+      check("a queued activation is found when the lazy bridge mounts, without any wake event", () => review() && pendingReads >= 1);
+      check("the review names what the saved notification pointed at", () => review().textContent.includes("Coding agent exited") && review().textContent.includes("task deleted"));
+      const closeNotice = [...review().querySelectorAll("button")].find(b => b.textContent.trim() === "Close notification");
+      check("the review offers to close the notification", () => closeNotice && !closeNotice.disabled);
+      closeNotice.click();
+      for (let i = 0; i < 40 && review(); i++) await settle();
+      check("closing acknowledges it once and the activation is consumed", () => acknowledged === 1 && !review() && !queued);
+      await unmount(bridge); delete window.__TAURI_INTERNALS__; bridgeHost.remove();
       check("no runtime errors", () => errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
     } catch (error) {

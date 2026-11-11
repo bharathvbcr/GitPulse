@@ -112,7 +112,7 @@
           {/if}
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-semibold {knowledge.bus_factor === 1 ? 'text-danger' : knowledge.bus_factor === 2 ? 'text-warn' : 'text-ok'}">
+          <span class="text-display font-semibold {knowledge.bus_factor === 1 ? 'text-danger' : knowledge.bus_factor === 2 ? 'text-warn' : 'text-ok'}">
             {knowledge.bus_factor}
           </span>
           <span class="text-xs text-textMuted font-medium">key contributor{knowledge.bus_factor === 1 ? '' : 's'}</span>
@@ -131,7 +131,7 @@
           <ShieldCheck size={14} class="text-accent" />
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-semibold text-textPrimary">{knowledge.scanned_files}</span>
+          <span class="text-display font-semibold text-textPrimary">{knowledge.scanned_files}</span>
           <span class="text-xs text-textMuted">of {knowledge.candidate_files} candidate files</span>
         </div>
         <p class="text-meta text-textMuted mt-1">
@@ -146,7 +146,7 @@
           <AlertTriangle size={14} class={knowledge.orphaned_files.length > 0 ? "text-warn" : "text-ok"} />
         </div>
         <div class="flex items-baseline gap-2 mt-2">
-          <span class="text-3xl font-semibold {knowledge.orphaned_files.length > 0 ? 'text-warn' : 'text-ok'}">
+          <span class="text-display font-semibold {knowledge.orphaned_files.length > 0 ? 'text-warn' : 'text-ok'}">
             {knowledge.orphaned_files.length}
           </span>
           <span class="text-xs text-textMuted">stale files</span>
