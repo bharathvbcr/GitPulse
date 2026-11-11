@@ -1225,13 +1225,12 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     &devmap_query::paths::stack_lease_path(wt_path),
                 )
                 .ok();
-                let zero_copy_anchor = stack_lease.as_ref().and_then(|lease| {
-                    let manifest_path = Path::new(&lease.base_dir).join("manifest.json");
-                    let bytes = std::fs::read(&manifest_path).ok()?;
-                    let manifest: devmap_query::stacked::BaseManifest =
-                        serde_json::from_slice(&bytes).ok()?;
-                    Some(manifest.source_repo_root)
-                });
+                // The lease names its donor itself since the base moved into
+                // the lane (lease format 2); the shared manifest it used to
+                // point at is no longer the place to ask.
+                let zero_copy_anchor = stack_lease
+                    .as_ref()
+                    .map(|lease| lease.source_repo_root.clone());
                 let devmap_mode = if stack_lease.is_some() {
                     "zero_copy_base_ref"
                 } else if has_local_store {
