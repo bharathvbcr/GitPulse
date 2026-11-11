@@ -610,7 +610,7 @@
           <!-- No hold: this branch names the file being loaded, and a held
                outro would keep the previous file's name on screen after a
                selection change or clear. -->
-          <Skeleton variant="code-lines" count={16} hold={false} />
+          <Skeleton variant="code-lines" count={16} />
           <span class="sr-only">Loading blame for {filePath}…</span>
         </div>
       {:else if errorMsg}

@@ -1,0 +1,35 @@
+{
+  "comment": "The design-lint gate's exemptions, read by `node scripts/design-lint.mjs --strict` (the `design:gate` step of `bun run ci:local`). Every violation outside this file fails the gate. `allow` is permanent and reported on every run as `allowed`; `deferred` is temporary and held to the baseline ratchet only. The gate also fails on an entry that matches no violation, so an exemption cannot outlive what it excused.",
+  "allow": [
+    {
+      "rule": 4,
+      "file": "src/lib/components/Logo.svelte",
+      "reason": "Brand art: the GitPulse mark's gradient stops are the logo's own colors. No design token maps to them, and tokenizing them would make the mark change with the theme."
+    },
+    {
+      "rule": 4,
+      "file": "src/lib/components/files/MarkDevLogo.svelte",
+      "reason": "Brand art: the MarkDev mark's gradient stops belong to another product's identity. No design token maps to them, and they must not follow the theme."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/components/FirebasePanel.svelte",
+      "term": "project",
+      "reason": "Vendor term: a Firebase project and a Google Cloud project are the vendor\u0027s own objects, not repositories. Backends live on a project and the App Hosting API is enabled on one, so the copy must say project. Only the bare uses remain here; the qualified ones (Firebase project, project alias, project ID) pass by shape."
+    }
+  ],
+  "deferred": [
+    {
+      "file": "src/lib/desktop/StatusPopover.svelte",
+      "rules": [4, 11, 12],
+      "owner": "wave-4 lane P",
+      "reason": "Lane P is retuning the menu-bar popover in parallel. At merge, delete this entry and retake the baseline (`node scripts/design-lint.mjs --baseline`); the gate then holds the file at zero."
+    },
+    {
+      "file": "src/lib/files/syntaxHighlight.ts",
+      "rules": [3],
+      "owner": "wave-4 lane R",
+      "reason": "Lane R is moving the highlighter in parallel. At merge, delete this entry and retake the baseline (`node scripts/design-lint.mjs --baseline`); the gate then holds the file at zero."
+    }
+  ]
+}

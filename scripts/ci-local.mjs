@@ -116,6 +116,18 @@ export const GATES = [
     covers: ["bun run check:release"],
   },
   {
+    // docs/design/UI_RULES.md section 1, mechanically. --strict fails on any violation
+    // outside the allow-list in scripts/design-lint.config.json (brand art, each with a
+    // reason) and on a count that rose over the baseline; allowed and deferred hits are
+    // still printed. CI does not run it yet, so it is exempt from the coverage contract.
+    id: "design-lint",
+    name: "Design lint (UI_RULES section 1)",
+    program: "bun",
+    args: ["run", "design:gate"],
+    local: true,
+    why: "the ratchet-and-allow-list gate for the design rules; ci.yml does not run it",
+  },
+  {
     id: "svelte-check",
     name: "Frontend Svelte and TypeScript check",
     program: "bun",

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "41d273d95f9a6f5b41d668369a73f5e1ab915993",
+  "commit": "b35a8a8a509ec608fa6711d89dbef686bce2dcd8",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
@@ -80,10 +80,9 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 9,
+      "total": 4,
       "files": {
-        "src/lib/components/FirebasePanel.svelte": 7,
-        "src/lib/components/RepoPanel.svelte": 2
+        "src/lib/components/FirebasePanel.svelte": 4
       }
     },
     "15": {

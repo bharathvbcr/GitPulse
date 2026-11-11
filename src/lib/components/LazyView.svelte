@@ -158,8 +158,8 @@
     aria-busy="true"
     aria-label="Loading {name}"
   >
-    <Skeleton variant="text" width="35%" height="1rem" hold={false} />
-    <Skeleton variant="card" hold={false} />
-    <Skeleton variant="text" count={4} hold={false} />
+    <Skeleton variant="text" width="35%" height="1rem" />
+    <Skeleton variant="card" />
+    <Skeleton variant="text" count={4} />
   </div>
 {/if}

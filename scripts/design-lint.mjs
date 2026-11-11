@@ -70,13 +70,18 @@
  *      N is not 35, 65, 90 (or `[0.35]`, `[0.65]`, `[0.9]`); and `<style>`
  *      border/outline declarations using `/ 0.N` outside those stops.
  *   9  layout transitions: tokens `transition-all`, `transition-shadow`,
- *      `transition-[...]` naming width/height/top/left/margin/padding/filter/
- *      box-shadow/backdrop-filter/all/...; the same properties in `<style>`
- *      `transition`/`transition-property`. A bare `transition` token is not
+ *      `transition-[...]` and `[transition:...]`/`[transition-property:...]` naming
+ *      width/height/top/left/margin/padding/filter/box-shadow/backdrop-filter/all/...;
+ *      any arbitrary animation (`animate-[...]`, `[animation:...]` other than none),
+ *      which escapes the reduced-motion lists rule 15 checks; the same properties
+ *      in `<style>` `transition`/`transition-property`. Class strings in `.ts` files
+ *      are read too. A bare `transition` token is not
  *      flagged (Tailwind's default list includes box-shadow and filter, but the
  *      rule text names only the explicit forms), and the `gp-slide-docked`
  *      exception lives in app.css, which this rule does not read.
  *   10 motion literals: tokens `duration-N|[..]`, `ease-in|out|in-out|linear|[..]`;
+ *      a time or easing literal inside an `animate-[...]`/`transition-[...]`
+ *      arbitrary value (`animate-[x_200ms_ease-out]`);
  *      `duration: N` and `motionDuration(N` inside script and mustache code
  *      (so UI text such as "Duration: 5" is safe); `cubic-bezier(`; time
  *      literals in `<style>` `transition`/`animation` declarations. The
@@ -129,8 +134,17 @@
  *      contract tests; animated rules with no class in their subject (the range
  *      thumb) and animations in scoped `<style>` blocks are not examined.
  *
+ * GATE. `--strict` (the `design:gate` script, a step of `bun run ci:local`) adds
+ * what the ratchet alone does not say: every violation must be either fixed or
+ * named in scripts/design-lint.config.json. `allow` entries (permanent, each with a
+ * reason: brand art with no token) are printed as "allowed" and never dropped;
+ * `deferred` entries (a file another lane is rewriting) are held to the ratchet
+ * only. An entry that matches no violation fails the gate, so an exemption
+ * cannot outlive its cause. To re-baseline to zero: delete the deferred entries
+ * once their files are clean and retake the baseline.
+ *
  * Flags: --baseline (write the baseline; refuses a dirty src/ unless
- * --allow-dirty), --json, --list [--rule N] (print every violation),
+ * --allow-dirty), --strict, --config-file FILE, --json, --list [--rule N] (print every violation),
  * --root DIR, --baseline-file FILE, --help.
  */
 import { execFileSync } from "node:child_process";
@@ -154,8 +168,8 @@ export const APP_CSS = "src/app.css";
  * @typedef {{ tag: number, tagName: string, name: string, nameStart: number, segs: Seg[] }} Attr
  * @typedef {{ text: string, start: number, css: boolean }} ColorRegion
  * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][] }} Model
- * @typedef {{ rule: number, file: string, line: number, col: number, message: string }} Violation
- * @typedef {(offset: number, message: string) => void} Report
+ * @typedef {{ rule: number, file: string, line: number, col: number, message: string, term?: string }} Violation
+ * @typedef {(offset: number, message: string, term?: string) => void} Report
  * @typedef {{ id: number, name: string, summary: string, svelte: boolean, ts: boolean, css: boolean, run: (m: Model, report: Report) => void }} Rule
  */
 
@@ -866,8 +880,25 @@ const BANNED_TRANSITION_PROPS = new Set([
   "all", "width", "height", "min-width", "max-width", "min-height", "max-height", "top", "left", "right", "bottom", "inset",
   "margin", "margin-top", "margin-bottom", "margin-left", "margin-right", "padding", "padding-top", "padding-bottom", "padding-left",
   "padding-right", "filter", "box-shadow", "backdrop-filter", "-webkit-backdrop-filter", "border-width", "grid-template-columns",
-  "grid-template-rows", "flex-basis", "gap",
+  "grid-template-rows", "flex-basis", "gap", "block-size", "inline-size", "margin-block", "margin-inline", "padding-block",
+  "padding-inline", "inset-block", "inset-inline",
 ]);
+
+/**
+ * An arbitrary-property class, `[transition:height_200ms]` or
+ * `[animation:foo_1s]`: Tailwind writes the underscore for a space.
+ * @param {string} util @returns {{ prop: string, value: string } | null}
+ */
+function arbitraryProperty(util) {
+  const hit = /^\[([a-z-]+):(.+)\]$/.exec(util);
+  return hit ? { prop: hit[1], value: hit[2].replace(/_/g, " ") } : null;
+}
+
+/** @param {string} value an arbitrary class value, `_` standing for a space */
+function arbitraryHasMotionLiteral(value) {
+  const spaced = value.replace(/_/g, " ");
+  return hasTimeLiteral(spaced) || /cubic-bezier\(|(?<![\w-])(?:ease|ease-in|ease-out|ease-in-out|linear)(?![\w-])/.test(spaced);
+}
 
 /** @param {string} value comma-separated transition-property or shorthand list @returns {string[]} */
 function transitionedProperties(value) {
@@ -910,6 +941,25 @@ const GLOBAL_BANNED_TERMS = BANNED_UI_TERMS.map((t) => ({
   use: t.use,
   pattern: new RegExp(t.pattern.source, t.pattern.flags.includes("g") ? t.pattern.flags : `${t.pattern.flags}g`),
 }));
+
+/**
+ * Rule 14 false positives that are not a glossary breach, accepted by shape:
+ *   - "project" qualified as the vendor's own term: "Firebase project", "Google Cloud
+ *     project", "project alias", "project ID" (in Firebase and Google Cloud a project is
+ *     not a repository);
+ *   - "repo" as a URL path segment, the placeholder "github.com/owner/repo.git", which
+ *     is GitHub's own convention.
+ * A bare "project" or "repo" in prose still fails. A file whose bare uses are all the
+ * vendor's word is listed in design-lint.config.json (allow, rule 14, with a term and a reason).
+ * @param {string} term @param {string} text @param {number} at @param {number} len
+ */
+function isVendorTermUse(term, text, at, len) {
+  const before = text.slice(Math.max(0, at - 14), at);
+  const after = text.slice(at + len, at + len + 8);
+  if (term === "project") return /(?:Firebase|Google Cloud|GCP) $/i.test(before) || /^ (?:alias(?:es)?|IDs?)\b/i.test(after);
+  if (term === "repo") return before.endsWith("/") && (/^\.git\b/.test(after) || after === "" || after.startsWith("/"));
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Rule 15 helpers.
@@ -1160,9 +1210,9 @@ export const RULES = [
   {
     id: 9,
     name: "layout-transitions",
-    summary: "transition-all and non-compositor transitions",
+    summary: "transition-all, non-compositor transitions and arbitrary animations",
     svelte: true,
-    ts: false,
+    ts: true,
     css: false,
     run(m, report) {
       eachToken(m, (t) => {
@@ -1170,10 +1220,25 @@ export const RULES = [
           report(t.start, `${t.util}: animate transform and opacity (colors only at --gp-dur-instant)`);
           return;
         }
+        if (/^animate-\[.+\]$/.test(t.util)) {
+          report(t.start, `${t.util}: arbitrary animation escapes the reduced-motion lists (rule 15); use a named gp-* animation utility from src/app.css`);
+          return;
+        }
         const arb = /^transition-\[(.+)\]$/.exec(t.util);
-        if (!arb) return;
-        const bad = arb[1].split(/[,_]/).map((s) => s.trim().toLowerCase()).filter((s) => BANNED_TRANSITION_PROPS.has(s));
-        if (bad.length > 0) report(t.start, `${t.util}: transitions ${bad.join(", ")}; animate transform and opacity only`);
+        if (arb) {
+          const bad = arb[1].split(/[,_]/).map((s) => s.trim().toLowerCase()).filter((s) => BANNED_TRANSITION_PROPS.has(s));
+          if (bad.length > 0) report(t.start, `${t.util}: transitions ${bad.join(", ")}; animate transform and opacity only`);
+          return;
+        }
+        const prop = arbitraryProperty(t.util);
+        if (!prop) return;
+        if (/^animation(?:-name)?$/.test(prop.prop)) {
+          if (prop.value.trim() === "none") return;
+          report(t.start, `${t.util}: arbitrary animation escapes the reduced-motion lists (rule 15); use a named gp-* animation utility from src/app.css`);
+        } else if (prop.prop === "transition" || prop.prop === "transition-property") {
+          const bad = transitionedProperties(prop.value).filter((p) => BANNED_TRANSITION_PROPS.has(p));
+          if (bad.length > 0) report(t.start, `${t.util}: transitions ${bad.join(", ")}; animate transform and opacity only`);
+        }
       });
       for (const d of m.decls) {
         if (d.prop !== "transition" && d.prop !== "transition-property") continue;
@@ -1191,6 +1256,12 @@ export const RULES = [
     css: false,
     run(m, report) {
       if (OWNERS_OF_MOTION.test(m.file)) return;
+      eachToken(m, (t) => {
+        const arb = /^(?:animate|transition)-\[(.+)\]$/.exec(t.util);
+        const prop = arbitraryProperty(t.util);
+        const value = arb ? arb[1] : prop && /^(?:animation|transition)(?:-[a-z]+)?$/.test(prop.prop) ? prop.value : null;
+        if (value !== null && arbitraryHasMotionLiteral(value)) report(t.start, `${t.util}: duration or easing literal inside an arbitrary value, use --gp-dur-* / --gp-ease-* / src/lib/motion/tokens.ts`);
+      });
       if (m.kind === "svelte") {
         eachToken(m, (t) => {
           if (/^duration-(?:\d+|\[.+\])$/.test(t.util)) report(t.start, `${t.util}: duration literal, use --gp-dur-* / src/lib/motion/tokens.ts`);
@@ -1272,7 +1343,8 @@ export const RULES = [
       for (const s of m.copyStrings) {
         for (const term of GLOBAL_BANNED_TERMS) {
           for (const hit of s.text.matchAll(term.pattern)) {
-            report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`);
+            if (isVendorTermUse(term.term, s.text, hit.index ?? 0, hit[0].length)) continue;
+            report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`, term.term);
           }
         }
       }
@@ -1384,9 +1456,9 @@ export function lintSource(file, src, rules = RULES) {
   for (const rule of rules) {
     if (!(m.kind === "svelte" ? rule.svelte : m.kind === "ts" ? rule.ts : rule.css)) continue;
     /** @type {Report} */
-    const report = (offset, message) => {
+    const report = (offset, message, term) => {
       const { line, col } = lineCol(starts, offset);
-      out.push({ rule: rule.id, file, line, col, message });
+      out.push(term === undefined ? { rule: rule.id, file, line, col, message } : { rule: rule.id, file, line, col, message, term });
     };
     rule.run(m, report);
   }
@@ -1511,6 +1583,99 @@ export function readBaseline(file) {
   return /** @type {Baseline} */ (parsed);
 }
 
+// ---------------------------------------------------------------------------
+// Gate: allow-list, deferred files, strict verdict.
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {{ rule: number, file: string, reason: string, term?: string }} AllowEntry
+ * @typedef {{ file: string, rules: number[], owner: string, reason: string }} DeferredEntry
+ * @typedef {{ allow: AllowEntry[], deferred: DeferredEntry[] }} GateConfig
+ */
+
+export const DEFAULT_CONFIG_FILE = path.join(REPO_ROOT, "scripts", "design-lint.config.json");
+
+/**
+ * Read the gate config. A missing file is an empty config (nothing allowed,
+ * nothing deferred); a malformed one throws, because a config that could not be
+ * read must not quietly turn every exemption on or off.
+ *
+ * `allow` is permanent and every entry carries the reason it will never go
+ * away (brand art with no token to map to; a vendor's own term). An entry may name a
+ * `term` (rule 14), so it excuses that one word and not the rest of the rule. `deferred` is temporary: a file
+ * another lane is rewriting, held to the ratchet alone until that lane merges.
+ * The strict gate fails on an entry that matches no violation, so an exemption
+ * cannot outlive the thing it excused.
+ *
+ * @param {string} file @param {Rule[]} [rules] @returns {GateConfig}
+ */
+export function readGateConfig(file, rules = RULES) {
+  if (!existsSync(file)) return { allow: [], deferred: [] };
+  const parsed = JSON.parse(readFileSync(file, "utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} is not a design-lint config`);
+  const ids = new Set(rules.map((r) => r.id));
+  const nonEmpty = (/** @type {unknown} */ v) => typeof v === "string" && v.trim() !== "";
+  /** @type {AllowEntry[]} */
+  const allow = [];
+  for (const [i, e] of (parsed.allow ?? []).entries()) {
+    if (!ids.has(e?.rule) || !nonEmpty(e?.file) || !nonEmpty(e?.reason)) throw new Error(`${file}: allow[${i}] needs a rule (1-${rules.length}), a file and a non-empty reason`);
+    if (e.term !== undefined && !nonEmpty(e.term)) throw new Error(`${file}: allow[${i}].term must be a non-empty string when present`);
+    allow.push(e.term === undefined ? { rule: e.rule, file: e.file, reason: e.reason.trim() } : { rule: e.rule, file: e.file, reason: e.reason.trim(), term: e.term });
+  }
+  /** @type {DeferredEntry[]} */
+  const deferred = [];
+  for (const [i, e] of (parsed.deferred ?? []).entries()) {
+    const ok = nonEmpty(e?.file) && nonEmpty(e?.owner) && nonEmpty(e?.reason) && Array.isArray(e?.rules) && e.rules.length > 0 && e.rules.every((/** @type {number} */ r) => ids.has(r));
+    if (!ok) throw new Error(`${file}: deferred[${i}] needs a file, rules, an owner and a non-empty reason`);
+    deferred.push({ file: e.file, rules: e.rules, owner: e.owner, reason: e.reason.trim() });
+  }
+  return { allow, deferred };
+}
+
+/**
+ * Sort every violation into exactly one bucket: allowed (permanent, reported),
+ * deferred (temporary, ratchet-only) or open (the gate fails on it). Entries that
+ * matched nothing come back as `stale`.
+ *
+ * @param {Violation[]} violations @param {GateConfig} config
+ * @returns {{ open: Violation[], allowed: (Violation & { reason: string })[], deferred: (Violation & { reason: string, owner: string })[], stale: string[] }}
+ */
+export function classifyViolations(violations, config) {
+  /** @type {ReturnType<typeof classifyViolations>} */
+  const out = { open: [], allowed: [], deferred: [], stale: [] };
+  const used = new Set();
+  for (const v of violations) {
+    const a = config.allow.findIndex((e) => e.rule === v.rule && e.file === v.file && (e.term === undefined || e.term === v.term));
+    if (a >= 0) {
+      used.add(`a${a}`);
+      out.allowed.push({ ...v, reason: config.allow[a].reason });
+      continue;
+    }
+    const d = config.deferred.findIndex((e) => e.file === v.file && e.rules.includes(v.rule));
+    if (d >= 0) {
+      used.add(`d${d}`);
+      out.deferred.push({ ...v, reason: config.deferred[d].reason, owner: config.deferred[d].owner });
+      continue;
+    }
+    out.open.push(v);
+  }
+  config.allow.forEach((e, i) => {
+    if (!used.has(`a${i}`)) out.stale.push(`allow: rule ${e.rule} ${e.file}${e.term === undefined ? "" : ` (${e.term})`} no longer has a violation; remove the entry`);
+  });
+  config.deferred.forEach((e, i) => {
+    if (!used.has(`d${i}`)) out.stale.push(`deferred: ${e.file} (${e.owner}) no longer has a violation of rules ${e.rules.join(", ")}; remove the entry and retake the baseline`);
+  });
+  return out;
+}
+
+/** @param {{ file: string, rule: number }[]} hits @returns {string[]} one "rule N  file xCOUNT" line per pair */
+function tally(hits) {
+  /** @type {Map<string, number>} */
+  const by = new Map();
+  for (const h of hits) by.set(`rule ${String(h.rule).padStart(2)}  ${h.file}`, (by.get(`rule ${String(h.rule).padStart(2)}  ${h.file}`) ?? 0) + 1);
+  return [...by.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => `${k} x${n}`);
+}
+
 /** @param {string} root @param {string[]} args @returns {string} */
 function git(root, args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -1527,6 +1692,8 @@ export function usage() {
     flags: [
       { flag: "--baseline", description: "write scripts/design-lint.baseline.json from the current tree and HEAD" },
       { flag: "--allow-dirty", description: "with --baseline: accept uncommitted changes under src/" },
+      { flag: "--strict", description: "the gate: also fail on any violation not allow-listed or deferred in the config, and on a config entry that matches nothing" },
+      { flag: "--config-file <file>", description: "alternate gate config path (default scripts/design-lint.config.json)" },
       { flag: "--json", description: "machine-readable result" },
       { flag: "--list", description: "print every violation, not only the ones over baseline" },
       { flag: "--rule <n>", description: "with --list: only this rule" },
@@ -1534,7 +1701,7 @@ export function usage() {
       { flag: "--baseline-file <file>", description: "alternate baseline path" },
       { flag: "--help, -h", description: "print this message and exit 0" },
     ],
-    exits: "0 no count rose · 1 a (rule, file) count rose or a new file has violations · 2 the check could not run",
+    exits: "0 no count rose (with --strict: and nothing is open) · 1 a count rose, a new file has violations, or with --strict a violation is open or an exemption is stale · 2 the check could not run",
   });
 }
 
@@ -1542,7 +1709,7 @@ export function usage() {
  * @param {string[]} argv
  */
 export function parseArgs(argv) {
-  const opts = { baseline: false, allowDirty: false, json: false, list: false, rule: /** @type {number | null} */ (null), root: REPO_ROOT, baselineFile: "" };
+  const opts = { baseline: false, allowDirty: false, json: false, list: false, strict: false, rule: /** @type {number | null} */ (null), root: REPO_ROOT, baselineFile: "", configFile: "" };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     /** @returns {string} */
@@ -1555,6 +1722,8 @@ export function parseArgs(argv) {
     else if (arg === "--allow-dirty") opts.allowDirty = true;
     else if (arg === "--json") opts.json = true;
     else if (arg === "--list") opts.list = true;
+    else if (arg === "--strict") opts.strict = true;
+    else if (arg === "--config-file") opts.configFile = path.resolve(next());
     else if (arg === "--rule") {
       const n = Number(next());
       if (!Number.isInteger(n)) throw new Error("--rule needs a rule number");
@@ -1564,6 +1733,7 @@ export function parseArgs(argv) {
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (opts.baselineFile === "") opts.baselineFile = opts.root === REPO_ROOT ? DEFAULT_BASELINE_FILE : path.join(opts.root, "scripts", "design-lint.baseline.json");
+  if (opts.configFile === "") opts.configFile = opts.root === REPO_ROOT ? DEFAULT_CONFIG_FILE : path.join(opts.root, "scripts", "design-lint.config.json");
   return opts;
 }
 
@@ -1622,7 +1792,10 @@ export function main(argv = process.argv.slice(2)) {
     }
     const baseline = readBaseline(opts.baselineFile);
     const { increases, decreases } = compareToBaseline(counts, baseline);
-    const ok = increases.length === 0;
+    const config = readGateConfig(opts.configFile);
+    const verdict = classifyViolations(violations, config);
+    const strictOk = verdict.open.length === 0 && verdict.stale.length === 0;
+    const ok = increases.length === 0 && (!opts.strict || strictOk);
 
     if (opts.json) {
       const over = new Set(increases.map((i) => `${i.rule}\0${i.file}`));
@@ -1630,12 +1803,17 @@ export function main(argv = process.argv.slice(2)) {
         JSON.stringify(
           {
             ok,
+            strict: opts.strict,
             files,
             baselineCommit: baseline.commit,
             totals,
             baselineTotals: Object.fromEntries(Object.entries(baseline.rules).map(([id, r]) => [id, r.total])),
             increases,
             decreases,
+            allowed: verdict.allowed,
+            deferred: verdict.deferred,
+            open: verdict.open,
+            stale: verdict.stale,
             violations: violations.filter((v) => (opts.list ? opts.rule === null || v.rule === opts.rule : over.has(`${v.rule}\0${v.file}`))),
           },
           null,
@@ -1655,19 +1833,41 @@ export function main(argv = process.argv.slice(2)) {
     if (opts.list) {
       for (const v of violations) if (opts.rule === null || v.rule === opts.rule) console.log(formatViolation(v));
     }
+    if (verdict.allowed.length > 0) {
+      console.log(`
+allowed (${verdict.allowed.length}, reported and never counted as failures):`);
+      for (const line of tally(verdict.allowed)) console.log(`  ${line}`);
+      for (const e of config.allow) console.log(`  why: ${e.file} rule ${e.rule}${e.term === undefined ? "" : ` (${e.term})`}: ${e.reason}`);
+    }
+    if (verdict.deferred.length > 0) {
+      console.log(`
+deferred (${verdict.deferred.length}, held to the ratchet until their owner merges):`);
+      for (const line of tally(verdict.deferred)) console.log(`  ${line}`);
+      for (const e of config.deferred) console.log(`  why: ${e.file} (${e.owner}): ${e.reason}`);
+    }
     if (decreases.length > 0) {
       const gone = decreases.reduce((a, d) => a + d.before - d.after, 0);
       console.log(`\nprogress: ${gone} violation${gone === 1 ? "" : "s"} fixed across ${decreases.length} (rule, file) pair${decreases.length === 1 ? "" : "s"}; run --baseline to lock it in`);
     }
     if (!ok) {
-      console.log(`\nFAIL: ${increases.length} (rule, file) count${increases.length === 1 ? "" : "s"} rose over the baseline`);
-      for (const inc of increases) {
-        console.log(`  rule ${inc.rule}  ${inc.file}: ${inc.before} -> ${inc.after}${inc.isNew ? " (new)" : ""}`);
-        for (const v of violations) if (v.rule === inc.rule && v.file === inc.file) console.log(`    ${formatViolation(v)}`);
+      if (increases.length > 0) {
+        console.log(`\nFAIL: ${increases.length} (rule, file) count${increases.length === 1 ? "" : "s"} rose over the baseline`);
+        for (const inc of increases) {
+          console.log(`  rule ${inc.rule}  ${inc.file}: ${inc.before} -> ${inc.after}${inc.isNew ? " (new)" : ""}`);
+          for (const v of violations) if (v.rule === inc.rule && v.file === inc.file) console.log(`    ${formatViolation(v)}`);
+        }
+      }
+      if (opts.strict && verdict.open.length > 0) {
+        console.log(`\nFAIL: ${verdict.open.length} violation${verdict.open.length === 1 ? "" : "s"} outside the allow-list (fix them; the allow-list is for brand art with a reason, not for debt)`);
+        for (const v of verdict.open) console.log(`  ${formatViolation(v)}`);
+      }
+      if (opts.strict && verdict.stale.length > 0) {
+        console.log(`\nFAIL: ${verdict.stale.length} stale config entr${verdict.stale.length === 1 ? "y" : "ies"}`);
+        for (const line of verdict.stale) console.log(`  ${line}`);
       }
       return 1;
     }
-    console.log("\nOK: no count rose over the baseline");
+    console.log(opts.strict ? "\nOK: no count rose over the baseline and nothing is open outside the allow-list" : "\nOK: no count rose over the baseline");
     return 0;
   } catch (err) {
     console.error(`design-lint: internal error: ${/** @type {Error} */ (err).message}`);

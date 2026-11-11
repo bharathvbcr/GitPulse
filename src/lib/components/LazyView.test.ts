@@ -73,7 +73,10 @@ describe("LazyView pending and failed states", () => {
   });
 
   it("swaps the skeleton for the view without an outro that would split the box", () => {
-    expect(source.match(/hold=\{false\}/g)?.length).toBe(3);
+    // Skeleton leaves at once by default; opting into `hold` would keep it in
+    // flow beside the view that replaces it.
+    expect(source.match(/<Skeleton\b/g)?.length).toBe(3);
+    expect(source).not.toMatch(/<Skeleton[^>]*\bhold\b/);
   });
 
   it("spreads optional props onto the resolved view, the same seam LazyMount uses", () => {
