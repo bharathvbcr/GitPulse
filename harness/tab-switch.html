@@ -389,9 +389,10 @@
             // bounded so a stuck one cannot hang the capture, and two frames so
             // the last one is painted.
             const finite = () => document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity);
+            const timelineStart = Number(document.timeline.currentTime ?? 0);
             const animationsDone = await sleepUntil(() => finite().every((a) => a.playState === "finished" || a.playState === "idle"), 6000);
             await raf(); await raf();
-            document.documentElement.dataset.gpShotAnimations = animationsDone ? "settled" : `pending ${finite().filter((a) => a.playState === "running").length}: ${[...new Set(finite().filter((a) => a.playState === "running").map((a) => `${a.animationName ?? a.transitionProperty ?? "script"}@${Math.round(Number(a.currentTime ?? 0))}/${Math.round(Number(a.effect?.getComputedTiming().endTime ?? 0))}<${(a.effect?.target?.className?.toString?.() ?? a.effect?.target?.nodeName ?? "").slice(0, 40)}>`))].slice(0, 6).join(",")}`;
+            document.documentElement.dataset.gpShotAnimations = animationsDone ? "settled" : `pending (timeline moved ${Math.round(Number(document.timeline.currentTime ?? 0) - timelineStart)}ms) ${finite().filter((a) => a.playState === "running").length}:${[...new Set(finite().filter((a) => a.playState === "running").map((a) => `${a.animationName ?? a.transitionProperty ?? "script"}@${Math.round(Number(a.currentTime ?? 0))}/${Math.round(Number(a.effect?.getComputedTiming().endTime ?? 0))}<${(a.effect?.target?.className?.toString?.() ?? a.effect?.target?.nodeName ?? "").slice(0, 40)}>`))].slice(0, 6).join(",")}`;
             $("#result").textContent = `shot ready: ${shot}`;
             document.documentElement.dataset.gpShot = "ready";
             return;
