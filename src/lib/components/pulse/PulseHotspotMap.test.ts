@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+// Imported at module level, not inside the test: compiling the component and
+// its import graph then happens while the file is collected, outside the 5 s
+// per-test timeout it used to exhaust on a loaded host.
+import { render } from "svelte/server";
+import PulseHotspotMap from "./PulseHotspotMap.svelte";
 
 const source = readFileSync(new URL("./PulseHotspotMap.svelte", import.meta.url), "utf8");
 
@@ -43,9 +48,7 @@ describe("PulseHotspotMap component", () => {
 });
 
 describe("PulseHotspotMap rescan action", () => {
-  it("offers Rescan on a failed coverage scan, only when the parent can rescan", async () => {
-    const { render } = await import("svelte/server");
-    const { default: PulseHotspotMap } = await import("./PulseHotspotMap.svelte");
+  it("offers Rescan on a failed coverage scan, only when the parent can rescan", () => {
     const props = { topFiles: [], coverageReport: null, coverageFailed: true };
     expect(render(PulseHotspotMap, { props }).body).not.toContain("Rescan");
     expect(render(PulseHotspotMap, { props: { ...props, onRescanCoverage: () => {} } }).body).toContain("Rescan");

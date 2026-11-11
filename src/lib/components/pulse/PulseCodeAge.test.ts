@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+// Imported at module level, not inside the test: compiling the component and
+// its import graph then happens while the file is collected, outside the 5 s
+// per-test timeout it used to exhaust on a loaded host.
+import { render } from "svelte/server";
+import PulseCodeAge from "./PulseCodeAge.svelte";
 
 const source = readFileSync(new URL("./PulseCodeAge.svelte", import.meta.url), "utf8");
 
@@ -36,9 +41,7 @@ describe("PulseCodeAge failure state", () => {
 });
 
 describe("PulseCodeAge rescan action", () => {
-  it("offers Rescan on a blame scan that measured nothing, only when the parent can refresh", async () => {
-    const { render } = await import("svelte/server");
-    const { default: PulseCodeAge } = await import("./PulseCodeAge.svelte");
+  it("offers Rescan on a blame scan that measured nothing, only when the parent can refresh", () => {
     const failed = { knowledge: null, error: "blame timed out" };
     expect(render(PulseCodeAge, { props: failed }).body).not.toContain("Rescan");
     const withRefresh = render(PulseCodeAge, { props: { ...failed, onRefresh: () => {} } }).body;
