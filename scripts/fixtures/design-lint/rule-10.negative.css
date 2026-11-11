@@ -1,0 +1,14 @@
+/* The tokens are defined with literals; the rules that use them do not repeat them. */
+:root {
+  --gp-dur-fast: 140ms;
+  --gp-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+@theme {
+  --animate-pop: gp-pop 180ms ease-out;
+}
+.gp-a {
+  transition: opacity var(--gp-dur-fast) var(--gp-ease-out);
+}
+.gp-b {
+  animation: gp-in var(--gp-dur-base, 180ms) var(--gp-ease-out) both;
+}

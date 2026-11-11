@@ -11,6 +11,7 @@ import {
   classifyViolations,
   compareToBaseline,
   countViolations,
+  lintFiles,
   lintRepo,
   lintSource,
   main,
@@ -120,9 +121,146 @@ describe("design-lint rules: one positive and one negative fixture each", () => 
     expect(lintSource("src/lib/ui/copy/vocabulary.ts", 'export const n = "border-red-500/60!";\n').filter((v) => v.rule === 3)).toHaveLength(1);
   });
 
-  it("TypeScript files run no rule but 3, 9 and 10", () => {
+  it("TypeScript files run no rule but 1, 3, 9, 10 and 14 (strings only)", () => {
     const ts = lintSource("src/lib/x.ts", 'export const c = "text-[10px] border-t z-50 rounded-3xl text-amber-400 uppercase tracking-wide";\n');
-    expect([...new Set(ts.map((v) => v.rule))]).toEqual([3]);
+    expect([...new Set(ts.map((v) => v.rule))]).toEqual([1, 3]);
+  });
+});
+
+describe("design-lint widened scopes: <style> blocks, stylesheets and .ts strings", () => {
+  const messages = (rule: number, name: string, as?: string) => hits(rule, name, as).map((v) => v.message.split(": ")[0]);
+
+  it("rule 1 reads font-size: Npx and @apply text-[Npx] in a <style> block, and not a token, rem or a comment", () => {
+    expect(messages(1, "rule-01-style.positive.svelte")).toEqual(["font-size", "font-size", "text-[10px]"]);
+    expect(hits(1, "rule-01-style.negative.svelte")).toEqual([]);
+  });
+
+  it("rule 1 reads a stylesheet, and exempts the token definitions in @theme and :root", () => {
+    expect(messages(1, "rule-01.positive.css")).toEqual(["font-size", "text-[10px]", "font-size"]);
+    expect(hits(1, "rule-01.negative.css")).toEqual([]);
+  });
+
+  it("rule 1 reads class strings in TypeScript, and not a comment, a token or an identifier", () => {
+    expect(messages(1, "rule-01.positive.ts.txt")).toEqual(["text-[10px]", "text-[17px]"]);
+    expect(hits(1, "rule-01.negative.ts.txt")).toEqual([]);
+  });
+
+  it("rule 3 reads @apply in <style> and in a stylesheet, dark: pairs included", () => {
+    expect(messages(3, "rule-03-apply.positive.svelte")).toEqual(["border-rose-500/35", "bg-rose-500/10", "text-rose-400", "dark:text-amber-300"]);
+    expect(hits(3, "rule-03-apply.negative.svelte")).toEqual([]);
+    expect(messages(3, "rule-03.positive.css")).toEqual(["border-amber-500/30", "bg-amber-500/[0.05]", "dark:border-amber-400/60"]);
+    expect(hits(3, "rule-03.negative.css")).toEqual([]);
+  });
+
+  it("rule 4 reads the declaration values of a stylesheet, and exempts custom properties and masks", () => {
+    expect(hits(4, "rule-04.positive.css")).toHaveLength(3);
+    expect(hits(4, "rule-04.negative.css")).toEqual([]);
+  });
+
+  it("rule 8 reads @apply opacity and border declarations in a stylesheet", () => {
+    expect(messages(8, "rule-08.positive.css")).toEqual(["border-border/70", "border"]);
+    expect(hits(8, "rule-08.negative.css")).toEqual([]);
+  });
+
+  it("rule 9 reads layout transitions in a stylesheet, and names gp-slide-docked as the one exception", () => {
+    expect(hits(9, "rule-09.positive.css")).toHaveLength(4);
+    expect(hits(9, "rule-09.negative.css")).toEqual([]);
+  });
+
+  it("rule 10 reads duration and easing literals in a stylesheet, and not the token definitions or var() fallbacks", () => {
+    expect(hits(10, "rule-10.positive.css")).toHaveLength(5);
+    expect(hits(10, "rule-10.negative.css")).toEqual([]);
+  });
+
+  it("a stylesheet other than app.css is linted too, and rule 15 still reads app.css alone", () => {
+    const css = ".x { font-size: 12px; animation: a 1s linear; }\n";
+    expect(lintSource("src/status.css", css).map((v) => v.rule)).toEqual([1, 10]);
+    expect(lintSource("src/app.css", css).map((v) => v.rule)).toContain(15);
+    expect(lintSource("src/status.css", css).map((v) => v.rule)).not.toContain(15);
+  });
+
+  it("rule 14 reads the copy strings of a .ts file: two words, or one word under a display key", () => {
+    const found = hits(14, "rule-14.positive.ts.txt");
+    expect(found.map((v) => v.term)).toEqual(["MANVI", "harness", "code graph", "devmap", "attempt", "Retry", "Reload"]);
+    expect(hits(14, "rule-14.negative.ts.txt")).toEqual([]);
+  });
+
+  it("rule 14 leaves the ban list itself and fixture data alone", () => {
+    const text = 'export const t = "MANVI policy checks are failing";\n';
+    expect(lintSource("src/lib/ui/copy/vocabulary.ts", text).filter((v) => v.rule === 14)).toEqual([]);
+    expect(lintSource("src/lib/x.fixtures.ts", text).filter((v) => v.rule === 14)).toEqual([]);
+    expect(lintSource("src/lib/x.ts", text).filter((v) => v.rule === 14)).toHaveLength(1);
+  });
+
+  it("rule 14 keeps a snake_case word that is prose in a .ts string, and drops one in an Error message, a path or a log pair", () => {
+    const rule14 = (text: string) => lintSource("src/lib/x.ts", `export const t = ${text};\n`).filter((v) => v.rule === 14).map((v) => v.term);
+    expect(rule14('"Match repository and run_id."')).toEqual(["snake_case identifier"]);
+    expect(rule14('new Error("health: audit_coverage was corrupt")')).toEqual([]);
+    expect(rule14('"go install x/go_orchestrator/cmd"')).toEqual([]);
+    expect(rule14('"reached max_gap_ms=5"')).toEqual([]);
+    expect(rule14('"skips node_modules itself"')).toEqual([]);
+  });
+
+  it("rule 14 flags a retired verb at the start of a label, and only there", () => {
+    const found = hits(14, "rule-14-verbs.positive.svelte");
+    expect(found.map((v) => `${v.line}:${v.term}`)).toEqual(["1:Retry", "2:Reload", "2:Reload", "3:Recheck", "4:Launch", "5:Retry", "6:Organise", "7:Retry", "7:Retry"]);
+    expect(found[0].message).toContain('say "Try again"');
+    expect(hits(14, "rule-14-verbs.negative.svelte")).toEqual([]);
+  });
+
+  it("rule 14 positions a retired verb on the verb, not on the whitespace before it", () => {
+    const [hit] = lintSource("src/lib/x.svelte", "<button>\n    Retry\n</button>\n").filter((v) => v.rule === 14);
+    expect({ line: hit.line, col: hit.col }).toEqual({ line: 2, col: 5 });
+  });
+
+  it("rule 17 flags a gp-* class in markup that no stylesheet defines, reporting it at the use", () => {
+    const { violations } = lintFiles([
+      ["src/app.css", fixture("rule-17.styles.css")],
+      ["src/lib/x.svelte", fixture("rule-17.positive.svelte")],
+    ]);
+    const undefinedUses = violations.filter((v) => v.rule === 17);
+    expect(undefinedUses.map((v) => `${v.file}:${v.line}:${v.term}`)).toEqual([
+      "src/lib/x.svelte:1:gp-missing",
+      "src/lib/x.svelte:2:gp-input",
+      "src/lib/x.svelte:2:gp-ghosty",
+      "src/lib/x.svelte:5:gp-nope",
+    ]);
+  });
+
+  it("rule 17 counts a class defined as a context, in a <style>, or in an @apply, and skips a dynamic prefix", () => {
+    const { violations } = lintFiles([
+      ["src/app.css", fixture("rule-17.negative.css")],
+      ["src/lib/x.svelte", fixture("rule-17.negative.svelte")],
+    ]);
+    expect(violations.filter((v) => v.rule === 17)).toEqual([]);
+  });
+
+  it("rule 18 flags a defined gp-* class nothing uses, at its definition, and not one named only in :not()", () => {
+    const { violations } = lintFiles([
+      ["src/app.css", fixture("rule-17.styles.css")],
+      ["src/lib/x.svelte", fixture("rule-17.positive.svelte")],
+    ]);
+    expect(violations.filter((v) => v.rule === 18).map((v) => `${v.file}:${v.line}:${v.term}`)).toEqual([
+      "src/app.css:7:gp-menu-item",
+      "src/app.css:10:gp-row",
+      "src/app.css:13:gp-dead",
+    ]);
+  });
+
+  it("rule 18 keeps a class alive that a script toggles, a dynamic prefix covers, @apply composes or index.html uses", () => {
+    const entries: [string, string][] = [
+      ["src/app.css", fixture("rule-17.negative.css")],
+      ["src/lib/x.svelte", fixture("rule-17.negative.svelte")],
+    ];
+    expect(lintFiles(entries, RULES, '<div class="gp-boot-only"></div>').violations.filter((v) => v.rule === 18)).toEqual([]);
+    expect(lintFiles(entries).violations.filter((v) => v.rule === 18).map((v) => v.term)).toEqual(["gp-boot-only"]);
+  });
+
+  it("a comment, a test file and a <style> body are not uses", () => {
+    const css = "@utility gp-a { @apply p-1; }\n@utility gp-b { @apply p-1; }\n";
+    const svelte = '<!-- gp-a -->\n<p class="x">a</p>\n<style>\n  .gp-b { color: red; }\n</style>\n';
+    const { violations } = lintFiles([["src/app.css", css], ["src/lib/x.svelte", svelte]]);
+    expect(violations.filter((v) => v.rule === 18).map((v) => v.term)).toEqual(["gp-a", "gp-b"]);
   });
 });
 
@@ -189,8 +327,9 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
 });
 
 describe("design-lint registry", () => {
-  it("has one entry per rule 1-16, rule 14 being the single banned-terms entry", () => {
-    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  it("has one entry per rule 1-18, rule 14 being the single banned-terms entry", () => {
+    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+    for (const r of RULES) expect(Boolean(r.run) !== Boolean(r.runRepo), `rule ${r.id} has exactly one of run and runRepo`).toBe(true);
     expect(new Set(RULES.map((r) => r.name)).size).toBe(RULES.length);
     for (const r of RULES) expect(r.summary).not.toBe("");
     expect(RULES.filter((r) => r.id === 14).map((r) => r.name)).toEqual(["banned-ui-terms"]);
@@ -295,8 +434,8 @@ describe("design-lint rule 14: banned UI terms", () => {
     expect(rule14('<a class="attempt lane" href="/project/repo" id="harness"></a>')).toEqual([]);
   });
 
-  it("is a .svelte rule: TypeScript and CSS files never run it", () => {
-    expect(lintSource("src/lib/x.ts", 'export const t = "Retry attempt";\n').filter((v) => v.rule === 14)).toEqual([]);
+  it("reads the copy strings of a .ts file, and never a stylesheet", () => {
+    expect(lintSource("src/lib/x.ts", 'export const t = "Open this attempt";\n').filter((v) => v.rule === 14)).toHaveLength(1);
     expect(lintSource("src/app.css", ".attempt { content: 'attempt'; }\n").filter((v) => v.rule === 14)).toEqual([]);
   });
 
@@ -471,6 +610,40 @@ describe("design-lint CLI against a scratch repository", () => {
     const { violations } = lintRepo({ root: dir });
     expect(violations.filter((x) => x.rule === 3).map((x) => x.file)).toEqual(["src/f.ts"]);
   });
+
+  it("reads a source directory named coverage (it was skipped by name, which hid src/lib/coverage/format.ts), and still skips node_modules", () => {
+    write("src/lib/coverage/format.ts", 'export const hit = "bg-emerald-500/15";\n');
+    write("src/lib/node_modules/x.ts", 'export const hit = "bg-emerald-500/15";\n');
+    const { violations } = lintRepo({ root: dir });
+    expect(violations.filter((x) => x.rule === 3).map((x) => x.file)).toEqual(["src/lib/coverage/format.ts"]);
+  });
+
+  it("holds a stylesheet to the ratchet: a planted violation in app.css fails the run, and passes once it is removed", () => {
+    write("src/app.css", ".gp-a {\n  transition: opacity var(--gp-dur-fast);\n}\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "css");
+    expect(run("--baseline").code).toBe(0);
+    expect(run().code).toBe(0);
+    write("src/app.css", ".gp-a {\n  transition: opacity 120ms;\n  font-size: 12px;\n}\n");
+    const planted = run();
+    expect(planted.code).toBe(1);
+    expect(planted.out).toContain("src/app.css:2:3  rule 10");
+    expect(planted.out).toContain("src/app.css:3:3  rule 1");
+    write("src/app.css", ".gp-a {\n  transition: opacity var(--gp-dur-fast);\n}\n");
+    expect(run().code).toBe(0);
+  });
+
+  it("counts the gp-* class rules in the baseline, per file, and fails when an undefined class is added", () => {
+    write("src/app.css", "@utility gp-card {\n  @apply p-1;\n}\n");
+    write("src/b.svelte", '<div class="gp-card">b</div>\n');
+    git("add", "-A");
+    git("commit", "-q", "-m", "gp");
+    expect(run("--baseline").code).toBe(0);
+    write("src/b.svelte", '<div class="gp-card gp-ghost">b</div>\n');
+    const r = run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("rule 17  src/b.svelte: 0 -> 1 (new)");
+  });
 });
 
 describe("design-lint gate (--strict) against a scratch repository", () => {
@@ -611,12 +784,15 @@ describe("the committed gate config", () => {
     for (const e of cfg.deferred) expect(e.owner).not.toBe("");
   });
 
-  it("allow-lists nothing but the brand marks (rule 4) and Firebase's own word \"project\" (rule 14)", () => {
+  it("allow-lists nothing but the brand marks (rule 4), Firebase's own word \"project\" two agent prompts and the embedded browser's reload (rule 14)", () => {
     const cfg = readGateConfig(configFile);
     expect(cfg.allow.map((e) => `${e.rule}:${e.file}${e.term ? `:${e.term}` : ""}`)).toEqual([
       "4:src/lib/components/Logo.svelte",
       "4:src/lib/components/files/MarkDevLogo.svelte",
       "14:src/lib/components/FirebasePanel.svelte:project",
+      "14:src/lib/workbench/taskCompose.ts:snake_case identifier",
+      "14:src/lib/secrets/agentPrompt.ts:project",
+      "14:src/lib/components/BrowserSession.svelte:Reload",
     ]);
   });
 

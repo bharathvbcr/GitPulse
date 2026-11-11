@@ -1,0 +1,4 @@
+// text-[10px] named in a comment is not a class
+export const CELL = "px-1 text-micro font-mono";
+export const VAR = "text-[var(--x)]";
+export const text10px = 10;

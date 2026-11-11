@@ -1,0 +1,12 @@
+.gp-a {
+  transition: box-shadow 1s;
+}
+.gp-b {
+  @apply transition-[width,opacity];
+}
+.gp-c {
+  transition-property: height;
+}
+@utility gp-slide-other {
+  transition-property: width;
+}

@@ -1,0 +1,6 @@
+.gp-chip {
+  @apply border border-border/70;
+}
+.gp-rule {
+  border: 1px solid rgb(var(--c-border) / 0.6);
+}

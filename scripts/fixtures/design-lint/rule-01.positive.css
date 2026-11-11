@@ -1,0 +1,9 @@
+.gp-note {
+  font-size: 12px;
+}
+.gp-chip {
+  @apply text-[10px] font-medium;
+}
+@utility gp-big {
+  font-size: 15.5px;
+}

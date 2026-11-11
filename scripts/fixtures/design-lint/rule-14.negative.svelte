@@ -7,7 +7,7 @@
 </script>
 
 <!-- A comment about the attempt, the lane and MANVI. -->
-<button data-testid="attempt-retry">Retry</button>
+<button data-testid="attempt-retry">Try again</button>
 <Row data-testid="project-lane" data-harness="on" />
 <p>{attemptCount} {lane.name} {project.repo.attempt} {harness}</p>
 <p>{item.kind === "attempt" ? "Done" : "Open"} {"lane" !== kind ? "x" : "y"}</p>

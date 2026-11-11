@@ -1,12 +1,36 @@
 {
   "schema": 1,
-  "commit": "d22f86583d9c4e53a7ef63baeab0668c6837f448",
+  "commit": "c7eefe3d1b1c31302d622b1fc91e7565621f7467",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 0,
-      "files": {}
+      "total": 92,
+      "files": {
+        "src/app.css": 9,
+        "src/lib/components/AttentionInbox.svelte": 1,
+        "src/lib/components/AutomaticEnhancements.svelte": 1,
+        "src/lib/components/CommandPalette.svelte": 17,
+        "src/lib/components/NativeNotificationBridge.svelte": 2,
+        "src/lib/components/NativeNotificationSettings.svelte": 1,
+        "src/lib/components/ScanProposals.svelte": 6,
+        "src/lib/components/SessionNotificationBridge.svelte": 1,
+        "src/lib/components/TaskActionDialog.svelte": 1,
+        "src/lib/components/TaskArchive.svelte": 1,
+        "src/lib/components/TaskDuePicker.svelte": 4,
+        "src/lib/components/TaskEditor.svelte": 9,
+        "src/lib/components/TaskHandoffForm.svelte": 1,
+        "src/lib/components/TaskHandoffSheet.svelte": 1,
+        "src/lib/components/TaskMergeDialog.svelte": 1,
+        "src/lib/components/TaskSavedViews.svelte": 3,
+        "src/lib/components/TaskViewMenu.svelte": 5,
+        "src/lib/components/WavePanel.svelte": 6,
+        "src/lib/components/WorkView.svelte": 1,
+        "src/lib/components/WorkspaceEditor.svelte": 1,
+        "src/lib/components/onboarding/ProductTour.svelte": 1,
+        "src/lib/coverage/fileCoverage.ts": 1,
+        "src/lib/desktop/StatusPopover.svelte": 18
+      }
     },
     "2": {
       "name": "weight-and-case",
@@ -15,13 +39,17 @@
     },
     "3": {
       "name": "palette-colors",
-      "total": 0,
-      "files": {}
+      "total": 9,
+      "files": {
+        "src/app.css": 7,
+        "src/lib/coverage/format.ts": 2
+      }
     },
     "4": {
       "name": "color-literals",
-      "total": 17,
+      "total": 28,
       "files": {
+        "src/app.css": 11,
         "src/lib/components/Logo.svelte": 8,
         "src/lib/components/files/MarkDevLogo.svelte": 9
       }
@@ -43,18 +71,24 @@
     },
     "8": {
       "name": "border-opacity",
-      "total": 0,
-      "files": {}
+      "total": 23,
+      "files": {
+        "src/app.css": 23
+      }
     },
     "9": {
       "name": "layout-transitions",
-      "total": 0,
-      "files": {}
+      "total": 6,
+      "files": {
+        "src/app.css": 6
+      }
     },
     "10": {
       "name": "motion-literals",
-      "total": 0,
-      "files": {}
+      "total": 20,
+      "files": {
+        "src/app.css": 20
+      }
     },
     "11": {
       "name": "backdrop-blur",
@@ -73,9 +107,66 @@
     },
     "14": {
       "name": "banned-ui-terms",
-      "total": 4,
+      "total": 142,
       "files": {
-        "src/lib/components/FirebasePanel.svelte": 4
+        "src/lib/agents/plane.ts": 11,
+        "src/lib/branches/types.ts": 2,
+        "src/lib/codeintel/buildBlock.ts": 1,
+        "src/lib/codeintel/diagnostics.ts": 1,
+        "src/lib/codeintel/linkCandidates.ts": 3,
+        "src/lib/codeintel/previewNormalize.ts": 2,
+        "src/lib/codeintel/rungFilter.ts": 2,
+        "src/lib/codeintel/types.ts": 5,
+        "src/lib/components/BrowserSession.svelte": 2,
+        "src/lib/components/CommandPalette.svelte": 1,
+        "src/lib/components/DiagnosticsModal.svelte": 2,
+        "src/lib/components/FirebasePanel.svelte": 4,
+        "src/lib/components/HostLoadSetting.svelte": 1,
+        "src/lib/components/LappiSettings.svelte": 1,
+        "src/lib/components/LazyView.svelte": 1,
+        "src/lib/components/NativeNotificationSettings.svelte": 2,
+        "src/lib/components/SessionAlertSettings.svelte": 2,
+        "src/lib/components/SettingsModal.svelte": 1,
+        "src/lib/components/onboarding/SetupWizard.svelte": 1,
+        "src/lib/coverage/report.ts": 1,
+        "src/lib/fleet/indexSweep.ts": 1,
+        "src/lib/graph/graphLayout.ts": 2,
+        "src/lib/harness/availability.ts": 4,
+        "src/lib/health/sections.ts": 5,
+        "src/lib/health/summary.ts": 2,
+        "src/lib/palette/catalog.ts": 2,
+        "src/lib/repos/repositoryTrust.ts": 1,
+        "src/lib/repos/terminalLoss.ts": 2,
+        "src/lib/secrets/agentPrompt.ts": 1,
+        "src/lib/secrets/summary.ts": 1,
+        "src/lib/stores/harnessStore.ts": 1,
+        "src/lib/stress/pickNamedFunction.ts": 3,
+        "src/lib/terminal/detachedSessions.ts": 3,
+        "src/lib/terminal/runResult.ts": 2,
+        "src/lib/terminal/sessionLifecycle.ts": 3,
+        "src/lib/terminal/taskLaunches.ts": 1,
+        "src/lib/tools/agentIntegration.ts": 1,
+        "src/lib/tools/devcouncilInstall.ts": 1,
+        "src/lib/tools/devcouncilSuite.ts": 1,
+        "src/lib/tools/externalTools.ts": 3,
+        "src/lib/ui/manviFocus.ts": 5,
+        "src/lib/ui/settingsCatalog.ts": 2,
+        "src/lib/ui/settingsSections.ts": 2,
+        "src/lib/views/viewAttention.ts": 1,
+        "src/lib/views/viewRegistry.ts": 6,
+        "src/lib/workbench/attemptActions.ts": 2,
+        "src/lib/workbench/attemptReview.ts": 1,
+        "src/lib/workbench/attemptWorktree.ts": 13,
+        "src/lib/workbench/sendToAgent.ts": 1,
+        "src/lib/workbench/taskCompose.ts": 2,
+        "src/lib/workbench/taskHandoff.ts": 1,
+        "src/lib/workbench/taskOpen.ts": 1,
+        "src/lib/workbench/taskQuickAdd.ts": 1,
+        "src/lib/workbench/taskSearchPlan.ts": 1,
+        "src/lib/workbench/taskSessions.ts": 3,
+        "src/lib/workbench/taskTerminal.ts": 1,
+        "src/lib/workbench/waveHost.ts": 1,
+        "src/lib/workbench/waveLaunch.ts": 12
       }
     },
     "15": {
@@ -87,6 +178,31 @@
       "name": "heading-separator",
       "total": 0,
       "files": {}
+    },
+    "17": {
+      "name": "undefined-gp-class",
+      "total": 21,
+      "files": {
+        "src/App.svelte": 1,
+        "src/lib/components/AgentDefaultsSettings.svelte": 1,
+        "src/lib/components/AgentLimitSetting.svelte": 1,
+        "src/lib/components/AgentModelSettings.svelte": 2,
+        "src/lib/components/DiffViewer.svelte": 2,
+        "src/lib/components/RepoMapPanel.svelte": 1,
+        "src/lib/components/RepoPanel.svelte": 7,
+        "src/lib/components/RepoTabBar.svelte": 1,
+        "src/lib/components/TaskArchive.svelte": 1,
+        "src/lib/components/ViewBar.svelte": 1,
+        "src/lib/components/ViewSectionTabs.svelte": 2,
+        "src/lib/components/ViewTabBar.svelte": 1
+      }
+    },
+    "18": {
+      "name": "unused-gp-class",
+      "total": 2,
+      "files": {
+        "src/app.css": 2
+      }
     }
   }
 }

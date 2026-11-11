@@ -1,0 +1,6 @@
+.gp-warn-box {
+  @apply border-warn/35 bg-warn/15 text-warn;
+}
+.gp-warn-dash {
+  @apply border-dashed dark:flex;
+}

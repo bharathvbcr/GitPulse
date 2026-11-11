@@ -1,0 +1,2 @@
+export const CELL = "px-1 text-[10px] font-mono";
+export const BIG = `w-4 text-[17px]`;

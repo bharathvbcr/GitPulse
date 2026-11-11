@@ -2,7 +2,7 @@
 /**
  * design-lint: the mechanical half of docs/design/UI_RULES.md section 1.
  *
- * It implements rules 1-16. Rule 14 (banned copy terms) reads the list owned
+ * It implements rules 1-18. Rule 14 (banned copy terms) reads the list owned
  * by the vocabulary (`BANNED_UI_TERMS` in src/lib/ui/copy/vocabulary.ts); it is
  * one entry in the flat `RULES` registry below. That list is a .ts file, which
  * node loads by type stripping (node 22.18+ / 24+; the repo runs node 26).
@@ -15,12 +15,29 @@
  * 2 the check could not run (a check that could not run never looks like a
  * check that passed).
  *
- * SCOPE. `src/**` `.svelte` and `.ts`, minus `*.test.ts`, `*.spec.ts`,
+ * SCOPE. `src/**` `.svelte`, `.ts` and `.css`, minus `*.test.ts`, `*.spec.ts`,
  * `__tests__/`, `*.d.ts` and files whose first lines say they are generated.
- * `.ts` files are scanned only by the rules that apply to TypeScript (3 and
- * 10). `src/app.css` is read by rule 15 alone, and is the one place the
- * allow-listed utilities (`@utility gp-menu-sep`, ...) are defined, so rule 7
- * never looks at it.
+ * Only `node_modules`, `.git` and `.svelte-kit` are skipped by directory name, at any depth:
+ * a source directory called `coverage` (src/lib/coverage) used to be skipped by name, which
+ * is how `coverage/format.ts` shipped `bg-emerald-500/15` past rule 3 in two audits.
+ * Each kind of file is read by the rules that apply to it:
+ *   .svelte  markup, the scripts (rules 3, 9, 10, 13) and the `<style>` blocks: their
+ *            declarations (rules 1, 2, 4, 6, 8, 9, 10, 11, 12) and their `@apply`
+ *            utilities, which are class tokens like any other;
+ *   .ts      string literals only (never identifiers, imports or comments), by rules 1,
+ *            3, 9, 10 and 14 (see rule 14 for what counts as copy in a `.ts` file);
+ *   .css     src/app.css and the other stylesheets, by rules 1, 3, 4, 8, 9, 10, 17 and
+ *            18, plus rule 15 on src/app.css alone. Rule 7 never reads a stylesheet: it
+ *            is where the allow-listed utilities (`@utility gp-menu-sep`, ...) are defined.
+ *   A stylesheet OWNS its tokens. A custom property declaration (`--c-bg: rgb(...)`,
+ *   `--gp-dur-fast: 140ms`, `--gp-ease-out: cubic-bezier(...)`, everything in `@theme` and
+ *   `:root`) is where the one permitted literal of that token lives, and a mask
+ *   declaration's `#000` is an alpha channel, not a colour: neither is read by any rule
+ *   (isOwnedDeclaration). A rule that USES a token reads it through `var(--x)` and is
+ *   checked like any other. Nothing else in a stylesheet is exempt: not a primitive
+ *   (`gp-btn`, `gp-field`), not a keyframe recipe; they are findings, held by the
+ *   ratchet. The one named exception is `gp-slide-docked`, rule 9's docked-sidebar width
+ *   transition (DESIGN_LANGUAGE section 8.5).
  *
  * HOW IT READS A FILE (this is what keeps false positives out)
  *   - A real tokenizer, not a line grep. A `.svelte` file is split into tags
@@ -36,8 +53,10 @@
  *     `*Class`-named props, and string literals in scripts.
  *
  * RULES (matcher, then what it deliberately does not see)
- *   1  type scale: token `text-[Npx]`. Not `text-[var(--x)]`, `text-[length:...]`
- *      or rem/em sizes (only the px form is a literal pixel size).
+ *   1  type scale: token `text-[Npx]` (also in a `@apply` and in a `.ts` string) and a
+ *      `font-size: Npx` declaration in `<style>`, `style=` or a stylesheet. Not
+ *      `text-[var(--x)]`, `text-[length:...]`, rem/em sizes (only the px form is a literal pixel
+ *      size) or the `font` shorthand.
  *   2  weight and case: tokens `font-thin|extralight|light|bold|extrabold|black`;
  *      `font-weight:` other than 400/500/600/normal/inherit/var(); a class
  *      source holding `uppercase` and `tracking-*` together; a CSS rule with
@@ -46,10 +65,12 @@
  *   3  palette: `{text,bg,border[-side],ring,from,via,to,fill,stroke,divide,...}-
  *      <palette>-<shade>` tokens, and any `dark:` token that is a color
  *      utility (text-/bg-/border-/ring-... but not sizes, alignment, widths or
- *      arbitrary values). Applies to `.ts` strings too. Misses `text-white`,
+ *      arbitrary values). Applies to `.ts` strings and to `@apply` too. Misses `text-white`,
  *      `bg-black` (not palette names) and colors built by string concatenation.
  *   4  literals: `#hex` and `rgb(12 34 56)`/`hsl(...)` literals in `.svelte`
- *      markup attributes, mustaches and `<style>` declaration values. In
+ *      markup attributes, mustaches and `<style>` declaration values, and in the
+ *      declaration values of a stylesheet (token definitions and masks excepted, see
+ *      SCOPE; a box-shadow or gradient recipe written with a literal is a hit). In
  *      `<style>` and `style=` any position counts; elsewhere the hex must be a
  *      whole quoted value or sit in a Tailwind `[#fff]` (so "Issue #123" and
  *      `querySelector("#add")` are not hits). `<script>` is exempt on purpose:
@@ -77,16 +98,20 @@
  *      in `<style>` `transition`/`transition-property`. Class strings in `.ts` files
  *      are read too. A bare `transition` token is not
  *      flagged (Tailwind's default list includes box-shadow and filter, but the
- *      rule text names only the explicit forms), and the `gp-slide-docked`
- *      exception lives in app.css, which this rule does not read.
+ *      rule text names only the explicit forms). The `gp-slide-docked` utility in
+ *      app.css, the docked sidebar's one-shot width slide, is the single named
+ *      exception (LAYOUT_TRANSITION_OWNERS); the same properties in a stylesheet
+ *      rule or a stylesheet `@apply` are otherwise hits.
  *   10 motion literals: tokens `duration-N|[..]`, `ease-in|out|in-out|linear|[..]`;
  *      a time or easing literal inside an `animate-[...]`/`transition-[...]`
  *      arbitrary value (`animate-[x_200ms_ease-out]`);
  *      `duration: N` and `motionDuration(N` inside script and mustache code
  *      (so UI text such as "Duration: 5" is safe); `cubic-bezier(`; time
- *      literals in `<style>` `transition`/`animation` declarations. The
+ *      literals in `<style>` and stylesheet `transition`/`animation`/`*-duration`
+ *      declarations (a duration inside a `--gp-dur-*` definition is not one). The
  *      owners (`src/lib/motion/**`, `src/lib/ui/transitions.ts`) are exempt.
- *      Applies to `.ts` for the code forms only. Misses `setTimeout(fn, 180)`.
+ *      Applies to `.ts` for the code forms only. Misses `setTimeout(fn, 180)`,
+ *      `transition-delay` and `animation-delay`.
  *   11 blur: tokens `backdrop-blur[-x]`, `backdrop-filter|brightness|...`;
  *      `backdrop-filter` declarations other than `none` in `<style>`/`style=`.
  *   12 widget dialects: a `<style>` selector class named like a button, link,
@@ -99,9 +124,23 @@
  *      literals of a `.svelte` file. Spread (`...args`) is code, not a string,
  *      so it is never seen; strings passed to `console.*` are skipped. Misses
  *      user text assembled in a `.ts` file (the rule is `.svelte` only).
- *   14 banned UI terms: every `BANNED_UI_TERMS` pattern (and only that list;
- *      `RETIRED_VERB_TERMS` and `VOICE_TERMS` are separate lists and are not
- *      read) over `.svelte` text a person sees: markup text nodes, the display
+ *   14 banned UI terms and retired verbs. Terms: every `BANNED_UI_TERMS` pattern over
+ *      the text a person sees (below), in `.svelte` and `.ts`. Retired verbs:
+ *      every `RETIRED_VERB_TERMS` entry (Reload, Recheck, Retry, Launch, Organise),
+ *      but only at the START of a LABEL, never in prose. A label is the text of a
+ *      button, link, summary or option, of anything with an action role
+ *      (button, menuitem, tab, ...), of a component named like a button or menu item,
+ *      of anything wearing gp-btn, gp-icon-btn, gp-menu-item, gp-chip or gp-seg-btn,
+ *      a `label=`, `aria-label=`, `title=`, `data-tip=`, `tooltip=` or `text=`
+ *      attribute on those or on any component, and in a `.ts` file the value of a
+ *      `label`, `title`, `ariaLabel`, `actionLabel`, `buttonLabel`, `cta`, `tooltip` or
+ *      `paletteCommand` key. "Retry search" and "Reload" are hits; a paragraph that
+ *      says "Retry later" and a heading are not. Not seen: a label assembled in a
+ *      variable (`{label}`), a verb that is not the first word, and `Retry` as a bare
+ *      `return "Retry"` in a `.ts` file. The retired-verb hits carry the verb as
+ *      their term, so an allow entry can excuse one word (BrowserSession's browser
+ *      "Reload" is the browser's own). The rest of this entry is the banned terms.
+ *      Text a person sees, in `.svelte`: markup text nodes, the display
  *      attributes of rule 13 (title, aria-label, placeholder, alt, label, ...,
  *      on elements and component props alike), and the string literals inside
  *      a mustache in a text position or in such an attribute
@@ -113,7 +152,20 @@
  *      prop (`onTools={() => ...}`). NOT seen: `<script>` strings (imports,
  *      invoke names, paths; rule 13 does read those, rule 14 does not),
  *      comments, `class`/`style`, and `data-*` attributes (`data-testid`;
- *      `data-tip`/`data-tooltip` are display and are read). Blind spots: copy
+ *      `data-tip`/`data-tooltip` are display and are read).
+ *      In a `.ts` file there is no markup, so the string literal itself and its
+ *      neighbours decide (isTsCopy): a literal of two or more words, or a single word
+ *      that is the value of a display key (label, title, description, heading, ...),
+ *      is copy. Not copy: an identifier-shaped literal (no whitespace: a kind, id,
+ *      key, path or event name), an object key, an operand of ==/===/case, an import
+ *      specifier, the argument of invoke/querySelector/getItem/classList/RegExp/
+ *      includes and similar, a console argument, a value under a keywords, id, kind,
+ *      type or path key, the vocabulary file and *.fixtures.ts. A snake_case word is
+ *      not a hit in an `Error(...)` message (an assertion about a wire field), after
+ *      a `.`, `/` or backtick, before `=`, `(` or `/`, or in a line of source. Blind
+ *      spots, on top of the ones below: prose assembled from single words, agent
+ *      prompts and developer diagnostics (both are copy in this reading; read the hit
+ *      and allow-list the file with a reason). Blind spots: copy
  *      passed to a call (`plural(n, "file")`) is skipped with the other
  *      arguments; copy assembled in script is not seen; component props that
  *      carry a non-copy value as plain text (`only="devmap"`,
@@ -133,6 +185,25 @@
  *      from that block) is not mechanically detectable and stays with the paired
  *      contract tests; animated rules with no class in their subject (the range
  *      thumb) and animations in scoped `<style>` blocks are not examined.
+ *   16 heading separator: a gp-separator directly under a section heading.
+ *   17 undefined gp-* class: a gp-* token in a `class`, `*Class` or `class:name` attribute of
+ *      a component, or in an `@apply`, that no stylesheet defines (no `@utility gp-x` and
+ *      no `.gp-x` in any selector of a stylesheet or a component's `<style>`, `:not()`
+ *      excluded). It styles nothing, whatever the markup looks like. Reported at the use,
+ *      so the ratchet is per file. NOT read: `.ts` and script strings, where the same
+ *      literal is a storage key, an id or an event name, or the class of an SVG string
+ *      with its own embedded stylesheet (gp-boot, gp-task, src/lib/pulse/exportCard.ts
+ *      all hold a gp-* word that is not a class this rule should define). A class built
+ *      by interpolation (`gp-seg-{tone}`) is a prefix and is not checked. A class that is
+ *      only a hook for a test or a script is a hit too: give it a data-* hook or style it.
+ *   18 unused gp-* class: a class a stylesheet defines (the same definitions) that no
+ *      markup, script, `.ts` string or `@apply` mentions, outside `<style>` bodies, comments,
+ *      tests, and index.html and public/*.js (read as extra text). Reported at the
+ *      first definition. Generous on purpose: any whole-word mention keeps a class
+ *      alive, and a prefix ending in a hyphen (`gp-seg-{tone}`) keeps every class that
+ *      starts with it. Blind spot: a class built from pieces sharing no literal prefix
+ *      is reported as unused when it is not. Rules 17 and 18 need the whole tree, so
+ *      they run in lintFiles/lintRepo (RULES entries with runRepo), not lintSource.
  *
  * GATE. `--strict` (the `design:gate` script, a step of `bun run ci:local`) adds
  * what the ratchet alone does not say: every violation must be either fixed or
@@ -151,7 +222,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BANNED_UI_TERMS } from "../src/lib/ui/copy/vocabulary.ts";
+import { BANNED_UI_TERMS, RETIRED_VERB_TERMS } from "../src/lib/ui/copy/vocabulary.ts";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -162,15 +233,16 @@ export const APP_CSS = "src/app.css";
  * @typedef {{ start: number, end: number, text: string }} Lit
  * @typedef {{ raw: string, util: string, variants: string[], opacity: string | null, start: number }} Token
  * @typedef {{ tokens: Token[], views: Token[][], tag: number, exempt: boolean }} ClassSource
- * @typedef {{ selector: string, selStart: number, at: boolean, parent: CssRule | null, decls: Decl[], applies: string[], applyStart: number }} CssRule
- * @typedef {{ prop: string, value: string, start: number, rule: CssRule }} Decl
+ * @typedef {{ selector: string, selStart: number, at: boolean, parent: CssRule | null, decls: Decl[], applies: string[], applyList: Lit[], applyStart: number }} CssRule
+ * @typedef {{ prop: string, value: string, start: number, end: number, rule: CssRule }} Decl
  * @typedef {{ type: "text" | "expr", start: number, end: number }} Seg
  * @typedef {{ tag: number, tagName: string, name: string, nameStart: number, segs: Seg[] }} Attr
  * @typedef {{ text: string, start: number, css: boolean }} ColorRegion
- * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][] }} Model
+ * @typedef {{ file: string, kind: "svelte" | "ts" | "css", src: string, clean: string, classSources: ClassSource[], decls: Decl[], cssRules: CssRule[], userStrings: Lit[], copyStrings: Lit[], labels: Lit[], colorRegions: ColorRegion[], codeRegions: [number, number][], styleRanges: [number, number][] }} Model
  * @typedef {{ rule: number, file: string, line: number, col: number, message: string, term?: string }} Violation
  * @typedef {(offset: number, message: string, term?: string) => void} Report
- * @typedef {{ id: number, name: string, summary: string, svelte: boolean, ts: boolean, css: boolean, run: (m: Model, report: Report) => void }} Rule
+ * @typedef {(file: string, offset: number, message: string, term?: string) => void} RepoReport
+ * @typedef {{ id: number, name: string, summary: string, svelte: boolean, ts: boolean, css: boolean, run?: (m: Model, report: Report) => void, runRepo?: (models: Model[], report: RepoReport, extraText: string) => void }} Rule
  */
 
 // ---------------------------------------------------------------------------
@@ -323,7 +395,7 @@ function lexTemplate(src, i, to, out) {
 
 /** @param {string} selector @param {number} selStart @param {CssRule | null} parent @returns {CssRule} */
 function newCssRule(selector, selStart, parent) {
-  return { selector, selStart, at: selector.startsWith("@"), parent, decls: [], applies: [], applyStart: selStart };
+  return { selector, selStart, at: selector.startsWith("@"), parent, decls: [], applies: [], applyList: [], applyStart: selStart };
 }
 
 /**
@@ -344,13 +416,17 @@ function parseCss(text, base) {
     const trimmed = s.trim();
     if (trimmed === "") return;
     if (trimmed.startsWith("@apply")) {
-      top.applies.push(trimmed.slice(6).trim());
+      const value = trimmed.slice(6).trim();
+      const at = base + off + (s.length - s.trimStart().length) + (trimmed.length - trimmed.slice(6).trimStart().length);
+      top.applies.push(value);
+      top.applyList.push({ start: at, end: at + value.length, text: value });
       top.applyStart = base + off;
       return;
     }
     const m = /^([a-zA-Z-]+|--[\w-]+)\s*:\s*([\s\S]*)$/.exec(trimmed);
     if (!m) return;
-    top.decls.push({ prop: m[1].toLowerCase(), value: m[2].trim(), start: base + off + (s.length - s.trimStart().length), rule: top });
+    const start = base + off + (s.length - s.trimStart().length);
+    top.decls.push({ prop: m[1].toLowerCase(), value: m[2].trim(), start, end: start + trimmed.length, rule: top });
   };
   let quote = "";
   let paren = 0;
@@ -434,6 +510,9 @@ function mustacheEnd(src, open, n, out) {
   return lexJs(src, open + 1, n, out, true);
 }
 
+/** Elements with no closing tag: they never become a parent. */
+const VOID_ELEMENTS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+
 /**
  * @param {string} src
  */
@@ -442,15 +521,17 @@ function parseSvelte(src) {
   /** @type {{ start: number, end: number }[]} */ const scripts = [];
   /** @type {{ start: number, end: number }[]} */ const styles = [];
   /** @type {Attr[]} */ const attrs = [];
-  /** @type {{ start: number, end: number }[]} */ const texts = [];
-  /** @type {{ start: number, end: number }[]} */ const exprs = [];
+  /** @type {{ start: number, end: number, parent: number }[]} */ const texts = [];
+  /** @type {{ start: number, end: number, parent: number }[]} */ const exprs = [];
+  /** @type {{ tag: number, name: string }[]} */ const open = [];
+  const parentTag = () => (open.length > 0 ? open[open.length - 1].tag : -1);
   /** @type {[number, number][]} */ const htmlComments = [];
   /** @type {string[]} */ const tags = [];
   const markupJs = newJsOut();
   let textStart = -1;
   /** @param {number} end */
   const flush = (end) => {
-    if (textStart >= 0 && end > textStart) texts.push({ start: textStart, end });
+    if (textStart >= 0 && end > textStart) texts.push({ start: textStart, end, parent: parentTag() });
     textStart = -1;
   };
   /** @param {number} start @returns {number} */
@@ -529,6 +610,7 @@ function parseSvelte(src) {
       (name === "script" ? scripts : styles).push({ start: j, end });
       return m ? end + m[0].length : n;
     }
+    if (!selfClosed && !VOID_ELEMENTS.has(name.toLowerCase())) open.push({ tag, name });
     return j;
   };
   let i = 0;
@@ -550,13 +632,22 @@ function parseSvelte(src) {
     if (c === "<" && src[i + 1] === "/") {
       flush(i);
       const j = src.indexOf(">", i);
+      const closing = /^[A-Za-z][\w:.-]*/.exec(src.slice(i + 2, i + 122));
+      if (closing) {
+        for (let k = open.length - 1; k >= 0; k--) {
+          if (open[k].name === closing[0]) {
+            open.length = k;
+            break;
+          }
+        }
+      }
       i = j < 0 ? n : j + 1;
       continue;
     }
     if (c === "{") {
       flush(i);
       const e = mustacheEnd(src, i, n, markupJs);
-      exprs.push({ start: i + 1, end: e });
+      exprs.push({ start: i + 1, end: e, parent: parentTag() });
       i = e + 1;
       continue;
     }
@@ -667,17 +758,33 @@ function stringSource(s) {
 export function buildModel(file, src) {
   const kind = kindOf(file);
   /** @type {Model} */
-  const m = { file, kind, src, clean: src, classSources: [], decls: [], cssRules: [], userStrings: [], copyStrings: [], colorRegions: [], codeRegions: [] };
+  const m = { file, kind, src, clean: src, classSources: [], decls: [], cssRules: [], userStrings: [], copyStrings: [], labels: [], colorRegions: [], codeRegions: [], styleRanges: [] };
   if (kind === "css") {
-    m.clean = blank(src, cssCommentRanges(src));
-    m.cssRules = parseCss(m.clean, 0).rules;
+    // A stylesheet is read twice. The first parse finds the declarations the
+    // file OWNS (see isOwnedDeclaration); they are blanked, and the second parse
+    // is what every rule reads, so a token definition is never a literal hit.
+    const commentFree = blank(src, cssCommentRanges(src));
+    const first = parseCss(commentFree, 0);
+    const owned = [first.root, ...first.rules].flatMap((r) => r.decls).filter((d) => isOwnedDeclaration(d));
+    m.clean = blank(commentFree, owned.map((d) => /** @type {[number, number]} */ ([d.start, d.end])));
+    const parsed = parseCss(m.clean, 0);
+    m.cssRules = parsed.rules;
+    const all = [parsed.root, ...parsed.rules];
+    m.decls.push(...all.flatMap((r) => r.decls));
+    for (const d of m.decls) m.colorRegions.push({ text: d.value, start: d.start, css: true });
+    for (const r of all) for (const a of r.applyList) addApplySource(m, a);
     return m;
   }
   if (kind === "ts") {
     const js = newJsOut();
     lexJs(src, 0, src.length, js, false);
     m.clean = blank(src, js.comments);
-    for (const s of js.strings) if (s.text.trim() !== "") m.classSources.push(stringSource(s));
+    for (const s of js.strings) {
+      if (s.text.trim() === "") continue;
+      m.classSources.push(stringSource(s));
+      if (isTsCopy(src, s, file)) m.copyStrings.push(s);
+      if (!TS_COPY_EXEMPT_FILES.test(file) && TS_LABEL_KEY.test(src.slice(Math.max(0, s.start - 80), s.start).replace(/["\x27`]$/, ""))) m.labels.push(s);
+    }
     m.codeRegions.push([0, src.length]);
     return m;
   }
@@ -692,6 +799,7 @@ export function buildModel(file, src) {
   const clean = m.clean;
 
   for (const sc of p.scripts) m.codeRegions.push([sc.start, sc.end]);
+  for (const st of p.styles) m.styleRanges.push([st.start, st.end]);
   for (const e of p.exprs) m.codeRegions.push([e.start, e.end]);
   for (const a of p.attrs) for (const sg of a.segs) if (sg.type === "expr") m.codeRegions.push([sg.start, sg.end]);
 
@@ -741,6 +849,7 @@ export function buildModel(file, src) {
     const parsed = parseCss(clean.slice(st.start, st.end), st.start);
     m.cssRules.push(...parsed.rules);
     m.decls.push(...parsed.root.decls, ...parsed.rules.flatMap((r) => r.decls));
+    for (const r of [parsed.root, ...parsed.rules]) for (const a of r.applyList) addApplySource(m, a);
     for (const r of [parsed.root, ...parsed.rules]) for (const d of r.decls) m.colorRegions.push({ text: d.value, start: d.start, css: true });
   }
   for (const a of p.attrs) {
@@ -753,7 +862,7 @@ export function buildModel(file, src) {
       const first = a.segs[0];
       const value = first ? clean.slice(first.start, first.end).trim() : "";
       const rule = newCssRule("", a.nameStart, null);
-      m.decls.push({ prop: a.name.slice(6).toLowerCase(), value, start: a.nameStart, rule });
+      m.decls.push({ prop: a.name.slice(6).toLowerCase(), value, start: a.nameStart, end: a.nameStart, rule });
     } else if (!DENY_COLOR_ATTRS.test(a.name)) {
       for (const sg of a.segs) m.colorRegions.push({ text: clean.slice(sg.start, sg.end), start: sg.start, css: false });
     }
@@ -799,7 +908,145 @@ export function buildModel(file, src) {
     const body = copyRanges.find(([a, b]) => s.start >= a && s.end <= b);
     if (body && !isCodeOperand(src, body, s)) m.copyStrings.push(s);
   }
+
+  // Label positions, for the retired verbs of rule 14: the text a person reads
+  // as the name of an action. See LABEL_TAGS.
+  /** @type {Map<number, Attr[]>} */
+  const attrsByTag = new Map();
+  for (const a of p.attrs) attrsByTag.set(a.tag, [...(attrsByTag.get(a.tag) ?? []), a]);
+  /** @type {Map<number, boolean>} */
+  const labelMemo = new Map();
+  /** @param {number} tag */
+  const isLabelTag = (tag) => {
+    if (tag < 0) return false;
+    const known = labelMemo.get(tag);
+    if (known !== undefined) return known;
+    const attrs = attrsByTag.get(tag) ?? [];
+    const role = attrs.find((a) => a.name === "role");
+    const roleText = role ? role.segs.map((sg) => (sg.type === "text" ? clean.slice(sg.start, sg.end) : "")).join("").trim() : "";
+    const hit =
+      LABEL_TAGS.test(p.tags[tag]) ||
+      LABEL_ROLES.test(roleText) ||
+      (byTag.get(tag) ?? []).some((cs) => cs.tokens.some((t) => LABEL_CLASS_UTIL.test(t.util)));
+    labelMemo.set(tag, hit);
+    return hit;
+  };
+  /** @param {number} from @param {number} to @returns {Lit[]} the string literals of a mustache that are copy, not code */
+  const copyIn = (from, to) =>
+    p.markupJs.strings.filter((str) => str.start >= from && str.end <= to && !CONSOLE_ARG.test(src.slice(Math.max(0, str.start - 40), str.start)) && !isCodeOperand(src, [from, to], str));
+  for (const t of p.texts) if (isLabelTag(t.parent)) m.labels.push({ start: t.start, end: t.end, text: clean.slice(t.start, t.end) });
+  for (const e of p.exprs) if (isLabelTag(e.parent) && !/^\s*[#:/@]/.test(clean.slice(e.start, e.end))) m.labels.push(...copyIn(e.start, e.end));
+  for (const a of p.attrs) {
+    if (!LABEL_ATTRS.test(a.name) || !(isLabelTag(a.tag) || /^[A-Z]/.test(a.tagName))) continue;
+    for (const sg of a.segs) {
+      if (sg.type === "text") m.labels.push({ start: sg.start, end: sg.end, text: clean.slice(sg.start, sg.end) });
+      else m.labels.push(...copyIn(sg.start, sg.end));
+    }
+  }
   return m;
+}
+
+/**
+ * The elements whose text is an action label: a button, link, summary or option;
+ * anything with an action role; a component named like a button or menu item; and
+ * anything wearing one of the action utilities. Text in a paragraph or a heading
+ * is prose and is not a label, whatever verb it starts with.
+ */
+const LABEL_TAGS = /^(?:button|a|summary|option|[A-Z]\w*(?:Button|MenuItem|Action|Link|Chip))$/;
+const LABEL_ROLES = /^(?:button|menuitem|menuitemcheckbox|menuitemradio|tab|link|option)$/;
+const LABEL_CLASS_UTIL = /^gp-(?:btn|icon-btn|menu-item|chip|seg-btn)$/;
+const LABEL_ATTRS = /^(?:label|aria-label|title|data-tip|tooltip|text)$/;
+const TS_LABEL_KEY = /(?:label|title|ariaLabel|actionLabel|buttonLabel|cta|paletteCommand|tooltip)["\x27]?\s*:\s*$/;
+
+/** @param {Model} m @param {Lit} a one `@apply` value: its utilities are a class source like any other */
+function addApplySource(m, a) {
+  const tokens = tokenize(a.text, a.start);
+  m.classSources.push({ tokens, views: [tokens], tag: -1, exempt: false });
+}
+
+/**
+ * A declaration a stylesheet OWNS, which no literal rule reads:
+ *   - a custom property (`--c-bg: rgb(...)`, `--gp-dur-fast: 140ms`,
+ *     `--gp-ease-out: cubic-bezier(...)`, `@theme { --text-micro: 10px }`). The
+ *     stylesheet is where tokens are defined, so the literal that defines one is
+ *     the single permitted spelling of it; a rule that USES the token reads it
+ *     through var(--x) and is still checked;
+ *   - a mask declaration (`mask-image: linear-gradient(..., #000, transparent)`):
+ *     the colour of a mask is its alpha channel, not a paint colour.
+ * Nothing else is exempt, so `.gp-btn-success { background-image: linear-gradient(#34d399, ...) }`
+ * and `transition: opacity 120ms` in a rule are findings.
+ * @param {Decl} d
+ */
+function isOwnedDeclaration(d) {
+  return d.prop.startsWith("--") || /^(?:-webkit-)?mask(?:-[a-z-]+)?$/.test(d.prop);
+}
+
+const DISPLAY_KEY = /(?:label|title|text|message|hint|description|heading|subtitle|caption|summary|tooltip|placeholder|headline|body|ariaLabel|actionLabel)["\x27]?\s*:\s*$/;
+const NOT_COPY_CALL =
+  /(?:invoke|listen|once|emit|emitTo|addEventListener|removeEventListener|querySelector(?:All)?|getElementById|closest|matches|getItem|setItem|removeItem|classList\.\w+|setAttribute|getAttribute|hasAttribute|removeAttribute|RegExp|CustomEvent|Event|startsWith|endsWith|includes|indexOf|split|join|replace|replaceAll|match|require|import|test|has|get|set|delete|resolve|dirname|basename|extname|relative|new URL|fetch|Symbol|Reflect\.\w+)\s*(?:<[^>()]*>)?\(\s*$/;
+const NOT_COPY_KEY = /(?:keywords|aliases|synonyms|tags|selector|pattern|regex|command|cmd|argv|args|path|url|href|id|kind|type|key)["\x27]?\s*:\s*$/;
+const TS_CODE_WORDS = /^(?:[.#/\[<@$~]|[a-z]+:\/\/|\w+\(|--)/;
+
+/**
+ * Whether a string literal of a `.ts` file is copy a person may read, for
+ * rule 14. A `.ts` file has no markup, so the position cannot say it; the
+ * literal itself and its left and right context have to:
+ *   copy     a literal of two or more words (it holds whitespace and letters), or
+ *            a single word that is the value of a display key (`label:`, `title:`,
+ *            `description:`, `heading:`, `message:`, ...);
+ *   not copy an identifier-shaped literal (no whitespace: a kind, id, path, key or
+ *            event name), an object key (`"a b":`), an operand of ==, ===, !=, !==
+ *            or `case`, an import specifier, the argument of a non-copy call
+ *            (`invoke(`, `querySelector(`, `getItem(`, `classList.add(`, `new RegExp(`,
+ *            `.includes(`, ...), a `console.*` argument, and anything that starts like
+ *            a selector, path, URL or CSS custom property.
+ * A template literal is read one segment at a time, so `MANVI is ${state}`
+ * is a hit and `${state}` is not. The ban list itself (the vocabulary file) is
+ * not copy: it names the words it forbids.
+ * Blind spots: a single word with no display key (`return "Retry"`), copy built by
+ * concatenation of single words, and copy in a call that is on the not-copy list.
+ * @param {string} src @param {Lit} s @param {string} file
+ */
+function isTsCopy(src, s, file) {
+  if (TS_COPY_EXEMPT_FILES.test(file)) return false;
+  const text = s.text.trim();
+  if (TS_CODE_WORDS.test(text) || !/[A-Za-z]{2}/.test(text)) return false;
+  const before = src.slice(Math.max(0, s.start - 80), s.start).replace(/["\x27`]$/, "");
+  const after = src.slice(s.end).replace(/^["\x27`]/, "");
+  if (CONSOLE_ARG.test(src.slice(Math.max(0, s.start - 40), s.start))) return false;
+  if (/(?:\bfrom|\bimport|\bcase)\s*$/.test(before) || NOT_COPY_CALL.test(before)) return false;
+  if (/(?:===|!==|==|!=)\s*$/.test(before) || /^\s*(?:===|!==|==|!=)/.test(after.slice(0, 12))) return false;
+  if (/^\s*:/.test(after) && /[{,]\s*$/.test(before)) return false;
+  if (NOT_COPY_KEY.test(before)) return false;
+  if (/\s/.test(text)) return true;
+  return DISPLAY_KEY.test(before);
+}
+
+/** Files that hold the banned words as data: the ban list and the retired-verb list, and fixture data. */
+const TS_COPY_EXEMPT_FILES = /^src\/lib\/ui\/copy\/vocabulary\.ts$|\.fixtures?\.ts$/;
+
+/**
+ * A snake_case word that is code, not a label, in a .ts string: a path segment or a
+ * method (`go_orchestrator/cmd`, `conversation.send_message(`), a key=value pair of a log
+ * line (`max_gap_ms=`), a code span (`python_files`), a directory name, or a line of source
+ * (`from google_antigravity import Agent`). An identifier in plain prose is still a hit.
+ * @param {string} text the whole string @param {number} at @param {string} word
+ */
+function isCodeShapedSnake(text, at, word) {
+  const prev = text[at - 1] ?? "";
+  const next = text[at + word.length] ?? "";
+  return word === "node_modules" || "./`".includes(prev) && prev !== "" || "=(/".includes(next) && next !== "" || /^\s*(?:from|import)\s/.test(text);
+}
+
+/**
+ * Whether the offset sits inside an `Error(` call on its own line. A message that names a
+ * wire field (`new Error("health: audit_coverage was corrupt")`) is an assertion for a developer, and
+ * the snake_case term is dropped there; every other term still applies to it.
+ * @param {string} src @param {number} offset
+ */
+function inErrorCall(src, offset) {
+  const lineStart = src.lastIndexOf("\n", offset - 1) + 1;
+  return /\bError\([^;]*$/.test(src.slice(lineStart, offset));
 }
 
 /** `onTools={() => ...}`, `onclick={...}`: a handler is code (and `only` is not one). */
@@ -930,6 +1177,19 @@ const HEX_QUOTED = new RegExp(`(?<=["'])#${HEX}(?=["'])`, "g");
 const HEX_ARBITRARY = new RegExp(`(?<=\\[)#${HEX}(?=[\\]/_])`, "g");
 const COLOR_FN = /(?<![\w-])(?:rgb|rgba|hsl|hsla)\(\s*\d/g;
 
+/**
+ * The one layout transition the design language allows (DESIGN_LANGUAGE section 8.5):
+ * the docked sidebar slides its width once, off while it is dragged. Rule 9 reads
+ * stylesheets, so this utility is named here rather than allow-listed, which would
+ * excuse every other layout transition in the same file.
+ */
+const LAYOUT_TRANSITION_OWNERS = new Set(["gp-slide-docked"]);
+
+/** @param {CssRule} r the utility a rule defines (`@utility gp-x`), or the empty string */
+function utilityName(r) {
+  return r.selector.startsWith("@utility ") ? r.selector.slice(9).trim() : "";
+}
+
 const OWNERS_OF_MOTION = /^src\/lib\/(?:motion\/|ui\/transitions\.ts$)/;
 
 /**
@@ -940,6 +1200,17 @@ const GLOBAL_BANNED_TERMS = BANNED_UI_TERMS.map((t) => ({
   term: t.term,
   use: t.use,
   pattern: new RegExp(t.pattern.source, t.pattern.flags.includes("g") ? t.pattern.flags : `${t.pattern.flags}g`),
+}));
+
+/**
+ * `RETIRED_VERB_TERMS` anchored to the start of a label, so "Retry search" and
+ * "Reload" are hits and "Nothing to reload" is not: a verb is retired as the
+ * name of an action, and only its leading position says that it is the action.
+ */
+const LEADING_RETIRED_VERBS = RETIRED_VERB_TERMS.map((t) => ({
+  term: t.term,
+  use: t.use,
+  pattern: new RegExp(`^\\s*(?:${t.pattern.source})`, t.pattern.flags.replace("g", "")),
 }));
 
 /**
@@ -1052,14 +1323,17 @@ export const RULES = [
   {
     id: 1,
     name: "type-scale",
-    summary: "text-[Npx] literal font size",
+    summary: "text-[Npx] and font-size: Npx literal font sizes",
     svelte: true,
-    ts: false,
-    css: false,
+    ts: true,
+    css: true,
     run(m, report) {
       eachToken(m, (t) => {
         if (/^text-\[\d+(?:\.\d+)?px\]$/.test(t.util)) report(t.start, `${t.util}: use text-micro, text-meta, text-xs, text-sm, text-base or text-lg`);
       });
+      for (const d of m.decls) {
+        if (d.prop === "font-size" && /^\d+(?:\.\d+)?px(?:\s*!important)?$/.test(d.value)) report(d.start, `font-size: ${d.value}: use the type scale (text-micro, text-meta, text-xs, text-sm, text-base, text-lg)`);
+      }
     },
   },
   {
@@ -1104,7 +1378,7 @@ export const RULES = [
     summary: "Tailwind palette colors and dark: color pairs",
     svelte: true,
     ts: true,
-    css: false,
+    css: true,
     run(m, report) {
       eachToken(m, (t) => {
         if (PALETTE_UTIL.test(t.util)) report(t.start, `${t.raw}: Tailwind palette color, use a role token (text-ok/warn/danger/info/unknown, text-accent, text-textMuted)`);
@@ -1115,10 +1389,10 @@ export const RULES = [
   {
     id: 4,
     name: "color-literals",
-    summary: "#hex / rgb() literals in markup and <style>",
+    summary: "#hex / rgb() literals in markup, <style> and the stylesheets",
     svelte: true,
     ts: false,
-    css: false,
+    css: true,
     run(m, report) {
       for (const r of m.colorRegions) {
         /** @type {RegExp[]} */
@@ -1189,7 +1463,7 @@ export const RULES = [
     summary: "border opacity other than 35 / 65 / 90",
     svelte: true,
     ts: false,
-    css: false,
+    css: true,
     run(m, report) {
       const STOPS = new Set(["35", "65", "90", "[0.35]", "[.35]", "[0.65]", "[.65]", "[0.9]", "[.9]", "[0.90]"]);
       eachToken(m, (t) => {
@@ -1213,7 +1487,7 @@ export const RULES = [
     summary: "transition-all, non-compositor transitions and arbitrary animations",
     svelte: true,
     ts: true,
-    css: false,
+    css: true,
     run(m, report) {
       eachToken(m, (t) => {
         if (t.util === "transition-all" || t.util === "transition-shadow") {
@@ -1242,6 +1516,7 @@ export const RULES = [
       });
       for (const d of m.decls) {
         if (d.prop !== "transition" && d.prop !== "transition-property") continue;
+        if (chain(d.rule).some((r) => LAYOUT_TRANSITION_OWNERS.has(utilityName(r)))) continue;
         const bad = transitionedProperties(d.value).filter((p) => BANNED_TRANSITION_PROPS.has(p));
         if (bad.length > 0) report(d.start, `${d.prop} names ${bad.join(", ")}; animate transform and opacity only`);
       }
@@ -1253,7 +1528,7 @@ export const RULES = [
     summary: "duration / easing literals",
     svelte: true,
     ts: true,
-    css: false,
+    css: true,
     run(m, report) {
       if (OWNERS_OF_MOTION.test(m.file)) return;
       eachToken(m, (t) => {
@@ -1262,7 +1537,7 @@ export const RULES = [
         const value = arb ? arb[1] : prop && /^(?:animation|transition)(?:-[a-z]+)?$/.test(prop.prop) ? prop.value : null;
         if (value !== null && arbitraryHasMotionLiteral(value)) report(t.start, `${t.util}: duration or easing literal inside an arbitrary value, use --gp-dur-* / --gp-ease-* / src/lib/motion/tokens.ts`);
       });
-      if (m.kind === "svelte") {
+      if (m.kind !== "ts") {
         eachToken(m, (t) => {
           if (/^duration-(?:\d+|\[.+\])$/.test(t.util)) report(t.start, `${t.util}: duration literal, use --gp-dur-* / src/lib/motion/tokens.ts`);
           else if (/^ease-(?:in|out|in-out|linear|\[.+\])$/.test(t.util)) report(t.start, `${t.util}: easing literal, use --gp-ease-* / src/lib/motion/tokens.ts`);
@@ -1335,17 +1610,24 @@ export const RULES = [
   {
     id: 14,
     name: "banned-ui-terms",
-    summary: "banned product vocabulary in user-visible .svelte text",
+    summary: "banned product vocabulary, and retired verbs used as a label, in user-visible text",
     svelte: true,
-    ts: false,
+    ts: true,
     css: false,
     run(m, report) {
       for (const s of m.copyStrings) {
         for (const term of GLOBAL_BANNED_TERMS) {
           for (const hit of s.text.matchAll(term.pattern)) {
             if (isVendorTermUse(term.term, s.text, hit.index ?? 0, hit[0].length)) continue;
+            if (m.kind === "ts" && term.term === "snake_case identifier" && (inErrorCall(m.src, s.start) || isCodeShapedSnake(s.text, hit.index ?? 0, hit[0]))) continue;
             report(s.start + (hit.index ?? 0), `"${hit[0]}" (${term.term}): say "${term.use}"`, term.term);
           }
+        }
+      }
+      for (const s of m.labels) {
+        for (const verb of LEADING_RETIRED_VERBS) {
+          const hit = verb.pattern.exec(s.text);
+          if (hit) report(s.start + (hit.index ?? 0) + hit[0].length - hit[0].trimStart().length, `"${hit[0].trim()}" (retired verb ${verb.term}) as a label: say "${verb.use}"`, verb.term);
         }
       }
     },
@@ -1433,7 +1715,125 @@ export const RULES = [
       }
     },
   },
+  {
+    id: 17,
+    name: "undefined-gp-class",
+    summary: "a gp-* class used in markup or @apply that no stylesheet defines",
+    svelte: true,
+    ts: false,
+    css: true,
+    runRepo(models, report) {
+      const defined = gpDefinitions(models);
+      for (const u of gpUsages(models)) {
+        if (!defined.has(u.name)) report(u.file, u.start, `${u.name}: no stylesheet defines this class (no @utility, no .${u.name} rule), so it styles nothing`, u.name);
+      }
+    },
+  },
+  {
+    id: 18,
+    name: "unused-gp-class",
+    summary: "a gp-* class a stylesheet defines that nothing uses",
+    svelte: true,
+    ts: true,
+    css: true,
+    runRepo(models, report, extraText) {
+      const used = gpMentions(models, extraText);
+      for (const [name, site] of gpDefinitions(models)) {
+        if (used.names.has(name) || used.prefixes.some((p) => name.startsWith(p))) continue;
+        report(site.file, site.offset, `${name}: defined but no markup, script or @apply uses it; delete it or use it`, name);
+      }
+    },
+  },
 ];
+
+// ---------------------------------------------------------------------------
+// Rules 17 and 18: the gp-* class vocabulary, which only the whole tree can see.
+// ---------------------------------------------------------------------------
+
+const GP_CLASS_NAME = /^gp-[a-z0-9](?:[\w-]*[a-z0-9_])?$/;
+
+/**
+ * Every gp-* class the stylesheets define, with the first place each is defined:
+ * `@utility gp-x`, and any `.gp-x` in a selector of src/app.css, another
+ * stylesheet or a component's own `<style>` (`:global(.gp-x)` included). A class
+ * named only inside `:not()` is not defined by that. A class that appears only as
+ * the context of another selector (`.gp-menu .gp-menu-item`) counts as defined:
+ * the rule is written, so the author meant it.
+ * @param {Model[]} models @returns {Map<string, { file: string, offset: number }>}
+ */
+function gpDefinitions(models) {
+  /** @type {Map<string, { file: string, offset: number }>} */
+  const defs = new Map();
+  for (const m of models) {
+    for (const r of m.cssRules) {
+      const util = utilityName(r);
+      if (GP_CLASS_NAME.test(util) && !defs.has(util)) defs.set(util, { file: m.file, offset: r.selStart });
+      if (r.at) continue;
+      const sel = r.selector.replace(/:not\((?:[^()]|\([^)]*\))*\)/g, (hit) => " ".repeat(hit.length));
+      for (const hit of sel.matchAll(/\.(gp-[\w-]+)/g)) {
+        if (GP_CLASS_NAME.test(hit[1]) && !defs.has(hit[1])) defs.set(hit[1], { file: m.file, offset: r.selStart + (hit.index ?? 0) });
+      }
+    }
+  }
+  return defs;
+}
+
+/**
+ * The gp-* classes a file applies in a position that is certainly a class: a
+ * `class`, `*Class` or `class:name` attribute of an element or component, and an
+ * `@apply`. A class string held in a script or a .ts file is not read here: the
+ * same literal may be a storage key or an event name (rule 18 reads those through
+ * gpMentions, which is allowed to be generous).
+ * @param {Model[]} models @returns {{ file: string, start: number, name: string }[]}
+ */
+function gpUsages(models) {
+  /** @type {{ file: string, start: number, name: string }[]} */
+  const out = [];
+  for (const m of models) {
+    if (m.kind === "ts") continue;
+    for (const cs of m.classSources) {
+      if (cs.tag < 0 && m.kind === "svelte") continue;
+      for (const t of cs.tokens) if (GP_CLASS_NAME.test(t.util)) out.push({ file: m.file, start: t.start, name: t.util });
+    }
+  }
+  return out;
+}
+
+/**
+ * Where a gp-* name is mentioned at all, for rule 18, which must be generous (a
+ * class toggled from a script, queried by a test hook or used in index.html is not
+ * unused): every `gp-name` word in markup, scripts, strings and .ts code outside
+ * `<style>` bodies and comments, in an @apply, and in `extraText` (index.html and the
+ * files under public/). A word that ends in a hyphen (`gp-seg-${tone}`, `gp-btn-{variant}`) is
+ * a prefix and keeps every class that starts with it alive. Blind spot: a class
+ * built from pieces that share no literal prefix (`"gp-" + a`) is invisible, so
+ * it can be reported unused.
+ * @param {Model[]} models @param {string} extraText
+ * @returns {{ names: Set<string>, prefixes: string[] }}
+ */
+function gpMentions(models, extraText) {
+  /** @type {Set<string>} */
+  const names = new Set();
+  /** @type {Set<string>} */
+  const prefixes = new Set();
+  /** @param {string} text */
+  const scan = (text) => {
+    for (const hit of text.matchAll(/(?<![\w-])gp-[a-z0-9][\w-]*/g)) {
+      if (hit[0].endsWith("-")) prefixes.add(hit[0]);
+      else names.add(hit[0]);
+    }
+  };
+  for (const m of models) {
+    if (m.kind === "css") {
+      for (const cs of m.classSources) for (const t of cs.tokens) scan(t.util);
+      continue;
+    }
+    scan(m.styleRanges.length === 0 ? m.clean : blank(m.clean, m.styleRanges));
+    for (const cs of m.classSources) if (cs.tag < 0) for (const t of cs.tokens) scan(t.util);
+  }
+  scan(extraText);
+  return { names, prefixes: [...prefixes] };
+}
 
 /** @param {string} name */
 function isWidgetClass(name) {
@@ -1474,12 +1874,20 @@ function lineCol(starts, offset) {
  * @returns {Violation[]}
  */
 export function lintSource(file, src, rules = RULES) {
-  const m = buildModel(file, src);
-  const starts = lineStarts(src);
+  return lintModel(buildModel(file, src), rules);
+}
+
+/**
+ * The per-file rules over one built model.
+ * @param {Model} m @param {Rule[]} rules @returns {Violation[]}
+ */
+function lintModel(m, rules) {
+  const file = m.file;
+  const starts = lineStarts(m.src);
   /** @type {Violation[]} */
   const out = [];
   for (const rule of rules) {
-    if (!(m.kind === "svelte" ? rule.svelte : m.kind === "ts" ? rule.ts : rule.css)) continue;
+    if (!rule.run || !(m.kind === "svelte" ? rule.svelte : m.kind === "ts" ? rule.ts : rule.css)) continue;
     /** @type {Report} */
     const report = (offset, message, term) => {
       const { line, col } = lineCol(starts, offset);
@@ -1490,7 +1898,14 @@ export function lintSource(file, src, rules = RULES) {
   return out.sort((a, b) => a.line - b.line || a.col - b.col || a.rule - b.rule);
 }
 
-const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".svelte-kit", "target", "coverage"]);
+/**
+ * Directories never read at any depth: dependencies and version control. Build
+ * output (dist, target, coverage reports) lives at the repository root, outside
+ * src/, which is all the walk reads. It must not be listed by name here: a source
+ * directory called `coverage` (src/lib/coverage) was skipped by that entry, so
+ * none of its files was ever linted.
+ */
+const SKIP_DIRS = new Set(["node_modules", ".git", ".svelte-kit"]);
 const NON_PRODUCTION = /(^|\/)__tests__\/|\.(?:test|spec)\.[cm]?[jt]s$|\.d\.ts$/;
 const GENERATED_HEADER = /@generated|DO NOT EDIT|\.gen\.[jt]s$/i;
 
@@ -1508,7 +1923,7 @@ export function collectFiles(root) {
       const rel = dir === "" ? entry.name : `${dir}/${entry.name}`;
       if (entry.isDirectory()) {
         if (!SKIP_DIRS.has(entry.name)) walk(rel);
-      } else if (/\.(?:svelte|ts)$/.test(entry.name) && !NON_PRODUCTION.test(rel)) {
+      } else if (/\.(?:svelte|ts|css)$/.test(entry.name) && !NON_PRODUCTION.test(rel)) {
         out.push(rel);
       }
     }
@@ -1522,21 +1937,63 @@ export function collectFiles(root) {
  * @returns {{ violations: Violation[], files: number }}
  */
 export function lintRepo({ root = REPO_ROOT, rules = RULES } = {}) {
-  /** @type {Violation[]} */
-  const violations = [];
-  let files = 0;
+  /** @type {[string, string][]} */
+  const entries = [];
   for (const rel of collectFiles(root)) {
     const src = readFileSync(path.join(root, rel), "utf8");
     if (GENERATED_HEADER.test(src.split("\n", 5).join("\n")) || GENERATED_HEADER.test(rel)) continue;
-    files++;
-    violations.push(...lintSource(rel, src, rules));
+    entries.push([rel, src]);
   }
-  const css = path.join(root, APP_CSS);
-  if (existsSync(css)) {
-    files++;
-    violations.push(...lintSource(APP_CSS, readFileSync(css, "utf8"), rules));
+  return lintFiles(entries, rules, readExtraText(root));
+}
+
+/**
+ * Text outside src/ that may apply a gp-* class: the boot plate in index.html and the
+ * scripts under public/. Rule 18 reads it so a class they use is not reported unused.
+ * @param {string} root
+ */
+function readExtraText(root) {
+  /** @type {string[]} */
+  const parts = [];
+  const index = path.join(root, "index.html");
+  if (existsSync(index)) parts.push(readFileSync(index, "utf8"));
+  const pub = path.join(root, "public");
+  if (existsSync(pub)) {
+    for (const entry of readdirSync(pub, { withFileTypes: true })) {
+      if (entry.isFile() && /\.(?:js|mjs|html|css)$/.test(entry.name)) parts.push(readFileSync(path.join(pub, entry.name), "utf8"));
+    }
   }
-  return { violations, files };
+  return parts.join("\n");
+}
+
+/**
+ * Lint a set of files held in memory: every per-file rule on each, then the rules
+ * that need the whole tree (17 and 18). The one entry point both the disk walk and
+ * the fixtures use.
+ * @param {[string, string][]} entries repository-relative path (slash form) and text
+ * @param {Rule[]} [rules] @param {string} [extraText]
+ * @returns {{ violations: Violation[], files: number }}
+ */
+export function lintFiles(entries, rules = RULES, extraText = "") {
+  const models = entries.map(([file, src]) => buildModel(file, src));
+  /** @type {Violation[]} */
+  const violations = models.flatMap((m) => lintModel(m, rules));
+  /** @type {Map<string, number[]>} */
+  const starts = new Map(models.map((m) => [m.file, lineStarts(m.src)]));
+  for (const rule of rules) {
+    const runRepo = rule.runRepo;
+    if (!runRepo) continue;
+    runRepo(
+      models.filter((m) => (m.kind === "svelte" ? rule.svelte : m.kind === "ts" ? rule.ts : rule.css)),
+      (file, offset, message, term) => {
+        const { line, col } = lineCol(starts.get(file) ?? [0], offset);
+        violations.push(term === undefined ? { rule: rule.id, file, line, col, message } : { rule: rule.id, file, line, col, message, term });
+      },
+      extraText,
+    );
+  }
+  violations.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line || a.col - b.col || a.rule - b.rule));
+  return { violations, files: models.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,7 +2170,7 @@ function git(root, args) {
 export function usage() {
   return formatUsage({
     name: "design-lint",
-    summary: "Check UI_RULES section 1 (rules 1-16) against a per-rule, per-file baseline that may only go down.",
+    summary: "Check UI_RULES section 1 (rules 1-18) against a per-rule, per-file baseline that may only go down.",
     flags: [
       { flag: "--baseline", description: "write scripts/design-lint.baseline.json from the current tree and HEAD" },
       { flag: "--allow-dirty", description: "with --baseline: accept uncommitted changes under src/" },
@@ -1868,7 +2325,10 @@ allowed (${verdict.allowed.length}, reported and never counted as failures):`);
       console.log(`
 deferred (${verdict.deferred.length}, held to the ratchet until their owner merges):`);
       for (const line of tally(verdict.deferred)) console.log(`  ${line}`);
-      for (const e of config.deferred) console.log(`  why: ${e.file} (${e.owner}): ${e.reason}`);
+      /** @type {Map<string, number>} */
+      const reasons = new Map();
+      for (const e of config.deferred) reasons.set(`${e.owner}: ${e.reason}`, (reasons.get(`${e.owner}: ${e.reason}`) ?? 0) + 1);
+      for (const [why, files] of reasons) console.log(`  why (${files} file${files === 1 ? "" : "s"}): ${why}`);
     }
     if (decreases.length > 0) {
       const gone = decreases.reduce((a, d) => a + d.before - d.after, 0);

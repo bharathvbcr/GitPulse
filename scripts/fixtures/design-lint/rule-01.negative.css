@@ -1,0 +1,14 @@
+/* Token definitions are where a size is allowed to be a literal. */
+@theme {
+  --text-micro: 10px;
+  --text-meta: 11px;
+}
+:root {
+  --gp-font-ui: 13px;
+}
+.gp-note {
+  font-size: var(--text-meta);
+}
+.gp-chip {
+  @apply text-micro font-medium;
+}

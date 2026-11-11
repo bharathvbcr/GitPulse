@@ -1,0 +1,6 @@
+.gp-warn-box {
+  @apply border-amber-500/30 bg-amber-500/[0.05];
+}
+.gp-warn-dash {
+  @apply border-dashed dark:border-amber-400/60;
+}

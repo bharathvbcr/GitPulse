@@ -1,0 +1,17 @@
+import { x } from "devmap";
+// MANVI harness in a comment
+const kind = "attempt";
+const id = "post_create";
+if (state === "MANVI") {
+  console.log("devmap attempt failed");
+}
+const modes = { "harness mode": 1 };
+invoke("devmap_status", { repo_path: path });
+const re = new RegExp("MANVI and harness");
+localStorage.getItem("harness collapsed");
+throw new Error("health: audit_coverage was corrupt");
+export const SEARCH = { keywords: "manvi harness lanes devmap" };
+const state = { retry: "Retry", kind: "Launch" };
+export function again(): string {
+  return "Retry";
+}
