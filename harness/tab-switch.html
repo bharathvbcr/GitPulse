@@ -164,7 +164,16 @@
         cmd_terminal_backend: () => ({ backend: "in-process", trouble: [] }),
         cmd_ledger_tail: () => [],
         cmd_get_file_content: () => "export {};\n",
+        cmd_workbench_request: (a) => workbenchFixture(a),
       };
+      // The workbench answers with a JSON string, and `page()` in
+      // src/lib/workbench/client.ts rejects anything that is not an
+      // `{ ok: true, items, shown, total, has_more, next_cursor }` page. The
+      // notification bridge reads `notifications.native.pending` when the
+      // window mounts, so answering it with nothing put an "invalid response"
+      // card on screen: an empty page is the real shape of "none pending".
+      const emptyWorkbenchPage = () => JSON.stringify({ ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null });
+      const workbenchFixture = (a) => (a.method === "notifications.native.pending" || a.method === "runs.list" ? emptyWorkbenchPage() : null);
       // Answered with nothing, on purpose: the window's background services
       // (menus, alerts, tool discovery, the ledger, GitHub alerts) that a tab
       // switch neither starts nor waits for. Listed rather than defaulted so a
@@ -172,7 +181,7 @@
       const QUIET = new Set([
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
         "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
-        "cmd_workbench_request", "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
+        "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
         "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
@@ -353,6 +362,10 @@
             // are not part of the header: put both away for the picture.
             (await import("../src/lib/tools/productTour.ts")).productTour.closeForSession();
             (await import("../src/lib/stores/toastStore.ts")).toastStore.clear();
+            // The first-run command-palette hint goes through its own dismiss
+            // (the store the × button calls), and the shot waits for its exit.
+            interfaceStore.dismissCoachMark("coach-palette");
+            await sleepUntil(() => !$('[role="tooltip"][aria-label="Command Palette"]'), 3000);
             if (words.includes("light")) document.documentElement.classList.replace("dark", "light");
             if (words.includes("fullscreen")) document.documentElement.setAttribute("data-fullscreen", "");
             for (const surface of ["fleet", "agents", "tasks"]) {
@@ -786,7 +799,7 @@
           // listing; with none recorded it asks nothing and the Git-action
           // question below is the first prompt.
           const runsPage = (items) => JSON.stringify({ ok: true, items, shown: items.length, total: items.length, has_more: false, next_cursor: null });
-          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage([]) : null);
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage([]) : workbenchFixture(a));
           const releasePull = hold("cmd_pull", ALPHA);
           const sweep = repoStore.runAcrossOpenRepos("pull", { only: [ALPHA] });
           await sleepUntil(() => calls.some((c) => c.cmd === "cmd_pull" && c.repo === ALPHA));
@@ -810,7 +823,7 @@
             created_at: 100, expires_at: 400, session_id: "session", exit_code: null, reason: "", outcome_uncertain: false,
             provider_state: "running", provider_thread_id: "thread", provider_turn_id: "turn",
           };
-          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage(JSON.parse(a.input).state === "running" ? [managedRun] : []) : null);
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage(JSON.parse(a.input).state === "running" ? [managedRun] : []) : workbenchFixture(a));
           const exitCalls = [];
           // A stop is recorded and then refused, so the page returns to a quit it
           // can be asked again (an accepted exit leaves the request pending for
@@ -857,7 +870,7 @@
           check("quit: leaving the run running reaches the exit as managed: leave, with no terminals choice", () =>
             exitCalls.length === 1 && JSON.stringify(exitCalls[0]) === JSON.stringify({ managed: "leave" }));
           delete fixtures.cmd_exit_app;
-          delete fixtures.cmd_workbench_request;
+          fixtures.cmd_workbench_request = (a) => workbenchFixture(a);
           delete fixtures.cmd_exit_request_answer;
           fixtures.cmd_terminal_backend = () => ({ backend: "in-process", trouble: [] });
 
