@@ -506,7 +506,7 @@
             }}
             placeholder="Search settings"
             aria-label="Search settings"
-            class="w-full rounded-lg border border-edge bg-surfaceHover/40 py-1 pl-6 pr-6 text-meta text-textPrimary placeholder:text-textMuted focus:border-accent focus:outline-hidden"
+            class="w-full rounded-lg border border-edge bg-surfaceHover/40 py-1 pl-6 pr-6 text-meta text-textPrimary placeholder:text-textMuted focus:border-(--field-focus-edge) focus:outline-hidden"
           />
           {#if query}
             <button

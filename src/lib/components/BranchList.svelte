@@ -1256,7 +1256,7 @@
 
   <!-- Search Box -->
   <div class="px-1 {gapBand}">
-    <div class="gp-field flex items-center gap-1 px-2! focus-within:border-accent focus-within:shadow-(--ring-focus)">
+    <div class="gp-field flex items-center gap-1 px-2! focus-within:border-(--field-focus-edge)">
       <Search size={11} class="text-textMuted shrink-0" />
       <input
         type="text"

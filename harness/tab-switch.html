@@ -1259,6 +1259,37 @@
               await sleepUntil(() => $$("[data-glance]", row2).length === 0, 5000);
               check("glance: with nothing to say, no chip is drawn (never a zero)", () => $$("[data-glance]", row2).length === 0);
             }
+
+            // ---- a text field's focus: an edge, not a halo ------------------------
+            // Owner, 2026-11-11: "make the focus ring less annoying". A focused
+            // field (the sidebar's file filter, a gp-field) and a field-shaped box
+            // around one (the branch filter) lean their edge toward the accent and
+            // draw no ring; a button reached by keyboard keeps its ring.
+            {
+              const probe = document.createElement("span");
+              probe.style.cssText = "position:absolute;border:1px solid var(--field-focus-edge)";
+              document.body.append(probe);
+              const focusEdge = getComputedStyle(probe).borderTopColor;
+              probe.remove();
+              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
+              const seen = [];
+              for (const [name, input, box] of [
+                ["file filter", fileFilter(), fileFilter()],
+                ["branch filter", branchFilter(), branchFilter()?.closest(".gp-field")],
+              ]) {
+                input?.focus();
+                // The edge eases in (the field's border-color transition).
+                await sleepUntil(() => !!box && getComputedStyle(box).borderTopColor === focusEdge, 1000);
+                const style = box ? getComputedStyle(box) : null;
+                seen.push({ name, focused: document.activeElement === input, edge: style?.borderTopColor, shadow: style?.boxShadow });
+                input?.blur();
+              }
+              check("focus: a focused text field leans its edge toward the accent (--field-focus-edge) and draws no halo", () => {
+                if (focusEdge && !/rgba?\(0, 0, 0, 0\)/.test(focusEdge) &&
+                  seen.every((s) => s.focused && s.edge === focusEdge && noShadow(s.shadow ?? ""))) return true;
+                throw new Error(`focus edge ${focusEdge}; ${JSON.stringify(seen)}`);
+              });
+            }
             repoStore.setActiveTab(viewBefore);
             await settle();
             // The Tasks surface, mounted in the real App on this page's fixture. A

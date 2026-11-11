@@ -1688,7 +1688,7 @@
     {/if}
 
     <div class="flex items-center gap-2">
-      <div class="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border focus-within:border-accent transition-colors font-mono">
+      <div class="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border focus-within:border-(--field-focus-edge) transition-colors font-mono">
         <span class="text-accent font-semibold select-none">$</span>
         <!-- A placeholder is not an accessible name: it is announced as a hint
              and vanishes the moment anything is typed, so this field read as

@@ -805,9 +805,11 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      window (macOSPrivateApi). The fill colour is what actually paints, so a
      missing plate cannot revert typed text and placeholders to black. */
   -webkit-text-fill-color: rgb(var(--c-text));
+  /* No halo: the edge leans toward the accent and the caret does the rest
+     (--field-focus-edge). Increase Contrast restores the ring below. */
   &:focus {
-    @apply outline-hidden border-accent/65;
-    box-shadow: var(--ring-focus);
+    @apply outline-hidden;
+    border-color: var(--field-focus-edge);
   }
   &::placeholder {
     -webkit-text-fill-color: rgb(var(--c-text-faint));
@@ -822,7 +824,6 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     border-color: rgb(var(--c-danger));
     &:focus {
       border-color: rgb(var(--c-danger));
-      box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);
     }
   }
   &:disabled,
@@ -1070,6 +1071,10 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      literal here would leave a teal window wearing a blue focus ring. */
     --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.55);
     --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.28);
+    /* A text field's focus: its edge leans toward the accent, with no halo.
+       The caret already says where typing goes (owner, 2026-11-11: "make the
+       focus ring less annoying"); the ring stays for operated controls. */
+    --field-focus-edge: rgb(var(--c-accent) / 0.45);
     --brand-gradient: linear-gradient(
       135deg,
       #22d3ee 0%,
@@ -1135,6 +1140,8 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      indicator rather than weakening it. */
     --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.45);
     --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.22);
+    /* Light plates wash a pale tint out, so the edge is a little stronger. */
+    --field-focus-edge: rgb(var(--c-accent) / 0.55);
     --brand-gradient: linear-gradient(
       135deg,
       #06b6d4 0%,
@@ -1367,6 +1374,14 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   @media (prefers-contrast: more) {
     :root {
       --ring-focus: 0 0 0 3px rgb(var(--c-accent));
+      --field-focus-edge: rgb(var(--c-accent));
+    }
+    /* System accessibility wins (DESIGN_LANGUAGE rule 8): a user who asked
+       for more contrast gets the field's ring back, opaque. */
+    .gp-field:focus,
+    .gp-field:focus-within,
+    .gp-field-multi:focus {
+      box-shadow: var(--ring-focus);
     }
   }
 
