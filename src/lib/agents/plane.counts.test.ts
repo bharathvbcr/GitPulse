@@ -105,15 +105,15 @@ describe("P7: the headline says what the rows are", () => {
       tasks: tasks({ tasks: [task(), task({ runId: "run-2", cwd: "/nowhere", tone: "needs-you" })] }),
     });
     expect(planeHeadline(watched, watched.rows.length))
-      .toBe("1 agent checkout · 1 live terminal · 2 task attempts · 1 need attention");
+      .toBe("1 agent checkout · 1 live terminal · 2 task runs · 1 need attention");
     expect(planeHeadline(watched, watched.rows.length)).not.toMatch(/session/);
   });
 
   it("says a task list that was not read is not zero attempts", () => {
     const unread = project({ tasks: tasks({ ok: false, unread: true }) });
-    expect(planeHeadline(unread, unread.rows.length)).toContain("task attempts not read");
+    expect(planeHeadline(unread, unread.rows.length)).toContain("task runs not read");
     const capped = project({ tasks: tasks({ complete: false, tasks: [task({ cwd: "/nowhere", tone: "needs-you" })] }) });
-    expect(planeHeadline(capped, capped.rows.length)).toContain("at least 1 task attempt");
+    expect(planeHeadline(capped, capped.rows.length)).toContain("at least 1 task run");
   });
 });
 

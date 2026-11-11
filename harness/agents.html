@@ -213,7 +213,7 @@
 
         check("the plane is a labelled region", () => root()?.getAttribute("aria-label") === "Agents");
         check("an unread task board is not an empty workspace", () =>
-          text().includes("Task attempts have not been read yet") && text().includes("Still reading") && !text().includes("No agent sessions"));
+          text().includes("Task runs have not been read yet") && text().includes("Still reading") && !text().includes("No agent sessions"));
         check("an unread board is not reported as a failed read", () => !text().includes("could not be read"));
         check("refresh waits, and can be cancelled, while the first read is in flight", () =>
           button("Refresh").disabled && button("Cancel"));
@@ -238,7 +238,7 @@
             && !attempt.textContent.includes("Stopped on an error");
         });
         check("the headline names checkouts, terminals and attempts, and who needs attention", () =>
-          text().includes("4 agent checkouts · 0 live terminals · 1 task attempt · 2 need attention")
+          text().includes("4 agent checkouts · 0 live terminals · 1 task run · 2 need attention")
           && !text().includes("session") && !text().includes("at least"));
         check("an attempt is placed in the repository its id names, not the directory it runs in", () =>
           row("Fix the gate").textContent.includes("GitPulse") && row("Fix the gate").querySelectorAll("td")[3].textContent.trim() === "5");
@@ -325,7 +325,7 @@
           && treeRow("Child session").getAttribute("aria-setsize") === "1"
           && treeRow("Child session").getAttribute("aria-expanded") === null);
         check("the child is not counted as a checkout, terminal or attempt", () =>
-          text().includes("4 agent checkouts · 1 live terminal · 1 task attempt · 1 child session"));
+          text().includes("4 agent checkouts · 1 live terminal · 1 task run · 1 child session"));
         check("a child's attention is not observed, and the parent says how many it cannot see", () =>
           treeRow("Child session").textContent.includes("Not observed")
           && treeRow("alpha").textContent.includes("1 not observed")

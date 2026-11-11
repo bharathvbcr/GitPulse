@@ -1208,7 +1208,10 @@ const LEADING_RETIRED_VERBS = RETIRED_VERB_TERMS.map((t) => ({
  *     project", "project alias", "project ID" (in Firebase and Google Cloud a project is
  *     not a repository);
  *   - "repo" as a URL path segment, the placeholder "github.com/owner/repo.git", which
- *     is GitHub's own convention.
+ *     is GitHub's own convention;
+ *   - lowercase "repo" followed by a colon, the task search's own filter operator
+ *     ("narrow with repo: or label:"): the operator is typed as written, so the copy
+ *     that names it has to spell it the same way.
  * A bare "project" or "repo" in prose still fails. A file whose bare uses are all the
  * vendor's word is listed in design-lint.config.json (allow, rule 14, with a term and a reason).
  * @param {string} term @param {string} text @param {number} at @param {number} len
@@ -1217,7 +1220,10 @@ function isVendorTermUse(term, text, at, len) {
   const before = text.slice(Math.max(0, at - 14), at);
   const after = text.slice(at + len, at + len + 8);
   if (term === "project") return /(?:Firebase|Google Cloud|GCP) $/i.test(before) || /^ (?:alias(?:es)?|IDs?)\b/i.test(after);
-  if (term === "repo") return before.endsWith("/") && (/^\.git\b/.test(after) || after === "" || after.startsWith("/"));
+  if (term === "repo") {
+    if (text.slice(at, at + len) === "repo" && /^:(?:\S|\s+(?:or|and)\b|\s*,|\s*$)/.test(text.slice(at + len))) return true;
+    return before.endsWith("/") && (/^\.git\b/.test(after) || after === "" || after.startsWith("/"));
+  }
   return false;
 }
 

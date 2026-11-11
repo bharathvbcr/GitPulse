@@ -5,6 +5,9 @@ import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repo
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
+/** The one text a canceled terminal start carries, so a caller that passes it on and a test that checks it cannot drift. */
+export const TERMINAL_SESSION_CANCELED = "Terminal session canceled";
+
 export const PROMPT_LAUNCHERS: readonly PromptLauncher[] = ["claude", "codex", "grok", "agy"];
 
 export function isPromptLauncher(value: unknown): value is PromptLauncher {
@@ -85,7 +88,7 @@ export function createTerminalLaunchRequests() {
   /** Hands one launch to the panel for `fields.repoPath`; resolves once it is claimed and opened. */
   function enqueue(fields: Omit<LaunchRequest, "complete">, signal?: AbortSignal): Promise<void> {
     if (!fields.repoPath.trim()) return Promise.reject(new Error("Open a repository before starting a terminal session"));
-    if (signal?.aborted) return Promise.reject(new Error("Terminal launch cancelled"));
+    if (signal?.aborted) return Promise.reject(new Error(TERMINAL_SESSION_CANCELED));
     if (busy) return Promise.reject(new Error("A terminal launch is already pending"));
     return new Promise<void>((resolve, reject) => {
       busy = true;
@@ -101,7 +104,7 @@ export function createTerminalLaunchRequests() {
         if (error) reject(new Error(error));
         else resolve();
       };
-      const abort = () => complete("Terminal launch cancelled");
+      const abort = () => complete(TERMINAL_SESSION_CANCELED);
       const timer = setTimeout(() => complete("The terminal did not open. Try again or copy the prompt."), 10000);
       signal?.addEventListener("abort", abort, { once: true });
       pending = { ...fields, complete };

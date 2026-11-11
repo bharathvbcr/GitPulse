@@ -7,7 +7,7 @@ import {
   AGENT_COMMIT_NO_REPO,
   AGENT_COMMIT_UNSUPPORTED_LAUNCHER,
 } from "./agentCommit";
-import { terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
+import { TERMINAL_SESSION_CANCELED, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
 import { AGENT_PROMPT_MAX_BYTES } from "../terminal/agentPromptText";
 
 describe("agentCommit", () => {
@@ -161,7 +161,7 @@ describe("agentCommit", () => {
         openTerminal,
       );
       expect(res.ok).toBe(false);
-      expect(res.error).toBe("Terminal launch cancelled");
+      expect(res.error).toBe(TERMINAL_SESSION_CANCELED);
       expect(openTerminal).not.toHaveBeenCalled();
     });
 

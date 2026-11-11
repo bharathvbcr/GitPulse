@@ -370,6 +370,15 @@ describe("design-lint rule 14: banned UI terms", () => {
     expect(rule14("<p>The repo.git file</p>")).toHaveLength(1);
   });
 
+  it("accepts the search filter operator \"repo:\" and still fails \"repo\" in prose, a capitalized label or a colon elsewhere", () => {
+    expect(rule14("<p>Narrow with repo: or label: to reach the rest</p>")).toEqual([]);
+    expect(rule14("<p>Narrow with repo:gitpulse</p>")).toEqual([]);
+    expect(rule14("<p>Repo: gitpulse</p>")).toHaveLength(1);
+    expect(rule14("<p>Open this repo: it is large</p>")).toHaveLength(1);
+    expect(rule14("<p>Open this repo now</p>")).toHaveLength(1);
+    expect(rule14("<p>Pick a repo</p>")).toHaveLength(1);
+  });
+
   it("records the term on a rule 14 hit, so an allow entry can excuse one word and not the rule", () => {
     const hits = rule14("<p>Open the project and the repo</p>");
     expect(hits.map((v) => v.term)).toEqual(["project", "repo"]);

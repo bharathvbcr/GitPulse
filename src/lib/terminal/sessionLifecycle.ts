@@ -278,7 +278,7 @@ export function createSessionLifecycle(options: {
       watchdog = setTimeout(() => {
         timedOut = !options.singleAttempt;
         state("error", options.singleAttempt
-          ? "Task terminal launch is still pending. Reconnect waits for this same attempt."
+          ? "Task terminal launch is still pending. Reconnect waits for this same run."
           : "Starting terminal timed out; awaiting native cleanup");
       }, 15000);
       const spawned = await transport.spawn();
@@ -361,7 +361,7 @@ export function createSessionLifecycle(options: {
     if (starting) return starting;
     if (disposed || (id && !reconnect)) return Promise.resolve();
     if (options.singleAttempt && attemptEnded) {
-      state("error", "This attempt ended. Launch a new attempt from the task details.");
+      state("error", "This run ended. Start another run from the task details.");
       return Promise.resolve();
     }
     starting = launch(reconnect).finally(() => { starting = null; });

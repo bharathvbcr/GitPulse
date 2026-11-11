@@ -429,8 +429,8 @@ export function worktreeSetupNotices(
   if (done.cache_error) notices.push(`The worktree was created, but its build caches were not copied: ${done.cache_error}`);
   if (done.hook_error) {
     notices.push(when === "create"
-      ? `The worktree was created, but its post_create hook did not finish, so it may not be set up: ${done.hook_error}`
-      : `The merge and teardown finished, but the post_merge hook did not: ${done.hook_error}`);
+      ? `The worktree was created, but its post-create hook did not finish, so it may not be set up: ${done.hook_error}`
+      : `The merge and teardown finished, but the post-merge hook did not: ${done.hook_error}`);
   }
   if (done.hook_notice) notices.push(done.hook_notice);
   if (when === "merge" && done.checkout_note) notices.push(done.checkout_note);

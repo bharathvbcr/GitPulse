@@ -305,7 +305,7 @@ describe("a wave end to end against a fake sidecar", () => {
     const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
     expect(w.merged).toEqual([]);
     expect(phases(done)).toEqual({ a: "held", b: "held" });
-    expect(done.members[0]!.detail).toMatch(/Not merged: the main checkout has 2 uncommitted files/);
+    expect(done.members[0]!.detail).toMatch(/Not merged: the main worktree has 2 uncommitted files/);
     expect(w.mainReads()).toBeGreaterThan(1);
   });
 

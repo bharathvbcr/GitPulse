@@ -11,7 +11,7 @@ describe("what a worktree operation left undone", () => {
     const notices = worktreeSetupNotices({ cache_error: "no space", hook_error: "npm ci exited 1" }, "create");
     expect(notices).toHaveLength(2);
     expect(notices[0]).toMatch(/created.*caches were not copied: no space/);
-    expect(notices[1]).toMatch(/created.*post_create hook did not finish.*npm ci exited 1/);
+    expect(notices[1]).toMatch(/created.*post-create hook did not finish.*npm ci exited 1/);
   });
 
   it("after a merge whose worktree could not be removed, says it is merged and why the cleanup is pending", () => {
@@ -53,7 +53,7 @@ describe("what a worktree operation left undone", () => {
 
   it("after a teardown, says the merge happened and the cleanup did not", () => {
     expect(worktreeSetupNotices({ hook_error: "exit 4" }, "merge")).toEqual([
-      "The merge and teardown finished, but the post_merge hook did not: exit 4",
+      "The merge and teardown finished, but the post-merge hook did not: exit 4",
     ]);
   });
 });

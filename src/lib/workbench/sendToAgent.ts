@@ -25,7 +25,7 @@ export const AGENT_NOTE_MAX_CHARS = 2000;
 
 const FACT_LABELS: Record<AttentionSignal["kind"], string> = {
   ci_failed: "CI failed on the branch you pushed.",
-  ci_cancelled: "CI was cancelled on the branch you pushed.",
+  ci_cancelled: "CI was canceled on the branch you pushed.",
   ci_passed: "CI passed on the branch you pushed.",
 };
 
@@ -149,5 +149,5 @@ export function unknownOutcome(result: AgentSendResult): "ask-again" | "closed" 
 export function describeResume(outcome: "started" | "queued" | "opened"): string {
   return outcome === "queued"
     ? "The conversation's checkout is still opening. It resumes with your message as its first prompt as soon as it does."
-    : "Resuming the conversation with your message as its first prompt. It is listed under this attempt; Show conversation to watch it.";
+    : "Resuming the conversation with your message as its first prompt. It is listed under this run; Show conversation to watch it.";
 }

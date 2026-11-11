@@ -108,7 +108,7 @@ export function explainEnhancementFailure(text: string): EnhancementFailureAdvic
   }
   if (lower.includes("cancelled") || lower.includes("canceled")) {
     return {
-      guidance: "Cancelled: the model selection changed.",
+      guidance: "Canceled: the model selection changed.",
       action: "restart",
     };
   }

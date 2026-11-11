@@ -43,7 +43,7 @@ describe("viewRegistry", () => {
     const policy = VIEW_REGISTRY.work.sections?.find((section) => section.id === "policy");
     expect(policy).toBeDefined();
     expect(policy?.label).toBe("Policy");
-    expect(policy?.paletteCommand).toContain("MANVI");
+    expect(policy?.paletteCommand).toContain("Manvi");
   });
 
   it("resolves every registered tab from its native menu id and nothing else", () => {

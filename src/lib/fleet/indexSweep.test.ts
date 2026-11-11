@@ -149,7 +149,7 @@ describe("runIndexSweep", () => {
     expect(result.outcomes.every((o) => o.status === "skipped")).toBe(true);
     expect(result.outcomes[2].reason).toBe(DEVMAP_MISSING);
     expect(isCleanIndexSweep(result)).toBe(false);
-    expect(summarizeIndexSweep(result)).toContain("devmap is not installed");
+    expect(summarizeIndexSweep(result)).toContain("The code map tool is not installed");
     expect(summarizeIndexSweep(result)).not.toMatch(/^Indexed 0 of/);
   });
 

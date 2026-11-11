@@ -11,7 +11,7 @@ describe("AgentsView", () => {
   it("does not call an unread task board an empty workspace", () => {
     const html = render(AgentsView).body;
     expect(html).toContain('data-testid="agents-view"');
-    expect(html).toContain("Task attempts have not been read yet");
+    expect(html).toContain("Task runs have not been read yet");
     expect(html).toContain("Still reading");
     expect(html).not.toContain("No agent sessions");
     expect(html).not.toContain("could not be read");

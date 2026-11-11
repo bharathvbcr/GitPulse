@@ -270,7 +270,7 @@ export function handoffGate(input: {
     return { ok: false, reason: `${PROVIDER_LABELS[input.settings.provider]} supports terminal handoffs only.` };
   }
   if (input.settings.permission === "bypass" && !input.acknowledgedBypass) {
-    return { ok: false, reason: "Bypass needs an explicit authorization for this attempt." };
+    return { ok: false, reason: "Bypass needs an explicit authorization for this run." };
   }
   if (input.model) {
     const override = launchModelOverride(input.settings, input.model);
@@ -550,7 +550,7 @@ export function runStateLabel(state: string): string {
     case "running": return "Running";
     case "exited": return "Exited";
     case "failed": return RUN_START_FAILED_LABEL;
-    case "cancelled": return "Cancelled";
+    case "cancelled": return "Canceled";
     case "unresolved": return "Unresolved";
     default: return state;
   }

@@ -31,9 +31,9 @@ function boundedSection(text: string): string {
 function nativeSection(label: string, lines: readonly string[]): string {
   const devmap = lines.filter((line) => line.includes(" [devmap] "));
   return boundedSection([
-    `${label}: ${devmap.length} DevMap entries in ${lines.length} sampled backend entries (limit ${LOG_LINES}).`,
-    "Recent tail across repositories; older entries may have rotated out. Match repository and run_id.",
-    ...(devmap.length ? devmap : ["No DevMap entries in this sampled tail."]),
+    `${label}: ${devmap.length} code map entries in ${lines.length} sampled backend entries (limit ${LOG_LINES}).`,
+    "Recent tail across repositories; older entries may have rotated out. Match the repository and the run ID.",
+    ...(devmap.length ? devmap : ["No code map entries in this sampled tail."]),
   ].join("\n"));
 }
 
@@ -54,7 +54,7 @@ export function formatDevmapLogs(
       ].join("\n")
     : `Durable log unavailable: ${formatDiagnosticFailure(durable.reason)}`;
   return [
-    `GitPulse DevMap logs — ${new Date().toISOString()}`,
+    `GitPulse code map logs — ${new Date().toISOString()}`,
     `GitPulse ${APP_VERSION} (${APP_BUILD_ID})`,
     "Map context at copy request:", contextText,
     "", boundedSection(memoryText), "", boundedSection(durableText),

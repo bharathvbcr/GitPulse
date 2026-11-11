@@ -165,7 +165,7 @@ export async function runAcrossRepos(
         path: target.path,
         label: target.label,
         status: "skipped",
-        reason: "Cancelled before this repository was reached.",
+        reason: "Canceled before this repository was reached.",
         durationMs: 0,
       };
     } else {
@@ -252,7 +252,7 @@ export function summarizeRun(report: BulkRunReport, verb: string): string {
 
   const head = `${verb} ${report.succeeded} of ${total}`;
   const detail = parts.length > 0 ? ` — ${parts.join(", ")}` : "";
-  const cancelled = report.cancelled ? " (cancelled)" : "";
+  const cancelled = report.cancelled ? " (canceled)" : "";
   return `${head}${detail}${cancelled}`;
 }
 

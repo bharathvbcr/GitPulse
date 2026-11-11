@@ -43,7 +43,7 @@ export function sectionAttention(
     };
   }
   if (section === "policy" && context.verdictStatus === "blocked") {
-    return { tone: "rose", count: null, reason: "MANVI blocked the last action" };
+    return { tone: "rose", count: null, reason: "Manvi blocked the last action" };
   }
   return null;
 }

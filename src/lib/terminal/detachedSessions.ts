@@ -58,7 +58,7 @@ export function stopQuestion(listing: Pick<TerminalListing, "run_id">, label: st
   return {
     title: `Stop ${label}?`,
     message: listing.run_id
-      ? `${label} is still working on a task, not shown in any tab. Stopping it ends that attempt; it cannot be restarted, only resumed as a new conversation.`
+      ? `${label} is still working on a task, not shown in any tab. Stopping it ends that run; it cannot be restarted, only resumed as a new conversation.`
       : `${label} is still running, not shown in any tab. Stopping it ends whatever it is doing.`,
   };
 }
@@ -134,7 +134,7 @@ function listDetached(
     repoPath: listing.repo,
     label,
     launcher,
-    ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
+    ...(listing.run_id ? { title: "Task run", taskRunId: listing.run_id } : {}),
     ...(family ? { family } : {}),
     status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
     sessionId: listing.id,
@@ -156,7 +156,7 @@ function listDetached(
       runId: listing.run_id ?? key,
       repoPath: listing.repo,
       provider: launcher,
-      title: listing.run_id ? "Task attempt" : label,
+      title: listing.run_id ? "Task run" : label,
       ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
       ...(family ? { family } : {}),
     });

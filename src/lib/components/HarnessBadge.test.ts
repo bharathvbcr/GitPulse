@@ -133,7 +133,7 @@ describe("HarnessBadge rendering", () => {
     expect(new Set(titles).size).toBe(titles.length);
     // The chip carries the harness and model state; the menu's select keeps
     // the model tooltip; only the navigation item needs an open repository.
-    expect(titles[0]).toContain("MANVI policy status has not been checked yet.");
+    expect(titles[0]).toContain("Manvi policy status has not been checked yet.");
     expect(titles[1]).toContain("Choose a local model.");
     expect(titles[1]).not.toContain("Open a repository");
     expect(titles.some((title) => title.includes("Open a repository to reach the Manvi view."))).toBe(true);

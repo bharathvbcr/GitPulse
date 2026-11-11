@@ -16,25 +16,25 @@ describe("pickNamedFunction", () => {
 
   it("refuses a name that is not on the allowlist even when the table has it", () => {
     const wider = { ...table, secret: () => "nope" };
-    expect(() => pickNamedFunction(wider, "secret", allowed)).toThrow(/unsupported harness component/);
+    expect(() => pickNamedFunction(wider, "secret", allowed)).toThrow(/unsupported stress component/);
   });
 
   it("does not dispatch through Object.prototype", () => {
     expect(() => pickNamedFunction(table, "toString", ["toString"])).toThrow(
-      /unsupported harness component/,
+      /unsupported stress component/,
     );
     expect(() => pickNamedFunction(table, "constructor", ["constructor"])).toThrow(
-      /unsupported harness component/,
+      /unsupported stress component/,
     );
     expect(() => pickNamedFunction(table, "__proto__", ["__proto__"])).toThrow(
-      /unsupported harness component/,
+      /unsupported stress component/,
     );
   });
 
   it("refuses an allowlisted name whose own property is not a function", () => {
     const broken = { PulseView: "not a function" };
     expect(() => pickNamedFunction(broken, "PulseView", ["PulseView"])).toThrow(
-      /unsupported harness component/,
+      /unsupported stress component/,
     );
   });
 

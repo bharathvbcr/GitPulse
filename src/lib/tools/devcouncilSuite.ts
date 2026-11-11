@@ -82,7 +82,7 @@ export function healthSummary(report: SuiteReport): HealthSummary {
   if (!report.doctor || !report.doctor.available) {
     return {
       kind: "unchecked",
-      reason: "devmap doctor did not answer",
+      reason: "The DevMap doctor check did not answer",
     };
   }
   if (report.warnings.length === 0) return { kind: "clean" };

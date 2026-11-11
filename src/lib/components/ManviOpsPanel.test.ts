@@ -86,7 +86,7 @@ describe("ManviOpsPanel rendering", () => {
     const { body } = render(ManviOpsPanel);
     expect(body).toContain("Manvi");
     expect(body).toContain("Ops");
-    expect(body).toContain("Harness");
+    expect(body).toContain("Policy &amp; AI");
   });
 });
 

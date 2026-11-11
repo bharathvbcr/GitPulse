@@ -56,7 +56,7 @@ export interface IndexSweepReport {
 }
 
 export const DEVMAP_MISSING =
-  "devmap is not installed, so there is nothing to build the index with";
+  "The code map tool is not installed, so there is nothing to build the index with";
 
 export interface IndexSweepOptions {
   initialize?: (repoPath: string, openRepos: string[]) => Promise<InitReport>;

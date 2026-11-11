@@ -28,12 +28,12 @@ describe("canAct", () => {
 
 describe("slotHeldNote", () => {
   it("names what the holder is doing, on other cards only", () => {
-    expect(slotHeldNote("b", { a: "Merging" }, "a")).toBe("Waiting: another attempt is merging.");
+    expect(slotHeldNote("b", { a: "Merging" }, "a")).toBe("Waiting: another run is merging.");
     expect(slotHeldNote("a", { a: "Merging" }, "a")).toBeNull();
     expect(slotHeldNote("b", {}, null)).toBeNull();
   });
 
   it("still says something when the holder's verb is unknown", () => {
-    expect(slotHeldNote("b", {}, "a")).toBe("Waiting: another attempt's action is running.");
+    expect(slotHeldNote("b", {}, "a")).toBe("Waiting: another run's action is running.");
   });
 });

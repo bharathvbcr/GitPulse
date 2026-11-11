@@ -358,7 +358,7 @@ export async function resumeTaskConversation(
       return { outcome: "unavailable", reason: explainError(cause) };
     }
     if (get(terminalSessions).some((record) => record.continuesRunId === run.id)) {
-      return { outcome: "unavailable", reason: "A resumed conversation for this attempt is already running. Type the message in its terminal; sending it from here would not reach it." };
+      return { outcome: "unavailable", reason: "A resumed conversation for this run is already running. Type the message in its terminal; sending it from here would not reach it." };
     }
   }
   const conversation = await findConversation(run.id);
@@ -573,7 +573,7 @@ async function startTerminal(run: TaskRun, label: string, deps: PreparedAttemptD
     outcome = await deps.startTerminal(run);
   } catch (cause) {
     const error = explainError(cause);
-    if (watching.withdrawn()) return { ok: false, run, error: "Cancelled." };
+    if (watching.withdrawn()) return { ok: false, run, error: "Canceled." };
     consumeTaskTerminal(run.id);
     noteIfStarting(run.id, "failed", error, deps);
     return { ok: false, run, error };
@@ -582,7 +582,7 @@ async function startTerminal(run: TaskRun, label: string, deps: PreparedAttemptD
   // whatever the open says now is about an attempt that no longer exists.
   if (watching.withdrawn()) {
     consumeTaskTerminal(run.id);
-    return { ok: false, run, error: "Cancelled." };
+    return { ok: false, run, error: "Canceled." };
   }
   const note = attemptStartNote(outcome);
   if (outcome.kind === "failed" && note) {

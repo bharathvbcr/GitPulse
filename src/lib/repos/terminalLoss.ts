@@ -43,8 +43,8 @@ export async function confirmTerminalLoss(
   const subject = repos === 1 ? "this repository tab" : `these ${repos} repository tabs`;
   const elsewhere = hosted === 0 ? ""
     : hosted === running
-      ? `${hosted === 1 ? "It is an agent" : "They are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `
-      : `${hosted} of them ${hosted === 1 ? "is an agent" : "are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `;
+      ? `${hosted === 1 ? "It is an agent" : "They are agents"} working in another worktree of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `
+      : `${hosted} of them ${hosted === 1 ? "is an agent" : "are agents"} working in another worktree of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `;
   return askConfirm({
     title: running === 1 ? "End the terminal session?" : `End ${running} terminal sessions?`,
     message:

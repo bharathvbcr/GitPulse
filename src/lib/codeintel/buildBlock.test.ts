@@ -9,8 +9,8 @@ describe("buildBlockReason", () => {
   });
 
   it("names the missing CLI, and that beats a running index", () => {
-    expect(buildBlockReason(true, undefined)).toBe("devmap CLI is not installed — run Setup first");
-    expect(buildBlockReason(true, "running")).toBe("devmap CLI is not installed — run Setup first");
+    expect(buildBlockReason(true, undefined)).toBe("The code map tool is not installed — run Setup first");
+    expect(buildBlockReason(true, "running")).toBe("The code map tool is not installed — run Setup first");
   });
 
   it("leaves Build available when the automatic path has stopped or has nothing to do", () => {

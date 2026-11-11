@@ -22,7 +22,7 @@ describe("sectionAttention", () => {
 
   it("marks Policy only for a blocked verdict", () => {
     expect(sectionAttention("work", "policy", { ...calm, verdictStatus: "blocked" }))
-      .toEqual({ tone: "rose", count: null, reason: "MANVI blocked the last action" });
+      .toEqual({ tone: "rose", count: null, reason: "Manvi blocked the last action" });
     for (const status of ["allowed", "warned", "unchecked", "degraded"] as const) {
       expect(sectionAttention("work", "policy", { ...calm, verdictStatus: status }), status).toBeNull();
     }
@@ -38,7 +38,7 @@ describe("viewAttention", () => {
   it("lifts the first section's attention onto the view's pill", () => {
     const ctx = { conflictedCount: 2, verdictStatus: "blocked" as const };
     expect(viewAttention("work", ["overview", "resolve", "policy"], ctx)?.count).toBe(2);
-    expect(viewAttention("work", ["overview", "policy"], ctx)?.reason).toBe("MANVI blocked the last action");
+    expect(viewAttention("work", ["overview", "policy"], ctx)?.reason).toBe("Manvi blocked the last action");
     expect(viewAttention("code", ["explorer", "blame"], ctx)).toBeNull();
   });
 });

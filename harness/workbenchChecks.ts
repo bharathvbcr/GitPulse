@@ -150,7 +150,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   enhance().click();
   await wait(() => state("Generating"));
   button("Cancel", editor()).click();
-  await wait(() => state("Cancelled"));
+  await wait(() => state("Canceled"));
   assert(field("Title", "input").value === `${title} after manual review`, "Cancellation changed the task");
   results.push("Cancellation waits for worker acknowledgment and preserves the task");
   const automation = document.querySelector<HTMLElement>('section[aria-label="Automatic Manvi suggestions"]');

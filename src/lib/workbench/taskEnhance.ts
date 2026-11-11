@@ -177,7 +177,7 @@ export function appendedHistory(previous: LoadedHistory, next: Pick<Page<Enhance
 export const ENHANCEMENT_STATE_LABELS: Readonly<Record<EnhancementState, string>> = Object.freeze(
   Object.assign(Object.create(null) as Record<EnhancementState, string>, {
     pending: "Waiting to start", running: "Generating", cancel_requested: "Cancellation requested",
-    ready: "Ready for review", failed: "Generation failed", cancelled: "Cancelled",
+    ready: "Ready for review", failed: "Generation failed", cancelled: "Canceled",
     interrupted: "Outcome uncertain", dismissed: "Dismissed", accepted: "Accepted", undone: "Undone",
   }),
 );

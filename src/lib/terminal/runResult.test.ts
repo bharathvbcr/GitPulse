@@ -85,7 +85,7 @@ describe("formatRunDetail never discards a captured stream", () => {
 
   it("distinguishes a silent success", () => {
     expect(formatRunDetail(result({ exit_code: 0 }))).toContain(
-      "Command completed successfully (exit 0)",
+      "Command completed (exit 0)",
     );
   });
 });

@@ -67,7 +67,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "work",
     label: "Work",
     summary:
-      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Branch chains and blocked items sort first.",
+      "Everything in flight: worktrees, pull requests, CI runs and Manvi verdicts. Branch chains and blocked items sort first.",
     paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
     // Everything in flight, and the surfaces that act on it. GitHub and MANVI
     // were separate views rendering halves of the same answer Work already
@@ -102,8 +102,8 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "policy",
         label: "Policy",
         summary:
-          "MANVI gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
-        paletteCommand: "Open MANVI — gates, verdicts and branch cleanup",
+          "Manvi gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
+        paletteCommand: "Open Manvi — gates, verdicts and branch cleanup",
       },
       {
         id: "tasks",
@@ -136,7 +136,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "map",
         label: "Map",
         summary:
-          "Subsystems, entry points, doc search, the code/doc graph canvas, and cross-repo link candidates. Caps and truncation are named, not dressed as complete.",
+          "Subsystems, entry points, doc search, the code and doc graph canvas, and cross-repository link candidates. Caps and truncation are named, not dressed as complete.",
         paletteCommand: "Open Map — subsystems, docs, graphs and link candidates",
       },
     ],
@@ -202,7 +202,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "coverage",
         label: "Coverage",
         summary:
-          "Line and file coverage from this project's own test commands. Truncation and failures are named, not dressed as 100%.",
+          "Line and file coverage from this repository's own test commands. Truncation and failures are named, not dressed as 100%.",
         paletteCommand: "Open Coverage",
       },
       // Secrets was a section of its own. It is a finding about this
@@ -214,7 +214,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "health",
         label: "Health",
         summary:
-          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code graph. A scanner that did not run is listed, not implied clean. No secret values are shown.",
+          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code map. A scanner that did not run is listed, not implied clean. No secret values are shown.",
         paletteCommand: "Scan dependencies and secrets",
       },
       {

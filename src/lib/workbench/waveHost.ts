@@ -200,7 +200,7 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       // The count and the parked operation are the two things that make the main checkout not free to merge into.
       const listing = await stoppable(invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout, depth: "dirty" }), signal);
       const main = listing.find((entry) => entry.is_main);
-      if (!main) throw new Error("The repository lists no main checkout.");
+      if (!main) throw new Error("The repository lists no main worktree.");
       const parked = await stoppable(invoke<RepoOperation | null>("cmd_repo_operation", { repoPath: main.path }), signal);
       return { dirty: main.dirty_files, operation: parked ? kindLabel(parked.kind) : null };
     },
