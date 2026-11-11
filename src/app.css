@@ -408,10 +408,12 @@
 }
 
 /* Header lane I: diffuse scroll edge */
-/* ScrollCue's opt-in `diffuse` mode: two stacked backdrop-blur strips at each
-   edge that still hides content, each masked from opaque at the edge to clear
-   inward, so together they step the blur up toward the edge under the opacity
-   mask above. Strength follows the float-blur setting (`--gp-float-blur`).
+/* ScrollCue's opt-in `diffuse` mode: a strip at each edge that still hides
+   content. It paints no blur: a backdrop filter over a translucent title bar
+   drew a hard-edged, lighter box where the strip ended (the "3 more" tab
+   strip), and the plan allows blur on floating chrome only. The scroller's own
+   opacity mask above does the fading; the strip keeps its inward mask so a
+   future paint stays soft at both ends.
    The strips are static while scrolling and only fade in and out (opacity,
    by Svelte transitions that already read the motion tokens and reduced
    motion). Chevrons in this mode show only while the scroller's parent is
@@ -422,8 +424,6 @@
    other contrast and transparency blocks do not land on it). */
 .gp-scroll-diffuse {
   @apply pointer-events-none absolute z-20;
-  --gp-diffuse-light: calc(var(--gp-float-blur, 34px) * 0.2);
-  --gp-diffuse-heavy: calc(var(--gp-float-blur, 34px) * 0.5);
 }
 
 .gp-scroll-diffuse[data-edge="top"],
@@ -463,41 +463,6 @@
   inset: 0;
   -webkit-mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
   mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
-  -webkit-backdrop-filter: blur(var(--gp-diffuse-light));
-  backdrop-filter: blur(var(--gp-diffuse-light));
-}
-
-.gp-scroll-diffuse-strip[data-strength="heavy"] {
-  -webkit-backdrop-filter: blur(var(--gp-diffuse-heavy));
-  backdrop-filter: blur(var(--gp-diffuse-heavy));
-}
-
-.gp-scroll-diffuse[data-edge="top"] > [data-strength="heavy"],
-.gp-scroll-diffuse[data-edge="bottom"] > [data-strength="heavy"] {
-  inset-block: auto;
-  height: 20px;
-}
-
-.gp-scroll-diffuse[data-edge="top"] > [data-strength="heavy"] {
-  top: 0;
-}
-
-.gp-scroll-diffuse[data-edge="bottom"] > [data-strength="heavy"] {
-  bottom: 0;
-}
-
-.gp-scroll-diffuse[data-edge="left"] > [data-strength="heavy"],
-.gp-scroll-diffuse[data-edge="right"] > [data-strength="heavy"] {
-  inset-inline: auto;
-  width: 20px;
-}
-
-.gp-scroll-diffuse[data-edge="left"] > [data-strength="heavy"] {
-  left: 0;
-}
-
-.gp-scroll-diffuse[data-edge="right"] > [data-strength="heavy"] {
-  right: 0;
 }
 
 html[data-float-blur="off"] .gp-scroll-diffuse,
@@ -668,7 +633,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   /* A rounded note card under a surface header: what could not be read or
      needs doing. The tone utilities below tint it; the layout inside is the
      call site's. */
-  @apply mx-3 mt-2 rounded-xl border border-edge bg-surface/60 px-3 py-2 text-xs;
+  @apply mx-3 mt-2 rounded-xl border border-border/65 bg-surface/60 px-3 py-2 text-xs;
 
   /* The honesty surface (design language §1.7, §9): `data-tone` is ok | warn |
      danger | info | unknown. A toned notice says what happened, or that it
@@ -2228,7 +2193,7 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
  *   in          docked: the dock has just been shown; it settles up 8 px and
  *               fades in once. The layout itself does not animate.
  *   slide-in    overlay: it rises from the bottom edge of the column.
- *   slide-out   overlay: it leaves in an exit, opacity and transform only.
+ *   slide-out   either mode: it leaves in an exit, opacity and transform only.
  *               The host holds the element for the exit, then hides it.
  *
  * transform and opacity only. `--gp-dock-exit-ms` is set by the host from the

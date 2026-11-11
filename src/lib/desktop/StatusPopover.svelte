@@ -272,7 +272,7 @@
     /* app.css's preflight puts line-height:1.5 on html; this window was laid out
        at the browser default, and the native window is sized to its content. */
     line-height:normal;
-    padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:var(--text-xs,.75rem); -webkit-font-smoothing:antialiased;
+    padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:.75rem; -webkit-font-smoothing:antialiased;
   }
   .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
   /* ── Liquid blur glass ──
@@ -423,7 +423,7 @@
   .branch { display:flex; align-items:center; gap:4px; margin-top:5px; color:rgb(var(--muted)); font-size:var(--text-meta,.6875rem); }
   .content { padding:0 20px; }
   .status-heading { display:flex; align-items:center; gap:7px; margin:0 0 16px; }
-  h1 { font-size:var(--text-xs,.75rem); font-weight:500; margin:0; letter-spacing:-.1px; }
+  h1 { font-size:.75rem; font-weight:500; margin:0; letter-spacing:-.1px; }
   .status-dot { width:6px; height:6px; border-radius:50%; background:rgb(var(--muted)); flex-shrink:0; }
   [data-tone="clean"] .status-dot { background:rgb(var(--green)); }
   [data-tone="warning"] .status-dot { background:rgb(var(--amber)); }

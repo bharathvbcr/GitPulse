@@ -96,11 +96,9 @@ describe("ScrollCue diffuse mode", () => {
     expect(source).not.toMatch(/duration:\s*\d/);
   });
 
-  it("app.css block blurs in proportion to --gp-float-blur and masks inward", () => {
-    expect(block).toContain("calc(var(--gp-float-blur, 34px) * 0.2)");
-    expect(block).toContain("calc(var(--gp-float-blur, 34px) * 0.5)");
+  it("app.css block paints no backdrop blur (it drew a hard-edged box at the strip end) and masks inward", () => {
+    expect(block).not.toMatch(/backdrop-filter|blur\(/);
     expect(block).toMatch(/mask-image: linear-gradient\(var\(--gp-diffuse-dir\), #000, transparent\)/);
-    expect(block).toContain("backdrop-filter: blur(var(--gp-diffuse-light))");
     expect(block).toContain("pointer-events-none");
     expect(block).not.toContain("transition: all");
   });

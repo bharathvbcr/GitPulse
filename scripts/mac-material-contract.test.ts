@@ -824,14 +824,15 @@ describe("macOS material", () => {
     }
   });
 
-  it("scopes the diffuse scroll edge's backdrop filter to its opt-in strips, off at blur 0 and under Reduce Transparency", () => {
-    // The one sanctioned backdrop filter in chrome: strips at a scroller's
-    // hidden edge, over the tabs. It follows `--gp-float-blur` and vanishes
-    // with the float blur or the transparency preference, leaving the mask.
+  it("keeps the diffuse scroll edge free of any backdrop filter, and off at blur 0 and under Reduce Transparency", () => {
+    // The strips once carried the one backdrop filter in chrome; over the
+    // translucent title bar it drew a hard-edged lighter box at the strip
+    // end. Blur is for floating chrome only, so the strips paint none.
     const from = css.indexOf("/* Header lane I: diffuse scroll edge */");
     const block = css.slice(from, css.indexOf(".gp-scroll-cue-btn[data-hover-only]", from));
     const strip = block.slice(block.indexOf(".gp-scroll-diffuse-strip {"), block.indexOf("}", block.indexOf(".gp-scroll-diffuse-strip {")));
-    expect(strip).toContain("backdrop-filter: blur(var(--gp-diffuse-light))");
+    expect(strip).not.toMatch(/backdrop-filter/);
+    expect(block).not.toMatch(/backdrop-filter/);
     expect(block).toMatch(/html\[data-float-blur="off"\][^{]*\{[^}]*display:\s*none/);
     expect(block).toMatch(/html\[data-transparency~="reduced"\][^{]*\{[^}]*display:\s*none/);
     // The media query sits at the end of app.css (contract tests that find the

@@ -62,6 +62,7 @@
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
+  import DropOverlay from "./lib/components/DropOverlay.svelte";
   import {
     dismissFirstRun,
     onboardingStore,
@@ -1352,16 +1353,7 @@
   {/if}
 
   {#if dropActive}
-    <div
-      class="gp-overlay absolute inset-0 bg-accent/10 p-4 flex items-center justify-center pointer-events-none gp-gpu"
-      style="z-index: {LAYERS.DROP_OVERLAY}"
-    >
-      <div class="w-full h-full rounded-2xl border-2 border-dashed border-accent/65 bg-accent/5 flex items-center justify-center">
-        <div class="gp-pop px-6 py-4 rounded-2xl bg-surface border border-accent/35 text-sm font-semibold text-textPrimary shadow-float">
-          Drop a Git repository to open
-        </div>
-      </div>
-    </div>
+    <DropOverlay />
   {/if}
 
   <!-- Overlay widgets: repo views stay in the pane boundaries above. Prompt

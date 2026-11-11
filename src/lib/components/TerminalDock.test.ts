@@ -122,6 +122,12 @@ describe("TerminalDock modes", () => {
     expect(source).toContain("{#if mounted}");
   });
 
+  it("leaves with the exit token when docked too, not only when floating", () => {
+    expect(source).toContain("if (isOpen || exitMs === 0) {");
+    expect(source).not.toMatch(/isOpen \|\| !overlay/);
+    expect(source).toContain("--gp-dock-exit-ms: {exitMs}ms;");
+  });
+
   it("dismisses on an outside pointerdown only while floating and open, with its status-bar trigger inside", () => {
     expect(source).toContain("use:popover={dockDismissOptions}");
     expect(source).toContain('pointer: overlay && open && !leaving ? "pointerdown" : "none"');

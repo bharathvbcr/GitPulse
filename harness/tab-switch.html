@@ -210,6 +210,10 @@
       holdForeground();
       const { mockIPCWithEvents } = await import("./tauriMocks.ts");
       mockIPCWithEvents(handler);
+      // getCurrentWindow() reads the window label from the host-provided metadata, which
+      // the IPC mock does not install; without it the shell's native-drag subscription
+      // throws after the menu listeners, so a file drop could never be exercised here.
+      window.__TAURI_INTERNALS__.metadata = { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } };
 
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");
@@ -965,6 +969,30 @@
           delete fixtures.cmd_get_commit_details;
           delete fixtures.cmd_verify_commit_signature;
           check("the graph and commit-details commands had fixtures throughout", () => unexpected.length === 0);
+
+          // ---- 7. dropping a folder on the window opens it -----------------------
+          // The native drag events (tauri://drag-*) are what the shell listens
+          // to; the window's own event routing is what the mock reproduces. An
+          // in-app drag carries no paths and must not raise the veil.
+          const DROPPED = "/code/tabs/dropped-folder";
+          fixtures.cmd_resolve_git_root = (a) => a.path;
+          const dropVeil = () => $('[data-testid="drop-overlay"]');
+          const emitDrag = (type, paths) => emit(`tauri://drag-${type}`, { paths, position: { type: "Physical", x: 40, y: 40 } });
+          await emitDrag("enter", []);
+          await wait(250);
+          check("drop: an in-app drag (no file paths) does not show the veil", () => dropVeil() === null);
+          await emitDrag("leave", []);
+          await emitDrag("enter", [DROPPED]);
+          await sleepUntil(() => dropVeil() !== null, 3000);
+          check("drop: a folder dragged over the window shows the veil", () => dropVeil() !== null && /Drop a Git repository to open/.test(text(dropVeil())));
+          check("drop: the veil takes no pointer events, so the drop reaches the window", () => dropVeil() !== null && getComputedStyle(dropVeil()).pointerEvents === "none");
+          check("drop: nothing has opened before the drop", () => !tabFor(DROPPED));
+          await emitDrag("drop", [DROPPED]);
+          await sleepUntil(() => !!tabFor(DROPPED), 5000);
+          check("drop: dropping the folder opens it as a repository tab", () => !!tabFor(DROPPED));
+          await sleepUntil(() => dropVeil() === null, 3000);
+          check("drop: the veil is gone once the folder is dropped", () => dropVeil() === null);
+          delete fixtures.cmd_resolve_git_root;
           report_();
         } catch (error) {
           stopped(error);
