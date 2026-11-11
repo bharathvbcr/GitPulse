@@ -1,5 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { worktreeSetupNotices, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
@@ -728,30 +730,22 @@
         aria-label="Sparse checkout paths"
         class="gp-field w-full font-mono"
       />
-      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
-        <input type="checkbox" bind:checked={cowCaches} class="gp-check" />
-        <span>Share build caches (reflink / clonefile)</span>
-      </label>
-      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
-        <input type="checkbox" bind:checked={seedDevmap} class="gp-check" />
-        <span>Seed DevMap index (copy-on-write clone, then built here)</span>
-      </label>
-      <label
-        class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none"
-        title="Only GitPulse reads the pointer; the DevMap CLI that agents run does not, and builds a full index beside it."
-      >
-        <input type="checkbox" bind:checked={zeroCopyDevmap} class="gp-check" />
-        <span>Zero-copy DevMap pointer instead (GitPulse only)</span>
-      </label>
-      <label class="flex items-center gap-1.5 text-micro text-textMuted cursor-pointer select-none">
-        <input
-          type="checkbox"
-          bind:checked={runHooks}
-          onchange={readHooksPreview}
-          class="gp-check"
-        />
-        <span>Run repository hooks (.gitpulse/hooks)</span>
-      </label>
+      <Checkbox label="Share build caches (reflink / clonefile)" checked={cowCaches} onchange={(next) => (cowCaches = next)} />
+      <Checkbox label="Seed the code map index (copy-on-write clone, then built here)" checked={seedDevmap} onchange={(next) => (seedDevmap = next)} />
+      <Checkbox
+        label="Link to the main code map instead of copying it (GitPulse only)"
+        description="Only GitPulse reads the link; the code map tool that agents run does not, and builds a full index beside it."
+        checked={zeroCopyDevmap}
+        onchange={(next) => (zeroCopyDevmap = next)}
+      />
+      <Checkbox
+        label="Run repository hooks (.gitpulse/hooks)"
+        checked={runHooks}
+        onchange={(next) => {
+          runHooks = next;
+          readHooksPreview();
+        }}
+      />
       {#if runHooks}
         <div class="rounded-xl bg-surface p-1.5 text-micro text-textMuted" data-testid="worktree-hooks-consent">
           {#if hooksError}
@@ -790,7 +784,7 @@
   {/if}
 
   {#if isLoading && worktrees.length === 0}
-    <div class="text-meta text-faint px-2 py-1 italic">Loading…</div>
+    <div class="px-2 py-1"><Skeleton variant="tree-row" count={2} /></div>
   {:else}
     {#if onlyMain && !showAddForm}
       <div class="mx-1 mb-1 px-2 py-1.5 rounded-xl bg-surface/50 text-micro text-textMuted" data-testid="worktrees-empty">
@@ -1029,10 +1023,15 @@
             <div class="text-micro font-semibold text-warn pt-0.5" role="status">
               Merge {wt.branch ?? wt.name} into the default branch and remove this worktree? Press merge again to confirm.
             </div>
-            <label class="flex items-center gap-1 pt-0.5 text-micro text-textMuted" title={MERGE_MODES.find((mode) => mode.mode === "squash")?.detail}>
-              <input type="checkbox" class="gp-check" bind:checked={mergeSquash} onchange={() => holdMergeConfirm(wt.path)} />
-              Squash into one commit
-            </label>
+            <Checkbox
+              label="Squash into one commit"
+              description={MERGE_MODES.find((mode) => mode.mode === "squash")?.detail ?? ""}
+              checked={mergeSquash}
+              onchange={(next) => {
+                mergeSquash = next;
+                holdMergeConfirm(wt.path);
+              }}
+            />
           {/if}
 
           {#if aiSummaries[wt.path]}

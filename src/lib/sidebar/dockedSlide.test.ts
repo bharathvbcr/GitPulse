@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import { DURATION_MS, EASING, EXIT_EASE, EXIT_MS } from "../motion/tokens";
 import { DOCKED_SLIDE_PROPERTIES, slideDocked } from "./dockedSlide";
 
@@ -8,14 +8,14 @@ const FULL = { matchMedia: () => ({ matches: false }) } as unknown as Pick<Windo
 interface Played {
   frames: Keyframe[];
   options: KeyframeAnimationOptions;
-  animation: { onfinish: (() => void) | null; cancel: ReturnType<typeof vi.fn> };
+  animation: { onfinish: (() => void) | null; cancel: Mock<() => void> };
 }
 
 function fakeElement(): { element: HTMLElement; played: Played[] } {
   const played: Played[] = [];
   const element = {
     animate: (frames: Keyframe[], options: KeyframeAnimationOptions) => {
-      const animation = { onfinish: null as (() => void) | null, cancel: vi.fn() };
+      const animation = { onfinish: null as (() => void) | null, cancel: vi.fn<() => void>() };
       played.push({ frames, options, animation });
       return animation as unknown as Animation;
     },

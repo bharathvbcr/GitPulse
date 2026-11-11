@@ -38,6 +38,7 @@
   import { LAYERS } from "../ui/layers";
   import BranchHealthDot from "./BranchHealthDot.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import EmptyState from "./EmptyState.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
   import {
@@ -1380,9 +1381,7 @@
     class="h-full overflow-y-auto min-h-0 relative select-none will-change-scroll {scrollerAir}"
   >
     {#if allRows.length === 0}
-      <div class="px-3 py-6 text-center text-meta text-textMuted">
-        {query ? `No branches match "${query}"` : "No branches found"}
-      </div>
+      <EmptyState compact icon={GitBranch} title={query ? `No branches match "${query}"` : "No branches found"} />
     {:else}
       <!-- Total Virtual Spacer -->
       <div style="height: {totalHeight}px; position: relative; width: 100%;">
