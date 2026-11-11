@@ -70,6 +70,11 @@
   // (fitGraphView of nothing is the identity). Plain, not $state: only the
   // effect below reads it, and it must not re-run that effect.
   let needsFit = false;
+  // The toolbar grows or shrinks when a payload lands (legend, group and
+  // language rows), so the stage is resized after the first fit. Until the
+  // reader pans or zooms, the fit follows the stage; afterwards the view is
+  // theirs. Plain, not $state, for the same reason as needsFit.
+  let fitFollowsStage = false;
   let dragging = false;
   let dragDistance = 0;
   let pointerStart = { x: 0, y: 0 };
@@ -155,7 +160,8 @@
     const rect = hostEl.getBoundingClientRect();
     width = Math.max(160, Math.floor(rect.width));
     height = Math.max(160, Math.floor(rect.height));
-    schedulePaint();
+    if (fitFollowsStage) resetView();
+    else schedulePaint();
   }
 
 
@@ -175,6 +181,7 @@
     // Drag arithmetic is in client space (deltas), so it never reads layout.
     const pt = { x: e.clientX, y: e.clientY };
     if (dragging) {
+      fitFollowsStage = false;
       dragDistance = Math.max(dragDistance, Math.hypot(pt.x - pointerStart.x, pt.y - pointerStart.y));
       panX += pt.x - lastPointer.x;
       panY += pt.y - lastPointer.y;
@@ -239,6 +246,7 @@
   }
 
   function zoomAt(factor: number, x = width / 2, y = height / 2) {
+    fitFollowsStage = false;
     const next = Math.min(5, Math.max(0.000001, scale * factor));
     panX = x - (x - panX) * next / scale;
     panY = y - (y - panY) * next / scale;
@@ -258,6 +266,7 @@
     panX = fitted.panX;
     panY = fitted.panY;
     scale = fitted.scale;
+    fitFollowsStage = true;
     schedulePaint();
   }
 
@@ -268,6 +277,7 @@
     query = "";
     showNodeList = false;
     connectionPage = 0;
+    fitFollowsStage = false;
     scale = Math.max(1.5, scale);
     panX = (width > 760 ? (width - 340) / 2 : width / 2) - node.x * scale;
     panY = height * (width > 760 ? 0.5 : 0.65) - node.y * scale;
@@ -284,6 +294,7 @@
       if (path) onOpenNode(path, selectedNode.id);
     }
     else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) {
+      fitFollowsStage = false;
       panX += e.key === "ArrowLeft" ? 40 : e.key === "ArrowRight" ? -40 : 0;
       panY += e.key === "ArrowUp" ? 40 : e.key === "ArrowDown" ? -40 : 0;
     } else return;
