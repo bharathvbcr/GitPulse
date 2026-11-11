@@ -1,9 +1,10 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { tokenClass } from "../files/syntaxHighlight";
 import { ACCENTS } from "./accents";
 import { TEXT_MIN } from "./color/guard";
 import { SHIPPED_BASE_HEX, SHIPPED_CONTRAST, deriveTokens, type TokenKey } from "./color/derive";
-import { contrastRatio, formatHex, type Rgb } from "./color/oklch";
+import { contrastRatio, formatHex, inSrgbGamut, oklchToRgb, type Rgb } from "./color/oklch";
 
 const css = readFileSync(new URL("../../app.css", import.meta.url), "utf8");
 const lightCss = css.match(/html\.light\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
@@ -67,12 +68,28 @@ describe("light-theme contrast contract", () => {
     expect(contrast(rgbVariable(`c-status-${name}`), lightHover)).toBeGreaterThanOrEqual(4.5);
   });
 
-  it("removes opacity from light-theme semantic text utilities", () => {
-    // Quote style and wrapping are formatter output; the class tokens are
-    // the contract. Tailwind 4's upgrade pretty-prints these :where() lists.
-    expect(css).toMatch(/html\.light\s*:where\([\s\S]*?\[class~=["']text-textMuted\/40["']\]/);
-    expect(css).toMatch(/\[class~=["']text-accent\/80["']\]/);
-    expect(css).toMatch(/\[class~=["']text-amber-400\/80["']\]/);
+  it("has no class-attribute remap of text colour, so a theme is only ever the tokens", () => {
+    expect(css).not.toMatch(/\[class~=["']text-/);
+  });
+
+  it("emits no translucent muted or accent text, which the light theme used to patch up with a remap", () => {
+    // `text-textMuted/60` is the muted colour at 60% alpha: below 4.5:1 on a
+    // light surface by construction. Text that wants to be quieter than
+    // muted uses `text-faint`, which is opaque and held to 4.5:1 below.
+    const offenders: string[] = [];
+    const walk = (dir: URL) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const child = new URL(entry.name + (entry.isDirectory() ? "/" : ""), dir);
+        if (entry.isDirectory()) walk(child);
+        else if (/\.(svelte|ts)$/.test(entry.name) && !/\.test\.ts$/.test(entry.name)) {
+          const text = readFileSync(child, "utf8");
+          const hit = text.match(/(?<![\w:\-/[])text-(?:textMuted\/(?:40|50|60|70|80)|accent\/(?:60|70|80))(?![\w/])/);
+          if (hit) offenders.push(`${entry.name}: ${hit[0]}`);
+        }
+      }
+    };
+    walk(new URL("../../", import.meta.url));
+    expect(offenders).toEqual([]);
   });
 });
 
@@ -156,6 +173,65 @@ describe("foundation color roles meet the contrast guard in both themes", () => 
       for (const surface of surfaces) {
         expect(contrastRatio(accent, over(accent, surface, 0.12))).toBeGreaterThanOrEqual(TEXT_MIN);
       }
+    });
+
+    describe("syntax roles", () => {
+      // The code background (viewer pane, panels it can sit in) plus the paints
+      // that land under code: the added and removed row tints the diff viewer
+      // uses (bg-ok/15, bg-danger/15) and the selected-line accent tint.
+      const codeBackgrounds: Rgb[] = [
+        ...surfaces,
+        ...surfaces.flatMap((surface) => [
+          over(triplet(theme, "c-ok"), surface, 0.15),
+          over(triplet(theme, "c-danger"), surface, 0.15),
+          over(triplet(theme, "c-accent"), surface, 0.15),
+        ]),
+      ];
+
+      function syntaxColour(name: string): Rgb {
+        const match = blocks[theme].match(
+          new RegExp(`--c-syntax-${name}:\\s*oklch\\(([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)\\)`),
+        );
+        if (!match) throw new Error(`missing --c-syntax-${name} (as oklch) in the ${theme} theme`);
+        const lch = { l: Number(match[1]), c: Number(match[2]), h: Number(match[3]) };
+        // The measurement only describes what a browser paints if the colour
+        // needs no gamut mapping, so a token is held inside sRGB.
+        expect(inSrgbGamut(lch), `--c-syntax-${name} must be inside sRGB`).toBe(true);
+        return oklchToRgb(lch);
+      }
+
+      const names = [
+        "keyword", "type", "string", "number", "function", "operator", "attribute", "property", "regex", "variable",
+        "punctuation",
+      ];
+
+      it("defines every syntax role in the theme, and a Tailwind colour for each", () => {
+        expect(names).toHaveLength(11);
+        for (const name of names) {
+          expect(blocks[theme], name).toContain(`--c-syntax-${name}:`);
+          expect(css, name).toContain(`--color-syntax-${name}: var(--c-syntax-${name});`);
+        }
+      });
+
+      it.each(names)("keeps %s at 4.5:1 on the code background, the diff row tints and a selected line", (name) => {
+        const colour = syntaxColour(name);
+        for (const bg of codeBackgrounds) {
+          expect(contrastRatio(colour, bg), `${name} on rgb(${bg.map(Math.round).join(" ")})`).toBeGreaterThanOrEqual(TEXT_MIN);
+        }
+      });
+
+      it("resolves every colour class tokenClass returns to a defined role", () => {
+        const types = [
+          "keyword", "type", "string", "comment", "number", "function", "operator", "tag", "attribute",
+          "property", "punctuation", "regex", "variable", "text",
+        ] as const;
+        for (const type of types) {
+          const colour = tokenClass(type).split(/\s+/).find((token) => token.startsWith("text-"));
+          const role = colour?.match(/^text-syntax-([a-z]+)$/)?.[1];
+          if (role) expect(names, `${type} -> ${colour}`).toContain(role);
+          else expect(colour, type).toMatch(/^text-(faint|textPrimary\/90)$/);
+        }
+      });
     });
 
     it("keeps the default on-accent ink readable on every preset accent, so a preset needs no ink of its own", () => {

@@ -613,35 +613,39 @@ function tokenizeJsonLine(line: string): SyntaxToken[] {
   return tokens;
 }
 
-/** CSS color class corresponding to token type. */
+/**
+ * CSS colour class for a token type. Each class is a `--c-syntax-*` role
+ * (app.css), defined for both themes and held to 4.5:1 by
+ * `themeContrast.test.ts`; comments use the faint text role.
+ */
 export function tokenClass(type: TokenType): string {
   switch (type) {
     case "keyword":
-      return "text-purple-400 font-medium";
+      return "text-syntax-keyword font-medium";
     case "type":
-      return "text-cyan-400";
+      return "text-syntax-type";
     case "string":
-      return "text-emerald-400";
+      return "text-syntax-string";
     case "comment":
-      return "text-textMuted/70 italic";
+      return "text-faint italic";
     case "number":
-      return "text-amber-400";
+      return "text-syntax-number";
     case "function":
-      return "text-blue-400";
+      return "text-syntax-function";
     case "operator":
-      return "text-rose-400";
+      return "text-syntax-operator";
     case "tag":
-      return "text-rose-400 font-medium";
+      return "text-syntax-operator font-medium";
     case "attribute":
-      return "text-amber-300";
+      return "text-syntax-attribute";
     case "property":
-      return "text-sky-300";
+      return "text-syntax-property";
     case "punctuation":
-      return "text-textMuted";
+      return "text-syntax-punctuation";
     case "regex":
-      return "text-rose-300";
+      return "text-syntax-regex";
     case "variable":
-      return "text-indigo-300";
+      return "text-syntax-variable";
     case "text":
     default:
       return "text-textPrimary/90";

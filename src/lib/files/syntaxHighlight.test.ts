@@ -46,10 +46,22 @@ describe("syntaxHighlight", () => {
   });
 
   it("returns appropriate classes for token types", () => {
-    expect(tokenClass("keyword")).toContain("text-purple-400");
-    expect(tokenClass("type")).toContain("text-cyan-400");
-    expect(tokenClass("string")).toContain("text-emerald-400");
+    expect(tokenClass("keyword")).toContain("text-syntax-keyword");
+    expect(tokenClass("type")).toContain("text-syntax-type");
+    expect(tokenClass("string")).toContain("text-syntax-string");
     expect(tokenClass("comment")).toContain("italic");
+  });
+
+  it("colours only with theme-aware roles, never a palette shade or an opacity modifier", () => {
+    const types = [
+      "keyword", "type", "string", "comment", "number", "function", "operator",
+      "tag", "attribute", "property", "punctuation", "regex", "variable", "text",
+    ] as const;
+    for (const type of types) {
+      const colours = tokenClass(type).split(/\s+/).filter((token) => token.startsWith("text-"));
+      expect(colours, type).toHaveLength(1);
+      expect(colours[0], type).toMatch(/^text-(syntax-[a-z]+|faint|textPrimary(\/90)?)$/);
+    }
   });
 });
 
