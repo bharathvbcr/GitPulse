@@ -15,3 +15,6 @@ const state = { retry: "Retry", kind: "Launch" };
 export function again(): string {
   return "Retry";
 }
+// The scan could not run: a comment, not copy.
+if (reason === "could not run") { console.warn("scan could not run"); }
+export const OK = "The scan couldn't run";

@@ -619,7 +619,7 @@ describe("a view that goes away without Close", () => {
     expect(f.transport.kill).not.toHaveBeenCalled();
     expect(adopted).toEqual([]);
     expect(get(registry)).toHaveLength(1);
-    expect(get(registry)[0].status).toContain("could not be detached");
+    expect(get(registry)[0].status).toContain("couldn't be detached");
     // Still stoppable from Sessions.
     await get(registry)[0].close();
     expect(f.transport.kill).toHaveBeenCalledWith("native-a");

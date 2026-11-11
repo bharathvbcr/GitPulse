@@ -135,7 +135,7 @@
     class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center font-sans"
     role="alert"
   >
-    <span class="text-sm text-textPrimary">{name} could not be loaded.</span>
+    <span class="text-sm text-textPrimary">{name} couldn't be loaded.</span>
     <span class="text-meta text-textMuted max-w-md">{failure}</span>
     <span class="text-meta text-textMuted max-w-md">
       This view ships as its own chunk, so a failed load means the install is

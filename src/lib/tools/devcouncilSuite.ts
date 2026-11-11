@@ -39,7 +39,7 @@ export function versionText(version: VersionReading): string {
     case "not_exposed":
       return `version not reported — ${version.detail}`;
     default:
-      return `could not run — ${version.detail}`;
+      return `couldn't run — ${version.detail}`;
   }
 }
 

@@ -36,7 +36,7 @@ function hits(rule: number, name: string, as?: string): Violation[] {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** rule -> [positive count, svelte negative file exists] */
-const SVELTE_RULES: Record<number, number> = { 1: 6, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 10, 16: 3 };
+const SVELTE_RULES: Record<number, number> = { 1: 6, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 12, 16: 3 };
 
 describe("design-lint rules: one positive and one negative fixture each", () => {
   for (const [rule, expected] of Object.entries(SVELTE_RULES)) {
@@ -204,7 +204,7 @@ describe("design-lint widened scopes: <style> blocks, stylesheets and .ts string
 
   it("rule 14 reads the copy strings of a .ts file: two words, or one word under a display key", () => {
     const found = hits(14, "rule-14.positive.ts.txt");
-    expect(found.map((v) => v.term)).toEqual(["MANVI", "harness", "code graph", "devmap", "attempt", "Retry", "Reload"]);
+    expect(found.map((v) => v.term)).toEqual(["MANVI", "harness", "code graph", "devmap", "attempt", "could not", "Retry", "Reload"]);
     expect(hits(14, "rule-14.negative.ts.txt")).toEqual([]);
   });
 
@@ -486,6 +486,7 @@ describe("design-lint rule 14: banned UI terms", () => {
       "linked checkout": "linked checkout", ticket: "ticket", repo: "repo", project: "project", Preferences: "Preferences",
       Options: "Options", "min rung": "min rung", rung: "rung", "ledger record": "ledger record", "generation N": "generation 12",
       is_fresh: "is_fresh", "snake_case identifier": "some_name", successfully: "successfully", Oops: "Oops",
+      "could not": "The log could not be read",
     };
     for (const t of BANNED_UI_TERMS) {
       expect(samples[t.term], `a sample for ${t.term}`).toBeDefined();

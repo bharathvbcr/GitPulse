@@ -59,7 +59,7 @@ describe("product walkthrough lifecycle", () => {
   it("reports unavailable storage and allows an explicit session-only exit", () => {
     const tour = createProductTour(() => { throw new Error("denied"); });
     tour.initialize();
-    expect(get(tour).error).toContain("could not be loaded");
+    expect(get(tour).error).toContain("couldn't be loaded");
     expect(tour.dismiss()).toBe(false);
     expect(get(tour).open).toBe(true);
     expect(get(tour).error).toContain("couldn't be saved");

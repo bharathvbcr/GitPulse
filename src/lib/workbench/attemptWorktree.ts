@@ -73,11 +73,11 @@ export async function mainCheckoutOf(cwd: string): Promise<string> {
     try {
       resolved = await invoke<ResolvedRepo>("cmd_resolve_repo", { repoPath: cwd });
     } catch (cause) {
-      throw new Error(`${cwd} could not be read as a Git worktree: ${formatError(cause)}`);
+      throw new Error(`${cwd} couldn't be read as a Git worktree: ${formatError(cause)}`);
     }
     root = familyFromCommonDir(resolved.common_dir, opts)?.root ?? null;
   }
-  if (!root) throw new Error(`GitPulse could not tell which repository ${cwd} belongs to, so it will not merge or remove it.`);
+  if (!root) throw new Error(`GitPulse couldn't tell which repository ${cwd} belongs to, so it will not merge or remove it.`);
   if (identityKey(root, opts) === key) throw new Error("This run worked in the repository's main worktree, so there is no separate worktree to merge or discard.");
   return root;
 }
@@ -113,7 +113,7 @@ async function listingFor(root: string, cwd: string): Promise<{ main: WorktreeIn
 async function mainCheckoutTarget(root: string, known: MutationTarget | null): Promise<MutationTarget> {
   if (known) return known;
   const target = await repoStore.targetForPath(root);
-  if (!target) throw new Error(`${root} could not be opened, so nothing is run in it.`);
+  if (!target) throw new Error(`${root} couldn't be opened, so nothing is run in it.`);
   return target;
 }
 
@@ -124,7 +124,7 @@ function failureOf(outcome: MutationOutcome): unknown {
 
 /** What a removal would cost, said before it happens. */
 function changesClause(dirty: number | null): string {
-  if (dirty === null) return "Its uncommitted changes could not be counted, so only a clean removal is tried.";
+  if (dirty === null) return "Its uncommitted changes couldn't be counted, so only a clean removal is tried.";
   return dirty > 0 ? `${plural(dirty, "uncommitted file")} in it will be lost.` : "It has no uncommitted changes.";
 }
 
@@ -234,7 +234,7 @@ export async function openAttemptDiff(
     if (!here) {
       notices.push("The repository view moved on before this run's changes were selected, so it may not be showing them. Use View diff again.");
     } else if (view.selectedDiffError) {
-      notices.push(`The diff could not be read: ${view.selectedDiffError}`);
+      notices.push(`The diff couldn't be read: ${view.selectedDiffError}`);
     } else {
       shown = "range";
       if (view.selectedDiffTruncated) {
@@ -248,7 +248,7 @@ export async function openAttemptDiff(
     if (ancestry.kind === "diverged") {
       notices.push(`${short(from)} is not an ancestor of ${short(to)}, so this diff (${short(from)}...${short(to)}, from their merge base) is not the range the review covers (${short(from)}..${short(to)}). Check that range itself before approving.`);
     } else if (ancestry.kind === "unknown") {
-      notices.push(`Whether ${short(from)} is an ancestor of ${short(to)} could not be told (${ancestry.reason}), so this diff may not be the range the review covers.`);
+      notices.push(`Whether ${short(from)} is an ancestor of ${short(to)} couldn't be told (${ancestry.reason}), so this diff may not be the range the review covers.`);
     }
   }
   for (const notice of notices) toastStore.add({ kind: "warning", message: notice, duration: NOTICE_MS });
@@ -267,7 +267,7 @@ export async function reviewAttemptChanges(run: Pick<TaskRun, "id" | "cwd">): Pr
   try {
     review = await readAttemptReview(run.id);
   } catch (cause) {
-    toastStore.add({ kind: "warning", message: `This run's commits could not be read (${formatError(cause)}), so only its uncommitted files are shown.`, duration: NOTICE_MS });
+    toastStore.add({ kind: "warning", message: `This run's commits couldn't be read (${formatError(cause)}), so only its uncommitted files are shown.`, duration: NOTICE_MS });
     return reviewAttemptUncommitted(run);
   }
   if (review.head_oid === review.base_oid) return reviewAttemptUncommitted(run);
@@ -394,12 +394,12 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   const { main, own } = await listingFor(root, run.cwd);
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   if (own.head !== expectedHead) throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${expectedHead.slice(0, 8)} was verified, so it is not merged.`);
-  if (own.dirty_files !== 0) throw new Error(own.dirty_files === null ? "The worktree's uncommitted changes could not be counted, so it is not merged." : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
+  if (own.dirty_files !== 0) throw new Error(own.dirty_files === null ? "The worktree's uncommitted changes couldn't be counted, so it is not merged." : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
   const target = main?.branch ?? null;
   if (!main || !target) throw new Error("The main worktree is not on a branch, so there is nothing to merge into.");
-  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main worktree ${root} could not be checked for uncommitted work, so nothing is merged into it.` : `The main worktree ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
+  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main worktree ${root} couldn't be checked for uncommitted work, so nothing is merged into it.` : `The main worktree ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
   const live = await listAllLiveRuns();
-  if (!live.complete) throw new Error("Live runs could not all be read, so the main worktree cannot be shown free of other sessions.");
+  if (!live.complete) throw new Error("Live runs couldn't all be read, so the main worktree cannot be shown free of other sessions.");
   if (liveRunIn(root, live.runs)) throw new Error(`Another run is working in the main worktree ${root}, so nothing is merged into it.`);
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
   // The head the verdict was reached for is the tip the host holds the merge to.

@@ -73,7 +73,7 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     id: "summary",
     label: "Summary",
     heading: "Summary",
-    summary: "The verdict for this scan, and what it could not establish.",
+    summary: "The verdict for this scan, and what it couldn't establish.",
   },
   {
     id: "plan",

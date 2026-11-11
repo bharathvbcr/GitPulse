@@ -143,7 +143,7 @@ export function describeIncident(incident: TerminalIncident, plan: IncidentPlan)
   const unknown =
     plan.unknown === 0
       ? ""
-      : ` ${plan.unknown} more could not be checked for a saved conversation, so ${plan.unknown === 1 ? "it is" : "they are"} not offered.`;
+      : ` ${plan.unknown} more couldn't be checked for a saved conversation, so ${plan.unknown === 1 ? "it is" : "they are"} not offered.`;
   return `${hosted} terminal session${hosted === 1 ? "" : "s"} ended by ${incident.signal || "a signal"} — ${sender}. ${
     resumable === 0
       ? "None has a saved Claude conversation to resume."

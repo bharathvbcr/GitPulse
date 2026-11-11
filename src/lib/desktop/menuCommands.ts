@@ -136,7 +136,7 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
     copyCommit: copy("copy-commit", "Commit SHA", async (state) => {
       if (!state.currentPath) return null;
       const sha = await deps.commitId(state.currentPath, state.selectedCommitId ?? "HEAD");
-      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) throw new Error("The commit could not be resolved to a full SHA.");
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) throw new Error("The commit couldn't be resolved to a full SHA.");
       return sha;
     }),
     revealRepo: () => run("reveal-repo", async (state) => { if (state.currentPath) await deps.reveal(state.currentPath); }),

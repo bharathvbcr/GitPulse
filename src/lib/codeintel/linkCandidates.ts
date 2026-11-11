@@ -10,7 +10,7 @@ export function linkCandidatesHonesty(result: WorkspaceLinksResult | null): stri
     return "No repositories in the workspace registry yet. Open more tabs or wait for sync.";
   }
   const gaps = result.coverage_gaps.length;
-  const unread = gaps === 0 ? "" : ` ${gaps} item(s) could not be read (${result.coverage_gaps.slice(0, 3).map((g) => `${g.repo}: ${g.reason}`).join("; ")}${gaps > 3 ? "; ..." : ""}), so this list may be incomplete.`;
+  const unread = gaps === 0 ? "" : ` ${gaps} item(s) couldn't be read (${result.coverage_gaps.slice(0, 3).map((g) => `${g.repo}: ${g.reason}`).join("; ")}${gaps > 3 ? "; ..." : ""}), so this list may be incomplete.`;
   if (result.count === 0) {
     return `No cross-repository import candidates across ${result.repos_considered} registered ${result.repos_considered === 1 ? "repository" : "repositories"}.${unread}`;
   }

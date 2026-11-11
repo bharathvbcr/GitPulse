@@ -14,7 +14,7 @@ describe("AgentsView", () => {
     expect(html).toContain("Task runs have not been read yet");
     expect(html).toContain("Still reading");
     expect(html).not.toContain("No agent sessions");
-    expect(html).not.toContain("could not be read");
+    expect(html).not.toContain("couldn't be read");
   });
 
   it("keeps gaps on the page when the attention column is hidden", () => {
@@ -22,7 +22,7 @@ describe("AgentsView", () => {
     const table = source.indexOf("<table");
     expect(gaps).toBeGreaterThan(-1);
     expect(table).toBeGreaterThan(gaps);
-    expect(source).toContain("Sessions could not be read");
+    expect(source).toContain("Sessions couldn't be read");
     expect(source).toContain("Still reading");
   });
 

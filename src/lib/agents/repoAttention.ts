@@ -220,7 +220,7 @@ export function repoAgentPill(input: {
           ? `The agents read failed: ${probe.error}`
           : gap
             ? "The agents read reported a gap for this repository."
-            : "Part of the agents read for this repository could not be measured.";
+            : "Part of the agents read for this repository couldn't be measured.";
     return { state: "unknown", live, reason: null, tone: null, phrase: !probe && scanning ? "Reading" : "Not read", why };
   }
   // Agent checkouts on disk are not running agents: only a live terminal makes

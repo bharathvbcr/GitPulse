@@ -1797,7 +1797,7 @@
         {#if codegraph?.available && !deadSymbolsAvailable}
           <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
             <div class="min-w-0 flex-1">
-              Dead-code check could not run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
+              Dead-code check couldn't run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
               That is not the same as finding no unreferenced symbols.
             </div>
           </div>

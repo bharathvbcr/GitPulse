@@ -132,7 +132,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
   | Ref | **branch** (ref only in Refs/Reflog) | — |
   | Commit | **commit** ("changes" only for uncommitted edits) | — |
   | App settings | **Settings** | Preferences, Options |
-- **Banned in UI strings:** min rung, rung, ledger record(s), generation N, is_fresh, sidecar, posture, harness (as a noun), MANVI, snake_case identifiers, successfully, Oops.
+- **Banned in UI strings:** min rung, rung, ledger record(s), generation N, is_fresh, sidecar, posture, harness (as a noun), MANVI, snake_case identifiers, successfully, Oops, and "could not" (write "couldn't": "The log couldn't be read", not "could not be read"). The lint reads user-string positions only: wire and protocol strings, text compared against Rust, comments and fixture data that mirrors a backend message keep their words.
 
   "Verdict" is Manvi's own term. Change it in both apps or neither, because this is cross-app copy.
 

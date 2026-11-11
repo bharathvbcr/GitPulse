@@ -61,7 +61,7 @@ describe("opening a task from a terminal session", () => {
 
   it("a run that cannot be read, or answers for another run, opens nothing", async () => {
     await expect(openTaskForRun("run-3", async () => { throw new Error("not found"); })).rejects.toThrow("not found");
-    await expect(openTaskForRun("run-3", async () => ({ id: "run-4", task_id: "task-9" }))).rejects.toThrow(/could not be read/);
+    await expect(openTaskForRun("run-3", async () => ({ id: "run-4", task_id: "task-9" }))).rejects.toThrow(/couldn't be read/);
     await expect(openTaskForRun("run-3", async () => ({ id: "run-3", task_id: "bad id" }))).rejects.toThrow(/not valid/);
     expect(get(taskOpenRequest)).toBeNull();
     expect(get(interfaceStore).globalSurface).toBe("repository");

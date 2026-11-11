@@ -3659,7 +3659,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       try {
         saveAutoFetchPrefs(autoFetchPrefs);
       } catch (error) {
-        diagnostics.warn("autoFetch", `could not save auto-fetch settings: ${formatError(error)}`);
+        diagnostics.warn("autoFetch", `couldn't save auto-fetch settings: ${formatError(error)}`);
       }
     },
     /**
@@ -3752,7 +3752,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return {
           ok: false as const,
           error:
-            "The stash list could not be read, so popping it would target the wrong entry.",
+            "The stash list couldn't be read, so popping it would target the wrong entry.",
         };
       }
       const top = session.stashEntries[0];

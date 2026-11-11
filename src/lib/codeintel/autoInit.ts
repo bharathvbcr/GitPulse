@@ -204,7 +204,7 @@ export function createAutoInit(opts?: {
       if (announce && report.exclude.status === "refused") {
         warn(
           "devcouncil-init",
-          `${activeKey}: Code map state could not be hidden from git status — ${report.exclude.reason}`,
+          `${activeKey}: Code map state couldn't be hidden from git status — ${report.exclude.reason}`,
         );
       }
       if (announce && report.workspace_registry === null && report.workspace_reason) {
@@ -224,7 +224,7 @@ export function createAutoInit(opts?: {
         if (unavailable.length > 0) {
           warn(
             "devcouncil-init",
-            `${activeKey}: cross-repository search omitted open tabs it could not register — ${unavailable.join("; ")}`,
+            `${activeKey}: cross-repository search omitted open tabs it couldn't register — ${unavailable.join("; ")}`,
           );
         }
       }

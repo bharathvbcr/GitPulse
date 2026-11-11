@@ -579,7 +579,7 @@
     try {
       await openTaskForRun(runId);
     } catch (cause) {
-      sessionError = `That session's task could not be opened: ${formatError(cause)}`;
+      sessionError = `That session's task couldn't be opened: ${formatError(cause)}`;
     }
   }
 
@@ -592,7 +592,7 @@
     const outcome = await onGoToSession(session);
     if (!outcome.ok) {
       sessionError = outcome.reason === "unavailable"
-        ? "That session could not be shown. It may have just exited; the Sessions list refreshes when it does."
+        ? "That session couldn't be shown. It may have just exited; the Sessions list refreshes when it does."
         : "That session is no longer running.";
     }
   }

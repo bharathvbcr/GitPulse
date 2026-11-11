@@ -1104,7 +1104,7 @@
                 <FleetCell
                   cell={row.changes}
                   label="Changes"
-                  partialNote="Some status rows could not be parsed, so the line counts are floors."
+                  partialNote="Some status rows couldn't be parsed, so the line counts are floors."
                 >
                   {#if row.changes.kind === "read"}
                     <button type="button" class="text-textPrimary hover:text-accent hover:underline" title="Preview uncommitted files and modifications in {row.label}"
@@ -1129,7 +1129,7 @@
                 <FleetCell
                   cell={row.sync}
                   label="Sync"
-                  partialNote="The stash could not be read, so the stash count is a floor."
+                  partialNote="The stash couldn't be read, so the stash count is a floor."
                 >
                   {#if row.sync.kind === "read"}
                     <span class="text-textPrimary">↑{row.sync.value.ahead}</span>

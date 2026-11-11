@@ -918,7 +918,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         repoPath: probe.path,
         label,
         kind: "failed",
-        reason: clean(probe.error || "The repository could not be read.", 240),
+        reason: clean(probe.error || "The repository couldn't be read.", 240),
       });
       continue;
     }
@@ -929,7 +929,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         repoPath: probe.path,
         label,
         kind: "failed",
-        reason: clean(snapshot.worktrees.error || "Worktrees could not be listed.", 240),
+        reason: clean(snapshot.worktrees.error || "Worktrees couldn't be listed.", 240),
       });
       continue;
     }
@@ -971,7 +971,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         repoPath: family.repoPath,
         label: family.repoLabel,
         kind: "partial",
-        reason: "Agent counts could not be read. The checkouts below are only the ones whose paths were listed.",
+        reason: "Agent counts couldn't be read. The checkouts below are only the ones whose paths were listed.",
       });
     } else if (family.floor) {
       gaps.push({
@@ -993,7 +993,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         kind: "partial",
         reason: named.snapshot.collisions.ok
           ? "Collision scan did not cover every worktree. An empty overlap list is not a clear one."
-          : clean(named.snapshot.collisions.error || "Collisions could not be read.", 240),
+          : clean(named.snapshot.collisions.error || "Collisions couldn't be read.", 240),
       });
     }
     for (const entry of entries) {
@@ -1063,7 +1063,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       repoPath: "",
       label: "Tasks",
       kind: "failed",
-      reason: clean(input.tasks.error || "Task runs could not be read.", 240),
+      reason: clean(input.tasks.error || "Task runs couldn't be read.", 240),
     });
   } else {
     if (!input.tasks.complete) {
@@ -1222,7 +1222,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       repoPath: "",
       label: "Child sessions",
       kind: "partial",
-      reason: `${plural(placed.unplaced, "child agent session", "child agent sessions")} could not be placed under a row: the session above ${placed.unplaced === 1 ? "it is" : "them is"} not one of the rows shown, or was not listed by any repository read. Their count is kept; their place is unknown.`,
+      reason: `${plural(placed.unplaced, "child agent session", "child agent sessions")} couldn't be placed under a row: the session above ${placed.unplaced === 1 ? "it is" : "them is"} not one of the rows shown, or was not listed by any repository read. Their count is kept; their place is unknown.`,
     });
   }
   for (const row of rows) {

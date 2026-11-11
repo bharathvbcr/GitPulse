@@ -40,7 +40,7 @@ describe("linkCandidatesHonesty", () => {
       repos_considered: 2,
       coverage_gaps: [{ repo: "b", reason: "store would not open" }],
     });
-    expect(text).toContain("could not be read");
+    expect(text).toContain("couldn't be read");
     expect(text).toContain("b: store would not open");
     expect(text).toContain("incomplete");
   });

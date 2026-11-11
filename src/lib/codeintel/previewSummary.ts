@@ -256,7 +256,7 @@ export function fileGlance(h: PreviewFileHonesty): string {
   if (!h.file_is_indexed) return "not in the index — callers unknown";
   if (isUnreliableParseStatus(h.parse_status)) {
     // parse_status is engine-supplied and has no documented length bound.
-    return `could not be parsed (${boundText(h.parse_status.trim().toLowerCase(), 24)})`;
+    return `couldn't be parsed (${boundText(h.parse_status.trim().toLowerCase(), 24)})`;
   }
   if (!h.delta_available) return "no before/after to compare";
   if (h.broken_total > 0) {

@@ -239,7 +239,7 @@ export function tabMarker(state: OperationState): string | null {
  */
 export function tabTooltip(state: OperationState): string | null {
   if (state.probeFailed) {
-    return "GitPulse could not determine whether an operation is in progress in this repository.";
+    return "GitPulse couldn't determine whether an operation is in progress in this repository.";
   }
   if (!state.operation) return null;
   return `${headline(state.operation)}. ${nextStep(state.operation)}`;

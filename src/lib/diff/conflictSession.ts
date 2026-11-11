@@ -237,7 +237,7 @@ export function createConflictSessions(storage?: Pick<Storage, "getItem" | "setI
         for (const draft of parsed.drafts) records.set(keyFor(draft.repo, draft.snapshot.file_path), draft);
         for (const repo of new Set([...records.values()].map(draft => draft.repo))) syncRegistry(repo);
       }
-    } catch { warning = "Stored conflict recovery could not be read. It was left untouched; new drafts are kept in memory."; storage = undefined; }
+    } catch { warning = "Stored conflict recovery couldn't be read. It was left untouched; new drafts are kept in memory."; storage = undefined; }
   }
   return {
     get warning() { return warning; },

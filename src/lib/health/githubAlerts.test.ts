@@ -623,7 +623,7 @@ describe("maybeNotifyGithubAlerts", () => {
     });
     await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
     expect(d.onError).toHaveBeenCalledWith(
-      "Dependabot alerts are incomplete: the critical, high severity tiers could not be read.",
+      "Dependabot alerts are incomplete: the critical, high severity tiers couldn't be read.",
     );
   });
 

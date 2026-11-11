@@ -301,7 +301,7 @@ export async function runHealthChecks(ctx) {
     knobs.dead = deadAnswer({ available: false, reason: "index is stale" });
     await rescan("findings");
     check("a dead-code check that could not run is not read as finding nothing", () =>
-      has(section("dead-code"), "Dead-code check could not run: index is stale") && has(section("dead-code"), "not the same as finding no unreferenced symbols"));
+      has(section("dead-code"), "Dead-code check couldn't run: index is stale") && has(section("dead-code"), "not the same as finding no unreferenced symbols"));
     knobs.dead = deadAnswer({});
     await rescan("findings");
     check("an answered, empty graph says there are no candidates", () => has(section("dead-code"), "No dead-code candidates in the indexed graph."));

@@ -146,7 +146,7 @@ export async function installTransparencyPreference(
   const failed = (cause: unknown) => {
     if (stopped) return;
     applyTransparency("unknown", source.target);
-    source.report?.(`Reduce Transparency could not be read: ${String(cause)}`);
+    source.report?.(`Reduce Transparency couldn't be read: ${String(cause)}`);
   };
 
   let unsubscribe: () => void = () => {};

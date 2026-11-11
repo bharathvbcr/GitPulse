@@ -102,7 +102,7 @@ describe("failed reads and actions are shown, not swallowed (SO-2)", () => {
   it("markOnboardingComplete rejects when the configuration cannot be loaded", async () => {
     vi.mocked(invoke).mockRejectedValue(new Error("config unreadable"));
     await expect(markOnboardingComplete()).rejects.toThrow(
-      "Tool configuration is not loaded yet, so setup completion could not be recorded.",
+      "Tool configuration is not loaded yet, so setup completion couldn't be recorded.",
     );
   });
 
@@ -113,7 +113,7 @@ describe("failed reads and actions are shown, not swallowed (SO-2)", () => {
     onboardingStore.actionError.set(null);
     await expect(finishSetup()).resolves.toBe(false);
     expect(get(onboardingStore.wizard).open).toBe(true);
-    expect(get(onboardingStore.actionError)).toContain("could not be recorded");
+    expect(get(onboardingStore.actionError)).toContain("couldn't be recorded");
   });
 
   it("finishSetup closes the wizard once completion is recorded", async () => {

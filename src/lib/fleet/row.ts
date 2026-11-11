@@ -96,11 +96,11 @@ function sweepFailure(
 ): string | null {
   if (snapshotError) return snapshotError;
   if (!facet) return null;
-  if (!facet.ok) return facet.error || "the repository could not be read";
+  if (!facet.ok) return facet.error || "the repository couldn't be read";
   if (!facet.worktrees_ok) {
-    return facet.worktrees_error || "the worktree list could not be read";
+    return facet.worktrees_error || "the worktree list couldn't be read";
   }
-  if (!facet.last_commit_ok) return "the last commit could not be read";
+  if (!facet.last_commit_ok) return "the last commit couldn't be read";
   return null;
 }
 
@@ -234,7 +234,7 @@ function coverageCell(
  */
 function commitsCell(facet: FleetRepoFacet): FleetRow["commits"] {
   if (!facet.commits_ok || facet.commits === null) {
-    return failedCell(facet.commits_error || "the commit history could not be read");
+    return failedCell(facet.commits_error || "the commit history couldn't be read");
   }
   const stats = facet.commits;
   const value: CommitsCellValue = {
@@ -263,7 +263,7 @@ function tierOne(
   }
   if (!facet) return { work: UNSCANNED, activity: UNSCANNED, commits: UNSCANNED };
   if (!facet.ok) {
-    const failure = failedCell(facet.error || "the repository could not be read");
+    const failure = failedCell(facet.error || "the repository couldn't be read");
     return { work: failure, activity: failure, commits: failure };
   }
   return {
@@ -284,14 +284,14 @@ function tierOne(
           // the cell wears the `≥` marker rather than reading as exact.
           facet.agents.truncated,
         )
-      : failedCell(facet.worktrees_error || "the worktree list could not be read"),
+      : failedCell(facet.worktrees_error || "the worktree list couldn't be read"),
     activity:
       facet.last_commit_ok && facet.last_commit_epoch > 0
         ? readCell(facet.last_commit_epoch * 1000, null)
         : facet.last_commit_ok
           ? // A repository with no commits at all is a real, readable answer.
             readCell(0, null)
-          : failedCell("the last commit could not be read"),
+          : failedCell("the last commit couldn't be read"),
   };
 }
 
@@ -325,7 +325,7 @@ function watchWarningFor(facts: RepoFacts): string | null {
  */
 function ledgerFailure(facet: FleetRepoFacet | undefined): string | undefined {
   if (!facet || facet.metrics_ok) return undefined;
-  return facet.metrics_error || "this repository's scan history could not be read";
+  return facet.metrics_error || "this repository's scan history couldn't be read";
 }
 
 function openRow(
@@ -371,7 +371,7 @@ function openRow(
           facts.churnPartial,
         )
       : facts.loadFailed
-        ? failedCell(facts.loadError ?? "the repository snapshot could not be read")
+        ? failedCell(facts.loadError ?? "the repository snapshot couldn't be read")
         : UNSCANNED,
     sync: known
       ? readCell(
@@ -385,7 +385,7 @@ function openRow(
           facts.stashFailed,
         )
       : facts.loadFailed
-        ? failedCell(facts.loadError ?? "the repository snapshot could not be read")
+        ? failedCell(facts.loadError ?? "the repository snapshot couldn't be read")
         : UNSCANNED,
     watchWarning: watchWarningFor(facts),
     ...tierOne(facet, inputs.snapshotError),

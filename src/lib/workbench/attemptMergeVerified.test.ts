@@ -75,9 +75,9 @@ describe("mergeVerifiedAttempt", () => {
   it.each([
     ["the worktree moved past the verified head", { head: "fedcba0987654321" }, {}, /moved to fedcba09 after 12345678/],
     ["the worktree has uncommitted files", { dirty_files: 2 }, {}, /2 uncommitted files no verdict covered/],
-    ["the worktree's changes could not be counted", { dirty_files: null }, {}, /could not be counted/],
+    ["the worktree's changes couldn't be counted", { dirty_files: null }, {}, /couldn't be counted/],
     ["the main checkout is dirty", {}, { dirty_files: 1 }, /main worktree \/work\/repo has 1 uncommitted file/],
-    ["the main checkout could not be checked", {}, { dirty_files: null }, /could not be checked for uncommitted work/],
+    ["the main checkout couldn't be checked", {}, { dirty_files: null }, /couldn't be checked for uncommitted work/],
     ["the main checkout is detached", {}, { branch: null }, /not on a branch/],
     ["the attempt has no branch", { branch: null }, {}, /not on a branch/],
   ])("merges nothing when %s", async (_why, own, main, message) => {
@@ -91,7 +91,7 @@ describe("mergeVerifiedAttempt", () => {
     live.mockResolvedValue({ runs: [{ cwd: "/work/repo" }], complete: true });
     await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/Another run is working in the main worktree/);
     live.mockResolvedValue({ runs: [], complete: false });
-    await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/could not all be read/);
+    await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/couldn't all be read/);
     live.mockRejectedValue(new Error("store down"));
     await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/store down/);
     expect(merged()).toBe(false);
@@ -150,10 +150,10 @@ describe("mergeVerifiedAttempt", () => {
     repoState.set({ openTabs: [{ id: "t", path: WT }] });
     const base = invoke.getMockImplementation()!;
     invoke.mockImplementation(async (cmd: string, args: unknown) => cmd === "cmd_worktree_merge_teardown"
-      ? { policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree could not be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }
+      ? { policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree couldn't be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }
       : base(cmd, args));
     const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
-    expect(result.message).toBe("Merged 1 commit from gitpulse/fix into main; cleanup pending: The worktree could not be removed after 3 attempts: locked.");
+    expect(result.message).toBe("Merged 1 commit from gitpulse/fix into main; cleanup pending: The worktree couldn't be removed after 3 attempts: locked.");
     expect(closeTab).not.toHaveBeenCalled();
   });
 

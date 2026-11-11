@@ -214,7 +214,7 @@
         {/if}
         {#if lost > 0}
           <p role="alert">
-            {view.status.dropped_queue} could not be queued, {view.status.dropped_scan} were read but
+            {view.status.dropped_queue} couldn't be queued, {view.status.dropped_scan} were read but
             not carried, and {view.status.displaced} were pushed out by other sessions. These were
             never judged; they are a fault, not a preference.
           </p>
@@ -242,7 +242,7 @@
     <p role="alert" class="text-danger">{error}</p>
   {:else if !draft && $sessionAlertsLoadError}
     <p role="alert" class="text-danger" data-testid="session-alerts-load-error">
-      The notification settings could not be read: {$sessionAlertsLoadError}
+      The notification settings couldn't be read: {$sessionAlertsLoadError}
     </p>
   {/if}
   {#if !draft && (error || $sessionAlertsLoadError)}

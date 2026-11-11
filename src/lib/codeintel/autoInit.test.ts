@@ -106,7 +106,7 @@ describe("autoInit", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(warn).toHaveBeenCalledWith(
       "devcouncil-init",
-      expect.stringContaining("could not be hidden from git status"),
+      expect.stringContaining("couldn't be hidden from git status"),
     );
     expect(warn).toHaveBeenCalledWith(
       "devcouncil-init",
@@ -270,7 +270,7 @@ describe("autoInit", () => {
     );
     expect(warn).toHaveBeenCalledWith(
       "devcouncil-init",
-      "/a: cross-repository search omitted open tabs it could not register — /gone: Cannot access path '/gone'",
+      "/a: cross-repository search omitted open tabs it couldn't register — /gone: Cannot access path '/gone'",
     );
     expect(warn).not.toHaveBeenCalledWith("devcouncil-init", expect.stringContaining("has no registry"));
     index.reset();
@@ -287,7 +287,7 @@ describe("autoInit", () => {
       initialize: async (repo) => report({ repo, skipped_unavailable: skipped }),
     });
     const omitted = () =>
-      warn.mock.calls.filter(([, message]) => String(message).includes("could not register"));
+      warn.mock.calls.filter(([, message]) => String(message).includes("couldn't register"));
 
     for (const active of ["/a", "/b", "/c"]) {
       index.setScope(scope(active, ["/a", "/b", "/c", "/gone"]));
@@ -295,7 +295,7 @@ describe("autoInit", () => {
     }
     expect(omitted()).toHaveLength(1);
     expect(omitted()[0][1]).toBe(
-      "/a: cross-repository search omitted open tabs it could not register — /gone: Cannot access path '/gone'",
+      "/a: cross-repository search omitted open tabs it couldn't register — /gone: Cannot access path '/gone'",
     );
 
     // A second, different omission is its own fact and is named alone.
@@ -304,7 +304,7 @@ describe("autoInit", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(omitted()).toHaveLength(2);
     expect(omitted()[1][1]).toBe(
-      "/a: cross-repository search omitted open tabs it could not register — /also: Cannot access path '/also'",
+      "/a: cross-repository search omitted open tabs it couldn't register — /also: Cannot access path '/also'",
     );
 
     // Registered cleanly, then lost again: that recurrence is reported.

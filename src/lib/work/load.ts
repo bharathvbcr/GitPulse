@@ -198,7 +198,7 @@ export async function loadWork(
       const why = probeFailureDetail ? ` (${probeFailureDetail})` : "";
       sources.worktrees = noteFailure(
         sources.worktrees,
-        `could not read parked operations for ${probeFailures} worktree${probeFailures === 1 ? "" : "s"}${why}`,
+        `couldn't read parked operations for ${probeFailures} worktree${probeFailures === 1 ? "" : "s"}${why}`,
       );
     }
     input.operations = operations;
@@ -266,7 +266,7 @@ export async function loadWork(
       const why = bindingFailureDetail ? ` (${bindingFailureDetail})` : "";
       sources.worktrees = noteFailure(
         sources.worktrees,
-        `could not read task binding for ${bindingFailures} worktree${bindingFailures === 1 ? "" : "s"}${why}`,
+        `couldn't read task binding for ${bindingFailures} worktree${bindingFailures === 1 ? "" : "s"}${why}`,
       );
     }
     if (input.worktrees.length > looked.length) {
@@ -292,7 +292,7 @@ export async function loadWork(
         if (title) titles[taskId] = title;
       }
     } catch (e) {
-      sources.tasks = noteFailure(sources.tasks, `task titles could not be read (${formatError(e)}); using task IDs`);
+      sources.tasks = noteFailure(sources.tasks, `task titles couldn't be read (${formatError(e)}); using task IDs`);
     }
     input.titles = titles;
   }

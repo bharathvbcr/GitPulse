@@ -64,7 +64,7 @@ describe("conflict draft recovery", () => {
   });
   it.each(["{broken", '{"version":2,"drafts":[]}', '{"version":1,"drafts":[{}]}'])("preserves corrupt storage without silently replacing it: %s", raw => {
     const disk = storage(); disk.setItem("", raw); const sessions = createConflictSessions(disk);
-    expect(sessions.warning).toContain("could not be read"); sessions.open("/repo", snapshot()); sessions.edit("/repo", "file", choice()); sessions.flush();
+    expect(sessions.warning).toContain("couldn't be read"); sessions.open("/repo", snapshot()); sessions.edit("/repo", "file", choice()); sessions.flush();
     expect(disk.getItem()).toBe(raw);
   });
   it("preserves a saved-but-unstaged receipt across a remount and clears only after completion", () => {
@@ -135,7 +135,7 @@ describe("conflict draft recovery", () => {
     const disk = storage(); const sessions = createConflictSessions(disk); sessions.open("/repo", snapshot()); sessions.edit("/repo", "file", choice()); sessions.flush();
     const payload = JSON.parse(disk.getItem()!); payload.drafts.push({ ...payload.drafts[0], state: choice(snapshot(), "duplicate") });
     disk.setItem("", JSON.stringify(payload)); const restored = createConflictSessions(disk);
-    expect(restored.warning).toContain("could not be read"); expect(restored.get("/repo", "file")).toBeNull();
+    expect(restored.warning).toContain("couldn't be read"); expect(restored.get("/repo", "file")).toBeNull();
   });
   it("publishes debounced storage failures and clears the notice after recovery", () => {
     let fail = true; const disk = { ...storage(), setItem: () => { if (fail) throw Error("quota"); } };
@@ -149,7 +149,7 @@ describe("conflict draft recovery", () => {
     const disk = storage(); const sessions = createConflictSessions(disk); sessions.open("/repo", snapshot()); sessions.edit("/repo", "file", choice()); sessions.flush();
     expect(() => sessions.pending("/repo", "file", snapshot("a", "other"))).toThrow("different file");
     const payload = JSON.parse(disk.getItem()!); payload.drafts[0].snapshot.document.marker_size = 0; disk.setItem("", JSON.stringify(payload));
-    expect(createConflictSessions(disk).warning).toContain("could not be read");
+    expect(createConflictSessions(disk).warning).toContain("couldn't be read");
   });
   it("shows lightweight progress and discards only the selected recovery or file", () => {
     const sessions = createConflictSessions(); sessions.open("/repo", snapshot()); sessions.edit("/repo", "file", choice());

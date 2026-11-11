@@ -52,7 +52,7 @@
 
   {#if unsaved}
     <p role="alert" class="text-warn">
-      These defaults could not be saved; they apply only to this visit.
+      These defaults couldn't be saved; they apply only to this visit.
     </p>
   {/if}
 

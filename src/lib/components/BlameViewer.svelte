@@ -452,7 +452,7 @@
       {#if coverageFailed && blameLines.length > 0}
         <span
           class="flex items-center gap-1 text-warn"
-          title="Coverage data could not be loaded; hit badges are unavailable."
+          title="Coverage data couldn't be loaded; hit badges are unavailable."
         >
           <span class="w-2 h-2 rounded-full bg-warn"></span> Coverage unavailable
         </span>

@@ -57,7 +57,7 @@ export function importSummary(report: ImportReport): string {
   const parts: string[] = [];
   if (report.created.length) parts.push(`Created ${report.created.length} ${report.created.length === 1 ? "workspace" : "workspaces"}`);
   if (report.skipped.length) parts.push(`skipped ${report.skipped.length} ${report.skipped.length === 1 ? "group that already has" : "groups that already have"} a workspace`);
-  if (report.failed.length) parts.push(`${report.failed.length} could not be imported`);
+  if (report.failed.length) parts.push(`${report.failed.length} couldn't be imported`);
   const sentence = parts.join(", ");
   return sentence ? `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.` : "No tab groups to import.";
 }

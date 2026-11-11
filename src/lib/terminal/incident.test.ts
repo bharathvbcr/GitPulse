@@ -177,7 +177,7 @@ describe("the incident controller", () => {
     const { c, notices } = controller(hostTabs(3), transcripts((i) => (i === 3 ? "unknown" : "found")));
     await c.handle(incident());
     expect(notices[0].action?.label).toBe("Resume 2");
-    expect(notices[0].message).toContain("1 more could not be checked for a saved conversation");
+    expect(notices[0].message).toContain("1 more couldn't be checked for a saved conversation");
   });
 
   it("says sender unknown rather than guessing, and offers nothing when nothing can resume", async () => {
@@ -287,8 +287,8 @@ describe("what taking the offer did, in words", () => {
     const line = describeResumeReport(report({ offered: 5, started: 1, deferred: 2, failed: 1, missing: 1 }));
     expect(line).toBe(
       "Resumed 1 of 5 Claude conversations: 2 waiting for a free terminal slot (each starts when one frees); " +
-        "1 could not start (each tab says why); 1 no longer had a tab to resume in.",
+        "1 couldn't start (each tab says why); 1 no longer had a tab to resume in.",
     );
-    expect(describeResumeReport(report({ offered: 2, failed: 2 }))).toBe("Resumed 0 of 2 Claude conversations: 2 could not start (each tab says why).");
+    expect(describeResumeReport(report({ offered: 2, failed: 2 }))).toBe("Resumed 0 of 2 Claude conversations: 2 couldn't start (each tab says why).");
   });
 });

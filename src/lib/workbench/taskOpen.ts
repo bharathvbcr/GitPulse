@@ -50,6 +50,6 @@ export async function openTaskForRun(
   read: (id: string) => Promise<Pick<TaskRun, "id" | "task_id">> = getTaskRun,
 ): Promise<void> {
   const run = await read(runId);
-  if (run.id !== runId) throw new Error("That run's record could not be read.");
+  if (run.id !== runId) throw new Error("That run's record couldn't be read.");
   requestTaskOpen(run.task_id);
 }

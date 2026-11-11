@@ -185,7 +185,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "insights",
     label: "Insights",
     summary:
-      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that could not run is never shown as clean.",
+      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that couldn't run is never shown as clean.",
     paletteCommand: "Open Insights — activity, dependencies, coverage, secrets and disk",
     // Scans of one subject: this repository. They were separate header
     // entries, each empty until someone ran it. As sections they share one

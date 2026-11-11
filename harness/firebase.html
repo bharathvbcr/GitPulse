@@ -436,7 +436,7 @@
       statusReply = status({ has_apphosting_config: false });
       await remount();
       check("a firebase.json without an apphosting key says so, without calling it an error",
-        () => text().includes("carries no") && !text().includes("could not be read"));
+        () => text().includes("carries no") && !text().includes("couldn't be read"));
 
       statusReply = status({ projects_truncated: true });
       await remount();

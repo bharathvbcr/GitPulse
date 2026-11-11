@@ -284,7 +284,7 @@ export function describePulseCoverage(pulse: FleetPulse): string {
     return "the sweep has not read commit history yet";
   }
   const parts: string[] = [];
-  if (pulse.failed > 0) parts.push(`${pulse.failed} could not be read`);
+  if (pulse.failed > 0) parts.push(`${pulse.failed} couldn't be read`);
   if (pulse.unscanned > 0) parts.push(`${pulse.unscanned} not swept`);
   if (pulse.mismatched > 0) parts.push(`${pulse.mismatched} on a different window`);
   const floor = pulse.partial ? ", some histories capped" : "";

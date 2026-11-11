@@ -127,7 +127,7 @@ describe("describePrWorktree", () => {
     expect(text).toContain("build caches were not copied: node_modules: permission denied");
     expect(text).toContain("post-create hook did not finish");
     expect(text).toContain("for want of disk: target");
-    expect(text).toContain("Free disk space could not be read");
+    expect(text).toContain("Free disk space couldn't be read");
     expect(text).toContain("Code map setup failed: no store");
   });
 });

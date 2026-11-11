@@ -60,7 +60,7 @@ describe("host-load wording", () => {
     expect(describeReading({ status: "unavailable", value: "unreadable" }, bytes)).toBe("unreadable");
     expect(describeReading({ status: "unavailable", value: "not_yet" }, bytes)).toBe("pending");
     expect(describeReading({ status: "unavailable", value: "unsupported" }, bytes)).toBe("not measured here");
-    expect(describeReading(null, bytes)).toBe("could not read");
+    expect(describeReading(null, bytes)).toBe("couldn't read");
     expect(valueOf({ status: "unavailable", value: "failed" })).toBeNull();
     expect(valueOf({ status: "value", value: 7 })).toBe(7);
   });
@@ -177,7 +177,7 @@ describe("the governor's lines", () => {
       },
     );
     const line = admissionLine(several);
-    expect(line).toMatch(/free space could not be read/);
+    expect(line).toMatch(/free space couldn't be read/);
     expect(line).toMatch(/\.turbo: boom/);
   });
 

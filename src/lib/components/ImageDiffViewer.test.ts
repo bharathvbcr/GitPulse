@@ -47,7 +47,7 @@ describe("ImageDiffViewer states", () => {
   it("puts a side's own read error under its label, so a failure is not presented as Deleted", () => {
     const html = body({ oldSrc: IMG, newError: "gone from the working tree" });
     expect(html).toContain("No current version (deleted)");
-    expect(html).toContain("could not be read: gone from the working tree");
+    expect(html).toContain("couldn't be read: gone from the working tree");
   });
 
   it("shows no absence note when both pictures are there", () => {

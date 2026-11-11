@@ -36,7 +36,7 @@ export function parseGitPreflight(value: unknown): GitPreflight {
  */
 export function preflightProblem(preflight: GitPreflight): string | null {
   if (preflight.status === "ok" || preflight.status === "unchecked") return null;
-  return preflight.message ?? "Git could not be used.";
+  return preflight.message ?? "Git couldn't be used.";
 }
 
 /** Mirrors the Rust `GitIdentity`. */

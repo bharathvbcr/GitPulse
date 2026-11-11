@@ -312,7 +312,7 @@
     try {
       await openTaskForRun(run.id);
     } catch (err: unknown) {
-      error = `That worktree's task could not be opened: ${reportPanelError("worktrees", err)}`;
+      error = `That worktree's task couldn't be opened: ${reportPanelError("worktrees", err)}`;
     }
   }
 

@@ -279,7 +279,7 @@ describe("tab marker and tooltip", () => {
     // and the user acts on a state the app never actually checked.
     const failed = { operation: null, probeFailed: true };
     expect(tabMarker(failed)).toBe("?");
-    expect(tabTooltip(failed)).toContain("could not determine");
+    expect(tabTooltip(failed)).toContain("couldn't determine");
   });
 
   it("carries the full instruction in the tooltip", () => {

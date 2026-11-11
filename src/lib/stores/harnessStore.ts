@@ -1155,7 +1155,7 @@ export function verdictDetail(verdict: PolicyVerdict): string {
     case "widened":
       return `Authorized by scope the agent added to its own task: ${verdict.widened}.`;
     case "degraded":
-      return `Allowed, but these checks could not run: ${verdict.degraded.join(", ")}.`;
+      return `Allowed, but these checks couldn't run: ${verdict.degraded.join(", ")}.`;
     case "warned":
       return verdict.reason;
     case "blocked":

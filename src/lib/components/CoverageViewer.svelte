@@ -2104,12 +2104,12 @@
           icon={FileCode}
           title={!contentError && hitMap.size === 0 ? "Not in any coverage report" : "No source available"}
           hint={contentError
-            ? `The source for this path could not be loaded: ${contentError}`
+            ? `The source for this path couldn't be loaded: ${contentError}`
             : hitMap.size === 0
               ? scanTruncated
                 ? "The scan was capped, so this file's absence may be incomplete rather than a real zero."
                 : "This file was not instrumented by the coverage artifacts found in the repository."
-              : "The source for this path could not be loaded."}
+              : "The source for this path couldn't be loaded."}
         />
       {:else}
         <EmptyState

@@ -248,7 +248,7 @@ export async function prepareTaskIssues(
     try {
       task = await bounded(io.read(card.id));
     } catch (cause) {
-      skipped.push({ title: card.title, reason: `could not be read: ${explainError(cause)}` });
+      skipped.push({ title: card.title, reason: `couldn't be read: ${explainError(cause)}` });
       continue;
     }
     const linked = linkedIssueNumber(task);

@@ -558,7 +558,7 @@
     <!-- Rose: the status read is local and free, so a failure here is a fault,
          not a configuration gap. -->
     <div class="gp-notice" data-tone="danger">
-      Firebase status could not be read: {statusError}
+      Firebase status couldn't be read: {statusError}
     </div>
   {:else if statusLoading && !status}
     <Skeleton variant="text" count={3} height="1.25rem" />
@@ -572,12 +572,12 @@
   {:else if status}
     {#if status.firebaserc_error}
       <div class="gp-notice mb-2" data-tone="warn">
-        .firebaserc could not be read: {status.firebaserc_error}
+        .firebaserc couldn't be read: {status.firebaserc_error}
       </div>
     {/if}
     {#if status.firebasejson_error}
       <div class="gp-notice mb-2" data-tone="warn">
-        firebase.json could not be read: {status.firebasejson_error}
+        firebase.json couldn't be read: {status.firebasejson_error}
       </div>
     {/if}
 

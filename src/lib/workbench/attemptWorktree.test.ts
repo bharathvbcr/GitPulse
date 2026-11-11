@@ -89,9 +89,9 @@ describe("mainCheckoutOf", () => {
     invoke.mockResolvedValueOnce({ path: "/work/repo", name: "repo", is_bare: false, common_dir: "/work/repo/.git" });
     await expect(mainCheckoutOf("/work/repo")).rejects.toThrow(/main worktree, so there is no separate worktree/);
     invoke.mockResolvedValueOnce({ path: WT, name: "fix", is_bare: false, common_dir: null });
-    await expect(mainCheckoutOf(WT)).rejects.toThrow(/could not tell which repository/);
+    await expect(mainCheckoutOf(WT)).rejects.toThrow(/couldn't tell which repository/);
     invoke.mockRejectedValueOnce(new Error("not a git repository"));
-    await expect(mainCheckoutOf(WT)).rejects.toThrow(/could not be read as a Git worktree/);
+    await expect(mainCheckoutOf(WT)).rejects.toThrow(/couldn't be read as a Git worktree/);
   });
 });
 
@@ -161,9 +161,9 @@ describe("merge and discard", () => {
     askChoice.mockResolvedValueOnce("alternate");
     repoState.set({ openTabs: [{ id: "t", path: WT, familyRoot: "/work/repo", currentBranch: "gitpulse/x" }] });
     invoke.mockImplementationOnce(async () => listing(0))
-      .mockImplementationOnce(async () => ({ policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree could not be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }));
+      .mockImplementationOnce(async () => ({ policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree couldn't be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }));
     const result = await mergeAttemptWorktree(run());
-    expect(result?.message).toBe("Merged 1 commit from gitpulse/fix-e42-wt0attem into main; cleanup pending: The worktree could not be removed after 3 attempts: locked.");
+    expect(result?.message).toBe("Merged 1 commit from gitpulse/fix-e42-wt0attem into main; cleanup pending: The worktree couldn't be removed after 3 attempts: locked.");
     expect(closeTab).not.toHaveBeenCalled();
   });
 
@@ -217,7 +217,7 @@ describe("merge and discard", () => {
     // Unscanned: never forced.
     calls.length = 0;
     await discardAttemptWorktree(run());
-    expect(askConfirm.mock.calls.at(-1)?.[0].message).toContain("could not be counted, so only a clean removal is tried");
+    expect(askConfirm.mock.calls.at(-1)?.[0].message).toContain("couldn't be counted, so only a clean removal is tried");
     expect(calls.filter(([c]) => c === "cmd_remove_worktree").at(-1)?.[1]).toMatchObject({ force: false });
   });
 
@@ -275,8 +275,8 @@ describe("merge and discard", () => {
     fake.state.openFails = true;
     askConfirm.mockResolvedValue(true);
     askChoice.mockResolvedValue("confirm");
-    await expect(discardAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
-    await expect(mergeAttemptWorktree(run())).rejects.toThrow(/could not be opened/);
+    await expect(discardAttemptWorktree(run())).rejects.toThrow(/couldn't be opened/);
+    await expect(mergeAttemptWorktree(run())).rejects.toThrow(/couldn't be opened/);
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_remove_worktree");
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_worktree_merge_teardown");
     expect(fake.seen).toEqual([]);
@@ -393,12 +393,12 @@ describe("reviewing what an attempt committed", () => {
   it("does not call an unmeasured ancestry a failed one", async () => {
     committedAttempt({ freshness: freshness({ landed_on_base: null, on_base: null, ahead: null, behind: null, base_relation_reason: "not measured: this is a shallow clone" }) });
     const opened = await openAttemptDiff(run(), reviewRecord() as never);
-    expect(opened.notices[0]).toContain("could not be told");
+    expect(opened.notices[0]).toContain("couldn't be told");
     expect(opened.notices[0]).toContain("this is a shallow clone");
     expect(opened.notices[0]).not.toContain("is not an ancestor");
     committedAttempt({ freshness: new Error("host gone") });
     const failed = await openAttemptDiff(run(), reviewRecord() as never);
-    expect(failed.notices[0]).toContain("could not be told");
+    expect(failed.notices[0]).toContain("couldn't be told");
     expect(failed.notices[0]).toContain("host gone");
   });
 
@@ -416,7 +416,7 @@ describe("reviewing what an attempt committed", () => {
   it("says when the diff could not be read, or the view moved on before it was selected", async () => {
     committedAttempt();
     rangeAnswer = (from, to) => ({ selectionKind: "range", selectedFilePath: `${from}...${to}`, selectedDiffTruncated: false, selectedDiffError: "bad revision" });
-    expect((await openAttemptDiff(run(), reviewRecord() as never)).notices.join(" ")).toContain("could not be read: bad revision");
+    expect((await openAttemptDiff(run(), reviewRecord() as never)).notices.join(" ")).toContain("couldn't be read: bad revision");
     // Something else took the selection before this one's answer: the view must not be reported as showing the range.
     rangeAnswer = () => ({ selectionKind: "file", selectedFilePath: "other.txt", selectedDiffTruncated: false, selectedDiffError: null });
     const overtaken = await openAttemptDiff(run(), reviewRecord() as never);
@@ -431,7 +431,7 @@ describe("reviewing what an attempt committed", () => {
     await reviewAttemptChanges(run());
     expect(previewUncommitted).toHaveBeenCalledWith(WT);
     expect(selectRangeDiff).not.toHaveBeenCalled();
-    expect(warnings().join(" ")).toContain("commits could not be read");
+    expect(warnings().join(" ")).toContain("commits couldn't be read");
     expect(warnings().join(" ")).toContain("store busy");
   });
 

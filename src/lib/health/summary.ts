@@ -234,7 +234,7 @@ function githubFacet(
       label,
       value: "unavailable",
       tone: "unknown",
-      caveat: `${label} could not be checked: ${why}.`,
+      caveat: `${label} couldn't be checked: ${why}.`,
     };
   }
   const missing = report.partial_tiers ?? [];
@@ -246,7 +246,7 @@ function githubFacet(
         label,
         value: "incomplete",
         tone: "unknown",
-        caveat: `${label} alerts could not be read for the ${missing.join(", ")} severity: none are shown, which is not the same as none being open.`,
+        caveat: `${label} alerts couldn't be read for the ${missing.join(", ")} severity: none are shown, which is not the same as none being open.`,
       };
     }
     return { id, label, value: "0 open", tone: "clear" };
@@ -259,7 +259,7 @@ function githubFacet(
     tone,
     caveat:
       missing.length > 0
-        ? `The ${missing.join(", ")} severity of ${label.toLowerCase()} alerts could not be read; ${report.alerts.length} are shown and more may be open.`
+        ? `The ${missing.join(", ")} severity of ${label.toLowerCase()} alerts couldn't be read; ${report.alerts.length} are shown and more may be open.`
         : report.truncated
           ? `Only the first ${report.alerts.length} ${label.toLowerCase()} alerts were returned; more remain.`
           : `${report.alerts.length} open ${label.toLowerCase()} alerts.`,

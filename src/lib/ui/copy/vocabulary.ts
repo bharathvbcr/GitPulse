@@ -343,6 +343,12 @@ export const BANNED_UI_TERMS: readonly BannedTerm[] = [
     pattern: /\boops\b/i,
     use: "Say what happened and what the user can do.",
   },
+  {
+    term: "could not",
+    pattern: /\bcould not\b/i,
+    use: "Couldn't",
+    note: 'The error voice is the contraction: "Couldn\'t read this file", "The log couldn\'t be read". Wire and protocol strings, text compared against Rust, comments and fixture data that mirrors a backend message keep their words; the lint reads user-string positions only, and a deliberate exception goes in the config allow list with a reason.',
+  },
 ];
 
 /**

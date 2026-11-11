@@ -67,7 +67,7 @@ describe("taskCreation", () => {
     // workspace would name a cause the board does not know.
     const creation = taskCreation(workspace, { ...ready, workspaceMembers: null, workspaceName: "Developer tools" });
     expect(creation.allowed).toBe(true);
-    expect(creation.caveat).toBe("This workspace's repositories could not be read. Choose one in the task.");
+    expect(creation.caveat).toBe("This workspace's repositories couldn't be read. Choose one in the task.");
   });
 
   it("never reports both a refusal and a caveat", () => {

@@ -36,7 +36,7 @@
   let retention = $derived(resolveRetention(defaults, override));
 
   function storage() { try { return localStorage; } catch { return null; } }
-  const unsaved = "Settings could not be saved; they apply only to this visit.";
+  const unsaved = "Settings couldn't be saved; they apply only to this visit.";
   /** This repository's departure from the host-wide default. */
   function persistOverride() {
     if (!saveOverride(storage(), key, override)) notice = unsaved;

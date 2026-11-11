@@ -220,9 +220,9 @@ describe("a view going away on a slow host", () => {
       await f.owner.start();
       f.owner.dispose();
       await later(CONTROL_QUICK_MS - 1000);
-      expect(get(f.registry)[0].status).not.toContain("could not be detached");
+      expect(get(f.registry)[0].status).not.toContain("couldn't be detached");
       await later(2000);
-      expect(get(f.registry)[0].status).toContain("could not be detached");
+      expect(get(f.registry)[0].status).toContain("couldn't be detached");
       expect(adopted).toEqual([]);
       expect(f.transport.kill).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }

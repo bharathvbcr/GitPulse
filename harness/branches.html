@@ -623,7 +623,7 @@ if(params.has("check")) {
     tagsTruncated=true;await repoStore.refresh();await settle();
     check("a capped tag list says older tags are not listed",document.getElementById("sidebar").textContent.includes("Older tags exist and are not listed."));
     tagsTruncated=false;failTags=true;await repoStore.refresh();await settle();
-    check("an unreadable tag list says so instead of looking complete",document.getElementById("sidebar").textContent.includes("The tag list could not be read, so this may not be complete."));
+    check("an unreadable tag list says so instead of looking complete",document.getElementById("sidebar").textContent.includes("The tag list couldn't be read, so this may not be complete."));
     failTags=false;tags=[];await repoStore.refresh();await settle();repoStore.setError(null);
     // The counters on line two say what they count, and a base comparison
     // also reports how far behind the base the branch is — no chip shows that.

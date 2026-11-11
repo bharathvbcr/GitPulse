@@ -174,4 +174,4 @@ export function closeQuestion(
   return isProvablyIdle(context) ? null : { title, message: COULD_NOT_TELL };
 }
 
-const COULD_NOT_TELL = "GitPulse could not tell whether something is still running in this terminal. Close it anyway?";
+const COULD_NOT_TELL = "GitPulse couldn't tell whether something is still running in this terminal. Close it anyway?";

@@ -38,7 +38,7 @@ export const VERDICT_HINTS: Readonly<Record<VerdictState, string>> = Object.free
   running: "Manvi is checking the work against the acceptance criteria.",
   passed: "Every check ran and every criterion was met.",
   failed: "A check found a defect or an unmet criterion.",
-  degraded: "A check could not run or could not be trusted. This is not a pass.",
+  degraded: "A check couldn't run or couldn't be trusted. This is not a pass.",
   could_not_run: "Verification did not run, so there is no verdict. This is not a failure.",
 });
 

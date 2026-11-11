@@ -429,7 +429,7 @@
           await terminalLaunchRequests.requestBrowser(repoPath, action.url);
           return;
         } catch (err) {
-          warning = `${action.url} opened in your browser: a browser session could not (${formatError(err)}).`;
+          warning = `${action.url} opened in your browser: a browser session couldn't (${formatError(err)}).`;
         }
       }
       try {
@@ -1132,7 +1132,7 @@
     try {
       await openTaskForRun(linkedRunId);
     } catch (cause) {
-      toastStore.error(`This attempt's task could not be opened: ${formatError(cause)}`);
+      toastStore.error(`This attempt's task couldn't be opened: ${formatError(cause)}`);
     }
   }
 
@@ -1836,7 +1836,7 @@
           class="ml-auto shrink-0 text-micro text-warn whitespace-nowrap"
           title={renderer === "reset"
             ? "The graphics context was lost, for example by a GPU reset or waking from sleep. This terminal draws without the GPU and will try again."
-            : "This terminal draws without the GPU: its graphics context was lost repeatedly or could not be created. Reopening the tab tries again."}
+            : "This terminal draws without the GPU: its graphics context was lost repeatedly or couldn't be created. Reopening the tab tries again."}
         >{renderer === "reset" ? "Drawing without GPU after a graphics reset" : "Drawing without GPU"}</span>
       {/if}
       <div class="{renderer === 'reset' || renderer === 'lost' ? '' : 'ml-auto '}flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">

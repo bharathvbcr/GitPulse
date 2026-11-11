@@ -75,7 +75,7 @@ describe("versionText", () => {
 
   it("distinguishes a component that could not run from one with no version", () => {
     const failed = versionText({ kind: "unavailable", detail: "not found" });
-    expect(failed).toContain("could not run");
+    expect(failed).toContain("couldn't run");
     expect(failed).not.toContain("not reported");
   });
 });

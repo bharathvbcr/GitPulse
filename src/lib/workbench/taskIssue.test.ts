@@ -234,7 +234,7 @@ describe("filing several tasks", () => {
     expect(skipped).toEqual([
       { title: "Linked", reason: "already linked to #4" },
       { title: "Nowhere", reason: "its repository is not loaded" },
-      { title: "Vanished", reason: expect.stringContaining("could not be read") },
+      { title: "Vanished", reason: expect.stringContaining("couldn't be read") },
     ]);
   });
 

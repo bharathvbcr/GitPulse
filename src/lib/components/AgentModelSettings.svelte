@@ -118,7 +118,7 @@
     const state = catalogs[launcher];
     if (!state) return null;
     if (state.status === "loading") return { text: "Asking for the model list…", problem: false };
-    if (state.status === "failed") return { text: `Could not list models: ${state.message}`, problem: true };
+    if (state.status === "failed") return { text: `couldn't list models: ${state.message}`, problem: true };
     const { catalog } = state;
     if (catalog.error) return { text: catalog.error, problem: true };
     const count = `${catalog.models.length}${catalog.truncated ? "+" : ""} model${catalog.models.length === 1 ? "" : "s"}`;

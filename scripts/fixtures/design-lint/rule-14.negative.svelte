@@ -22,3 +22,7 @@
 <style>
   .attempt-lane { content: "project"; }
 </style>
+<p>The log couldn't be read</p>
+<p>{item.reason === "could not run" ? "Done" : "Open"} {invoke("could not")}</p>
+{#if state === "could not"}<p>Done</p>{/if}
+<!-- A comment: the scan could not run. -->

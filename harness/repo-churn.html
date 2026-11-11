@@ -309,7 +309,7 @@
         await show(CodeStackViewer);
         await until(banner);
         check(`CodeStackViewer: unresolved branches render a banner with the count (saw ${banner()?.textContent.trim() ?? "none"})`,
-          () => /3 branches could not be placed/.test(banner()?.textContent ?? "") && /budget/.test(banner()?.textContent ?? ""));
+          () => /3 branches couldn't be placed/.test(banner()?.textContent ?? "") && /budget/.test(banner()?.textContent ?? ""));
         // Mounted: a refresh of the repository loads the stack again.
         const mountedLoads = count("cmd_get_stack_hierarchy");
         await repoStore.refresh();

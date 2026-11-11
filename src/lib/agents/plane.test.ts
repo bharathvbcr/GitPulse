@@ -292,7 +292,7 @@ describe("projectAgentPlane", () => {
     });
     expect(plane.rows[0].parallelCount).toBe(1);
     expect(plane.rows[0].parallelFloor).toBe(true);
-    expect(plane.gaps.some((gap) => gap.reason.includes("could not be read"))).toBe(true);
+    expect(plane.gaps.some((gap) => gap.reason.includes("couldn't be read"))).toBe(true);
   });
 
   it("attaches one live process to its checkout and clones a second into its own row", () => {

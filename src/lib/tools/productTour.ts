@@ -49,7 +49,7 @@ export function createProductTour(storage: () => TourStorage) {
         const progress = parseProgress(storage().getItem(STORAGE_KEY));
         publish({ ...progress, open: progress.status === "active" });
       } catch {
-        publish({ open: true, error: "Walkthrough progress could not be loaded. You can continue from the beginning." });
+        publish({ open: true, error: "Walkthrough progress couldn't be loaded. You can continue from the beginning." });
       }
     },
     open() {

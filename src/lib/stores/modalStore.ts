@@ -114,7 +114,7 @@ export function completePrompt(value: string | boolean | null): void {
     try {
       problem = current.options.validate?.(value) ?? null;
     } catch (err: unknown) {
-      problem = `This answer could not be checked: ${err instanceof Error ? err.message : String(err)}`;
+      problem = `This answer couldn't be checked: ${err instanceof Error ? err.message : String(err)}`;
     }
     if (problem !== null) {
       promptError.set(problem);

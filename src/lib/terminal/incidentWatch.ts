@@ -14,7 +14,7 @@ export function describeResumeReport(report: ResumeReport): string | null {
   if (report.started === report.offered) return null;
   const parts = [
     report.deferred > 0 ? `${report.deferred} waiting for a free terminal slot (each starts when one frees)` : null,
-    report.failed > 0 ? `${report.failed} could not start (each tab says why)` : null,
+    report.failed > 0 ? `${report.failed} couldn't start (each tab says why)` : null,
     report.missing > 0 ? `${report.missing} no longer had a tab to resume in` : null,
   ].filter((part): part is string => part !== null);
   return `Resumed ${report.started} of ${report.offered} Claude conversations${parts.length ? `: ${parts.join("; ")}` : ""}.`;
@@ -38,7 +38,7 @@ export function watchIncidents(listen: EventListen): Promise<() => void> {
       toastStore.warning(message, action ?? undefined, 0);
     },
     fail: (_terminalId, cause) => {
-      toastStore.error(`A Claude conversation could not be resumed: ${formatError(cause)}`);
+      toastStore.error(`A Claude conversation couldn't be resumed: ${formatError(cause)}`);
     },
     done: (report) => {
       const line = describeResumeReport(report);

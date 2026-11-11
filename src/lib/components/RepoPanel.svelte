@@ -281,7 +281,7 @@
     try {
       const outcome = await action();
       if (!outcome.ok) {
-        const message = outcome.error ?? "The action could not be completed.";
+        const message = outcome.error ?? "The action couldn't be completed.";
         toastStore.error(
           isStaleStackError(outcome.cause)
             ? "The stash list changed — refreshed. Try again."
@@ -819,7 +819,7 @@
              stash is work that exists nowhere else. -->
         <p class="flex items-start gap-1.5 text-meta text-warn">
           <AlertTriangle size={11} class="mt-0.5 shrink-0" />
-          <span>The stash list could not be read, so this may not be complete.</span>
+          <span>The stash list couldn't be read, so this may not be complete.</span>
         </p>
       {:else if stashEntries.length === 0}
         <EmptyState icon={Archive} title="No stashed changes" compact />

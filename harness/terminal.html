@@ -990,7 +990,7 @@
           while (performance.now() < hangDeadline && !get(promptState)) await wait(100);
           const unsure = get(promptState);
           check("closing a terminal whose context read never answers asks first, saying it could not tell",
-            () => unsure?.options.mode === "confirm" && unsure.options.message.includes("could not tell") && report.killed === killedBeforeHang);
+            () => unsure?.options.mode === "confirm" && unsure.options.message.includes("couldn't tell") && report.killed === killedBeforeHang);
           completePrompt(false);
           await wait(200);
           check("declining that question keeps the session running",

@@ -58,8 +58,8 @@ export function commitGraphHint(report: CommitGraphReport | null | undefined): C
   if (report.state === "unknown") {
     return {
       tone: "unchecked",
-      title: "Commit-graph could not be checked",
-      detail: report.note?.trim() || "GitPulse could not read the commit-graph.",
+      title: "Commit-graph couldn't be checked",
+      detail: report.note?.trim() || "GitPulse couldn't read the commit-graph.",
     };
   }
   return null;

@@ -82,7 +82,7 @@ export async function readWorkingTreeContent(
         ? err
         : err instanceof Error
           ? err.message
-          : "could not read working-tree content";
+          : "couldn't read working-tree content";
     return { ok: false, reason };
   }
 }
@@ -198,7 +198,7 @@ export const previewStore = {
           available: false,
           binary: null,
           lookup: null,
-          reason: "could not read any staged file from the working tree",
+          reason: "couldn't read any staged file from the working tree",
           files: [],
           cancelled: false,
         };

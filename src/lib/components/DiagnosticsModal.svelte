@@ -155,7 +155,7 @@
 
   /** What to say about the attribution daemon, or null when there is nothing to say. */
   function daemonNoticeFor(status: DaemonStatus): string | null {
-    if (status.error) return `The attribution daemon could not be checked: ${redactDiagnosticText(String(status.error))}`;
+    if (status.error) return `The attribution daemon couldn't be checked: ${redactDiagnosticText(String(status.error))}`;
     if (!status.running || !status.mismatch) return null;
     return `A gitpulsed from another version (${redactDiagnosticText(String(status.version ?? "unknown"))}, this app is ${redactDiagnosticText(String(status.app_version))}) is running${status.pid ? ` as pid ${status.pid}` : ""}. Restart it so it writes with this version's rules.`;
   }
@@ -262,7 +262,7 @@
         report,
         "",
         "Backend memory log — unavailable",
-        `  ! could not be read: ${memoryReadError}`,
+        `  ! couldn't be read: ${memoryReadError}`,
       ].join("\n");
     }
     report = withPersistedLogSection(
@@ -373,7 +373,7 @@
           </div>
 
           {#if memoryReadError}
-            <p class="text-meta text-warn wrap-break-word">Current-session log could not be read: {memoryReadError}</p>
+            <p class="text-meta text-warn wrap-break-word">Current-session log couldn't be read: {memoryReadError}</p>
           {/if}
           {#if daemonNotice}
             <p class="text-meta text-warn wrap-break-word">{daemonNotice}</p>

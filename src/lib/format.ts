@@ -110,7 +110,7 @@ export function signatureLabel(
       return { text: "Signed with a revoked key", ok: false };
     case "cannot_check":
     case "none":
-      return { text: "Signed, could not verify", ok: false };
+      return { text: "Signed, couldn't verify", ok: false };
     default:
       return { text: "Signature status unknown", ok: false };
   }

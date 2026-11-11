@@ -53,7 +53,7 @@ export function watchFailed(reason: unknown): WatchState {
       ? reason.message
       : typeof reason === "string"
         ? reason
-        : "the filesystem watcher could not be started";
+        : "the filesystem watcher couldn't be started";
   return { status: "degraded", reason: text.trim() || "unknown reason" };
 }
 

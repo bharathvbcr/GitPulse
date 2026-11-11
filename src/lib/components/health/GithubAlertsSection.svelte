@@ -94,7 +94,7 @@
   <div role="status" data-testid="github-alerts-partial" class="gp-notice" data-tone="warn">
     <div class="min-w-0 flex-1">
       Incomplete: the {missingTiers.join(", ")} severity
-      {missingTiers.length === 1 ? "tier" : "tiers"} of {noun} could not be fetched, so alerts
+      {missingTiers.length === 1 ? "tier" : "tiers"} of {noun} couldn't be fetched, so alerts
       of {missingTiers.length === 1 ? "that severity" : "those severities"} may be missing.
       Check GitHub alerts again to fill the gap.
     </div>

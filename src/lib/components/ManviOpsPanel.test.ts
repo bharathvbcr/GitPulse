@@ -33,7 +33,7 @@ describe("ManviOpsPanel tag retention", () => {
 
   it("reports tags it could not compare instead of hiding them in a bucket", () => {
     // An unmeasured tag is neither deletable nor evidence of retained work.
-    expect(source).toContain("{tagPlan.uncompared_tags} could not be compared");
+    expect(source).toContain("{tagPlan.uncompared_tags} couldn't be compared");
   });
 
   it("pre-selects no tags, unlike merged branches", () => {

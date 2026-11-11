@@ -89,7 +89,7 @@ export function notificationUnavailableReason(
   // surfacing verbatim rather than restating as "unsupported".
   return error
     ? `Desktop notifications are unavailable: ${error}`
-    : "Desktop notifications could not start. Open the activity inbox, or recheck below.";
+    : "Desktop notifications couldn't start. Open the activity inbox, or recheck below.";
 }
 
 /**

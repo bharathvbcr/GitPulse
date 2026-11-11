@@ -225,7 +225,7 @@ export function createSessionLifecycle(options: {
     try {
       kept = await terminalDeadline(transport.detach(target), CONTROL_QUICK_MS, "Detaching terminal", { clock: options.clock, pauseWhileHidden: true });
     } catch (error) {
-      if (id === target) slot?.update(`Still running; its view closed but it could not be detached. ${String(error)}`);
+      if (id === target) slot?.update(`Still running; its view closed but it couldn't be detached. ${String(error)}`);
       throw error;
     }
     // Not kept: it had already ended, and its exit (still subscribed) releases.

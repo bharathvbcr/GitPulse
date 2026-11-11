@@ -28,7 +28,7 @@ export function valueOf<T>(reading: Reading<T> | null | undefined): T | null {
 const WHY_LABEL: Record<Why, string> = {
   unsupported: "not measured here",
   unreadable: "unreadable",
-  failed: "could not read",
+  failed: "couldn't read",
   not_yet: "pending",
 };
 
@@ -184,7 +184,7 @@ function advice(advisory: Advisory, refused: boolean): string[] {
     case "cache_error":
       return [`Advice: the last worktree was made without its build caches (${advisory.message}).`];
     case "disk_unknown":
-      return ["Advice: free space could not be read, so no build cache was skipped on its account."];
+      return ["Advice: free space couldn't be read, so no build cache was skipped on its account."];
     case "low_disk": {
       const names = advisory.skipped.join(", ");
       if (advisory.cause === "byte_cap") {

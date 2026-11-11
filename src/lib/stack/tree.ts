@@ -296,8 +296,8 @@ export function unresolvedStackNotice(
   const plural = n === 1 ? "" : "es";
   const why = payload.walk_incomplete
     ? "the history walk did not finish (its commit or time budget ran out, or git failed) before reaching their base"
-    : "their history could not be read";
-  return `${n} branch${plural} could not be placed on a stack: ${why}. ${
+    : "their history couldn't be read";
+  return `${n} branch${plural} couldn't be placed on a stack: ${why}. ${
     n === 1 ? "It is" : "They are"
   } shown without a base rather than guessed.`;
 }

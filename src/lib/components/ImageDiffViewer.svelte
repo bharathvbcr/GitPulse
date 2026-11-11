@@ -88,7 +88,7 @@
         <TriangleAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
         <div class="min-w-0 flex-1">
           <p class="font-semibold">Couldn't read this image.</p>
-          <p class="mt-0.5 text-textMuted">{error ?? "The image could not be read."}</p>
+          <p class="mt-0.5 text-textMuted">{error ?? "The image couldn't be read."}</p>
         </div>
         {#if onRetry}
           <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={onRetry}>Try again</button>
@@ -169,7 +169,7 @@
 </div>
 
 {#snippet readError(message: string)}
-  <span class="max-w-64 text-center text-micro text-textMuted">could not be read: {message}</span>
+  <span class="max-w-64 text-center text-micro text-textMuted">couldn't be read: {message}</span>
 {/snippet}
 
 <!-- Swipe and onion draw whatever sides exist on one stage, so a side with no

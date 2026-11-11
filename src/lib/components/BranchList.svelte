@@ -1245,7 +1245,7 @@
     <!-- An unreadable tag list must not render as "no tags". -->
     <p class="px-2 {gapBand} flex items-start gap-1.5 text-meta text-unknown">
       <AlertTriangle size={11} class="mt-0.5 shrink-0" />
-      <span>The tag list could not be read, so this may not be complete.</span>
+      <span>The tag list couldn't be read, so this may not be complete.</span>
     </p>
   {:else if $repoStore.tagsTruncated}
     <p class="px-2 {gapBand} flex items-start gap-1.5 text-meta text-warn">

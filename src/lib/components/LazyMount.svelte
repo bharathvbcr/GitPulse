@@ -72,7 +72,7 @@
         if (cancelled) return;
         diagnostics.error(`lazy-mount:${name}`, error);
         toastStore.error(
-          `${name} could not be loaded. It ships as its own chunk, so this means the install is incomplete — reopening the window retries it.`,
+          `${name} couldn't be loaded. It ships as its own chunk, so this means the install is incomplete — reopening the window retries it.`,
         );
       },
     );

@@ -104,7 +104,7 @@
         Repository state unknown
       </p>
       <p class="mt-0.5 text-meta leading-relaxed text-textMuted">
-        GitPulse could not check whether a merge, rebase or cherry-pick is in
+        GitPulse couldn't check whether a merge, rebase or cherry-pick is in
         progress here. Run <code class="rounded bg-surfaceHover px-1">git status</code>
         in the Terminal view before making changes.
       </p>

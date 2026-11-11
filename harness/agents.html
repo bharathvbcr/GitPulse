@@ -214,7 +214,7 @@
         check("the plane is a labelled region", () => root()?.getAttribute("aria-label") === "Agents");
         check("an unread task board is not an empty workspace", () =>
           text().includes("Task runs have not been read yet") && text().includes("Still reading") && !text().includes("No agent sessions"));
-        check("an unread board is not reported as a failed read", () => !text().includes("could not be read"));
+        check("an unread board is not reported as a failed read", () => !text().includes("couldn't be read"));
         check("refresh waits, and can be cancelled, while the first read is in flight", () =>
           button("Refresh").disabled && button("Cancel"));
 
@@ -371,15 +371,15 @@
         // it is counted as unplaced and the plane says so.
         orphan = true;
         button("Refresh").click();
-        await until(() => text().includes("Child sessions") && text().includes("could not be placed under a row"), "a child with an unseen parent was dropped without a trace");
+        await until(() => text().includes("Child sessions") && text().includes("couldn't be placed under a row"), "a child with an unseen parent was dropped without a trace");
         check("a child whose parent no probe lists is said to be unplaced, not left out", () =>
-          text().includes("1 child agent session could not be placed under a row") && !!row("Child session"));
+          text().includes("1 child agent session couldn't be placed under a row") && !!row("Child session"));
         check("the unseen-parent child is not nested under any row", () => rows().filter((item) => item.textContent.includes("pid 902")).length === 0);
         // Later checks read the plane without any child agent process.
         orphan = false;
         lineage = false;
         button("Refresh").click();
-        await until(() => !row("Child session") && !text().includes("could not be placed under a row"), "the child sessions did not clear");
+        await until(() => !row("Child session") && !text().includes("couldn't be placed under a row"), "the child sessions did not clear");
 
         let releaseSlow = () => {};
         slow = new Promise((resolve) => { releaseSlow = resolve; });
@@ -434,9 +434,9 @@
         await until(() => !row("Fix the gate"), "the attempt did not leave after the board read it gone");
         mode = "fail";
         button("Refresh").click();
-        await until(() => text().includes("Sessions could not be read"), "a failed read looked like an empty workspace");
+        await until(() => text().includes("Sessions couldn't be read"), "a failed read looked like an empty workspace");
         check("a failed read names itself and is not an empty workspace", () =>
-          text().includes("insights down") && text().includes("Sessions could not be read") && !text().includes("No agent sessions"));
+          text().includes("insights down") && text().includes("Sessions couldn't be read") && !text().includes("No agent sessions"));
         check("the run made no unexpected native calls", () => unexpected.length === 0 && errors.length === 0);
         await finish();
       } catch (error) {

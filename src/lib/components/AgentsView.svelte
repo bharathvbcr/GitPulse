@@ -460,7 +460,7 @@
         class="gp-notice mx-3! mt-2! shrink-0 flex-col! gap-0! p-0!"
         data-tone="unknown"
         data-testid="agents-gaps"
-        aria-label="What the plane could not read"
+        aria-label="What the plane couldn't read"
       >
         <div class="flex items-center gap-2 px-3 pt-2 pb-1">
           <CircleAlert size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
@@ -501,7 +501,7 @@
         {:else if plane.rows.length > 0}
           <EmptyState compact icon={Bot} title="Nothing matches this filter" hint="The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid." />
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
-          <div class="gp-notice" data-tone="unknown" role="status">Sessions could not be read. The notes above are the reason, not an empty workspace.</div>
+          <div class="gp-notice" data-tone="unknown" role="status">Sessions couldn't be read. The notes above are the reason, not an empty workspace.</div>
         {:else if plane.gaps.length > 0 || scanning}
           <div class="gp-notice" data-tone="unknown" role="status">Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.</div>
         {:else}

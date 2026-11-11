@@ -463,7 +463,7 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  blobs["gone.png"]={base64:"R09ORQ==",mime:"image/png",failNew:"gone from the working tree"};
  await repoStore.selectFileDiff("gone.png",false);await wait(500);
  check("an image whose current side cannot be read still shows the old picture, not 'No image'",()=>imgSrc("Before version of gone.png")==="data:image/png;base64,R09ORQ=="&&!text().includes("No image"));
- check("and the missing side is labelled with the reason it gave, not passed off as plain Deleted",()=>text().includes("No current version (deleted)")&&text().includes("could not be read: gone from the working tree"));
+ check("and the missing side is labelled with the reason it gave, not passed off as plain Deleted",()=>text().includes("No current version (deleted)")&&text().includes("couldn't be read: gone from the working tree"));
  blobs["new.png"]={base64:"TkVX",mime:"image/png",failOld:"no such path in HEAD"};
  await repoStore.selectFileDiff("new.png",false);await wait(500);
  check("an added image shows the new picture and says the previous version is absent",()=>imgSrc("After version of new.png")==="data:image/png;base64,TkVX"&&text().includes("No previous version (added)"));

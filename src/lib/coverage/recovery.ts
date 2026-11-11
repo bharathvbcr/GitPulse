@@ -170,7 +170,7 @@ export function planCoverageRecovery(
       steps,
       mode: "all",
       limitation: { kind: "scoped_to_modules", modules, partial },
-      note: `Retried per Go module (${modules.join(", ")}): the repository root is not a module, so \`go test ./...\` could not run there. This coverage covers only those modules.${capped}`,
+      note: `Retried per Go module (${modules.join(", ")}): the repository root is not a module, so \`go test ./...\` couldn't run there. This coverage covers only those modules.${capped}`,
     };
   }
 

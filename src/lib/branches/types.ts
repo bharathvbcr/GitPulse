@@ -419,7 +419,7 @@ export function worktreeSetupNotices(
   const notices: string[] = [];
   if (when !== "create" && done.cleanup_error) notices.push(done.cleanup_error);
   if (when !== "create" && done.sweep_problems?.length) {
-    notices.push(`Leftover files from an earlier worktree removal could not be cleared: ${done.sweep_problems.join("; ")}`);
+    notices.push(`Leftover files from an earlier worktree removal couldn't be cleared: ${done.sweep_problems.join("; ")}`);
   }
   if (when === "merge" && done.worktree_removed === false) {
     notices.push(`Merged, but the worktree was not removed: ${done.removal_error ?? "no reason was given"}. The merge stands; remove the worktree when it is free.`);

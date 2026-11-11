@@ -98,7 +98,7 @@ describe("three-state evidence survives to the screen", () => {
     // as "unchanged" makes a reformat start looking like exculpatory evidence.
     expect(panel).toContain('if (changed === true) return "changed"');
     expect(panel).toContain('if (changed === false) return "moved"');
-    expect(panel).toContain('return "could not tell"');
+    expect(panel).toContain(`return "couldn't tell"`);
     expect(panel).toContain("touch.body_changed === null");
     expect(panel).toContain("not the same as unchanged");
   });

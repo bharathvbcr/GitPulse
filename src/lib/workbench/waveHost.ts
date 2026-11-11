@@ -223,7 +223,7 @@ export async function beginWave(input: { repositoryId: string; n: number; waves:
   if (current?.record().state === "running") throw new Error("A wave is already running. Stop it before starting another.");
   const found = await findActiveWave(taskApi);
   if (found.record) throw new Error("A wave from before a restart is still marked running on the board. Resume or stop it before starting another.");
-  if (!found.complete) throw new Error("The board could not be read far enough to be sure no other wave is running, so none was started.");
+  if (!found.complete) throw new Error("The board couldn't be read far enough to be sure no other wave is running, so none was started.");
   return adopt(await startWave(input, await waveDeps(input.repositoryId, createWavePersister(taskApi), input.maxPriority)));
 }
 
