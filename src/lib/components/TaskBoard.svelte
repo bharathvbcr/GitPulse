@@ -3162,7 +3162,7 @@
   {/if}
   {#if taskTabs.tabs.length}
     <div class="editor-dock">
-      <div class="task-tabs bg-surface">
+      <div class="task-tabs">
         <div
           bind:this={tabStrip}
           class="task-tab-strip gp-header-scroll"
