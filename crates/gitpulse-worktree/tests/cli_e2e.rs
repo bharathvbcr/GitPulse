@@ -386,13 +386,19 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
 
 #[test]
 fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
-    let real_devmap = std::env::var_os("HOME")
+    // An explicit GITPULSE_DEVMAP_BIN names the build under test (a gate run
+    // against a devmap newer than the installed one); otherwise the installed
+    // binary, as before.
+    let real_devmap = std::env::var_os("GITPULSE_DEVMAP_BIN")
         .map(PathBuf::from)
-        .and_then(|h| {
-            [".local/bin/devmap", ".cargo/bin/devmap"]
-                .into_iter()
-                .map(|rel| h.join(rel))
-                .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+                [".local/bin/devmap", ".cargo/bin/devmap"]
+                    .into_iter()
+                    .map(|rel| h.join(rel))
+                    .find(|p| p.is_file())
+            })
         })
         .unwrap_or_else(|| {
             PathBuf::from(
