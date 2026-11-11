@@ -26,7 +26,7 @@
   import { summarizeRun, type BulkRunReport } from "../repos/workspaceOps";
   import { describeWorkspace, wipDestination } from "../repos/wipSummary";
   import { describeDestination } from "../views/viewRegistry";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { markEnter, markExit } from "../ui/headerMotion";
@@ -235,7 +235,7 @@
     {#if detailsOpen}
       <div
         use:portal
-        use:popover={dismissal}
+        use:popover={dismissal} out:popoverExit
         data-workspace-wip
         class="fixed right-3 top-20 w-80 gp-menu gp-pop shadow-float text-meta"
         style="z-index: {LAYERS.MENU}"

@@ -14,7 +14,7 @@
   import { isMacOS } from "../platform";
   import { liquidSelection } from "../ui/transitions";
   import { portal } from "../dom/portal";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import ViewSectionTabs from "./ViewSectionTabs.svelte";
 
@@ -314,7 +314,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     use:portal={"body"}
-    use:popover={flyoutPlacement}
+    use:popover={flyoutPlacement} out:popoverExit
     data-view-flyout={view}
     role="group"
     aria-label="{item?.label ?? view} sections"

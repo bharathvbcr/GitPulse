@@ -16,7 +16,7 @@
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { MAX_COLUMN_PAGES, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
   import { createLiveLoader } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
@@ -2595,7 +2595,7 @@
       <div
         bind:this={addMenuEl}
         use:portal={"body"}
-        use:popover={addMenuDismissal}
+        use:popover={addMenuDismissal} out:popoverExit
         id="task-add-repo-menu"
         data-add-repo-popup
         data-testid="task-add-repo-menu"

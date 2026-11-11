@@ -16,7 +16,7 @@
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { terminalPillView } from "../terminal/statusPill";
   import { launcherLabel } from "../terminal/tabs";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
 
   /**
    * How long the pointer may spend between the pill and its portaled menu
@@ -328,7 +328,7 @@
       role="group"
       aria-label="Terminal options"
       use:portal={"body"}
-      use:popover={menuPopover}
+      use:popover={menuPopover} out:popoverExit
       onpointerenter={showMenu}
       onpointerleave={scheduleHide}
       onfocusin={showMenu}

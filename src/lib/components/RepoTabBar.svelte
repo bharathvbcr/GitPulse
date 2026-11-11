@@ -10,7 +10,7 @@
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
   import { LAYERS } from "../ui/layers";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { copyText } from "../desktop/clipboard";
   import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
@@ -61,7 +61,7 @@
   import { headerAgentPlane } from "../agents/headerPlane";
   import { repoAgentPill, type RepoAgentPill } from "../agents/repoAttention";
   import { tabCardRows } from "../repos/tabCard";
-  import { markEnter, markExit, popupEnter, popupExit, tabEnter, tabExit } from "../ui/headerMotion";
+  import { markEnter, markExit, popupEnter, tabEnter, tabExit } from "../ui/headerMotion";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import WorkspaceActions from "./WorkspaceActions.svelte";
@@ -1800,7 +1800,7 @@
         <div
           bind:this={recentsEl}
           use:portal={"body"}
-          use:popover={recentsPlacement}
+          use:popover={recentsPlacement} out:popoverExit
           data-recents-menu
           id="recent-repositories-menu"
           role="menu"
@@ -1929,7 +1929,7 @@
     onpointerenter={onCardEnter}
     onpointerleave={onTabLeave}
     in:popupEnter
-    out:popupExit
+    out:popoverExit
     class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu p-2.5 text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
@@ -1961,7 +1961,7 @@
     tabindex="-1"
     onkeydown={handlePopupKeydown}
     in:popupEnter
-    out:popupExit
+    out:popoverExit
     class="fixed w-64 max-w-[calc(100vw-1rem)] gp-menu flex flex-col max-h-[min(24rem,calc(100vh-7.5rem))] shadow-float text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
@@ -2013,7 +2013,7 @@
     <div
       bind:this={menuEl}
       use:portal={"body"}
-      use:popover={menuDismissal}
+      use:popover={menuDismissal} out:popoverExit
       data-repo-menu
       role="menu"
       aria-label={`Repository actions for ${tab.label}`}
@@ -2256,7 +2256,7 @@
     <div
       bind:this={groupMenuEl}
       use:portal={"body"}
-      use:popover={groupMenuDismissal}
+      use:popover={groupMenuDismissal} out:popoverExit
       data-group-menu
       role="menu"
       aria-label={`Group actions for ${groupHeader.label}`}
@@ -2444,7 +2444,7 @@
     <div
       bind:this={stackMenuEl}
       use:portal={"body"}
-      use:popover={stackMenuDismissal}
+      use:popover={stackMenuDismissal} out:popoverExit
       id="repo-stack-menu"
       data-stack-menu={info.key}
       role="menu"
@@ -2606,7 +2606,7 @@
   <div
     bind:this={stripMenuEl}
     use:portal={"body"}
-    use:popover={stripMenuDismissal}
+    use:popover={stripMenuDismissal} out:popoverExit
     data-strip-menu
     role="menu"
     aria-label="Repository tab strip actions"

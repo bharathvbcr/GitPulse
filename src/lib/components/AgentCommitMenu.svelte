@@ -23,7 +23,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
-  import { popover, restoreFocusTo, type DismissReason, type PopoverOptions } from "../ui/popover";
+  import { popover, restoreFocusTo, type DismissReason, type PopoverOptions, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { describeFailure } from "../ui/copy/describeFailure";
   import SettingSegment from "./SettingSegment.svelte";
@@ -376,7 +376,7 @@
        after it has left the clipping pane, not while it is still inside it. -->
   <div
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     id={panelId}
     data-agent-commit-panel={uid}
     class="fixed gp-menu gp-pop gp-scroll p-3 w-80 max-w-[calc(100vw-16px)] max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain flex flex-col gap-2.5 font-sans"

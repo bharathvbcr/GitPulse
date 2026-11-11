@@ -548,6 +548,11 @@ const settle = async (ms = 30) => {
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
   if (prompt && pendingPrompt.options.title === "Refresh from saved task?") { button("Refresh", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
+// A popover leaves with a short exit now (`popoverExit`, 70 ms), so it is still
+// on screen for a moment after the close that dismissed it. A check that asks
+// "is it gone?" waits for the exit, bounded, and then asserts: it never skips
+// the assertion, and a popover that stays still fails it.
+const untilGone = async probe => { for (const end = Date.now() + 3000; probe() && Date.now() < end;) await settle(30); };
 const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error(`Timed out waiting for task UI [${describeForeground()}]`); };
 const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete",  "Copy for agent":"Copy task for an AI agent"};
 const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
@@ -857,11 +862,11 @@ if (params.has("check")) {
       const tab = (el, shiftKey = false) => { if (!el) return; el.focus(); el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true })); };
       tab(focusables()[0]); await settle(60);
       const stayed = Boolean(repoPopup());
-      tab(focusables().at(-1)); await settle(60);
+      tab(focusables().at(-1)); await settle(60); await untilGone(repoPopup);
       check("Tab within the repository dropdown keeps it open; Tab off its last control closes it",
         stayed && !repoPopup() && Boolean(editor()));
       await openRepoPicker();
-      tab(focusables()[0], true); await settle(60);
+      tab(focusables()[0], true); await settle(60); await untilGone(repoPopup);
       check("Shift+Tab off the dropdown's first control closes it too", !repoPopup() && Boolean(editor()));
       await openRepoPicker();
     }
@@ -874,7 +879,7 @@ if (params.has("check")) {
     // The sheet also closes on Escape. One Escape must dismiss one thing.
     repoPopup()?.querySelector("input")?.focus();
     document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    await settle(80);
+    await settle(80); await untilGone(repoPopup);
     check("Escape in the repository dropdown closes the dropdown, not the task",
       !repoPopup() && Boolean(editor()) && document.activeElement === repoToggle());
     // The anchor scrolling away must not leave the popover behind it. Guarded
@@ -884,7 +889,7 @@ if (params.has("check")) {
     if (!editor()) { card("task-2").click(); await wait(editor); }
     await openRepoPicker();
     editor()?.querySelector(".sheet-body")?.dispatchEvent(new Event("scroll"));
-    await settle(80);
+    await settle(80); await untilGone(repoPopup);
     check("scrolling the sheet dismisses the repository dropdown instead of leaving it floating",
       Boolean(editor()) && !repoPopup() && repoToggle()?.getAttribute("aria-expanded") === "false");
     const paneTab = id => editor()?.querySelector(`[data-sheet-tab="${id}"]`);
@@ -989,7 +994,7 @@ if (params.has("check")) {
         check("Choose folder remains fully readable in the add-repository menu",
           Boolean(choose) && uncropped(choose));
         menu?.querySelector('[role="menuitem"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-        await settle(80);
+        await settle(80); await untilGone(addRepoMenu);
         check("Escape in the add-repository menu restores focus to the plus",
           !addRepoMenu() && document.activeElement === addRepoTrigger());
         repos.push(...extras.slice(1));
@@ -1001,7 +1006,7 @@ if (params.has("check")) {
         check("a long registered list still fits the window and scrolls inside the menu",
           Boolean(tall) && fitsViewport(tall) && tall.scrollHeight > tall.clientHeight && getComputedStyle(tall).overflowY === "auto");
         document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-        await settle(80);
+        await settle(80); await untilGone(addRepoMenu);
         check("a pointer outside dismisses the add-repository menu", !addRepoMenu());
       } finally {
         if (addRepoMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60); }
@@ -1420,8 +1425,54 @@ if (params.has("check")) {
     check("task menus are clamped to the anchor, not left at the origin", Math.abs(rect.right - (innerWidth - 8)) <= 1 && Math.abs(rect.bottom - (innerHeight - 8)) <= 1);
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"End",bubbles:true,cancelable:true})); await settle();
     check("End selects the last task menu action", document.activeElement.textContent.includes("Delete"));
-    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle(); await untilGone(menu);
     check("Escape dismisses the portaled task menu", !menu());
+
+    // ---- Every popover the shared owner places leaves with one short exit ----
+    // They animated in (gp-pop) and vanished on close. The exit is a script
+    // animation Svelte plays while it still holds the node (a transition on
+    // the element, because an action's destroy has nothing left to animate):
+    // 70 ms or less, transform and opacity only, and the node is still on
+    // screen while it plays.
+    {
+      // Svelte starts a transition with a zero-length placeholder animation and
+      // creates the real one a frame later, so reading `getAnimations()` right
+      // after the close sees only the placeholder, and a read a frame later races
+      // the 70 ms on a loaded host. The probe records the node's own `animate`
+      // calls instead: what Svelte asked the browser to run, load-independent.
+      const probe = async (name, node, close) => {
+        const asked = [];
+        const animate = node.animate.bind(node);
+        node.animate = (keyframes, options) => {
+          asked.push({ keyframes: [...keyframes], duration: options?.duration ?? 0, connected: node.isConnected });
+          return animate(keyframes, options);
+        };
+        close(); await tick();
+        for (const end = Date.now() + 1500; !asked.some(call => call.duration > 0) && node.isConnected && Date.now() < end;) await settle(30);
+        const exit = asked.find(call => call.duration > 0);
+        const properties = exit ? [...new Set(exit.keyframes.flatMap(frame => Object.keys(frame)))] : [];
+        check(`${name}: closing plays an exit animation while the popover is still on screen (${asked.length} animate calls, connected ${exit?.connected})`, Boolean(exit) && exit.connected);
+        check(`${name}: the exit is 70 ms or less (${exit?.duration ?? "none"})`, Boolean(exit) && exit.duration <= 70);
+        check(`${name}: the exit animates transform and opacity and nothing else (${properties.join(", ") || "none"})`,
+          properties.length > 0 && properties.every(key => key === "transform" || key === "opacity"));
+        await untilGone(() => node.isConnected);
+        check(`${name}: the popover is gone once the exit has run`, !node.isConnected);
+      };
+      await openMenu("task-11");
+      await probe("the task menu", menu(), () => menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+      await settle(150);
+      const viewToggle = () => root.querySelector("[data-task-view-toggle]");
+      const viewsToggle = () => root.querySelector("[data-task-views-toggle]");
+      check("the View and Views controls are on the board for the exit probes", Boolean(viewToggle()) && Boolean(viewsToggle()));
+      if (viewToggle() && viewsToggle()) {
+        viewToggle().click(); await settle();
+        await probe("the View menu", document.querySelector('[data-testid="task-view-menu"]'), () => viewToggle().click());
+        await settle(150);
+        viewsToggle().click(); await settle();
+        await probe("the saved-views panel", document.querySelector('[data-testid="task-saved-views"]'), () => viewsToggle().click());
+        await settle(150);
+      }
+    }
     card("task-11").focus(); card("task-11").dispatchEvent(new KeyboardEvent("keydown",{key:"F10",shiftKey:true,bubbles:true,cancelable:true})); await settle();
     check("Shift F10 opens the focused task actions", Boolean(menu()));
     button("Move to…",menu()).click(); await settle(); button("Backlog",menu()).click(); await settle(150);
@@ -1939,7 +1990,7 @@ if (params.has("check")) {
       viewMenu().querySelector('[data-task-order-option="priority"]')?.getAttribute("aria-checked") === "true");
     // The keyboard and drag checks below move cards within a column.
     viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle();
-    viewToggle().click(); await settle();
+    viewToggle().click(); await settle(); await untilGone(viewMenu);
     check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
 
     // ---- The archive, and what it is willing to claim --------------------

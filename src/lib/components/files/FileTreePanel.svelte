@@ -62,7 +62,7 @@
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
-  import { popover, restoreFocusTo } from "../../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../../ui/popover";
   import { focusAdjacentToMenuOpener } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
@@ -1283,7 +1283,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     data-file-tree-menu
     role="menu"
     aria-label={`File actions for ${row.path}`}

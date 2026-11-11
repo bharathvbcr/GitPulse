@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { Archive, ArrowLeft, Bot, Calendar, Check, CircleDot, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { cycleFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { menuPageItems, submenuTitle, typeAheadIndex, type TaskMenuIcon, type TaskMenuItem, type TaskMenuSubmenu } from "../workbench/taskMenu";
@@ -175,7 +175,7 @@
 <div
   bind:this={menuEl}
   use:portal={"body"}
-  use:popover={dismissal}
+  use:popover={dismissal} out:popoverExit
   data-task-menu
   class="gp-menu gp-pop fixed min-w-56 max-w-[min(18rem,calc(100vw-1rem))] max-h-[min(32rem,calc(100vh-1rem))] overflow-y-auto text-xs text-textPrimary py-1"
   style="z-index: {LAYERS.MENU}"

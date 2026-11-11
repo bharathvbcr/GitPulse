@@ -79,7 +79,7 @@ describe("where the header uses it", () => {
   });
 
   it("opens and closes the overflow menu and the hover card with the popup motion, not the unrelated pop", () => {
-    expect(tabBar.match(/in:popupEnter\s+out:popupExit/g)).toHaveLength(2);
+    expect(tabBar.match(/in:popupEnter\s+out:popoverExit/g)).toHaveLength(2);
     const card = tabBar.slice(tabBar.indexOf("data-tab-card={cardTab.id}"));
     expect(card.slice(0, card.indexOf("</div>"))).not.toContain("gp-pop");
   });

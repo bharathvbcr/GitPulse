@@ -17,7 +17,8 @@ import { cubicBezierEasing, springEasing } from "./transitions";
  *
  * What moves:
  * - a repository tab opening and closing: `tabEnter` / `tabExit`;
- * - the overflow menu and the hover card: `popupEnter` / `popupExit`;
+ * - the overflow menu and the hover card: `popupEnter`, and the shared
+ *   `popoverExit` (`ui/popover.ts`), which plays this module's popup frames out;
  * - the attention mark and the Fetch-all pill with its progress ring:
  *   `markEnter` / `markExit`;
  * - row 2 swapping under a global surface: `swapRow` (a Web Animation on the
@@ -57,7 +58,6 @@ export function headerTransition(kind: keyof typeof HEADER_FRAMES, entering: boo
 export const tabEnter = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("tab", true);
 export const tabExit = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("tab", false);
 export const popupEnter = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("popup", true);
-export const popupExit = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("popup", false);
 export const markEnter = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("mark", true);
 export const markExit = (_node?: Element, _params?: unknown, _options?: unknown) => headerTransition("mark", false);
 

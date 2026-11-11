@@ -10,7 +10,7 @@
   import { Settings2, Square, SquareCheck } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { portal } from "../dom/portal";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
@@ -88,7 +88,7 @@
   {#if open}
     <div
       use:portal={"body"}
-      use:popover={dismissal}
+      use:popover={dismissal} out:popoverExit
       data-task-view-menu
       class="view-panel fixed gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
       style="z-index: {LAYERS.MENU}"

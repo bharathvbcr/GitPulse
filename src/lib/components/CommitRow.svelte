@@ -31,7 +31,7 @@
   import { shortRefLabel } from "../graph/refScope";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
 
   import type { RefItem } from "../graph/graphDecorations";
 
@@ -376,7 +376,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     class="fixed min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden shadow-float"
     style="z-index: {LAYERS.MENU};"
     role="menu"

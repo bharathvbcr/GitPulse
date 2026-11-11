@@ -7,7 +7,7 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { locMetric } from "../metrics/repoMetrics";
   import type { MetricSnapshot } from "../metrics/freshness";
   import {
@@ -205,7 +205,7 @@
 {#if open}
   <div
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     data-language-panel
     role="dialog"
     aria-label="Language breakdown"

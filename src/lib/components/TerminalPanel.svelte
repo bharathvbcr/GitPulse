@@ -92,7 +92,7 @@
   import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
@@ -1401,7 +1401,7 @@
       <div
         id="terminal-launcher-menu"
         use:portal={"body"}
-        use:popover={launcherMenuDismissal}
+        use:popover={launcherMenuDismissal} out:popoverExit
         data-terminal-launcher-popup
         class="fixed w-52 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-meta text-textPrimary"
         style="z-index: {LAYERS.MENU}"

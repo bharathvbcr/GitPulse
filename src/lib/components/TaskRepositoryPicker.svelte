@@ -36,7 +36,7 @@
   import { portal } from "../dom/portal";
   import Checkbox from "./Checkbox.svelte";
   import { LAYERS } from "../ui/layers";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { groupRows, summaryLine, outsiderLine, type LinkSummary, type PickerRow, type TriggerChip } from "../workbench/taskRepositories";
   import type { OpenTabRef } from "../workbench/openMembership";
 
@@ -210,7 +210,7 @@
   <div
     bind:this={popupEl}
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     data-task-repo-popup
     data-testid="task-repo-popup"
     class="fixed gp-menu gp-pop repo-popup"

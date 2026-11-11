@@ -50,7 +50,7 @@
     totalRowHeight,
     windowFromOffsets,
   } from "../sidebar/rowWindow";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
   import { repoScope } from "../repos/repoScope.svelte";
@@ -1426,7 +1426,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     class="fixed min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
     style="z-index: {LAYERS.MENU};"
     role="menu"

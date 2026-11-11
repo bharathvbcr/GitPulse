@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { repoStore } from "../stores/repoStore";
@@ -246,7 +246,7 @@
     <div
       bind:this={menuEl}
       use:portal={"body"}
-      use:popover={menuPopover}
+      use:popover={menuPopover} out:popoverExit
       data-manvi-menu
       class="fixed gp-menu gp-pop w-72 shadow-float text-xs"
       style="z-index: {LAYERS.MENU}"

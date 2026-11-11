@@ -14,7 +14,7 @@
   import { Bookmark, X } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { portal } from "../dom/portal";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { MAX_VIEW_NAME, boardPrefs, sameSnapshot, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import { newID } from "../workbench/client";
@@ -95,7 +95,7 @@
   {#if open}
     <div
       use:portal={"body"}
-      use:popover={dismissal}
+      use:popover={dismissal} out:popoverExit
       data-task-saved-views
       class="panel fixed gp-menu gp-pop p-2 w-64 flex flex-col gap-1"
       style="z-index: {LAYERS.MENU}"
