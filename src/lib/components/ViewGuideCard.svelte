@@ -2,7 +2,8 @@
   import type { DestinationGuide } from "../views/viewGuide";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
-  import ViewGuideArt from "./ViewGuideArt.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  import { loadViewGuideArt } from "./lazyLoaders";
 
   /**
    * The rich destination tooltip: schematic, title, shortcut, and the
@@ -15,7 +16,11 @@
 
 <div class="w-72 overflow-hidden text-left">
   <div class="bg-background/80 px-2 pt-2">
-    <ViewGuideArt view={guide.view} section={guide.section} />
+    <!-- The slot keeps the schematic's 76px so the card does not resize, and the
+         tooltip is not re-placed, when the chunk lands. -->
+    <div class="h-[76px]">
+      <LazyMount load={loadViewGuideArt} name="The view schematic" props={{ view: guide.view, section: guide.section }} />
+    </div>
   </div>
   <div class="px-3 py-2.5">
     <div class="flex items-center justify-between gap-2">

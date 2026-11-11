@@ -12,7 +12,8 @@
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
-  import MergeBranchDialog from "./MergeBranchDialog.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  import { loadMergeBranchDialog } from "./lazyLoaders";
   import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
@@ -1370,7 +1371,11 @@
 </div>
 
 {#if mergeRequest}
-  <MergeBranchDialog request={mergeRequest} onClose={() => { mergeRequest = null; }} />
+  <LazyMount
+    load={loadMergeBranchDialog}
+    name="The merge dialog"
+    props={{ request: mergeRequest, onClose: () => { mergeRequest = null; } }}
+  />
 {/if}
 
 {#if menu}

@@ -18,12 +18,18 @@ describe("onboarding integration and native permission purposes", () => {
   });
   it("mounts the production tour with existing actions", () => {
     const app = read("src/App.svelte");
-    expect(app).toContain('<ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}');
-    expect(app).toContain('onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}');
-    expect(app).toContain('onTasks={() => interfaceStore.setTasksOpen(true)}');
+    // The tour rides its own chunk (19 KB the entry chunk was over budget for), so
+    // App hands it the same actions as LazyMount props rather than as attributes.
+    expect(app).toContain('import { loadProductTour, warmLazyChunks } from "./lib/components/lazyLoaders";');
+    expect(app).not.toContain('import ProductTour from');
+    expect(app).toContain('<LazyMount load={loadProductTour} name="The walkthrough" props={{');
+    expect(app).toContain('onOpenRepository: () => repoStore.pickAndOpenRepo(),');
+    expect(app).toContain('onSettings: () => (isSettingsModalOpen = true),');
+    expect(app).toContain('onTools: () => openSetupWizard("devmap", "explain"),');
+    expect(app).toContain('onTasks: () => interfaceStore.setTasksOpen(true),');
     expect(app).toContain('repoStore.setActiveTab(view)');
-    expect(app).toContain('repositoryPath={$repoStore.currentPath}');
-    expect(app).toContain('settingsOpen={isSettingsModalOpen}');
+    expect(app).toContain('repositoryPath: $repoStore.currentPath,');
+    expect(app).toContain('settingsOpen: isSettingsModalOpen,');
     expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="repository"');
     expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
     // The Tasks tab is a surfaceTab snippet now, so it names its tour stop as

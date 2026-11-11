@@ -8,6 +8,7 @@
   import OnboardingHost from "./OnboardingHost.svelte";
   import { createChecks } from "./checks.ts";
   import { createProductTour } from "../src/lib/tools/productTour";
+  import { loadProductTour } from "../src/lib/components/lazyLoaders";
   import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
   const params = new URLSearchParams(location.search);
   const { results, check, stopped } = createChecks();
@@ -34,6 +35,9 @@
       openSettings: () => { settings++; patch({ settings: true }); },
       openTools: () => tools++,
     }});
+    // The tour is its own chunk, mounted by LazyMount. This loader resolves after
+    // LazyMount's own continuation, so it waits for the real path, not a sleep.
+    await loadProductTour();
     await settle();
   };
   resetHostPlatformForTests({ os: "macos", dock_hiding: true });
