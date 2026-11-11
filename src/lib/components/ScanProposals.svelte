@@ -279,10 +279,10 @@
   .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .lede,.state,.empty{margin:0;font-size:var(--text-xs);color:rgb(var(--c-text-muted))}
   .error{margin:0;font-size:var(--text-xs);color:rgb(var(--c-danger))}
-  .coverage{padding:8px 10px;border-radius:10px;font-size:var(--text-xs);border:1px solid rgb(var(--c-border) / 0.65)}
+  .coverage{padding:8px 10px;border-radius: var(--gp-r-md);font-size:var(--text-xs);border:1px solid rgb(var(--c-border) / 0.65)}
   .coverage ul{margin:4px 0 0;padding-left:16px}
   .list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
-  .proposal{padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:var(--text-xs)}
+  .proposal{padding:10px;border-radius: var(--gp-r-lg);border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:var(--text-xs)}
   .proposal.dismissed{opacity:.6}
   .head{display:flex;gap:6px;flex-wrap:wrap}
   .title{margin:0;font-weight:600;overflow-wrap:anywhere}
@@ -292,7 +292,7 @@
   .editor{display:flex;flex-direction:column;gap:6px}
   .editor label{display:flex;flex-direction:column;gap:2px;font-size:var(--text-meta)}
   .filed{margin:0;color:rgb(var(--c-accent))}
-  .related{padding:8px;border-radius:8px;border:1px solid rgb(var(--c-border) / 0.65)}
+  .related{padding:8px;border-radius: var(--gp-r-sm);border:1px solid rgb(var(--c-border) / 0.65)}
   .related p,.related ul{margin:0 0 4px}
   .attached{margin:0;color:rgb(var(--c-text-muted))}
 </style>

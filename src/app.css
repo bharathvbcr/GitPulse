@@ -546,7 +546,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   height: 2px;
   margin-block: 0.5rem;
   margin-inline: auto;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border) / 0.4);
 }
 
@@ -559,7 +559,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   height: 1px;
   margin-block: 0.25rem;
   margin-inline: auto;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border) / 0.4);
 }
 
@@ -1346,7 +1346,7 @@ input[type="range"] {
 }
 input[type="range"]::-webkit-slider-runnable-track {
   height: 6px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border));
 }
 input[type="range"]::-webkit-slider-thumb {
@@ -1355,7 +1355,7 @@ input[type="range"]::-webkit-slider-thumb {
   width: 16px;
   height: 16px;
   margin-top: -5px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   border: 2px solid rgb(var(--c-surface));
   background-image: var(--brand-gradient);
   box-shadow: var(--shadow-glow);
@@ -1376,7 +1376,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 ::-webkit-scrollbar-thumb {
   background: rgb(var(--c-border));
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   border: 3px solid transparent;
   background-clip: padding-box;
 }
@@ -1741,7 +1741,7 @@ html.macos .gp-glass.gp-repo-tabs {
 html.macos .gp-welcome-card {
   padding: 32px;
   border: 1px solid var(--mac-glass-edge);
-  border-radius: 28px;
+  border-radius: var(--gp-r-xl);
 }
 
 /* The sidebar and the workspace are two rounded cards that fill the space
@@ -1881,7 +1881,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   min-width: 14px;
   height: 14px;
   padding: 0 3px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   color: white;
   @apply text-micro;
   font-weight: 600;
@@ -1907,7 +1907,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   width: 100%;
   align-items: center;
   gap: 8px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   padding: 5px 10px;
   text-align: left;
   color: rgb(var(--c-text));
@@ -2439,7 +2439,7 @@ html.light .gp-markdown {
 .gp-markdown mark {
   color: inherit;
   background: rgb(var(--md-mark) / 0.28);
-  border-radius: 3px;
+  border-radius: var(--gp-r-xs);
   padding: 0 0.15em;
 }
 .gp-markdown :is(ul, ol) {
@@ -2496,14 +2496,14 @@ html.light .gp-markdown {
 }
 .gp-markdown :not(pre) > code {
   padding: 0.12em 0.38em;
-  border-radius: 5px;
+  border-radius: var(--gp-r-xs);
   background: rgb(var(--c-surface-hover));
   border: 1px solid rgb(var(--c-border) / 0.35);
 }
 .gp-markdown pre {
   overflow-x: auto;
   padding: 0.85em 1em;
-  border-radius: 8px;
+  border-radius: var(--gp-r-md);
   background: rgb(var(--c-surface-hover) / 0.7);
   border: 1px solid rgb(var(--c-border) / 0.65);
   line-height: 1.5;
@@ -2524,7 +2524,7 @@ html.light .gp-markdown {
   top: 6px;
   right: 6px;
   padding: 1px 8px;
-  border-radius: 999px;
+  border-radius: var(--gp-r-full);
   border: 1px solid rgb(var(--c-border) / 0.65);
   background: rgb(var(--c-surface));
   color: rgb(var(--c-text-muted));
@@ -2581,7 +2581,7 @@ html.light .gp-markdown {
   min-height: 2.4em;
   padding: 0.3em 0.6em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
   font-size: var(--text-meta);
   cursor: pointer;
@@ -2591,7 +2591,7 @@ html.light .gp-markdown {
   min-width: 4em;
   min-height: 1.5em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
   cursor: pointer;
 }
@@ -2599,13 +2599,13 @@ html.light .gp-markdown {
   display: inline-block;
   padding: 0.1em 0.5em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
   font-size: var(--text-meta);
 }
 .gp-markdown .tag {
   padding: 0.05em 0.45em;
-  border-radius: 999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-accent) / 0.14);
   color: rgb(var(--c-accent));
   font-size: var(--text-meta);
@@ -2640,7 +2640,7 @@ html.light .gp-markdown {
   --md-callout: var(--md-note);
   padding: 0.6em 0.9em;
   border-left: 3px solid rgb(var(--md-callout));
-  border-radius: 6px;
+  border-radius: var(--gp-r-md);
   background: rgb(var(--md-callout) / 0.08);
 }
 .gp-markdown .callout:is([data-callout-type="tip"], [data-callout-type="success"]) {
@@ -2699,7 +2699,7 @@ html.light .gp-markdown {
   margin-bottom: 0.75em;
   padding: 0.4em 0.7em;
   border: 1px solid rgb(var(--c-border) / 0.65);
-  border-radius: 6px;
+  border-radius: var(--gp-r-md);
   background: rgb(var(--c-surface-hover) / 0.6);
   color: rgb(var(--c-text-muted));
   @apply text-meta;
@@ -2715,7 +2715,7 @@ html.light .gp-markdown {
   margin-bottom: 1.1em;
   padding: 0.55em 0.8em;
   border: 1px solid rgb(var(--c-border) / 0.65);
-  border-radius: 6px;
+  border-radius: var(--gp-r-md);
   @apply text-meta;
 }
 .gp-md-frontmatter dt {

@@ -3371,7 +3371,7 @@
   .card-meta{display:flex;align-items:flex-start;gap:6px}
   .pip{width:7px;height:7px;margin-top:4px;border-radius:var(--gp-r-full);flex-shrink:0;background:rgb(var(--c-accent))}
   .pip[data-priority="0"]{background:rgb(var(--c-danger))}
-  .insert{height:2px;margin:2px 4px;border-radius:2px;background:rgb(var(--c-accent))}
+  .insert{height:2px;margin:2px 4px;border-radius: calc(var(--gp-r-xs) / 2);background:rgb(var(--c-accent))}
   .card-repos,.muted,.status{font-size:var(--text-micro);color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card-repos{margin-top:4px}
   .card-extra{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}

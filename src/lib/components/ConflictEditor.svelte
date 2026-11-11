@@ -606,7 +606,7 @@
                     {#if chunk.base_content !== undefined && chunk.base_content !== null}<details class="base-context"><summary>Common ancestor</summary><pre class="source-code">{chunk.base_content || "(Empty ancestor)"}</pre></details>{/if}
                     <details class="custom-resolution" open={typeof chunk.resolution === "object"}>
                       <summary>Custom resolution <span>Write the exact replacement</span></summary>
-                      <div class="custom-body"><textarea rows={4} maxlength={1024 * 1024} aria-label={`Custom resolution for conflict ${chunk.chunk_index + 1}`} placeholder="Type the exact content this conflict should resolve to…" disabled={isSaving}
+                      <div class="custom-body"><textarea class="gp-field-multi" rows={4} maxlength={1024 * 1024} aria-label={`Custom resolution for conflict ${chunk.chunk_index + 1}`} placeholder="Type the exact content this conflict should resolve to…" disabled={isSaving}
                         value={customText(chunk)} oninput={(event) => onCustomInput(chunk.chunk_index, event.currentTarget.value)}></textarea>
                         <div class="custom-footer"><span>Empty content removes this block. Reset clears your choice.</span><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving} onclick={() => setChunkResolution(chunk.chunk_index, { Custom: "" })}>Use empty resolution</button></div>
                       </div>
@@ -637,10 +637,10 @@
   .resolve-page { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; color: rgb(var(--c-text)); font-size: var(--text-xs); }
   .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 16px; flex-shrink: 0; }
   .heading-copy { display: flex; align-items: center; gap: 12px; min-width: 0; }
-  .heading-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .1); }
+  .heading-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: var(--gp-r-md); color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .1); }
   h2 { margin: 0; font-size: var(--text-lg); font-weight: 600; }
   .heading-copy p, .rail-note { margin: 4px 0 0; color: rgb(var(--c-text-muted)); font-size: var(--text-meta); line-height: 1.6; }
-  .file-count { border-radius: 20px; padding: 6px 10px; background: rgb(var(--c-surface-hover) / .7); color: rgb(var(--c-text-muted)); white-space: nowrap; font-size: var(--text-meta); }
+  .file-count { border-radius: var(--gp-r-full); padding: 6px 10px; background: rgb(var(--c-surface-hover) / .7); color: rgb(var(--c-text-muted)); white-space: nowrap; font-size: var(--text-meta); }
   .operation { padding: 0 16px 12px; }
   .whole-file-actions, .recovery-panel, .staged-review { padding: 10px 18px; background: var(--mac-fill-surface, rgb(var(--c-surface))); font-size: var(--text-meta); }
   .whole-file-actions p, .recovery-panel p, .staged-review p { color: rgb(var(--c-text-muted)); line-height: 1.6; margin: 8px 0; }
@@ -653,11 +653,11 @@
   .resolve-workspace { display: flex; flex: 1; min-height: 0; }
   .file-rail { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 16px 10px; background: var(--mac-fill-surface, rgb(var(--c-surface))); }
   .rail-heading { display: flex; justify-content: space-between; padding: 0 6px 12px; font-size: var(--text-meta); font-weight: 600; color: rgb(var(--c-text-muted)); }
-  .file-search { display: flex; align-items: center; gap: 7px; margin: 0 3px 12px; padding: 7px 8px; border: 1px solid var(--gp-edge); border-radius: 8px; color: rgb(var(--c-text-muted)); }
+  .file-search { display: flex; align-items: center; gap: 7px; margin: 0 3px 12px; padding: 7px 8px; border: 1px solid var(--gp-edge); border-radius: var(--gp-r-full); color: rgb(var(--c-text-muted)); }
   .file-search input { width: 100%; min-width: 0; background: transparent; outline: none; font-size: var(--text-meta); }
   .file-search:focus-within { outline: 2px solid rgb(var(--c-accent)); }
   .file-list { overflow: auto; flex: 1; }
-  .file-row { width: 100%; display: flex; align-items: center; gap: 9px; padding: 11px 9px; border-radius: 9px; margin-bottom: 4px; text-align: left; color: rgb(var(--c-text-muted)); cursor: pointer; transition: background-color var(--gp-dur-instant) var(--gp-ease-effect); }
+  .file-row { width: 100%; display: flex; align-items: center; gap: 9px; padding: 11px 9px; border-radius: var(--gp-r-sm); margin-bottom: 4px; text-align: left; color: rgb(var(--c-text-muted)); cursor: pointer; transition: background-color var(--gp-dur-instant) var(--gp-ease-effect); }
   .file-row:hover:not(:disabled) { background-color: rgb(var(--c-accent) / .12); }
   .file-row:disabled { opacity: .4; cursor: default; }
   .file-row.current { color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .12); }
@@ -675,7 +675,7 @@
   .mobile-file-select { display: none; }
   .resolution-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 18px; font-size: var(--text-meta); }
   .progress-copy { display: flex; gap: 10px; align-items: center; font-variant-numeric: tabular-nums; }
-  progress { width: 62px; height: 4px; border: 0; border-radius: 4px; overflow: hidden; appearance: none; }
+  progress { width: 62px; height: 4px; border: 0; border-radius: var(--gp-r-xs); overflow: hidden; appearance: none; }
   progress::-webkit-progress-bar { background: var(--gp-edge); }
   progress::-webkit-progress-value { background: rgb(var(--c-accent)); }
   progress::-moz-progress-bar { background: rgb(var(--c-accent)); }
@@ -685,14 +685,14 @@
   summary:focus-visible, textarea:focus-visible, pre:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .bulk-actions { margin-left: auto; position: relative; }
   summary { cursor: pointer; color: rgb(var(--c-text-muted)); font-size: var(--text-meta); }
-  .bulk-actions > summary { padding: 5px 7px; border-radius: 6px; }
+  .bulk-actions > summary { padding: 5px 7px; border-radius: var(--gp-r-sm); }
   .bulk-menu { position: absolute; right: 0; top: 30px; width: 230px; padding: 7px; }
   .bulk-menu p { margin: 5px 7px; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
   .bulk-menu button { padding: 9px 7px; font-size: var(--text-meta); }
   .bulk-menu button:disabled { opacity: .4; cursor: default; }
   .editor-panes { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(260px, 1fr); flex: 1; min-height: 0; }
   .conflict-inspector { min-height: 0; overflow: auto; padding: 16px; scroll-padding-top: 16px; }
-  .conflict-block { border: 1px solid var(--gp-edge); border-radius: 11px; overflow: hidden; margin-bottom: 14px; background: rgb(var(--c-surface) / .35); }
+  .conflict-block { border: 1px solid var(--gp-edge); border-radius: var(--gp-r-md); overflow: hidden; margin-bottom: 14px; background: rgb(var(--c-surface) / .35); }
   .conflict-block.active-block { border-color: rgb(var(--c-accent)); }
   .conflict-block:focus { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .block-heading, .block-heading > div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -706,7 +706,7 @@
   .custom-resolution > summary, .base-context > summary { padding: 11px 12px; }
   .custom-resolution summary span { margin-left: 8px; font-size: var(--text-micro); opacity: .8; }
   .custom-body { padding: 0 12px 10px; }
-  textarea { width: 100%; resize: vertical; min-height: 78px; border: 1px solid var(--gp-edge); border-radius: 7px; background: var(--mac-fill-bg, rgb(var(--c-bg))); padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--text-meta); line-height: 1.7; user-select: text; }
+  textarea { width: 100%; resize: vertical; min-height: 78px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--text-meta); line-height: 1.7; user-select: text; }
   .custom-footer { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 6px; color: rgb(var(--c-text-muted)); font-size: var(--text-micro); margin-top: 5px; }
   .unchanged-context { margin: 0 0 14px; }
   .unchanged-context summary { padding: 5px 2px; font-size: var(--text-micro); }
@@ -723,7 +723,7 @@
   .editor-state { display: flex; flex: 1; flex-direction: column; justify-content: center; align-items: center; padding: 24px; gap: 10px; color: rgb(var(--c-text-muted)); overflow: auto; }
   .editor-state h3 { color: rgb(var(--c-text)); font-weight: 600; }
   .editor-state p { max-width: 600px; overflow-wrap: anywhere; text-align: center; }
-  .error-notice, .source-notice { display: flex; align-items: flex-start; gap: 8px; padding: 11px 13px; margin: 10px 14px; background: rgb(var(--c-accent) / .07); border-radius: 8px; font-size: var(--text-meta); line-height: 1.7; overflow-wrap: anywhere; }
+  .error-notice, .source-notice { display: flex; align-items: flex-start; gap: 8px; padding: 11px 13px; margin: 10px 14px; background: rgb(var(--c-accent) / .07); border-radius: var(--gp-r-md); font-size: var(--text-meta); line-height: 1.7; overflow-wrap: anywhere; }
   .error-notice { color: rgb(var(--c-danger)); background: rgb(var(--c-danger) / .08); }
   .source-notice { color: rgb(var(--c-text-muted)); }
   .preview-state { display: flex; align-items: center; gap: 8px; padding: 22px 16px; font-size: var(--text-meta); color: rgb(var(--c-text-muted)); }

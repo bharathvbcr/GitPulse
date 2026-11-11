@@ -345,7 +345,12 @@ describe("ConflictEditor materials", () => {
     const menu = source.match(/\.bulk-menu \{([^}]*)\}/)?.[1];
     expect(menu).toBeDefined();
     expect(menu).not.toMatch(/(?:^|;)\s*background(?:-color)?:\s*rgb\(\s*var\(--c-/);
-    expect(source).toMatch(/textarea \{[^}]*background:\s*var\(--mac-fill-bg,\s*rgb\(var\(--c-bg\)\)\)/);
+    // The custom resolution box is the shared multi-line field; its macOS glass
+    // fill comes from the same owner rule as the select below.
+    expect(source).toMatch(/<textarea class="gp-field-multi"/);
+    const box = source.match(/\btextarea \{([^}]*)\}/)?.[1] ?? "";
+    expect(box).not.toMatch(/background(?:-color)?:|border(?:-radius)?:/);
+    expect(appCss).toMatch(/html\.macos :where\([^)]*\.gp-field-multi[^)]*\) \{\s*background-color: var\(--mac-fill-bg\);/);
     // The mobile file picker is the shared select, which takes the macOS glass
     // fill from its owner in app.css rather than an opaque scoped background.
     expect(source).toContain('class="gp-select mobile-file-select"');

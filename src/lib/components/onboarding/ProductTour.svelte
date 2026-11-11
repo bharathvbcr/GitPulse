@@ -178,7 +178,7 @@
   .tour-live { position: fixed; inset: 0; pointer-events: none; }
   .tour-card { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: hidden; padding: 24px; display: flex; flex-direction: column; gap: 16px; pointer-events: auto; }
   .tour-coach { position: absolute; width: min(380px, calc(100vw - 32px)); padding: 20px; }
-  .tour-spotlight { position: fixed; border: 2px solid var(--color-accent); border-radius: 12px; box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 15%, transparent); pointer-events: none; }
+  .tour-spotlight { position: fixed; border: 2px solid var(--color-accent); border-radius: var(--gp-r-md); box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 15%, transparent); pointer-events: none; }
   .tour-success { display: flex; align-items: flex-start; gap: 8px; color: var(--color-textPrimary); }
   .tour-success :global(svg) { flex-shrink: 0; margin-top: 3px; color: var(--color-accent); }
   .tour-focus { font-size: var(--text-xs); color: var(--color-accent); text-decoration: underline; text-underline-offset: 3px; }

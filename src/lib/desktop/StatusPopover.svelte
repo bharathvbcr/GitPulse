@@ -274,7 +274,7 @@
     line-height:normal;
     padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:var(--text-xs); -webkit-font-smoothing:antialiased;
   }
-  .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
+  .panel { background:var(--bg); border:1px solid var(--line); border-radius: var(--gp-r-xl); overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
   /* ── Liquid blur glass ──
      The native window server supplies desktop blur via NSVisualEffectView.
      On top of that the page paints the same hue field and glass fills as the
@@ -415,7 +415,7 @@
   .status-shell :global(.gp-btn[data-variant="primary"]:hover:not(:disabled)) { background-image:linear-gradient(rgb(var(--action-hover)), rgb(var(--action-hover))); filter:none; }
   .status-shell :global(.gp-btn:not([data-variant]):hover:not(:disabled)) { background:var(--soft); }
   header { display:flex; align-items:center; gap:10px; padding:20px 20px 17px; }
-  .mark { width:34px; height:34px; flex-shrink:0; display:grid; place-items:center; border:1px solid var(--line); border-radius:10px; background:var(--surface); }
+  .mark { width:34px; height:34px; flex-shrink:0; display:grid; place-items:center; border:1px solid var(--line); border-radius: var(--gp-r-md); background:var(--surface); }
   .identity { min-width:0; flex:1; }
   .repository { display:flex; align-items:center; gap:6px; max-width:100%; font-weight:600; font-size:var(--text-base); letter-spacing:-.2px; text-align:left; }
   .repository span,.branch span,.upstream { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -429,7 +429,7 @@
   [data-tone="warning"] .status-dot { background:rgb(var(--amber)); }
   [data-tone="changed"] .status-dot,[data-tone="busy"] .status-dot { background:rgb(var(--blue)); }
   .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-  .metric { text-align:left; padding:12px 10px; border:1px solid var(--line); background:var(--surface); border-radius:10px; min-width:0; transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
+  .metric { text-align:left; padding:12px 10px; border:1px solid var(--line); background:var(--surface); border-radius: var(--gp-r-md); min-width:0; transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
   .metric:hover:not(:disabled) { border-color:rgb(var(--blue)); background:var(--soft); }
   .metric-label { display:flex; align-items:center; gap:4px; font-size:var(--text-micro); color:rgb(var(--muted)); }
   .metric strong { display:block; margin-top:8px; font-size:var(--text-display); line-height:1; font-weight:600; letter-spacing:-.6px; font-variant-numeric:tabular-nums; }
@@ -455,7 +455,7 @@
   .shortcut-block { padding:10px 0 0; }
   .group-label { display:block; margin-bottom:6px; font-size:var(--text-micro); font-weight:500; }
   .shortcuts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding-bottom:10px; }
-  .shortcut { display:flex; align-items:center; gap:6px; padding:8px; border-radius:6px; text-align:left; font-size:var(--text-micro); }
+  .shortcut { display:flex; align-items:center; gap:6px; padding:8px; border-radius: var(--gp-r-sm); text-align:left; font-size:var(--text-micro); }
   .shortcut:hover:not(:disabled) { color:rgb(var(--text)); background:var(--soft); }
   .shortcut:disabled { opacity:.45; }
   .shortcut.copied { color:rgb(var(--green)); }
@@ -466,19 +466,19 @@
   footer { display:flex; justify-content:space-between; align-items:center; padding:8px 14px 8px 20px; }
   .open-app { display:flex; align-items:center; gap:4px; color:rgb(var(--muted)); font-size:var(--text-micro); }
   .open-app:hover { color:rgb(var(--text)); }
-  .repositories { max-height:180px; overflow:auto; border:1px solid var(--line); background:var(--surface); margin:0 20px 15px; padding:4px; border-radius:9px; }
-  .repositories button { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; padding:8px; border-radius:5px; }
+  .repositories { max-height:180px; overflow:auto; border:1px solid var(--line); background:var(--surface); margin:0 20px 15px; padding:4px; border-radius: var(--gp-r-md); }
+  .repositories button { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; padding:8px; border-radius: var(--gp-r-sm); }
   .repositories span { min-width:0; display:flex; flex-direction:column; gap:3px; }
   .repositories strong,.repositories em { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .repositories strong { font-weight:500; }
   .repositories em { font-size:var(--text-micro); font-style:normal; color:rgb(var(--muted)); }
   .repositories button:hover,.repositories .current { background:var(--soft); }
   .repo-badges { display:flex; flex-direction:row; gap:4px; margin-top:2px; }
-  .repo-badges .badge { font-size:var(--text-micro); font-variant-numeric:tabular-nums; color:rgb(var(--muted)); background:var(--soft); border-radius:4px; padding:1px 5px; }
+  .repo-badges .badge { font-size:var(--text-micro); font-variant-numeric:tabular-nums; color:rgb(var(--muted)); background:var(--soft); border-radius: var(--gp-r-xs); padding:1px 5px; }
   .repo-badges .badge.warn { color:rgb(var(--amber)); }
   .repo-badges .badge.busy { letter-spacing:.5px; }
   .empty { text-align:center; padding:6px 0 22px; }
-  .empty-mark { width:56px; height:56px; border-radius:16px; display:grid; place-items:center; margin:0 auto 16px; background:var(--soft); color:rgb(var(--muted)); }
+  .empty-mark { width:56px; height:56px; border-radius: var(--gp-r-lg); display:grid; place-items:center; margin:0 auto 16px; background:var(--soft); color:rgb(var(--muted)); }
   .empty h1 { font-size:var(--text-base); font-weight:600; }
   .empty p { color:rgb(var(--muted)); line-height:1.5; margin:9px auto 20px; max-width:230px; }
   .error { display:flex; gap:7px; color:rgb(var(--amber)); font-size:var(--text-meta); line-height:1.4; margin:0 0 14px; }

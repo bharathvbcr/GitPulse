@@ -53,7 +53,7 @@
   .plain-code, .empty-side { padding: 10px 12px; }
   .code-line { display: flex; min-height: 1.8em; }
   .line-number { display: inline-block; min-width: 35px; text-align: right; padding-right: 12px; user-select: none; color: rgb(var(--c-text-muted) / .65); }
-  .changed { background: rgb(var(--side-color) / .18); border-radius: 2px; }
+  .changed { background: rgb(var(--side-color) / .18); border-radius: calc(var(--gp-r-xs) / 2); }
   .side-actions { display: flex; gap: 5px; flex-wrap: wrap; padding: 9px; }
   button[aria-pressed="true"] { border-color: rgb(var(--side-color)); background: rgb(var(--side-color) / .15); color: rgb(var(--c-text)); }
   .source-scroll:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: -2px; }

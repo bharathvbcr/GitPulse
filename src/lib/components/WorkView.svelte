@@ -1056,7 +1056,7 @@
   .overview-metrics > button {
     min-width: 0;
     padding: 10px 14px;
-    border-radius: 14px;
+    border-radius: var(--gp-r-md);
   }
 
   .overview-metric-value {
