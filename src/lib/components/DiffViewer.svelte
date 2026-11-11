@@ -2146,7 +2146,7 @@
             overscan={OVERSCAN}
             contentWidth={!wrapping}
             bind:scrollTop={unifiedScroll}
-            class="gp-diff-surface flex-1 min-h-0 font-mono"
+            class="flex-1 min-h-0 font-mono"
           >
             {#snippet row(_, index)}
               {@const line = unifiedRow(index)}
@@ -2163,7 +2163,7 @@
             overscan={OVERSCAN}
             contentWidth={!wrapping}
             bind:scrollTop={splitScroll}
-            class="gp-diff-surface flex-1 min-h-0 font-mono"
+            class="flex-1 min-h-0 font-mono"
           >
             {#snippet row(_, index)}
               {@const item = splitRow(index)}

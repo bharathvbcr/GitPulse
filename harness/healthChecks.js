@@ -122,15 +122,15 @@ export async function runHealthChecks(ctx) {
     await rescan("findings");
 
     button("Fix with Manvi").click();
-    await until(() => !!section("plan") && has(section("plan"), "Rescan Health"));
+    await until(() => !!section("plan") && has(section("plan"), "Rescan health"));
     repoStore.setTerminalOpen(false);
     button("Terminal").click(); await tick();
     check("the plan opens the terminal beside it, not instead of it", () =>
       get(repoStore).terminalOpen === true && !!section("plan") && has(section("plan"), "Run all steps"));
     const scansBeforeRescan = scanCalls(REPO);
-    button("Rescan Health").click();
+    button("Rescan health").click();
     await settle();
-    check("the plan's Rescan Health rescans", () => scanCalls(REPO) === scansBeforeRescan + 1);
+    check("the plan's Rescan health rescans", () => scanCalls(REPO) === scansBeforeRescan + 1);
     check("a rescan supersedes the plan it was written against", () => !section("plan"));
 
     // ---- Coding-agent launch: the shared channel, the dock, and cancellation ---
@@ -143,7 +143,7 @@ export async function runHealthChecks(ctx) {
     check("the terminal dock opens before the launch is awaited", () => get(repoStore).terminalOpen === true && has(agentBar(), "Opening agent terminal…"));
     terminalLaunchRequests.take(REPO).complete(); await wait();
     check("a claimed launch reports the session as opened", () =>
-      has(agentBar(), `${PROVIDER_LABELS.claude} session opened in the terminal. Rescan Health after it finishes.`));
+      has(agentBar(), `${PROVIDER_LABELS.claude} session opened in the terminal. Rescan health after it finishes.`));
     runButton().click(); await tick();
     terminalLaunchRequests.take(REPO).complete("Fixture launch refused"); await wait();
     check("a refused launch says why", () => has(agentBar().querySelector('[role="alert"]'), "Fixture launch refused"));

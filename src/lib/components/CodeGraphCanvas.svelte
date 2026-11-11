@@ -20,6 +20,10 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
+  import { Filter, Network } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { getLanguageIconColor, type LanguageIconKey } from "../language/languageLogos";
 
   /**
@@ -386,7 +390,7 @@
       <span class="gp-label">Dependency map</span>
       <div class="map-counts" role="status" data-testid="code-graph-legend">
         {#if loading}
-          <span>Loading graph…</span>
+          <div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>
         {:else if !load?.available}
           <span>{load?.reason ?? "Graph unavailable"}</span>
         {:else}
@@ -449,10 +453,10 @@
   {/if}
 
   <div class="map-filters" aria-label="Graph filters">
-    <label title="Identified by conventional test directory and filename patterns"><input type="checkbox" bind:checked={hideTests} onchange={filtersChanged}/> Hide tests</label>
-    <label title="Identified by conventional generated, build, and vendor paths"><input type="checkbox" bind:checked={hideGenerated} onchange={filtersChanged}/> Hide generated/vendor</label>
-    <label title="Keep nodes with relationships in the loaded graph"><input type="checkbox" bind:checked={connectedOnly} onchange={filtersChanged}/> Connected only</label>
-    <label title="Hide document and note nodes, or subsystems made entirely of documentation"><input type="checkbox" aria-label="Hide notes & Markdown" bind:checked={hideNotes} onchange={filtersChanged}/> Hide notes &amp; Markdown</label>
+    <span title="Identified by conventional test directory and filename patterns"><Checkbox label="Hide tests" checked={hideTests} onchange={(next) => { hideTests = next; filtersChanged(); }} /></span>
+    <span title="Identified by conventional generated, build, and vendor paths"><Checkbox label="Hide generated/vendor" checked={hideGenerated} onchange={(next) => { hideGenerated = next; filtersChanged(); }} /></span>
+    <span title="Keep nodes with relationships in the loaded graph"><Checkbox label="Connected only" checked={connectedOnly} onchange={(next) => { connectedOnly = next; filtersChanged(); }} /></span>
+    <span title="Hide document and note nodes, or subsystems made entirely of documentation"><Checkbox label="Hide notes &amp; Markdown" ariaLabel="Hide notes & Markdown" checked={hideNotes} onchange={(next) => { hideNotes = next; filtersChanged(); }} /></span>
     <span role="status" data-testid="graph-filter-count">{matches.length} of {model.nodes.length} match filters</span>
     {#if query || activeCommunity || selectedLanguage || hideTests || hideGenerated || hideNotes || connectedOnly}<button type="button" onclick={clearFilters}>Clear filters</button>{/if}
   </div>
@@ -487,10 +491,10 @@
       <aside class="map-neighbors" aria-label="Node connections">
         <div class="neighbor-heading"><strong>Connections</strong><button type="button" aria-label="Close connections" onclick={() => selectedId = null}>×</button></div>
         <div class="trace-controls">
-          <select aria-label="Trace direction" bind:value={direction} onchange={() => connectionPage = 0}>
+          <select class="gp-select" aria-label="Trace direction" bind:value={direction} onchange={() => connectionPage = 0}>
             <option value="both">Both directions</option><option value="outgoing">Depends on</option><option value="incoming">Used by</option>
           </select>
-          <select aria-label="Trace depth" bind:value={depth}><option value={1}>1 hop</option><option value={2}>2 hops</option><option value={3}>3 hops</option></select>
+          <select class="gp-select" aria-label="Trace depth" bind:value={depth}><option value={1}>1 hop</option><option value={2}>2 hops</option><option value={3}>3 hops</option></select>
         </div>
         <p class="trace-summary" role="status">{trace?.ids.size ?? 0} nodes in trace · {visibleConnections.length} of {connectionRows.length} direct relationships match filters/direction</p>
         {#if trace?.truncated}<p class="map-honesty" role="note">Trace limit reached (1,000 nodes or 50,000 edge visits). More nodes may be reachable.</p>{/if}
@@ -514,9 +518,9 @@
     {/if}
 
     {#if !loading && load?.available && model.nodes.length === 0}
-      <div class="map-empty"><strong>No nodes to display</strong><span>This graph payload is empty.</span></div>
+      <div class="map-empty"><EmptyState icon={Network} title="No nodes to display" hint="This graph payload is empty." compact /></div>
     {:else if !loading && load?.available && matches.length === 0}
-      <div class="map-empty"><strong>No nodes match the current filters</strong><span>Clear filters to show all loaded nodes.</span></div>
+      <div class="map-empty"><EmptyState icon={Filter} title="No nodes match the current filters" hint="Clear filters to show all loaded nodes." compact /></div>
     {/if}
 
     <div class="map-zoom" aria-label="Graph view controls">
@@ -578,14 +582,12 @@
   .community-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; }
   .chip-count { opacity: .55; font-variant-numeric: tabular-nums; }
   .map-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 0 20px 10px; font-size: var(--text-micro); color: var(--map-muted); }
-  .map-filters label { display: inline-flex; align-items: center; gap: 5px; }
-  .map-filters input { accent-color: rgb(var(--c-accent)); }
   .map-filters button { color: inherit; text-decoration: underline; }
   .map-neighbors { position: absolute; right: 16px; top: 8px; width: 304px; max-height: calc(100% - 76px); overflow: auto; padding: 10px; border: 1px solid var(--map-border); border-radius: 10px; background: var(--map-panel); box-shadow: var(--shadow-pop); }
   .neighbor-heading, .trace-controls, .map-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .neighbor-heading { font-size: var(--text-meta); margin-bottom: 9px; }
   .neighbor-heading button { width: 24px; height: 24px; }
-  .trace-controls select { min-width: 0; padding: 5px; border-radius: 5px; background: var(--map-panel); color: inherit; border: 1px solid var(--map-border); font-size: var(--text-meta); }
+  .trace-controls select { min-width: 0; flex: 1; }
   .trace-summary, .neighbor-list p { margin: 8px 0; font-size: var(--text-micro); line-height: 1.5; color: var(--map-muted); }
   .neighbor-list button { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 8px 4px; border-radius: 6px; }
   .neighbor-list button:hover { background: var(--map-hover); }

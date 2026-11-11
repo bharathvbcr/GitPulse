@@ -51,8 +51,8 @@ describe("RepoPanel remotes", () => {
 
   it("offers an explicit way to remove saved credentials from Set URL", () => {
     expect(source).toContain("drop_credentials: editDropCredentials");
-    expect(source).toContain("bind:checked={editDropCredentials}");
-    expect(source).toMatch(/\{#if remote\.has_credentials\}\s*<label/);
+    expect(source).toContain("checked={editDropCredentials}");
+    expect(source).toMatch(/\{#if remote\.has_credentials\}\s*<div class="w-full">\s*<Checkbox/);
   });
 
   it("arms destructive remote changes before executing them", () => {
@@ -73,8 +73,10 @@ describe("RepoPanel section headers on a failed read", () => {
   };
 
   it("names the failure instead of describing an empty list", () => {
-    expect(header("remotes")).toContain('remotesLoaded ? describeRemotes(remotes) : "Loading…"');
-    expect(header("submodules")).toContain('submodulesLoaded ? describeSubmodules(submodules) : "Loading…"');
+    expect(header("remotes")).toContain("remotesLoaded ? describeRemotes(remotes) : null");
+    expect(header("remotes")).toContain("<Skeleton");
+    expect(header("submodules")).toContain("submodulesLoaded ? describeSubmodules(submodules) : null");
+    expect(header("submodules")).toContain("<Skeleton");
   });
 
   it("checks the error before the loaded flag and uses the body's error colour", () => {

@@ -18,6 +18,9 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
+  import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import {
     Cloud,
     Package,
@@ -63,7 +66,6 @@
     isStaleStackError,
     stashActionConsequence,
     stashActionLabel,
-    stashEmptyMessage,
     stashSubtitle,
     stashTitle,
     stashEntryKey,
@@ -390,7 +392,7 @@
           <Cloud size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Remotes</h2>
           <span class="truncate text-meta {remotesError ? 'text-danger' : 'text-textMuted'}">
-            {remotesError ? "Could not read remotes" : remotesLoaded ? describeRemotes(remotes) : "Loading…"}
+            {remotesError ? "Could not read remotes" : remotesLoaded ? describeRemotes(remotes) : null}{#if !remotesError && !remotesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <button
@@ -409,7 +411,7 @@
       <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-edge p-2.5 text-meta text-textSecondary">
         <label class="inline-flex items-center gap-1.5">
           Pull by
-          <select class="gp-input py-0.5!" bind:value={pullStrategy} disabled={busy !== null}>
+          <select class="gp-select py-0.5!" bind:value={pullStrategy} disabled={busy !== null}>
             <option value="config">{pullRebaseConfig ? `pull.rebase (${pullRebaseConfig})` : "git's default (merge)"}</option>
             <option value="merge">Merging (--no-rebase)</option>
             <option value="rebase">Rebasing local commits (--rebase)</option>
@@ -419,11 +421,10 @@
           {#if busy === "pull"}<Loader2 size={11} class="animate-spin" />{:else}<Download size={11} />{/if} Pull
         </button>
         <span class="flex-1"></span>
-        <label class="inline-flex items-center gap-1.5" title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
-          <input type="checkbox" checked={autoFetchOn} onchange={(event) => setAutoFetch(event.currentTarget.checked, autoFetchMinutes)} />
-          Auto-fetch every
-        </label>
-        <select class="gp-input py-0.5!" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
+        <span title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
+          <Checkbox label="Auto-fetch every" checked={autoFetchOn} onchange={(next) => setAutoFetch(next, autoFetchMinutes)} />
+        </span>
+        <select class="gp-select py-0.5!" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
           onchange={(event) => setAutoFetch(true, Number(event.currentTarget.value))}>
           {#each [5, 10, 15, 30, 60, 120, 240].filter((m) => m >= MIN_AUTO_FETCH_MINUTES && m <= MAX_AUTO_FETCH_MINUTES) as minutes (minutes)}
             <option value={minutes}>{minutes} min</option>
@@ -440,11 +441,11 @@
       {#if remotesError}
         <p class="text-meta text-danger">{remotesError}</p>
       {:else if remotes.length === 0}
-        <p class="text-meta text-textMuted">
-          {remotesLoaded
-            ? "Nothing to fetch from or push to. Add a remote to sync this repository."
-            : "Reading .git/config…"}
-        </p>
+        {#if remotesLoaded}
+          <EmptyState icon={Cloud} title="No remotes" hint="Add a remote to fetch from and push to." compact />
+        {:else}
+          <Skeleton variant="rect" height="3rem" />
+        {/if}
       {:else}
         <ul class="space-y-2">
           {#each remotes as remote (remote.name)}
@@ -549,16 +550,19 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono text-meta!"
+                    class="gp-field min-w-0 flex-1 font-mono text-meta!"
                     bind:value={editUrl}
                     aria-label="New URL for {remote.name}"
                     placeholder="https://github.com/owner/repo.git"
                   />
                   {#if remote.has_credentials}
-                    <label class="flex w-full items-center gap-1.5 text-meta text-textMuted">
-                      <input type="checkbox" bind:checked={editDropCredentials} />
-                      Remove the saved password or token (otherwise it is kept)
-                    </label>
+                    <div class="w-full">
+                      <Checkbox
+                        label="Remove the saved password or token (otherwise it is kept)"
+                        checked={editDropCredentials}
+                        onchange={(next) => (editDropCredentials = next)}
+                      />
+                    </div>
                   {/if}
                   <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={busy !== null}>
                     {armed?.key === setKey ? "Confirm URL" : "Apply URL"}
@@ -574,7 +578,7 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono text-meta!"
+                    class="gp-field min-w-0 flex-1 font-mono text-meta!"
                     bind:value={renameTo}
                     aria-label="New name for {remote.name}"
                     placeholder="upstream"
@@ -610,13 +614,13 @@
       >
         <div class="flex flex-wrap items-center gap-1.5">
           <input
-            class="gp-input w-28 font-mono text-meta!"
+            class="gp-field w-28 font-mono text-meta!"
             bind:value={addName}
             aria-label="Remote name"
             placeholder="origin"
           />
           <input
-            class="gp-input min-w-0 flex-1 font-mono text-meta!"
+            class="gp-field min-w-0 flex-1 font-mono text-meta!"
             bind:value={addUrl}
             aria-label="Remote URL"
             placeholder="https://github.com/owner/repo.git"
@@ -640,7 +644,7 @@
           <Package size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Submodules</h2>
           <span class="truncate text-meta {submodulesError ? 'text-danger' : 'text-textMuted'}">
-            {submodulesError ? "Could not read submodules" : submodulesLoaded ? describeSubmodules(submodules) : "Loading…"}
+            {submodulesError ? "Could not read submodules" : submodulesLoaded ? describeSubmodules(submodules) : null}{#if !submodulesError && !submodulesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
@@ -680,9 +684,11 @@
       {#if submodulesError}
         <p class="text-meta text-danger">{submodulesError}</p>
       {:else if submodules.length === 0}
-        <p class="text-meta text-textMuted">
-          {submodulesLoaded ? "Nothing is embedded in this repository." : "Reading .gitmodules…"}
-        </p>
+        {#if submodulesLoaded}
+          <EmptyState icon={Package} title="No submodules" hint="Nothing is embedded in this repository." compact />
+        {:else}
+          <Skeleton variant="rect" height="3rem" />
+        {/if}
       {:else}
         <ul class="space-y-2">
           {#each submodules as sub (sub.path)}
@@ -776,12 +782,12 @@
       <form class="mb-3 space-y-2" onsubmit={(event) => { event.preventDefault(); void saveStash(); }}>
         <label class="block text-meta text-textSecondary">
           Stash message
-          <input class="gp-input mt-1 w-full" bind:value={stashMessage} maxlength={4096} placeholder="What are you setting aside?" disabled={busy !== null} />
+          <input class="gp-field mt-1 w-full" bind:value={stashMessage} maxlength={4096} placeholder="What are you setting aside?" disabled={busy !== null} />
         </label>
         <div class="flex flex-wrap gap-3 text-meta text-textSecondary">
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={includeUntracked} disabled={busy !== null} />Include untracked files</label>
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={keepIndex} disabled={busy !== null} />Keep staged changes</label>
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={stashSelectedOnly} disabled={busy !== null || changedPaths.length === 0} />Only selected files</label>
+          <Checkbox label="Include untracked files" checked={includeUntracked} disabled={busy !== null} onchange={(next) => (includeUntracked = next)} />
+          <Checkbox label="Keep staged changes" checked={keepIndex} disabled={busy !== null} onchange={(next) => (keepIndex = next)} />
+          <Checkbox label="Only selected files" checked={stashSelectedOnly} disabled={busy !== null || changedPaths.length === 0} onchange={(next) => (stashSelectedOnly = next)} />
         </div>
         {#if stashSelectedOnly}
           {#if changedPaths.length > STASH_PICKER_LIMIT}
@@ -789,7 +795,14 @@
           {:else}
             <fieldset class="max-h-40 overflow-y-auto rounded-lg border border-edge p-2 space-y-0.5" disabled={busy !== null} aria-label="Files to stash">
               {#each changedPaths as path (path)}
-                <label class="flex items-center gap-1.5 text-meta font-mono"><input type="checkbox" value={path} bind:group={stashPaths} /><span class="truncate">{path}</span></label>
+                <label class="flex items-center gap-1.5 text-meta font-mono">
+                  <Checkbox
+                    ariaLabel={path}
+                    checked={stashPaths.includes(path)}
+                    onchange={(next) => (stashPaths = next ? [...stashPaths, path] : stashPaths.filter((p) => p !== path))}
+                  />
+                  <span class="truncate">{path}</span>
+                </label>
               {/each}
             </fieldset>
             <p class="text-meta text-textMuted">{stashPaths.length} of {changedPaths.length} selected</p>
@@ -809,7 +822,7 @@
           <span>The stash list could not be read, so this may not be complete.</span>
         </p>
       {:else if stashEntries.length === 0}
-        <p class="text-meta text-textMuted">{stashEmptyMessage(true)}</p>
+        <EmptyState icon={Archive} title="No stashed changes" compact />
       {:else}
         <ul class="space-y-2">
           {#each stashEntries as entry (stashEntryKey(entry))}
@@ -854,7 +867,7 @@
                   {:else if preview}
                     {#if preview.truncated}<p class="mb-2 text-meta text-warn">Preview is incomplete. {preview.truncation_reason ?? "The diff exceeds the display limit."}</p>{/if}
                     <div class="h-80 overflow-hidden rounded-lg border border-edgeSoft"><CodeViewer filePath={`stash-${entry.index}.diff`} content={preview.text} readOnly /></div>
-                  {:else}<p role="status" class="text-meta text-textMuted">Loading stash preview…</p>{/if}
+                  {:else}<Skeleton variant="rect" height="20rem" />{/if}
                 </div>
               {/if}
             </li>

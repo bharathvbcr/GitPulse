@@ -33,6 +33,7 @@
     Save,
     RotateCcw,
     Hash,
+    Loader2,
   } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
@@ -464,7 +465,7 @@
   role="textbox"
   aria-multiline="true"
   aria-readonly={isEditing ? "false" : "true"}
-  aria-label="Code Viewer"
+  aria-label="Code viewer"
 >
   <!--
     Editor chrome. The two clusters used to share one justify-between row and
@@ -539,7 +540,7 @@
         type="button"
         onclick={() => (showWhitespace = !showWhitespace)}
         class="gp-icon-btn p-1.5! {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
-        title="Toggle Whitespace Indicators"
+        title="Show whitespace"
       >
         <span class="font-mono text-meta font-semibold">·_</span>
       </button>
@@ -591,7 +592,7 @@
           class="gp-btn-primary py-1! px-3! flex items-center gap-1 text-meta"
         >
           {#if isSaving}
-            <span class="animate-spin text-xs">⏳</span>
+            <Loader2 size={12} class="animate-spin" />
           {:else}
             <Save size={12} />
           {/if}
@@ -654,7 +655,7 @@
             class="px-2 py-0.5 text-micro font-mono rounded border transition-colors {isCaseSensitive
               ? 'bg-accent/20 border-accent text-accent font-semibold'
               : 'border-edgeSoft text-textMuted hover:text-textPrimary'}"
-            title="Match Case"
+            title="Match case"
           >Aa</button>
           <button
             type="button"
@@ -662,7 +663,7 @@
             class="px-2 py-0.5 text-micro font-mono rounded border transition-colors {isRegex
               ? 'bg-accent/20 border-accent text-accent font-semibold'
               : 'border-edgeSoft text-textMuted hover:text-textPrimary'}"
-            title="Use Regular Expression"
+            title="Use regular expression"
           >.*</button>
         </div>
       </div>

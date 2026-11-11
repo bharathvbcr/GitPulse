@@ -68,6 +68,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import { formatError } from "../ui/formatError";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
 
   /** Null while no repository is open; the panel renders nothing for it. */
   let { repoPath }: { repoPath: string | null } = $props();
@@ -551,9 +552,6 @@
       <Flame size={12} />
       Firebase App Hosting
     </h3>
-    {#if statusLoading || backendsLoading || rolloutsLoading}
-      <LoaderCircle size={12} class="animate-spin text-textMuted" />
-    {/if}
   </div>
 
   {#if statusError}
@@ -562,6 +560,8 @@
     <div class="gp-notice" data-tone="danger">
       Firebase status could not be read: {statusError}
     </div>
+  {:else if statusLoading && !status}
+    <Skeleton variant="text" count={3} height="1.25rem" />
   {:else if status && !status.configured}
     <EmptyState
       icon={Flame}
@@ -665,7 +665,7 @@
           disabled={!selectedProjectId || backendsLoading}
           onclick={() => void loadBackends()}
         >
-          <Server size={12} />
+          {#if backendsLoading}<LoaderCircle size={12} class="animate-spin" />{:else}<Server size={12} />{/if}
           List backends
         </button>
 
@@ -675,7 +675,7 @@
             disabled={!selectedProjectId || !selectedBackend || rolloutsLoading}
             onclick={() => void loadRollouts()}
           >
-            <RefreshCw size={12} />
+            {#if rolloutsLoading}<LoaderCircle size={12} class="animate-spin" />{:else}<RefreshCw size={12} />{/if}
             Check rollouts
           </button>
         {/if}
@@ -708,6 +708,8 @@
         <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
           Backend listing did not run: {backends.error ?? "no reason was reported"}
         </div>
+      {:else if backendsLoading && !backends}
+        <div class="mb-2 h-4"><Skeleton variant="text" width="50%" height="0.75rem" /></div>
       {:else if backends}
         {#if backends.walk_incomplete}
           {@render qualification(backends.walk_incomplete, "Backend listing")}
@@ -741,6 +743,8 @@
           <div class="min-w-0 flex-1">Rollout listing did not run: {rollouts.error ?? "no reason was reported"}</div>
           <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={rolloutsLoading} onclick={() => void loadRollouts()}>Rescan</button>
         </div>
+      {:else if rolloutsLoading && !rollouts}
+        <Skeleton variant="rect" height="7rem" />
       {:else if rollouts}
         <!-- The listing names its own target rather than relying on the
              selectors above. Both are restored from one snapshot, but a

@@ -108,7 +108,7 @@
           <Checkbox label="Suggest clearer task titles and descriptions automatically" checked={enabled} onchange={(next) => { enabled = next; }} />
           <Checkbox label="Use a provider and model for this profile" checked={override} onchange={(next) => { override = next; }} />
           {#if override}<div class="pair"><label>Automatic provider<input class="gp-field" bind:value={provider} maxlength="128" placeholder="Provider name" /></label><label>Automatic model<input class="gp-field" bind:value={model} maxlength="512" placeholder="Model name" /></label></div>
-          {:else}<p>Manvi selection: {configured || "Loading…"}</p>{/if}
+          {:else if configured}<p>Manvi selection: {configured}</p>{:else}<div class="my-2 w-48"><Skeleton variant="text" height="0.75rem" /></div>{/if}
           <div class="actions"><button class="gp-btn" data-variant="primary" type="button" onclick={() => save()} disabled={override && (!provider.trim() || !model.trim())}>Save automatic settings</button><button class="gp-btn" data-variant="secondary" type="button" onclick={() => save(true)} disabled={!settings.enabled}>Stop automatic suggestions</button></div>
         </fieldset>
         <p>{queued === null ? "Queue count unavailable" : `${queued} saved tasks waiting`} · One generation at a time · Up to 20 automatic suggestions per hour</p>
@@ -122,7 +122,7 @@
 </section>
 
 <style>
-  .automation{padding:8px 24px;font-size:12px;position:relative}
+  .automation{padding:8px 24px;font-size:0.75rem;position:relative}
   .automation.compact{border:0;padding:0}
   .automation.compact .settings{position:absolute;right:0;top:calc(100% + 6px);width:min(360px,70vw);padding:10px 12px;border:1px solid rgb(var(--c-border));border-radius:10px;max-height:min(560px,calc(100vh - 150px));overflow:auto}
   .summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}fieldset:disabled{opacity:.55}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:rgb(var(--c-danger))}.settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
