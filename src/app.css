@@ -2846,3 +2846,92 @@ html.light .gp-markdown {
     display: none;
   }
 }
+
+/* ===== STATUS POPOVER TOKENS (lane P) =====================================
+   The menu-bar popover floats over an arbitrary desktop, so its palette is
+   solved separately from the app theme: every foreground has to clear 4.5:1
+   (text) and 3:1 (non-text) against a pure black AND a pure white wallpaper at
+   the panel's own material alpha. src/lib/desktop/StatusPopover.contrast.test.ts
+   reads this block and fails a retune that loses that. RGB triplets, like every
+   other --c-* token, so `rgb(var(--c-pop-text) / .5)` works.
+
+   Light is the default and dark arrives with `html.dark` or, before the first
+   snapshot has stamped a theme class, `prefers-color-scheme: dark` - the same
+   order the component has always resolved.
+   `-solid` is the opaque palette (opaque material, Reduce Transparency);
+   `-glass` is the one tuned for the translucent panel. */
+:root {
+  --c-pop-base: 250 251 252;
+  --c-pop-card: 255 255 255;
+  --c-pop-soft: 240 242 245;
+  --c-pop-line: 229 232 237;
+  --c-pop-text: 32 36 44;
+  --c-pop-muted-solid: 99 108 121;
+  --c-pop-muted-glass: 66 76 91;
+  --c-pop-blue-solid: 37 99 235;
+  --c-pop-blue-glass: 23 76 176;
+  --c-pop-green-solid: 28 125 78;
+  --c-pop-green-glass: 24 91 57;
+  --c-pop-amber-solid: 151 86 0;
+  --c-pop-amber-glass: 114 66 6;
+  --c-pop-action: 37 99 235;
+  --c-pop-action-hover: 30 85 206;
+  --c-pop-on-action: 255 255 255;
+  --c-pop-hue-a: 120 152 255;
+  --c-pop-hue-b: 46 196 214;
+  --c-pop-hue-c: 168 136 252;
+  --c-pop-hue-d: 240 122 186;
+  --c-pop-white: 255 255 255;
+  --c-pop-shade: 38 46 76;
+  --c-pop-tint: 23 76 176;
+  --c-pop-shadow: 0 0 0;
+}
+html.dark {
+  --c-pop-base: 32 35 41;
+  --c-pop-card: 41 45 52;
+  --c-pop-soft: 43 48 56;
+  --c-pop-line: 56 61 70;
+  --c-pop-text: 240 242 245;
+  --c-pop-muted-solid: 161 169 182;
+  --c-pop-muted-glass: 213 220 233;
+  --c-pop-blue-solid: 120 164 255;
+  --c-pop-blue-glass: 206 222 255;
+  --c-pop-green-solid: 118 197 157;
+  --c-pop-green-glass: 165 238 203;
+  --c-pop-amber-solid: 241 187 112;
+  --c-pop-amber-glass: 255 229 200;
+  --c-pop-action: 50 106 222;
+  --c-pop-action-hover: 40 95 207;
+  --c-pop-hue-a: 52 78 200;
+  --c-pop-hue-b: 12 150 170;
+  --c-pop-hue-c: 110 66 210;
+  --c-pop-hue-d: 180 50 130;
+  --c-pop-shade: 0 0 0;
+  --c-pop-tint: 182 206 255;
+}
+@media (prefers-color-scheme: dark) {
+  html:not(.light) {
+    --c-pop-base: 32 35 41;
+    --c-pop-card: 41 45 52;
+    --c-pop-soft: 43 48 56;
+    --c-pop-line: 56 61 70;
+    --c-pop-text: 240 242 245;
+    --c-pop-muted-solid: 161 169 182;
+    --c-pop-muted-glass: 213 220 233;
+    --c-pop-blue-solid: 120 164 255;
+    --c-pop-blue-glass: 206 222 255;
+    --c-pop-green-solid: 118 197 157;
+    --c-pop-green-glass: 165 238 203;
+    --c-pop-amber-solid: 241 187 112;
+    --c-pop-amber-glass: 255 229 200;
+    --c-pop-action: 50 106 222;
+    --c-pop-action-hover: 40 95 207;
+    --c-pop-hue-a: 52 78 200;
+    --c-pop-hue-b: 12 150 170;
+    --c-pop-hue-c: 110 66 210;
+    --c-pop-hue-d: 180 50 130;
+    --c-pop-shade: 0 0 0;
+    --c-pop-tint: 182 206 255;
+  }
+}
+/* ===== END STATUS POPOVER TOKENS ===== */

@@ -3,6 +3,11 @@ import { tick } from "svelte";
 /** Exercise the shared production component in the existing interactive fixture. */
 export async function checkStatusPopover() {
   const results: { name: string; pass: boolean }[] = [];
+  // The controls are the shared gp-btn / disclosure, so they are found by the
+  // test ids the component stamps on them rather than by a scoped class.
+  const PRIMARY = '[data-testid="status-primary"]';
+  const SECONDARY = '[data-testid="status-secondary"]';
+  const DETAILS_TOGGLE = '[data-testid="status-details-toggle"]';
   const check = (name: string, pass: boolean) => results.push({ name, pass });
   /**
    * Every animation that can still change what the next probe reads.
@@ -181,15 +186,18 @@ export async function checkStatusPopover() {
     const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("Color sampling unavailable");
+    // The inks are bare RGB triplets ("240 242 245") so they take an alpha;
+    // the glass passes are full colours. The canvas needs a colour either way.
     const color = (value: string) => {
-      context.clearRect(0, 0, 1, 1); context.fillStyle = value; context.fillRect(0, 0, 1, 1);
+      const text = value.trim();
+      context.clearRect(0, 0, 1, 1); context.fillStyle = /^\d+\s+\d+\s+\d+$/.test(text) ? `rgb(${text})` : text; context.fillRect(0, 0, 1, 1);
       return [...context.getImageData(0, 0, 1, 1).data];
     };
     const blend = (front: number[], back: number[]) => front.slice(0, 3).map((c, i) => c * front[3] / 255 + back[i] * (1 - front[3] / 255));
     const luminance = (rgb: number[]) => rgb.slice(0, 3).map(c => c / 255).map(c => c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4).reduce((value, c, i) => value + c * [.2126, .7152, .0722][i], 0);
     const style = getComputedStyle(element(".status-shell"));
     const base = color(getComputedStyle(element(".panel")).backgroundColor);
-    const sheen = color(style.getPropertyValue("--sheen"));
+    const sheen = color(style.getPropertyValue("--glass-sheen-top"));
     const backgrounds = [0, 255].flatMap(c => {
       const tinted = blend(base, [c, c, c]);
       return [tinted, blend(sheen, tinted)];
@@ -224,10 +232,10 @@ export async function checkStatusPopover() {
     check("reference counts render from the snapshot", metrics().map(m => m.querySelector("strong")?.textContent).join(",") === "12,4,0");
     check("last-fetch comparison remains explicit", /fetched \d+ min ago|never fetched/.test(element(".sync").textContent ?? "") && !!document.querySelector('[aria-label="3 ahead"]'));
     check("stashes and shortcuts are initially disclosed", !details() && !document.querySelector('[aria-label="2 stashes"], [aria-label="Go"], [aria-label="Tools"], [aria-label="Command palette"]'));
-    check("only one primary action is visible", document.querySelectorAll(".primary").length === 1 && element(".primary").textContent?.includes("Review changes") === true);
+    check("only one primary action is visible", document.querySelectorAll(PRIMARY).length === 1 && element(PRIMARY).textContent?.includes("Review changes") === true);
     check("zero conflicts cannot navigate", button('[aria-label="0 conflicts"]').disabled);
-    await click(".primary"); check("review opens the existing work view", action("section:work:overview"));
-    await click(".details-toggle");
+    await click(PRIMARY); check("review opens the existing work view", action("section:work:overview"));
+    await click(DETAILS_TOGGLE);
     check("Details reveals the available stashes and utilities", !!details() && !button('[aria-label="2 stashes"]').disabled && !!document.querySelector('[aria-label="Tools"]'));
     // Split from one `&&`. A panel that outgrew its window, a pane that lost
     // its height cap, and a pane that stopped scrolling are three different
@@ -247,11 +255,11 @@ export async function checkStatusPopover() {
     // DOM, and a disclosure still under the slide's inline `overflow:hidden`.
     // Both are what a `playState === "running"` test, or a stopwatch, calls
     // settled — and both are exactly what failed on the runner and passed here.
-    button(".details-toggle").click();
+    button(DETAILS_TOGGLE).click();
     await tick(); await frame(); outlastAnyBudget();
     await settle();
     check("a collapse slower than the wait is waited out, not read through", !details());
-    button(".details-toggle").click();
+    button(DETAILS_TOGGLE).click();
     await tick(); await frame(); outlastAnyBudget();
     await settle();
     check("a disclosure slower than the wait is waited out, not read through",
@@ -293,18 +301,18 @@ export async function checkStatusPopover() {
       afterEscape.closed && afterEscape.action);
     await select(1, "conflicts");
     check("conflicts receive a specific headline and card", element("h1").textContent === "Conflicts need your attention" && button('[aria-label="2 conflicts"]').classList.contains("attention"));
-    await click(".primary"); check("the conflict action opens Resolve", action("section:work:resolve"));
+    await click(PRIMARY); check("the conflict action opens Resolve", action("section:work:resolve"));
     await select(1, "clean");
     check("clean state shows real zeros and disables all cards", metrics().every(m => m.disabled && m.querySelector("strong")?.textContent === "0"));
-    await click(".primary"); check("clean state offers history", action("section:history:graph"));
+    await click(PRIMARY); check("clean state offers history", action("section:history:graph"));
     await select(1, "loading");
-    check("loading shows unknown values and blocks retry", metrics().every(m => m.disabled && m.querySelector("strong")?.textContent === "—") && button(".primary").disabled);
+    check("loading shows unknown values and blocks retry", metrics().every(m => m.disabled && m.querySelector("strong")?.textContent === "—") && button(PRIMARY).disabled);
     await select(1, "unavailable");
-    check("failure offers recovery and reports the watcher", !button(".primary").disabled && element(".live").textContent === "Not live" && metrics().every(m => m.querySelector("strong")?.textContent === "—"));
-    await click(".primary"); check("retry uses the existing refresh route", action("refresh"));
+    check("failure offers recovery and reports the watcher", !button(PRIMARY).disabled && element(".live").textContent === "Not live" && metrics().every(m => m.querySelector("strong")?.textContent === "—"));
+    await click(PRIMARY); check("retry uses the existing refresh route", action("refresh"));
     await select(1, "empty");
-    check("empty state offers opening and cloning without metrics", metrics().length === 0 && element(".primary").textContent?.includes("Open repository") === true);
-    await click(".secondary"); check("clone remains accessible", action("clone"));
+    check("empty state offers opening and cloning without metrics", metrics().length === 0 && element(PRIMARY).textContent?.includes("Open repository") === true);
+    await click(SECONDARY); check("clone remains accessible", action("clone"));
     await select(1, "long names");
     check("long names truncate without widening the panel", fits() && getComputedStyle(element(".branch span")).textOverflow === "ellipsis" && element(".branch").title.includes("many-segments"));
     await select(0, "dark");
@@ -345,7 +353,7 @@ export async function checkStatusPopover() {
     await select(0, "dark");
     await select(1, "busy");
     check("active work remains visible in the headline", element("h1").textContent === "Fetching…");
-    await click(".details-toggle");
+    await click(DETAILS_TOGGLE);
     check("Details retains background-work insights", element('[aria-label="Workspace insights"]').textContent?.includes("1 running elsewhere") === true);
     await select(1, "operation");
     check("parked operations remain visible in both layers", element("h1").textContent?.includes("Merge in progress") === true && element('[aria-label="Workspace insights"]').textContent?.includes("Merge in progress") === true);

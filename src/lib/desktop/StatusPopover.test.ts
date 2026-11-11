@@ -111,9 +111,10 @@ describe("compact status popover", () => {
     // that declares or reads a glass token has to name both materials — the
     // ladder, both appearance arms, the panel treatment and the inner cards,
     // five of them as this stands. Comments come out first: prose about one
-    // material must not stand in for a selector that targets it. The blur is
-    // the sole material-specific rule and touches no glass token, because
-    // native's blur comes from the window server rather than from CSS.
+    // material must not stand in for a selector that targets it. The preview's
+    // CSS blur is the sole material-specific rule and is not in this file at
+    // all: native's blur comes from the window server, and the fixture's
+    // stand-in lives in harness/StatusPreview.svelte.
     const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
     const tuned = [...styles.matchAll(/([^{}]+)\{([^}]*)\}/g)]
       .filter(([, selector, body]) => body.includes("--glass-") && selector.includes("data-material"))
@@ -123,6 +124,36 @@ describe("compact status popover", () => {
       expect(selector).toContain('[data-material="native"]');
       expect(selector).toContain('[data-material="preview"]');
     }
+  });
+});
+
+describe("status popover speaks the shared grammar", () => {
+  const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const markup = source.slice(0, source.indexOf("<style>"));
+
+  it("paints every colour from a --c-* token", () => {
+    expect(styles).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(styles).not.toMatch(/rgba?\(\s*\d/);
+  });
+
+  it("owns no scoped button, chip or icon-button class and no blur of its own", () => {
+    for (const name of ["chip", "primary", "secondary", "icon-button", "detail-action", "details-toggle"]) {
+      expect(styles, `.${name}`).not.toMatch(new RegExp(`\\.${name}\\b`));
+    }
+    expect(styles).not.toMatch(/[;{]\s*(?:-webkit-)?backdrop-filter:\s*(?!none)\S/);
+  });
+
+  it("keeps the actions on gp-btn, gp-chip and gp-icon-btn with the test ids the harness uses", () => {
+    expect(markup).toContain('data-variant="primary"');
+    expect(markup).toContain('data-testid="status-primary"');
+    expect(markup).toContain('data-variant="ghost"');
+    expect(markup).toContain('data-testid="status-secondary"');
+    expect(markup).toContain('data-testid="status-details-toggle"');
+    expect(markup).toContain('class="gp-chip"');
+    expect(markup.match(/class="gp-icon-btn"/g)).toHaveLength(3);
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("empty"), onaction: () => {} } });
+    expect(body).toContain('data-variant="primary"');
+    expect(body).toContain('data-variant="ghost"');
   });
 });
 

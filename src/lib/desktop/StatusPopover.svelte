@@ -1,4 +1,8 @@
 <script lang="ts">
+  // The menu-bar window loads only status.css, so the shared tokens and the
+  // gp-btn / gp-chip / gp-icon-btn utilities come in with the component that
+  // uses them (it is the one place both the window and the harness mount it).
+  import "../../app.css";
   import { slide } from "svelte/transition";
   import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Bot, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
   import type { MenuState } from "./menuState";
@@ -79,7 +83,7 @@
         </button>
         <div class="branch" title={card?.branch}><GitBranch size={12} /><span>{card?.branch || "Menu bar companion"}</span></div>
       </div>
-      <button class="icon-button refresh" aria-label="Refresh repository" title="Refresh · R"
+      <button class="gp-icon-btn" data-size="md" aria-label="Refresh repository" title="Refresh · R"
         disabled={!enabled("refresh")} onclick={() => act("refresh")}>
         <RefreshCw size={15} class={card?.tone === "busy" || pending ? "rotating" : ""} />
       </button>
@@ -111,14 +115,14 @@
       {#if !snapshot}
         <div class="empty"><div class="empty-mark"><Activity size={27} /></div><h1>{error ? "Status unavailable" : "Connecting…"}</h1>
           <p>{error || "Getting your workspace status."}</p>
-          {#if error}<button class="primary" onclick={() => act("retry")}>Try again</button>{/if}
+          {#if error}<button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" onclick={() => act("retry")}>Try again</button>{/if}
         </div>
       {:else if !hasRepo}
         <div class="empty"><div class="empty-mark"><GitBranch size={29} strokeWidth={1.5} /></div>
           <h1>Your work, at a glance</h1><p>Open a repository to see what needs attention.</p>
-          <button class="primary" disabled={pending} onclick={() => act("open")}>Open repository <ArrowUpRight size={15} /></button>
+          <button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" disabled={pending} onclick={() => act("open")}>Open repository <ArrowUpRight size={15} /></button>
           {#if enabled("clone")}
-            <button class="secondary" disabled={pending} onclick={() => act("clone")}>Clone repository</button>
+            <button class="gp-btn mt-2 w-full" data-variant="ghost" data-size="md" data-testid="status-secondary" disabled={pending} onclick={() => act("clone")}>Clone repository</button>
           {/if}
         </div>
       {:else if card}
@@ -148,11 +152,11 @@
             <GitBranch size={13} /><span class="upstream">{card.branch ? "No upstream data" : "Branch unavailable"}</span>
           {/if}
         </div>
-        <button class="primary" disabled={!enabled(snapshot.traySummary.id)}
+        <button class="gp-btn w-full" data-variant="primary" data-size="md" data-testid="status-primary" disabled={!enabled(snapshot.traySummary.id)}
           onclick={() => act(snapshot.traySummary.id)}>
           {card.primaryLabel}<ArrowUpRight size={15} />
         </button>
-        <button class="details-toggle" aria-expanded={expanded} aria-controls="status-details" onclick={() => expanded = !expanded}>
+        <button class="disclosure" data-testid="status-details-toggle" aria-expanded={expanded} aria-controls="status-details" onclick={() => expanded = !expanded}>
           <span><ChevronRight size={13} class={expanded ? "expanded" : ""} />Details</span>
           <span class="live" class:degraded={card.watchStatus === "degraded"}>
             <span></span>{card.watchStatus === "watching" ? "Live" : card.watchStatus === "degraded" ? "Not live" : "Connecting"}
@@ -164,19 +168,19 @@
           <div class="details" id="status-details" tabindex="0" role="region" aria-label="Repository details"
             transition:slide={{ duration: motion }}>
             <div class="detail-actions">
-              <button class="detail-action" aria-label={`${card.stashes ?? "Unknown"} stashes`}
+              <button class="gp-btn w-full justify-start" data-size="md" aria-label={`${card.stashes ?? "Unknown"} stashes`}
                 disabled={!enabled("section:work:overview") || !card.stashes} onclick={() => act("section:work:overview")}>
-                <Archive size={13} /><span>Stashes</span><strong>{card.stashes ?? "—"}</strong>
+                <Archive size={13} /><span>Stashes</span><strong class="ml-auto tabular-nums">{card.stashes ?? "—"}</strong>
               </button>
-              <button class="detail-action" aria-label="Command palette" disabled={!enabled("palette")} onclick={() => act("palette")}>
+              <button class="gp-btn w-full justify-start" data-size="md" aria-label="Command palette" disabled={!enabled("palette")} onclick={() => act("palette")}>
                 <Command size={13} /><span>Command palette</span>
               </button>
             </div>
             {#if insights.length}
               <div class="insights" aria-label="Workspace insights">
                 {#each insights as insight}
-                  <button class="chip" class:warning={insight.tone === "warning"} class:busy={insight.tone === "busy"}
-                    disabled={!enabled(insight.id)} onclick={() => act(insight.id)}>{insight.text}</button>
+                  <button class="gp-chip" data-tone={insight.tone === "warning" ? "warn" : insight.tone === "busy" ? "info" : "neutral"}
+                    title={insight.text} disabled={!enabled(insight.id)} onclick={() => act(insight.id)}>{insight.text}</button>
                 {/each}
               </div>
             {/if}
@@ -221,84 +225,65 @@
     <footer>
       <button class="open-app" onclick={() => act("show")}>Open GitPulse <ArrowUpRight size={12} /></button>
       <div>
-        <button class="icon-button" aria-label="Settings" title="Settings" onclick={() => act("settings")}><Settings2 size={14} /></button>
-        <button class="icon-button" aria-label="Quit GitPulse" title="Quit GitPulse" onclick={() => act("quit")}><Power size={14} /></button>
+        <button class="gp-icon-btn" data-size="md" aria-label="Settings" title="Settings" onclick={() => act("settings")}><Settings2 size={14} /></button>
+        <button class="gp-icon-btn" data-size="md" aria-label="Quit GitPulse" title="Quit GitPulse" onclick={() => act("quit")}><Power size={14} /></button>
       </div>
     </footer>
   </section>
 </div>
 
 <style>
+  /* Every colour here is a --c-pop-* token from app.css (the popover's own
+     palette, solved against a black and a white wallpaper and pinned by
+     StatusPopover.contrast.test.ts). The names below are this component's
+     aliases for them: bare triplets for the inks, so `rgb(var(--text) / .5)`
+     works, and full colours for the three fills that carry an alpha.
+     This block is the opaque material. The glass arms below swap the inks to
+     their glass-tuned twins. */
   .status-shell {
-    --base:250 251 252;
-    --card-base:255 255 255;
-    --solid-muted:#69727f;
-    --glass-muted:#424c5b;
-    --glass-blue:#174cb0;
-    --glass-green:#185b39;
-    --glass-amber:#75450b;
-    --sheen:rgb(255 255 255 / .18);
-    --bg:#fafbfc;
-    --surface:#fff;
-    --text:#20242c;
-    --muted:#69727f;
-    --line:#e5e8ed;
-    --soft:#f0f2f5;
-    --blue:#2563eb;
-    --action:#2563eb;
-    --action-hover:#1e55ce;
-    --green:#258354;
-    --amber:#ac6719; padding:8px; color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:12px; -webkit-font-smoothing:antialiased;
+    --base:var(--c-pop-base);
+    --card-base:var(--c-pop-card);
+    --solid-muted:var(--c-pop-muted-solid);
+    --glass-muted:var(--c-pop-muted-glass);
+    --glass-blue:var(--c-pop-blue-glass);
+    --glass-green:var(--c-pop-green-glass);
+    --glass-amber:var(--c-pop-amber-glass);
+    --bg:rgb(var(--base));
+    --surface:rgb(var(--card-base));
+    --soft:rgb(var(--c-pop-soft));
+    --line:rgb(var(--c-pop-line));
+    --text:var(--c-pop-text);
+    --muted:var(--solid-muted);
+    --blue:var(--c-pop-blue-solid);
+    --action:var(--c-pop-action);
+    --action-hover:var(--c-pop-action-hover);
+    --green:var(--c-pop-green-solid);
+    --amber:var(--c-pop-amber-solid);
+    /* The shared primitives (gp-btn, gp-chip, gp-icon-btn) read the app's
+       tokens. Pointing those at the popover's own palette is what keeps them
+       legible over a wallpaper, instead of restyling them. */
+    --c-text:var(--text);
+    --c-text-muted:var(--muted);
+    --c-accent:var(--blue);
+    --c-info:var(--blue);
+    --c-ok:var(--green);
+    --c-warn:var(--amber);
+    --c-surface:var(--card-base);
+    --c-surface-hover:var(--c-pop-soft);
+    --gp-edge:var(--line);
+    --brand-gradient:linear-gradient(rgb(var(--action)), rgb(var(--action)));
+    --shadow-glow:0 1px 2px rgb(var(--c-pop-shadow) / .07);
+    padding:8px; color:rgb(var(--text)); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:12px; -webkit-font-smoothing:antialiased;
   }
-  :global(:where(.dark)) .status-shell {
-    --base:32 35 41;
-    --card-base:41 45 52;
-    --solid-muted:#a1a9b6;
-    --glass-muted:#c2c9d5;
-    --glass-blue:#b6ceff;
-    --glass-green:#95ddbb;
-    --glass-amber:#ffd099;
-    --sheen:rgb(255 255 255 / .025);
-    --bg:#202329;
-    --surface:#292d34;
-    --text:#f0f2f5;
-    --muted:#a1a9b6;
-    --line:#383d46;
-    --soft:#2b3038;
-    --blue:#558aff;
-    --action:#326ade;
-    --action-hover:#285fcf;
-    --green:#76c59d;
-    --amber:#f1bb70;
-  }
-  @media(prefers-color-scheme:dark) { :global(:where(html:not(.light))) .status-shell {
-    --base:32 35 41;
-    --card-base:41 45 52;
-    --solid-muted:#a1a9b6;
-    --glass-muted:#c2c9d5;
-    --glass-blue:#b6ceff;
-    --glass-green:#95ddbb;
-    --glass-amber:#ffd099;
-    --sheen:rgb(255 255 255 / .025);
-    --bg:#202329;
-    --surface:#292d34;
-    --text:#f0f2f5;
-    --muted:#a1a9b6;
-    --line:#383d46;
-    --soft:#2b3038;
-    --blue:#558aff;
-    --action:#326ade;
-    --action-hover:#285fcf;
-    --green:#76c59d;
-    --amber:#f1bb70;
-  } }
-  .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px #00000012,0 1px 3px #00000008; }
+  .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px rgb(var(--c-pop-shadow) / .07),0 1px 3px rgb(var(--c-pop-shadow) / .03); }
   /* ── Liquid blur glass ──
      The native window server supplies desktop blur via NSVisualEffectView.
      On top of that the page paints the same hue field and glass fills as the
      main app so the popover reads as part of the same surface language.
-     The browser fixture ("preview") stands in for that material, simulating
-     only the part it cannot have — the desktop blur — with a CSS filter.
+     The browser fixture ("preview") stands in for that material; the one thing
+     it cannot have, the desktop blur, is a CSS filter that lives in
+     harness/StatusPreview.svelte, because only the fixture needs it and only
+     the float rule in app.css may blur in a component.
 
      Both materials therefore share one ladder and one pair of appearance
      arms. They used to be two copies, and the copy drifted exactly the way
@@ -312,24 +297,24 @@
   .status-shell[data-material="native"],
   .status-shell[data-material="preview"] {
     --liquid-ease:var(--gp-ease-effect);
-    /* Hue blobs — same four colours as .gp-shell in app.css, dark theme. */
-    --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
+    /* Hue blobs — same four colours as .gp-shell in app.css, per theme. */
+    --hue-a:var(--c-pop-hue-a); --hue-b:var(--c-pop-hue-b); --hue-c:var(--c-pop-hue-c); --hue-d:var(--c-pop-hue-d);
     --hue-gain:1;
     /* Glass surface ladder — mirrors --mac-glass-fill / --mac-fill-surface. */
-    --glass-edge:rgb(255 255 255 / .14);
-    --glass-sheen-top:rgb(255 255 255 / .05);
-    --glass-shade-bottom:rgb(0 0 0 / .22);
-    --glass-tint:rgb(23 76 176 / .07);
+    --glass-edge:rgb(var(--c-pop-white) / .14);
+    --glass-sheen-top:rgb(var(--c-pop-white) / .05);
+    --glass-shade-bottom:rgb(var(--c-pop-shade) / .22);
+    --glass-tint:rgb(var(--c-pop-tint) / .07);
     /* 0.8 is a floor, not a taste choice. This panel floats over an arbitrary
        desktop, so every foreground token has to clear 4.5:1 against BOTH a
        pure-white and a pure-black wallpaper, and panel opacity is the only
-       thing decoupling the text from it. Solved against the model in
-       harness/statusChecks.ts: the minimum passing alpha is .787 light and
-       .795 dark. At .55 the accents land at 2.1-2.5:1 — and no single colour
-       can clear 4.5:1 at both extremes once the panel is that thin, so
-       darkening the tokens instead is not available. The glass still reads:
-       20% of the desktop shows through, under the hue field and the sheen and
-       tint passes below. */
+       thing decoupling the text from it. Solved in
+       StatusPopover.contrast.test.ts against the palette in app.css: the
+       minimum passing alpha is .787 light and .795 dark. At .55 the accents
+       land at 2.1-2.5:1 — and no single colour can clear 4.5:1 at both
+       extremes once the panel is that thin, so darkening the tokens instead
+       is not available. The glass still reads: 20% of the desktop shows
+       through, under the hue field and the sheen and tint passes below. */
     --bg:rgb(var(--base) / .8);
     --surface:rgb(var(--card-base) / .4);
     --soft:rgb(var(--card-base) / .28);
@@ -350,22 +335,21 @@
   :global(:where(.dark)) .status-shell[data-material="preview"],
   :global(:where(html:not(.light))) .status-shell[data-material="native"],
   :global(:where(html:not(.light))) .status-shell[data-material="preview"] {
-    --glass-sheen-top:rgb(255 255 255 / .05);
-    --glass-shade-bottom:rgb(0 0 0 / .22);
-    --glass-tint:rgb(182 206 255 / .07);
+    --glass-sheen-top:rgb(var(--c-pop-white) / .05);
+    --glass-shade-bottom:rgb(var(--c-pop-shade) / .22);
+    --glass-tint:rgb(var(--c-pop-tint) / .07);
   }
   .status-shell[data-material="native"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *),
   .status-shell[data-material="preview"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *) {
-    --hue-a:120 152 255; --hue-b:46 196 214; --hue-c:168 136 252; --hue-d:240 122 186;
     --hue-gain:.5;
     /* Same floor as the dark arm above; light solves to .787. */
     --bg:rgb(var(--base) / .8);
     --surface:rgb(var(--card-base) / .58);
     --soft:rgb(var(--card-base) / .36);
     --glass-edge:rgb(var(--card-base) / .24);
-    --glass-sheen-top:rgb(255 255 255 / .7);
-    --glass-shade-bottom:rgb(38 46 76 / .07);
-    --glass-tint:rgb(23 76 176 / .05);
+    --glass-sheen-top:rgb(var(--c-pop-white) / .7);
+    --glass-shade-bottom:rgb(var(--c-pop-shade) / .07);
+    --glass-tint:rgb(var(--c-pop-tint) / .05);
     --line:var(--glass-edge);
   }
   .status-shell[data-material="native"] .panel,
@@ -380,30 +364,22 @@
       inset 0 -1px 0 var(--glass-shade-bottom);
   }
   /* Inner surfaces thin so they read as glass cards inside the panel. */
-  .status-shell[data-material="native"] :is(.metric, .detail-action, .repositories, .chip, .mark),
-  .status-shell[data-material="preview"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
+  .status-shell[data-material="native"] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])),
+  .status-shell[data-material="preview"] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])) {
     border-color:var(--glass-edge);
     background:var(--surface);
   }
   /* Liquid-ease transitions on interactive elements. */
   @media (prefers-reduced-motion: no-preference) {
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip),
-    .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut) {
       transition-property:color, background-color, border-color, transform;
       transition-duration:var(--gp-dur-fast);
       transition-timing-function:var(--liquid-ease);
     }
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled),
-    .status-shell[data-material="preview"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(.metric, .shortcut):active:not(:disabled),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(.metric, .shortcut):active:not(:disabled) {
       transform:scale(0.97);
-    }
-  }
-  /* The one thing the fixture cannot borrow: native gets its desktop blur from
-     the window server, so only the fixture pays for a CSS filter. */
-  @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
-    .status-shell[data-material="preview"] .panel {
-      -webkit-backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
-      backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
     }
   }
   /* With no CSS filter there is no desktop blur to stand in for, so the fixture
@@ -418,7 +394,7 @@
   @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
     .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
     .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
-    .status-shell[data-material] :is(.metric, .detail-action, .repositories, .chip, .mark) { background:var(--surface); border-color:var(--line); }
+    .status-shell[data-material] :is(.metric, .repositories, .gp-chip, .mark, .gp-btn:not([data-variant])) { background:var(--surface); border-color:var(--line); }
   }
   /* WKWebView does not implement prefers-reduced-transparency, so the query above
      never fires for the macOS Reduce Transparency setting. The native bridge
@@ -429,92 +405,84 @@
      var(--glass-edge), and --line is var(--glass-edge). */
   :global(html[data-transparency="reduced"]) .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
   :global(html[data-transparency="reduced"]) .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
-  button { font:inherit; cursor:pointer; border:0; color:inherit; background:none; padding:0; }
-  button:disabled { cursor:default; }
-  button:focus-visible,.details:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+  /* The shared button resets come from app.css's preflight; only the pointer
+     is the component's to say, and never over a gp- primitive that already did. */
+  button:not(.gp-btn, .gp-icon-btn, .gp-chip) { font:inherit; cursor:pointer; color:inherit; }
+  button:disabled:not(.gp-btn, .gp-icon-btn) { cursor:default; }
+  .gp-chip:disabled { opacity:.45; cursor:default; }
+  button:focus-visible,.details:focus-visible { outline:2px solid rgb(var(--blue)); outline-offset:3px; box-shadow:none; }
+  /* The primary fill's hover, from the popover's own solved token rather than
+     the shared brightness filter, which would walk the white label off 4.5:1. */
+  .status-shell :global(.gp-btn[data-variant="primary"]:hover:not(:disabled)) { background-image:linear-gradient(rgb(var(--action-hover)), rgb(var(--action-hover))); filter:none; }
+  .status-shell :global(.gp-btn:not([data-variant]):hover:not(:disabled)) { background:var(--soft); }
   header { display:flex; align-items:center; gap:10px; padding:20px 20px 17px; }
   .mark { width:34px; height:34px; flex-shrink:0; display:grid; place-items:center; border:1px solid var(--line); border-radius:10px; background:var(--surface); }
   .identity { min-width:0; flex:1; }
   .repository { display:flex; align-items:center; gap:6px; max-width:100%; font-weight:600; font-size:15px; letter-spacing:-.2px; text-align:left; }
   .repository span,.branch span,.upstream { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .repository:not(:disabled):hover { color:var(--blue); }
-  .branch { display:flex; align-items:center; gap:4px; margin-top:5px; color:var(--muted); font-size:11px; }
-  .icon-button { width:28px; height:28px; display:inline-grid; place-items:center; border-radius:7px; color:var(--muted); }
-  .icon-button:hover:not(:disabled) { background:var(--soft); color:var(--text); }
-  .icon-button:disabled { opacity:.4; }
+  .repository:not(:disabled):hover { color:rgb(var(--blue)); }
+  .branch { display:flex; align-items:center; gap:4px; margin-top:5px; color:rgb(var(--muted)); font-size:11px; }
   .content { padding:0 20px; }
   .status-heading { display:flex; align-items:center; gap:7px; margin:0 0 16px; }
   h1 { font-size:12px; font-weight:500; margin:0; letter-spacing:-.1px; }
-  .status-dot { width:6px; height:6px; border-radius:50%; background:var(--muted); flex-shrink:0; }
-  [data-tone="clean"] .status-dot { background:var(--green); }
-  [data-tone="warning"] .status-dot { background:var(--amber); }
-  [data-tone="changed"] .status-dot,[data-tone="busy"] .status-dot { background:var(--blue); }
+  .status-dot { width:6px; height:6px; border-radius:50%; background:rgb(var(--muted)); flex-shrink:0; }
+  [data-tone="clean"] .status-dot { background:rgb(var(--green)); }
+  [data-tone="warning"] .status-dot { background:rgb(var(--amber)); }
+  [data-tone="changed"] .status-dot,[data-tone="busy"] .status-dot { background:rgb(var(--blue)); }
   .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
   .metric { text-align:left; padding:12px 10px; border:1px solid var(--line); background:var(--surface); border-radius:10px; min-width:0; transition:background var(--gp-dur-fast),border-color var(--gp-dur-fast); }
-  .metric:hover:not(:disabled) { border-color:var(--blue); background:var(--soft); }
-  .metric-label { display:flex; align-items:center; gap:4px; font-size:10px; color:var(--muted); }
+  .metric:hover:not(:disabled) { border-color:rgb(var(--blue)); background:var(--soft); }
+  .metric-label { display:flex; align-items:center; gap:4px; font-size:10px; color:rgb(var(--muted)); }
   .metric strong { display:block; margin-top:8px; font-size:27px; line-height:1; font-weight:600; letter-spacing:-1px; font-variant-numeric:tabular-nums; }
-  .metric.attention { color:var(--amber); border-color:color-mix(in srgb,var(--amber) 40%,var(--line)); background:color-mix(in srgb,var(--amber) 7%,var(--surface)); }
-  .sync { display:flex; align-items:center; gap:8px; min-width:0; color:var(--muted); margin:14px 0 18px; font-size:10px; }
-  .sync-counts { display:flex; gap:9px; color:var(--text); font-variant-numeric:tabular-nums; }
+  .metric.attention { color:rgb(var(--amber)); border-color:color-mix(in srgb,rgb(var(--amber)) 40%,var(--line)); background:color-mix(in srgb,rgb(var(--amber)) 7%,var(--surface)); }
+  .sync { display:flex; align-items:center; gap:8px; min-width:0; color:rgb(var(--muted)); margin:14px 0 18px; font-size:10px; }
+  .sync-counts { display:flex; gap:9px; color:rgb(var(--text)); font-variant-numeric:tabular-nums; }
   .sync-counts span { display:flex; align-items:center; gap:2px; }
   .upstream { flex:1; }
   .caption { font-size:9px; }
-  .primary { display:flex; align-items:center; justify-content:center; gap:8px; width:100%; min-height:34px; color:#fff; background:var(--action); border-radius:8px; font-size:12px; font-weight:600; box-shadow:0 1px 2px #00000012; }
-  .primary:hover:not(:disabled) { background:var(--action-hover); }
-  .primary:disabled { opacity:.45; }
-  .details-toggle { display:flex; align-items:center; justify-content:space-between; width:100%; min-height:43px; font-size:10px; color:var(--muted); }
-  .details-toggle>span { display:flex; align-items:center; gap:4px; }
-  .details-toggle:hover { color:var(--text); }
-  .details-toggle :global(.expanded) { transform:rotate(90deg); }
+  .disclosure { display:flex; align-items:center; justify-content:space-between; width:100%; min-height:43px; font-size:10px; color:rgb(var(--muted)); }
+  .disclosure>span { display:flex; align-items:center; gap:4px; }
+  .disclosure:hover { color:rgb(var(--text)); }
+  .disclosure :global(.expanded) { transform:rotate(90deg); }
   .live { font-size:9px; }
-  .live>span { width:4px; height:4px; background:var(--muted); border-radius:50%; }
-  .live.degraded { color:var(--amber); }
-  .live.degraded>span { background:var(--amber); }
-  .details { max-height:190px; overflow:auto; padding:0 0 14px; margin-bottom:2px; font-size:10px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
-  .detail-rows>div { display:flex; gap:8px; padding:7px 0; border-top:1px solid var(--line); }
+  .live>span { width:4px; height:4px; background:rgb(var(--muted)); border-radius:50%; }
+  .live.degraded { color:rgb(var(--amber)); }
+  .live.degraded>span { background:rgb(var(--amber)); }
+  .details { max-height:190px; overflow:auto; padding:0 0 14px; margin-bottom:2px; font-size:10px; line-height:1.5; color:rgb(var(--muted)); overflow-wrap:anywhere; }
+  .detail-rows { display:flex; flex-direction:column; gap:2px; }
+  .detail-rows>div { display:flex; gap:8px; padding:7px 0; }
   .detail-rows span { flex:0 0 62px; font-weight:500; }
   .detail-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding-bottom:12px; }
-  .detail-action { display:flex; align-items:center; gap:6px; padding:9px 8px; border:1px solid var(--line); border-radius:7px; background:var(--surface); }
-  .detail-action strong { margin-left:auto; color:var(--text); font-variant-numeric:tabular-nums; }
-  .detail-action:disabled { opacity:.55; }
-  .detail-action:hover:not(:disabled) { color:var(--text); background:var(--soft); }
-  .shortcut-block { padding:10px 0 0; border-top:1px solid var(--line); }
+  .shortcut-block { padding:10px 0 0; }
   .group-label { display:block; margin-bottom:6px; font-size:10px; font-weight:500; }
   .shortcuts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding-bottom:10px; }
   .shortcut { display:flex; align-items:center; gap:6px; padding:8px; border-radius:6px; text-align:left; font-size:10px; }
-  .shortcut:hover:not(:disabled) { color:var(--text); background:var(--soft); }
+  .shortcut:hover:not(:disabled) { color:rgb(var(--text)); background:var(--soft); }
   .shortcut:disabled { opacity:.45; }
-  .shortcut.copied { color:var(--green); }
+  .shortcut.copied { color:rgb(var(--green)); }
   .insights { display:flex; flex-wrap:wrap; gap:6px; padding-bottom:12px; }
-  .chip { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:10px; text-align:left; }
-  .chip.warning { color:var(--amber); }
-  .chip.busy { color:var(--blue); }
-  .chip:hover:not(:disabled) { background:var(--soft); }
-  .secondary { display:flex; align-items:center; justify-content:center; width:100%; min-height:32px; margin-top:8px; color:var(--muted); }
-  .secondary:hover:not(:disabled) { color:var(--blue); }
   .repository :global(.expanded) { transform:rotate(180deg); }
   footer>div { display:flex; }
-  .metric.unknown strong { color:var(--muted); }
-  footer { display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--line); padding:8px 14px 8px 20px; }
-  .open-app { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:10px; }
-  .open-app:hover { color:var(--text); }
+  .metric.unknown strong { color:rgb(var(--muted)); }
+  footer { display:flex; justify-content:space-between; align-items:center; padding:8px 14px 8px 20px; }
+  .open-app { display:flex; align-items:center; gap:4px; color:rgb(var(--muted)); font-size:10px; }
+  .open-app:hover { color:rgb(var(--text)); }
   .repositories { max-height:180px; overflow:auto; border:1px solid var(--line); background:var(--surface); margin:0 20px 15px; padding:4px; border-radius:9px; }
   .repositories button { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; padding:8px; border-radius:5px; }
   .repositories span { min-width:0; display:flex; flex-direction:column; gap:3px; }
   .repositories strong,.repositories em { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .repositories strong { font-weight:500; }
-  .repositories em { font-size:10px; font-style:normal; color:var(--muted); }
+  .repositories em { font-size:10px; font-style:normal; color:rgb(var(--muted)); }
   .repositories button:hover,.repositories .current { background:var(--soft); }
   .repo-badges { display:flex; flex-direction:row; gap:4px; margin-top:2px; }
-  .repo-badges .badge { font-size:10px; font-variant-numeric:tabular-nums; color:var(--muted); background:var(--soft); border-radius:4px; padding:1px 5px; }
-  .repo-badges .badge.warn { color:var(--amber); }
+  .repo-badges .badge { font-size:10px; font-variant-numeric:tabular-nums; color:rgb(var(--muted)); background:var(--soft); border-radius:4px; padding:1px 5px; }
+  .repo-badges .badge.warn { color:rgb(var(--amber)); }
   .repo-badges .badge.busy { letter-spacing:.5px; }
   .empty { text-align:center; padding:6px 0 22px; }
-  .empty-mark { width:56px; height:56px; border-radius:16px; display:grid; place-items:center; margin:0 auto 16px; background:var(--soft); color:var(--muted); }
+  .empty-mark { width:56px; height:56px; border-radius:16px; display:grid; place-items:center; margin:0 auto 16px; background:var(--soft); color:rgb(var(--muted)); }
   .empty h1 { font-size:16px; font-weight:600; }
-  .empty p { color:var(--muted); line-height:1.5; margin:9px auto 20px; max-width:230px; }
-  .error { display:flex; gap:7px; color:var(--amber); font-size:11px; line-height:1.4; margin:0 0 14px; }
+  .empty p { color:rgb(var(--muted)); line-height:1.5; margin:9px auto 20px; max-width:230px; }
+  .error { display:flex; gap:7px; color:rgb(var(--amber)); font-size:11px; line-height:1.4; margin:0 0 14px; }
   .error>span { min-width:0; overflow-wrap:anywhere; }
   .error :global(svg) { flex-shrink:0; margin-top:1px; }
   :global(.rotating) { animation:spin calc(var(--gp-dur-emphasis) * 3) linear infinite; }
