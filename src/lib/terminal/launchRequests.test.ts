@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
@@ -116,7 +116,7 @@ describe("terminal agent launch requests", () => {
     const controller = new AbortController();
     const launched = requests.request("/a", "codex", "Generate coverage", controller.signal);
     controller.abort();
-    await expect(launched).rejects.toThrow("cancelled");
+    await expect(launched).rejects.toThrow(TERMINAL_SESSION_CANCELED);
     expect(requests.take("/a")).toBeNull();
   });
 

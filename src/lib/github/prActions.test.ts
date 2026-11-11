@@ -128,7 +128,7 @@ describe("describePrWorktree", () => {
     expect(text).toContain("post-create hook did not finish");
     expect(text).toContain("for want of disk: target");
     expect(text).toContain("Free disk space could not be read");
-    expect(text).toContain("DevMap setup failed: no store");
+    expect(text).toContain("Code map setup failed: no store");
   });
 });
 

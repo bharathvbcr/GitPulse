@@ -53,7 +53,7 @@ const LABELS: Record<string, string> = {
   paused: "Paused",
   succeeded: "Live",
   failed: "Failed",
-  cancelled: "Cancelled",
+  cancelled: "Canceled",
   skipped: "Skipped",
 };
 

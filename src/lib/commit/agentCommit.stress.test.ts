@@ -20,7 +20,7 @@ import {
   type CommitFileRef,
 } from "./agentCommit";
 import { AGENT_PROMPT_MAX_BYTES } from "../terminal/agentPromptText";
-import { terminalLaunchRequests } from "../terminal/launchRequests";
+import { TERMINAL_SESSION_CANCELED, terminalLaunchRequests } from "../terminal/launchRequests";
 
 describe("agentCommit stress testing & hardening", () => {
   it("survives 10,000 adversarial files without exceeding byte limits or dropping instructions", () => {
@@ -219,12 +219,12 @@ describe("agentCommit stress testing & hardening", () => {
     const requestSpy = vi
       .spyOn(terminalLaunchRequests, "request")
       .mockImplementation(async (_repo, _launcher, _prompt, signal) => {
-        if (signal?.aborted) throw new Error("Terminal launch cancelled");
+        if (signal?.aborted) throw new Error(TERMINAL_SESSION_CANCELED);
         return new Promise<void>((resolve, reject) => {
           const timeout = setTimeout(() => resolve(), 5);
           signal?.addEventListener("abort", () => {
             clearTimeout(timeout);
-            reject(new Error("Terminal launch cancelled"));
+            reject(new Error(TERMINAL_SESSION_CANCELED));
           });
         });
       });

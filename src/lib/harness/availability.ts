@@ -34,19 +34,23 @@ export function harnessPermissionSummary(status: HarnessStatus | null): string {
 }
 
 /**
- * What Manvi reports as its `posture`, in words a person reads. `host` and
- * `devcouncil` are the two values `manvi serve --posture` takes. Any other
- * value is shown as Manvi sent it, with underscores and hyphens as spaces,
- * rather than guessed at; an empty one says nothing.
+ * What Manvi reports as its `posture`, said as what it means for the user.
+ * `host` and `devcouncil` are the two values `manvi serve --posture` takes
+ * (Manvi's serve.go and serve/policy.go define them): under `host` hard rules
+ * are enforced and a denial that only says no task authorizes the action is
+ * demoted to an allow that records why; under `devcouncil` a task is required
+ * and its absence is a denial. Any other value is shown as Manvi sent it, with
+ * underscores and hyphens as spaces, rather than guessed at; an empty one says
+ * nothing.
  */
 export function harnessPostureLabel(posture: string | null | undefined): string | null {
   const value = (posture ?? "").trim();
   if (!value) return null;
   switch (value.toLowerCase()) {
     case "host":
-      return "hosted by GitPulse";
+      return "No task required (hard rules still apply)";
     case "devcouncil":
-      return "DevCouncil rules";
+      return "Task required";
     default:
       return value.replace(/[_-]+/g, " ").toLowerCase();
   }

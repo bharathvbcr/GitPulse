@@ -54,9 +54,9 @@ describe("harness permission availability", () => {
   });
 
   it("shows Manvi's posture as words, never the raw value, and nothing when there is none", () => {
-    expect(harnessPostureLabel("host")).toBe("hosted by GitPulse");
-    expect(harnessPostureLabel("Host ")).toBe("hosted by GitPulse");
-    expect(harnessPostureLabel("devcouncil")).toBe("DevCouncil rules");
+    expect(harnessPostureLabel("host")).toBe("No task required (hard rules still apply)");
+    expect(harnessPostureLabel("Host ")).toBe("No task required (hard rules still apply)");
+    expect(harnessPostureLabel("devcouncil")).toBe("Task required");
     expect(harnessPostureLabel("strict_write")).toBe("strict write");
     expect(harnessPostureLabel("")).toBeNull();
     expect(harnessPostureLabel("   ")).toBeNull();
