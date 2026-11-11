@@ -228,7 +228,7 @@
   .ok{margin:0;color:rgb(var(--c-ok))}
   .warn{color:rgb(var(--c-danger))}
   h4{margin:6px 0 0}
-  .proposal{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;border:1px solid var(--gp-edge)}
+  .proposal{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:var(--gp-r-lg);border:1px solid var(--gp-edge)}
   .rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
   .present{opacity:.65}
   .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-danger))}

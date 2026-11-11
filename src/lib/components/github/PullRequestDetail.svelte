@@ -204,7 +204,7 @@
     {#if open}
       <div class="space-y-1.5">
         <textarea
-          class="gp-field w-full min-h-16 font-sans"
+          class="gp-field-multi w-full min-h-16 font-sans"
           placeholder="Review comment (required to comment or request changes)"
           aria-label="Review comment for #{number}"
           bind:value={reviewBody}

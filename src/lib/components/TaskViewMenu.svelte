@@ -216,10 +216,10 @@
 {/snippet}
 
 <style>
-  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);text-align:left;width:100%}
+  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);text-align:left;width:100%}
   .row:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
-  .reset{width:100%;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);text-align:left;color:rgb(var(--c-text-muted))}
+  .reset{width:100%;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);text-align:left;color:rgb(var(--c-text-muted))}
   .reset:hover:not(:disabled){color:rgb(var(--c-text));background:rgb(var(--c-surface-hover) / 0.7)}
   .reset:disabled{opacity:.5}
   .row:disabled{opacity:.55;cursor:default}

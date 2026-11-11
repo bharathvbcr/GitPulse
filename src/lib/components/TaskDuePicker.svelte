@@ -277,7 +277,7 @@
 
 <style>
   .due{position:relative;min-width:0}
-  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:var(--text-xs);cursor:pointer;min-width:0}
+  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px 12px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-full);background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:var(--text-xs);cursor:pointer;min-width:0}
   .due-trigger:hover:not(:disabled){border-color:rgb(var(--c-accent))}
   .due-trigger:disabled{opacity:.5;cursor:not-allowed}
   /* Muted until there is a deadline, so "No due date" reads as the absence it
@@ -298,7 +298,7 @@
   .cal-title{font-size:var(--text-xs);font-weight:600}
   .cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
   .dow{text-align:center;font-size:var(--text-micro);color:rgb(var(--c-text-muted));padding-bottom:3px}
-  .day{border:1px solid transparent;background:none;border-radius:8px;padding:6px 0;font:inherit;font-size:var(--text-meta);color:rgb(var(--c-text));cursor:pointer}
+  .day{border:1px solid transparent;background:none;border-radius:var(--gp-r-sm);padding:6px 0;font:inherit;font-size:var(--text-meta);color:rgb(var(--c-text));cursor:pointer}
   /* Slash-alpha, not a flat token: an alpha-less fill is a slab that paints
      over the window material rather than reading as a recess in it. */
   .day:hover{background:rgb(var(--c-surface-hover) / 0.7)}

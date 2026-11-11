@@ -73,7 +73,7 @@
           {/each}
         </fieldset>
         <label class="reason">Why these are one task
-          <textarea class="gp-field" rows="2" maxlength="2000" bind:value={reason} disabled={busy} placeholder="Recorded in each task's history" data-testid="task-merge-reason"></textarea>
+          <textarea class="gp-field-multi" rows="2" maxlength="2000" bind:value={reason} disabled={busy} placeholder="Recorded in each task's history" data-testid="task-merge-reason"></textarea>
         </label>
         {#if error}<p class="error" role="alert">{error}</p>{/if}
       {:else}

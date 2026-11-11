@@ -199,7 +199,7 @@
   .field{display:flex;align-items:center;gap:6px;min-width:0}
   .field input{flex:1;min-width:0;font-size:var(--text-xs)}
   .is-compact .field input{font-size:var(--text-meta);padding:4px 7px}
-  .preview{display:flex;flex-direction:column;gap:5px;padding:7px 9px;border-radius:9px;border:1px solid var(--gp-edge)}
+  .preview{display:flex;flex-direction:column;gap:5px;padding:7px 9px;border-radius:var(--gp-r-md);border:1px solid var(--gp-edge)}
   .tokens{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:var(--text-meta);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;color:rgb(var(--c-text))}
   .summary{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:0}
   .chip-title{font-weight:600;color:rgb(var(--c-text));max-width:16rem}

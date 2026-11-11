@@ -677,7 +677,7 @@
                     <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
                   </label>
                   <label class:flash={flash.includes("description")}>Description
-                    <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+                    <textarea class="gp-field-multi" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
                   </label>
                   <div class="subtasks-section">
                     <div class="subtasks-head">
@@ -738,7 +738,7 @@
                       <span class="sr-only">Acceptance criteria</span>
                       <textarea
                         id="task-criteria-{id}"
-                        class="gp-field criteria-textarea"
+                        class="gp-field-multi criteria-textarea"
                         data-testid="task-criteria"
                         bind:value={criteria}
                         rows="3"
@@ -755,7 +755,7 @@
                     <button type="button" class="gp-btn" onclick={() => void copyLogs()} disabled={!hasLogs || copying || saving} aria-label="Copy raw logs">Copy logs</button>
                   </div>
                   <fieldset disabled={enhancementBusy}>
-                    <label>Raw logs<textarea class="gp-field logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
+                    <label>Raw logs<textarea class="gp-field-multi logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
                   </fieldset>
                   {#if logNotice}<p class="meta" role="status">{logNotice}</p>{/if}
                 </div>
@@ -868,16 +868,16 @@
   .pane[hidden]{display:none}
   .sheet-tabs{flex-shrink:0;margin:0 18px 8px;width:calc(100% - 36px)}
   .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
-  .tab-badge{margin-left:5px;padding:0 4px;border-radius:999px;font-size:var(--text-micro);line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
+  .tab-badge{margin-left:5px;padding:0 4px;border-radius:var(--gp-r-full);font-size:var(--text-micro);line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
   .tab-badge[data-asking]{background:rgb(var(--c-warn) / 0.2);color:rgb(var(--c-warn));font-weight:600}
-  .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:999px;background:rgb(var(--c-accent));display:inline-block}
+  .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:var(--gp-r-full);background:rgb(var(--c-accent));display:inline-block}
   .flash :is(input,textarea){animation:gp-task-flash var(--gp-dur-emphasis) ease-out 2}
   @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}
   @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
   /* `--gp-task-sheet-w` (app.css) is the one owner of this width: the strip
      of open-task tabs above the sheet reads the same token, and these used to
      be two literals that could drift apart. */
-  .task-editor{width:var(--gp-task-sheet-w);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
+  .task-editor{width:var(--gp-task-sheet-w);flex-shrink:0;min-width:0;min-height:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-lg);margin:0 8px 8px 0;overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
   /* The columns respond to the sheet, not the window: this is a dock whose
      width the reader's window only partly decides. `container-type` also
      makes this a containing block for fixed descendants, which is why the
@@ -890,7 +890,7 @@
   .step{min-width:0}
   .step-head{display:flex;align-items:center;gap:7px;margin:0 0 8px}
   .step-head h3{margin:0;font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
-  .step-n{flex-shrink:0;width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;font-size:var(--text-micro);font-weight:600;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.35)}
+  .step-n{flex-shrink:0;width:16px;height:16px;border-radius:var(--gp-r-full);display:inline-flex;align-items:center;justify-content:center;font-size:var(--text-micro);font-weight:600;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.35)}
   .step-rule{flex:1;height:1px;background:linear-gradient(to right,rgb(var(--c-border) / 0.55),transparent)}
   .assist-status{font-size:var(--text-micro);font-weight:500;color:rgb(var(--c-text-muted))}
   
@@ -907,7 +907,11 @@
   .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0}
   .field-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   .owner-field{margin-bottom:0;gap:0}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:var(--text-base);font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:var(--text-xs);min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:var(--text-base);font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:var(--text-xs);min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;min-width:0}textarea{resize:vertical}
+  /* Only a control that carries no field primitive is drawn here. This rule used
+     to restyle every input, so its scoped selector outranked gp-field and
+     gp-select and squared the editor's one-line pills into 8px rectangles. */
+  :where(input,textarea,select):not(.gp-field):not(.gp-field-multi):not(.gp-select){padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6);color:inherit}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
   .error{color:rgb(var(--c-danger))}p{font-size:var(--text-xs);margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
   .subtasks-section{display:flex;flex-direction:column;gap:8px;margin-bottom:13px}
   .subtasks-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -915,10 +919,10 @@
   .criteria-count{font-size:var(--text-meta);font-weight:400;color:rgb(var(--c-text-muted))}
   
   .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
-  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
+  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
   .subtask-bullet{color:rgb(var(--c-text-muted));font-size:var(--text-sm);line-height:1}
   .subtask-text{flex:1;min-width:0;word-break:break-word}
-  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:4px}
+  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs)}
   .subtask-remove:hover{color:rgb(var(--c-text))}
   .subtask-add-row{display:flex;gap:6px;align-items:center}
   .subtask-add-input{flex:1;font-size:var(--text-meta);padding:5px 8px}

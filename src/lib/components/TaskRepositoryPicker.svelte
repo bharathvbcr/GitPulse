@@ -289,7 +289,7 @@
   legend{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   /* A field, not a pill: it holds chips and sits in a column of inputs, so it
      takes the same geometry as the fields around it. */
-  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;border-radius:var(--gp-r-md);padding:6px 9px;min-height:38px;background:rgb(var(--c-bg) / 0.6)}
+  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;border-radius:var(--gp-r-full);padding:6px 12px;min-height:38px;background:rgb(var(--c-bg) / 0.6)}
   .repo-chips{display:flex;flex-wrap:wrap;gap:5px;flex:1;min-width:0;align-items:center}
   .repo-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* The primary is the one that decides where an agent runs, so it is the one
@@ -312,13 +312,13 @@
   /* Only the rows scroll. The summary and the filter above them are how the
      picker stays readable at any catalog size, so they must not scroll away. */
   .repo-list{max-height:220px;overflow:auto;margin:2px 0 4px}
-  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between;border-radius:8px;padding:3px 6px}
+  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between;border-radius:var(--gp-r-sm);padding:3px 6px}
   .repo-row:hover{background:rgb(var(--c-surface-hover) / 0.6)}
   .repo-row.linked{background:rgb(var(--c-accent) / 0.08)}
   .repo-row .check{flex:1;min-width:0;gap:7px}
   .repo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:var(--text-micro)}
-  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted));border:1px solid transparent;border-radius:999px;padding:1px 7px;cursor:pointer}
+  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted));border:1px solid transparent;border-radius:var(--gp-r-full);padding:1px 7px;cursor:pointer}
   .primary-pick:hover{border-color:var(--gp-edge)}
   .primary-pick input{width:auto}
   .repo-row.linked .primary-pick{color:rgb(var(--c-text))}

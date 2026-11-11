@@ -3247,7 +3247,7 @@
   .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
   .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
   .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
-  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:9px;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
+  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:var(--gp-r-sm);font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
   .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
   .navigator.nav-liquid .nav-scope.selected{background:transparent}
@@ -3291,7 +3291,7 @@
   .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
   .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs)}
-  .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
+  .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:var(--gp-r-md)}
   .undo-strip>span{flex:1;min-width:0;font-size:var(--text-xs)}
   button,input,select{font-size:var(--text-xs)}
   button:disabled{opacity:.5}
@@ -3314,7 +3314,7 @@
   .query-help dt{min-width:130px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   .query-help dd{margin:0;color:rgb(var(--c-text-muted))}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
-  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
+  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:var(--gp-r-xl);border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}
   /* Over its work-in-progress limit: the column says so in its border and its head, and still accepts work. */
   .column.over-limit,.column-head.over-limit{border-color:rgb(var(--c-danger))}
@@ -3322,7 +3322,7 @@
   /* Lanes: one head row for the columns, then a row of cells per lane. */
   .columns.laned{flex-direction:column;align-items:stretch;gap:10px}
   .lane-head,.lane-cells{display:grid;gap:8px}
-  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
+  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-lg)}
   .lane{flex-shrink:0;display:flex;flex-direction:column;gap:6px}
   .lane-title{margin:0;font-size:var(--text-meta);font-weight:600;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
   .lane-title span{font-weight:400;color:rgb(var(--c-text-muted))}
@@ -3333,7 +3333,7 @@
   .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px}
   .column-meta{display:flex;align-items:center;gap:4px;color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
-  .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:10px}
+  .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-md)}
   .card,.row{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;cursor:grab;touch-action:none;user-select:none}
   .row{cursor:pointer;display:grid;grid-template-columns:7rem minmax(0,1fr) auto auto auto;gap:8px;align-items:center}
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
@@ -3358,18 +3358,18 @@
      one column and must not be able to disagree about its width. */
   .task-tabs{position:relative;width:var(--gp-task-sheet-w);flex-shrink:0}
   .task-tab-strip{display:flex;align-items:stretch;gap:4px;min-width:0;overflow-x:auto;padding:6px 8px}
-  .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:8px;border:1px solid transparent;padding:0 2px 0 8px}
+  .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:var(--gp-r-full);border:1px solid transparent;padding:0 2px 0 8px}
   .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.35);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}
   .task-tab-shell.is-draft [role="tab"]{font-style:italic}
   .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:var(--text-meta)}
   .task-tab-shell .gp-icon-btn{flex-shrink:0}
   .tab-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-  .tab-pip{width:6px;height:6px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
+  .tab-pip{width:6px;height:6px;border-radius:var(--gp-r-full);flex-shrink:0;background:rgb(var(--c-accent))}
   .task-panel{flex:1;min-height:0;display:flex}
   .task-panel :global(.task-editor){flex:1}
   .card h3,.row-title{font-size:var(--text-xs);line-height:1.4;font-weight:500;margin:0;overflow-wrap:anywhere;min-width:0}
   .card-meta{display:flex;align-items:flex-start;gap:6px}
-  .pip{width:7px;height:7px;margin-top:4px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
+  .pip{width:7px;height:7px;margin-top:4px;border-radius:var(--gp-r-full);flex-shrink:0;background:rgb(var(--c-accent))}
   .pip[data-priority="0"]{background:rgb(var(--c-danger))}
   .insert{height:2px;margin:2px 4px;border-radius:2px;background:rgb(var(--c-accent))}
   .card-repos,.muted,.status{font-size:var(--text-micro);color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

@@ -236,7 +236,7 @@
             {#if mine}
               <div class="editor" data-testid="proposal-editor">
                 <label>Title <input class="gp-field" data-testid="proposal-edit-title" bind:value={mine.title} maxlength="300" /></label>
-                <label>Description <textarea class="gp-field" rows="5" bind:value={mine.description}></textarea></label>
+                <label>Description <textarea class="gp-field-multi" rows="5" bind:value={mine.description}></textarea></label>
                 <label>Priority
                   <select class="gp-select" bind:value={mine.priority}>
                     {#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}

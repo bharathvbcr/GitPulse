@@ -605,7 +605,7 @@
       {/if}
 
       <textarea
-        class="gp-field breakdown-area"
+        class="gp-field-multi breakdown-area"
         rows="2"
         data-testid="task-breakdown-input"
         aria-label="Break down into subtasks"

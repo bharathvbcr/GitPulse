@@ -837,7 +837,7 @@
   .said::after{content:"”"}
   .doing{color:rgb(var(--c-text-muted));font-size:var(--text-meta);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .changes{display:block;margin-top:3px;color:rgb(var(--c-text-muted))}
-  .dot{width:7px;height:7px;border-radius:999px;flex-shrink:0;transform:translateY(-1px);background:rgb(var(--c-text-muted)/.6)}
+  .dot{width:7px;height:7px;border-radius:var(--gp-r-full);flex-shrink:0;transform:translateY(-1px);background:rgb(var(--c-text-muted)/.6)}
   li[data-tone="active"] .dot{background:rgb(var(--c-ok))}
   li[data-tone="needs-you"] .dot{background:rgb(var(--c-warn));box-shadow:0 0 0 3px rgb(var(--c-warn)/.22)}
   li[data-tone="starting"] .dot,li[data-tone="signalled"] .dot{background:rgb(var(--c-warn))}

@@ -350,6 +350,13 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
     expect(svelte("<style>\n  .chip { a: b }\n</style>", 12)).toHaveLength(1);
   });
 
+  it("a textarea wearing the one-line pill gp-field is a widget dialect; gp-field-multi is the rounded rect", () => {
+    expect(svelte('<textarea class="gp-field w-full"></textarea>', 12)).toHaveLength(1);
+    expect(svelte('<textarea class={busy ? "gp-field opacity-50" : "gp-field"}></textarea>', 12)).toHaveLength(1);
+    expect(svelte('<textarea class="gp-field gp-field-multi"></textarea><textarea class="gp-field-multi"></textarea>', 12)).toEqual([]);
+    expect(svelte('<input class="gp-field" /><select class="gp-select"></select>', 12)).toEqual([]);
+  });
+
   it("hex needs a color position outside CSS: a whole quoted value or a [#hex] arbitrary value", () => {
     expect(svelte('<p title="Fixes #1234">x</p><button data-go={"#panel"}>y</button>', 4)).toEqual([]);
     expect(svelte("<p class=\"bg-[#abc]/50\"></p><i style={`color: ${c}`}></i>{x ? '#fff' : '#000'}", 4)).toHaveLength(3);

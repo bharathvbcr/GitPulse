@@ -128,7 +128,7 @@
   .field{position:relative;display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
   .field input{width:200px}
   .list{position:absolute;top:calc(100% + 4px);left:18px;min-width:220px;max-width:320px;margin:0;padding:4px;list-style:none}
-  .list li{display:flex;justify-content:space-between;gap:12px;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);cursor:pointer;color:rgb(var(--c-text))}
+  .list li{display:flex;justify-content:space-between;gap:12px;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);cursor:pointer;color:rgb(var(--c-text))}
   .list li:hover,.list li.active{background:rgb(var(--c-surface-hover) / 0.8)}
   .list li.active{outline:1px solid rgb(var(--c-accent))}
   .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

@@ -117,6 +117,8 @@
  *      chip, pill, toggle or tab (`.link`, `.btn`, `.chip-remove`, `.icon-button`,
  *      `.text-action`, `.close-alert`, `.nav-link`). Names inside `:not()` and
  *      `@keyframes` are skipped. Misses widgets named by an unrelated word.
+ *      Also a `<textarea>` wearing the one-line pill `gp-field` without
+ *      `gp-field-multi`: a box that grows taller is a rounded rect, never a pill.
  *   13 ellipsis: `...` (exactly three dots) in markup text, in the string
  *      attributes that carry display text (title, placeholder, aria-label,
  *      alt, label, ... and any prop of a component), and in JS string/template
@@ -231,7 +233,7 @@ export const APP_CSS = "src/app.css";
 /**
  * @typedef {{ start: number, end: number, text: string }} Lit
  * @typedef {{ raw: string, util: string, variants: string[], opacity: string | null, start: number }} Token
- * @typedef {{ tokens: Token[], views: Token[][], tag: number, exempt: boolean }} ClassSource
+ * @typedef {{ tokens: Token[], views: Token[][], tag: number, tagName?: string, exempt: boolean }} ClassSource
  * @typedef {{ selector: string, selStart: number, at: boolean, parent: CssRule | null, decls: Decl[], applies: string[], applyList: Lit[], applyStart: number }} CssRule
  * @typedef {{ prop: string, value: string, start: number, end: number, rule: CssRule }} Decl
  * @typedef {{ type: "text" | "expr", start: number, end: number }} Seg
@@ -817,7 +819,7 @@ export function buildModel(file, src) {
   for (const a of p.attrs) {
     if (a.name.startsWith("class:")) {
       const tokens = tokenize(a.name.slice(6).replace(/\|.*$/, ""), a.nameStart + 6);
-      addSource({ tokens, views: [tokens], tag: a.tag, exempt: false });
+      addSource({ tokens, views: [tokens], tag: a.tag, tagName: a.tagName, exempt: false });
       continue;
     }
     if (!CLASS_ATTR.test(a.name)) continue;
@@ -835,7 +837,7 @@ export function buildModel(file, src) {
     }
     const tokens = [...fixed, ...lits.flat()];
     const views = [fixed, ...lits.map((l) => [...fixed, ...l])];
-    addSource({ tokens, views, tag: a.tag, exempt: false });
+    addSource({ tokens, views, tag: a.tag, tagName: a.tagName, exempt: false });
   }
   for (const s of scriptJs.strings) if (s.text.trim() !== "") addSource(stringSource(s));
   for (const list of byTag.values()) {
@@ -1631,6 +1633,16 @@ export const RULES = [
         const sel = r.selector.replace(/:not\((?:[^()]|\([^)]*\))*\)/g, (s) => " ".repeat(s.length));
         for (const hit of sel.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)) {
           if (!hit[1].startsWith("gp-") && isWidgetClass(hit[1])) report(r.selStart + (hit.index ?? 0), `.${hit[1]}: scoped widget dialect, use the owner in UI_RULES section 2`);
+        }
+      }
+      for (const cs of m.classSources) {
+        if (cs.tagName !== "textarea") continue;
+        for (const view of cs.views) {
+          const pill = view.find((t) => t.util === "gp-field");
+          if (pill && !view.some((t) => t.util === "gp-field-multi")) {
+            report(pill.start, "gp-field on a <textarea>: a field that grows taller is gp-field-multi, the rounded rect, not the one-line pill");
+            break;
+          }
         }
       }
     },

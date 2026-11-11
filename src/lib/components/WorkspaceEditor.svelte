@@ -72,7 +72,7 @@
     <div class="sheet-body">
     <fieldset disabled={saving || adding || confirming || pending !== null}>
       <label>Name<input class="gp-field" bind:value={draft.name} required maxlength="300" /></label>
-      <label>Description<textarea class="gp-field" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
+      <label>Description<textarea class="gp-field-multi" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
       <label>Icon<input class="gp-field" bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
       <label>Color<input class="gp-field" bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
       <SettingToggle label="Pinned" description="Keep this workspace at the top of the navigator." checked={draft.pinned} onchange={(next) => { draft.pinned = next; }} />

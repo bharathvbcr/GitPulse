@@ -123,7 +123,7 @@
 <style>
   .panel{max-height:min(70vh,32rem);overflow:hidden auto}
   .view-row{display:flex;align-items:center;gap:4px}
-  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:5px;font-size:var(--text-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .apply:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .apply[aria-pressed="true"]{color:rgb(var(--c-accent));font-weight:600}
   .apply:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}

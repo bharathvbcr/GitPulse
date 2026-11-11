@@ -69,7 +69,7 @@
   {:else}
     <div class="text-meta text-textMuted font-mono">{headBranch} → <input class="gp-field inline-block w-40 py-0.5! text-meta!" aria-label="Base branch" bind:value={base} disabled={busy} /></div>
     <input class="gp-field w-full" placeholder="Title" aria-label="Pull request title" bind:value={title} disabled={busy} />
-    <textarea class="gp-field w-full min-h-20 font-sans" placeholder="Description" aria-label="Pull request description" bind:value={body} disabled={busy}></textarea>
+    <textarea class="gp-field-multi w-full min-h-20 font-sans" placeholder="Description" aria-label="Pull request description" bind:value={body} disabled={busy}></textarea>
     <div class="flex items-center gap-3">
       <label class="flex items-center gap-1.5 text-meta text-textMuted"><input type="checkbox" class="gp-check" bind:checked={draft} disabled={busy} /> draft</label>
       <span class="flex-1"></span>

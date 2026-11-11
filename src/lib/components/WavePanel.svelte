@@ -157,7 +157,7 @@
   .members{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
   .members li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:var(--text-xs)}
   .title{font-weight:500;overflow-wrap:anywhere}
-  .phase{font-size:var(--text-micro);padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent)}
+  .phase{font-size:var(--text-micro);padding:1px 5px;border-radius:var(--gp-r-xs);background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent)}
   li[data-phase="held"] .phase{background:rgb(var(--c-danger) / .16);color:rgb(var(--c-danger))}
   .detail{font-size:var(--text-meta);color:rgb(var(--c-text-muted));overflow-wrap:anywhere}
 </style>

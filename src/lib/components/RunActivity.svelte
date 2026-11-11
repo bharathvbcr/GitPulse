@@ -150,7 +150,7 @@
   summary:focus-visible{outline:2px solid rgb(var(--c-accent)/.65);outline-offset:2px}
   .spent{font-weight:500;color:rgb(var(--c-text-muted))}
   .meta{color:rgb(var(--c-text-muted));font-size:var(--text-meta);margin:6px 0 0}
-  .bar{display:flex;height:8px;margin-top:8px;border-radius:4px;overflow:hidden;background:rgb(var(--c-text-muted)/.12)}
+  .bar{display:flex;height:8px;margin-top:8px;border-radius:var(--gp-r-xs);overflow:hidden;background:rgb(var(--c-text-muted)/.12)}
   .bar span,.swatch{background:rgb(var(--c-text-muted)/.5)}
   .bar [data-state="working"],li[data-state="working"] .swatch{background:rgb(var(--c-ok))}
   .bar [data-state="waiting_tool"],li[data-state="waiting_tool"] .swatch{background:rgb(var(--c-accent))}

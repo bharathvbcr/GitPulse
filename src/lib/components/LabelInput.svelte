@@ -73,7 +73,7 @@
 </div>
 
 <style>
-  .label-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;padding:4px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6)}
+  .label-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;padding:4px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6)}
   .label-input.disabled{opacity:.5}
   .draft{flex:1;min-width:7rem;border:0 !important;background:transparent !important;padding:4px !important;margin:0}
 </style>
