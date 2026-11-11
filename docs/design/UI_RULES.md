@@ -72,7 +72,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 | Pick items from a list, or confirm a statement before an action | `Checkbox.svelte` (native checkbox, `gp-check` look; its unchecked edge is `--c-text-faint`, not `--gp-edge`, because a control edge needs 3:1 and a separator hairline doesn't reach it) | a `Toggle` used as a row selector, a raw unstyled `type="checkbox"` |
 | Choice of 2–5 | `SettingSegment` / `gp-segmented` + `gp-seg-btn` + `gp-liquid-tabs` on tablists | hand-rolled segmented thumbs |
 | Range | `Slider.svelte` (the existing range styles) | custom slider |
-| Menu / popover | `gp-menu`, `gp-menu-item`, `gp-menu-sep`, positioned by `src/lib/ui/popover.ts` | a `gp-card` used as a menu |
+| Menu / popover | `gp-menu`, `gp-menu-item`, `gp-menu-sep`, positioned by `src/lib/ui/popover.ts`, which also owns the exit: put `out:popoverExit` beside `use:popover` | a `gp-card` used as a menu |
 | Dialog / sheet | `gp-scrim` + `gp-card` + `focusTrap` + `backdropFade`/`cardScale` in **and** out (→ `Dialog.svelte`) | a dialog without an outro, `rounded-3xl` |
 | Toast | `ToastContainer` on `LAYERS.TOAST` | literal `fly`/`fade` timings |
 | Panel header | `gp-header` (title and actions slots, tonal step) | `border-b` headers, hand-picked `px-3 py-2` |

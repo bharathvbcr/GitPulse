@@ -197,7 +197,7 @@ As built in Wave 1 lane A: `EXIT_MS` caps every exit at `dur-fast / 2` = 70 ms, 
 ### 8.4 Named choreographies
 - **View switch** (`.gp-view`): fade+6px rise, 220/`spatial` [today 180/260 verified app.css:1487–1506]; the liquid selection pill crossfade stays 280 (Svelte crossfade, transform/opacity).
 - **Section switch**: content crossfade 140 only; no translate (same subject, different lens: §viewRegistry doc).
-- **Menu/popover** (`.gp-pop`): opacity + 8px + scale .97 → 1, 220/`spatial-fast`; exit 70.
+- **Menu/popover** (`.gp-pop`): opacity + 8px + scale .97 → 1, 220/`spatial-fast`; exit 70. The exit is `popoverExit`, exported by `ui/popover.ts`, as `out:popoverExit` on the element that carries `use:popover` (an action cannot hold a node for an animation, so the template must say it). `popover.exit.contract.test.ts` fails a placed popover without it; the sidebar overlay, the terminal dock and the task rail keep their own exits and are named there.
 - **Toast**: enter from `translateY(8px)`, 220; exit 140 opacity.
 - **Loading → content hand-off**: skeleton holds ≥ 400 ms once shown (no flash), content enters via `.gp-view` fade; skeleton exits at 70 ms. Skeleton appears only after a 300 ms delay (Doherty/0.1–1 s band [brief]).
 - **Splash/boot** (§12): a static plate with the mark and the brand gradient on the `#app` background *before* JS (so cold start is never an empty `#app`), then a 480 ms opacity hand-off to the shell.

@@ -439,6 +439,41 @@
               $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
               await sleepUntil(() => !!$('[role="dialog"]'), 3000);
             }
+            // `shortcuts-end` scrolls the open sheet to its last row, to see that the
+            // end of the list is not cut off.
+            if (words.includes("shortcuts-end")) {
+              $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+              await sleepUntil(() => !!$('[role="dialog"]'), 3000);
+              await wait(400);
+              const scroller = $$("*", $('[role="dialog"]')).find((el) => el.scrollHeight > el.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(el).overflowY));
+              if (scroller) scroller.scrollTop = scroller.scrollHeight;
+            }
+            // The panels' own modes: `rail` collapses the docked sidebar to its rail,
+            // `floating` opens it as an overlay panel, `dock` opens the terminal dock.
+            if (words.includes("rail")) (await import("../src/lib/sidebar/layoutStore.ts")).layoutStore.toggleCollapsed();
+            if (words.includes("floating")) (await import("../src/lib/ui/panelMode.ts")).panelModes.set("sidebar", "overlay");
+            if (words.includes("dock")) { repoStore.setTerminalOpen(true); await sleepUntil(() => $("[data-terminal-dock]") !== null, 5000); }
+            // `popover-exit` opens the language popover, closes it, and stops its
+            // exit half way, so the picture is of a popover that is leaving.
+            if (words.includes("popover-exit")) {
+              langTrigger()?.click();
+              await sleepUntil(() => !!$("[data-language-panel]"), 3000);
+              await wait(300);
+              const leaving = $("[data-language-panel]");
+              if (leaving) {
+                const asked = [];
+                const animate = leaving.animate.bind(leaving);
+                leaving.animate = (keyframes, options) => { const a = animate(keyframes, options); asked.push(a); return a; };
+                langTrigger()?.click();
+                await sleepUntil(() => asked.some((a) => (a.effect?.getComputedTiming().duration ?? 0) > 0), 3000);
+                const exit = asked.find((a) => (a.effect?.getComputedTiming().duration ?? 0) > 0);
+                if (exit) { exit.pause(); exit.currentTime = (exit.effect.getComputedTiming().duration ?? 0) / 2; }
+                document.documentElement.dataset.gpShotLeaving = exit ? `paused at ${exit.currentTime} of ${exit.effect.getComputedTiming().duration} ms` : "no exit animation found";
+              } else document.documentElement.dataset.gpShotLeaving = "no popover found";
+              $("#result").textContent = `shot ready: ${shot}`;
+              document.documentElement.dataset.gpShot = "ready";
+              return;
+            }
             // `settings` opens Settings (`settings-layout` on its Layout panel);
             // `icons` sets Header button labels to Icons only first.
             if (words.includes("icons")) interfaceStore.setHeaderLabels("icons");
@@ -577,6 +612,9 @@
           check("branches: the Local chip is no longer selected, All is", () =>
             chip("All").getAttribute("aria-pressed") === "true" && chip("Local").getAttribute("aria-pressed") === "false");
           check("branches: the half-typed new branch and its form are gone", () => !createInput());
+          // Menus and panels leave with a 70 ms exit (popoverExit), so alpha's three are
+          // gone a moment after the switch closes them, not in the same frame.
+          await sleepUntil(() => !contextMenu() && !agentPanel() && !langPanel(), 3000);
           check("branches: the context menu opened on alpha's branch is gone", () => !contextMenu());
           check("branches: lists beta's branches and none of alpha's", () =>
             text(branchList()).includes("beta-only") && !text(branchList()).includes("alpha-only"));

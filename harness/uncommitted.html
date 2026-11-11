@@ -177,6 +177,8 @@ async function agentCommitMenuChecks(){
  await openAgentMenu(first);
  pointerDown(second.trigger);second.trigger.click();
  await until(()=>agentPanel(second.uid),"second agent panel");await frames();
+ // The first menu leaves with its 70 ms exit (popoverExit), so it is gone a moment after it is closed.
+ await until(()=>!agentPanel(first.uid),"first agent panel closed");
  check("opening another mount's menu closes the first",!agentPanel(first.uid)&&agentPanels()===1);
  await closeAgentMenu(second);
 
@@ -201,6 +203,9 @@ async function agentCommitMenuChecks(){
  try{
   for(let i=0;i<60;i++){const entry=expanded[i%expanded.length];pointerDown(entry.trigger);entry.trigger.click();if(i%7===0)await tick();}
   await frames();
+  // Panels that were closed are still on screen for their 70 ms exit (popoverExit); a stack
+  // is panels that stay, so wait for the exits to end and then count what is left.
+  for(let i=0;i<60&&agentPanels()>1;i++){await tick();await step();}
   check("rapid toggling never stacks panels",agentPanels()<=1);
   for(const entry of expanded)await closeAgentMenu(entry);
   await frames();
