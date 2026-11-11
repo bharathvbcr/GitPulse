@@ -133,7 +133,7 @@ describe("BranchList virtual window tail guarantee", () => {
     expect(source).toContain("let rowOffsets = $derived(buildRowOffsets(rowHeights));");
     expect(source).toContain("totalRowHeight(rowOffsets)");
     expect(source).toContain("rowTop(rowOffsets, win.start)");
-    expect(source).toContain("scrollOffsetToReveal(rowOffsets, index, scrollTop, viewportHeight)");
+    expect(source).toContain("scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight)");
     expect(source).toContain("scrollOffsetToCenter(rowOffsets, idx, viewportHeight)");
     // No surviving uniform-height arithmetic.
     expect(source).not.toMatch(/idx \* [A-Z_]*HEIGHT/);
@@ -486,5 +486,16 @@ describe("BranchList mutation contract", () => {
     expect(body.match(/offerBranchUndo\(/g)).toHaveLength(2);
     expect(body).not.toContain("repoStore.createBranch(");
     expect(body).not.toContain('toastStore.success(`Restored');
+  });
+});
+
+describe("BranchList keyboard reveal", () => {
+  it("measures the reveal against the scroller itself, not the scroll-event state", () => {
+    // `scrollTop` state only follows scroll events; under load a late event let
+    // ArrowUp compute from a stale offset and leave the row clipped at the edge.
+    const body = functionBody(source, "ensureVisible");
+    expect(body).toContain("containerEl.scrollTop");
+    expect(body).toContain("containerEl.clientHeight");
+    expect(body).not.toContain("viewportHeight");
   });
 });

@@ -366,12 +366,13 @@ if(params.has("check")) {
     }
     check(`ArrowDown keeps the selected row rendered and fully in view across mixed heights${revealed===38?"":` (${revealed}/38 in view, ${scroller.scrollHeight}/${scroller.clientHeight} scroll/client; ${missed.join("; ")})`}`,
       revealed===38 && sawBranchRow > 10 && scroller.scrollHeight > scroller.clientHeight * 2);
-    let upRevealed = 0;
+    let upRevealed = 0;const upMissed = [];
     for (let i = 0; i < 20; i++) {
       tree.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowUp",bubbles:true,cancelable:true}));
       if (await arrives()) upRevealed++;
+      else {const s = selectedRow(), sr = scroller.getBoundingClientRect(), er = s?.getBoundingClientRect(); upMissed.push(`#${i}: ${s ? `${s.textContent.trim().slice(0,20)} ${Math.round(er.top-sr.top)}..${Math.round(er.bottom-sr.top)} of ${Math.round(sr.height)}, scrollTop ${Math.round(scroller.scrollTop)}` : "none rendered"}`);}
     }
-    check(`ArrowUp reveals rows on the way back as well${upRevealed===20?"":` (${upRevealed}/20 in view)`}`,upRevealed===20);
+    check(`ArrowUp reveals rows on the way back as well${upRevealed===20?"":` (${upRevealed}/20 in view; ${upMissed.join("; ")})`}`,upRevealed===20);
     // Locate: the checked-out branch is mid-list now, because a row near
     // either end cannot be placed where the gesture wants it and the clamp
     // there would hide a wrong offset.

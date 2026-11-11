@@ -443,7 +443,11 @@
     // Reads the same offsets the window does, so a list of mixed row heights
     // reveals the row the reader actually selected. null means "already fully
     // visible" — distinct from "scroll to 0", which is why it is not a number.
-    const top = scrollOffsetToReveal(rowOffsets, index, scrollTop, viewportHeight);
+    // The scroller's own position, not the `scrollTop` state: that state only
+    // follows `scroll` events, which a busy frame delivers late, so a second
+    // arrow key pressed before the first scroll's event landed was measured
+    // against a stale offset and left its row clipped at the edge.
+    const top = scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight);
     if (top !== null) containerEl.scrollTo({ top });
   }
 
