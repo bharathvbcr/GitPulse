@@ -1061,7 +1061,7 @@
 
   .overview-metric-value {
     margin: 4px 0 3px;
-    font-size: var(--text-2xl);
+    font-size: 1.5rem;
     font-weight: 600;
     line-height: 1.15;
     letter-spacing: -0.04em;

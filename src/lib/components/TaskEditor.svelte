@@ -906,8 +906,8 @@
   .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0}
   .field-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   .owner-field{margin-bottom:0;gap:0}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:1rem;font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:var(--text-xs);min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
-  .error{color:rgb(var(--c-danger))}p{font-size:var(--text-xs);margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:1rem;font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:0.75rem;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
+  .error{color:rgb(var(--c-danger))}p{font-size:0.75rem;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
   .subtasks-section{display:flex;flex-direction:column;gap:8px;margin-bottom:13px}
   .subtasks-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
   .subtasks-head label{margin-bottom:0;font-weight:500}
@@ -915,7 +915,7 @@
   
   .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
   .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:.6875rem}
-  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:var(--text-sm);line-height:1}
+  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:0.875rem;line-height:1}
   .subtask-text{flex:1;min-width:0;word-break:break-word}
   .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:4px}
   .subtask-remove:hover{color:rgb(var(--c-text))}

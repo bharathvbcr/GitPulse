@@ -356,7 +356,7 @@
      window so short that the panel's own chrome exceeds the cap: it degrades
      to a scrolling panel rather than clipping the actions off. In normal use
      `.entries` absorbs the shrink and this never engages. */
-  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:var(--text-xs);color:rgb(var(--c-text))}
+  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:0.75rem;color:rgb(var(--c-text))}
   /* Every row but the list keeps its natural height and never shrinks, so
      the whole of an over-tall panel is taken out of the row list and the
      action bar cannot be the part that goes off screen. */

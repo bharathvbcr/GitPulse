@@ -149,13 +149,13 @@
 <style>
   .wave{margin:8px 14px 0;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
   .head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  h2{font-size:var(--text-xs);font-weight:600;margin:0;flex:1}
+  h2{font-size:0.75rem;font-weight:600;margin:0;flex:1}
   label{font-size:var(--text-meta);display:flex;align-items:center;gap:6px}
   input{width:52px}
   .repo{font-weight:400;color:rgb(var(--c-text-muted))}
   .note{font-size:var(--text-meta);margin:0;color:rgb(var(--c-text-muted))}
   .members{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
-  .members li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:var(--text-xs)}
+  .members li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:0.75rem}
   .title{font-weight:500;overflow-wrap:anywhere}
   .phase{font-size:var(--text-micro);padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent)}
   li[data-phase="held"] .phase{background:rgb(var(--c-danger) / .16);color:rgb(var(--c-danger))}
