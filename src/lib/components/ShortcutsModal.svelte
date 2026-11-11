@@ -68,7 +68,7 @@
         { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
         { keys: ["⌘", "⇧", "A"], description: "Open the Agents plane" },
         { keys: ["Ctrl", "`"], description: "Toggle the terminal dock" },
-        { keys: ["⌘", "F"], description: "Search commits — switches to History from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
+        { keys: ["⌘", "F"], description: "Search commits (switches to History). In Code it searches the open file; in History → Diff, the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
         { keys: ["⌘", "+"], description: "Zoom in — scales the whole interface" },
         { keys: ["⌘", "-"], description: "Zoom out — scales the whole interface" },
@@ -250,7 +250,7 @@
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {#each category.shortcuts as item}
                 <div class="flex items-center justify-between gap-3 p-2 rounded-xl bg-background/50 border border-edge hover:border-border transition-colors">
-                  <span class="text-xs text-textMuted leading-tight truncate">{item.description}</span>
+                  <span data-shortcut-description class="min-w-0 text-xs text-textMuted leading-snug text-pretty">{item.description}</span>
                   <div class="flex items-center gap-1 shrink-0">
                     {#each item.keys as key}
                       <kbd class="gp-keycap text-meta font-sans font-medium px-1.5 py-0.5">{key}</kbd>

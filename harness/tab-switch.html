@@ -526,6 +526,26 @@
           check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$(GUIDE_ART) && $$(`${GUIDE_ART} *`).length > 3);
           guideTab?.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
 
+          // The shortcuts sheet exists to say what each chord does, so a
+          // description that is clipped (one line, ellipsis) defeats it. At the
+          // regression viewport every description must be drawn in full: its
+          // box is not scrolled, and its text lies inside its own box.
+          $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+          await sleepUntil(() => $$("[data-shortcut-description]").length > 20, 3000);
+          const descriptions = $$("[data-shortcut-description]");
+          const clippedDescriptions = descriptions.filter((el) => {
+            const box = el.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const drawn = range.getBoundingClientRect();
+            return el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight + 1
+              || drawn.right > box.right + 0.5 || drawn.bottom > box.bottom + 0.5;
+          }).map((el) => text(el).slice(0, 48));
+          check(`the shortcuts sheet draws every description in full at ${window.innerWidth}px${clippedDescriptions.length ? ` (clipped: ${clippedDescriptions.join(" | ")})` : ""}`, () =>
+            window.innerWidth >= 1280 && descriptions.length > 20 && clippedDescriptions.length === 0);
+          $$("button").find((b) => text(b) === "Done")?.click();
+          await sleepUntil(() => !$('[role="dialog"]'), 3000);
+
           // ---- 4. an answer in flight for the repository left does not land -----
           const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
           generateBtn().click();
