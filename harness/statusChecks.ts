@@ -224,7 +224,7 @@ export async function checkStatusPopover() {
   try {
     await settle();
     check("first glance has three equal metric cards", metrics().length === 3 && new Set(metrics().map(m => m.offsetWidth)).size === 1);
-    check("numbers use the reference's large readable scale", getComputedStyle(element(".metric strong")).fontSize === "27px");
+    check("numbers use the top step of the type scale (text-lg, 18px)", getComputedStyle(element(".metric strong")).fontSize === "18px");
     check("the preview renders an actual backdrop blur", getComputedStyle(element(".panel")).getPropertyValue("backdrop-filter").includes("blur(34px)"));
     check("the panel leaves room for the blurred backdrop", getComputedStyle(element(".panel")).backgroundColor === "rgba(250, 251, 252, 0.8)");
     check("light glass text and accents retain contrast over black and white backdrops", contrastOnGlass());
