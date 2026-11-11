@@ -888,7 +888,7 @@
               {#if row.verdicts.unparsed > 0}
                 <span
                   class="rounded bg-danger/15 px-1.5 py-0.5 text-micro font-medium text-danger"
-                  title="Verdicts this build could not read. Not counted as allowed."
+                  title="Verdicts this build couldn't read. Not counted as allowed."
                 >
                   unreadable {row.verdicts.unparsed}
                 </span>
