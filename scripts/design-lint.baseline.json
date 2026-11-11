@@ -1,32 +1,22 @@
 {
   "schema": 1,
-  "commit": "bc9ddc05b2bf69d7215fa58c25edb55aee23c048",
+  "commit": "70e5f56e4c5369307eac9dab91714e4824b2b358",
   "retake": "Taken at the commit above. It must be retaken at the overhaul BASE_SHA from a clean checkout (`node scripts/design-lint.mjs --baseline`), so another session's half-finished work never becomes the floor.",
   "rules": {
     "1": {
       "name": "type-scale",
-      "total": 92,
+      "total": 55,
       "files": {
         "src/app.css": 9,
-        "src/lib/components/AttentionInbox.svelte": 1,
         "src/lib/components/AutomaticEnhancements.svelte": 1,
         "src/lib/components/CommandPalette.svelte": 17,
         "src/lib/components/NativeNotificationBridge.svelte": 2,
         "src/lib/components/NativeNotificationSettings.svelte": 1,
-        "src/lib/components/ScanProposals.svelte": 6,
         "src/lib/components/SessionNotificationBridge.svelte": 1,
         "src/lib/components/TaskActionDialog.svelte": 1,
-        "src/lib/components/TaskArchive.svelte": 1,
-        "src/lib/components/TaskDuePicker.svelte": 4,
-        "src/lib/components/TaskEditor.svelte": 9,
         "src/lib/components/TaskHandoffForm.svelte": 1,
         "src/lib/components/TaskHandoffSheet.svelte": 1,
         "src/lib/components/TaskMergeDialog.svelte": 1,
-        "src/lib/components/TaskSavedViews.svelte": 3,
-        "src/lib/components/TaskViewMenu.svelte": 5,
-        "src/lib/components/WavePanel.svelte": 6,
-        "src/lib/components/WorkView.svelte": 1,
-        "src/lib/components/WorkspaceEditor.svelte": 1,
         "src/lib/components/onboarding/ProductTour.svelte": 1,
         "src/lib/coverage/fileCoverage.ts": 1,
         "src/lib/desktop/StatusPopover.svelte": 18
@@ -181,7 +171,7 @@
     },
     "17": {
       "name": "undefined-gp-class",
-      "total": 21,
+      "total": 20,
       "files": {
         "src/App.svelte": 1,
         "src/lib/components/AgentDefaultsSettings.svelte": 1,
@@ -191,7 +181,6 @@
         "src/lib/components/RepoMapPanel.svelte": 1,
         "src/lib/components/RepoPanel.svelte": 7,
         "src/lib/components/RepoTabBar.svelte": 1,
-        "src/lib/components/TaskArchive.svelte": 1,
         "src/lib/components/ViewBar.svelte": 1,
         "src/lib/components/ViewSectionTabs.svelte": 2,
         "src/lib/components/ViewTabBar.svelte": 1
