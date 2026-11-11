@@ -62,7 +62,7 @@ describe("product walkthrough lifecycle", () => {
     expect(get(tour).error).toContain("could not be loaded");
     expect(tour.dismiss()).toBe(false);
     expect(get(tour).open).toBe(true);
-    expect(get(tour).error).toContain("could not be saved");
+    expect(get(tour).error).toContain("couldn't be saved");
     tour.closeForSession();
     expect(get(tour).open).toBe(false);
   });
