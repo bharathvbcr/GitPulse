@@ -34,6 +34,7 @@
   import { onMount } from "svelte";
   import { ChevronDown, FolderGit2, Star } from "@lucide/svelte";
   import { portal } from "../dom/portal";
+  import Checkbox from "./Checkbox.svelte";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
   import { groupRows, summaryLine, outsiderLine, type LinkSummary, type PickerRow, type TriggerChip } from "../workbench/taskRepositories";
@@ -195,7 +196,7 @@
   {/each}
   {#if workspace}
     {#if workspace.error}
-      <p class="repo-note" role="status">Could not read {workspace.name}'s repositories: {workspace.error}</p>
+      <p class="repo-note" role="status">Couldn't read {workspace.name}'s repositories: {workspace.error}</p>
     {:else if summary.outsiders.length}
       <p class="repo-note">
         {outsiderLine(summary.outsiders, workspace.name)}
@@ -239,7 +240,7 @@
         {#each group.rows as row (row.id)}
           <div class="repo-row" class:linked={row.linked}>
             <label class="check">
-              <input type="checkbox" class="gp-check" checked={row.linked} onchange={(e) => onToggle(row.id, e.currentTarget.checked)} />
+              <Checkbox ariaLabel={row.name} checked={row.linked} onchange={(next) => onToggle(row.id, next)} />
               <span class="repo-name">{row.name}</span>
               <!-- Only under "Linked", where the group heading does not
                    already say it. A linked repository that is *not* a member
@@ -274,7 +275,7 @@
       <small>Open in GitPulse</small>
       {#each addable as openTab (openTab.path)}
         <label class="check" title={openTab.path}>
-          <input type="checkbox" class="gp-check" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; onAddPaths([openTab.path]); }} />
+          <Checkbox ariaLabel={`Add ${openTab.label}`} checked={false} disabled={adding} onchange={() => onAddPaths([openTab.path])} />
           {openTab.label}<span class="open-mark">Open</span>
         </label>
       {/each}
@@ -285,7 +286,7 @@
 
 <style>
   .repositories{border:0;padding:0;min-width:0;margin:0 0 13px}
-  legend{color:rgb(var(--c-text-muted));font-size:.6875rem}
+  legend{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   /* A field, not a pill: it holds chips and sits in a column of inputs, so it
      takes the same geometry as the fields around it. */
   .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;border-radius:var(--gp-r-md);padding:6px 9px;min-height:38px;background:rgb(var(--c-bg) / 0.6)}
@@ -293,19 +294,19 @@
   .repo-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* The primary is the one that decides where an agent runs, so it is the one
      chip that is coloured rather than merely present. */
-  .repo-more{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:.6875rem}
+  .repo-more{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   .repo-trigger-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* No repository linked is not a neutral state — it is the one thing that
      stops the task saving, so the trigger says so at full contrast. */
   .repo-trigger.needs{border-color:rgb(var(--c-accent))}
   .repo-trigger.needs .repo-trigger-label{color:rgb(var(--c-text))}
-  .repo-summary-line{margin:5px 0 0;font-size:.6875rem;color:rgb(var(--c-text-muted))}
-  .repo-group{margin:7px 0 2px;padding:0 6px;font-size:.6875rem;font-weight:500;color:rgb(var(--c-text-muted))}
+  .repo-summary-line{margin:5px 0 0;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .repo-group{margin:7px 0 2px;padding:0 6px;font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
   .repo-group:first-child{margin-top:2px}
-  .repo-unknown{display:block;color:rgb(var(--c-text-muted));font-size:.6875rem;margin-top:4px}
-  .repo-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;font-size:.75rem;color:rgb(var(--c-text-muted))}
-  .repo-popup{width:min(360px,92vw);padding:10px;font-size:.75rem;color:rgb(var(--c-text))}
-  .repo-summary{margin:0 0 6px;font-size:.6875rem;color:rgb(var(--c-text-muted))}
+  .repo-unknown{display:block;color:rgb(var(--c-text-muted));font-size:var(--text-meta);margin-top:4px}
+  .repo-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;font-size:var(--text-xs);color:rgb(var(--c-text-muted))}
+  .repo-popup{width:min(360px,92vw);padding:10px;font-size:var(--text-xs);color:rgb(var(--c-text))}
+  .repo-summary{margin:0 0 6px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .repo-summary.needs{color:rgb(var(--c-text))}
   .repo-filter{margin-bottom:6px;width:100%}
   /* Only the rows scroll. The summary and the filter above them are how the
@@ -316,8 +317,8 @@
   .repo-row.linked{background:rgb(var(--c-accent) / 0.08)}
   .repo-row .check{flex:1;min-width:0;gap:7px}
   .repo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:.625rem}
-  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:.625rem;color:rgb(var(--c-text-muted));border:1px solid transparent;border-radius:999px;padding:1px 7px;cursor:pointer}
+  .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:var(--text-micro)}
+  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted));border:1px solid transparent;border-radius:999px;padding:1px 7px;cursor:pointer}
   .primary-pick:hover{border-color:var(--gp-edge)}
   .primary-pick input{width:auto}
   .repo-row.linked .primary-pick{color:rgb(var(--c-text))}
@@ -327,8 +328,7 @@
   .primary-pick.is-primary{color:rgb(var(--c-accent));border-color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.12)}
   .repo-empty{margin:6px 0;color:rgb(var(--c-text-muted))}
   .check{display:flex;flex-direction:row;align-items:center;margin:5px 0;gap:7px}
-  .check input{width:auto}
-  .open-mark{color:rgb(var(--c-text-muted));font-size:.625rem;margin-left:6px}
-  small{color:rgb(var(--c-text-muted));font-size:.6875rem}
+  .open-mark{color:rgb(var(--c-text-muted));font-size:var(--text-micro);margin-left:6px}
+  small{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   input[type="search"]{min-width:0}
 </style>

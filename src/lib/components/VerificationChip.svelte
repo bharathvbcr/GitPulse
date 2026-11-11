@@ -48,7 +48,7 @@
 
 <style>
   .verdict{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem}
-  .detail{flex-basis:100%;font-size:.8rem}
+  .detail{flex-basis:100%;font-size:var(--text-xs)}
   .criteria,.findings{margin:.25rem 0 0 1rem;padding:0}
   .unchecked{margin:.4rem 0 0;font-weight:600}
 </style>

@@ -56,7 +56,7 @@ describe("WorkView", () => {
 
   it("gives both could-not-check banners a Rescan that is the header's own refresh", () => {
     const banner = (needle: string) => source.slice(source.indexOf(needle), source.indexOf("</div>", source.indexOf(needle)));
-    for (const needle of ["Could not check overlapping files", "<span>{degraded}</span>"]) {
+    for (const needle of ["Couldn't check overlapping files", "<span>{degraded}</span>"]) {
       const body = banner(needle);
       expect(body).toContain(">Rescan</button>");
       expect(body).toContain("void refresh($repoStore.currentPath)");
@@ -139,7 +139,7 @@ describe("WorkView", () => {
     // with nothing parked in it, which is the one thing this screen may not
     // let happen.
     expect(source).toContain("$repoStore.operation.probeFailed");
-    expect(source).toContain("Could not check for a parked merge or rebase here");
+    expect(source).toContain("Couldn't check for a parked merge or rebase here");
   });
 
   it("surfaces a parked operation, which is the one thing that needs a person", () => {

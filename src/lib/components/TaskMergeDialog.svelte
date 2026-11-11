@@ -100,8 +100,8 @@
   .merge-backdrop{position:fixed;inset:0;display:grid;place-items:center;padding:20px;color:rgb(var(--c-text))}
   .merge-dialog{width:min(520px,100%);max-height:calc(100dvh - 40px);display:flex;flex-direction:column;border-radius:var(--gp-r-xl);overflow:hidden}
   header,footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;flex-shrink:0}
-  h2{font-size:0.9375rem;font-weight:600;margin:0}
-  .body{padding:0 20px;overflow:auto;scroll-padding-block:2rem;font-size:0.75rem}
+  h2{font-size:var(--text-base);font-weight:600;margin:0}
+  .body{padding:0 20px;overflow:auto;scroll-padding-block:2rem;font-size:var(--text-xs)}
   p{line-height:1.6;margin:14px 0;color:rgb(var(--c-text-muted))}
   fieldset{border:0;padding:0;margin:0 0 12px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
   legend{font-weight:600;margin-bottom:6px}

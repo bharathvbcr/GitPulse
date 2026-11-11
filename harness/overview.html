@@ -151,7 +151,7 @@
               check("search reaches beyond the rendered page", target.querySelectorAll("[data-work-row]").length === 1 && target.textContent.includes("feature/249"));
             } else if (scenario === "empty") check("empty repository state", target.textContent.includes("Nothing in flight"));
             else if (scenario === "closed") check("closed repository state", target.textContent.includes("No repository open"));
-            else if (scenario === "unavailable") check("unavailable sources stay explicit", target.textContent.includes("PRs unavailable") && target.textContent.includes("Could not check overlapping files"));
+            else if (scenario === "unavailable") check("unavailable sources stay explicit", target.textContent.includes("PRs unavailable") && target.textContent.includes("Couldn't check overlapping files"));
           } else {
           check("all worktrees loaded", target.querySelectorAll("[data-work-row]").length === 4);
           const dirty = await click("Uncommitted changes");

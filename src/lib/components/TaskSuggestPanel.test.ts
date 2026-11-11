@@ -34,7 +34,7 @@ describe("TaskSuggestPanel", () => {
   it("never reads a capped board as the whole board", () => {
     expect(html(answer())).not.toContain("task-suggest-partial");
     expect(html(answer({ board: { scanned: 2000, complete: false, unhydrated: 0 } }))).toContain("only 2000 tasks were read");
-    expect(html(answer({ board: { scanned: 5, complete: true, unhydrated: 2 } }))).toContain("2 open tasks' links could not be read");
+    expect(html(answer({ board: { scanned: 5, complete: true, unhydrated: 2 } }))).toContain("2 open tasks' links couldn't be read");
     expect(html(answer({ verification: { checked: 12, unchecked: 8, failed: 0 } }))).toContain("Verification read for 12 of 20");
   });
   it("calls a task blocked only when an open task blocks it, and counts unread tasks apart", () => {
@@ -51,7 +51,7 @@ describe("TaskSuggestPanel", () => {
     const body = html(answer({ suggestions: [], candidates: 0, excluded: { in_progress: 0, review: 0, duplicate: 0, blocked: 0, unread: 3, filtered: 0 }, board: { scanned: 5, complete: false, unhydrated: 3 } }));
     expect(body).toContain("task-suggest-empty");
     expect(body).toContain("task-suggest-partial");
-    expect(body).toContain("3 open tasks' links could not be read");
+    expect(body).toContain("3 open tasks' links couldn't be read");
     expect(body).not.toContain("No open task is ready to start");
     expect(html(answer({ suggestions: [], candidates: 0 }))).toContain("No open task is ready to start");
   });

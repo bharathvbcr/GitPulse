@@ -111,12 +111,12 @@
   h2{margin:0;flex:1}
   .list,.groups{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
   .row{flex-wrap:wrap;gap:6px 8px;padding-block:6px;height:auto}
-  .row-title{white-space:normal;text-align:left;padding-inline:0;font-size:0.75rem;font-weight:500;overflow-wrap:anywhere}
+  .row-title{white-space:normal;text-align:left;padding-inline:0;font-size:var(--text-xs);font-weight:500;overflow-wrap:anywhere}
   .chips{display:flex;gap:4px;align-items:center;flex-shrink:0}
-  .reason,.note,.groups,.outcome{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .reason,.note,.groups,.outcome{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .note,.groups{margin:0}
   .reason{flex:1;min-width:12em}
-  .arrow{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .arrow{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .actions{display:flex;gap:4px}
   .outcome{flex-basis:100%}
 </style>

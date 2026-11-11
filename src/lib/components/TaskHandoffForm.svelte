@@ -502,7 +502,7 @@
   {#if occupant}
     <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This run gets its own worktree and branch beside it.</p>
   {:else if holder.kind === "unknown"}
-    <p class="meta" role="status" data-testid="checkout-holder-unknown">Cannot tell whether an agent already works in this checkout ({holder.reason}), so this run uses its own worktree. Running in the checkout itself is disabled until that is known.</p>
+    <p class="meta" role="status" data-testid="checkout-holder-unknown">Couldn't tell whether an agent already works in this checkout ({holder.reason}), so this run uses its own worktree. Running in the checkout itself is disabled until that is known.</p>
   {:else if useWorktree}
     <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the run is refused.</p>
   {/if}
@@ -587,7 +587,7 @@
 </div>
 
 <style>
-  .handoff-form{display:flex;flex-direction:column;gap:12px;font-size:0.75rem;min-width:0}
+  .handoff-form{display:flex;flex-direction:column;gap:12px;font-size:var(--text-xs);min-width:0}
   .pair{display:flex;gap:8px;flex-wrap:wrap}
   .model{border:0;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
   .model .pair > *{flex:1 1 8rem;width:auto}

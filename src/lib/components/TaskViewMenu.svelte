@@ -9,7 +9,8 @@
    */
   import { Settings2, Square, SquareCheck } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { popover } from "../ui/popover";
+  import { portal } from "../dom/portal";
+  import { popover, restoreFocusTo } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
@@ -27,7 +28,7 @@
   const laneIgnored = $derived(lane !== "none" && effectiveSwimlane($interfaceStore.taskLayout, lane) === "none");
 
   let open = $state(false);
-  let root: HTMLDivElement | undefined = $state();
+  let toggleEl: HTMLButtonElement | undefined = $state();
 
   const hidden = $derived(new Set($interfaceStore.taskHiddenColumns));
   const fields = $derived(new Set($interfaceStore.taskCardFields));
@@ -44,30 +45,36 @@
   );
 
   /**
-   * Dismissal only, from the shared popover owner: this panel is placed by
-   * CSS, `absolute` under its own trigger inside a `relative` wrapper, so it
-   * has no anchor to clamp and the owner leaves its position alone.
+   * Placed and dismissed by the shared popover owner: portaled to the body
+   * (the board's `.gp-pane` is paint-contained and would clip an `absolute`
+   * panel at its edge), anchored under its trigger, right-aligned, and
+   * clamped to the window. The panel grows and shrinks with the columns and
+   * chips it lists, so a count of what is shown re-places it.
    *
    * Escape bubbles rather than capturing — nothing behind the board menu also
    * closes on Escape, so there is nothing to stop propagation from.
    */
-  const dismissal = {
-    dismiss: { inside: "[data-task-view-menu]", escape: "bubble" as const },
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: toggleEl, gap: 4, align: "end" as const },
+    inset: 8,
+    revision: `${hidden.size}|${fields.size}|${lane}|${order}`,
+    dismiss: { inside: "[data-task-view-menu]", escape: "bubble" as const, resize: true },
     onDismiss: (reason: string) => {
       open = false;
       // Only Escape hands focus back. A pointer dismissal means the reader is
       // already somewhere else, and pulling focus to the trigger would take
       // them off whatever they just clicked.
-      if (reason === "escape") root?.querySelector<HTMLButtonElement>("[data-task-view-toggle]")?.focus();
+      if (reason === "escape") restoreFocusTo(toggleEl);
     },
-  };
+  });
 </script>
 
-<div class="relative" bind:this={root} data-task-view-menu>
+<div class="relative" data-task-view-menu>
   <button
     type="button"
     class="gp-btn"
     data-task-view-toggle
+    bind:this={toggleEl}
     aria-expanded={open}
     aria-haspopup="true"
     {disabled}
@@ -80,8 +87,10 @@
   </button>
   {#if open}
     <div
+      use:portal={"body"}
       use:popover={dismissal}
-      class="view-panel absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
+      data-task-view-menu
+      class="view-panel fixed gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
       style="z-index: {LAYERS.MENU}"
       role="group"
       aria-label="Board view"

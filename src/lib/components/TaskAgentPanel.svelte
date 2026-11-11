@@ -255,7 +255,7 @@
   // and waits for a first successful read: an unread history is not an empty one.
   const formOpen = $derived(expandedForm ?? (readOnce && live.length === 0));
   const summary = $derived.by(() => {
-    if (!total && !allRuns.length) return historyError ? "Runs could not be read." : loading ? "Reading runs…" : "No runs yet.";
+    if (!total && !allRuns.length) return historyError ? "Couldn't read runs." : loading ? "Reading runs…" : "No runs yet.";
     const floor = liveComplete ? "" : "at least ";
     const working = live.length ? `${floor}${live.length} working now` : "Nothing working now";
     const asking = askingCount ? ` · ${askingCount} ${askingCount === 1 ? "needs" : "need"} you` : "";
@@ -795,7 +795,7 @@
   </div>
   {#if !runs.length}
     {#if loading}<Skeleton variant="text" count={2} />
-    {:else}<p>{historyError ? "Runs could not be read." : "No runs yet."}</p>{/if}
+    {:else}<p>{historyError ? "Couldn't read runs." : "No runs yet."}</p>{/if}
   {:else if !ended.length}<p>No ended runs{cursor ? " loaded yet" : ""}.</p>{/if}
   <div class="run-list" data-testid="agents-history">
     {#each ended as run (run.id)}{@render runCard(run)}{/each}
@@ -805,13 +805,13 @@
 </section>
 
 <style>
-  .task-runs{font-size:0.75rem;padding-top:2px;display:flex;flex-direction:column;gap:10px}
+  .task-runs{font-size:var(--text-xs);padding-top:2px;display:flex;flex-direction:column;gap:10px}
   .agents-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
   .agents-head h3{margin:0}
   .agents-head .meta{margin:2px 0 0}
   h4{margin:0}
   p{color:rgb(var(--c-text-muted));line-height:1.5;margin:0}
-  .meta{color:rgb(var(--c-text-muted));font-size:0.6875rem}
+  .meta{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   #task-agent-launch[hidden]{display:none}
   .launch-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0 8px}
   .gate{flex:1;min-width:8rem}
@@ -822,7 +822,7 @@
   .run p{margin:7px 0 0}
   .run > :global(.gp-notice){margin:7px 0 0}
   .run-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
-  .kind{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .kind{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .state{margin-left:auto}
   .row-message{overflow-wrap:anywhere}
   .cause{color:rgb(var(--c-text));overflow-wrap:anywhere}
@@ -835,7 +835,7 @@
   .said{color:rgb(var(--c-text));overflow-wrap:anywhere}
   .said::before{content:"“"}
   .said::after{content:"”"}
-  .doing{color:rgb(var(--c-text-muted));font-size:0.6875rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .doing{color:rgb(var(--c-text-muted));font-size:var(--text-meta);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .changes{display:block;margin-top:3px;color:rgb(var(--c-text-muted))}
   .dot{width:7px;height:7px;border-radius:999px;flex-shrink:0;transform:translateY(-1px);background:rgb(var(--c-text-muted)/.6)}
   li[data-tone="active"] .dot{background:rgb(var(--c-ok))}

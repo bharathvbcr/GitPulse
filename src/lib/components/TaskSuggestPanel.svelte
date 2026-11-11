@@ -29,7 +29,7 @@
   const partialNote = $derived.by(() => {
     if (!result) return "";
     const notes: string[] = [];
-    if (result.board.unhydrated > 0) notes.push(`${result.board.unhydrated} open tasks' links could not be read, so a task here may be blocked by one of them`);
+    if (result.board.unhydrated > 0) notes.push(`${result.board.unhydrated} open tasks' links couldn't be read, so a task here may be blocked by one of them`);
     if (!result.board.complete && result.board.unhydrated === 0) notes.push(`only ${result.board.scanned} tasks were read`);
     return notes.join("; ");
   });
@@ -109,13 +109,13 @@
   h2{margin:0;flex:1}
   .list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
   .item{align-items:flex-start;width:100%;text-align:left;padding-block:6px;cursor:pointer}
-  .rank{width:18px;height:18px;border-radius:var(--gp-r-full, 999px);display:inline-flex;align-items:center;justify-content:center;font-size:0.625rem;font-weight:600;flex-shrink:0;background:color-mix(in srgb,rgb(var(--c-accent)) 14%,transparent)}
+  .rank{width:18px;height:18px;border-radius:var(--gp-r-full, 999px);display:inline-flex;align-items:center;justify-content:center;font-size:var(--text-micro);font-weight:600;flex-shrink:0;background:color-mix(in srgb,rgb(var(--c-accent)) 14%,transparent)}
   .body{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
-  .title{font-size:0.75rem;font-weight:500;overflow-wrap:anywhere}
-  .reason{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .title{font-size:var(--text-xs);font-weight:500;overflow-wrap:anywhere}
+  .reason{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .chips{display:flex;gap:4px;flex-shrink:0}
-  .note,.foot{font-size:0.6875rem;margin:0;color:rgb(var(--c-text-muted))}
-  .blocked{list-style:none;margin:0;padding:0 8px;display:flex;flex-direction:column;gap:2px;font-size:0.6875rem}
+  .note,.foot{font-size:var(--text-meta);margin:0;color:rgb(var(--c-text-muted))}
+  .blocked{list-style:none;margin:0;padding:0 8px;display:flex;flex-direction:column;gap:2px;font-size:var(--text-meta)}
   .blocked .muted{color:rgb(var(--c-text-muted))}
   .blocked-open{white-space:normal;text-align:left;padding-inline:0}
 </style>

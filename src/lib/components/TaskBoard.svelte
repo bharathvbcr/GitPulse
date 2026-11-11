@@ -1271,7 +1271,7 @@
       if (disposed) return;
       try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
       if (result.failed.length) {
-        catalogError = `${name} did not finish moving: ${result.failed.length} of ${writes.length} ${writes.length === 1 ? "workspace" : "workspaces"} could not be updated. ${result.failed[0]?.error ?? ""}`;
+        catalogError = `${name} did not finish moving: ${result.failed.length} of ${writes.length} ${writes.length === 1 ? "workspace" : "workspaces"} couldn't be updated. ${result.failed[0]?.error ?? ""}`;
       } else {
         announce = `${name} moved ${delta < 0 ? "up" : "down"}`;
       }
@@ -1288,7 +1288,7 @@
     importingGroups = true;
     try {
       for (let page = 0; workspaceCursor && page < 50; page++) await moreWorkspaces();
-      if (workspaceCursor) { catalogError = "Not every workspace could be read, so the import could not tell which tab groups already have one."; return; }
+      if (workspaceCursor) { catalogError = "Not every workspace could be read, so the import couldn't tell which tab groups already have one."; return; }
       const report = await importTabGroups(importableGroups, workspaces);
       if (disposed) return;
       try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
@@ -1955,7 +1955,7 @@
       // The board went away mid-window; the deletion still went out, so say
       // what did not, where it can still be read.
       const missed = rows.length - done.length;
-      if (missed) toastStore.error(`${plural(missed, "task")} could not be deleted. Open Tasks to retry.`);
+      if (missed) toastStore.error(`Couldn't delete ${plural(missed, "task")}. Open Tasks to try again.`);
       return;
     }
     deletesRunning--;
@@ -3247,14 +3247,14 @@
   .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
   .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
   .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
-  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:9px;font-size:0.75rem;font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
+  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;min-height:28px;position:relative;text-align:left;border:0;padding:4px 8px;border-radius:9px;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
   .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
   .navigator.nav-liquid .nav-scope.selected{background:transparent}
   .navigator .nav-scope:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-2px}
   .navigator .nav-scope > :not(:global(.gp-liquid-selection)){position:relative}
   .navigator .nav-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .navigator .nav-meta{flex-shrink:0;font-size:0.6875rem;color:rgb(var(--c-text-muted));white-space:nowrap}
+  .navigator .nav-meta{flex-shrink:0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));white-space:nowrap}
   .navigator .nav-meta.checkout-mark{color:rgb(var(--c-warn))}
   /* Every trailing control on a row is one 24px gp-icon-btn, revealed together
      on hover or focus-within. `data-persist` keeps the ones that carry state
@@ -3276,40 +3276,40 @@
      panel off the window the way the old 260px-in-188px absolute menu did.
      `gp-menu`'s overflow:hidden is overridden so the list can scroll. */
   .add-menu{width:min(20rem,calc(100vw - 16px));max-width:calc(100vw - 16px);max-height:min(20rem,calc(100vh - 16px));overflow:hidden auto;box-sizing:border-box}
-  .add-menu-label{padding:4px 8px;font-size:0.625rem;color:rgb(var(--c-text-muted))}
+  .add-menu-label{padding:4px 8px;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .add-menu button{width:100%;height:auto;min-width:0;padding:6px 8px;white-space:normal;overflow:visible;text-align:left}
   .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0}
   .add-name,.add-path{display:block;min-width:0;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
-  .add-path{font-size:0.625rem;color:rgb(var(--c-text-muted))}
+  .add-path{font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-pick{padding:0 8px}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
   /* The header's box and the title's type are the shared gp-surface-header
      and gp-surface-title (app.css), so Tasks and Agents read as one chrome. */
   h1{display:flex;align-items:baseline;gap:8px}
-  h1 span{font-size:0.6875rem;font-weight:500;color:rgb(var(--c-text-muted))}
+  h1 span{font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
   .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
-  .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:0.75rem}
+  .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs)}
   .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
-  .undo-strip>span{flex:1;min-width:0;font-size:0.75rem}
-  button,input,select{font-size:0.75rem}
+  .undo-strip>span{flex:1;min-width:0;font-size:var(--text-xs)}
+  button,input,select{font-size:var(--text-xs)}
   button:disabled{opacity:.5}
-  .hint{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .match-hint{display:block;margin-top:4px;font-size:0.625rem;line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .match-hint{display:block;margin-top:4px;font-size:var(--text-micro);line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
-  .nav-search input{flex:1;min-width:0;font-size:0.6875rem}
-  .nav-empty{margin:2px 6px 6px;font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .nav-search input{flex:1;min-width:0;font-size:var(--text-meta)}
+  .nav-empty{margin:2px 6px 6px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .query-bar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:0 14px 8px}
   .quick-filters{display:flex;flex-wrap:wrap;gap:4px}
   .quick[data-active="true"]{background:rgb(var(--c-accent) / .18);border-color:rgb(var(--c-accent) / .65)}
   .query-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
   .query-term{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   .query-term.negated span{text-decoration:line-through}
-  .query-coverage{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
-  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:0.6875rem;color:rgb(var(--c-warn))}
-  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:0.6875rem}
+  .query-coverage{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:var(--text-meta);color:rgb(var(--c-warn))}
+  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:var(--text-meta)}
   .query-help div{display:flex;gap:8px}
   .query-help dt{min-width:130px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   .query-help dd{margin:0;color:rgb(var(--c-text-muted))}
@@ -3322,15 +3322,15 @@
   /* Lanes: one head row for the columns, then a row of cells per lane. */
   .columns.laned{flex-direction:column;align-items:stretch;gap:10px}
   .lane-head,.lane-cells{display:grid;gap:8px}
-  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:0.75rem;padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
+  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
   .lane{flex-shrink:0;display:flex;flex-direction:column;gap:6px}
-  .lane-title{margin:0;font-size:0.6875rem;font-weight:600;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
+  .lane-title{margin:0;font-size:var(--text-meta);font-weight:600;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
   .lane-title span{font-weight:400;color:rgb(var(--c-text-muted))}
   .lane-cell{width:auto;min-width:0;flex:none}
   .lane-cell .cards{min-height:48px;overflow:visible}
   .list-lane{display:flex;flex-direction:column;margin-bottom:10px}
   .list-lane .lane-title{padding:4px 2px 6px}
-  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:0.75rem;padding:8px 10px}
+  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px}
   .column-meta{display:flex;align-items:center;gap:4px;color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
   .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:10px}
@@ -3349,9 +3349,9 @@
   /* A task whose primary repository has no checkout here: said on the card, before a launch finds out. */
   .checkout-note{align-self:flex-start;flex-shrink:0;white-space:nowrap}
   .card .checkout-note{margin-top:4px}
-  .card-lineage{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;max-width:100%;font-size:0.625rem;line-height:1.2;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card-lineage{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;max-width:100%;font-size:var(--text-micro);line-height:1.2;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card .card-lineage{display:flex;margin-top:4px}
-  .checkout-mark{color:rgb(var(--c-warn));font-size:0.625rem}
+  .checkout-mark{color:rgb(var(--c-warn));font-size:var(--text-micro)}
   .navigator .gp-icon-btn.urgent{color:rgb(var(--c-warn))}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
   /* Same token the sheet below uses (app.css): the strip and the sheet are
@@ -3361,37 +3361,37 @@
   .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:8px;border:1px solid transparent;padding:0 2px 0 8px}
   .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.35);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}
   .task-tab-shell.is-draft [role="tab"]{font-style:italic}
-  .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:0.6875rem}
+  .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:var(--text-meta)}
   .task-tab-shell .gp-icon-btn{flex-shrink:0}
   .tab-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
   .tab-pip{width:6px;height:6px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
   .task-panel{flex:1;min-height:0;display:flex}
   .task-panel :global(.task-editor){flex:1}
-  .card h3,.row-title{font-size:0.75rem;line-height:1.4;font-weight:500;margin:0;overflow-wrap:anywhere;min-width:0}
+  .card h3,.row-title{font-size:var(--text-xs);line-height:1.4;font-weight:500;margin:0;overflow-wrap:anywhere;min-width:0}
   .card-meta{display:flex;align-items:flex-start;gap:6px}
   .pip{width:7px;height:7px;margin-top:4px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
   .pip[data-priority="0"]{background:rgb(var(--c-danger))}
   .insert{height:2px;margin:2px 4px;border-radius:2px;background:rgb(var(--c-accent))}
-  .card-repos,.muted,.status{font-size:0.625rem;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card-repos,.muted,.status{font-size:var(--text-micro);color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card-repos{margin-top:4px}
   .card-extra{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
   .labels{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
   .paging{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:6px}
-  .paging-count{font-size:0.625rem;color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
-  .paging-note{flex-basis:100%;margin:0;font-size:0.625rem;color:rgb(var(--c-text-muted))}
-  .column-empty{margin:10px 8px;font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .paging-count{font-size:var(--text-micro);color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
+  .paging-note{flex-basis:100%;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
+  .column-empty{margin:10px 8px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}
   /* The card skin is gp-notice (app.css); this is only the row inside it. */
   .banner{display:flex;align-items:center;justify-content:space-between;gap:10px}
   .read-notes{list-style:none;display:flex;flex-direction:column;gap:4px;color:rgb(var(--c-text-muted))}
-  .read-notes li{display:flex;align-items:flex-start;gap:8px;font-size:0.6875rem;line-height:1.45}
+  .read-notes li{display:flex;align-items:flex-start;gap:8px;font-size:var(--text-meta);line-height:1.45}
   .read-notes li :global(svg){flex-shrink:0;margin-top:2px;color:rgb(var(--c-warn))}
   .error{color:rgb(var(--c-danger))}
-  .ghost{position:fixed;top:0;left:0;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:0.75rem;font-weight:500;overflow:hidden;overflow-wrap:anywhere}
+  .ghost{position:fixed;top:0;left:0;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:var(--text-xs);font-weight:500;overflow:hidden;overflow-wrap:anywhere}
   .pad{padding:16px}
   .quick-add-row{padding:8px 14px 0}
   .quick-add-row.dimmed{opacity:.45;pointer-events:none}
-  .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   /* Compact trades the card's breathing room for roughly a third more cards
      on screen. Only padding and gaps change: nothing is dropped, so the same
      card reads the same way at either density. */

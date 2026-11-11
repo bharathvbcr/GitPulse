@@ -1895,7 +1895,7 @@ if (params.has("check")) {
 
     // ---- Board customization, and what it costs --------------------------
     const viewToggle = () => root.querySelector("[data-task-view-toggle]");
-    const viewMenu = () => root.querySelector('[data-testid="task-view-menu"]');
+    const viewMenu = () => document.querySelector('[data-testid="task-view-menu"]');
     const columnToggle = status => viewMenu().querySelector(`[data-task-column-toggle="${status}"]`);
     const hiddenNote = () => root.querySelector('[data-testid="task-hidden-columns"]');
     const columnEl = status => root.querySelector(`[data-task-column="${status}"]`);
@@ -3356,6 +3356,33 @@ if (params.has("check")) {
       interfaceStore.flush();
       check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
       await closeViews();
+      {
+        // The panel opens leftwards from a trigger near the pane's edge. Placed by CSS inside the paint-contained pane it
+        // was cut off at the pane edge (left edge x=109 at 1200 px), so the owner places it against the window instead.
+        // The app frame stands in for the window at 1200 and 900 px: the panel must lie whole inside it, and outside the pane.
+        const frame = document.getElementById("app");
+        const fit = [];
+        try {
+          for (const width of [1200, 900]) {
+            frame.style.width = `${width}px`; await settle(350);
+            await closeViews(); await openViews();
+            const panel = viewsPanel(), box = panel.getBoundingClientRect(), edge = frame.getBoundingClientRect();
+            fit.push(`${width}: ${Math.round(box.left)}..${Math.round(box.right)} in ${Math.round(edge.left)}..${Math.round(edge.right)}`);
+            check(`the saved-views panel lies whole inside a ${width} px window and is not inside the clipping pane (${fit.at(-1)})`,
+              box.width > 0 && box.height > 0 && box.left >= edge.left - 1 && box.right <= edge.right + 1 && box.left >= 0 && box.top >= 0
+              && box.right <= innerWidth && box.bottom <= innerHeight && !panel.closest(".gp-pane"));
+            const toggleBox = viewsToggle().getBoundingClientRect();
+            check(`and it opens under its trigger, not over it, at ${width} px`, box.top >= toggleBox.bottom - 1 || box.bottom <= toggleBox.top + 1);
+            // The View menu beside it is placed the same way and has the same failure.
+            await closeViews(); await openView();
+            const menuBox = viewMenu().getBoundingClientRect();
+            check(`the View menu lies whole inside a ${width} px window and is not inside the clipping pane (${Math.round(menuBox.left)}..${Math.round(menuBox.right)})`,
+              menuBox.width > 0 && menuBox.left >= edge.left - 1 && menuBox.right <= edge.right + 1 && menuBox.left >= 0 && menuBox.top >= 0
+              && menuBox.right <= innerWidth && menuBox.bottom <= innerHeight && !viewMenu().closest(".gp-pane"));
+            await closeView();
+          }
+        } finally { frame.style.width = ""; await settle(350); await closeViews(); }
+      }
       await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();
       button("List").click(); await settle(150);
       await click("Clear filters");
