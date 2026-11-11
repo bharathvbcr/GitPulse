@@ -105,7 +105,8 @@ describe("ViewBar", () => {
   it("gives its scroller the diffuse edge and keeps the drag spacer outside the scroller", () => {
     expect(source).toContain('<ScrollCue target={scroller} axis="x" diffuse />');
     const scroll = source.indexOf("bind:this={scroller}");
-    const spacer = source.indexOf('class="h-full min-w-4 flex-1"');
+    // The spacer keeps a 48px floor (min-w-12) beside the folded context slot.
+    const spacer = source.indexOf('class="h-full min-w-12 flex-1"');
     expect(spacer).toBeGreaterThan(source.indexOf("<ScrollCue"));
     expect(scroll).toBeGreaterThan(-1);
   });
