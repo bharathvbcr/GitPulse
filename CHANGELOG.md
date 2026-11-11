@@ -3579,6 +3579,16 @@ untrusted checkout described as a broken one.
   a narrow sidebar runs out of room. Counts are never clipped.
 - **Appearance › Sidebar branch rows** switches back to the dense single-line
   list, which fits roughly 45% more refs on screen.
+- Sidebar branch rows are three lines by default, because two was too cramped.
+  The name keeps line one, the numbers — churn, uncommitted work, files, ahead
+  and behind, freshness — keep line two, and the last commit's age and author
+  now have line three to themselves, so a branch with many numbers no longer
+  squeezes the author. A branch row is 62px tall (56px compact), measured
+  rather than chosen, against 40px (34px) for two lines; headers, folders and
+  tags keep their height. **Two lines** stays in Appearance, listed after
+  **Three lines**. A saved "two lines" is moved to three once, because it was
+  the old default far more often than a choice; picking it again afterwards
+  sticks, and "one line" is never touched.
 - Four macOS-only surfaces that shipped on every platform are hidden where they
   cannot work, decided by a capability the host reports once rather than a
   platform test repeated at each call site. Hidden rather than disabled: a

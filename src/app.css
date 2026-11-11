@@ -2247,7 +2247,7 @@ html[data-fullscreen] .gp-traffic-inset {
   content-visibility: auto;
   /* Fallback only: BranchList sets `contain-intrinsic-size` inline per row
      KIND from src/lib/sidebar/metrics.ts, which is the single source of truth
-     — a two-line branch row is taller than the headers around it. This static
+     — a two- or three-line branch row is taller than the headers around it. This static
      value is the header height and covers non-JS edge paints. */
   contain-intrinsic-size: auto 30px;
 }

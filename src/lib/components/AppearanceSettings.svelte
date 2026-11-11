@@ -94,9 +94,14 @@
 
   const BRANCH_ROW_OPTIONS: readonly { value: BranchRowLayout; label: string; title: string }[] = [
     {
+      value: "three-line",
+      label: "Three lines",
+      title: "Name on its own line, churn and counts on the second, last commit age and author on the third",
+    },
+    {
       value: "two-line",
       label: "Two lines",
-      title: "Name on its own line, churn and counts below — long names stay readable",
+      title: "Name on its own line, churn, counts, age and author together on the second",
     },
     {
       value: "one-line",
@@ -689,7 +694,9 @@
       <p class="text-micro text-textMuted">
         On one line the branch name is the only thing that can shrink, so a row of counters and buttons squeezes it
         down to a few characters. Two lines give the name the full width and move every number — lines changed,
-        ahead and behind, files, author and age — underneath it. Density still sets how tall each line is.
+        ahead and behind, files, age and author — underneath it. Three lines also give the age and author a line of
+        their own, so a branch with many numbers never loses the author to them. Density still sets how tall each
+        line is.
       </p>
     </div>
 

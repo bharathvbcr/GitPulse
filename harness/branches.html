@@ -13,6 +13,7 @@ import { toastStore } from "../src/lib/stores/toastStore";
 import BranchList from "../src/lib/components/BranchList.svelte";
 import WorktreesPanel from "../src/lib/components/WorktreesPanel.svelte";
 import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
+import { interfaceStore } from "../src/lib/stores/interfaceStore";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 const params = new URLSearchParams(location.search);
@@ -55,6 +56,17 @@ const REPO = "/fixture/branches";
 const LONG_WORKTREE = "gitpulse-prompting-extraction-c8e628";
 const names = ["main", "feature/branch-selection", "feature/keyboard-navigation", "release/0.0.9"];
 let branches = [...names.map(n => branch(n)), branch("origin/feature/branch-selection", true), branch("upstream/main", true), branch("origin/HEAD", true)];
+// 40 branches in 10 folders under one checked-out branch, each on its own tip:
+// the store donates a branch's numbers to any other on the same commit, so a
+// shared tip would flatten them. Used by the scroll checks below and, as
+// ?many, to look at a list long enough to scroll.
+const manyBranches = () => {
+  const list = [{...branch("main"), tip_commit_id: "feedfacemain"}];
+  for (let f = 0; f < 10; f++) for (let n = 0; n < 4; n++) list.push({...branch(`team-${String(f).padStart(2,"0")}/topic-${n}`), tip_commit_id: `feedface${f}${n}`});
+  return list;
+};
+const MANY_CURRENT = "team-05/topic-1";
+if(params.has("many")) {current = MANY_CURRENT;branches = manyBranches();}
 const fixture = {
   cmd_resolve_repo: a => ({path:a.path,name:"GitPulse",is_bare:false}),
   cmd_list_branches: () => branches.map(b => ({...b,is_current:!b.is_remote&&b.name===current})),
@@ -106,12 +118,22 @@ const search = async text => {const input=document.querySelector("#merge-branch-
 const check = (name,pass) => results.push({name,pass:Boolean(pass)});
 const dialog = () => document.querySelector('[role="dialog"]');
 await repoStore.openRepo("/fixture/branches");
+// Preview knobs for looking at one row layout by eye (and for screenshots):
+// ?layout=one-line|two-line|three-line, ?density=compact|comfortable and
+// ?width=360 for the sidebar's real default width. The checks below set the
+// layout they measure themselves, so these only matter without ?check.
+if(params.has("layout"))interfaceStore.setBranchRowLayout(params.get("layout"));
+if(params.has("density"))interfaceStore.setDensity(params.get("density"));
+if(params.has("width"))document.getElementById("sidebar").style.width=`${params.get("width")}px`;
 mount(BranchList,{target:document.getElementById("sidebar")});
 mount(ToastContainer,{target:document.getElementById("toasts")});
 await settle();
 if(params.has("check")) {
   try {
     // --- two-line branch rows -------------------------------------------
+    // The default is three lines now, so the layout under test is chosen
+    // here rather than inherited: the two-line row is still a setting.
+    interfaceStore.setBranchRowLayout("two-line");await settle();
     // Geometry, so it can only be checked where real layout exists. The
     // sidebar here is 320px. Line two of a branch with churn AND divergence
     // used to overflow at that width and paint numbers straight through the
@@ -199,6 +221,175 @@ if(params.has("check")) {
     const freshAge = [...lines(navRow)[1].querySelectorAll("span")]
       .find(el => el.title.startsWith("Last commit"));
     check("a fresh branch's age is not tinted",!freshAge.className.includes("text-warn"));
+
+    // --- three-line branch rows (the default) ---------------------------
+    // Line one the name, line two the numbers, line three the last commit's
+    // age and author. Everything here is geometry again, so it is measured.
+    const sidebarWidth = px => {document.getElementById("sidebar").style.width = px ? `${px}px` : "";};
+    interfaceStore.setBranchRowLayout("three-line");await settle();
+    const threeLine = sidebarRowHeight("branch","spacious","three-line");
+    const stackOf = row => row.querySelector(".flex-col").getBoundingClientRect().height;
+    const spans = (row,i,prefix) => [...lines(row)[i].querySelectorAll("span")].filter(el => el.title.startsWith(prefix));
+    check("three-line rows exist to measure",branchRows().length===4);
+    check("every branch row has exactly three lines",branchRows().every(r => lines(r).length===3));
+    check("each three-line row is exactly as tall as the window math believes",
+      branchRows().every(r => Math.round(r.getBoundingClientRect().height)===threeLine));
+    // The row's inline height is written from the same constant, so the
+    // check above alone cannot tell a wrong constant from a right one: the
+    // stack checks below are what hold it to the content. This one only
+    // proves the comparison discriminates, rejecting a constant one pixel off.
+    check("the height comparison rejects a constant that is one pixel off",
+      !branchRows().every(r => Math.round(r.getBoundingClientRect().height)===threeLine+1));
+    check("no row clips its own content",
+      branchRows().every(r => r.scrollHeight <= r.clientHeight + 0.5 && stackOf(r) <= r.getBoundingClientRect().height));
+    check("three lines are taller than two, and headers do not grow",
+      threeLine > sidebarRowHeight("branch","spacious","two-line")
+      && [...document.querySelectorAll(".gp-cv-row")].filter(r => !r.querySelector('[aria-label^="Copy branch name"]'))
+          .every(r => Math.round(r.getBoundingClientRect().height)===sidebarRowHeight("section-header","spacious","three-line")));
+    // Three distinct line boxes, stacked and not overlapping: a collapsed
+    // line two (no churn) would still be a box, because min-h-lh holds it.
+    check("the three lines are separate boxes stacked top to bottom",branchRows().every(row => {
+      const b = lines(row).map(l => l.getBoundingClientRect());
+      return b.every(r => r.height > 0) && b[0].bottom <= b[1].top + 0.5 && b[1].bottom <= b[2].top + 0.5;
+    }));
+    // The documented stack: this is what `BRANCH_ROW_HEIGHT_THREE_LINE`'s
+    // comment says it measured. Row height = stack + the density's padding,
+    // 15px spacious and 9px compact, so a line or gap that changes size
+    // fails here instead of clipping a row.
+    check("the content stack is the 47px the metrics document, on every row",
+      branchRows().every(r => Math.round(stackOf(r))===47));
+    check("spacious padding around the stack is 15px in all",
+      branchRows().every(r => Math.round(r.getBoundingClientRect().height - stackOf(r))===15));
+    const density = get(interfaceStore).density;
+    interfaceStore.setDensity("compact");await settle();
+    check("compact rows match their declared height and keep the same stack",
+      branchRows().every(r => Math.round(r.getBoundingClientRect().height)===sidebarRowHeight("branch","compact","three-line")
+        && Math.round(stackOf(r))===47 && Math.round(r.getBoundingClientRect().height - stackOf(r))===9));
+    interfaceStore.setDensity(density);await settle();
+    // Line one: the glyph level with the name, and the name and its chips
+    // only. Line two: the numbers. Line three: age then author, nothing else.
+    const navThree = branchRows().find(r => r.textContent.includes("keyboard-navigation"));
+    check("line one is the name alone, with its glyph level with it",
+      !/[+↑↓]\d/.test(lines(navThree)[0].textContent) && spans(navThree,0,"Last commit").length===0
+      && Math.abs(navThree.querySelector(".flex-col").previousElementSibling.getBoundingClientRect().top - lines(navThree)[0].getBoundingClientRect().top) < 1.5);
+    check("line two carries the measured numbers and no age or author",
+      /\+2768/.test(lines(navThree)[1].textContent) && /↑14/.test(lines(navThree)[1].textContent)
+      && spans(navThree,1,"Last commit").length===0);
+    check("line three shows the age, then the author",
+      spans(navThree,2,"Last commit ").length===2
+      && /ago|now/.test(spans(navThree,2,"Last commit ")[0].textContent)
+      && spans(navThree,2,"Last commit by")[0]?.textContent.includes("Alex")
+      && lines(navThree)[2].textContent.indexOf("Alex") > lines(navThree)[2].textContent.search(/ago|now/));
+    // At 320px the two-line row made the author shorten to fit beside the
+    // numbers; on its own line it is shown in full.
+    const threeAuthor = spans(navThree,2,"Last commit by")[0];
+    check("at 320px the author is shown in full on line three",threeAuthor.scrollWidth <= threeAuthor.clientWidth + 1);
+    check("line three has room to spare at 320px",lines(navThree)[2].scrollWidth <= lines(navThree)[2].clientWidth);
+    const staleThree = branchRows().find(r => r.textContent.includes("0.0.9"));
+    const staleAgeThree = spans(staleThree,2,"Last commit ")[0];
+    check("a stale branch's age is tinted on line three, and no stale chip appears",
+      staleAgeThree.className.includes("text-warn") && staleAgeThree.title.endsWith("stale") && !staleThree.textContent.includes("stale"));
+    check("a quiet branch keeps its second line's height",
+      Math.round(lines(branchRows().find(r => r.textContent.includes("default")))[1].getBoundingClientRect().height)===13);
+    // A busy row clips line two as it always did, but the age and author
+    // below it are not touched by that.
+    // Line two now holds only numbers, so it needs a narrower sidebar than
+    // the two-line row's 280px before it overflows: walk down until it does.
+    let clipAt = 0;
+    for (const w of [280, 240, 200, 160]) {
+      sidebarWidth(w);await settle();
+      if (lines(navThree)[1].scrollWidth > lines(navThree)[1].clientWidth) {clipAt = w;break;}
+    }
+    check(`line two clips below ${clipAt || "every tried width"}px while line three still shows its age`,
+      clipAt > 0 && spans(navThree,2,"Last commit ")[0].getBoundingClientRect().width > 0
+      && spans(navThree,2,"Last commit ")[0].getBoundingClientRect().right <= lines(navThree)[2].getBoundingClientRect().right);
+    check("a clipped three-line row paints nothing past its edge",branchRows().every(row =>
+      paintRight(row) <= row.getBoundingClientRect().right));
+    sidebarWidth(0);
+    // The action rail sits level with line one and above line two.
+    const railThree = row => row.querySelector('[aria-label^="Copy branch name"]').parentElement.getBoundingClientRect();
+    check("the hover actions stay level with line one, clear of line two",branchRows().every(row =>
+      linePaintRight(lines(row)[0]) <= railThree(row).left + 0.5
+      && lines(row)[1].getBoundingClientRect().top >= railThree(row).bottom - 0.5));
+    // The name at the sidebar's real default width, 360px, for a 30-character
+    // name on a branch carrying the full set of numbers.
+    const LONG30 = "a-thirty-character-branch-name";
+    const baseBranches = branches;
+    // Unique tips: the store donates a branch's numbers to any other branch
+    // on the same commit, which would scramble the fixture the checks below
+    // were written against.
+    branches = [...baseBranches, {...branch(LONG30), tip_commit_id: "feedface0000"}];await repoStore.refresh();await settle();
+    sidebarWidth(360);await settle();
+    const longRow30 = branchRows().find(r => r.textContent.includes(LONG30));
+    const longName30 = longRow30?.querySelector(".truncate");
+    check("a 30-character branch name is shown in full at 360px, not ellipsised",
+      LONG30.length===30 && !!longName30 && longName30.textContent===LONG30 && longName30.scrollWidth <= longName30.clientWidth + 1);
+    sidebarWidth(0);
+    // Keyboard navigation and "locate branch" over MIXED heights: headers
+    // are 30px, branch rows 62px, and the window, the reveal and the centring
+    // all read one set of offsets. 40 branches in 10 folders, in a viewport
+    // that holds far fewer rows. The checked-out branch is drawn in its own
+    // accent, not as a keyboard selection, so the arrow keys walk a list whose
+    // checked-out branch is at the far end.
+    current = "team-09/topic-3";
+    branches = manyBranches();await repoStore.refresh();await settle();
+    const scroller = document.querySelector('[role="tree"] .will-change-scroll');
+    const inView = el => {const e = el.getBoundingClientRect(), s = scroller.getBoundingClientRect();return e.top >= s.top - 0.5 && e.bottom <= s.bottom + 0.5;};
+    // The keyboard-selected row: headers, tags and branch rows all take
+    // `bg-surfaceHover` when selected (the hover tint is the distinct
+    // `hover:bg-surfaceHover` token).
+    const selectedRow = () => scroller.querySelector(".bg-surfaceHover");
+    const tree = document.querySelector('[role="tree"]');
+    tree.focus();
+    // The scroll that reveals a row may animate, so "in view" is awaited with
+    // a bound rather than read once: a row that never arrives is the failure.
+    const arrives = async () => {
+      for (let i = 0; i < 60; i++) {
+        await settle();
+        const s = selectedRow();
+        if (s && inView(s)) return s;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      return null;
+    };
+    let revealed = 0, sawBranchRow = 0;const missed = [];
+    for (let i = 0; i < 38; i++) {
+      tree.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));
+      const sel = await arrives();
+      if (sel) {revealed++; if (sel.querySelector('[aria-label^="Copy branch name"]')) sawBranchRow++;}
+      else {const s = selectedRow(), sr = scroller.getBoundingClientRect(), er = s?.getBoundingClientRect(); missed.push(`#${i}: ${s ? `${s.textContent.trim().slice(0,20)} ${Math.round(er.top-sr.top)}..${Math.round(er.bottom-sr.top)} of ${Math.round(sr.height)}` : "none rendered"}`);}
+    }
+    check(`ArrowDown keeps the selected row rendered and fully in view across mixed heights${revealed===38?"":` (${revealed}/38 in view, ${scroller.scrollHeight}/${scroller.clientHeight} scroll/client; ${missed.join("; ")})`}`,
+      revealed===38 && sawBranchRow > 10 && scroller.scrollHeight > scroller.clientHeight * 2);
+    let upRevealed = 0;
+    for (let i = 0; i < 20; i++) {
+      tree.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowUp",bubbles:true,cancelable:true}));
+      if (await arrives()) upRevealed++;
+    }
+    check(`ArrowUp reveals rows on the way back as well${upRevealed===20?"":` (${upRevealed}/20 in view)`}`,upRevealed===20);
+    // Locate: the checked-out branch is mid-list now, because a row near
+    // either end cannot be placed where the gesture wants it and the clamp
+    // there would hide a wrong offset.
+    current = MANY_CURRENT;await repoStore.refresh();await settle();
+    scroller.scrollTop = 0;await settle();
+    await click("Locate checked-out branch");
+    // Wait for the scroll to come to rest, not merely to reach the row.
+    let restedAt = -1, resting = 0;
+    for (let i = 0; i < 200 && resting < 5; i++) {
+      await settle();await new Promise(resolve => setTimeout(resolve, 20));
+      resting = scroller.scrollTop === restedAt && scroller.scrollTop > 0 ? resting + 1 : 0;
+      restedAt = scroller.scrollTop;
+    }
+    const located = branchRows().find(x => x.classList.contains("ring-accent/40"));
+    // The gesture parks the row a third of the way down the viewport (see
+    // `scrollOffsetToCenter`), measured from the top edge of its row.
+    const fromTop = located ? located.getBoundingClientRect().top - scroller.getBoundingClientRect().top : -1;
+    const locatedOk = !!located && located.textContent.includes("topic-1") && inView(located)
+      && Math.abs(fromTop - scroller.clientHeight / 3) < 8;
+    check(`locate lands on the checked-out branch, a third of the way down the viewport${locatedOk?"":` (found ${!!located}, row top ${Math.round(fromTop)} of ${scroller.clientHeight}, scrollTop ${Math.round(scroller.scrollTop)})`}`,locatedOk);
+    // Put the fixture back exactly as the checks below were written for it.
+    current = "main";branches = baseBranches;await repoStore.refresh();await settle();
+    scroller.scrollTop = 0;await settle();
 
     // --- two-line worktree rows -----------------------------------------
     // Same defect, same sidebar, same fix — so the same harness. The

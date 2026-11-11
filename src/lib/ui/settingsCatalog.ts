@@ -205,7 +205,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Sidebar branch rows",
     keywords:
-      "branch list sidebar two line rows truncated truncate ellipsis name width churn lines changed author age density compact",
+      "branch list sidebar one two three line rows truncated truncate ellipsis name width churn lines changed author age density compact",
   },
   {
     id: "coach-marks",
