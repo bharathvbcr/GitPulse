@@ -389,10 +389,30 @@
             // bounded so a stuck one cannot hang the capture, and two frames so
             // the last one is painted.
             const finite = () => document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity);
+            // A headless page whose clock is virtual (`--virtual-time-budget`) can go
+            // without a frame for the whole wait: a transition that has been created
+            // but not yet started keeps `pending = true` with no start time, and
+            // `playState` says "running" for it forever. Count the frames the wait
+            // really gets, so that case is told apart from an animation that is
+            // simply long.
+            let frames = 0;
+            const onFrame = () => { frames++; requestAnimationFrame(onFrame); };
+            requestAnimationFrame(onFrame);
             const timelineStart = Number(document.timeline.currentTime ?? 0);
             const animationsDone = await sleepUntil(() => finite().every((a) => a.playState === "finished" || a.playState === "idle"), 6000);
+            // A 6 s wait on a page that is being drawn sees hundreds of frames; one
+            // that saw fewer than one a second is not being drawn, and its
+            // animations cannot advance however long it waits. Put what is left at
+            // its end state, which is what the picture is of, and say so.
+            let forced = 0;
+            if (!animationsDone && frames < 6) {
+              for (const a of finite()) if (a.playState === "running") { a.finish(); forced++; }
+            }
             await raf(); await raf();
-            document.documentElement.dataset.gpShotAnimations = animationsDone ? "settled" : `pending (timeline moved ${Math.round(Number(document.timeline.currentTime ?? 0) - timelineStart)}ms) ${finite().filter((a) => a.playState === "running").length}:${[...new Set(finite().filter((a) => a.playState === "running").map((a) => `${a.animationName ?? a.transitionProperty ?? "script"}@${Math.round(Number(a.currentTime ?? 0))}/${Math.round(Number(a.effect?.getComputedTiming().endTime ?? 0))}<${(a.effect?.target?.className?.toString?.() ?? a.effect?.target?.nodeName ?? "").slice(0, 40)}>`))].slice(0, 6).join(",")}`;
+            const stillRunning = finite().filter((a) => a.playState === "running");
+            document.documentElement.dataset.gpShotFrames = String(frames);
+            document.documentElement.dataset.gpShotForced = String(forced);
+            document.documentElement.dataset.gpShotAnimations = stillRunning.length === 0 ? "settled" : `pending (timeline moved ${Math.round(Number(document.timeline.currentTime ?? 0) - timelineStart)}ms, ${frames} frames) ${stillRunning.length}:${[...new Set(stillRunning.map((a) => `${a.animationName ?? a.transitionProperty ?? "script"}@${Math.round(Number(a.currentTime ?? 0))}/${Math.round(Number(a.effect?.getComputedTiming().endTime ?? 0))}<${(a.effect?.target?.className?.toString?.() ?? a.effect?.target?.nodeName ?? "").slice(0, 40)}>`))].slice(0, 6).join(",")}`;
             $("#result").textContent = `shot ready: ${shot}`;
             document.documentElement.dataset.gpShot = "ready";
             return;
@@ -725,6 +745,72 @@
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);
 
+          // ---- an idle window is quiet, in both themes -----------------------------
+          // Nothing is moving, so nothing should be created: a transition made
+          // again and again on an idle page is a reactive loop, a style written
+          // every frame, or a class toggling back and forth, and it costs GPU and
+          // CPU for nothing. Count what a 3 s idle window makes after the theme
+          // flip's own crossfade and the entrances have finished.
+          const { themeStore } = await import("../src/lib/stores/themeStore.ts");
+          const finiteAnims = () => document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity);
+          const whereIs = (el) => `${el?.nodeName?.toLowerCase?.() ?? "?"}.${(el?.className?.toString?.() ?? "").slice(0, 40)}${el?.dataset?.testid ? `#${el.dataset.testid}` : ""}`;
+          // The most attribute writes an idle 3 s may make. The measured count on
+          // this page is 0 in both themes; the slack is for a timer that stamps
+          // an attribute on a slow host, not for a loop, which makes hundreds.
+          const idleNotes = [];
+          const IDLE_ATTRIBUTE_BOUND = 12;
+          const watchIdle = async (ms) => {
+            const known = new WeakSet(finiteAnims());
+            const created = [];
+            const attributes = {};
+            let attributeCount = 0;
+            const onRun = (event) => created.push(`${event.type}:${event.animationName ?? event.propertyName}<${whereIs(event.target)}>`);
+            document.addEventListener("transitionrun", onRun, true);
+            document.addEventListener("animationstart", onRun, true);
+            const observer = new MutationObserver((records) => {
+              for (const record of records) {
+                if (record.type !== "attributes") continue;
+                attributeCount++;
+                const key = `${whereIs(record.target)}[${record.attributeName}]`;
+                attributes[key] = (attributes[key] ?? 0) + 1;
+              }
+            });
+            observer.observe(document.documentElement, { attributes: true, subtree: true });
+            const end = performance.now() + ms;
+            while (performance.now() < end) {
+              for (const a of finiteAnims()) {
+                if (known.has(a)) continue;
+                known.add(a);
+                created.push(`animation:${a.animationName ?? a.transitionProperty ?? "script"}<${whereIs(a.effect?.target)}>`);
+              }
+              await wait(25);
+            }
+            observer.disconnect();
+            document.removeEventListener("transitionrun", onRun, true);
+            document.removeEventListener("animationstart", onRun, true);
+            const top = Object.entries(attributes).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, n]) => `${k}x${n}`).join(", ");
+            return { created, attributeCount, top };
+          };
+          for (const theme of ["dark", "light"]) {
+            themeStore.setTheme(theme);
+            await settle();
+            await wait(900);
+            await sleepUntil(() => finiteAnims().every((a) => a.playState === "finished" || a.playState === "idle"), 4000);
+            const idle = await watchIdle(3000);
+            check(`idle (${theme}): 3 s of nothing happening creates no transition or animation`, () => {
+              if (document.documentElement.classList.contains(theme) && idle.created.length === 0) return true;
+              throw new Error(`theme class ${document.documentElement.className}; created ${idle.created.length}: ${idle.created.slice(0, 6).join(" | ")}`);
+            });
+            check(`idle (${theme}): 3 s of nothing happening writes at most ${IDLE_ATTRIBUTE_BOUND} attributes`, () => {
+              if (idle.attributeCount <= IDLE_ATTRIBUTE_BOUND) return true;
+              throw new Error(`${idle.attributeCount} attribute writes; most often ${idle.top}`);
+            });
+            idleNotes.push(`idle ${theme}: ${idle.created.length} created, ${idle.attributeCount} attribute writes`);
+          }
+          themeStore.setPreference("system");
+          try { localStorage.removeItem("gitpulse_theme_preference"); } catch { /* the page then starts from the system theme, as it did */ }
+          await settle();
+
           // ---- a crashed sidebar recovers on the next switch --------------------
           // The sidebar used to be rebuilt per repository, which cleared a crash
           // caused by one repository's data. It is not rebuilt now, so its
@@ -768,7 +854,7 @@
             const sorted = [...series].sort((a, b) => a - b);
             return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
           };
-          diagnostics = `${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          diagnostics = `${idleNotes.join("; ")}; ${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
           // ---- the graph keeps rows for a bounded number of repositories ---------
           // The real App, its real graph scheduler and the real graph store, with
           // a backend that answers the commit graph. After 8 repositories have
