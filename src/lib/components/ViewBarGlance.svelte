@@ -14,6 +14,7 @@
    * the default 1280px window it leaves no room at all.
    */
   import { onMount } from "svelte";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { Archive, CloudDownload, GitPullRequest, Layers } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { agentPlaneStore } from "../agents/store";
@@ -34,6 +35,8 @@
 
   // Ages are read against a clock that ticks once a minute: the chips say
   // minutes at their finest, and a faster tick would only rewrite the row.
+  // The adaptive timer stops while the window is hidden and ticks once when
+  // it is shown again, so an age is current the moment it can be seen.
   let now = $state(Date.now());
 
   const repoPath = $derived($repoStore.currentPath ?? "");
@@ -88,14 +91,14 @@
   });
 
   onMount(() => {
-    const timer = setInterval(() => (now = Date.now()), 60_000);
+    const stopClock = createAdaptiveTimer(() => (now = Date.now()), 60_000);
     let observer: ResizeObserver | undefined;
     if (strip && typeof ResizeObserver === "function") {
       observer = new ResizeObserver(() => fit());
       observer.observe(strip);
     }
     return () => {
-      clearInterval(timer);
+      stopClock();
       observer?.disconnect();
     };
   });

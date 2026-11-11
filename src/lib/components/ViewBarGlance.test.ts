@@ -112,9 +112,10 @@ describe("ViewBarGlance", () => {
     expect(source).toContain("onclick={onOpenAgents}");
   });
 
-  it("ticks its clock once a minute and stops it on unmount", () => {
-    expect(source).toContain("setInterval(() => (now = Date.now()), 60_000)");
-    expect(source).toContain("clearInterval(timer)");
+  it("ticks its clock once a minute through the adaptive timer (stopped while hidden), and stops it on unmount", () => {
+    expect(source).toContain("createAdaptiveTimer(() => (now = Date.now()), 60_000)");
+    expect(source).toContain("stopClock();");
+    expect(source).not.toMatch(/\bsetInterval\(/);
   });
 
   it("has no accessibility compiler warnings", () => {
