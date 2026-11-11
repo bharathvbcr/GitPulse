@@ -57,7 +57,9 @@ describe("AgentsView", () => {
   });
 
   it("takes directories from the sweep the tab chip also reads, and does not invent one", () => {
-    expect(source).toContain("$agentDirectories.get(record.sessionId)");
+    // The mapping lives in agents/repoAttention.ts (`planeTerminals`), which
+    // the header shares; it leaves an unread directory null (repoAttention.test.ts).
+    expect(source).toContain("planeTerminals($terminalSessions, $sessionActivity, $agentDirectories)");
     expect(source).not.toContain("cwd: null");
     // The sweep (cwd.ts, createAgentDirectorySweep) owns when to read, and
     // re-reads only when the set of sessions changes (cwd.test.ts). A second

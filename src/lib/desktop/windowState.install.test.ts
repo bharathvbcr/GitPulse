@@ -9,6 +9,7 @@ const win = {
   outerSize: vi.fn(async () => ({ width: 1300, height: 900 })),
   outerPosition: vi.fn(async () => ({ x: 40, y: 50 })),
   isMaximized: vi.fn(async () => false),
+  isFullscreen: vi.fn(async () => false),
   onResized: vi.fn(async (_handler: () => void) => unlistenResize),
   onMoved: vi.fn(async (_handler: () => void) => unlistenMove),
 };
@@ -120,6 +121,24 @@ describe("installWindowStatePersistence", () => {
     await vi.advanceTimersByTimeAsync(2);
     expect(JSON.parse(storage.data.get(KEY)!)).toEqual({ x: 40, y: 50, width: 1300, height: 900, maximized: false });
     expect(win.outerSize).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
+  it("asks isFullscreen on start and on every resize, the only full-screen signal tao gives", async () => {
+    const dispose = await installWindowStatePersistence(true, memoryStorage());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(win.isFullscreen).toHaveBeenCalledTimes(1);
+    (win.onResized.mock.calls[0]![0] as () => void)();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(win.isFullscreen).toHaveBeenCalledTimes(2);
+    dispose();
+  });
+
+  it("keeps listening when isFullscreen is unavailable or throws", async () => {
+    win.isFullscreen.mockRejectedValueOnce(new Error("gone"));
+    const dispose = await installWindowStatePersistence(true, memoryStorage());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(win.onResized).toHaveBeenCalledTimes(1);
     dispose();
   });
 

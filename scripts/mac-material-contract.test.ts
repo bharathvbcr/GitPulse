@@ -802,4 +802,39 @@ describe("macOS material", () => {
       /html\.macos \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
     );
   });
+
+  it("gives both header rows that same dense fill, and the Reduce Transparency override keyed on the attribute", () => {
+    // The tabs moved up into the title bar, so the title bar carries the
+    // 0.78 fill (not the thin 40% chrome fill) and the view bar, which now
+    // holds 13px section labels, takes it too. One selector serves both rows,
+    // so the reduced-transparency rules below cover both with no second list.
+    const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
+    const viewBar = readFileSync(new URL("../src/lib/components/ViewBar.svelte", import.meta.url), "utf8");
+    const header = app.slice(app.indexOf("<header"), app.indexOf("<header") + 400);
+    expect(header).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
+    expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b[^"]*\bgp-viewbar\b/);
+    expect(css).toMatch(
+      /html\.macos\[data-transparency="reduced"\] \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
+    );
+    // Neither row paints its own backdrop filter: they are always-on chrome.
+    for (const source of [header, viewBar]) {
+      expect(source).not.toMatch(/backdrop-blur|backdrop-filter/);
+    }
+  });
+
+  it("scopes the diffuse scroll edge's backdrop filter to its opt-in strips, off at blur 0 and under Reduce Transparency", () => {
+    // The one sanctioned backdrop filter in chrome: strips at a scroller's
+    // hidden edge, over the tabs. It follows `--gp-float-blur` and vanishes
+    // with the float blur or the transparency preference, leaving the mask.
+    const from = css.indexOf("/* Header lane I: diffuse scroll edge */");
+    const block = css.slice(from, css.indexOf(".gp-scroll-cue-btn[data-hover-only]", from));
+    const strip = block.slice(block.indexOf(".gp-scroll-diffuse-strip {"), block.indexOf("}", block.indexOf(".gp-scroll-diffuse-strip {")));
+    expect(strip).toContain("backdrop-filter: blur(var(--gp-diffuse-light))");
+    expect(block).toMatch(/html\[data-float-blur="off"\][^{]*\{[^}]*display:\s*none/);
+    expect(block).toMatch(/html\[data-transparency~="reduced"\][^{]*\{[^}]*display:\s*none/);
+    // The media query sits at the end of app.css (contract tests that find the
+    // first block of a query by prefix must not land on it), so it is read
+    // from the whole sheet rather than from the block above.
+    expect(css).toMatch(/@media[^{]*prefers-reduced-transparency: reduce[^{]*\{\s*\.gp-scroll-diffuse \{\s*display:\s*none/);
+  });
 });

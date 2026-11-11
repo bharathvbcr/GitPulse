@@ -451,22 +451,70 @@ describe("App display preferences", () => {
   });
 });
 
+const viewBarSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "lib", "components", "ViewBar.svelte"),
+  "utf8",
+);
+
+describe("the two header rows", () => {
+  it("puts the title bar above the view bar, and the repository tabs inside the title bar", () => {
+    const header = source.indexOf("<header");
+    const headerEnd = source.indexOf("</header>");
+    const tabs = source.indexOf("<RepoTabBar");
+    const viewBar = source.indexOf("<ViewBar");
+    expect(header).toBeGreaterThan(-1);
+    expect(tabs).toBeGreaterThan(header);
+    expect(tabs).toBeLessThan(headerEnd);
+    // Row 2 follows row 1 and sits under the same crash boundary.
+    expect(viewBar).toBeGreaterThan(headerEnd);
+    expect(source.indexOf("</svelte:boundary>", viewBar)).toBeGreaterThan(viewBar);
+    expect(source.slice(source.indexOf("<svelte:boundary"), header)).toContain('paneCrashes.report("header"');
+  });
+
+  it("drops the wordmark: the title bar carries the logo mark and no control after it but the tabs", () => {
+    const row = source.slice(source.indexOf("<header"), source.indexOf("</header>"));
+    expect(row).toContain("<Logo size={19}");
+    expect(row).not.toContain(">GitPulse<");
+    // The old inline Refresh moved to the view bar.
+    expect(row).not.toContain("Refresh Status");
+    expect(row).not.toContain("RefreshCw");
+  });
+
+  it("orders the host-wide chips Manvi then Diagnostics, last, so the badge sits at the corner", () => {
+    const row = source.slice(source.indexOf('class="gp-titlebar-actions'), source.indexOf("</header>"));
+    expect(row.indexOf("<HarnessBadge")).toBeGreaterThan(-1);
+    expect(row.indexOf("<HarnessBadge")).toBeLessThan(row.indexOf('aria-label="Open Diagnostics"'));
+  });
+
+  it("makes each row its own container and gives both the dense glass fill", () => {
+    expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 200)).toContain("@container");
+    expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 300)).toContain("gp-repo-tabs");
+    expect(viewBarSource).toContain("@container gp-glass gp-repo-tabs gp-viewbar");
+  });
+
+  it("stamps the traffic-light inset a class the full-screen rule can collapse", () => {
+    expect(source).toContain('class="gp-traffic-inset h-full shrink-0"');
+    expect(source).not.toContain("w-[76px]");
+  });
+});
+
 /**
- * The title-bar row is `min-w-full w-max`, so everything in it counts toward
- * the scroller's width. A drag spacer with a minimum width, or padding after
- * the last control, made the row wider than the header by that much while
- * every control was in view: the overflow cue then sat on the right edge over
- * empty space (at ~912-940px wide), and its chevron scrolled into nothing.
+ * The view switcher's row is `min-w-full w-max`, so everything in it counts
+ * toward the scroller's width. A drag spacer with a minimum width, or padding
+ * after the last control, made the row wider than the scroller by that much
+ * while every control was in view: the overflow cue then sat on the right edge
+ * over empty space (at ~912-940px wide), and its chevron scrolled into
+ * nothing. The view bar keeps the spacer OUTSIDE the scroller for that reason.
  */
 describe("title-bar overflow", () => {
-  const start = source.indexOf("bind:this={headerScroller}");
-  const end = source.indexOf("<ScrollCue target={headerScroller}", start);
-  const region = source.slice(start, end);
+  const start = viewBarSource.indexOf("bind:this={scroller}");
+  const end = viewBarSource.indexOf("<ScrollCue target={scroller}", start);
+  const region = viewBarSource.slice(start, end);
 
   it("is measured from the controls, not from empty space", () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    const row = /<div class="([^"]*min-w-full w-max[^"]*)"([^>]*)>/.exec(region);
+    const row = /<div class="([^"]*min-w-full[^"]*w-max[^"]*|[^"]*w-max[^"]*min-w-full[^"]*)"([^>]*)>/.exec(region);
     expect(row).not.toBeNull();
     // No padding after the last control...
     expect(row![1]).not.toMatch(/(^|\s)(px|pr|pe)-/);

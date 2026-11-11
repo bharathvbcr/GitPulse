@@ -397,6 +397,113 @@
   --gp-fade-mask: linear-gradient(to bottom, transparent, #000 2rem, #000 calc(100% - 2rem), transparent);
 }
 
+/* Header lane I: diffuse scroll edge */
+/* ScrollCue's opt-in `diffuse` mode: two stacked backdrop-blur strips at each
+   edge that still hides content, each masked from opaque at the edge to clear
+   inward, so together they step the blur up toward the edge under the opacity
+   mask above. Strength follows the float-blur setting (`--gp-float-blur`).
+   The strips are static while scrolling and only fade in and out (opacity,
+   by Svelte transitions that already read the motion tokens and reduced
+   motion). Chevrons in this mode show only while the scroller's parent is
+   hovered. Opt-outs: float blur off, reduced transparency (attribute, written
+   with `~=` so mac-material-contract's rule-for-rule pin on the exact
+   attribute selector is not asked to mirror it) and increased contrast (a
+   media query kept at the end of this file, where prefix searches for the
+   other contrast and transparency blocks do not land on it). */
+.gp-scroll-diffuse {
+  @apply pointer-events-none absolute z-20;
+  --gp-diffuse-light: calc(var(--gp-float-blur, 34px) * 0.2);
+  --gp-diffuse-heavy: calc(var(--gp-float-blur, 34px) * 0.5);
+}
+
+.gp-scroll-diffuse[data-edge="top"],
+.gp-scroll-diffuse[data-edge="bottom"] {
+  inset-inline: 0;
+  height: 40px;
+}
+
+.gp-scroll-diffuse[data-edge="left"],
+.gp-scroll-diffuse[data-edge="right"] {
+  inset-block: 0;
+  width: 40px;
+}
+
+.gp-scroll-diffuse[data-edge="top"] {
+  top: 0;
+  --gp-diffuse-dir: to bottom;
+}
+
+.gp-scroll-diffuse[data-edge="bottom"] {
+  bottom: 0;
+  --gp-diffuse-dir: to top;
+}
+
+.gp-scroll-diffuse[data-edge="left"] {
+  left: 0;
+  --gp-diffuse-dir: to right;
+}
+
+.gp-scroll-diffuse[data-edge="right"] {
+  right: 0;
+  --gp-diffuse-dir: to left;
+}
+
+.gp-scroll-diffuse-strip {
+  position: absolute;
+  inset: 0;
+  -webkit-mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
+  mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
+  -webkit-backdrop-filter: blur(var(--gp-diffuse-light));
+  backdrop-filter: blur(var(--gp-diffuse-light));
+}
+
+.gp-scroll-diffuse-strip[data-strength="heavy"] {
+  -webkit-backdrop-filter: blur(var(--gp-diffuse-heavy));
+  backdrop-filter: blur(var(--gp-diffuse-heavy));
+}
+
+.gp-scroll-diffuse[data-edge="top"] > [data-strength="heavy"],
+.gp-scroll-diffuse[data-edge="bottom"] > [data-strength="heavy"] {
+  inset-block: auto;
+  height: 20px;
+}
+
+.gp-scroll-diffuse[data-edge="top"] > [data-strength="heavy"] {
+  top: 0;
+}
+
+.gp-scroll-diffuse[data-edge="bottom"] > [data-strength="heavy"] {
+  bottom: 0;
+}
+
+.gp-scroll-diffuse[data-edge="left"] > [data-strength="heavy"],
+.gp-scroll-diffuse[data-edge="right"] > [data-strength="heavy"] {
+  inset-inline: auto;
+  width: 20px;
+}
+
+.gp-scroll-diffuse[data-edge="left"] > [data-strength="heavy"] {
+  left: 0;
+}
+
+.gp-scroll-diffuse[data-edge="right"] > [data-strength="heavy"] {
+  right: 0;
+}
+
+html[data-float-blur="off"] .gp-scroll-diffuse,
+html[data-transparency~="reduced"] .gp-scroll-diffuse {
+  display: none;
+}
+
+.gp-scroll-cue-btn[data-hover-only] {
+  opacity: 0;
+  transition: opacity var(--gp-dur-fast) var(--gp-ease-effect);
+}
+
+[data-gp-hover] .gp-scroll-cue-btn[data-hover-only] {
+  opacity: 1;
+}
+
 @utility gp-scroll-cue-btn {
   @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-surface/90 text-textMuted;
   &:hover {
@@ -2084,6 +2191,20 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
   height: 0;
 }
 
+/* Header lane I: the window inset (HEADER_SPEC section 4). The title bar
+   leaves 76px for the traffic lights. In full screen macOS hides them, and
+   windowState.ts stamps `html[data-fullscreen]`, so the inset collapses to a
+   12px gutter. Nothing clickable sits in that band: when the pointer touches
+   the top edge the system slides the menu bar and the lights over it. No
+   width transition: the collapse happens inside the system's own animation. */
+.gp-traffic-inset {
+  width: 76px;
+}
+
+html[data-fullscreen] .gp-traffic-inset {
+  width: 12px;
+}
+
 .gp-gpu {
   transform: translateZ(0);
   backface-visibility: hidden;
@@ -2190,7 +2311,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
     animation: none !important;
   }
 
-  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
     transition: none !important;
   }
 
@@ -2203,7 +2324,7 @@ html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion,
   animation: none !important;
 }
 
-html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
   transition: none !important;
 }
 
@@ -2715,4 +2836,13 @@ html.light .gp-markdown {
   margin: 0;
   color: rgb(var(--c-text));
   overflow-wrap: anywhere;
+}
+
+/* Header lane I: the diffuse scroll edge's contrast and transparency opt-out.
+   Last in the file on purpose: contract tests find the first block of each
+   media query by prefix, and this one must not be it. */
+@media (prefers-contrast: more), (forced-colors: active), (prefers-reduced-transparency: reduce) {
+  .gp-scroll-diffuse {
+    display: none;
+  }
 }

@@ -28,6 +28,7 @@
     LayoutGrid,
     ListChecks,
     SquareTerminal,
+    BellRing,
   } from "@lucide/svelte";
   import { askConfirm, askText, isPromptOpen } from "../stores/modalStore";
   import {
@@ -37,7 +38,7 @@
     type StackHeaderItem,
     type TabItem,
   } from "../repos/tabGroups";
-  import { planDrop, unitForTab, unitIds, type StripUnit } from "../repos/stripNav";
+  import { activationStops, planDrop, unitForTab, unitIds, type StripUnit } from "../repos/stripNav";
   import { checkoutName } from "../repos/repoFamily";
   import { expandedStacks, lastUsedCheckouts, setStackExpanded } from "../repos/stackState";
   import {
@@ -57,6 +58,12 @@
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
   import { liveAgentCount, plural } from "../agents/plane";
   import { agentDirectories } from "../agents/cwd";
+  import { headerAgentPlane } from "../agents/headerPlane";
+  import { repoAgentPill, type RepoAgentPill } from "../agents/repoAttention";
+  import { tabCardRows } from "../repos/tabCard";
+  import { markEnter, markExit, popupEnter, popupExit, tabEnter, tabExit } from "../ui/headerMotion";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import { taskChrome } from "../workbench/taskTabs";
@@ -106,6 +113,8 @@
   // hovered unit; null means "no allowed insertion point" and hides the bar.
   let dropTarget = $state<{ unit: string; before: boolean } | null>(null);
   let scroller: HTMLDivElement | undefined = $state();
+  /** The title bar's one tablist: surfaces and repositories. */
+  let tablist: HTMLDivElement | undefined = $state();
   let moveAnnouncement = $state("");
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const identity = (path: string) => identityKey(path, pathOpts);
@@ -270,6 +279,40 @@
   // The Agents plane's own definition, over the directories it last read, so
   // the chip and the plane's "live terminals" are one number.
   const liveAgents = $derived(liveAgentCount($terminalSessions, $agentDirectories));
+  const viewingRepo = $derived($interfaceStore.globalSurface === "repository");
+
+  /**
+   * What each repository's agents ask of the reader: the same derivation as
+   * the view bar's Agents pill (agents/repoAttention.ts), so a repository you
+   * are not looking at still reaches you (E1). Unknown stays unknown: a tab
+   * draws a mark only for a request, never for "not read".
+   */
+  const agentStates = $derived(
+    new Map(
+      $repoStore.openTabs.map((tab) => [
+        tab.path,
+        repoAgentPill({
+          plane: $headerAgentPlane.plane,
+          probes: $headerAgentPlane.probes,
+          repoPath: tab.path,
+          paths: pathOpts,
+        }),
+      ] as const),
+    ),
+  );
+
+  function agentRequest(path: string): RepoAgentPill | null {
+    const state = agentStates.get(path);
+    return state?.state === "attention" ? state : null;
+  }
+
+  /** The tab that is the one roving stop: the selected one, never two. */
+  const rovingTabId = $derived(viewingRepo ? $repoStore.activeTabId : null);
+  const surfaceStop = $derived<"fleet" | "agents" | "tasks" | null>(
+    fleetOpen ? "fleet" : agentsOpen ? "agents" : tasksOpen ? "tasks" : null,
+  );
+  /** With nothing selected (no repository, none active), Fleet is the way in. */
+  const fallbackStop = $derived(surfaceStop === null && rovingTabId === null ? "fleet" : null);
 
   function closeStripMenu(options?: { restoreFocus?: boolean }) {
     const opener = stripMenuOpener;
@@ -292,6 +335,7 @@
   /** The control that opened whichever popup is showing, for focus to return to. */
   function currentOpener(): HTMLElement | null {
     if (menu) return menuOpener;
+    if (overflowOpen) return overflowTriggerEl ?? null;
     if (recentsOpen) return recentsTriggerEl ?? null;
     if (groupMenu) return groupMenuOpener;
     if (stackMenu) return stackMenuOpener;
@@ -301,8 +345,10 @@
 
   function closeMenu(options?: { restoreFocus?: boolean }) {
     const opener = currentOpener();
+    closeCard();
     menu = null;
     recentsOpen = false;
+    overflowOpen = false;
     groupMenu = null;
     stackMenu = null;
     stripMenu = null;
@@ -535,10 +581,16 @@
     onDismiss: () => closeStripMenu(),
   });
 
-  const recentsDismissal = {
+  // Anchored to the trigger and clamped to the window: Open now sits beside
+  // the tabs rather than at the right edge, so the menu cannot assume room.
+  const recentsPlacement = $derived({
+    anchor: { kind: "element" as const, element: recentsTriggerEl, gap: 6, align: "start" as const },
+    estimate: { width: 320, height: 320 },
+    inset: 8,
+    revision: $repoStore.recentRepos.length,
     dismiss: { inside: "[data-recents-menu]", resize: true, escape: "none" as const },
     onDismiss: () => { recentsOpen = false; },
-  };
+  });
 
   function focusPopup(element: HTMLElement | undefined) {
     window.setTimeout(() => {
@@ -609,7 +661,7 @@
     if (isImeComposition(e)) return;
     // Escape closes any open tab menu, regardless of where focus sits —
     // same window-listener pattern as ViewTabBar.
-    if (e.key === "Escape" && (menu || recentsOpen || groupMenu || stackMenu || stripMenu)) {
+    if (e.key === "Escape" && (menu || recentsOpen || overflowOpen || groupMenu || stackMenu || stripMenu)) {
       e.preventDefault();
       closeMenu({ restoreFocus: true });
       return;
@@ -630,7 +682,10 @@
         if (!digit) return;
         e.preventDefault();
         revealRepository();
-        void repoStore.activateTabAt(Number(digit[1]) - 1);
+        // 9 is the last repository however many are open, as in a browser:
+        // there is no ninth to reach for once there are more than nine.
+        const wanted = Number(digit[1]);
+        void repoStore.activateTabAt(wanted === 9 ? activationStops(tabLayout).length - 1 : wanted - 1);
         return;
       }
       case "cycleTabs": {
@@ -847,7 +902,12 @@
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     const key = e.key as RovingKey;
     if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
-    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index], [data-group-head], [data-stack-head]") ?? [];
+    // One roving set across the surfaces and the repositories: the title bar
+    // is one tablist, so Left/Right pass from Tasks into the first repository.
+    const tabs =
+      tablist?.querySelectorAll<HTMLElement>(
+        "[data-surface-tab], [data-tab-index], [data-group-head], [data-stack-head]",
+      ) ?? [];
     if (tabs.length === 0) return;
     const current = Array.from(tabs).findIndex((el) => el === document.activeElement);
     const next = nextRovingIndex(current, tabs.length, key);
@@ -871,6 +931,174 @@
         : "border-edge bg-background/50 text-textPrimary hover:border-accent/35 hover:bg-accent/5 hover:text-accent"
     }`;
   }
+
+  // ---- E2: the hover card ---------------------------------------------------
+  // Intent before it opens, grace before it closes, as the view switcher's
+  // flyout does. It replaces the native `title` tooltip, which could not hold
+  // more than a path and could not be placed or styled.
+  const CARD_INTENT_MS = 500;
+  const CARD_GRACE_MS = 120;
+  const NO_AGENTS: RepoAgentPill = { state: "none", live: 0, reason: null, tone: null, phrase: "", why: "" };
+
+  let card = $state<{ id: string; anchor: HTMLElement } | null>(null);
+  let cardTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function closeCard() {
+    clearTimeout(cardTimer);
+    cardTimer = undefined;
+    card = null;
+  }
+
+  function onTabEnter(event: PointerEvent, id: string) {
+    if (event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+    clearTimeout(cardTimer);
+    const anchor = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    if (!anchor || dragFrom !== null || menu || recentsOpen || groupMenu || stackMenu || stripMenu || overflowOpen) return;
+    // Already reading cards: the next one follows at once.
+    cardTimer = setTimeout(() => {
+      card = { id, anchor };
+    }, card ? 0 : CARD_INTENT_MS);
+  }
+
+  function onTabLeave() {
+    clearTimeout(cardTimer);
+    cardTimer = setTimeout(closeCard, CARD_GRACE_MS);
+  }
+
+  function onCardEnter() {
+    clearTimeout(cardTimer);
+    cardTimer = undefined;
+  }
+
+  const cardTab = $derived(card ? $repoStore.openTabs.find((item) => item.id === card?.id) ?? null : null);
+  const cardRows = $derived.by(() => {
+    const tab = cardTab;
+    if (!tab) return [];
+    // Ahead/behind and the last fetch come from the hovered tab's own session
+    // (projected onto the tab), so any tab that has been read answers; one
+    // that has not says "Not read yet" instead of leaving the row out.
+    const fetchedMs = tab.fetchedAt;
+    return tabCardRows({
+      tab,
+      sync: tab.sync ?? null,
+      fetchedAt: fetchedMs === undefined ? undefined : fetchedMs === null ? null : Math.floor(fetchedMs / 1000),
+      terminals: terminalCounts.get(tab.path) ?? 0,
+      agents: agentStates.get(tab.path) ?? NO_AGENTS,
+    });
+  });
+  const cardPlacement = $derived({
+    anchor: { kind: "element" as const, element: card?.anchor ?? null, gap: 6, align: "start" as const },
+    estimate: { width: 288, height: 168 },
+    inset: 8,
+    revision: `${card?.id ?? ""}:${cardRows.length}`,
+    dismiss: { inside: "[data-tab-card]", pointer: "pointerdown" as const, scroll: true, resize: true, escape: "bubble" as const },
+    onDismiss: () => closeCard(),
+  });
+
+  $effect(() => () => clearTimeout(cardTimer));
+
+  // ---- Overflow: the units the strip hides ----------------------------------
+  // An IntersectionObserver on the strip's units, so there is no per-frame
+  // layout read: it tells us when a unit crosses the scroller's edge. A
+  // collapsed group and a folded stack are one unit each (they are one
+  // `data-drop-unit` element).
+  let offscreen = $state<ReadonlySet<string>>(new Set());
+  let overflowOpen = $state(false);
+  let overflowTriggerEl: HTMLButtonElement | undefined = $state();
+  let overflowEl: HTMLDivElement | undefined = $state();
+
+  function unitKeyOf(element: Element): string | null {
+    if (!(element instanceof HTMLElement)) return null;
+    if (element.dataset.dropStack) return `stack:${element.dataset.dropStack}`;
+    if (element.dataset.tabId) return `tab:${element.dataset.tabId}`;
+    return null;
+  }
+
+  $effect(() => {
+    const root = scroller;
+    // The layout is read so the observer is rebuilt when units come and go.
+    void tabLayout.visibleItems;
+    if (!root || typeof IntersectionObserver !== "function") {
+      offscreen = new Set();
+      return;
+    }
+    const hidden = new Map<Element, boolean>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) hidden.set(entry.target, entry.intersectionRatio < 0.98);
+        const next = new Set<string>();
+        for (const [element, isHidden] of hidden) {
+          const key = isHidden && element.isConnected ? unitKeyOf(element) : null;
+          if (key) next.add(key);
+        }
+        offscreen = next;
+      },
+      { root, threshold: [0, 0.5, 0.98, 1] },
+    );
+    for (const element of root.querySelectorAll("[data-drop-unit]")) observer.observe(element);
+    return () => observer.disconnect();
+  });
+
+  interface OverflowUnit {
+    key: string;
+    id: string;
+    label: string;
+    branch: string | null;
+    dirty: boolean;
+    conflicts: number;
+    terminals: number;
+    ask: RepoAgentPill | null;
+  }
+
+  const overflowUnits = $derived.by(() => {
+    const units: OverflowUnit[] = [];
+    for (const item of tabLayout.visibleItems) {
+      if (item.kind === "stack-header") {
+        if (!offscreen.has(`stack:${item.key}`)) continue;
+        units.push({
+          key: `stack:${item.key}`,
+          id: item.current.id,
+          label: item.label,
+          branch: item.current.currentBranch,
+          dirty: item.isDirty,
+          conflicts: item.conflictedCount,
+          terminals: item.terminalCount,
+          ask: stackMembers(item).map((member) => agentRequest(member.path)).find((entry) => entry !== null) ?? null,
+        });
+      } else if (item.kind === "tab") {
+        if (!offscreen.has(`tab:${item.tab.id}`)) continue;
+        units.push({
+          key: `tab:${item.tab.id}`,
+          id: item.tab.id,
+          label: item.tab.label,
+          branch: item.tab.currentBranch,
+          dirty: item.tab.isDirty,
+          conflicts: item.tab.conflictedCount,
+          terminals: terminalCounts.get(item.tab.path) ?? 0,
+          ask: agentRequest(item.tab.path),
+        });
+      }
+    }
+    return units;
+  });
+
+  // The menu's content can empty while open (the window grew): close it.
+  $effect(() => {
+    if (overflowUnits.length === 0) untrack(() => { overflowOpen = false; });
+  });
+
+  const overflowPlacement = $derived({
+    anchor: { kind: "element" as const, element: overflowTriggerEl, gap: 6, align: "end" as const },
+    estimate: { width: 256, height: 200 },
+    inset: 8,
+    revision: overflowUnits.length,
+    dismiss: { inside: "[data-overflow-menu], [data-overflow-popup]", resize: true, escape: "none" as const },
+    onDismiss: () => { overflowOpen = false; },
+  });
+
+  $effect(() => {
+    if (overflowOpen && overflowEl) focusPopup(overflowEl);
+  });
 
   /**
    * Open-repository pills have to carry their own plate. Ghost text on the
@@ -970,6 +1198,82 @@
   });
 </script>
 
+{#snippet surfaceTab(spec: {
+  id: "fleet" | "agents" | "tasks";
+  open: boolean;
+  label: string;
+  title: string;
+  icon: typeof LayoutGrid;
+  onselect: () => void;
+  onclose: () => void;
+  count?: number;
+  countTitle?: string;
+  countNoun?: string;
+  tour?: string;
+})}
+  {@const Icon = spec.icon}
+  {@const surfaceCount = spec.count ?? 0}
+  <!-- The tab and its close control are siblings, as a repository tab's are:
+       a second target inside a tab is how a close gets mis-hit. -->
+  <div class="{surfaceChipClass(spec.open)} pr-1!" data-testid="{spec.id}-tab-chip" data-surface={spec.id}>
+    <button
+      type="button"
+      role="tab"
+      class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
+      aria-selected={spec.open}
+      aria-label={surfaceCount > 0 ? `${spec.label}, ${surfaceCount} ${spec.countNoun ?? ""}`.trim() : spec.label}
+      tabindex={spec.open || fallbackStop === spec.id ? 0 : -1}
+      data-surface-tab={spec.id}
+      data-tour={spec.tour}
+      onclick={spec.onselect}
+      onkeydown={(event) => {
+        if (event.key === "Delete" && spec.open) {
+          event.preventDefault();
+          spec.onclose();
+        }
+      }}
+      title={spec.title}
+    >
+      <span class="relative inline-flex">
+        <Icon size={12} aria-hidden="true" />
+        {#if surfaceCount > 0}
+          <!-- Below 1100px the label and pill give way to this badge on the
+               icon: a count is never a bare number. -->
+          <span
+            class="gp-attention-badge bg-accent text-onAccent! @min-[1100px]:hidden"
+            aria-hidden="true"
+            title={spec.countTitle}
+          >{surfaceCount}</span>
+        {/if}
+      </span>
+      <span class="hidden @min-[1100px]:inline">{spec.label}</span>
+      {#if surfaceCount > 0}
+        <span class="hidden @min-[1100px]:inline-flex" aria-hidden="true" title={spec.countTitle}>
+          <span class="gp-chip" data-kind="count" data-tone="accent">{surfaceCount}</span>
+        </span>
+      {/if}
+    </button>
+    {#if spec.open}
+      <button
+        type="button"
+        class="gp-icon-btn"
+        data-size="sm"
+        data-tone="danger"
+        tabindex="-1"
+        data-testid="{spec.id}-tab-close"
+        aria-label="Close {spec.label}"
+        title="Close {spec.label}"
+        onclick={(event) => {
+          event.stopPropagation();
+          spec.onclose();
+        }}
+      >
+        <X size={11} aria-hidden="true" />
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet groupHead(info?: GroupHeaderItem)}
   {#if info}
     <div
@@ -1056,8 +1360,9 @@
     data-stack-member={item.stack ?? undefined}
     data-tab-color={colorInfo.color ?? undefined}
     data-tab-color-source={colorInfo.source ?? undefined}
-    title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}${colorInfo.color ? `\n${colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group`}` : ""}`}
     draggable="true"
+    onpointerenter={(e) => onTabEnter(e, tab.id)}
+    onpointerleave={onTabLeave}
     onauxclick={(e) => {
       if (e.button === 1) {
         e.preventDefault();
@@ -1065,7 +1370,10 @@
       }
     }}
     oncontextmenu={(e) => onContext(e, tab.id)}
-    ondragstart={(e) => onUnitDragStart(e, { kind: "tab", id: tab.id })}
+    ondragstart={(e) => {
+      onUnitDragStart(e, { kind: "tab", id: tab.id });
+      closeCard();
+    }}
     ondragend={endDrag}
     class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,opacity] {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
       ? 'opacity-60'
@@ -1089,14 +1397,13 @@
     <button
     type="button"
     role="tab"
-      tabindex={tab.isActive ? 0 : -1}
-      aria-selected={tab.isActive}
+      tabindex={tab.isActive && viewingRepo ? 0 : -1}
+      aria-selected={tab.isActive && viewingRepo}
       aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
       data-active-repo={tab.isActive ? "true" : "false"}
       data-tab-index={index}
       data-tab-id={tab.id}
       data-parked={tab.watch === "parked" ? "true" : undefined}
-      title={tab.watch === "parked" ? PARKED_TITLE : undefined}
       onclick={() => selectRepoTab(tab.id)}
       onkeydown={(e) => {
         if (e.key === "p" || e.key === "P") {
@@ -1123,10 +1430,29 @@
         <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
       {/if}
       {#if tab.currentBranch}
-        <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
+        <!-- Branch names are the first thing the strip gives up as the window
+             narrows (1280px); the hover card and the status bar still say it. -->
+        <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden @min-[1280px]:inline">{tab.currentBranch}</span>
       {/if}
       {#if tab.conflictedCount > 0}
         <span class="text-warn shrink-0">{tab.conflictedCount}</span>
+      {/if}
+      {#if !(tab.isActive && viewingRepo)}
+        {@const ask = agentRequest(tab.path)}
+        {#if ask}
+          <!-- An agent in a repository you are not looking at is waiting. A
+               different shape from the dirty dot, and the only place a
+               background tab says so. -->
+          <span
+            class="shrink-0 inline-flex items-center {ask.tone === 'danger' ? 'text-danger' : ask.tone === 'info' ? 'text-info' : 'text-warn'}"
+            data-agent-mark={ask.reason}
+            in:markEnter
+            out:markExit
+          >
+            <BellRing size={10} aria-hidden="true" />
+            <span class="sr-only">, agent: {ask.phrase.toLowerCase()}</span>
+          </span>
+        {/if}
       {/if}
       {#if terminalCounts.get(tab.path)}
         <!-- Not a button: the tab itself is the way in, and a second
@@ -1233,8 +1559,8 @@
       <button
         type="button"
         role="tab"
-        tabindex={info.hasActiveTab ? 0 : -1}
-        aria-selected={info.hasActiveTab}
+        tabindex={info.hasActiveTab && viewingRepo ? 0 : -1}
+        aria-selected={info.hasActiveTab && viewingRepo}
         aria-label={stackAriaLabel(info)}
         aria-keyshortcuts="Enter ArrowDown + Control+Shift+ArrowLeft Control+Shift+ArrowRight"
         data-stack-head={info.key}
@@ -1248,13 +1574,27 @@
         <span class="whitespace-nowrap font-medium">{info.label}</span>
         {#if member.primary}
           {#if current.currentBranch}
-            <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden sm:inline">{current.currentBranch}</span>
+            <span class="whitespace-nowrap text-micro font-mono opacity-80 hidden @min-[1280px]:inline">{current.currentBranch}</span>
           {/if}
         {:else}
           <span class="whitespace-nowrap text-micro font-mono opacity-80 max-w-40 truncate" data-stack-current>{member.name}</span>
         {/if}
         {#if info.conflictedCount > 0}
           <span class="text-warn shrink-0" title="{info.conflictedCount} conflicted files across {info.label}">{info.conflictedCount}</span>
+        {/if}
+        {#if !(info.hasActiveTab && viewingRepo)}
+          {@const ask = stackMembers(info).map((member) => agentRequest(member.path)).find((entry) => entry !== null)}
+          {#if ask}
+            <span
+              class="shrink-0 inline-flex items-center {ask.tone === 'danger' ? 'text-danger' : ask.tone === 'info' ? 'text-info' : 'text-warn'}"
+              data-agent-mark={ask.reason}
+              in:markEnter
+              out:markExit
+            >
+              <BellRing size={10} aria-hidden="true" />
+              <span class="sr-only">, agent: {ask.phrase.toLowerCase()}</span>
+            </span>
+          {/if}
         {/if}
         {#if info.terminalCount > 0}
           <span
@@ -1299,123 +1639,120 @@
   </div>
 {/snippet}
 
-  <div style:z-index={LAYERS.SCROLL_CUE} class="gp-glass gp-repo-tabs relative h-11 bg-surface gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
-    <!-- Fleet sits left of the tabs because it is above them: one surface for
-         the whole workspace, not another repository. -->
-    <div class="{surfaceChipClass(fleetOpen)} pr-1!" data-testid="fleet-tab-chip">
-      <button
-        type="button"
-        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
-        aria-pressed={fleetOpen}
-        onclick={() => interfaceStore.toggleFleet()}
-        title="Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health."
-      >
-        <LayoutGrid size={12} />
-        <span>Fleet</span>
-      </button>
-      {#if fleetOpen}
-        <button
-          type="button"
-          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
-          data-testid="fleet-tab-close"
-          aria-label="Close Fleet"
-          title="Close Fleet"
-          onclick={(event) => {
-            event.stopPropagation();
-            interfaceStore.setFleetOpen(false);
-          }}
-        >
-          <X size={11} />
-        </button>
-      {/if}
-    </div>
-    <div class="{surfaceChipClass(agentsOpen)} pr-1!" data-testid="agents-tab-chip">
-      <button
-        type="button"
-        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
-        aria-pressed={agentsOpen}
-        onclick={() => interfaceStore.setAgentsOpen(true)}
-        title="Agents — checkouts on disk, processes this window started, and runs that need you. A checkout is not a running process."
-      >
-        <Bot size={12} />
-        <span>Agents</span>
-        {#if liveAgents > 0}
-          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{plural(liveAgents, 'live agent terminal', 'live agent terminals')} this window started">{liveAgents}</span>
-        {/if}
-      </button>
-      {#if agentsOpen}
-        <button
-          type="button"
-          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-danger"
-          data-testid="agents-tab-close"
-          aria-label="Close Agents"
-          title="Close Agents"
-          onclick={() => interfaceStore.setAgentsOpen(false)}
-        >
-          <X size={11} />
-        </button>
-      {/if}
-    </div>
-    <div class="{surfaceChipClass(tasksOpen)} pr-1!" data-testid="tasks-tab-chip">
-      <button
-        type="button"
-        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
-        aria-pressed={tasksOpen}
-        data-tour="tasks"
-        onclick={() => interfaceStore.setTasksOpen(true)}
-        title="Tasks — global, workspace and repository Kanban boards"
-      >
-        <ListChecks size={12} />
-        <span>Tasks</span>
-        {#if $taskChrome.openTabs > 0}
-          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{$taskChrome.openTabs} open {$taskChrome.openTabs === 1 ? 'task' : 'tasks'}">{$taskChrome.openTabs}</span>
-        {/if}
-      </button>
-      {#if tasksOpen}
-        <button
-          type="button"
-          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-danger"
-          data-testid="tasks-tab-close"
-          aria-label="Close Tasks"
-          title="Close Tasks"
-          onclick={() => interfaceStore.setTasksOpen(false)}
-        >
-          <X size={11} />
-        </button>
-      {/if}
-    </div>
+  <!-- Row 1 of the header (HEADER_SPEC section 2). The window's title bar
+       hosts this: the surfaces and the repositories are one tablist with one
+       selected tab and one roving stop; Open, the drag zone and the workspace
+       actions follow it. -->
+  <div class="gp-repo-strip relative flex min-w-0 flex-1 items-center gap-1.5 self-stretch text-xs" data-repo-strip>
+    <div
+      bind:this={tablist}
+      role="tablist"
+      tabindex="-1"
+      aria-label="Workspace"
+      data-workspace-tablist
+      class="flex min-w-0 shrink items-center gap-1.5 self-stretch"
+      onkeydown={onTablistKeydown}
+    >
+      <!-- Fleet, Agents and Tasks are peers of a repository tab, not of a
+           view: one surface for the whole workspace, not another repository. -->
+      {@render surfaceTab({
+        id: "fleet",
+        open: fleetOpen,
+        label: "Fleet",
+        title: "Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health.",
+        icon: LayoutGrid,
+        onselect: () => interfaceStore.toggleFleet(),
+        onclose: () => interfaceStore.setFleetOpen(false),
+      })}
+      {@render surfaceTab({
+        id: "agents",
+        open: agentsOpen,
+        label: "Agents",
+        title: "Agents — checkouts on disk, processes this window started, and runs that need you. A checkout is not a running process.",
+        icon: Bot,
+        onselect: () => interfaceStore.setAgentsOpen(true),
+        onclose: () => interfaceStore.setAgentsOpen(false),
+        count: liveAgents,
+        countTitle: `${plural(liveAgents, "live agent terminal", "live agent terminals")} this window started`,
+        countNoun: "running",
+      })}
+      {@render surfaceTab({
+        id: "tasks",
+        open: tasksOpen,
+        label: "Tasks",
+        title: "Tasks — global, workspace and repository Kanban boards",
+        icon: ListChecks,
+        onselect: () => interfaceStore.setTasksOpen(true),
+        onclose: () => interfaceStore.setTasksOpen(false),
+        count: $taskChrome.openTabs,
+        countTitle: `${$taskChrome.openTabs} open ${$taskChrome.openTabs === 1 ? "task" : "tasks"}`,
+        countNoun: "open",
+        tour: "tasks",
+      })}
     {#if !hideTabStrip}
-      <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
+      <div class="gp-separator m-0! h-3.5! w-0.5! shrink-0" aria-hidden="true"></div>
       <div class="relative min-w-0 max-w-full shrink self-stretch">
       <div
         bind:this={scroller}
         class="gp-header-scroll h-full flex items-center gap-1 min-w-0 py-1"
-        role="tablist"
-        tabindex="-1"
-        aria-label="Open repositories"
-        onkeydown={onTablistKeydown}
+        data-repo-strip-scroller
+        role="presentation"
         ondragover={onScrollerDragOver}
         ondrop={onScrollerDrop}
         oncontextmenu={onStripContext}
       >
         {#each tabLayout.visibleItems as item (`${item.kind}:${item.id}`)}
-          {#if item.kind === "group-header"}
-            {@render groupHead(item)}
-          {:else if item.kind === "stack-header"}
-            {@render stackHead(item)}
-          {:else}
-            {@render repoTab(item)}
-          {/if}
+          <!-- The wrapper is the keyed item's own element, so its transition
+               belongs to the each block and plays when a tab opens or closes,
+               not when an ancestor block changes. It is a plain flex box (not
+               display: contents, which cannot be animated). -->
+          <div class="flex shrink-0 items-center" data-tab-motion in:tabEnter out:tabExit>
+            {#if item.kind === "group-header"}
+              {@render groupHead(item)}
+            {:else if item.kind === "stack-header"}
+              {@render stackHead(item)}
+            {:else}
+              {@render repoTab(item)}
+            {/if}
+          </div>
         {/each}
       </div>
-      <ScrollCue target={scroller} axis="x" />
+      <ScrollCue target={scroller} axis="x" diffuse />
+      </div>
+    {/if}
+    </div>
+
+    {#if !hideTabStrip && overflowUnits.length > 0}
+      <!-- Only when the strip hides something: a menu of the units that are
+           off screen, with their marks, so nothing is reachable only by
+           scrolling. Renders nothing when the strip fits. -->
+      <div class="relative shrink-0" data-overflow-menu>
+        <button
+          bind:this={overflowTriggerEl}
+          type="button"
+          class="gp-btn"
+          data-size="sm"
+          data-testid="repo-overflow"
+          aria-haspopup="menu"
+          aria-expanded={overflowOpen}
+          aria-controls="repo-overflow-menu"
+          aria-label="{overflowUnits.length} more {overflowUnits.length === 1 ? 'repository' : 'repositories'}"
+          title="Repositories scrolled out of view"
+          onclick={() => {
+            menu = null;
+            recentsOpen = false;
+            overflowOpen = !overflowOpen;
+          }}
+        >
+          <span>{overflowUnits.length} more</span>
+          <ChevronDown size={12} aria-hidden="true" />
+        </button>
       </div>
     {/if}
 
-    <!-- `ml-auto` pins Open, its menu and the workspace actions to the
-         strip's right edge at every window width, wherever the tabs end. The
-         tab list itself stays shrink-wrapped (no flex-1), so its overflow cue
-         marks the last tab rather than empty space.
+    <!-- Open follows the strip like a browser's new-tab control, and the drag
+         zone after it keeps a 48px minimum (E3): the tab strip scrolls before
+         that space shrinks, so the window can always be grabbed.
          Open and its menu arrow are one split pill: Open's square right edge
          is the divider, the arrow drops its own left border, and `-ml-1.5`
          takes back the strip's gap between them. -->
@@ -1426,10 +1763,10 @@
       data-testid="open-repo-tab"
       data-tour="repository"
       onclick={() => onOpen?.()}
-      class="gp-btn h-[26px] py-0! pl-2.5! pr-2! shrink-0 ml-auto rounded-r-none! active:transform-none!"
+      class="gp-btn h-[26px] py-0! pl-2.5! pr-2! shrink-0 rounded-r-none! active:transform-none!"
     >
       <Plus size={13} class="text-accent" />
-      <span>Open</span>
+      <span class="hidden @min-[1100px]:inline">Open</span>
     </button>
 
     <div class="relative shrink-0 -ml-1.5" data-recents-menu>
@@ -1453,13 +1790,15 @@
       {#if recentsOpen}
         <div
           bind:this={recentsEl}
-          use:popover={recentsDismissal}
+          use:portal={"body"}
+          use:popover={recentsPlacement}
+          data-recents-menu
           id="recent-repositories-menu"
           role="menu"
           aria-label="Clone or open a recent repository"
           tabindex="-1"
           onkeydown={handlePopupKeydown}
-          class="absolute right-0 top-full mt-1.5 w-80 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(28rem,calc(100vh-7.5rem))] shadow-float"
+          class="fixed w-80 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(28rem,calc(100vh-7.5rem))] shadow-float"
           style="z-index: {LAYERS.MENU}"
         >
           {#if onClone}
@@ -1474,7 +1813,7 @@
               }}
             >
               <Download size={13} class="text-accent" />
-              Clone Repository…
+              Clone repository…
             </button>
             <div class="gp-separator shrink-0" aria-hidden="true"></div>
           {/if}
@@ -1520,11 +1859,17 @@
       {/if}
     </div>
 
+    <!-- The window-drag zone (E3). `min-w-12` is the 48px floor: the free
+         space belongs to the strip until it is gone, but never below this. A
+         bare drag-region attribute starts a drag only on a direct hit, so
+         nothing clickable is affected. -->
+    <div class="h-full min-w-12 flex-1 self-stretch" data-tauri-drag-region data-drag-zone></div>
+
     <!-- Workspace-wide actions live here rather than in a view: they act on
-         every open repository, so they belong to the tab strip that owns
+         every open repository, so they belong to the title bar that owns
          them. Hidden with a single tab open, where they say nothing new. -->
     <WorkspaceActions />
-    <div class="sr-only" role="status" aria-live="polite">{moveAnnouncement}</div>
+    <div class="sr-only" role="status" aria-live="polite" data-move-announcement>{moveAnnouncement}</div>
   </div>
 
 {#snippet colorChoices(
@@ -1565,6 +1910,96 @@
     </div>
   </div>
 {/snippet}
+
+{#if card && cardTab}
+  {@const stop = activationStops(tabLayout).indexOf(cardTab.id)}
+  <!-- Justified: pointer enter/leave only keep the card open while it is under
+       the pointer; it holds no controls. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    use:portal={"body"}
+    use:popover={cardPlacement}
+    data-tab-card={cardTab.id}
+    role="group"
+    aria-label="{cardTab.label} details"
+    onpointerenter={onCardEnter}
+    onpointerleave={onTabLeave}
+    in:popupEnter
+    out:popupExit
+    class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu p-2.5 text-meta text-textPrimary"
+    style="z-index: {LAYERS.MENU}"
+  >
+    <p class="truncate text-xs font-medium">{cardTab.label}</p>
+    <dl class="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+      {#each cardRows as row (row.label)}
+        <dt class="text-textMuted">{row.label}</dt>
+        <dd class="min-w-0 break-words {row.label === 'Path' ? 'font-mono text-micro' : ''} {row.unknown ? 'text-textMuted' : ''}">{row.value}</dd>
+      {/each}
+    </dl>
+    {#if cardTab.watch === "parked"}
+      <p class="mt-1.5 text-textMuted">{PARKED_TITLE}</p>
+    {/if}
+    <p class="mt-1.5 text-micro text-textMuted">
+      Drag to reorder · P to {cardTab.pinned ? "unpin" : "pin"} · {shortcutTextLabel("⌃⇧←/→", $hostPlatform.os)} to move{stop >= 0 && stop < 9 ? ` · ${shortcutTextLabel(`⌃⌥${stop + 1}`, $hostPlatform.os)} to jump here` : ""}
+    </p>
+  </div>
+{/if}
+
+{#if overflowOpen && overflowUnits.length > 0}
+  <div
+    bind:this={overflowEl}
+    use:portal={"body"}
+    use:popover={overflowPlacement}
+    data-overflow-popup
+    id="repo-overflow-menu"
+    role="menu"
+    aria-label="Repositories scrolled out of view"
+    tabindex="-1"
+    onkeydown={handlePopupKeydown}
+    in:popupEnter
+    out:popupExit
+    class="fixed w-64 max-w-[calc(100vw-1rem)] gp-menu flex flex-col max-h-[min(24rem,calc(100vh-7.5rem))] shadow-float text-meta text-textPrimary"
+    style="z-index: {LAYERS.MENU}"
+  >
+    <div class="overflow-y-auto min-h-0 flex-1 overscroll-contain">
+      {#each overflowUnits as unit (unit.key)}
+        <button
+          type="button"
+          role="menuitem"
+          data-overflow-unit={unit.key}
+          class="gp-menu-item"
+          onclick={() => {
+            overflowOpen = false;
+            selectRepoTab(unit.id);
+          }}
+        >
+          <span class="min-w-0 flex-1 truncate">{unit.label}</span>
+          {#if unit.branch}
+            <span class="shrink-0 truncate max-w-24 font-mono text-micro text-textMuted">{unit.branch}</span>
+          {/if}
+          {#if unit.ask}
+            <span class="shrink-0 {unit.ask.tone === 'danger' ? 'text-danger' : unit.ask.tone === 'info' ? 'text-info' : 'text-warn'}">
+              <BellRing size={10} aria-hidden="true" />
+              <span class="sr-only">Agent: {unit.ask.phrase.toLowerCase()}</span>
+            </span>
+          {/if}
+          {#if unit.conflicts > 0}
+            <span class="shrink-0 text-warn">{unit.conflicts}<span class="sr-only"> conflicts</span></span>
+          {/if}
+          {#if unit.terminals > 0}
+            <span class="shrink-0 inline-flex items-center gap-0.5 text-accent">
+              <SquareTerminal size={10} aria-hidden="true" />{unit.terminals}<span class="sr-only"> terminal sessions</span>
+            </span>
+          {/if}
+          {#if unit.dirty}
+            <span class="shrink-0 size-1.5 rounded-full bg-warn" aria-hidden="true"></span>
+            <span class="sr-only">Uncommitted changes</span>
+          {/if}
+        </button>
+      {/each}
+    </div>
+  </div>
+{/if}
 
 {#if menu}
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}

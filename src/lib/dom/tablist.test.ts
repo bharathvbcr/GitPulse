@@ -89,7 +89,10 @@ describe("every tablist in the app implements the pattern it announces", () => {
     // active view's sections are tabs: theirs are the only panels that exist.
     // A nested tablist inside a tablist would announce neither correctly.
     const source = read("ViewTabBar.svelte");
-    expect(source).toContain('<nav class="relative shrink-0" aria-label="Views"');
+    // The nav landmark is row 2 of the header (ViewBar); the switcher inside
+    // it is the group that carries aria-current.
+    expect(read("ViewBar.svelte")).toContain('aria-label="Views"');
+    expect(read("ViewBar.svelte")).toMatch(/<nav\b[^>]*\n?[^>]*aria-label="Views"/);
     expect(source).toContain('aria-current={active ? "page" : undefined}');
     expect(source).not.toContain('role="tablist"');
     expect(source).toContain("handleTablistKeydown");

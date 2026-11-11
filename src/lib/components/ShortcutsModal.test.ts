@@ -22,7 +22,7 @@ describe("ShortcutsModal", () => {
   it("documents the same Open, Clone, and Work accelerators the native menu binds", () => {
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Open Repository…");
-    expect(body).toContain("Clone Repository…");
+    expect(body).toContain("Clone repository…");
     expect(body).toContain("Open Work");
     expect(body).toContain("F10");
     // Native File menu binds CmdOrCtrl+O and CmdOrCtrl+Shift+O; the sheet

@@ -1,5 +1,6 @@
 /**
- * The status-bar terminal control is a pill, not the old 10px muted label.
+ * The terminal control is a pill, not the old 10px muted label. It lives in
+ * TerminalPill.svelte (the view bar), no longer in the status bar.
  * Server render covers the closed and open faces. The hover menu is closed
  * until pointer or focus, so its actions are pinned from the component source
  * the same way the rest of StatusBar's wiring is.
@@ -11,10 +12,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { render } from "svelte/server";
 import StatusBar from "./StatusBar.svelte";
+import TerminalPill from "./TerminalPill.svelte";
 import { interfaceStore } from "../stores/interfaceStore";
 import { terminalSessions } from "../terminal/sessionRegistry";
 
 const source = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "TerminalPill.svelte"),
+  "utf8",
+);
+const statusBarSource = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "StatusBar.svelte"),
   "utf8",
 );
@@ -39,7 +45,7 @@ vi.mock("../stores/repoStore", async (importOriginal) => {
   };
 });
 
-const bar = () => render(StatusBar).body;
+const bar = () => render(TerminalPill).body;
 
 function pillTag(body: string): string {
   const tag = /<button\b[^>]*data-testid="terminal-pill"[\s\S]*?>/.exec(body)?.[0];
@@ -64,7 +70,19 @@ afterEach(() => {
   interfaceStore.setStatusBarMode("full");
 });
 
-describe("StatusBar terminal pill", () => {
+describe("terminal pill", () => {
+  it("is no longer part of the status bar", () => {
+    expect(statusBarSource).not.toContain("terminal-pill");
+    expect(statusBarSource).not.toContain("SquareTerminal");
+    expect(statusBarSource).not.toContain("terminalPillView");
+    expect(render(StatusBar).body).not.toContain("terminal-pill");
+  });
+
+  it("renders nothing without a current repository", () => {
+    pill.currentPath = null;
+    expect(bar()).not.toContain("terminal-pill");
+  });
+
   it("is a pill, not the old 10px muted text button", () => {
     // The previous control was a borderless `text-[10px]` label. That class
     // string is the regression this test exists to fail on.
@@ -72,10 +90,11 @@ describe("StatusBar terminal pill", () => {
     const body = bar();
     const tag = pillTag(body);
     expect(tag).toContain("rounded-full");
-    expect(tag).toContain("h-5");
-    expect(tag).toContain("text-[11px]");
+    expect(tag).toContain("h-6");
+    expect(tag).toContain("text-meta");
+    expect(tag).not.toContain("text-[11px]");
     expect(tag).toContain("text-textPrimary");
-    expect(tag).toContain("border-border");
+    expect(tag).toContain("border-edge");
     expect(tag).not.toContain("text-[10px]");
     expect(tag).toContain('aria-pressed="false"');
     expect(source).toContain("onclick={toggleDock}");
@@ -123,7 +142,7 @@ describe("StatusBar terminal pill", () => {
   it("wires the hover menu to the dock's own actions", () => {
     const menu = source.slice(
       source.indexOf('data-testid="terminal-pill-menu"'),
-      source.indexOf("Open Command Palette"),
+      source.length,
     );
     expect(menu).toContain("Show terminal");
     expect(menu).toContain("Hide terminal");
@@ -138,6 +157,7 @@ describe("StatusBar terminal pill", () => {
     expect(handler("newTerminal")).toContain("terminalLaunchRequests.request(");
     expect(handler("newTerminal")).toContain("repoStore.setTerminalOpen(true)");
     expect(source).toContain("const MENU_CLOSE_GRACE_MS = 220");
+    expect(source).toContain('place: "below" as const');
     expect(source).toContain('event.key === "Escape"');
     expect(source).toContain('event.key !== "Escape"');
   });

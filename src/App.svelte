@@ -42,7 +42,6 @@
   import { createMenuCommands, checkUpdatesFromMenu } from "./lib/desktop/menuCommands";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
   import Logo from "./lib/components/Logo.svelte";
-  import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
   import RepoPaneRecovery from "./lib/components/RepoPaneRecovery.svelte";
@@ -129,10 +128,9 @@
   // at startup; it renders nothing until `onboardingStore.wizard.open`.
   const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
-  import ViewTabBar from "./lib/components/ViewTabBar.svelte";
+  import ViewBar from "./lib/components/ViewBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
   import {
-    RefreshCw,
     FolderOpen,
     Download,
     Clock,
@@ -221,7 +219,6 @@
     if ($setupWizard.open) setupWizardMounted = true;
   });
   let dropActive = $state(false);
-  let headerScroller: HTMLDivElement | undefined = $state();
   const macos = isMacOS();
 
   // --- terminal dock --------------------------------------------------------
@@ -1071,41 +1068,40 @@
 >
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("header", error)}>
+    <!-- Row 1 of the header (HEADER_SPEC section 2): the title bar. The window
+         inset for the traffic lights, the logo mark (not a control), then
+         RepoTabBar, which is the surfaces, the repositories, Open and the
+         workspace actions; the host-wide chips sit at the right edge. Row 2,
+         the view bar, is the sibling below. `@container` makes this row's own
+         width the breakpoint source for everything inside it. -->
+    <!-- A container query measures the container's CONTENT box, so the padding
+         lives on the row inside it: the tiers (1100, 1280, 1440, 1600) are then
+         the window's own width, as HEADER_SPEC section 4 states them. -->
     <header
-    class="gp-glass gp-titlebar bg-surface border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
-      ? 'h-12 pr-3'
-      : 'h-10 px-3'}"
+    class="@container gp-glass gp-titlebar gp-repo-tabs relative bg-surface shrink-0 select-none min-w-0 {macos
+      ? 'h-12'
+      : 'h-10'}"
+    style:z-index={LAYERS.SCROLL_CUE}
+    data-tauri-drag-region
   >
+    <div class="flex h-full min-w-0 items-center {macos ? 'pr-3' : 'px-3'}" data-tauri-drag-region>
     {#if macos}
-      <div class="w-[76px] h-full shrink-0" data-tauri-drag-region></div>
+      <div class="gp-traffic-inset h-full shrink-0" data-tauri-drag-region></div>
     {/if}
     <div
-      class="gp-drag-children flex items-center gap-2 font-semibold text-sm tracking-tight text-accent shrink-0"
+      class="gp-drag-children mr-2 flex items-center text-accent shrink-0"
       data-tauri-drag-region
     >
       <Logo size={19} variant="badge" />
-      <span class="text-textPrimary">GitPulse</span>
-    </div>
-    <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
-
-    <div class="relative min-w-0 flex-1 h-full">
-    <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
-      <!-- Everything in this row is measured as overflow, so nothing may sit
-           after the last control: a drag spacer (and the gap before it) or
-           trailing padding put the overflow cue over empty space. The row is
-           the drag region instead -- a bare attribute drags only on direct
-           hits, so the controls inside it still take their own clicks. -->
-      <div class="flex items-center gap-2 min-w-full w-max pl-2 h-full" data-tauri-drag-region>
-        {#if $repoStore.currentPath}
-          <ViewTabBar {conflictedCount} />
-        {/if}
-      </div>
-    </div>
-    <ScrollCue target={headerScroller} axis="x" />
     </div>
 
-    <!-- Right Actions -->
-    <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+    <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />
+
+    <!-- Host-wide chips, last so the Diagnostics badge sits at the window corner. -->
+    <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 pl-2 h-full">
+      {#if $interfaceStore.showHarnessBadges}
+        <HarnessBadge />
+      {/if}
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
@@ -1126,23 +1122,17 @@
         {/if}
       </button>
       {/if}
-      {#if $repoStore.currentPath}
-        <button
-          onclick={() => repoStore.refresh()}
-          title="Refresh Status"
-          class="gp-icon-btn"
-        >
-          <RefreshCw size={14} class={$repoStore.isLoading ? "animate-spin" : ""} />
-        </button>
-      {/if}
-      {#if $interfaceStore.showHarnessBadges}
-        <HarnessBadge />
-      {/if}
+    </div>
     </div>
   </header>
-  </svelte:boundary>
 
-  <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />
+  <!-- Row 2 (HEADER_SPEC section 3): the lenses on the selected repository.
+       Not rendered on the welcome screen. Under a global surface it stays
+       mounted, inert, so the workspace never jumps. -->
+  {#if $repoStore.currentPath}
+    <ViewBar {conflictedCount} />
+  {/if}
+  </svelte:boundary>
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />

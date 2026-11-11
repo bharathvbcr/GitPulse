@@ -170,6 +170,23 @@ export function writeWindowState(
   }
 }
 
+// --- Full screen ------------------------------------------------------------
+
+/**
+ * Mirrors the native full-screen state onto `<html data-fullscreen>`.
+ *
+ * In full screen macOS hides the traffic lights, so the header's 76px inset
+ * is dead space; `html[data-fullscreen]` collapses it to a gutter (see the
+ * header block in app.css). Only the attribute's presence carries meaning.
+ */
+export function stampFullscreen(
+  fullscreen: boolean,
+  root: Pick<HTMLElement, "toggleAttribute"> | null =
+    typeof document === "undefined" ? null : document.documentElement,
+): void {
+  root?.toggleAttribute("data-fullscreen", fullscreen);
+}
+
 // --- Tauri wiring -----------------------------------------------------------
 
 /**
@@ -235,8 +252,22 @@ export async function installWindowStatePersistence(
       timer = setTimeout(() => void capture(), debounceMs);
     };
 
-    const unlistenResize = await win.onResized(schedule);
+    // Tauri has no full-screen event, but tao emits a resize on entering and
+    // leaving it, so the existing resize subscription asks `isFullscreen()`.
+    // A failed read leaves the last stamp as it was: unknown is not "off".
+    const readFullscreen = async () => {
+      try {
+        stampFullscreen(await win.isFullscreen());
+      } catch {
+        /* the window can go away mid-read during shutdown */
+      }
+    };
+    const unlistenResize = await win.onResized(() => {
+      schedule();
+      void readFullscreen();
+    });
     const unlistenMove = await win.onMoved(schedule);
+    void readFullscreen();
 
     return () => {
       if (timer !== undefined) clearTimeout(timer);

@@ -183,6 +183,12 @@ export function project(
   return projectRest(internal, openTabs, active);
 }
 
+/** Ahead and behind of the session's current branch; null when it has none to measure. */
+function syncOf(session: RepoSession): { ahead: number; behind: number } | null {
+  const current = session.branches.find((item) => item.is_current || item.name === session.currentBranch);
+  return current ? { ahead: current.ahead_count ?? 0, behind: current.behind_count ?? 0 } : null;
+}
+
 function projectTab(
   tab: TabRecord,
   session: RepoSession | undefined,
@@ -214,6 +220,8 @@ function projectTab(
       changedCount: new Set(statuses.map((file) => file.path)).size,
       watch: session?.watch.status ?? "unknown",
       countsKnown: session?.hasHydrated === true,
+      sync: session?.hasHydrated === true ? syncOf(session) : null,
+      fetchedAt: session?.hasHydrated === true ? session.fetchedAt : undefined,
     };
 }
 

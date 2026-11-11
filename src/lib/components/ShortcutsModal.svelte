@@ -41,11 +41,11 @@
       shortcuts: [
         { keys: ["⌘", "O"], description: "Open Repository…" },
         { keys: ["⌘", "T"], description: "Open Repository… (new tab)" },
-        { keys: ["⌘", "⇧", "O"], description: "Clone Repository…" },
+        { keys: ["⌘", "⇧", "O"], description: "Clone repository…" },
         { keys: ["⌘", "⇧", "W"], description: "Close active repository tab" },
         { keys: ["Ctrl", "Tab"], description: "Cycle to next repository tab" },
         { keys: ["Ctrl", "⇧", "Tab"], description: "Cycle to previous repository tab" },
-        { keys: ["Ctrl", "Alt", "1–9"], description: "Jump to specific repository tab" },
+        { keys: ["Ctrl", "Alt", "1–9"], description: "Jump to a repository tab; 9 is the last one" },
         { keys: ["Ctrl", "⇧", "← / →"], description: "Move the focused repository tab left or right" },
       ],
     },

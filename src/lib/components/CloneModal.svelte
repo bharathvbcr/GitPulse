@@ -208,7 +208,7 @@
           class="gp-btn-primary"
         >
           <Check size={14} />
-          <span>{isCloning ? "Cloning…" : "Clone Repository"}</span>
+          <span>{isCloning ? "Cloning…" : "Clone repository"}</span>
         </button>
       </div>
     </div>
