@@ -531,7 +531,7 @@
         {@const badge = editorTabBadge(entry.id, { working: workingCount })}
         <button
           type="button"
-          class="gp-seg-btn text-meta! py-1!"
+          class="gp-seg-btn text-meta!"
           role={props.role}
           id={props.id}
           aria-selected={props["aria-selected"]}

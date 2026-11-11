@@ -556,7 +556,7 @@
                   {#if entry.expandable}
                     <button
                       type="button"
-                      class="gp-icon-btn h-4! w-4! mt-0.5 shrink-0"
+                      class="gp-icon-btn mt-0.5 shrink-0" data-size="sm"
                       tabindex="-1"
                       aria-label="{entry.expanded ? 'Collapse' : 'Expand'} {row.session}"
                       title={entry.expanded ? "Collapse" : "Expand"}

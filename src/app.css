@@ -189,6 +189,8 @@
      stay as working aliases until Wave 2 migrates their call sites and empties
      them. Only colors and the press transform animate. */
   @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-xs;
+  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
+  min-height: 28px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-instant);
@@ -323,6 +325,9 @@
 @utility gp-icon-btn {
   /* Round icon button (ghost). */
   @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted;
+  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
+  min-height: 28px;
+  min-width: 28px;
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-fast);
   transition-timing-function: var(--gp-ease-effect);
@@ -776,6 +781,8 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
 
 @utility gp-seg-btn {
   @apply rounded-full px-2.5 py-1 text-xs text-textMuted;
+  /* The sm height (24px) whatever text size a caller picks. */
+  min-height: 24px;
   transition-property: color, background-color;
   transition-duration: var(--gp-dur-fast);
   transition-timing-function: var(--gp-ease-effect);
@@ -791,6 +798,8 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
 @utility gp-field {
   /* Rounded input field. */
   @apply rounded-full border border-edge bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-faint;
+  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
+  min-height: 28px;
   transition: color var(--gp-dur-fast) var(--gp-ease-effect), background-color var(--gp-dur-fast) var(--gp-ease-effect), border-color var(--gp-dur-fast) var(--gp-ease-effect);
   /* WKWebView ignores `color` on form controls when the page is a transparent
      window (macOSPrivateApi). The fill colour is what actually paints, so a
@@ -855,16 +864,14 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      what it means; `data-kind` (count | label | removable) sets the 20px
      metrics. A removable chip holds a `gp-icon-btn` `data-size="sm"` for its
      ×. `gp-pill` is the retiring twin; new code writes this. */
-  @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border px-2 py-0.5 text-meta leading-none;
+  @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border px-2 py-0 text-meta leading-none;
+  /* One size, 20px (§8), whether or not data-kind is set. */
+  min-height: 20px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color;
   transition-duration: var(--gp-dur-instant);
   transition-timing-function: var(--gp-ease-effect);
 
-  &[data-kind] {
-    min-height: 20px;
-    padding-block: 0;
-  }
   &[data-kind="count"] {
     @apply justify-center text-micro;
     min-width: 20px;
@@ -942,6 +949,8 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
    * `gp-field` pills, so it is not the rounded rectangle it used to be.
    */
   @apply cursor-pointer truncate rounded-full border bg-background py-1 pl-3 pr-7 text-xs text-textPrimary;
+  /* Unmarked, it is the md size (28px, DESIGN_LANGUAGE §8); data-size="sm" is the compact 24px. */
+  min-height: 28px;
   border-color: var(--gp-edge);
   -webkit-text-fill-color: rgb(var(--c-text));
   appearance: none;

@@ -223,7 +223,7 @@
               type="text"
               bind:value={filterQuery}
               placeholder="Search shortcuts…"
-              class="gp-field pl-7! py-1! text-xs! w-44!"
+              class="gp-field pl-7! text-xs! w-44!" data-size="sm"
             />
           </div>
           <button
@@ -272,7 +272,7 @@
       <!-- Footer -->
       <div class="p-3 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-meta text-textMuted px-5">
         <span>Tip: Press <kbd class="gp-keycap">?</kbd> anywhere to reopen</span>
-        <button type="button" class="gp-btn py-1! px-3!" onclick={close}>Done</button>
+        <button type="button" class="gp-btn px-3!" data-size="sm" onclick={close}>Done</button>
       </div>
     </div>
   </div>

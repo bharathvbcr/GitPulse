@@ -397,7 +397,7 @@
           aria-label="Float sidebar over the workspace"
           aria-pressed={overlay}
           data-sidebar-mode-toggle
-          class="gp-icon-btn p-1! hover:text-accent"
+          class="gp-icon-btn hover:text-accent" data-size="sm"
         >
           {#if overlay}<PinOff size={14} />{:else}<Pin size={14} />{/if}
         </button>
@@ -406,7 +406,7 @@
           onclick={toggleCollapsed}
           title="Collapse sidebar"
           aria-label="Collapse sidebar"
-          class="gp-icon-btn p-1! hover:text-accent"
+          class="gp-icon-btn hover:text-accent" data-size="sm"
         >
           <PanelLeftClose size={14} />
         </button>
@@ -509,7 +509,7 @@
         <div class="@container/actions flex w-full min-w-0 gap-1 overflow-x-hidden pt-1.5 mt-2">
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.fetch()}
             disabled={$repoStore.isLoading}
             title="Fetch from remote"
@@ -520,7 +520,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.pull()}
             disabled={$repoStore.isLoading}
             title="Pull from upstream"
@@ -531,7 +531,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.push()}
             disabled={$repoStore.isLoading}
             title="Push to upstream"
@@ -542,7 +542,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.stashSave()}
             disabled={$repoStore.isLoading}
             title="Stash changes"

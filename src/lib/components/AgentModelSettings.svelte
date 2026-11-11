@@ -203,7 +203,7 @@
               {#if field === "effort"}
                 <select
                   {id}
-                  class="gp-select text-meta py-0.5! min-w-0"
+                  class="gp-select text-meta min-w-0" data-size="sm"
                   data-testid={id}
                   disabled={busy}
                   value={choice.effort ?? ""}
@@ -221,7 +221,7 @@
                   type="text"
                   spellcheck="false"
                   autocomplete="off"
-                  class="gp-field text-meta py-0.5! min-w-0 font-mono"
+                  class="gp-field text-meta min-w-0 font-mono" data-size="sm"
                   data-testid={id}
                   disabled={busy}
                   placeholder={field === "advisor" ? "Off unless your settings turn it on" : field === "fallback" ? "None" : "CLI default"}

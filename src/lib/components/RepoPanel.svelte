@@ -411,7 +411,7 @@
       <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-edge p-2.5 text-meta text-textSecondary">
         <label class="inline-flex items-center gap-1.5">
           Pull by
-          <select class="gp-select py-0.5!" bind:value={pullStrategy} disabled={busy !== null}>
+          <select class="gp-select" data-size="sm" bind:value={pullStrategy} disabled={busy !== null}>
             <option value="config">{pullRebaseConfig ? `pull.rebase (${pullRebaseConfig})` : "git's default (merge)"}</option>
             <option value="merge">Merging (--no-rebase)</option>
             <option value="rebase">Rebasing local commits (--rebase)</option>
@@ -424,7 +424,7 @@
         <span title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
           <Checkbox label="Auto-fetch every" checked={autoFetchOn} onchange={(next) => setAutoFetch(next, autoFetchMinutes)} />
         </span>
-        <select class="gp-select py-0.5!" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
+        <select class="gp-select" data-size="sm" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
           onchange={(event) => setAutoFetch(true, Number(event.currentTarget.value))}>
           {#each [5, 10, 15, 30, 60, 120, 240].filter((m) => m >= MIN_AUTO_FETCH_MINUTES && m <= MAX_AUTO_FETCH_MINUTES) as minutes (minutes)}
             <option value={minutes}>{minutes} min</option>

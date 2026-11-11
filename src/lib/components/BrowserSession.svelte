@@ -340,7 +340,7 @@
       onblur={() => (editing = false)}
       onkeydown={onAddressKey}
     />
-    <button type="submit" class="gp-btn py-0! text-meta!">{opened ? "Go" : "Open"}</button>
+    <button type="submit" class="gp-btn text-meta!" data-size="sm">{opened ? "Go" : "Open"}</button>
     <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
   {#if error}

@@ -308,7 +308,7 @@
       <button
         type="button"
         onclick={onClose}
-        class="gp-icon-btn p-0.5!"
+        class="gp-icon-btn" data-size="sm"
         title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — the session keeps running"
         aria-label="Hide the terminal dock"
       >

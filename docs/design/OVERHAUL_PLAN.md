@@ -376,6 +376,13 @@ The two final audits (`tmp/overhaul/audit-final/`) found about 30 gaps at the Wa
 - 909/909 test files and 13,687 tests pass.
 - The entry chunk is 634,421 B against the 640,000 budget.
 
+**Second consistency audit (2026-11-11).** A live sweep of 731 controls on 42 harness pages found five classes; each was fixed at its owner and given a lint guard:
+- **A. Corner style missed most corners.** Tailwind's `--radius-*` were never mapped onto `--gp-r-*`, so ~260 `rounded-*` uses, `gp-menu` and `gp-card` ignored Appearance → Corner style. Mapped in `@theme inline`; `rounded-md` (6px, off the ladder) is now 8px.
+- **B. Scoped CSS beat the primitives.** The `gp-*` primitives are layered utilities and component CSS is not, so any scoped rule setting padding, height, border or radius on a primitive won outright. The primitives gained `gp-btn data-size="inline"` and `data-size="sm"` on `gp-field`/`gp-select`; rule 12 flags the override.
+- **C. Heights.** *Orchestrator decision, not yet confirmed by the owner:* an unmarked `gp-btn`, `gp-icon-btn`, `gp-field` and `gp-select` is the md size, 28px (it was an accidental 26px); `data-size="sm"` is 24px; every `gp-chip` is 20px; `gp-seg-btn` is at least 24px. The 80 forced `py-*!`/`p-*!`/`h-*` overrides became `data-size`. Flipping the default to 24px is one line in each utility plus this note.
+- **D.** The last five hand-styled selects and eight raw checkboxes use `gp-select` and `Checkbox`; rule 12 flags both.
+- **E.** 48 literal `border-radius` values in `<style>` and `app.css` moved onto the ladder; rule 5 now reads them.
+
 ## 8. Lane brief template (Sonnet)
 
 Each lane gets this brief, filled in:

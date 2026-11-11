@@ -250,7 +250,7 @@
         <button
           type="button"
           role="tab"
-          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-micro"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! text-micro"
           aria-selected={!showingHistory}
           data-active={!showingHistory ? "true" : "false"}
           title="Files in this change"
@@ -273,7 +273,7 @@
         <button
           type="button"
           role="tab"
-          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-micro"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! text-micro"
           aria-selected={showingHistory}
           data-active={showingHistory ? "true" : "false"}
           title="Commit history — pick or compare commits ({shortcutTextLabel('⌥H', $hostPlatform.os)})"
@@ -351,7 +351,7 @@
     <div class="gp-segmented p-0.5!" role="group" aria-label="File list layout">
       <button
         type="button"
-        class="gp-seg-btn px-1.5! py-0.5!"
+        class="gp-seg-btn px-1.5!"
         aria-pressed={mode === "list"}
         data-active={mode === "list" ? "true" : "false"}
         title="Flat list, in the order git reports"
@@ -361,7 +361,7 @@
       </button>
       <button
         type="button"
-        class="gp-seg-btn px-1.5! py-0.5!"
+        class="gp-seg-btn px-1.5!"
         aria-pressed={mode === "tree"}
         data-active={mode === "tree" ? "true" : "false"}
         title="Group by directory"
@@ -377,7 +377,7 @@
     <input
       bind:value={query}
       type="text"
-      class="gp-field min-w-0 flex-1 py-0.5! text-meta!"
+      class="gp-field min-w-0 flex-1 text-meta!" data-size="sm"
       placeholder="Filter files…"
       aria-label="Filter files in this diff"
       onkeydown={(e) => {

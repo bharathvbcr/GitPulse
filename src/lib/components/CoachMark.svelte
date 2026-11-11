@@ -76,7 +76,7 @@
           <button
             type="button"
             onclick={dismiss}
-            class="gp-btn-primary py-0.5! px-2.5! text-micro! font-semibold!"
+            class="gp-btn-primary px-2.5! text-micro! font-semibold!" data-size="sm"
           >
             Got it
           </button>

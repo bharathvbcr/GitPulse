@@ -767,7 +767,7 @@
       aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
       aria-pressed={paneLayout.explorerVisible}
       title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer ({shortcutTextLabel('⌘B', $hostPlatform.os)})"
-      class="gp-icon-btn p-1.5! shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+      class="gp-icon-btn shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
     >
       {#if paneLayout.explorerVisible}
         <PanelLeftClose size={14} />
@@ -783,7 +783,7 @@
       aria-pressed={searchRailUp}
       title={searchRailUp ? "Back to the file tree" : "Search file contents across the repository"}
       data-search-toggle
-      class="gp-icon-btn p-1.5! shrink-0 {searchRailUp ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+      class="gp-icon-btn shrink-0 {searchRailUp ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
     >
       <Search size={14} />
     </button>
@@ -870,7 +870,7 @@
           onclick={closeOtherTabs}
           aria-label="Close other tabs"
           title="Close Other Tabs"
-          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
         >
           <Columns2 size={13} />
         </button>
@@ -879,7 +879,7 @@
           onclick={closeAllTabs}
           aria-label="Close all tabs"
           title="Close All Tabs"
-          class="gp-icon-btn p-1! text-textMuted hover:text-danger"
+          class="gp-icon-btn text-textMuted hover:text-danger" data-size="sm"
         >
           <XCircle size={13} />
         </button>
@@ -892,9 +892,7 @@
         aria-pressed={paneLayout.dashboardVisible}
         aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
         title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard ({shortcutTextLabel('⌘⇧D', $hostPlatform.os)})"
-        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta {paneLayout.dashboardVisible
-          ? 'border-accent bg-accent/15 text-accent font-semibold'
-          : ''}"
+        class="gp-btn px-2! flex items-center gap-1 text-meta {paneLayout.dashboardVisible ? 'border-accent bg-accent/15 text-accent font-semibold' : ''}" data-size="sm"
       >
         <Activity size={12} />
         <span>Live Pulse</span>
@@ -952,7 +950,7 @@
         <button
           type="button"
           onclick={copyActivePath}
-          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
           aria-label="Copy relative path"
           title="Copy Relative Path"
         >
@@ -962,7 +960,7 @@
         <button
           type="button"
           onclick={openActiveInDefaultApp}
-          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
           aria-label="Open in default application"
           title="Open in Default Application"
         >
@@ -974,7 +972,7 @@
         <button
           type="button"
           onclick={inspectInDiff}
-          class="gp-btn py-0.5! px-1.5! text-micro flex items-center gap-1 text-info"
+          class="gp-btn px-1.5! text-micro flex items-center gap-1 text-info" data-size="sm"
           title="View in Diff Tab"
         >
           <Layers size={11} />
@@ -988,9 +986,7 @@
           onclick={toggleBlameLens}
           aria-pressed={$explorerLens.lens === "blame"}
           data-blame-lens
-          class="gp-btn py-0.5! px-1.5! text-micro flex items-center gap-1 {$explorerLens.lens === 'blame'
-            ? 'text-accent bg-accent/15 border-accent!'
-            : 'text-accent'}"
+          class="gp-btn px-1.5! text-micro flex items-center gap-1 {$explorerLens.lens === 'blame' ? 'text-accent bg-accent/15 border-accent!' : 'text-accent'}" data-size="sm"
           title={$explorerLens.lens === "blame" ? "Back to the editor" : "Show Git blame for this file"}
         >
           <GitCommit size={11} />

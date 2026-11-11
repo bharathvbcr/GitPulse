@@ -1841,9 +1841,9 @@
       {/if}
       <div class="{renderer === 'reset' || renderer === 'lost' ? '' : 'ml-auto '}flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 
-        <button type="button" class="gp-icon-btn p-0.5!" aria-label="Decrease terminal text size" title="Smaller text ({platformChord('⌘−', 'Ctrl+Shift+−', $hostPlatform.os)})" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
+        <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Decrease terminal text size" title="Smaller text ({platformChord('⌘−', 'Ctrl+Shift+−', $hostPlatform.os)})" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
         <button type="button" class="text-micro text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size ({platformChord('⌘0', 'Ctrl+Shift+0', $hostPlatform.os)})" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>
-        <button type="button" class="gp-icon-btn p-0.5!" aria-label="Increase terminal text size" title="Larger text ({platformChord('⌘+', 'Ctrl+Shift++', $hostPlatform.os)})" disabled={fontSize >= TERMINAL_FONT_MAX} onclick={() => setFontSize(fontSize + 1)}><Plus size={12} /></button>
+        <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Increase terminal text size" title="Larger text ({platformChord('⌘+', 'Ctrl+Shift++', $hostPlatform.os)})" disabled={fontSize >= TERMINAL_FONT_MAX} onclick={() => setFontSize(fontSize + 1)}><Plus size={12} /></button>
       </div>
     </div>
   {/if}

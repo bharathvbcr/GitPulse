@@ -2358,7 +2358,7 @@
             onclick={() => stageHunk(index)}
             disabled={stagingBlocked}
             title={stagingBlockedReason}
-            class="gp-btn ml-auto h-4 shrink-0 py-0! px-2! font-sans text-micro"
+            class="gp-btn ml-auto shrink-0 px-2! font-sans text-micro" data-size="sm"
             data-variant="ghost"
           >
             {isStaged ? "Unstage hunk" : "Stage hunk"}
@@ -2494,7 +2494,7 @@
             onclick={() => stageHunk(row.index)}
             disabled={stagingBlocked}
             title={stagingBlockedReason}
-            class="gp-btn ml-auto h-4 shrink-0 py-0! px-2! font-sans text-micro"
+            class="gp-btn ml-auto shrink-0 px-2! font-sans text-micro" data-size="sm"
             data-variant="ghost"
           >
             {isStaged ? "Unstage hunk" : "Stage hunk"}

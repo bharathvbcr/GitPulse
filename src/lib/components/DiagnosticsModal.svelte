@@ -348,7 +348,7 @@
             {#if backendStatus === "degraded" || backendStatus === "unavailable"}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! ml-auto"
+                class="gp-btn px-2! ml-auto" data-size="sm"
                 onclick={() => void beginBackendLoad()}
               >Try again</button>
             {/if}
@@ -358,7 +358,7 @@
             <div class="flex items-center gap-2" role="status" aria-live="polite">
               <span>{diagnosticPersistenceLabel($diagnosticHealth)}</span>
               {#if $diagnosticHealth.persistence === "memory-only"}
-                <button type="button" class="gp-btn py-0.5! px-2! ml-auto" onclick={() => diagnostics.retryPersistence()}>Try saving again</button>
+                <button type="button" class="gp-btn px-2! ml-auto" data-size="sm" onclick={() => diagnostics.retryPersistence()}>Try saving again</button>
               {/if}
             </div>
             {#if $diagnosticHealth.persistenceError}
@@ -456,7 +456,7 @@
               <span>{hiddenNotice}</span>
               <button
                 type="button"
-                class="gp-btn py-1! px-2.5! text-meta!"
+                class="gp-btn px-2.5! text-meta!" data-size="sm"
                 onclick={() => (filter = "all")}
               >
                 Show all

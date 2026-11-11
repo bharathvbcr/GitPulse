@@ -54,21 +54,21 @@
         onclick={() => (mode = "2up")}
         aria-pressed={mode === "2up"}
         data-active={mode === "2up" ? "true" : "false"}
-        class="gp-seg-btn py-0.5!"
+        class="gp-seg-btn"
       >2-up</button>
       <button
         type="button"
         onclick={() => (mode = "swipe")}
         aria-pressed={mode === "swipe"}
         data-active={mode === "swipe" ? "true" : "false"}
-        class="gp-seg-btn py-0.5!"
+        class="gp-seg-btn"
       >Swipe</button>
       <button
         type="button"
         onclick={() => (mode = "onion")}
         aria-pressed={mode === "onion"}
         data-active={mode === "onion" ? "true" : "false"}
-        class="gp-seg-btn py-0.5!"
+        class="gp-seg-btn"
       >Onion skin</button>
     </div>
   </div>

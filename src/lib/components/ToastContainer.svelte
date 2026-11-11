@@ -153,7 +153,7 @@
                   type="button"
                   onclick={() => handleAction(toast)}
                   aria-label="{toast.action.label}: {toast.message}"
-                  class="gp-btn py-0.5! px-2.5! text-meta font-semibold hover:border-accent/65"
+                  class="gp-btn px-2.5! text-meta font-semibold hover:border-accent/65" data-size="sm"
                 >
                   {toast.action.label}
                 </button>

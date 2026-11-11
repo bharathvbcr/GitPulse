@@ -1094,7 +1094,7 @@
           type="button"
           aria-pressed={mode === "shell"}
           data-active={mode === "shell" ? "true" : "false"}
-          class="gp-seg-btn text-meta! py-0.5!"
+          class="gp-seg-btn text-meta!"
           onclick={() => (mode = "shell")}
           title="A real interactive shell in this repository"
         >
@@ -1104,7 +1104,7 @@
           type="button"
           aria-pressed={mode === "console"}
           data-active={mode === "console" ? "true" : "false"}
-          class="gp-seg-btn text-meta! py-0.5!"
+          class="gp-seg-btn text-meta!"
           onclick={() => (mode = "console")}
           title="Run single commands with capped output and per-run policy verdicts"
         >

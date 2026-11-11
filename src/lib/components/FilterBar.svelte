@@ -39,7 +39,7 @@
       class="w-full bg-transparent text-textPrimary placeholder:text-faint text-xs focus:outline-hidden"
     />
     {#if $filterStore.searchQuery}
-      <button onclick={() => filterStore.setSearch("")} aria-label="Clear search" title="Clear search" class="gp-icon-btn p-0.5!">
+      <button onclick={() => filterStore.setSearch("")} aria-label="Clear search" title="Clear search" class="gp-icon-btn" data-size="sm">
         <X size={13} />
       </button>
     {/if}

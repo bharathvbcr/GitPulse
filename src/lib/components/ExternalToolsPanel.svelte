@@ -145,7 +145,7 @@
           <div class="flex shrink-0 items-center gap-1">
             <button
               type="button"
-              class="gp-btn py-0.5! px-2! text-micro"
+              class="gp-btn px-2! text-micro" data-size="sm"
               onclick={() => openSetupWizard(row.tool, "explain")}
             >
               Setup
@@ -153,7 +153,7 @@
             {#if installing === row.tool}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-micro inline-flex items-center gap-1"
+                class="gp-btn px-2! text-micro inline-flex items-center gap-1" data-size="sm"
                 onclick={() => void cancel()}
               >
                 <X size={10} />
@@ -162,21 +162,21 @@
             {:else}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-micro"
+                class="gp-btn px-2! text-micro" data-size="sm"
                 onclick={() => void toggleDisabled(row.tool, !row.disabled)}
               >
                 {row.disabled ? "Enable" : "Disable"}
               </button>
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-micro"
+                class="gp-btn px-2! text-micro" data-size="sm"
                 onclick={() => void uninstall(row.tool)}
               >
                 Uninstall
               </button>
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-micro inline-flex items-center gap-1"
+                class="gp-btn px-2! text-micro inline-flex items-center gap-1" data-size="sm"
                 disabled={!row.install_ready || installing !== null || row.disabled === true}
                 title={row.install_command}
                 onclick={() => void runInstall(row.tool)}

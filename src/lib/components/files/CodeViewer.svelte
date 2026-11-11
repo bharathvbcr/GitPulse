@@ -508,7 +508,7 @@
       <button
         type="button"
         onclick={() => (isSearchOpen = !isSearchOpen)}
-        class="gp-btn py-0.5! px-2! ml-2 flex items-center gap-1 text-meta {isSearchOpen ? 'border-accent bg-accent/15 text-accent' : ''}"
+        class="gp-btn px-2! ml-2 flex items-center gap-1 text-meta {isSearchOpen ? 'border-accent bg-accent/15 text-accent' : ''}" data-size="sm"
       >
         <Search size={11} />
         <span>Find</span>
@@ -518,7 +518,7 @@
       <button
         type="button"
         onclick={() => (goToLineOpen = true)}
-        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta"
+        class="gp-btn px-2! flex items-center gap-1 text-meta" data-size="sm"
       >
         <Hash size={11} />
         <span>Go to Line</span>
@@ -530,7 +530,7 @@
       <button
         type="button"
         onclick={() => (wordWrap = !wordWrap)}
-        class="gp-icon-btn p-1.5! {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
         title="Word wrap (edit mode)"
       >
         <WrapText size={13} />
@@ -539,7 +539,7 @@
       <button
         type="button"
         onclick={() => (showWhitespace = !showWhitespace)}
-        class="gp-icon-btn p-1.5! {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
         title="Show whitespace"
       >
         <span class="font-mono text-meta font-semibold">·_</span>
@@ -571,7 +571,7 @@
           onclick={startEdit}
           disabled={editBlockedReason !== null}
           title={editBlockedReason ?? undefined}
-          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-meta"
+          class="gp-btn px-2.5! flex items-center gap-1 text-meta" data-size="sm"
         >
           <Edit3 size={12} class="text-accent" />
           <span>Edit</span>
@@ -580,7 +580,7 @@
         <button
           type="button"
           onclick={cancelEdit}
-          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-meta text-textMuted"
+          class="gp-btn px-2.5! flex items-center gap-1 text-meta text-textMuted" data-size="sm"
         >
           <RotateCcw size={12} />
           <span>Cancel</span>
@@ -589,7 +589,7 @@
           type="button"
           onclick={saveChanges}
           disabled={isSaving || !hasUnsavedChanges}
-          class="gp-btn-primary py-1! px-3! flex items-center gap-1 text-meta"
+          class="gp-btn-primary px-3! flex items-center gap-1 text-meta" data-size="sm"
         >
           {#if isSaving}
             <Loader2 size={12} class="animate-spin" />
@@ -603,7 +603,7 @@
       <button
         type="button"
         onclick={handleCopy}
-        class="gp-btn py-1! px-2.5! flex items-center gap-1 text-meta"
+        class="gp-btn px-2.5! flex items-center gap-1 text-meta" data-size="sm"
         title="Copy whole file content"
       >
         {#if copied}
@@ -673,7 +673,7 @@
           type="button"
           onclick={prevMatch}
           disabled={matchCount === 0}
-          class="gp-btn py-1! px-2! flex items-center gap-1"
+          class="gp-btn px-2! flex items-center gap-1" data-size="sm"
           title="Previous match (Shift+Enter)"
         >
           <ChevronUp size={12} />
@@ -682,7 +682,7 @@
           type="button"
           onclick={nextMatch}
           disabled={matchCount === 0}
-          class="gp-btn py-1! px-2! flex items-center gap-1"
+          class="gp-btn px-2! flex items-center gap-1" data-size="sm"
           title="Next match (Enter)"
         >
           <ChevronDown size={12} />
@@ -690,7 +690,7 @@
         <button
           type="button"
           onclick={() => { isSearchOpen = false; searchQuery = ""; }}
-          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
           aria-label="Close find"
         >✕</button>
       </div>
@@ -717,8 +717,8 @@
         placeholder="Line number"
         class="gp-field w-24!"
       />
-      <button type="button" class="gp-btn-primary py-1! px-3! shrink-0" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn py-1! px-2! shrink-0" onclick={() => (goToLineOpen = false)}>Cancel</button>
+      <button type="button" class="gp-btn-primary px-3! shrink-0" data-size="sm" onclick={handleGoToLine}>Go</button>
+      <button type="button" class="gp-btn px-2! shrink-0" data-size="sm" onclick={() => (goToLineOpen = false)}>Cancel</button>
         </div>
       </div>
       <ScrollCue target={goToBar} axis="x" />

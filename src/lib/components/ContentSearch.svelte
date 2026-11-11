@@ -187,9 +187,9 @@
     <div class="flex items-center gap-1.5 min-w-0">
       <input class="gp-field flex-1 min-w-0 font-mono" placeholder="Revision (optional)" aria-label="Revision to search" bind:value={revision} />
       {#if running}
-        <button type="button" class="gp-btn shrink-0 py-1! px-2.5! text-meta! flex items-center gap-1" onclick={cancel}><X size={12} /> Cancel</button>
+        <button type="button" class="gp-btn shrink-0 px-2.5! text-meta! flex items-center gap-1" data-size="sm" onclick={cancel}><X size={12} /> Cancel</button>
       {:else}
-        <button type="submit" class="gp-btn shrink-0 py-1! px-2.5! text-meta!" disabled={!pattern}>Search</button>
+        <button type="submit" class="gp-btn shrink-0 px-2.5! text-meta!" data-size="sm" disabled={!pattern}>Search</button>
       {/if}
     </div>
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">

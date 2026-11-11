@@ -108,7 +108,7 @@
         </label>
         <select
           id="gp-agent-default-{launcher}"
-          class="gp-select text-meta py-0.5! flex-1 min-w-0"
+          class="gp-select text-meta flex-1 min-w-0" data-size="sm"
           data-testid="agent-default-{launcher}"
           disabled={busy}
           value={chosen(launcher)}

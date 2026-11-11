@@ -106,7 +106,7 @@
       min="1"
       {max}
       step="1"
-      class="gp-field text-meta py-0.5! w-16 text-right"
+      class="gp-field text-meta w-16 text-right" data-size="sm"
       data-testid={testid}
       disabled={busy}
       value={current}

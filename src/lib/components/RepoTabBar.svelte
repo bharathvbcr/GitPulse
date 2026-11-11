@@ -1772,7 +1772,7 @@
       data-testid="open-repo-tab"
       data-tour="repository"
       onclick={() => onOpen?.()}
-      class="gp-btn h-[26px] py-0! pl-2.5! pr-2! shrink-0 rounded-r-none! active:transform-none!"
+      class="gp-btn pl-2.5! pr-2! shrink-0 rounded-r-none! active:transform-none!"
     >
       <Plus size={13} class="text-accent" />
       <span class="hidden @min-[1100px]:inline">Open</span>
@@ -1792,7 +1792,7 @@
           recentsOpen = !recentsOpen;
         }}
         data-testid="open-repo-menu"
-        class="gp-btn h-[26px] py-0! px-1.5! rounded-l-none! border-l-0! active:transform-none!"
+        class="gp-btn px-1.5! rounded-l-none! border-l-0! active:transform-none!"
       >
         <ChevronDown size={13} />
       </button>

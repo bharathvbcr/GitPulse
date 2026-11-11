@@ -540,7 +540,7 @@
       <label class="relative flex-1 min-w-52">
         <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
         <input
-          class="gp-field w-full pl-7! py-2!"
+          class="gp-field w-full pl-7!"
           type="search"
           placeholder="Filter by branch, path, task or pull request"
           aria-label="Filter work rows"

@@ -1257,7 +1257,7 @@
               <label class="relative w-48">
                 <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
                 <input
-                  class="gp-field w-full pl-7! py-0.5!"
+                  class="gp-field w-full pl-7!" data-size="sm"
                   type="search"
                   placeholder="Filter issues"
                   aria-label="Filter issues"
