@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { runDevmapChecks, stressDevmap } from "./devmapChecks";
+  import { devmapCheckRows, runDevmapChecks, stressDevmap } from "./devmapChecks";
   import { onMount } from "svelte";
   import CodeGraphCanvas from "../src/lib/components/CodeGraphCanvas.svelte";
   import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
@@ -41,12 +41,16 @@
       checking = false;
     }
   }
-  // `?check=1` (the measurement runner) runs both suites and reports the verdict.
+  // `?check=1` (the browser runners) runs both suites and reports every guard
+  // that ran as its own row, then each suite's verdict: the runners refuse a
+  // page that reports only a handful of rows.
   async function reportChecks() {
     const results: Array<{ name: string; pass: boolean }> = [];
     const errors: string[] = [];
     for (const [name, stress] of [["runtime checks", false], ["stress checks", true]] as const) {
+      devmapCheckRows.length = 0;
       await runChecks(stress);
+      for (const row of devmapCheckRows) results.push({ name: `${name}: ${row.name}`, pass: row.pass });
       results.push({ name, pass: verdict.startsWith("PASS") });
       if (!verdict.startsWith("PASS")) errors.push(`${name}: ${verdict}`);
     }
