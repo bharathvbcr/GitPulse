@@ -18,7 +18,7 @@ One `role="tablist" aria-label="Workspace"` holds the surfaces and the repositor
 | 1 | Logo mark, non-interactive | — | The "GitPulse" wordmark leaves the chrome (decision D2) |
 | 2 | Fleet · Agents n · Tasks n | global | Become `role="tab"` in the same tab shell as repositories; close × stays beside the tab. `data-testid`s unchanged |
 | 3 | `gp-separator` | — | The one sanctioned hairline |
-| 4 | Repository tabs | per tab | All behaviour unchanged: pin, groups, stacks, dirty dot, conflicts, terminal count, preview, close, drag, keys, context menus, parked. Adds the overflow menu (§5) |
+| 4 | Repository tabs | per tab | All behaviour unchanged: pin, groups, stacks, dirty dot, conflicts, terminal count, preview, close, drag, keys, context menus, parked. Adds the overflow menu (§5). Each repository tab is a 28 px pill (`h-7`, 128 px minimum, 12 px icon), the height the stack and group heads already had; it used to shrink to its 18 px text line (decision D5) |
 | 5 | Window-drag spacer | — | `data-drag-zone`, `flex-1`, 48 px minimum (E3). Open no longer follows the last tab, so the free space sits before it |
 | 6 | + Open ▾ | global | Split pill: Open / Clone or recent. The first item of the global cluster, so its position is fixed (decision D4). Its recents menu aligns to the trigger's end edge |
 | 7 | Fetch all · workspace status | global | `WorkspaceActions`, still hidden with one tab or fewer |
@@ -30,7 +30,7 @@ One `role="tablist" aria-label="Workspace"` holds the surfaces and the repositor
 | Order | Control | Notes |
 |---|---|---|
 | 1 | View switcher | Four pills; the active one expands into its section tabs, inactive ones keep the hover flyout. DOM contract unchanged |
-| 2 | `ViewContextBar` content, folded inline | Only at ≥ 1600 px; below that it keeps its own 40 px row |
+| 2 | `ViewContextBar` content, folded inline | Only at ≥ 1600 px; below that it keeps its own 40 px row. Folded, the slot takes three shares of the free width to the drag spacer's one (spacer floor 48 px), so History's search grows into the bar rather than sitting input-sized beside an empty band; the slot's own background drags the window (decision D6) |
 | 3 | **Agents pill (this repository)** | Shows the most urgent attention among this repository's agents, ranked by the agent plane's `ATTENTION_REASONS` (needs-you › error › pending/blocked › finished), then the live count. Reads the plane through `scopeToRepository` and the per-session attention from `terminal/sessionActivity.ts` (`ATTENTION_EVENTS`); no second attention model. Click opens the Agents surface narrowed to this repository with `setAgentsRepositoryScope` (as Fleet's agent count already does). An unscanned or unprobed plane reads "unknown", never "0". Hidden when the repository has no agents and nothing unknown |
 | 4 | **Terminal pill** | The terminal toggle moves here from the status bar: the most-used control gets the most-seen row. It is the *same* control, not a copy: it renders `terminalPillView` (`terminal/statusPill.ts`, the session summary and hover menu another session is building in the main checkout right now) and calls `repoStore.toggleTerminal()`. Lane I relocates it after that work lands; it does not rebuild it. Shortcut label from `platformCopy` |
 | 5 | Uncommitted chip | Moves out of the switcher into the trailing cluster: the switcher says "where am I", the trailing cluster says "what state is this repository in" |
@@ -108,6 +108,9 @@ Landmarks: `header` (row 1), `nav "Views"` (row 2), `main`, `aside`, `footer`. T
 - **D2 Wordmark.** Drop "GitPulse" from the title bar (the menu bar and window title already say it; the welcome card keeps it). Decided: drop.
 - **D3 Sidebar Open.** With Open in the title row, the sidebar's Open icon is a third copy. Decided: retire it, rewriting the Sidebar.test.ts pin in the same commit.
 - **D4 Open placement.** + Open ▾ followed the last tab like a browser's new-tab control, so it moved whenever a tab opened or closed. Decided 2026-11-10 by the user: Open pinned right for a fixed position. It is the first control of the global cluster, after the drag spacer.
+
+- **D5 Repository tab height (2026-11-11, user).** "Increase the tab pill size." Repository tabs are 28 px pills, matching the stack and group heads.
+- **D6 One band, and the search takes the space (2026-11-11, user).** "Remove the separator line above, 2 headers should blend in." Rows 1 and 2 are one band of glass on macOS: where they meet, row 1 drops its bottom shade and drop shadow, row 2 drops its top sheen, and both drop their diagonal sheen (`app.css`, after the reduced-transparency rules; `--shadow-card-drop` is the card shadow without its top highlight). History's commit search fills its row up to 56 rem and, folded, grows into row 2 (§3). Its focus does not repaint the pill: no accent border, no ring; the caret marks the field. `harness/tab-switch.html` checks the join and the folded width.
 
 ## 10. Unverified until the app runs
 

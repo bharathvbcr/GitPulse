@@ -919,6 +919,49 @@
             for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
               !controls().inert && !$("[data-viewbar-surface]", row2));
+            // Rows 1 and 2 are one band of glass. Each used to draw its own edges, so
+            // where they met row 1's bottom shade and drop shadow sat on row 2's top
+            // sheen: a line across the window. The page stamps html.macos, where the
+            // glass is drawn, so this cannot pass by not applying.
+            check("header: rows 1 and 2 join with no seam: row 1 keeps only its top sheen, row 2 has no top sheen, neither a diagonal gradient", () => {
+              const layers = (el) => getComputedStyle(el).boxShadow.split(/,(?![^(]*\))/).map((s) => s.trim());
+              const top = layers(row1), below = layers(row2);
+              return document.documentElement.classList.contains("macos") &&
+                top.length === 1 && /0px 1px 0px 0px inset/.test(top[0]) &&
+                !below.some((s) => /0px 1px 0px 0px inset/.test(s)) && below.some((s) => /0px -1px 0px 0px inset/.test(s)) &&
+                getComputedStyle(row1).backgroundImage === "none" && getComputedStyle(row2).backgroundImage === "none";
+            });
+            // From 1600px the view's own row folds into row 2's slot. History's search
+            // used to stay input-sized there (about 180px) beside an empty drag band;
+            // it now shares the free width with the drag zone, which keeps its floor.
+            // The shell is sized by the viewport, so the page cannot widen row 2; it
+            // sends the fold signal the bar's ResizeObserver sends, then the real width.
+            const { reportViewBarWidth, FOLD_MIN_WIDTH } = await import("../src/lib/ui/headerSlots.ts");
+            const viewBefore = get(repoStore).activeTab;
+            repoStore.setActiveTab("history");
+            reportViewBarWidth(FOLD_MIN_WIDTH);
+            await sleepUntil(() => !!$("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement, 5000);
+            await settle();
+            const foldedSearch = $("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement;
+            const dragZone = $("[data-viewbar-controls] > [data-tauri-drag-region]:not([data-viewbar-context])", row2);
+            // At this 1400px row the view switcher fills most of it, and an
+            // input-sized pill already beats a squeezed drag zone. The switcher is
+            // hidden for the measurement, so the free width is wide and the claim
+            // is about where it goes: to the search, with the zone at its floor share.
+            const switcher = $("[data-viewbar-controls] > .relative", row2);
+            switcher.style.display = "none";
+            await settle();
+            check("header: folded into row 2 with free width, History's search takes it (over 400px, more than twice the drag zone) and the zone keeps its 48px floor", () => {
+              const searchWidth = foldedSearch?.getBoundingClientRect().width ?? -1;
+              const zoneWidth = dragZone?.getBoundingClientRect().width ?? -1;
+              if (searchWidth > 400 && searchWidth > 2 * zoneWidth && zoneWidth >= 48 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`search ${searchWidth}px, drag zone ${zoneWidth}px, row 2 ${row2.clientWidth}px wide / ${row2.scrollWidth}px content, active view ${get(repoStore).activeTab}`);
+            });
+            switcher.style.display = "";
+            reportViewBarWidth(row2.getBoundingClientRect().width);
+            repoStore.setActiveTab(viewBefore);
+            await sleepUntil(() => !$("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement, 5000);
+            await settle();
             // The Tasks surface, mounted in the real App on this page's fixture. A
             // list the fixture answered in the wrong shape made it say "Couldn't
             // load tasks. Task storage returned an invalid response." in every

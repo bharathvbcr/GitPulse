@@ -25,8 +25,14 @@
      inert on the rest. It now sits inside History's section bar, which is the
      only place it filters anything. -->
 <div class="flex-1 min-w-0 flex items-center gap-3 text-xs select-none">
+  <!-- The pill takes the bar's free width, up to 56rem: the section bar holds
+       nothing else but the graph's list segment and the branch chip, and in
+       the view bar (1600px and wider) it shares the space with the drag zone.
+       Focus does not repaint it (no accent border, no ring); the caret marks
+       the field. -->
   <div
-    class="flex-1 max-w-xl flex items-center gap-2 bg-background border border-edgeStrong rounded-full px-3 py-1 transition-colors focus-within:border-accent/65 focus-within:shadow-(--ring-focus)"
+    class="flex-1 min-w-0 max-w-4xl flex items-center gap-2 bg-background border border-edgeStrong rounded-full px-3 py-1"
+    data-commit-filter
   >
     <Search size={14} class="text-textMuted shrink-0" />
     <input

@@ -59,7 +59,7 @@
     bind:this={content}
     role="group"
     aria-label={label}
-    class="flex min-w-0 items-center gap-3 {folded ? '' : 'flex-1'}"
+    class="flex min-w-0 flex-1 items-center gap-3"
   >
     {@render children()}
   </div>

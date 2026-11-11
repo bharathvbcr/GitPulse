@@ -1053,9 +1053,10 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --c-syntax-punctuation: oklch(0.76 0.03 265);
 
     /* Elevation. Soft, layered, low-contrast — bubbles, not boxes. */
-    --shadow-card:
-      inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3),
-      0 10px 28px -18px rgb(0 0 0 / 0.65);
+    /* The drop alone, for a surface whose top edge joins another (the view
+       bar under the title row); --shadow-card adds the top highlight. */
+    --shadow-card-drop: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px -18px rgb(0 0 0 / 0.65);
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), var(--shadow-card-drop);
     --shadow-pop:
       0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
     --shadow-float:
@@ -1118,9 +1119,8 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --c-syntax-variable: oklch(0.475 0.15 280);
     --c-syntax-punctuation: oklch(0.45 0.03 265);
 
-    --shadow-card:
-      inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
-      0 12px 32px -20px rgb(38 46 76 / 0.25);
+    --shadow-card-drop: 0 1px 2px rgb(38 46 76 / 0.06), 0 12px 32px -20px rgb(38 46 76 / 0.25);
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.8), var(--shadow-card-drop);
     --shadow-pop:
       0 2px 8px -2px rgb(38 46 76 / 0.08),
       0 18px 44px -16px rgb(38 46 76 / 0.22);
@@ -2079,6 +2079,25 @@ html.macos[data-transparency="reduced"] :is(.gp-scrim, .backdrop-blur-sm) {
 html.macos[data-transparency="reduced"] .gp-liquid-selection {
   background: rgb(var(--c-surface-hover));
   border-color: rgb(var(--c-accent));
+}
+
+/* The title row and the view bar under it are one band of chrome. Each is a
+   glass slab on its own, so where they met the upper one drew its bottom
+   shade and drop shadow and the lower one its top sheen: a seam across the
+   window. Joined, the pair keeps only the band's outer edges, and both drop
+   their diagonal sheen (two gradients each sized to its own row cannot meet
+   without a step). The fill is the same token on both, so nothing marks the
+   join. Placed after every glass and reduced-transparency rule so it wins in
+   all of them. */
+html.macos .gp-glass.gp-repo-tabs:has(+ .gp-glass.gp-repo-tabs) {
+  background-image: none;
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen);
+}
+html.macos .gp-glass.gp-repo-tabs + .gp-glass.gp-repo-tabs {
+  background-image: none;
+  box-shadow:
+    inset 0 -1px 0 var(--mac-glass-shade),
+    var(--shadow-card-drop);
 }
 
 .overflow-auto,

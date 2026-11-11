@@ -163,10 +163,21 @@
       <ScrollCue target={scroller} axis="x" diffuse />
     </div>
 
-    <!-- The view's own toolbar lands here from 1600px (ViewContextBar). -->
-    <div bind:this={slot} class="flex min-w-0 items-center gap-3 empty:hidden" data-viewbar-context></div>
+    <!-- The view's own toolbar lands here from 1600px (ViewContextBar). It
+         takes three shares of the free width to the drag spacer's one, so
+         History's search pill grows into the bar instead of staying
+         input-sized beside an empty band; the spacer keeps a 48px floor so
+         the window can always be grabbed. The slot's own background is a
+         drag region too: the bare attribute starts a drag only on a direct
+         hit, so the controls inside keep their clicks. -->
+    <div
+      bind:this={slot}
+      class="flex min-w-0 flex-[3] items-center gap-3 empty:hidden"
+      data-viewbar-context
+      data-tauri-drag-region
+    ></div>
 
-    <div class="h-full min-w-4 flex-1" data-tauri-drag-region></div>
+    <div class="h-full min-w-12 flex-1" data-tauri-drag-region></div>
 
     {#if agents.state !== "none"}
       <button

@@ -1379,7 +1379,7 @@
       closeCard();
     }}
     ondragend={endDrag}
-    class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,opacity] {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
+    class="group relative h-7 min-w-32 pr-1.5 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,opacity] {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
       ? 'opacity-60'
       : ''} {dropHere ? 'border-accent/35' : ''} {repoTabChrome(tab)}"
   >
@@ -1419,12 +1419,12 @@
         }
       }}
       ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
-      class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+      class="h-full pl-3 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
     >
       {#if tab.pinned}
-        <Pin size={10} class="text-accent shrink-0" />
+        <Pin size={11} class="text-accent shrink-0" />
       {:else}
-        <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-danger' : 'text-accent'}" />
+        <FolderGit2 size={12} class="shrink-0 {tab.error ? 'text-danger' : 'text-accent'}" />
       {/if}
       <span class="whitespace-nowrap font-medium {tab.watch === 'parked' ? 'opacity-60' : ''}">{tab.label}</span>
       {#if tab.watch === "parked"}
@@ -1548,7 +1548,7 @@
         onkeydown={(e) => onStackKeydown(e, info)}
       >
         <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary" />
-        <Layers size={11} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
+        <Layers size={12} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
         <span class="whitespace-nowrap">{info.label}</span>
         <span class="text-micro tabular-nums font-mono opacity-70">({info.tabCount})</span>
       </button>
@@ -1574,7 +1574,7 @@
         onkeydown={(e) => onStackKeydown(e, info)}
         class="h-7 pl-2.5 pr-1 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
       >
-        <Layers size={11} class="shrink-0 {current.error ? 'text-danger' : 'text-accent'}" />
+        <Layers size={12} class="shrink-0 {current.error ? 'text-danger' : 'text-accent'}" />
         <span class="whitespace-nowrap font-medium">{info.label}</span>
         {#if member.primary}
           {#if current.currentBranch}
