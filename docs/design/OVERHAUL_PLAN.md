@@ -316,6 +316,66 @@ The lane list is a starting partition. Before launch, `rg --files src/lib/compon
 - The native Liquid Glass flag, built with `apply_liquid_glass` behind an off-by-default setting. Measure shell-idle and menu-open frame time with and without it on macOS 26+, then decide.
 - Re-run the four audits with the same prompts and compare the numbers against §2.
 
+**Wave 3 status (2026-11-10, evening).** The user said to work on everything and leave no gaps, so nothing waits on the main checkout any more.
+- **Base.** `overhaul/wave-3-base` starts from the `overhaul/wave-2` tip cf0b0b7e and adds:
+  - W1b and S, merged;
+  - a snapshot commit of the owner's uncommitted terminal pill, shortcut guide and header edits, frozen from main at 16:15;
+  - the design docs, committed.
+- **Main's files are untouched.** When the owner commits that work, run `git merge-tree` on that commit against the overhaul tip before anything lands on main.
+- **Not in the snapshot.** Main's `TerminalDock`, tasks harness, `BranchList`, `CommitComposer` and proposals edits were still changing at 15:47, so expect conflicts there.
+- **Lanes D and I ran in parallel.** D3 moved to lane D, and lane F took every outstanding handoff.
+
+**Decided 2026-11-10 (user): E4.** ⌘1–9 switch repository tabs, and ⌘9 selects the last tab.
+- The views move off ⌘1–3, to ⌥⌘1–3 on macOS and Ctrl+Shift+1–3 on Windows and Linux. That avoids AltGr and the macOS screenshot chords.
+- Wave 4 lane K implemented this.
+
+**Decided 2026-11-10 (user): Open pinned right.** The "+ Open ▾" split pill is the first control of the right-hand cluster, after the window-drag zone and before Fetch all, so it no longer moves as tabs open and close.
+- The drag zone keeps its 48 px floor (E3).
+- The recents menu aligns to the pill's end edge.
+- Wave 4 lane O implemented this, and it is recorded as HEADER_SPEC decision D4.
+
+**Decided 2026-11-10 (user): three-line branch rows.** The sidebar branch row has three lines:
+1. name and chips;
+2. churn, divergence, files and freshness;
+3. last-commit age (tinted when stale) and author.
+
+`three-line` is the default, and a stored `two-line` migrates to it once. Two-line and one-line stay selectable. Measured heights are 62 px spacious and 56 px compact. Wave 4 lane T implemented this.
+
+**Decided 2026-11-11 (orchestrator, not yet confirmed by the user).**
+- **Docked sidebar.** It stays the default and now slides on transform and opacity, reflowing the workspace once rather than every frame (Wave 5 lane B). The alternative was to make overlay the default.
+- **Surface names are proper nouns:** Settings, Tasks, Fleet, Agents, Work, Code, History and Insights.
+- **Case.** Command-palette labels use sentence case. Native macOS menus keep title case (Apple HIG). The two may differ in case, never in wording, and a test enforces that.
+- **Metric numerals** use a new 24 px `--text-display` step.
+- **`--text-xs` line height** stays 1.333, not 1.45, so 315 uses don't reflow.
+
+### Wave 5: closing every gap the final audits found
+
+The two final audits (`tmp/overhaul/audit-final/`) found about 30 gaps at the Wave 4 tip. Nothing was worse than at the start, but the design-lint read only `.svelte` markup, so it reported zero while gaps remained.
+
+**Lint first.** Lane L2 widened the lint before anyone fixed anything:
+- It now reads `app.css`, `<style>` blocks and `.ts` user strings.
+- It found a walker that had skipped every `coverage/` directory.
+- It added rules 17 (an undefined `gp-*` class) and 18 (an unused one).
+
+**Fixing lanes, each owning its own files:**
+- **A (shell and styles):** the type tokens and the display step; rule 1 also reads rem/em/% and the `font:` shorthand; the "3 more" tint box; the dock exit; the boot colour contract; the drop overlay.
+- **B (sidebar):** the transform-only docked slide, the rail clip, the scroll fade and the light floating edge.
+- **C (copy):** glossary copy across the `.ts` files.
+- **E (settings and dialogs):** the "Header button labels" setting restored, the scroll-edge fade on dialogs, the dialog exits, and a lazy notification bridge (−2,688 B).
+- **F (panels):** selects, checkboxes, skeletons and empty states.
+- **S (task surfaces):** type scale and sweep.
+- **Z:** no idle render loop; a capture artifact, plus idle-stability checks.
+
+**Residue lanes and the final pass:**
+- **R1, R2, R3 and the final lane** cleared the remaining 201 off-scale sizes, the remaining copy, and "could not", which is now retired by rule 14.
+- **The code map fit.** The never-registered `devmap` harness, once registered, exposed a real code-map bug: the first fit ignored the toolbar growing, leaving the graph 28 px off-centre.
+- **Exits.** Every placed popover now leaves through one shared 70 ms exit.
+
+**Final tip:** `overhaul/wave-5-final`.
+- 0 deferred lint entries, with 6 reasoned `allow` entries.
+- 909/909 test files and 13,687 tests pass.
+- The entry chunk is 634,421 B against the 640,000 budget.
+
 ## 8. Lane brief template (Sonnet)
 
 Each lane gets this brief, filled in:
