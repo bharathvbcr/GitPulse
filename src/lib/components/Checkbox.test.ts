@@ -108,7 +108,7 @@ describe("Checkbox", () => {
       expect(boxTag(render(Checkbox, { props: { ariaLabel: "x" } }).body)).not.toMatch(/\sdisabled(\s|=|>)/);
     });
 
-    it("shows focus through the global input:focus-visible ring and removes none of it", () => {
+    it("shows focus through the global checkbox focus-visible ring and removes none of it", () => {
       expect(source).not.toMatch(/outline-none|outline-hidden|focus:outline|focus-visible:/);
     });
 

@@ -733,7 +733,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
                       role, which holds 4.5:1 on every surface in both themes;
        checked        accent fill, `--c-on-accent` glyph;
        indeterminate  accent fill, a bar in place of the tick;
-       focus          the global `input:focus-visible` ring;
+       focus          the global `input[type="checkbox"]:focus-visible` ring;
        disabled       dimmed to the .4 every control uses.
      Only colors animate, at `--gp-dur-instant`; the glyph appears with the
      fill and has no transition of its own. */
@@ -1280,14 +1280,30 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     background-color: rgb(var(--c-accent) / 0.32);
   }
 
+  /* Keyboard focus is a ring on the controls you operate: buttons, tabs,
+     boxes, sliders, colour and file pickers, selects. A text box you type
+     into (text, search, number, time…) carries none; its
+     caret marks it (owner decision 2026-11-11: "don't highlight this when
+     typing", then "turn off the global highlighting rule"). A focused text
+     box always matches :focus-visible, so this rule used to draw a box
+     inside every search pill while typing. Forced colours below still
+     outline every focused field, text included. */
   button:focus-visible,
   [role="button"]:focus-visible,
   [role="tab"]:focus-visible,
-  input:focus-visible,
-  textarea:focus-visible,
+  input[type="checkbox"]:focus-visible,
+  input[type="radio"]:focus-visible,
+  input[type="range"]:focus-visible,
+  input[type="color"]:focus-visible,
+  input[type="file"]:focus-visible,
   select:focus-visible {
     outline: none;
     box-shadow: var(--ring-focus);
+  }
+
+  input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]):focus-visible,
+  textarea:focus-visible {
+    outline: none;
   }
 }
 

@@ -72,7 +72,7 @@ Surfaces (exist): `--c-bg`, `--c-surface`, `--c-surface-hover`, `--c-border`.
 Ink (exist): `--c-text`, `--c-text-muted`. Add `--c-text-faint` (disabled/placeholder, light-mode remap-safe, replaces every `text-textMuted/40..80`).
 Accent (exist): `--c-accent`. Add `--c-on-accent` (text on an accent fill; white in dark, computed in light).
 Status (new, both themes, replaces the light-only `--c-status-*` zoo [verified app.css:458–472] and the 889 raw palette lines): `--c-ok`, `--c-warn`, `--c-danger`, `--c-info`, `--c-unknown` (the "could not determine" tone: neutral slate, deliberately *not* grey-as-disabled), each with a paired `--c-on-ok`… for filled chips. Mapping of today's zoo: emerald/green/teal → ok; amber/yellow/orange → warn; rose/red → danger; sky/cyan/blue/indigo → info; purple → accent or info (decide per site); zinc/slate → unknown.
-Focus (exists): `--ring-focus`, derived from accent.
+Focus (exists): `--ring-focus`, derived from accent. The global rule rings operated controls only; text boxes being typed in are marked by their caret (2026-11-11), and forced colours still outline them.
 Brand (exists): `--brand-gradient`; **restrict to the primary button, the slider thumb and the splash**. Nothing else is gradient.
 
 Tailwind side: `@theme` gains `--color-ok: rgb(var(--c-ok))` etc., so components write `text-ok`, `bg-warn/15`, `border-danger/40`. The light-mode `[class~=…]` remap block [verified app.css:502–653] and the 277 `dark:` pairs are retired **last**, once no component names a palette color (migration order §13).

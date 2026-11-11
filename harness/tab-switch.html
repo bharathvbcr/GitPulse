@@ -958,6 +958,24 @@
               throw new Error(`search ${searchWidth}px, drag zone ${zoneWidth}px, row 2 ${row2.clientWidth}px wide / ${row2.scrollWidth}px content, active view ${get(repoStore).activeTab}`);
             });
             switcher.style.display = "";
+            // Typing in the search must not paint it: no accent edge or ring on the
+            // pill, and no global input:focus-visible ring on the input inside it.
+            const filterInput = $("#gitpulse-filter", row2);
+            const pillEdge = getComputedStyle(foldedSearch).borderTopColor;
+            filterInput.focus();
+            filterInput.value = "fix";
+            filterInput.dispatchEvent(new Event("input", { bubbles: true }));
+            await settle();
+            check("header: typing in History's search draws no ring or accent edge on the input or its pill", () => {
+              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
+              const shadows = [getComputedStyle(filterInput).boxShadow, getComputedStyle(foldedSearch).boxShadow];
+              const edge = getComputedStyle(foldedSearch).borderTopColor;
+              if (document.activeElement === filterInput && shadows.every(noShadow) && edge === pillEdge) return true;
+              throw new Error(`focused ${document.activeElement === filterInput}, shadows ${JSON.stringify(shadows)}, edge ${pillEdge} -> ${edge}`);
+            });
+            filterInput.value = "";
+            filterInput.dispatchEvent(new Event("input", { bubbles: true }));
+            filterInput.blur();
             reportViewBarWidth(row2.getBoundingClientRect().width);
             repoStore.setActiveTab(viewBefore);
             await sleepUntil(() => !$("[data-viewbar-context] #gitpulse-filter", row2)?.parentElement, 5000);

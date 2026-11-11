@@ -84,7 +84,7 @@
        the free width of the toolbar row it opened in; a fixed width wrapped
        onto a line of its own in the diff's 900px toolbar, which is the
        second row this replaced. Focus does not repaint it: the caret marks
-       the field. -->
+       the field (text boxes carry no global focus ring; app.css). -->
   <div role="search" aria-label={label} class="find-open flex h-7 min-w-60 max-w-80 shrink grow basis-64 items-center gap-0.5 rounded-full border border-edgeStrong bg-background pl-2.5 pr-0.5" data-find-field>
     <Search size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
     <input

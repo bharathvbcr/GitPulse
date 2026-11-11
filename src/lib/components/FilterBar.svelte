@@ -29,7 +29,7 @@
        nothing else but the graph's list segment and the branch chip, and in
        the view bar (1600px and wider) it shares the space with the drag zone.
        Focus does not repaint it (no accent border, no ring); the caret marks
-       the field. -->
+       the field (text boxes carry no global focus ring; app.css). -->
   <div
     class="flex-1 min-w-0 max-w-4xl flex items-center gap-2 bg-background border border-edgeStrong rounded-full px-3 py-1"
     data-commit-filter

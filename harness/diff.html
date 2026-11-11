@@ -184,6 +184,14 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
   const input=field().querySelector("input");
   input.value="two";input.dispatchEvent(new Event("input",{bubbles:true}));await until(()=>/of/.test(field().querySelector("[data-find-status]")?.textContent??""),"match count");
   check("a query shows its match count inside the field",()=>/^1 of [1-9]/.test(field().querySelector("[data-find-status]").textContent.trim()));
+  // The global focus ring drew a box inside the pill while typing. Chromium
+  // treats this programmatic focus as :focus-visible, so the rule is
+  // exercised there; WebKit does not, and the shadows are checked anyway.
+  check("typing draws no focus ring: neither the focused input nor its pill has a box shadow",()=>{
+   const shadows=[getComputedStyle(input).boxShadow,getComputedStyle(field()).boxShadow];
+   if(document.activeElement===input&&shadows.every(s=>s==="none"||/^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s)))return true;
+   throw new Error(`focused ${document.activeElement===input}, focus-visible ${input.matches(":focus-visible")}, shadows ${JSON.stringify(shadows)}`);
+  });
   input.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true}));await tick();
   check("Enter steps to the next match",()=>/^2 of /.test(field().querySelector("[data-find-status]").textContent.trim()));
   input.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));await until(()=>!field(),"find closed");

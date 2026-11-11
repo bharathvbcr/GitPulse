@@ -149,7 +149,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 ## 5. Accessibility
 
 - Text contrast ≥ 4.5:1 and non-text ≥ 3:1 against the worst surface, for every theme, accent, imported theme and material setting. The runtime guard `src/lib/ui/color/guard.ts` and the contract tests use the same function.
-- Targets ≥ 24×24 CSS px. Focus is always visible through `--ring-focus`.
+- Targets ≥ 24×24 CSS px. Focus on an operated control (button, tab, box, slider, select) is always visible through `--ring-focus`. A text box being typed in carries no global ring; its caret marks it (owner decision 2026-11-11). Forced colours outline every focused field, text included. `gp-field` keeps its own accent edge and ring.
 - System Reduce Motion, Reduce Transparency (via the native bridge, because WebKit does not implement the media feature, verified 2026-11-09), Increase Contrast and forced colors override every app setting.
 - Never use color alone to carry meaning. Pair a tone with an icon or a word.
 

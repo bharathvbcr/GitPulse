@@ -28,9 +28,22 @@ describe("focus is visible when the system paints the colours", () => {
     expect(forced).toMatch(/outline:\s*2px solid Highlight/);
   });
 
-  it("covers every role the base focus rule covers", () => {
+  it("rings every operated control, and forced colours outline those plus every text field", () => {
     const base = block("  button:focus-visible");
     const forced = block("@media (forced-colors: active)");
+    for (const role of [
+      "button:focus-visible",
+      '[role="button"]:focus-visible',
+      '[role="tab"]:focus-visible',
+      'input[type="checkbox"]:focus-visible',
+      'input[type="radio"]:focus-visible',
+      'input[type="range"]:focus-visible',
+      'input[type="color"]:focus-visible',
+      'input[type="file"]:focus-visible',
+      "select:focus-visible",
+    ]) {
+      expect(base).toContain(role);
+    }
     for (const role of [
       "button:focus-visible",
       '[role="button"]:focus-visible',
@@ -39,9 +52,17 @@ describe("focus is visible when the system paints the colours", () => {
       "textarea:focus-visible",
       "select:focus-visible",
     ]) {
-      expect(base).toContain(role);
       expect(forced).toContain(role);
     }
+  });
+
+  it("draws no ring on a text box being typed in (owner decision 2026-11-11)", () => {
+    // A focused text box always matches :focus-visible, so the base ring drew
+    // a box inside every search pill while typing. The caret marks it; the
+    // forced-colours outline above still applies.
+    const base = block("  button:focus-visible");
+    expect(base).not.toMatch(/^\s*input:focus-visible,?$/m);
+    expect(base).not.toMatch(/^\s*textarea:focus-visible,?$/m);
   });
 
   it("uses system colour keywords rather than theme tokens", () => {
