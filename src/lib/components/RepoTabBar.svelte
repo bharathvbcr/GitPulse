@@ -581,10 +581,11 @@
     onDismiss: () => closeStripMenu(),
   });
 
-  // Anchored to the trigger and clamped to the window: Open now sits beside
-  // the tabs rather than at the right edge, so the menu cannot assume room.
+  // Anchored to the trigger's END edge and clamped to the window: Open sits
+  // near the window's right edge, so a start-aligned 320px menu would spill
+  // off it.
   const recentsPlacement = $derived({
-    anchor: { kind: "element" as const, element: recentsTriggerEl, gap: 6, align: "start" as const },
+    anchor: { kind: "element" as const, element: recentsTriggerEl, gap: 6, align: "end" as const },
     estimate: { width: 320, height: 320 },
     inset: 8,
     revision: $repoStore.recentRepos.length,
@@ -1750,12 +1751,17 @@
       </div>
     {/if}
 
-    <!-- Open follows the strip like a browser's new-tab control, and the drag
-         zone after it keeps a 48px minimum (E3): the tab strip scrolls before
-         that space shrinks, so the window can always be grabbed.
-         Open and its menu arrow are one split pill: Open's square right edge
-         is the divider, the arrow drops its own left border, and `-ml-1.5`
-         takes back the strip's gap between them. -->
+    <!-- The window-drag zone (E3). `min-w-12` is the 48px floor: the free
+         space belongs to the strip until it is gone, but never below this, so
+         the window can always be grabbed. A bare drag-region attribute starts
+         a drag only on a direct hit, so nothing clickable is affected. -->
+    <div class="h-full min-w-12 flex-1 self-stretch" data-tauri-drag-region data-drag-zone></div>
+
+    <!-- Open is pinned to the right of the title row, the first control of the
+         right-hand cluster, so its position never shifts as tabs open and
+         close. Open and its menu arrow are one split pill: Open's square
+         right edge is the divider, the arrow drops its own left border, and
+         `-ml-1.5` takes back the strip's gap between them. -->
     <button
       type="button"
       title="Open repository"
@@ -1858,12 +1864,6 @@
         </div>
       {/if}
     </div>
-
-    <!-- The window-drag zone (E3). `min-w-12` is the 48px floor: the free
-         space belongs to the strip until it is gone, but never below this. A
-         bare drag-region attribute starts a drag only on a direct hit, so
-         nothing clickable is affected. -->
-    <div class="h-full min-w-12 flex-1 self-stretch" data-tauri-drag-region data-drag-zone></div>
 
     <!-- Workspace-wide actions live here rather than in a view: they act on
          every open repository, so they belong to the title bar that owns

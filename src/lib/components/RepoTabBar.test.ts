@@ -48,18 +48,29 @@ describe("RepoTabBar", () => {
     expect(source).toContain("aria-label={surfaceCount > 0 ? `${spec.label}, ${surfaceCount} ${spec.countNoun ?? \"\"}`.trim() : spec.label}");
   });
 
-  it("orders the title bar: the tablist, Open beside it, the drag zone, then the workspace actions", () => {
-    // Open follows the strip like a browser's new-tab control, and the free
-    // space after it is the window-drag zone (E3), not margin in front of
-    // Open: the strip scrolls before that space shrinks below 48px.
+  it("opens the recent-repositories menu aligned to the trigger's end edge", () => {
+    // Open sits at the right edge now, so a start-aligned 320px menu would
+    // spill off the window.
+    const placement = source.slice(source.indexOf("const recentsPlacement"), source.indexOf("estimate: { width: 320"));
+    expect(placement).toContain('align: "end"');
+    expect(placement).not.toContain('align: "start"');
+  });
+
+  it("orders the title bar: the tablist, the drag zone, Open pinned right, then the workspace actions", () => {
+    // Open is the first control of the right-hand cluster, so its position is
+    // fixed rather than following the last tab. The free space before it is
+    // the window-drag zone (E3): the strip scrolls before that space shrinks
+    // below 48px.
     const tabs = source.indexOf('aria-label="Workspace"');
-    const open = source.indexOf('data-testid="open-repo-tab"');
     const zone = source.indexOf("data-drag-zone");
+    const open = source.indexOf('data-testid="open-repo-tab"');
+    const menu = source.indexOf('data-testid="open-repo-menu"');
     const actions = source.indexOf("<WorkspaceActions");
     expect(tabs).toBeGreaterThan(-1);
-    expect(open).toBeGreaterThan(tabs);
-    expect(zone).toBeGreaterThan(open);
-    expect(actions).toBeGreaterThan(zone);
+    expect(zone).toBeGreaterThan(tabs);
+    expect(open).toBeGreaterThan(zone);
+    expect(menu).toBeGreaterThan(open);
+    expect(actions).toBeGreaterThan(menu);
     const zoneTag = source.slice(source.lastIndexOf("<div", zone), source.indexOf("></div>", zone));
     expect(zoneTag).toContain("min-w-12");
     expect(zoneTag).toContain("flex-1");
