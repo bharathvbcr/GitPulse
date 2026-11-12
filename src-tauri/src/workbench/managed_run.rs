@@ -487,6 +487,20 @@ pub(super) fn follow_up_with(
     follow_up_answer(call(OP_CONTINUE, continue_params(id, request_id, message)))
 }
 
+/// Delivers an A2A peer message to a live managed run when it is parked between
+/// turns (`Request::AgentDeliver`), using the profile worker's `work.runs.managed.continue`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn deliver_peer_follow_up(
+    state: &WorkbenchState,
+    id: &str,
+    request_id: &str,
+    message: &str,
+) -> Result<Value, WorkbenchError> {
+    follow_up_with(state, id, Some(request_id), Some(message), |op, params| {
+        state.worker_call_current(op, params)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

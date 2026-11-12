@@ -1,7 +1,9 @@
 import { writable } from "svelte/store";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { isSessionId, type LauncherKind, type SessionKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
+import { formatError } from "../ui/formatError";
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
@@ -62,6 +64,8 @@ interface LaunchRequest {
   prompt?: string;
   /** A browser session's first address (`requestBrowser`); absent otherwise. */
   url?: string;
+  /** Pre-arms quiescent peer auto-wake on unattended kickoff launches. */
+  autoWake?: boolean;
   complete(error?: string): void;
 }
 
@@ -121,12 +125,18 @@ export function createTerminalLaunchRequests() {
     forget(id: string) {
       sessions.update(rows => rows.filter(row => row.id !== id));
     },
-    async request(repoPath: string, launcher: SessionKind, prompt?: string, signal?: AbortSignal): Promise<void> {
+    async request(
+      repoPath: string,
+      launcher: SessionKind,
+      prompt?: string,
+      signal?: AbortSignal,
+      options?: { autoWake?: boolean },
+    ): Promise<void> {
       // Validates here, at the boundary, so a bad prompt is refused before a
       // panel is asked to open a tab for it. A promptless launch returns null
       // for every launcher, which is what makes "new shell" fit this channel.
       agentPromptArgs(launcher, prompt);
-      return enqueue({ repoPath, launcher, prompt }, signal);
+      return enqueue({ repoPath, launcher, prompt, ...(options?.autoWake ? { autoWake: true } : {}) }, signal);
     },
     /**
      * A browser session on `url` in `repoPath`'s dock: a session already on
@@ -158,3 +168,87 @@ export function createTerminalLaunchRequests() {
 }
 
 export const terminalLaunchRequests = createTerminalLaunchRequests();
+
+export const AGENT_KICKOFF_EVENT = "gitpulse-agent-kickoff";
+const MAX_QUEUED_KICKOFF = 8;
+const KICKOFF_WAIT_MS = 10_000;
+
+export interface AgentKickoffRequest {
+  repo: string;
+  provider: PromptLauncher;
+  prompt: string;
+  autoWake: boolean;
+}
+
+export function parseAgentKickoffRequest(payload: unknown): AgentKickoffRequest | null {
+  if (!payload || typeof payload !== "object") return null;
+  const raw = payload as Record<string, unknown>;
+  if (typeof raw.repo !== "string" || !raw.repo || raw.repo.length > 4096) return null;
+  if (!isPromptLauncher(raw.provider)) return null;
+  if (typeof raw.prompt !== "string" || !raw.prompt.trim()) return null;
+  try {
+    agentPromptArgs(raw.provider, raw.prompt);
+  } catch {
+    return null;
+  }
+  return {
+    repo: raw.repo,
+    provider: raw.provider,
+    prompt: raw.prompt,
+    autoWake: raw.auto_wake === true,
+  };
+}
+
+/** Listens for unattended `gitpulse_kickoff_agent` (`spawn: "terminal"`) requests. */
+export async function installAgentKickoffRequests(): Promise<UnlistenFn> {
+  const [{ repoStore }, { toastStore }] = await Promise.all([
+    import("../stores/repoStore"),
+    import("../stores/toastStore"),
+  ]);
+  const waiting: AgentKickoffRequest[] = [];
+  let draining = false;
+  const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
+
+  async function drain(): Promise<void> {
+    if (draining) return;
+    draining = true;
+    try {
+      for (let next = waiting.shift(); next; next = waiting.shift()) {
+        try {
+          let canonical: string | null = null;
+          const opened = await repoStore.openRepo(next.repo, {
+            activate: true,
+            onReady: (path) => (canonical = path),
+          });
+          const targetRepo = opened ? (canonical ?? next.repo) : null;
+          if (!targetRepo) throw new Error(`${next.repo} could not be opened`);
+          repoStore.setTerminalOpen(true);
+          for (let waited = 0; terminalLaunchRequests.busy; waited += 100) {
+            if (waited >= KICKOFF_WAIT_MS) throw new Error("another terminal launch is still pending");
+            await sleep(100);
+          }
+          await terminalLaunchRequests.request(targetRepo, next.provider, next.prompt, undefined, {
+            autoWake: next.autoWake,
+          });
+        } catch (cause) {
+          toastStore.error(`An agent kickoff session did not open: ${formatError(cause)}`);
+        }
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
+  return listen(AGENT_KICKOFF_EVENT, (event) => {
+    const request = parseAgentKickoffRequest(event.payload);
+    if (!request) return;
+    if (waiting.length >= MAX_QUEUED_KICKOFF) {
+      toastStore.error(
+        `An agent kickoff session was not opened: ${MAX_QUEUED_KICKOFF} requests are already waiting.`,
+      );
+      return;
+    }
+    waiting.push(request);
+    void drain();
+  });
+}

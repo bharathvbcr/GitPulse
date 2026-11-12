@@ -60,7 +60,10 @@ pub(super) fn judge(
     }
     let session = match run["kind"].as_str() {
         Some("managed") => run["provider_thread_id"].as_str(),
-        _ => run["id"].as_str(),
+        _ => run["provider_thread_id"]
+            .as_str()
+            .filter(|id| is_canonical_uuid(id))
+            .or_else(|| run["id"].as_str()),
     }
     .filter(|id| is_canonical_uuid(id));
     let (found_reason, absent_reason, session_missing_reason) = if provider == "agy" {
@@ -135,6 +138,7 @@ pub(crate) fn antigravity_homes_in(agy_home: Option<PathBuf>, home: Option<&Path
         let gemini = home.join(".gemini");
         candidates.push(gemini.join("antigravity"));
         candidates.push(gemini.join("antigravity-cli"));
+        candidates.push(gemini.join("antigravity-ide"));
     }
     let mut seen = Vec::new();
     let mut out = Vec::new();
@@ -464,6 +468,22 @@ fn answer(session: &str, found: Transcript) -> ConversationTranscript {
     }
 }
 
+/// Checks whether a saved transcript exists for `provider` and canonical UUID `session`.
+pub(crate) fn has_saved_transcript(provider: &str, session: &str) -> bool {
+    if !is_canonical_uuid(session) {
+        return false;
+    }
+    if provider == "agy" || provider == "antigravity" {
+        let homes = antigravity_homes();
+        matches!(search_antigravity_homes(&homes, session), Transcript::Found)
+    } else if provider == "claude" {
+        let configs = claude_config_dirs();
+        matches!(search_claude_configs(&configs, session), Transcript::Found)
+    } else {
+        false
+    }
+}
+
 pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
     if input.len() > 1024 {
         return Err(WorkbenchError::new(
@@ -481,12 +501,21 @@ pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, Workben
     }
     let response = state
         .with_store(|store| query(store, "runs.get", &json!({"id": request.id}).to_string()))?;
-    let run = &response["item"];
+    let mut run = response["item"].clone();
     let checkout_exists = run["cwd"]
         .as_str()
         .is_some_and(|cwd| Path::new(cwd).is_dir());
-    let provider = run["provider"].as_str().unwrap_or("claude");
-    Ok(judge(run, checkout_exists, |session| {
+    let provider = run["provider"].as_str().unwrap_or("claude").to_owned();
+    if run["provider_thread_id"].as_str().is_none() && checkout_exists {
+        if let Some(cwd) = run["cwd"].as_str() {
+            if let Some(peer_sid) =
+                crate::engine::agent_bus::peer_session_id_for_run(cwd, &request.id)
+            {
+                run["provider_thread_id"] = json!(peer_sid);
+            }
+        }
+    }
+    Ok(judge(&run, checkout_exists, |session| {
         if provider == "agy" {
             let homes = antigravity_homes();
             search_antigravity_homes(&homes, session)
@@ -800,5 +829,20 @@ mod tests {
             super::search_antigravity_homes(&agy_homes, THREAD),
             Transcript::Found
         );
+        assert!(agy_homes.contains(&home.join(".gemini").join("antigravity-ide")));
+
+        // An external_terminal `agy` attempt bound via `runs.bind_thread` resumes by
+        // its bound `provider_thread_id` rather than its run id.
+        let mut agy_term = ended();
+        agy_term["id"] = json!("run-agy-ext-1");
+        agy_term["provider"] = json!("agy");
+        agy_term["provider_thread_id"] = json!(THREAD);
+        let resumed = judge(&agy_term, true, |session| {
+            assert_eq!(session, THREAD);
+            Transcript::Found
+        });
+        assert_eq!(resumed["resumable"], true);
+        assert_eq!(resumed["session_id"], THREAD);
+        assert_eq!(resumed["provider"], "agy");
     }
 }

@@ -55,6 +55,8 @@ fn notice(key: &str, channel: &'static str) -> Notice {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 

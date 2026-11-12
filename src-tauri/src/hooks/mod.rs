@@ -70,6 +70,10 @@ pub mod worktree;
 /// instead lets us give up *loudly*.
 pub const BUDGET: Duration = Duration::from_secs(5);
 
+/// Tighter wall-clock ceiling for `peer-inbox` and `stop-or-notify` (`timeout: 5`
+/// in `hooks.json`, leaving `HOST_TIMEOUT_MARGIN` (`2s`) intact).
+pub const PEER_INBOX_BUDGET: Duration = Duration::from_secs(2);
+
 /// Wall-clock ceiling for the whole process, from the moment `main` starts.
 ///
 /// [`BUDGET`] bounds one wait, but a hook makes several in a row (stdin, then
@@ -136,7 +140,14 @@ pub const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 /// for the one-shot hook executable: on timeout it exits and tears down the
 /// single reader that may still be waiting for the host to close stdin.
 pub fn read_input(reader: impl std::io::Read + Send + 'static) -> Result<HookInput, String> {
-    within_budget(BUDGET, move || {
+    read_input_within(reader, BUDGET)
+}
+
+fn read_input_within(
+    reader: impl std::io::Read + Send + 'static,
+    budget: Duration,
+) -> Result<HookInput, String> {
+    within_budget(budget, move || {
         let mut bytes = Vec::new();
         reader
             .take(MAX_INPUT_BYTES as u64 + 1)
@@ -172,6 +183,9 @@ pub fn read_for(
     argument: Option<&str>,
     reader: impl std::io::Read + Send + 'static,
 ) -> Result<HookInput, String> {
+    if matches!(subcommand, "peer-inbox" | "stop-or-notify") {
+        return read_input_within(reader, PEER_INBOX_BUDGET);
+    }
     if subcommand != "notify" {
         return read_input(reader);
     }
@@ -201,7 +215,26 @@ pub const BRIEF_LIMIT: usize = 2000;
 
 /* ── Wire types ───────────────────────────────────────────────────────────── */
 
-/// The subset of the host's hook JSON these three handlers read.
+/// Which agent host dialect sent this hook payload and expects its stdout schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostKind {
+    #[default]
+    Claude,
+    Cursor,
+    Antigravity,
+}
+
+/// Returns `true` when the environment explicitly identifies `gitpulse-hook` as
+/// running under an Antigravity plugin or hosted `agy` session, so early-exit /
+/// stdin-error paths still emit `"{}"` rather than 0-byte stdout.
+pub fn is_antigravity_env() -> bool {
+    std::env::var("GITPULSE_HOST").ok().as_deref() == Some("antigravity")
+        || std::env::var(AGENT_KIND_ENV).ok().as_deref() == Some("agy")
+        || std::env::var_os("PLUGIN_ROOT")
+            .is_some_and(|p| p.to_string_lossy().contains("gitpulse-agy"))
+}
+
+/// The subset of the host's hook JSON these handlers read.
 ///
 /// Parsed field by field out of a `Value` rather than derived, because this
 /// struct is filled from a foreign process's stdout: a `tool_input` that is a
@@ -210,13 +243,15 @@ pub const BRIEF_LIMIT: usize = 2000;
 /// payload or a panic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookInput {
+    pub host: HostKind,
     pub hook_event_name: String,
     pub session_id: String,
     pub cwd: String,
     pub tool_name: String,
-    /// `tool_input.file_path` (Edit/Write) or `tool_input.notebook_path`.
+    /// `tool_input.file_path` (Edit/Write), `tool_input.notebook_path`, or
+    /// Antigravity `toolCall.args.{Path, TargetFile}`.
     pub file_path: String,
-    /// `tool_input.command` (Bash).
+    /// `tool_input.command` (Bash) or Antigravity `toolCall.args.CommandLine`.
     pub command: String,
     /// SessionStart's `source`: startup, resume, clear, compact or fork.
     pub source: String,
@@ -247,8 +282,8 @@ pub struct HookInput {
     pub last_assistant_message: String,
     /// `StopFailure`'s `error`: `rate_limit`, `overloaded`, ….
     pub error: String,
-    /// The host's id for one tool call (`tool_use_id`). Two copies of this
-    /// hook judging the same call see the same id ([`advisory_once`]).
+    /// The host's id for one tool call (`tool_use_id` or `toolCall.id`). Two
+    /// copies of this hook judging the same call see the same id ([`advisory_once`]).
     pub tool_use_id: String,
     /// The host's permission mode for this call (`permission_mode`), as Claude
     /// Code sends it. Only [`BYPASS_PERMISSIONS`] changes what a gate does
@@ -261,6 +296,10 @@ pub struct HookInput {
     /// `asyncRewake` wake starts is itself a stop-hook continuation (see the
     /// `stop_hook_active` paragraph of `deliver.rs`'s module documentation).
     pub stop_hook_active: bool,
+    /// Antigravity `Stop` payload's `terminationReason` (`"NO_TOOL_CALL"`, etc.).
+    pub termination_reason: String,
+    /// Antigravity `Stop` payload's `fullyIdle` flag (`true` when quiescent).
+    pub fully_idle: Option<bool>,
     /// `WorktreeCreate`'s `name`: the slug Claude Code would have put the
     /// worktree under (`bold-oak-a3f2`). See [`worktree`].
     pub worktree_name: String,
@@ -275,51 +314,87 @@ pub struct HookInput {
     pub discard_changes: bool,
 }
 
+fn first_non_empty<'a>(candidates: impl IntoIterator<Item = String>) -> String {
+    candidates
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
 impl HookInput {
     /// Reads the fields we use out of one already-parsed hook payload.
     pub fn from_value(value: &Value) -> Self {
+        let is_cursor = is_cursor_payload(value);
+        let host = if is_cursor {
+            HostKind::Cursor
+        } else if is_antigravity_payload(value) {
+            HostKind::Antigravity
+        } else {
+            HostKind::Claude
+        };
         let tool_input = value.get("tool_input");
+        let tool_call = value.get("toolCall");
+        let tool_args = tool_call.and_then(|tc| tc.get("args"));
         // `file_path` is the documented field for Write and Edit and is always
         // absolute. `notebook_path` is NotebookEdit's, checked against that
         // tool's own published input schema rather than the hook reference's
-        // `tool_input` table, which does not list it. Should either name ever
-        // move we derive no path and report a non-check, which is the safe
-        // direction to be wrong in.
-        let file_path = string_at(tool_input, "file_path");
-        let file_path = if file_path.is_empty() {
-            string_at(tool_input, "notebook_path")
-        } else {
-            file_path
-        };
-        let cwd = string_at(Some(value), "cwd");
-        let cwd = if cwd.is_empty() {
-            first_workspace_root(value)
-        } else {
-            cwd
-        };
+        // `tool_input` table, which does not list it. Antigravity's `toolCall.args`
+        // uses `Path` (`write_file`, `edit_file`) or `TargetFile` (`multi_edit`).
+        let file_path = first_non_empty([
+            string_at(tool_input, "file_path"),
+            string_at(tool_input, "notebook_path"),
+            string_at(tool_args, "Path"),
+            string_at(tool_args, "TargetFile"),
+            string_at(tool_args, "file_path"),
+        ]);
+        let cwd = first_non_empty([string_at(Some(value), "cwd"), first_workspace_root(value)]);
+        let hook_event_name = first_non_empty([
+            string_at(Some(value), "hook_event_name"),
+            string_at(Some(value), "hookEventName"),
+        ]);
+        let session_id = first_non_empty([
+            string_at(Some(value), "session_id"),
+            string_at(Some(value), "conversationId"),
+        ]);
+        let tool_name = first_non_empty([
+            string_at(Some(value), "tool_name"),
+            string_at(tool_call, "name"),
+        ]);
+        let command = first_non_empty([
+            string_at(tool_input, "command"),
+            string_at(tool_args, "CommandLine"),
+            string_at(tool_args, "command"),
+        ]);
+        let tool_use_id = first_non_empty([
+            string_at(Some(value), "tool_use_id"),
+            string_at(tool_call, "id"),
+        ]);
         HookInput {
-            hook_event_name: string_at(Some(value), "hook_event_name"),
-            session_id: string_at(Some(value), "session_id"),
+            host,
+            hook_event_name,
+            session_id,
             cwd,
-            tool_name: string_at(Some(value), "tool_name"),
+            tool_name,
             file_path,
             incoming: incoming_edit(value),
-            command: string_at(tool_input, "command"),
+            command,
             source: string_at(Some(value), "source"),
-            is_cursor: is_cursor_payload(value),
+            is_cursor,
             message: string_at(Some(value), "message"),
             tool_subject: tool_subject(value),
             tool_summary: tool_summary(value),
             agent_id: string_at(Some(value), "agent_id"),
             last_assistant_message: string_at(Some(value), "last_assistant_message"),
             error: string_at(Some(value), "error"),
-            tool_use_id: string_at(Some(value), "tool_use_id"),
+            tool_use_id,
             // Claude spells it `permission_mode`; Grok, whose `--permission-mode`
             // takes the same values, writes camelCase payload fields.
             permission_mode: Some(string_at(Some(value), "permission_mode"))
                 .filter(|mode| !mode.is_empty())
                 .unwrap_or_else(|| string_at(Some(value), "permissionMode")),
             stop_hook_active: value.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
+            termination_reason: string_at(Some(value), "terminationReason"),
+            fully_idle: value.get("fullyIdle").and_then(Value::as_bool),
             worktree_name: string_at(Some(value), "name"),
             worktree_path: string_at(Some(value), "worktree_path"),
             discard_changes: value.get("discard_changes").and_then(Value::as_bool) == Some(true),
@@ -327,27 +402,70 @@ impl HookInput {
     }
 }
 
-/// The change an editing tool call is about to make, from its `tool_input`.
+/// The change an editing tool call is about to make, from its `tool_input` or
+/// Antigravity `toolCall.args`.
 ///
 /// An `Edit` or `MultiEdit` whose `old_string` is missing or not a string is
 /// still an edit: it reads as an empty string, which cannot be located and so
 /// is asked about, rather than as no edit at all.
 fn incoming_edit(value: &Value) -> Option<insights::IncomingEdit> {
-    let input = value.get("tool_input");
-    match string_at(Some(value), "tool_name").as_str() {
-        "Write" | "NotebookEdit" => Some(insights::IncomingEdit::WholeFile),
+    let tool_call = value.get("toolCall");
+    let input = value
+        .get("tool_input")
+        .or_else(|| tool_call.and_then(|tc| tc.get("args")));
+    let name = first_non_empty([
+        string_at(Some(value), "tool_name"),
+        string_at(tool_call, "name"),
+    ]);
+    match name.as_str() {
+        "Write" | "NotebookEdit" | "write_file" | "write_to_file" | "notebook_edit" => {
+            Some(insights::IncomingEdit::WholeFile)
+        }
         "Edit" => Some(insights::IncomingEdit::Replacing(vec![string_at(
             input,
             "old_string",
         )])),
-        "MultiEdit" => {
+        "edit_file" | "replace_file_content" => {
+            if let Some(chunks) = input
+                .and_then(|i| i.get("ReplacementChunks"))
+                .and_then(Value::as_array)
+                .filter(|c| !c.is_empty())
+            {
+                let targets = chunks
+                    .iter()
+                    .map(|chunk| {
+                        first_non_empty([
+                            string_at(Some(chunk), "TargetContent"),
+                            string_at(Some(chunk), "Target"),
+                        ])
+                    })
+                    .collect();
+                Some(insights::IncomingEdit::Replacing(targets))
+            } else {
+                Some(insights::IncomingEdit::Replacing(vec![first_non_empty([
+                    string_at(input, "Target"),
+                    string_at(input, "TargetContent"),
+                ])]))
+            }
+        }
+        "MultiEdit" | "multi_edit" | "multi_replace_file_content" => {
             let edits = input
-                .and_then(|input| input.get("edits"))
+                .and_then(|input| {
+                    input
+                        .get("edits")
+                        .or_else(|| input.get("ReplacementChunks"))
+                })
                 .and_then(Value::as_array);
             Some(insights::IncomingEdit::Replacing(match edits {
                 Some(edits) if !edits.is_empty() => edits
                     .iter()
-                    .map(|edit| string_at(Some(edit), "old_string"))
+                    .map(|edit| {
+                        first_non_empty([
+                            string_at(Some(edit), "old_string"),
+                            string_at(Some(edit), "TargetContent"),
+                            string_at(Some(edit), "Target"),
+                        ])
+                    })
                     .collect(),
                 _ => vec![String::new()],
             }))
@@ -393,13 +511,20 @@ fn canonical(value: &Value, out: &mut String) {
 /// waiting request early, and the peer able to cause it is the same user —
 /// so the cheapest stable hash that needs no dependency is the right one.
 fn tool_subject(value: &Value) -> String {
-    let name = string_at(Some(value), "tool_name");
+    let tool_call = value.get("toolCall");
+    let name = first_non_empty([
+        string_at(Some(value), "tool_name"),
+        string_at(tool_call, "name"),
+    ]);
     if name.is_empty() {
         return String::new();
     }
     let mut text = name;
     text.push('\0');
-    if let Some(input) = value.get("tool_input") {
+    if let Some(input) = value
+        .get("tool_input")
+        .or_else(|| tool_call.and_then(|tc| tc.get("args")))
+    {
         canonical(input, &mut text);
     }
     format!("{:016x}", fnv1a(&text))
@@ -421,14 +546,23 @@ const TOOL_SUMMARY_CHARS: usize = 160;
 /// `tool_input`, said in a line, for the board: the tool and the one field a
 /// person would read to decide — a command, a path, a URL.
 fn tool_summary(value: &Value) -> String {
-    let name = string_at(Some(value), "tool_name");
+    let tool_call = value.get("toolCall");
+    let name = first_non_empty([
+        string_at(Some(value), "tool_name"),
+        string_at(tool_call, "name"),
+    ]);
     if name.is_empty() {
         return String::new();
     }
-    let input = value.get("tool_input");
+    let input = value
+        .get("tool_input")
+        .or_else(|| tool_call.and_then(|tc| tc.get("args")));
     let what = [
         "command",
+        "CommandLine",
         "file_path",
+        "Path",
+        "TargetFile",
         "notebook_path",
         "url",
         "pattern",
@@ -454,19 +588,36 @@ fn is_cursor_payload(value: &Value) -> bool {
         .is_some_and(|version| !version.is_null())
 }
 
+/// Antigravity (`agy` CLI and Antigravity IDE) sends camelCase `conversationId`,
+/// `hookEventName`, `workspacePaths`, `toolCall`, `terminationReason`, or `fullyIdle`.
+fn is_antigravity_payload(value: &Value) -> bool {
+    if is_cursor_payload(value) {
+        return false;
+    }
+    value.get("conversationId").is_some_and(|v| !v.is_null())
+        || value.get("toolCall").is_some_and(|v| !v.is_null())
+        || value.get("workspacePaths").is_some_and(|v| !v.is_null())
+        || value.get("terminationReason").is_some_and(|v| !v.is_null())
+        || value.get("fullyIdle").is_some_and(|v| !v.is_null())
+        || (!string_at(Some(value), "hookEventName").is_empty()
+            && string_at(Some(value), "hook_event_name").is_empty())
+}
+
 /// How many `workspace_roots` entries we will examine. Cursor's array is
 /// unbounded; a pathological payload must not turn SessionStart into a
 /// walk of a million empty strings.
 const MAX_WORKSPACE_ROOTS: usize = 256;
 
-/// Cursor native sessionStart sends `workspace_roots` (and often no `cwd`).
-/// The first non-empty string is the repository we brief; everything else is
-/// ignored. Hostile shapes (a string, an object, numbers) yield empty, which
-/// is the same answer as "the host told us nothing".
+/// Cursor native sessionStart sends `workspace_roots` (and often no `cwd`);
+/// Antigravity sends `workspacePaths`. The first non-empty string is the
+/// repository we brief; everything else is ignored. Hostile shapes (a string,
+/// an object, numbers) yield empty, which is the same answer as "the host told
+/// us nothing".
 fn first_workspace_root(value: &Value) -> String {
     value
         .get("workspace_roots")
         .or_else(|| value.get("workspaceRoots"))
+        .or_else(|| value.get("workspacePaths"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -583,10 +734,121 @@ impl HookOutput {
     /// `preToolUse` is a permission hook whose schema is not Claude's — a
     /// nested `permissionDecision` there blocks the tool.
     pub fn render_for_host(&self, is_cursor: bool) -> Option<String> {
-        if is_cursor {
-            return self.render_cursor();
+        let host = if is_cursor {
+            HostKind::Cursor
+        } else {
+            HostKind::Claude
+        };
+        self.render_for_host_kind(host, "")
+    }
+
+    /// Host-specific stdout including Antigravity (`agy` CLI + Antigravity IDE).
+    /// Antigravity never accepts 0-byte stdout: silent passes render `"{}"`.
+    pub fn render_for_host_kind(&self, host: HostKind, fallback_event: &str) -> Option<String> {
+        match host {
+            HostKind::Claude => self.render(),
+            HostKind::Cursor => self.render_cursor(),
+            HostKind::Antigravity => Some(self.render_antigravity(fallback_event)),
         }
-        self.render()
+    }
+
+    fn render_antigravity(&self, fallback_event: &str) -> String {
+        if self.is_silent() {
+            return "{}".to_string();
+        }
+        let event_tag = self
+            .hook_specific_output
+            .as_ref()
+            .map(|s| s.hook_event_name.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback_event);
+
+        if event_tag == PRE_TOOL_USE || fallback_event == PRE_TOOL_USE {
+            if let Some(specific) = &self.hook_specific_output {
+                if let Some(decision) = specific.permission_decision {
+                    let reason = specific
+                        .permission_decision_reason
+                        .as_deref()
+                        .unwrap_or_default();
+                    let full_reason = match &self.system_message {
+                        Some(note) if !note.is_empty() => format!("{reason}\n{note}"),
+                        _ => reason.to_string(),
+                    };
+                    let agy_decision = match decision {
+                        PermissionDecision::Deny => "deny",
+                        PermissionDecision::Ask => "force_ask",
+                    };
+                    return json!({
+                        "decision": agy_decision,
+                        "reason": full_reason,
+                    })
+                    .to_string();
+                }
+            }
+            if let Some(note) = &self.system_message {
+                if is_degraded_or_unchecked_gate_notice(note) {
+                    return json!({
+                        "decision": "ask",
+                        "reason": note,
+                    })
+                    .to_string();
+                }
+            }
+            return "{}".to_string();
+        }
+
+        if event_tag == "Stop:continue" {
+            let reason = self
+                .hook_specific_output
+                .as_ref()
+                .and_then(|s| s.additional_context.as_deref())
+                .or(self.system_message.as_deref())
+                .unwrap_or_default();
+            if !reason.trim().is_empty() {
+                return json!({
+                    "decision": "continue",
+                    "reason": reason,
+                })
+                .to_string();
+            }
+            return "{}".to_string();
+        }
+
+        if matches!(
+            event_tag,
+            "SessionStart" | "PreInvocation" | "PostInvocation" | "PostInvocation:force_continue"
+        ) || matches!(
+            fallback_event,
+            "SessionStart" | "PreInvocation" | "PostInvocation"
+        ) {
+            let ctx = match (
+                self.hook_specific_output
+                    .as_ref()
+                    .and_then(|s| s.additional_context.as_deref()),
+                self.system_message.as_deref(),
+            ) {
+                (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
+                    Some(format!("{a}\n{b}"))
+                }
+                (Some(a), _) if !a.is_empty() => Some(a.to_string()),
+                (_, Some(b)) if !b.is_empty() => Some(b.to_string()),
+                _ => None,
+            };
+            if let Some(text) = ctx {
+                let mut out = json!({
+                    "injectSteps": [{
+                        "systemMessage": { "systemMessage": text }
+                    }]
+                });
+                if event_tag == "PostInvocation:force_continue" {
+                    out["terminationBehavior"] = json!("force_continue");
+                }
+                return out.to_string();
+            }
+            return "{}".to_string();
+        }
+
+        "{}".to_string()
     }
 
     fn render_cursor(&self) -> Option<String> {
@@ -616,6 +878,16 @@ impl HookOutput {
         }
         self.render()
     }
+}
+
+fn is_degraded_or_unchecked_gate_notice(note: &str) -> bool {
+    note.contains("did NOT run")
+        || note.contains("was INCOMPLETE")
+        || note.contains("The check was INCOMPLETE")
+        || note.contains("ran UNGATED")
+        || note.contains("could not judge this")
+        || note.contains("checks it could not run")
+        || note.contains("MANVI harness warning")
 }
 
 fn decision(event: &str, decision: PermissionDecision, reason: String) -> HookSpecificOutput {
@@ -1526,7 +1798,14 @@ fn owning_checkout(here: &Path, file: &Path) -> Owner {
 /// planned file as `scope.operation`, and the tool already says which it is.
 fn write_op(tool_name: &str, file: &Path) -> &'static str {
     match tool_name {
-        "Write" if !file.exists() => "create",
+        "Write" | "write_file" | "write_to_file" if !file.exists() => "create",
+        "write_file"
+        | "write_to_file"
+        | "edit_file"
+        | "replace_file_content"
+        | "multi_edit"
+        | "multi_replace_file_content"
+        | "notebook_edit" => "modify",
         t if FILE_WRITE_TOOLS.contains(&t) => "modify",
         _ => "write",
     }
@@ -2774,12 +3053,14 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
-pub const SUBCOMMANDS: [&str; 7] = [
+pub const SUBCOMMANDS: [&str; 9] = [
     "collision-guard",
     "command-gate",
     "session-brief",
     "notify",
     "deliver",
+    "peer-inbox",
+    "stop-or-notify",
     // `worktree::CREATE` and `worktree::REMOVE`, spelled out because
     // `plugin-contract.test.ts` reads this list as literals.
     "worktree-create",
@@ -2837,6 +3118,8 @@ pub fn dispatch(
         "session-brief" => Ok(run_session_brief(input)),
         "notify" => run_notify(argument, input, notify_send),
         "deliver" => deliver::run(input),
+        "peer-inbox" => Ok(run_peer_inbox(input)),
+        "stop-or-notify" => run_stop_or_notify(input),
         // Not a JSON answer: the worktree events take a path on stdout and an
         // exit code, so the binary runs them through `worktree::run` before it
         // gets here.
@@ -2850,6 +3133,301 @@ pub fn dispatch(
         )
         .into()),
     }
+}
+
+/* ── peer-inbox & stop-or-notify ─────────────────────────────────────────── */
+
+/// Reads the current checked-out branch directly from `.git/HEAD` (supporting
+/// linked worktrees whose `.git` is a `gitdir:` pointer file) with zero git
+/// subprocess overhead.
+fn fast_head_branch(worktree_root: &Path) -> Option<String> {
+    let dot_git = worktree_root.join(".git");
+    let head_path = if dot_git.is_dir() {
+        dot_git.join("HEAD")
+    } else {
+        let raw = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
+        let resolved = Path::new(gitdir);
+        if resolved.is_absolute() {
+            resolved.join("HEAD")
+        } else {
+            worktree_root.join(resolved).join("HEAD")
+        }
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    let trimmed = head.trim();
+    trimmed
+        .strip_prefix("ref: refs/heads/")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned)
+}
+
+fn parent_agent_process_identity() -> (Option<u32>, Option<u64>) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getppid` has no preconditions and cannot fail.
+        let ppid = unsafe { libc::getppid() };
+        if ppid > 1 {
+            let pid = ppid as u32;
+            let start_ns = crate::workbench::process_birth::started_unix_nanos(pid);
+            return (Some(pid), start_ns);
+        }
+    }
+    (None, None)
+}
+
+fn peer_provider_and_surface(input: &HookInput) -> (&'static str, &'static str) {
+    let provider = match input.host {
+        HostKind::Antigravity => "antigravity",
+        HostKind::Cursor => "cursor",
+        HostKind::Claude => "claude",
+    };
+    let surface = if session_env().is_some() {
+        "hosted_terminal"
+    } else if input.host == HostKind::Antigravity
+        && std::env::var_os("ANTIGRAVITY_EDITOR_APP_ROOT").is_some()
+    {
+        "antigravity_ide"
+    } else {
+        "external_cli"
+    };
+    (provider, surface)
+}
+
+fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<String> {
+    let (provider, surface) = peer_provider_and_surface(input);
+    let (pid, proc_start_ns) = parent_agent_process_identity();
+    let branch = fast_head_branch(root);
+    let run_id = std::env::var("GITPULSE_RUN_ID")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let record = crate::engine::agent_bus::upsert_peer(
+        &root.to_string_lossy(),
+        crate::engine::agent_bus::PeerUpsert {
+            peer_id: None,
+            provider: provider.to_string(),
+            surface: surface.to_string(),
+            provider_session_id: crate::workbench::terminal_command::is_canonical_uuid(
+                &input.session_id,
+            )
+            .then(|| input.session_id.to_ascii_lowercase()),
+            terminal_session_id: session_env(),
+            run_id,
+            worktree_path: root.to_string_lossy().into_owned(),
+            branch,
+            role: None,
+            turn_state: Some(turn_state.to_string()),
+            auto_wake: None,
+            pid,
+            proc_start_ns,
+            transcript_path: None,
+        },
+    )
+    .ok()?;
+    Some(record.peer_id)
+}
+
+/// Synchronous `0ms` boundary delivery (`SessionStart`, `UserPromptSubmit` /
+/// `PreInvocation`, `PostToolUse` / `PostInvocation`) across Claude Code, `agy`
+/// CLI, and Antigravity IDE.
+pub fn run_peer_inbox(input: &HookInput) -> HookOutput {
+    let owned = input.clone();
+    within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
+        .unwrap_or_else(HookOutput::silent)
+}
+
+fn trusted_hook_root(input: &HookInput) -> Option<PathBuf> {
+    (!input.cwd.is_empty())
+        .then(|| find_git_root(Path::new(&input.cwd)))
+        .flatten()
+        .filter(|root| crate::repository_trust::require(root).is_ok())
+}
+
+fn peer_inbox_in_default(input: &HookInput) -> HookOutput {
+    if trusted_hook_root(input).is_none() {
+        return HookOutput::silent();
+    }
+    if input.host == HostKind::Antigravity
+        && matches!(
+            input.hook_event_name.as_str(),
+            "SessionStart" | "PreInvocation"
+        )
+        && session_env().is_some()
+    {
+        let mut active = input.clone();
+        active.fully_idle = Some(false);
+        let _ = run_notify_within(
+            Some("prompt_submitted"),
+            &active,
+            notify_send,
+            &notify_drops::PROCESS_DROPS,
+            Some(Duration::from_millis(300)),
+        );
+    }
+    let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() else {
+        return HookOutput::silent();
+    };
+    peer_inbox_in(&mailbox, input)
+}
+
+pub(crate) fn peer_inbox_in(
+    mailbox: &crate::agent_mailbox::Mailbox,
+    input: &HookInput,
+) -> HookOutput {
+    let Some(root) = (!input.cwd.is_empty())
+        .then(|| find_git_root(Path::new(&input.cwd)))
+        .flatten()
+        .filter(|root| crate::repository_trust::require(root).is_ok())
+    else {
+        return HookOutput::silent();
+    };
+
+    let reader_id = upsert_hook_peer(&root, input, "working");
+    if crate::agent_mailbox::session_key(&input.session_id).is_err() {
+        return HookOutput::silent();
+    }
+    if matches!(
+        input.hook_event_name.as_str(),
+        "UserPromptSubmit" | "PreInvocation"
+    ) {
+        let _ = mailbox.bump_turn_epoch(&input.session_id);
+    }
+
+    let Ok(claimed) =
+        mailbox.try_claim_batch(&input.session_id, 8, std::time::SystemTime::now())
+    else {
+        return HookOutput::silent();
+    };
+    if claimed.is_empty() {
+        return HookOutput::silent();
+    }
+
+    let fallback_reader = format!(
+        "{}:{}",
+        peer_provider_and_surface(input).0,
+        input.session_id.to_ascii_lowercase()
+    );
+    let effective_reader = reader_id.as_deref().unwrap_or(&fallback_reader);
+    let mut parts = Vec::with_capacity(claimed.len());
+    let mut any_wakeable = false;
+    for env in &claimed {
+        if deliver::wake_filter(&env.provenance) {
+            any_wakeable = true;
+        }
+        parts.push(deliver::format_claimed_message(
+            env,
+            Some(&root),
+            Some(effective_reader),
+        ));
+    }
+    let combined = parts.join("\n");
+
+    let hook_event_name = if input.host == HostKind::Antigravity
+        && input.hook_event_name == "PostInvocation"
+    {
+        let under_cap = mailbox
+            .continuation_count(&input.session_id)
+            .unwrap_or(u32::MAX)
+            < crate::agent_mailbox::MAX_CONTINUATIONS;
+        if any_wakeable && under_cap {
+            let _ = mailbox.bump_continuation(&input.session_id);
+            "PostInvocation:force_continue".to_string()
+        } else {
+            "PostInvocation".to_string()
+        }
+    } else if input.hook_event_name.is_empty() {
+        "PostToolUse".to_string()
+    } else {
+        input.hook_event_name.clone()
+    };
+
+    HookOutput {
+        hook_specific_output: Some(HookSpecificOutput {
+            hook_event_name,
+            permission_decision: None,
+            permission_decision_reason: None,
+            additional_context: Some(combined),
+        }),
+        system_message: None,
+    }
+}
+
+/// Antigravity `Stop` handler: checks the narrow window between `PostInvocation`
+/// and `Stop` when `terminationReason == "NO_TOOL_CALL"` (continuing up to
+/// `MAX_CONTINUATIONS`), and otherwise marks the peer idle + reports
+/// `turn_finished` with `fully_idle` and `provider_session_id`.
+pub fn run_stop_or_notify(input: &HookInput) -> Result<HookOutput, HookError> {
+    if trusted_hook_root(input).is_none() {
+        return Ok(HookOutput::silent());
+    }
+    if let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() {
+        if let Some(cont) = stop_continue_in(&mailbox, input) {
+            return Ok(cont);
+        }
+    }
+    run_notify_within(
+        Some("turn_finished"),
+        input,
+        notify_send,
+        &notify_drops::PROCESS_DROPS,
+        Some(Duration::from_millis(800)),
+    )
+}
+
+pub(crate) fn stop_continue_in(
+    mailbox: &crate::agent_mailbox::Mailbox,
+    input: &HookInput,
+) -> Option<HookOutput> {
+    let root = (!input.cwd.is_empty())
+        .then(|| find_git_root(Path::new(&input.cwd)))
+        .flatten()
+        .filter(|root| crate::repository_trust::require(root).is_ok())?;
+
+    if input.termination_reason == "NO_TOOL_CALL"
+        && crate::agent_mailbox::session_key(&input.session_id).is_ok()
+        && mailbox
+            .continuation_count(&input.session_id)
+            .unwrap_or(u32::MAX)
+            < crate::agent_mailbox::MAX_CONTINUATIONS
+    {
+        if let Ok(claimed) = mailbox.try_claim_batch_filtered(
+            &input.session_id,
+            8,
+            std::time::SystemTime::now(),
+            deliver::wake_filter,
+        ) {
+            if !claimed.is_empty() {
+                let _ = mailbox.bump_continuation(&input.session_id);
+                let reader_id = upsert_hook_peer(&root, input, "working");
+                let fallback_reader = format!(
+                    "{}:{}",
+                    peer_provider_and_surface(input).0,
+                    input.session_id.to_ascii_lowercase()
+                );
+                let effective_reader = reader_id.as_deref().unwrap_or(&fallback_reader);
+                let combined = claimed
+                    .iter()
+                    .map(|env| {
+                        deliver::format_claimed_message(env, Some(&root), Some(effective_reader))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Some(HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        hook_event_name: "Stop:continue".to_string(),
+                        permission_decision: None,
+                        permission_decision_reason: None,
+                        additional_context: Some(combined),
+                    }),
+                    system_message: None,
+                });
+            }
+        }
+    }
+    let _ = upsert_hook_peer(&root, input, "idle");
+    None
 }
 
 /* ── notify ───────────────────────────────────────────────────────────────── */
@@ -3028,10 +3606,15 @@ fn missed_reply(
 }
 
 /// The GitPulse PTY this hook runs under, when it runs under one.
+///
+/// Held to [`crate::alerts::bridge::valid_key`], the exact alphabet and 96-byte
+/// cap the bridge itself requires (`Reason::StateOutsideSession`), so a
+/// whitespace, path-traversal, bidi, or oversized `GITPULSE_SESSION_ID` neither
+/// stuffs an oversized report into the socket nor poisons `peers.json`.
 fn session_env() -> Option<String> {
     std::env::var(crate::alerts::bridge::SESSION_ENV)
         .ok()
-        .filter(|session| !session.is_empty())
+        .filter(|session| crate::alerts::bridge::valid_key(session))
 }
 
 /// The most of a ledger caveat the brief carries: the brief is read by an
@@ -3160,10 +3743,9 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
         {
             kind
         }
-        // Nothing authoritative. Cursor identifies itself in its payload;
-        // otherwise this binary is only ever installed as a Claude Code,
-        // Codex or Cursor plugin, and Claude Code is the one whose
-        // `Notification` event exists.
+        // Nothing authoritative. Antigravity and Cursor identify themselves in
+        // their payloads; otherwise Claude Code is the default host.
+        _ if input.host == HostKind::Antigravity => "agy".to_string(),
         _ if input.is_cursor => "cursor".to_string(),
         _ => "claude".to_string(),
     };
@@ -3189,6 +3771,15 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
         if crate::alerts::bridge::valid_key(&input.agent_id) {
             report.insert("agent_id".into(), json!(input.agent_id));
         }
+    }
+    if let Some(fully_idle) = input.fully_idle {
+        report.insert("fully_idle".into(), json!(fully_idle));
+    }
+    if crate::workbench::terminal_command::is_canonical_uuid(&input.session_id) {
+        report.insert(
+            "provider_session_id".into(),
+            json!(input.session_id.to_ascii_lowercase()),
+        );
     }
     // What is left once the fixed fields are in: the place and the message
     // share it, the place first because it names the session and the message
@@ -9086,6 +9677,325 @@ done
                 "{}",
                 text(&output)
             );
+        }
+    }
+
+    mod antigravity_a2a_tests {
+        use super::*;
+        use crate::agent_mailbox::{EnvelopeProvenance, Mailbox, MAX_CONTINUATIONS};
+        use crate::test_support::git_in;
+        use std::time::SystemTime;
+
+        const AGY_SESSION: &str = "8a2f4b10-3c9e-4d12-8b77-112233445566";
+
+        fn init_trusted_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-b", "feat/agy-a2a"]);
+            (dir, home, repo)
+        }
+
+        #[test]
+        fn antigravity_input_parses_tool_call_and_renders_never_empty_stdout() {
+            let raw = json!({
+                "hookEventName": "PreToolUse",
+                "conversationId": AGY_SESSION,
+                "workspacePaths": ["/tmp/ws"],
+                "toolCall": {
+                    "id": "tc-99",
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "/tmp/ws/src/main.rs",
+                        "Target": "fn old() {}",
+                        "Replacement": "fn new() {}"
+                    }
+                }
+            });
+            let parsed = HookInput::from_value(&raw);
+            assert_eq!(parsed.host, HostKind::Antigravity);
+            assert_eq!(parsed.hook_event_name, "PreToolUse");
+            assert_eq!(parsed.session_id, AGY_SESSION);
+            assert_eq!(parsed.cwd, "/tmp/ws");
+            assert_eq!(parsed.tool_name, "edit_file");
+            assert_eq!(parsed.tool_use_id, "tc-99");
+            assert_eq!(parsed.file_path, "/tmp/ws/src/main.rs");
+            assert_eq!(
+                parsed.incoming,
+                Some(insights::IncomingEdit::Replacing(vec!["fn old() {}".into()]))
+            );
+
+            // Clean pass renders "{}" (never empty, never auto-approving "allow").
+            assert_eq!(
+                HookOutput::silent().render_for_host_kind(HostKind::Antigravity, "PreToolUse"),
+                Some("{}".to_string())
+            );
+
+            // Hard block renders "deny".
+            let denied = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    PermissionDecision::Deny,
+                    "blocked by scope".into(),
+                )),
+                system_message: None,
+            };
+            let v: Value = serde_json::from_str(
+                &denied
+                    .render_for_host_kind(HostKind::Antigravity, "PreToolUse")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["decision"], "deny");
+
+            // Collision ask renders "force_ask".
+            let asked = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    PermissionDecision::Ask,
+                    "contended file".into(),
+                )),
+                system_message: None,
+            };
+            let v: Value = serde_json::from_str(
+                &asked
+                    .render_for_host_kind(HostKind::Antigravity, "PreToolUse")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["decision"], "force_ask");
+
+            // Unchecked/degraded gate notice renders "ask" (never silent "{}").
+            let unchecked_out = HookOutput::notice(
+                "GitPulse collision check did NOT run for this edit: missing cwd.",
+            );
+            let v: Value = serde_json::from_str(
+                &unchecked_out
+                    .render_for_host_kind(HostKind::Antigravity, "PreToolUse")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["decision"], "ask");
+        }
+
+        #[test]
+        fn post_invocation_claims_peer_inbox_with_force_continue_capped_at_three_and_resets_on_pre_invocation(
+        ) {
+            let serial = crate::test_support::env::env_serial();
+            let (_dir, home, repo) = init_trusted_repo();
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .remove(crate::alerts::bridge::SESSION_ENV)
+                .remove(AGENT_KIND_ENV);
+            let mailbox = Mailbox::at_default().unwrap();
+            let post_input = HookInput {
+                host: HostKind::Antigravity,
+                hook_event_name: "PostInvocation".into(),
+                session_id: AGY_SESSION.into(),
+                cwd: repo.to_string_lossy().into_owned(),
+                ..HookInput::default()
+            };
+
+            for step in 1..=(MAX_CONTINUATIONS + 1) {
+                let id = format!("msg-step-{step}");
+                mailbox
+                    .deposit_with_provenance(
+                        AGY_SESSION,
+                        &id,
+                        &format!("peer step {step}"),
+                        EnvelopeProvenance::PeerAgent {
+                            msg_id: id.clone(),
+                            from_peer: "claude:peer-1".into(),
+                            provider: "claude".into(),
+                            branch: "main".into(),
+                            thread_key: "t".into(),
+                            hop: 1,
+                            max_hops: 6,
+                            truncated_in_bus: false,
+                            repo_root: repo.to_string_lossy().into_owned(),
+                        },
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let out = peer_inbox_in(&mailbox, &post_input);
+                let rendered: Value = serde_json::from_str(
+                    &out.render_for_host_kind(HostKind::Antigravity, "PostInvocation")
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(rendered["injectSteps"].is_array(), "{rendered}");
+                if step <= MAX_CONTINUATIONS {
+                    assert_eq!(
+                        rendered["terminationBehavior"], "force_continue",
+                        "step {step}: {rendered}"
+                    );
+                } else {
+                    assert!(
+                        rendered.get("terminationBehavior").is_none(),
+                        "cap exceeded on step {step}: {rendered}"
+                    );
+                }
+            }
+
+            // PreInvocation bumps turn_epoch and resets continuation_count to 0.
+            let pre_input = HookInput {
+                host: HostKind::Antigravity,
+                hook_event_name: "PreInvocation".into(),
+                session_id: AGY_SESSION.into(),
+                cwd: repo.to_string_lossy().into_owned(),
+                ..HookInput::default()
+            };
+            let _ = peer_inbox_in(&mailbox, &pre_input);
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 0);
+        }
+
+        #[test]
+        fn stop_or_notify_continues_on_no_tool_call_and_hydrates_large_bus_payloads() {
+            let serial = crate::test_support::env::env_serial();
+            let (_dir, home, repo) = init_trusted_repo();
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .remove(crate::alerts::bridge::SESSION_ENV)
+                .remove(AGENT_KIND_ENV);
+            let mailbox = Mailbox::at_default().unwrap();
+            let large_body = "large-peer-payload-line\n".repeat(350);
+            let posted = crate::engine::agent_bus::post_peer_message(
+                &repo.to_string_lossy(),
+                "claude:sender",
+                Some(&format!("antigravity:{AGY_SESSION}")),
+                Some("feat-thread"),
+                "handoff",
+                &large_body,
+                Some("feat/agy-a2a"),
+                Some("msg-large-1"),
+                1,
+                6,
+            )
+            .unwrap();
+            let msg_id = posted.msg_id.unwrap();
+            let (preview, truncated) =
+                crate::agent_mailbox::preview_for_mailbox(&large_body, &msg_id);
+            assert!(truncated);
+            mailbox
+                .deposit_with_provenance(
+                    AGY_SESSION,
+                    &msg_id,
+                    &preview,
+                    EnvelopeProvenance::PeerAgent {
+                        msg_id: msg_id.clone(),
+                        from_peer: "claude:sender".into(),
+                        provider: "claude".into(),
+                        branch: "main".into(),
+                        thread_key: "feat-thread".into(),
+                        hop: 1,
+                        max_hops: 6,
+                        truncated_in_bus: true,
+                        repo_root: repo.to_string_lossy().into_owned(),
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let stop_input = HookInput {
+                host: HostKind::Antigravity,
+                hook_event_name: "Stop".into(),
+                session_id: AGY_SESSION.into(),
+                cwd: repo.to_string_lossy().into_owned(),
+                termination_reason: "NO_TOOL_CALL".into(),
+                fully_idle: Some(true),
+                ..HookInput::default()
+            };
+            let cont = stop_continue_in(&mailbox, &stop_input).expect("late message continues");
+            let rendered: Value = serde_json::from_str(
+                &cont
+                    .render_for_host_kind(HostKind::Antigravity, "Stop")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(rendered["decision"], "continue");
+            assert!(
+                rendered["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&large_body),
+                "hydrated full >6KiB body from agent_bus"
+            );
+
+            // Also verify notify_payload carries fully_idle + provider_session_id and parses cleanly!
+            drop(_env);
+            let _hosted_env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set(crate::alerts::bridge::SESSION_ENV, "term-42-1");
+            let turn_ev = crate::alerts::bridge::event("turn_finished").unwrap();
+            let wire = notify_payload(turn_ev, &stop_input);
+            let parsed_notice = crate::alerts::bridge::parse_report(wire.as_bytes()).unwrap();
+            assert_eq!(parsed_notice.fully_idle, Some(true));
+            assert_eq!(
+                parsed_notice.provider_session_id.as_deref(),
+                Some(AGY_SESSION)
+            );
+        }
+
+        #[test]
+        fn untrusted_repo_silently_ignores_peer_inbox_and_external_deliver_requires_opt_in() {
+            let serial = crate::test_support::env::env_serial();
+            let (dir, home, trusted_repo) = init_trusted_repo();
+            let untrusted_repo = dir.path().join("untrusted");
+            std::fs::create_dir_all(&untrusted_repo).unwrap();
+            git_in(&untrusted_repo, &["init", "-b", "main"]);
+            crate::repository_trust::revoke(&untrusted_repo.to_string_lossy()).unwrap();
+
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set("GITPULSE_DELIVER_WAIT_MS", "50")
+                .remove(crate::alerts::bridge::SESSION_ENV)
+                .remove("GITPULSE_PEER_OPT_IN");
+
+            let mailbox = Mailbox::at_default().unwrap();
+            mailbox
+                .deposit(AGY_SESSION, "m-untrusted", "hello", SystemTime::now())
+                .unwrap();
+
+            // Untrusted checkout: peer_inbox does not claim or write peers.json.
+            let untrusted_input = HookInput {
+                host: HostKind::Claude,
+                hook_event_name: "PostToolUse".into(),
+                session_id: AGY_SESSION.into(),
+                cwd: untrusted_repo.to_string_lossy().into_owned(),
+                ..HookInput::default()
+            };
+            assert!(peer_inbox_in(&mailbox, &untrusted_input).is_silent());
+            assert_eq!(mailbox.pending(AGY_SESSION), 1);
+
+            // External Claude session in trusted repo without opt-in: deliver exits 0 silently.
+            let stop_trusted = HookInput {
+                host: HostKind::Claude,
+                hook_event_name: "Stop".into(),
+                session_id: AGY_SESSION.into(),
+                cwd: trusted_repo.to_string_lossy().into_owned(),
+                ..HookInput::default()
+            };
+            assert!(deliver::run(&stop_trusted).unwrap().is_silent());
+            assert_eq!(mailbox.pending(AGY_SESSION), 1);
+
+            // With GITPULSE_PEER_OPT_IN=1 in trusted repo: external deliver wakes!
+            drop(_env);
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set("GITPULSE_DELIVER_WAIT_MS", "50")
+                .set("GITPULSE_PEER_OPT_IN", "1")
+                .remove(crate::alerts::bridge::SESSION_ENV);
+            assert!(matches!(
+                deliver::run(&stop_trusted),
+                Err(HookError::Wake(_))
+            ));
         }
     }
 }

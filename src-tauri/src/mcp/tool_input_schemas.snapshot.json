@@ -661,6 +661,320 @@
     ],
     "type": "object"
   },
+  "gitpulse_agent_inbox": {
+    "additionalProperties": false,
+    "properties": {
+      "ack": {
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "type": "boolean"
+      },
+      "for_peer": {
+        "description": "Recipient peer_id, role, or agent identifier reading its inbox (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "include_broadcasts": {
+        "description": "Include broadcast coordination messages where to_agent is null (default false)",
+        "type": "boolean"
+      },
+      "limit": {
+        "description": "Maximum messages to return (default 50)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "provider_session_id": {
+        "description": "Optional canonical UUID of the session's mailbox to deduplicate and cross-ack (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Return bus messages strictly after this sequence number (default 0)",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "thread_key": {
+        "description": "Optional conversation thread filter (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "for_peer"
+    ],
+    "type": "object"
+  },
+  "gitpulse_agent_peers": {
+    "additionalProperties": false,
+    "properties": {
+      "include_exited": {
+        "description": "Include exited non-resumable peers in addition to live and resumable sessions (default false)",
+        "type": "boolean"
+      },
+      "provider": {
+        "description": "Optional provider filter ('claude', 'agy', or 'codex')",
+        "enum": [
+          "claude",
+          "agy",
+          "codex"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_agent_register": {
+    "additionalProperties": false,
+    "properties": {
+      "branch": {
+        "description": "Branch this peer is working on (defaults to current worktree HEAD branch) (at most 256 UTF-8 bytes)",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "claimed_files": {
+        "description": "Optional pre-edit file paths claimed by this peer",
+        "items": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "claimed_symbols": {
+        "description": "Optional symbols claimed by this peer",
+        "items": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "peer_id": {
+        "description": "Explicit peer identifier (defaults to <provider>:<session_or_pid>) (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "pid": {
+        "description": "Live agent OS process id for liveness reconciliation",
+        "maximum": 4294967295,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "provider": {
+        "description": "Agent runtime provider ('claude', 'agy', or 'codex'; inferred from existing session when omitted)",
+        "enum": [
+          "claude",
+          "agy",
+          "codex"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "provider_session_id": {
+        "description": "Canonical UUID of the Claude session_id or Antigravity conversationId (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "role": {
+        "description": "Peer role label for addressing (e.g. 'reviewer', 'implementer', 'planner') (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "run_id": {
+        "description": "Workbench run identifier when bound to a workbench run (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "surface": {
+        "description": "Execution surface ('terminal', 'managed', 'external_cli', or 'ide')",
+        "enum": [
+          "terminal",
+          "managed",
+          "external_cli",
+          "ide"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "terminal_session_id": {
+        "description": "GitPulse terminal session identifier when hosted in a terminal tab (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "wake_mode": {
+        "description": "Delivery wake mode ('boundary' for hook boundaries only, 'auto' to opt into idle async/auto wake)",
+        "enum": [
+          "boundary",
+          "auto"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_agent_send": {
+    "additionalProperties": false,
+    "properties": {
+      "body": {
+        "description": "Message payload in Markdown or structured text (at most 16384 UTF-8 bytes)",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "from_peer": {
+        "description": "Sender peer or agent identifier (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "hop": {
+        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; human messages reset to 0)",
+        "maximum": 32,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "kind": {
+        "description": "Message kind ('note', 'ask', 'reply', or 'handoff'; default 'note') (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "max_hops": {
+        "description": "Maximum automatic wake hops before pausing for human review (default 6)",
+        "maximum": 32,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "msg_id": {
+        "description": "Optional idempotency message identifier (1-64 ASCII letters, digits, '-' or '_') (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "thread_key": {
+        "description": "Optional conversation thread key for grouping multi-turn replies (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to_peer": {
+        "description": "Target peer selector (peer_id, provider_session_id, terminal_session_id, run_id, role, branch, or bare provider when unambiguous) (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from_peer",
+      "to_peer",
+      "body"
+    ],
+    "type": "object"
+  },
+  "gitpulse_agent_wait": {
+    "additionalProperties": false,
+    "properties": {
+      "ack": {
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "type": "boolean"
+      },
+      "for_peer": {
+        "description": "Recipient peer_id, role, or agent identifier waiting for a peer message (at most 128 UTF-8 bytes)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "include_broadcasts": {
+        "description": "Wake on broadcast coordination messages where to_agent is null (default false)",
+        "type": "boolean"
+      },
+      "limit": {
+        "description": "Maximum messages to return on wake (default 20)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "provider_session_id": {
+        "description": "Optional canonical UUID of the session's mailbox to watch and cross-ack (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Wait for bus messages strictly after this sequence number (default 0)",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "thread_key": {
+        "description": "Optional conversation thread filter (at most 80 UTF-8 bytes)",
+        "maxLength": 80,
+        "minLength": 1,
+        "type": "string"
+      },
+      "timeout_ms": {
+        "description": "Maximum milliseconds to wait (clamped to <= 45000ms and server budget - 5000ms; default 15000)",
+        "maximum": 60000,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "repo_path",
+      "for_peer"
+    ],
+    "type": "object"
+  },
   "gitpulse_browser_open": {
     "additionalProperties": false,
     "properties": {
@@ -1245,6 +1559,15 @@
         "description": "Absolute path to a git repository (at most 4096 characters)",
         "maxLength": 4096,
         "minLength": 1,
+        "type": "string"
+      },
+      "spawn": {
+        "description": "Optional unattended launch surface ('terminal' or 'managed')",
+        "enum": [
+          "terminal",
+          "managed"
+        ],
+        "maxLength": 32,
         "type": "string"
       },
       "task_id": {

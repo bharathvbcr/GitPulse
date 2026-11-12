@@ -160,6 +160,7 @@ describe("plugin hooks", () => {
         for (const handler of group.hooks) {
           const subcommand = bareHookCommand(String(handler.command)).split(/\s+/)[1];
           const reports = subcommand === "notify";
+          const injectsPeerInbox = subcommand === "peer-inbox";
           // `deliver` is the one hook that waits, in the background: `asyncRewake`
           // runs it without blocking the agent and wakes the agent on exit 2. It
           // is not `async`, which "cannot block" and so cannot wake.
@@ -168,6 +169,12 @@ describe("plugin hooks", () => {
             expect(event, "deliver only makes sense where a turn ends").toBe("Stop");
             expect(handler.asyncRewake, "deliver is asyncRewake").toBe(true);
             expect(handler.async, "an async hook cannot wake the agent").toBeUndefined();
+            continue;
+          }
+          if (injectsPeerInbox) {
+            expect(["PostToolUse", "SessionStart", "UserPromptSubmit"]).toContain(event);
+            expect(handler.async, "peer-inbox injects context synchronously").toBeUndefined();
+            expect(handler.asyncRewake, "peer-inbox is not a background waiter").toBeUndefined();
             continue;
           }
           if (mustBeAsync.has(event)) expect(handler.async, `${event} blocks the agent on a report`).toBe(true);
@@ -450,6 +457,27 @@ describe("the package's executables are installable", () => {
         if (typeof server.command === "string" && server.command) found.add(server.command);
       }
     }
+
+    const agyHooks = JSON.parse(
+      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "hooks.json"), "utf8"),
+    ) as Record<string, Record<string, Array<{ command?: string; hooks?: Array<{ command?: string }> }>>>;
+    for (const namedHook of Object.values(agyHooks)) {
+      for (const entries of Object.values(namedHook)) {
+        for (const item of entries) {
+          const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+          for (const handler of handlers) {
+            const bin = bareHookCommand(String(handler.command ?? "")).split(/\s+/)[0];
+            if (bin) found.add(bin);
+          }
+        }
+      }
+    }
+    const agyMcp = JSON.parse(
+      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "mcp_config.json"), "utf8"),
+    ) as { mcpServers?: Record<string, { command?: string }> };
+    for (const server of Object.values(agyMcp.mcpServers ?? {})) {
+      if (typeof server.command === "string" && server.command) found.add(server.command);
+    }
     return found;
   }
 
@@ -701,8 +729,14 @@ describe("hook budgets sit inside the host's timeouts", () => {
     for (const { event, command, timeout } of declaredTimeouts()) {
       const subcommand = command.split(/\s+/)[1];
       if (subcommand === "notify") continue;
-      // The worktree hooks have their own whole-process deadline.
-      const deadline = subcommand === "worktree-create" || subcommand === "worktree-remove" ? worktreeBudgetSeconds() : total;
+      if (subcommand === "deliver") continue;
+      // Worktree and peer-inbox hooks have their own explicit whole-process budgets.
+      const deadline =
+        subcommand === "worktree-create" || subcommand === "worktree-remove"
+          ? worktreeBudgetSeconds()
+          : subcommand === "peer-inbox"
+            ? seconds("PEER_INBOX_BUDGET")
+            : total;
       expect(
         timeout,
         `${event} "${command}" times out at ${timeout}s; the hook's own deadline is ${deadline}s plus a ${margin}s margin`,
@@ -854,5 +888,52 @@ describe("notify routes", () => {
     const copy = structuredClone(shipped);
     copy.SessionEnd[0].hooks[0].command = "gitpulse-hook notify turn_finished";
     expect(problems(copy)).toContain("EVENTS has session_ended, which nothing routes");
+  });
+});
+
+describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
+  const AGY_PLUGIN = path.join(ROOT, "plugins", "gitpulse-agy");
+
+  it("carries a valid Antigravity manifest, logo asset, MCP config, and named-hook root hooks.json", () => {
+    const manifest = loadJsonAt(path.join(AGY_PLUGIN, "plugin.json"));
+    expect(manifest.name).toBe("gitpulse-agy");
+    expect(manifest.logo).toBe("assets/logo.svg");
+    expect(existsSync(path.join(AGY_PLUGIN, "assets", "logo.svg"))).toBe(true);
+
+    const mcp = loadJsonAt(path.join(AGY_PLUGIN, "mcp_config.json")) as {
+      mcpServers: Record<string, { command: string }>;
+    };
+    expect(mcp.mcpServers.gitpulse.command).toBe("gitpulse-mcp");
+
+    const hooks = loadJsonAt(path.join(AGY_PLUGIN, "hooks.json")) as Record<
+      string,
+      Record<string, Array<{ matcher?: string; command?: string; env?: Record<string, string>; hooks?: Array<{ command?: string; env?: Record<string, string> }> }>>
+    >;
+    expect(Object.keys(hooks)).toEqual(["gitpulse"]);
+    expect(Object.keys(hooks.gitpulse).sort()).toEqual([
+      "PostInvocation",
+      "PostToolUse",
+      "PreInvocation",
+      "PreToolUse",
+      "SessionStart",
+      "Stop",
+    ]);
+
+    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
+    const known = source.match(/pub const SUBCOMMANDS: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
+    const implemented = new Set([...known.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]));
+
+    for (const [event, entries] of Object.entries(hooks.gitpulse)) {
+      for (const item of entries) {
+        const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+        for (const handler of handlers) {
+          const [bin, sub] = bareHookCommand(String(handler.command)).split(/\s+/);
+          expect(bin, `${event}`).toBe("gitpulse-hook");
+          expect(implemented, `${event}: ${sub}`).toContain(sub);
+          expect(handler.env?.GITPULSE_HOST).toBe("antigravity");
+          expect(handler.env?.GITPULSE_AGY_PLUGIN_ROOT).toBe("$PLUGIN_ROOT");
+        }
+      }
+    }
   });
 });

@@ -44,15 +44,18 @@ const PLUGIN_HOOKS: &str = include_str!("../../../plugins/gitpulse/hooks/hooks.j
 
 /// The hook events injected, by the plugin manifest's own name for each.
 ///
-/// `PreToolUse` is the safety gate. The rest are the notification hooks that
-/// say what a session is doing: a question asked (`PermissionRequest`), a tool
-/// run (`PostToolUse`, `PostToolUseFailure`), a prompt answered
-/// (`UserPromptSubmit`), a turn ended (`Stop`) and a session ended
-/// (`SessionEnd`). Without them a Claude launched under a configuration that
-/// does not enable the plugin reports only a bell, which says something
-/// happened and never what, and stays "signalled" until someone types. They
-/// only report: `gitpulse-hook notify` writes nothing to stdout, so it can
-/// neither allow nor deny anything.
+/// `PreToolUse` is the safety gate. `UserPromptSubmit` and `PostToolUse` also
+/// carry `gitpulse-hook peer-inbox` (`timeout: 5`), injecting pending peer or
+/// human-confirmed mailbox messages at `0ms` hook boundaries in trusted repos.
+/// The remaining entries are the notification hooks that say what a session is
+/// doing: a question asked (`PermissionRequest`), a tool run (`PostToolUse`,
+/// `PostToolUseFailure`), a prompt answered (`UserPromptSubmit`), a turn ended
+/// (`Stop`) and a session ended (`SessionEnd`). Without them a Claude launched
+/// under a configuration that does not enable the plugin reports only a bell,
+/// which says something happened and never what, and stays "signalled" until
+/// someone types. `gitpulse-hook notify` writes nothing to stdout, so it can
+/// neither allow nor deny anything; `peer-inbox` claims one-shot mailbox files
+/// under `flock`, so dual plugin + `--settings` loading never double-delivers.
 ///
 /// `Stop` also carries `gitpulse-hook deliver`, the `asyncRewake` entry that
 /// lets a person's message reach an idle session (`hooks::deliver`). It rides

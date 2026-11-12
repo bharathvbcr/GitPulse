@@ -1113,7 +1113,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
     }
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| Reason::NotJson)?;
     let object = value.as_object().ok_or(Reason::NotAnObject)?;
-    if object.len() > 12 {
+    if object.len() > 14 {
         return Err(Reason::TooManyFields);
     }
     if object.get("v").and_then(serde_json::Value::as_u64) != Some(PROTOCOL_VERSION) {
@@ -1162,6 +1162,20 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         Some(value) => value.as_bool().ok_or(Reason::MalformedSubagent)?,
     };
     let agent_id = match object.get("agent_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|id| valid_key(id))
+                .ok_or(Reason::MalformedField)?
+                .to_owned(),
+        ),
+    };
+    let fully_idle = match object.get("fully_idle") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_bool().ok_or(Reason::MalformedField)?),
+    };
+    let provider_session_id = match object.get("provider_session_id") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
             value
@@ -1240,6 +1254,8 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         subject,
         subagent,
         agent_id,
+        fully_idle,
+        provider_session_id,
     };
     Ok((notice, seq))
 }

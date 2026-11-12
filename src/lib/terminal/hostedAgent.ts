@@ -231,6 +231,28 @@ export function createHostedAgentStore(storage: HostedStorage | null) {
       });
       persist();
     },
+    /**
+     * Records a conversation whose id the agent reported after spawn
+     * (Antigravity's `conversationId` from `SessionStart`/`PreInvocation`,
+     * since `--conversation` is resume-only and cannot be passed at fresh start).
+     */
+    remember(
+      record: Omit<HostedAgent, "endedSignal" | "provider"> & {
+        provider?: AgentProvider;
+        sessionId: string;
+        terminalId: string | null;
+      },
+    ) {
+      if (!isSessionId(record.sessionId)) return;
+      const sessionId = record.sessionId.toLowerCase();
+      records.set(sessionId, {
+        ...record,
+        sessionId,
+        provider: record.provider ?? "agy",
+        endedSignal: null,
+      });
+      persist();
+    },
     /** Ties the conversation to the PTY that runs it. */
     bind(sessionId: string, terminalId: string) {
       const record = records.get(sessionId);

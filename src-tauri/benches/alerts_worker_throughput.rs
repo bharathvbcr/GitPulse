@@ -84,6 +84,8 @@ fn notice(origin: Origin, channel: &'static str, event: &'static str, n: usize) 
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 

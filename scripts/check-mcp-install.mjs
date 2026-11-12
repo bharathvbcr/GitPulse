@@ -85,8 +85,9 @@ export const SERVER_BIN = "gitpulse-mcp";
  */
 export const HOOK_BIN = "gitpulse-hook";
 
-/** Where the shipped hook manifest lives, relative to the repo root. */
+/** Where the shipped hook manifests live, relative to the repo root. */
 const HOOKS_MANIFEST = path.join("plugins", "gitpulse", "hooks", "hooks.json");
+const AGY_HOOKS_MANIFEST = path.join("plugins", "gitpulse-agy", "hooks.json");
 
 /** Handshake budget. An unresponsive server must fail, never hang a release. */
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -395,6 +396,28 @@ export function declaredHookSubcommands(root = REPO_ROOT) {
         const [bin, subcommand] = bareHookCommand(handler.command).split(/\s+/);
         if (bin !== HOOK_BIN || !subcommand) continue;
         found.add(subcommand);
+      }
+    }
+  }
+  const agyRaw = readFileSync(path.join(root, AGY_HOOKS_MANIFEST), "utf8");
+  /** @type {unknown} */
+  const agyParsed = JSON.parse(agyRaw);
+  if (!isRecord(agyParsed)) {
+    throw new Error(`${AGY_HOOKS_MANIFEST} is not an object`);
+  }
+  for (const namedHook of Object.values(agyParsed)) {
+    if (!isRecord(namedHook)) continue;
+    for (const entries of Object.values(namedHook)) {
+      if (!Array.isArray(entries)) continue;
+      for (const item of entries) {
+        if (!isRecord(item)) continue;
+        const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+        for (const handler of handlers) {
+          if (!isRecord(handler) || typeof handler.command !== "string") continue;
+          const [bin, subcommand] = bareHookCommand(handler.command).split(/\s+/);
+          if (bin !== HOOK_BIN || !subcommand) continue;
+          found.add(subcommand);
+        }
       }
     }
   }

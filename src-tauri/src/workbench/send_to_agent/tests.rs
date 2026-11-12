@@ -37,7 +37,8 @@ fn a_live_claude_terminal_attempt_is_reached_through_its_mailbox() {
             route,
             Route::Mailbox {
                 session: SESSION.into(),
-                listening: false
+                listening: false,
+                provider: "claude".into(),
             },
             "{state}"
         );
@@ -52,7 +53,8 @@ fn a_live_claude_terminal_attempt_is_reached_through_its_mailbox() {
         route,
         Route::Mailbox {
             session: SESSION.into(),
-            listening: true
+            listening: true,
+            provider: "claude".into(),
         }
     );
     // The mailbox is named by the lower-case id whatever case the run has.
@@ -67,7 +69,8 @@ fn a_live_claude_terminal_attempt_is_reached_through_its_mailbox() {
         route,
         Route::Mailbox {
             session: SESSION.into(),
-            listening: false
+            listening: false,
+            provider: "claude".into(),
         }
     );
 }
@@ -162,7 +165,8 @@ fn an_ended_attempt_whose_resumed_conversation_is_listening_is_reached_through_i
         route,
         Route::Mailbox {
             session: SESSION.into(),
-            listening: true
+            listening: true,
+            provider: "claude".into(),
         }
     );
 }
@@ -762,6 +766,7 @@ fn a_documented_refusal_is_still_a_definite_not_sent() {
 fn the_not_listening_preview_names_no_unobserved_cause_as_the_cause() {
     let preview = Route::Mailbox {
         session: SESSION.into(),
+        provider: "claude".into(),
         listening: false,
     }
     .preview();
@@ -1135,4 +1140,97 @@ fn warm_managed_run_transitions_from_managed_route_to_resume_after_idle_expiry()
             "{provider} idle-expired route"
         );
     }
+}
+
+#[test]
+fn live_antigravity_terminal_attempt_and_peer_id_route_through_mailbox() {
+    let mut agy_run = run("external_terminal", "agy", "running", "run-agy-1");
+    let Route::Unavailable { reason } = decide(&agy_run, never_listening, no_conversation, no_manvi)
+    else {
+        panic!("unbound agy run should be unavailable until conversationId is bound");
+    };
+    assert!(
+        reason.contains("no Antigravity conversation id"),
+        "{reason}"
+    );
+
+    agy_run["provider_thread_id"] = json!(SESSION);
+    let route = decide(&agy_run, never_listening, no_conversation, no_manvi);
+    assert_eq!(
+        route,
+        Route::Mailbox {
+            session: SESSION.into(),
+            listening: false,
+            provider: "agy".into(),
+        }
+    );
+
+    // Direct `peer_id` + `repo_path` send deposits a human-confirmed message for a live peer.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root) = host(dir.path());
+    let repo_str = root.to_str().unwrap();
+    let my_pid = std::process::id();
+    let my_start_ns = crate::workbench::process_birth::started_unix_nanos(my_pid);
+    crate::engine::agent_bus::upsert_peer(
+        repo_str,
+        crate::engine::agent_bus::PeerUpsert {
+            peer_id: Some("agy-peer-main".into()),
+            provider: "agy".into(),
+            surface: "terminal".into(),
+            provider_session_id: Some(SESSION.into()),
+            terminal_session_id: Some("term-1".into()),
+            run_id: None,
+            worktree_path: repo_str.into(),
+            branch: Some("main".into()),
+            role: Some("reviewer".into()),
+            turn_state: Some("idle".into()),
+            auto_wake: Some(false),
+            pid: Some(my_pid),
+            proc_start_ns: my_start_ns,
+            transcript_path: None,
+        },
+    )
+    .unwrap();
+
+    let mb = mailbox(dir.path());
+    let preview = send_with(
+        &state,
+        &json!({
+            "peer_id": "agy-peer-main",
+            "repo_path": repo_str,
+            "text": "Please re-check the failing snapshot.",
+            "request_id": "peer-req-1",
+            "confirm": false
+        })
+        .to_string(),
+        &mb,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(preview["route"], "mailbox");
+    assert_eq!(preview["session_id"], SESSION);
+    assert_eq!(preview["sent"], false);
+    assert!(preview["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Antigravity session is live"));
+
+    let confirmed = send_with(
+        &state,
+        &json!({
+            "peer_id": "agy-peer-main",
+            "repo_path": repo_str,
+            "text": "Please re-check the failing snapshot.",
+            "request_id": "peer-req-1",
+            "confirm": true,
+            "expect_route": "mailbox"
+        })
+        .to_string(),
+        &mb,
+        never_called,
+    )
+    .unwrap();
+    assert_eq!(confirmed["sent"], true);
+    assert_eq!(confirmed["status"], "queued");
+    assert_eq!(mb.pending(SESSION), 1);
 }

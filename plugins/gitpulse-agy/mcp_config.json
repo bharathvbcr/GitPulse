@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "gitpulse": {
+      "command": "gitpulse-mcp",
+      "args": [],
+      "env": {
+        "GITPULSE_HOST": "antigravity"
+      }
+    }
+  }
+}

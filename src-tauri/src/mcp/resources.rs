@@ -808,6 +808,10 @@ mod tests {
                 "gitpulse_inbox_post",
                 "gitpulse_inbox_withdraw",
                 "gitpulse_kickoff_agent",
+                "gitpulse_agent_register",
+                "gitpulse_agent_send",
+                "gitpulse_agent_inbox",
+                "gitpulse_agent_wait",
                 "gitpulse_worktree_overlay_sync"
             ])
         );

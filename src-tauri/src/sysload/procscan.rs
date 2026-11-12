@@ -124,9 +124,10 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     if base == "codex" {
         return Some(AgentKind::Codex);
     }
-    // The app bundle's binary is `Antigravity` (capitalised); the CLI is
-    // `antigravity`. Helpers (`Antigravity Helper`) are neither.
-    if base.eq_ignore_ascii_case("antigravity")
+    // The app bundle's binary is `Antigravity` (capitalised); the CLI is `agy`
+    // (or `antigravity`). Helpers (`Antigravity Helper`) are neither.
+    if base == "agy"
+        || base.eq_ignore_ascii_case("antigravity")
         || base
             .get(..12)
             .is_some_and(|head| head.eq_ignore_ascii_case("antigravity-"))
@@ -203,12 +204,28 @@ pub(crate) fn classify_argv(exec: &str, argv: &[String]) -> Option<AgentKind> {
 pub(crate) fn name_selects_procargs(name: &str) -> bool {
     name == "claude"
         || name == "codex"
+        || name == "agy"
         || name.eq_ignore_ascii_case("antigravity")
         || name == "language_server"
         || name == "devcouncil"
         || name == "manvi"
         || name == "bun"
         || name.starts_with("node")
+}
+
+/// Whether a classified process is an IDE-hosted agent rather than a CLI one.
+///
+/// Antigravity's `Antigravity` app bundle and `language_server` run from `/`
+/// and infer their workspace from descendants, whereas the `agy` CLI runs in
+/// the developer's working directory like `claude` and `codex`.
+pub(crate) fn is_exec_ide_hosted(exec: &str, kind: AgentKind) -> bool {
+    if !kind.is_ide_hosted() {
+        return false;
+    }
+    Path::new(exec)
+        .file_name()
+        .and_then(|n| n.to_str())
+        != Some("agy")
 }
 
 /// A name the kernel reports for a versioned installer binary: empty, or a
@@ -270,6 +287,7 @@ pub(crate) struct SessionRow {
     pub ppid: i32,
     pub start_us: u64,
     pub kind: AgentKind,
+    pub ide_hosted: bool,
     pub launch: Option<LaunchKey>,
 }
 
@@ -482,7 +500,7 @@ fn session_cwds(
     for row in rows.iter().take(MAX_SESSIONS) {
         let own = cwd_of(row.pid);
         let outside = own.as_deref().and_then(repo_root_of).is_none();
-        let hinted = if row.kind.is_ide_hosted() && outside {
+        let hinted = if row.ide_hosted && outside {
             if children.is_empty() {
                 for (pid, link) in links {
                     if *pid != link.ppid {
@@ -546,11 +564,13 @@ pub(crate) fn session_row(
 ) -> Option<SessionRow> {
     if let Some((exec, argv, launch)) = args {
         let kind = classify_argv(&exec, &argv)?;
+        let ide_hosted = is_exec_ide_hosted(&exec, kind);
         return Some(SessionRow {
             pid,
             ppid,
             start_us,
             kind,
+            ide_hosted,
             launch,
         });
     }
@@ -559,11 +579,13 @@ pub(crate) fn session_row(
         SessionProbe::Args => resolve()?,
     };
     let kind = classify(&path, None)?;
+    let ide_hosted = is_exec_ide_hosted(&path, kind);
     Some(SessionRow {
         pid,
         ppid,
         start_us,
         kind,
+        ide_hosted,
         launch: None,
     })
 }
@@ -1615,10 +1637,13 @@ fn assemble_sessions(
         links,
         mut cwds,
     } = table;
-    let by_pid: HashMap<i32, AgentKind> = rows.iter().map(|row| (row.pid, row.kind)).collect();
+    let by_pid: HashMap<i32, (AgentKind, bool)> = rows
+        .iter()
+        .map(|row| (row.pid, (row.kind, row.ide_hosted)))
+        .collect();
     let kept: Vec<&SessionRow> = rows
         .iter()
-        .filter(|row| by_pid.get(&row.ppid).copied() != Some(row.kind))
+        .filter(|row| by_pid.get(&row.ppid).copied() != Some((row.kind, row.ide_hosted)))
         .collect();
     if kept.len() > MAX_SESSIONS {
         return Err(format!(
@@ -3425,12 +3450,54 @@ pub(crate) mod tests {
             assert_eq!(classify_argv(exec, &argv), want, "{exec} {argv:?}");
         }
         assert!(name_selects_procargs("Antigravity"));
+        assert!(name_selects_procargs("agy"));
         assert!(name_selects_procargs("language_server"));
         assert!(!name_selects_procargs("Antigravity Helper"));
         assert!(path_selects_procargs(AG_LS));
+        assert!(path_selects_procargs("/Users/me/.local/bin/agy"));
+        assert_eq!(
+            classify("/Users/me/.local/bin/agy", None),
+            Some(AgentKind::Antigravity)
+        );
+        assert!(is_exec_ide_hosted(AG_APP, AgentKind::Antigravity));
+        assert!(is_exec_ide_hosted(AG_LS, AgentKind::Antigravity));
+        assert!(!is_exec_ide_hosted("/Users/me/.local/bin/agy", AgentKind::Antigravity));
         // Without readable arguments the flag cannot be checked.
         let row = session_row(7, 1, 4, SessionProbe::ArgsOf(AG_LS.into()), None, || None);
         assert!(row.is_none());
+    }
+
+    #[test]
+    fn agy_cli_session_keeps_its_own_working_directory_without_ide_descendant_reattribution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("Code");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = checkout(tmp.path(), "OtherRepo");
+        let agy_row = session_row(
+            42,
+            1,
+            10,
+            SessionProbe::Args,
+            Some((
+                "/Users/me/.local/bin/agy".into(),
+                args(&["agy", "--resume", "conv-1"]),
+                LaunchKey::from_env(["GITPULSE_SESSION_ID=term-agy"]),
+            )),
+            || None,
+        )
+        .expect("agy CLI classified");
+        assert_eq!(agy_row.kind, AgentKind::Antigravity);
+        assert!(!agy_row.ide_hosted);
+        let mut table = SessionTable::from(vec![agy_row]);
+        let mut fx = ProcFixture::default();
+        fx.cwds.insert(42, home.clone());
+        fx.add(&mut table, 43, 42, repo.to_str().unwrap(), &["git", "status"]);
+        let sessions = sessions_for(table, &fx);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].kind, AgentKind::Antigravity);
+        assert_eq!(sessions[0].kind.name(), "antigravity");
+        assert_eq!(sessions[0].cwd.as_deref(), home.to_str());
+        assert_eq!(sessions[0].tree.as_deref(), Some("session:term-agy"));
     }
 
     /// A checkout fixture: `<tmp>/<name>/.git`.
@@ -3880,6 +3947,7 @@ pub(crate) mod tests {
                 ppid: 1,
                 start_us: 5,
                 kind: AgentKind::Claude,
+                ide_hosted: false,
                 launch: LaunchKey::from_env(["GITPULSE_SESSION_ID=term-9"]),
             },
             // The native binary a shim exec'd: same kind, direct child.
@@ -3888,6 +3956,7 @@ pub(crate) mod tests {
                 ppid: 10,
                 start_us: 6,
                 kind: AgentKind::Claude,
+                ide_hosted: false,
                 launch: None,
             },
             // A shell is not a candidate, so this Claude is its own session.
@@ -3896,6 +3965,7 @@ pub(crate) mod tests {
                 ppid: 20,
                 start_us: 8,
                 kind: AgentKind::Claude,
+                ide_hosted: false,
                 launch: None,
             },
             SessionRow {
@@ -3903,6 +3973,7 @@ pub(crate) mod tests {
                 ppid: 1,
                 start_us: 9,
                 kind: AgentKind::Codex,
+                ide_hosted: false,
                 launch: LaunchKey::from_env(["GITPULSE_RUN_ID=run-3"]),
             },
         ];
@@ -3946,6 +4017,7 @@ pub(crate) mod tests {
                 ppid: 0,
                 start_us: 1,
                 kind: AgentKind::Claude,
+                ide_hosted: false,
                 launch: None,
             })
             .collect();
@@ -3959,6 +4031,7 @@ pub(crate) mod tests {
             ppid,
             start_us,
             kind,
+            ide_hosted: kind.is_ide_hosted(),
             launch: None,
         }
     }

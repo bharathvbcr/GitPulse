@@ -26,6 +26,10 @@ export interface AgentBusMessage {
   branch: string | null;
   created_at_ms: number;
   thread_key?: string;
+  msg_id?: string;
+  read_by?: string[];
+  hop?: number;
+  max_hops?: number;
 }
 
 export type BusMessage = AgentBusMessage;

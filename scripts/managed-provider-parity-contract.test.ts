@@ -30,6 +30,7 @@ import type { AgentProvider } from "../src/lib/workbench/vocabulary";
  * is absent, instead of quietly passing as if it had been compared.
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const MANVI_ROOT = process.env.GITPULSE_MANVI_ROOT || path.join(ROOT, "..", "Manvi");
 
 /** Providers the Rust workbench admits, read from the function that decides. */
 function rustManagedProviders(): string[] {
@@ -43,7 +44,7 @@ function rustManagedProviders(): string[] {
 
 /** Providers the harness has an adapter for, read from its own exported list. */
 function harnessManagedProviders(): string[] | null {
-  const source = path.join(ROOT, "..", "Manvi", "manvi", "codingagent", "codex.go");
+  const source = path.join(MANVI_ROOT, "manvi", "codingagent", "codex.go");
   if (!existsSync(source)) return null;
   const text = readFileSync(source, "utf8");
   const match = text.match(/var ManagedProviders = \[\]string\{([^}]*)\}/);
@@ -188,7 +189,7 @@ describe("managed provider parity", () => {
       // Not a pass. The sibling checkout is absent, so this comparison did not
       // run, and saying so is the whole point — a check that could not run must
       // never read like one that ran and agreed.
-      expect(existsSync(path.join(ROOT, "..", "Manvi"))).toBe(false);
+      expect(existsSync(MANVI_ROOT)).toBe(false);
       return;
     }
     expect(harness).toEqual(renderer);

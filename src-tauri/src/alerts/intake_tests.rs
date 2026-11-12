@@ -351,6 +351,8 @@ fn bell(session: &str) -> Notice {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 

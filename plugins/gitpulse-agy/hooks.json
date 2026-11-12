@@ -1,0 +1,102 @@
+{
+  "gitpulse": {
+    "PreToolUse": [
+      {
+        "matcher": "^(write_file|write_to_file|edit_file|replace_file_content|multi_edit|multi_replace_file_content|notebook_edit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook collision-guard",
+            "timeout": 10000,
+            "env": {
+              "GITPULSE_HOST": "antigravity",
+              "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+            }
+          }
+        ]
+      },
+      {
+        "matcher": "^run_command$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook command-gate",
+            "timeout": 10000,
+            "env": {
+              "GITPULSE_HOST": "antigravity",
+              "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+            }
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify tool_finished",
+            "timeout": 5000,
+            "env": {
+              "GITPULSE_HOST": "antigravity",
+              "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+            }
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook session-brief",
+        "timeout": 10000,
+        "env": {
+          "GITPULSE_HOST": "antigravity",
+          "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+        }
+      },
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5000,
+        "env": {
+          "GITPULSE_HOST": "antigravity",
+          "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+        }
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5000,
+        "env": {
+          "GITPULSE_HOST": "antigravity",
+          "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+        }
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5000,
+        "env": {
+          "GITPULSE_HOST": "antigravity",
+          "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+        }
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook stop-or-notify",
+        "timeout": 5000,
+        "env": {
+          "GITPULSE_HOST": "antigravity",
+          "GITPULSE_AGY_PLUGIN_ROOT": "$PLUGIN_ROOT"
+        }
+      }
+    ]
+  }
+}

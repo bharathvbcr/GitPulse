@@ -71,6 +71,16 @@ pub(crate) fn running_since(pid: u32, instant: u128) -> Liveness {
     }
 }
 
+/// Returns the non-zombie creation timestamp of `pid` in nanoseconds since the
+/// Unix epoch, for recording `proc_start_ns` on peer registration.
+pub(crate) fn started_unix_nanos(pid: u32) -> Option<u64> {
+    observe(pid)
+        .ok()
+        .flatten()
+        .filter(|birth| !birth.zombie)
+        .and_then(|birth| u64::try_from(birth.started_unix_nanos).ok())
+}
+
 /// `Ok(None)` only when the OS says no such process exists.
 #[cfg(target_os = "macos")]
 fn observe(pid: u32) -> Result<Option<Birth>, String> {

@@ -73,7 +73,11 @@ fn main() {
 fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
     std::panic::catch_unwind(decide).unwrap_or_else(|_| {
         log::error!(target: "hook", "gitpulse-hook panicked; no decision");
-        hooks::worktree::exit_code_after_panic()
+        let code = hooks::worktree::exit_code_after_panic();
+        if code == 0 && hooks::is_antigravity_env() {
+            emit("{}\n".into());
+        }
+        code
     })
 }
 
@@ -117,13 +121,17 @@ fn decide() -> i32 {
 
     if !SUBCOMMANDS.contains(&subcommand.as_str()) {
         log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
+        if hooks::is_antigravity_env() {
+            emit("{}\n".into());
+        }
         return 0;
     }
 
     // An unparseable payload is reported on stderr and dropped. Guessing at a
     // decision from input we could not read would be the worst of both worlds:
     // neither a check that ran nor an admission that one did not. Exiting 0
-    // with no stdout leaves the host's own permission flow exactly as it was.
+    // with no stdout leaves the host's own permission flow exactly as it was
+    // (or `"{}"` on Antigravity, which never accepts empty stdout).
     //
     // `notify` takes the matcher's name as a second argument, because a
     // `Notification` payload does not say which matcher routed it. It is taken
@@ -138,6 +146,9 @@ fn decide() -> i32 {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
+            if !worktree_hook && hooks::is_antigravity_env() {
+                emit("{}\n".into());
+            }
             // Nothing was done; the launcher can still have plain git do it.
             return if worktree_hook {
                 hooks::worktree::EXIT_UNAVAILABLE
@@ -168,7 +179,7 @@ fn decide() -> i32 {
             } else {
                 output
             };
-            if let Some(json) = output.render_for_host(input.is_cursor) {
+            if let Some(json) = output.render_for_host_kind(input.host, &input.hook_event_name) {
                 emit(format!("{json}\n"));
             }
             0
@@ -184,6 +195,9 @@ fn decide() -> i32 {
         // One line per invocation, at the level the outcome calls for: a
         // transport this platform does not have is information, not a failure.
         Err(error) => {
+            if input.host == hooks::HostKind::Antigravity {
+                emit("{}\n".into());
+            }
             let diagnostic = hooks::diagnostic(&error);
             log::log!(target: "hook", diagnostic.level, "{}", diagnostic.line);
             diagnostic.exit_code

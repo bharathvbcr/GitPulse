@@ -564,6 +564,7 @@ pub fn run() {
             cmd_ai_coverage_report,
             cmd_terminal_spawn,
             cmd_terminal_write,
+            cmd_terminal_deliver_peer,
             cmd_terminal_ack,
             cmd_terminal_export,
             cmd_terminal_resize,

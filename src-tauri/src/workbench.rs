@@ -23,7 +23,7 @@ pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
 mod lineage;
-mod managed_run;
+pub(crate) mod managed_run;
 pub(crate) mod notifications;
 mod organize;
 pub(crate) mod process_birth;
@@ -506,7 +506,7 @@ impl WorkbenchState {
         body(store)
     }
 
-    fn request(&self, method: &str, input: &str) -> Result<Value, WorkbenchError> {
+    pub(crate) fn request(&self, method: &str, input: &str) -> Result<Value, WorkbenchError> {
         self.check_open()?;
         if input.len() > MAX_INPUT || method.len() > 64 {
             return Err(WorkbenchError::new(
@@ -540,6 +540,7 @@ impl WorkbenchState {
                 | "runs.finish"
                 | "runs.reconcile"
                 | "runs.protocol"
+                | "runs.bind_thread"
                 | "runs.managed.prepare"
                 | "runs.managed.activate"
                 // A relink names a checkout the host resolves itself, through
@@ -566,6 +567,9 @@ impl WorkbenchState {
         }
         if method == "runs.claim" {
             return terminal_launch::claim(self, input);
+        }
+        if method == "runs.bind_terminal_thread" {
+            return terminal_launch::bind_terminal_thread(self, input);
         }
         if method == "runs.cancel" {
             return terminal_launch::cancel(self, input);

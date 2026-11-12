@@ -276,6 +276,8 @@ impl WireNotice {
             subject: self.subject,
             subagent: self.subagent,
             agent_id: self.agent_id,
+            fully_idle: None,
+            provider_session_id: None,
         })
     }
 }
@@ -622,6 +624,8 @@ mod tests {
             subject: None,
             subagent: false,
             agent_id: None,
+            fully_idle: None,
+            provider_session_id: None,
         };
         let wire = WireNotice::from_notice(&notice);
         assert_eq!(wire.clone().into_notice().unwrap(), notice);
@@ -650,6 +654,8 @@ mod tests {
             subject: None,
             subagent: true,
             agent_id: Some("a1b2c3d4e5f6".into()),
+            fully_idle: None,
+            provider_session_id: None,
         };
         let wire = WireNotice::from_notice(&notice);
         let text = serde_json::to_string(&wire).unwrap();

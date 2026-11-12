@@ -106,6 +106,8 @@
 
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { isTauri } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord } from "../ui/platformCopy";
   import { invoke } from "../ipc/invoke";
@@ -145,7 +147,8 @@
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
   import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
-  import { sessionActivity } from "../terminal/sessionActivity";
+  import { PEER_QUIESCENCE_MS, canAutoWakePeerInbox, clean, sessionActivity } from "../terminal/sessionActivity";
+  import { bindTerminalRunThread } from "../workbench/client";
   import { createGpuRenderer, type GpuRenderer, type GpuState } from "../terminal/gpuRenderer";
   import { createFrameProbe, FRAME_PROBE_OSC, handleFrameProbeCommand } from "../diagnostics/frameProbe";
   import {
@@ -200,6 +203,7 @@
     tabId,
     launcher,
     initialPrompt,
+    initialAutoWake = false,
     startDir,
     taskRunId,
     resume,
@@ -227,6 +231,7 @@
     tabId: string;
     launcher: LauncherKind;
     initialPrompt?: string;
+    initialAutoWake?: boolean;
     /** Directory below the checkout to start in; absent starts at its root. */
     startDir?: string;
     taskRunId?: string;
@@ -276,6 +281,17 @@
    * wrong id would tell the notifier that some other session is on screen.
    */
   let nativeSessionId = "";
+  let activePtyId = $state("");
+  let peerAutoWake = $state(untrack(() => Boolean(initialAutoWake)));
+  let peerInboxPending = $state(false);
+  let peerInboxSender = $state<string | null>(null);
+  let peerInboxGeneration = $state(0);
+  let peerInboxArrivedAt = $state(0);
+  let peerAutoWakeAttemptedGen = $state(0);
+  let peerDelivering = $state(false);
+  let boundRunThreadId: string | null = null;
+  let peerWakeTimer: ReturnType<typeof setTimeout> | null = null;
+  let peerFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The permission mode this tab launches with, or null for the CLI's own
    * default. Read once before the spawn because it becomes argv, and a change
@@ -969,6 +985,8 @@
           // left behind it pushes the live one out of the bounded report.
           if (nativeSessionId && nativeSessionId !== spawned.id) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
           nativeSessionId = spawned.id;
+          activePtyId = spawned.id;
+          boundRunThreadId = null;
           if (hostedId) {
             hostedClaude.bind(hostedId, spawned.id);
             hostedLive = true;
@@ -1451,6 +1469,39 @@
     themeObserver = new MutationObserver(applyTheme);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
     lifecycle = createLifecycle();
+    let unlistenPeerInbox: (() => void) | null = null;
+    if (isTauri()) {
+      void listen("gitpulse-peer-inbox", (event) => {
+        if (disposed || launcher !== "agy") return;
+        const raw =
+          event.payload && typeof event.payload === "object"
+            ? (event.payload as Record<string, unknown>)
+            : null;
+        if (!raw) return;
+        const targetSession = typeof raw.session_id === "string" ? raw.session_id : null;
+        const targetProviderSession =
+          typeof raw.provider_session_id === "string" ? raw.provider_session_id.toLowerCase() : null;
+        const currentProvider =
+          (nativeSessionId ? get(sessionActivity).get(nativeSessionId)?.providerSessionId : null) ??
+          hostedId;
+        const matchesTerminal = Boolean(nativeSessionId && targetSession === nativeSessionId);
+        const matchesConversation = Boolean(
+          currentProvider &&
+            targetProviderSession &&
+            currentProvider.toLowerCase() === targetProviderSession,
+        );
+        if (!matchesTerminal && !matchesConversation) return;
+        peerInboxGeneration += 1;
+        peerInboxArrivedAt = Date.now();
+        peerInboxPending = true;
+        peerInboxSender = clean(raw.from_peer ?? raw.peer_id, 64);
+      })
+        .then((stop) => {
+          if (disposed) stop();
+          else unlistenPeerInbox = stop;
+        })
+        .catch(() => {});
+    }
     // Awaited before the spawn so the launch reflects the saved default mode
     // rather than the one the store starts at.
     void Promise.allSettled([loadAgentDefaults()])
@@ -1481,6 +1532,10 @@
       observedHelper = null;
       for (const timer of armTimers) clearTimeout(timer);
       armTimers.clear();
+      unlistenPeerInbox?.();
+      unlistenPeerInbox = null;
+      if (peerWakeTimer) { clearTimeout(peerWakeTimer); peerWakeTimer = null; }
+      if (peerFallbackTimer) { clearTimeout(peerFallbackTimer); peerFallbackTimer = null; }
       disposed = true;
       // Closing the tab is the reader's own end of it, not an incident. A
       // process still running is kept (`lifecycle.dispose`), and so is its
@@ -1677,6 +1732,152 @@
     terminalAttendance.report(nativeSessionId, visible);
   });
 
+  const liveActivity = $derived(activePtyId ? $sessionActivity.get(activePtyId) : undefined);
+  const effectiveProviderSessionId = $derived(
+    liveActivity?.providerSessionId ?? (hostedId && hostedId !== AGY_CONTINUE_SENTINEL ? hostedId : null),
+  );
+
+  function dismissPeerInbox() {
+    peerInboxPending = false;
+    if (peerFallbackTimer) { clearTimeout(peerFallbackTimer); peerFallbackTimer = null; }
+  }
+
+  async function deliverPeerInbox(fromAutoWake: boolean): Promise<void> {
+    const sessionId = nativeSessionId;
+    const providerSessionId = effectiveProviderSessionId;
+    if (!sessionId || !providerSessionId || peerDelivering || disposed) return;
+    if (fromAutoWake) peerAutoWakeAttemptedGen = peerInboxGeneration;
+    peerDelivering = true;
+    try {
+      const delivered = await invoke<boolean>("cmd_terminal_deliver_peer", {
+        sessionId,
+        providerSessionId,
+      });
+      if (disposed) return;
+      if (!delivered) {
+        peerInboxPending = false;
+        return;
+      }
+      if (peerFallbackTimer) clearTimeout(peerFallbackTimer);
+      peerFallbackTimer = setTimeout(() => {
+        peerFallbackTimer = null;
+        // Single-shot per inboxGeneration: if PreInvocation did not fire within
+        // 5s (e.g. a modal was open), keep manual [Deliver] on screen.
+      }, 5_000);
+    } catch (err: unknown) {
+      if (!fromAutoWake && !disposed) warning = formatError(err);
+    } finally {
+      peerDelivering = false;
+    }
+  }
+
+  /**
+   * Bind Antigravity's dynamically discovered `conversationId` (`SessionStart` /
+   * `PreInvocation` -> `alerts::bridge` -> `sessionActivity`) to either the
+   * owned workbench `external_terminal` run or `hostedClaude` so resume and A2A
+   * delivery use `--conversation <uuid>`.
+   */
+  $effect(() => {
+    if (launcher !== "agy") return;
+    const ptyId = activePtyId;
+    const discovered = liveActivity?.providerSessionId ?? null;
+    if (!ptyId || !discovered) return;
+    untrack(() => {
+      if (taskRunId) {
+        if (boundRunThreadId === discovered) return;
+        boundRunThreadId = discovered;
+        void bindTerminalRunThread(taskRunId, ptyId, discovered).catch(() => {});
+        return;
+      }
+      if (hostedId !== discovered) {
+        hostedId = discovered;
+        hostedLive = true;
+        hostedClaude.remember({
+          sessionId: discovered,
+          terminalId: ptyId,
+          repoPath: workPath,
+          startDir: startDir ?? null,
+          mode: permissionMode,
+          startedAt: Date.now(),
+          provider: "agy",
+        });
+      }
+    });
+  });
+
+  /**
+   * Clear the peer inbox overlay once `PreInvocation` (`prompt_submitted`)
+   * confirms `agy` actually started a turn after the message arrived.
+   */
+  $effect(() => {
+    if (!peerInboxPending) return;
+    const submittedAt = liveActivity?.lastPromptSubmittedAt ?? 0;
+    if (peerInboxArrivedAt > 0 && submittedAt >= peerInboxArrivedAt) {
+      untrack(() => {
+        peerInboxPending = false;
+        if (peerFallbackTimer) { clearTimeout(peerFallbackTimer); peerFallbackTimer = null; }
+      });
+    }
+  });
+
+  /**
+   * Verdict 2 5-invariant quiescent auto-wake: armed only when toggled On or
+   * spawned unattended via `gitpulse_kickoff_agent`.
+   */
+  $effect(() => {
+    if (peerWakeTimer) { clearTimeout(peerWakeTimer); peerWakeTimer = null; }
+    if (
+      launcher !== "agy" ||
+      !peerInboxPending ||
+      !peerAutoWake ||
+      exited ||
+      spawning ||
+      !activePtyId ||
+      !effectiveProviderSessionId ||
+      peerAutoWakeAttemptedGen >= peerInboxGeneration
+    ) {
+      return;
+    }
+    const act = liveActivity;
+    if (!act || !act.fullyIdle || act.dirtyPrompt) return;
+    const now = Date.now();
+    const waitInput = act.lastInputAt == null ? 0 : Math.max(0, PEER_QUIESCENCE_MS - (now - act.lastInputAt));
+    const waitOutput = act.lastOutputAt == null ? 0 : Math.max(0, PEER_QUIESCENCE_MS - (now - act.lastOutputAt));
+    const delay = Math.max(waitInput, waitOutput);
+    const sessionId = activePtyId;
+    const gen = peerInboxGeneration;
+    peerWakeTimer = setTimeout(() => {
+      peerWakeTimer = null;
+      if (disposed || !peerInboxPending || !peerAutoWake || peerInboxGeneration !== gen) return;
+      void (async () => {
+        try {
+          const context = parseTerminalContext(
+            await invoke<unknown>("cmd_terminal_context", { sessionId }),
+          );
+          if (disposed) return;
+          const fresh = get(sessionActivity).get(sessionId);
+          if (
+            canAutoWakePeerInbox({
+              autoWake: peerAutoWake,
+              activity: fresh,
+              foregroundProcess: context?.process ?? null,
+              inboxGeneration: peerInboxGeneration,
+              attemptedGeneration: peerAutoWakeAttemptedGen,
+              now: Date.now(),
+            })
+          ) {
+            await deliverPeerInbox(true);
+          }
+        } catch {
+          // Leave the manual [Deliver] pill intact if context inspection fails.
+        }
+      })();
+    }, delay);
+    return () => {
+      if (peerWakeTimer) { clearTimeout(peerWakeTimer); peerWakeTimer = null; }
+    };
+  });
+
   /**
    * WebGL while attended: the same `onscreen` the notifier is told. A hidden
    * tab, a collapsed dock or another repository's dock keeps its warm context
@@ -1731,6 +1932,41 @@
     ></div>
     {#if scrolledBack}
       <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
+    {/if}
+    {#if peerInboxPending && launcher === "agy" && !exited}
+      <div
+        role="status"
+        data-testid="terminal-peer-inbox-pill"
+        class="gp-card absolute top-3 right-5 flex items-center gap-1.5 bg-surface/95 px-2.5 py-1.5 text-xs text-textPrimary shadow-lg"
+      >
+        <span class="truncate max-w-48">
+          {peerInboxSender ? `Peer message from ${peerInboxSender}` : "Peer message waiting"}
+        </span>
+        <button
+          type="button"
+          class="gp-btn py-0.5! px-2! text-xs!"
+          disabled={peerDelivering || !effectiveProviderSessionId}
+          onclick={() => void deliverPeerInbox(false)}
+        >
+          Deliver
+        </button>
+        <button
+          type="button"
+          class="gp-btn py-0.5! px-2! text-xs!"
+          aria-pressed={peerAutoWake}
+          onclick={() => (peerAutoWake = !peerAutoWake)}
+        >
+          {peerAutoWake ? "Auto-wake: On" : "Auto-wake: Off"}
+        </button>
+        <button
+          type="button"
+          class="gp-icon-btn"
+          aria-label="Dismiss peer message notice"
+          onclick={dismissPeerInbox}
+        >
+          <X size={12} />
+        </button>
+      </div>
     {/if}
     {#if awaitingAcknowledgement}
       <!-- Covers the grid rather than sitting beside it: nothing has spawned,

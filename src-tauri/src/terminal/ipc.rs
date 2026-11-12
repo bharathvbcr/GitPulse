@@ -61,6 +61,32 @@ pub async fn write_async(
     .await
 }
 
+/// Verifies unread peer messages exist in `agent_mailbox` (without claiming
+/// them) and that `"agy"` is the foreground process before writing
+/// [`super::PEER_WAKE_PROMPT`] on the session's input lane.
+pub async fn deliver_peer_wake_async(
+    state: &TerminalSessions,
+    session_id: String,
+    provider_session_id: String,
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        let lane = host.input_lane(&session_id)?;
+        let state = state.clone();
+        return lane
+            .run("terminal_deliver_peer", move || {
+                super::deliver_peer_wake(&state, &session_id, &provider_session_id)
+            })
+            .await;
+    }
+    let lane = state.input_lane(&session_id)?;
+    let state = state.clone();
+    lane.run("terminal_deliver_peer", move || {
+        super::deliver_peer_wake(&state, &session_id, &provider_session_id)
+    })
+    .await
+}
+
 /// Applies a size to a session's PTY.
 pub async fn resize_async(
     state: &TerminalSessions,

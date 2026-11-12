@@ -40,8 +40,16 @@ const MAX_REQUEST_ID: usize = 64;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
-    /// The attempt (run) the message is for.
+    /// The attempt (run) the message is for, unless `peer_id` + `repo_path`
+    /// address a live peer directly.
+    #[serde(default)]
     id: String,
+    /// Optional direct peer target in `peers.json` (used with `repo_path`).
+    #[serde(default)]
+    peer_id: Option<String>,
+    /// Checkout path owning `peers.json` when `peer_id` is supplied.
+    #[serde(default)]
+    repo_path: Option<String>,
     /// Exactly the text the person saw.
     text: String,
     /// Fresh for each press of Confirm; a retry of the same press reuses it.
@@ -59,6 +67,7 @@ pub(super) enum Route {
     Mailbox {
         session: String,
         listening: bool,
+        provider: String,
     },
     /// The conversation can be resumed; carries `conversation::judge`'s answer.
     Resume {
@@ -88,11 +97,17 @@ impl Route {
     /// The route, and why, as the preview reads it.
     fn preview(&self) -> Value {
         match self {
-            Self::Mailbox { session, listening } => json!({
+            Self::Mailbox {
+                session,
+                listening,
+                provider,
+            } => json!({
                 "route": "mailbox",
                 "session_id": session,
                 "listening": listening,
-                "reason": if *listening {
+                "reason": if provider == "agy" {
+                    "This agent's Antigravity session is live. The message is left in its GitPulse mailbox and injected at its next hook boundary (or when delivered from its terminal banner)."
+                } else if *listening {
                     "This agent's Claude Code session is live and a GitPulse hook is waiting on it. The message is handed to the hook and shown to the agent as a reminder."
                 } else {
                     "No GitPulse hook is waiting on this agent's Claude Code session right now, and GitPulse cannot see why (it may be mid-turn, idle too long, or running a hook build without deliver). The message is held for two hours and is shown only if a hook on this session picks it up."
@@ -188,16 +203,20 @@ pub(super) fn decide(
         },
         (Some("managed"), false, true) => resume_or(provider, resumable),
         (Some("external_terminal"), true, _) => {
-            if provider != "claude" {
+            if !matches!(provider, "claude" | "agy") {
                 return unavailable(
-                    "Only a Claude Code session can be sent a message from GitPulse; this agent is not Claude Code.",
+                    "Only a Claude Code or Antigravity session can be sent a message from GitPulse; this agent is not Claude Code or Antigravity.",
                 );
             }
             match session_of(run) {
                 Some(session) => Route::Mailbox {
                     listening: listening(&session),
                     session,
+                    provider: provider.to_owned(),
                 },
+                None if provider == "agy" => unavailable(
+                    "This attempt has no Antigravity conversation id yet, so there is no session to leave a message for.",
+                ),
                 None => unavailable(
                     "This attempt has no Claude Code session id, so there is no session to leave a message for.",
                 ),
@@ -207,12 +226,13 @@ pub(super) fn decide(
             // A conversation resumed from this attempt keeps the attempt's
             // session id. If a hook is waiting on it, it is live right now and
             // the message belongs there, not in a second resume.
-            if provider == "claude" {
+            if matches!(provider, "claude" | "agy") {
                 if let Some(session) = session_of(run) {
                     if listening(&session) {
                         return Route::Mailbox {
                             session,
                             listening: true,
+                            provider: provider.to_owned(),
                         };
                     }
                 }
@@ -247,13 +267,34 @@ fn resume_or(provider: &str, resumable: impl FnOnce() -> Value) -> Route {
     }
 }
 
-/// The Claude Code session a terminal attempt runs as: its run id, which
-/// GitPulse passed as `--session-id`, when that is the canonical form.
+/// The provider conversation a terminal attempt runs as: `provider_thread_id`
+/// once bound (`runs.bind_thread`, used by Antigravity), else for Claude Code
+/// the canonical UUID passed as `--session-id` (`run["id"]`), else the peer's
+/// bound `provider_session_id` in `peers.json`.
 fn session_of(run: &Value) -> Option<String> {
-    run["id"]
+    if let Some(bound) = run["provider_thread_id"]
         .as_str()
         .filter(|id| super::terminal_command::is_canonical_uuid(id))
-        .map(str::to_ascii_lowercase)
+    {
+        return Some(bound.to_ascii_lowercase());
+    }
+    let provider = run["provider"].as_str().unwrap_or("claude");
+    if provider == "claude" {
+        if let Some(id) = run["id"]
+            .as_str()
+            .filter(|id| super::terminal_command::is_canonical_uuid(id))
+        {
+            return Some(id.to_ascii_lowercase());
+        }
+    }
+    if let (Some(cwd), Some(run_id)) = (run["cwd"].as_str(), run["id"].as_str()) {
+        if let Some(peer_sid) = crate::engine::agent_bus::peer_session_id_for_run(cwd, run_id) {
+            if super::terminal_command::is_canonical_uuid(&peer_sid) {
+                return Some(peer_sid.to_ascii_lowercase());
+            }
+        }
+    }
+    None
 }
 
 fn invalid(message: impl Into<String>) -> WorkbenchError {
@@ -262,7 +303,20 @@ fn invalid(message: impl Into<String>) -> WorkbenchError {
 
 fn parse(input: &str) -> Result<Request, WorkbenchError> {
     let request: Request = serde_json::from_str(input).map_err(|e| invalid(e.to_string()))?;
-    if !super::is_record_id(&request.id) {
+    if let Some(ref pid) = request.peer_id {
+        let clean = pid.trim();
+        if clean.is_empty() || clean.len() > 128 || clean.chars().any(char::is_control) {
+            return Err(invalid("Select a valid live peer identity."));
+        }
+        let repo = request
+            .repo_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
+            .ok_or_else(|| invalid("Addressing a peer directly requires an absolute repo_path."))?;
+        crate::repository_trust::require(std::path::Path::new(repo))
+            .map_err(|e| WorkbenchError::new("untrusted_repository", e.message()))?;
+    } else if !super::is_record_id(&request.id) {
         return Err(invalid("Select a saved attempt."));
     }
     if !super::is_record_id_within(&request.request_id, MAX_REQUEST_ID) {
@@ -304,28 +358,108 @@ pub(super) fn send_with_homes(
     mut call: impl FnMut(&str, Value) -> Result<Value, WorkbenchError>,
 ) -> Result<Value, WorkbenchError> {
     let request = parse(input)?;
-    let row = state
-        .with_store(|store| query(store, "runs.get", &json!({"id": request.id}).to_string()))?;
-    let run = &row["item"];
-    let id = request.id.clone();
-    let route = decide(
-        run,
-        |session| mailbox.listening(session, SystemTime::now()),
-        || {
-            let checkout_exists = run["cwd"]
-                .as_str()
-                .is_some_and(|cwd| std::path::Path::new(cwd).is_dir());
-            let provider = run["provider"].as_str().unwrap_or("claude");
-            conversation::judge(run, checkout_exists, |session| {
-                if provider == "agy" {
-                    conversation::search_antigravity_homes(agy_homes, session)
+    let (id, route) = if let (Some(ref peer_target), Some(ref repo_path)) =
+        (&request.peer_id, &request.repo_path)
+    {
+        match crate::engine::agent_bus::resolve_target_peer(repo_path, peer_target) {
+            Ok(peer) => {
+                if peer.record.surface == "managed" && peer.liveness == "live" {
+                    if let Some(run_id) = peer.record.run_id.clone() {
+                        let managed = match managed_run::follow_up_with(
+                            state,
+                            &run_id,
+                            None,
+                            None,
+                            &mut call,
+                        ) {
+                            Ok(answer) if answer["ok"] == true => match answer["state"].as_str() {
+                                Some(st @ ("parked" | "running")) => Route::Managed {
+                                    state: st.to_owned(),
+                                    turn: answer["turn"].as_i64().unwrap_or(0),
+                                    max_turns: answer["max_turns"].as_i64().unwrap_or(0),
+                                },
+                                other => unavailable(format!(
+                                    "This managed run no longer takes follow-ups (it reports {}).",
+                                    other.unwrap_or("an unknown state")
+                                )),
+                            },
+                            Ok(answer) => unavailable(
+                                answer["reason"]
+                                    .as_str()
+                                    .unwrap_or("This managed run cannot take a follow-up.")
+                                    .to_owned(),
+                            ),
+                            Err(error) => unavailable(format!(
+                                "Manvi could not be asked whether this run takes follow-ups, so nothing was checked: {}",
+                                error.message
+                            )),
+                        };
+                        (run_id, managed)
+                    } else {
+                        (
+                            String::new(),
+                            unavailable("This managed peer has no associated run id."),
+                        )
+                    }
+                } else if peer.liveness == "live" {
+                    let route = match peer.record.provider_session_id.as_deref() {
+                        Some(sid)
+                            if matches!(peer.record.provider.as_str(), "claude" | "agy")
+                                && super::terminal_command::is_canonical_uuid(sid) =>
+                        {
+                            let session = sid.to_ascii_lowercase();
+                            Route::Mailbox {
+                                listening: mailbox.listening(&session, SystemTime::now()),
+                                session,
+                                provider: peer.record.provider.clone(),
+                            }
+                        }
+                        _ => unavailable(
+                            "This peer has no active Claude Code or Antigravity session id to leave a message for.",
+                        ),
+                    };
+                    (peer.record.run_id.unwrap_or_default(), route)
                 } else {
-                    conversation::search_claude_configs(claude_configs, session)
+                    (
+                        peer.record.run_id.unwrap_or_default(),
+                        unavailable(format!(
+                            "This peer is not currently live (state: {}).",
+                            peer.liveness
+                        )),
+                    )
                 }
-            })
-        },
-        || managed_run::follow_up_with(state, &id, None, None, &mut call),
-    );
+            }
+            Err(err) => (
+                String::new(),
+                unavailable(err.into_command_error().message().to_owned()),
+            ),
+        }
+    } else {
+        let row = state.with_store(|store| {
+            query(store, "runs.get", &json!({"id": request.id}).to_string())
+        })?;
+        let run = &row["item"];
+        let id = request.id.clone();
+        let route = decide(
+            run,
+            |session| mailbox.listening(session, SystemTime::now()),
+            || {
+                let checkout_exists = run["cwd"]
+                    .as_str()
+                    .is_some_and(|cwd| std::path::Path::new(cwd).is_dir());
+                let provider = run["provider"].as_str().unwrap_or("claude");
+                conversation::judge(run, checkout_exists, |session| {
+                    if provider == "agy" {
+                        conversation::search_antigravity_homes(agy_homes, session)
+                    } else {
+                        conversation::search_claude_configs(claude_configs, session)
+                    }
+                })
+            },
+            || managed_run::follow_up_with(state, &id, None, None, &mut call),
+        );
+        (id, route)
+    };
     let mut answer = route.preview();
     answer["ok"] = json!(true);
     answer["sent"] = json!(false);

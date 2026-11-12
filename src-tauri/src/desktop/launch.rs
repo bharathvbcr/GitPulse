@@ -152,8 +152,12 @@ pub fn establish() -> Launch {
 /// while this one was starting are delivered first.
 pub fn attach(app: &tauri::AppHandle) {
     if let Some(primary) = PRIMARY.get() {
-        let app = app.clone();
-        primary.attach(move |request| super::answer_forwarded(&app, request));
+        let forwarded = app.clone();
+        primary.attach(move |request| super::answer_forwarded(&forwarded, request));
+        let deliver_app = app.clone();
+        primary.attach_agent_deliver(std::sync::Arc::new(move |request| {
+            super::serve_agent_deliver(&deliver_app, request)
+        }));
     }
 }
 
