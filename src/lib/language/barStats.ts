@@ -52,8 +52,15 @@ const NOTE_MARKDOWN_LANGUAGES = new Set([
   "documentation",
 ]);
 
+/**
+ * Whether a language row is documentation rather than code. The one owner of
+ * "docs" for the language bar's code-only mode and for every lines-of-code
+ * total (Pulse headline, Fleet column). A row without a language name is
+ * judged by its category alone rather than throwing.
+ */
 export function isMarkdownOrNote(stat: RepoLanguageStat | LanguageStat): boolean {
   if (stat.category === "prose") return true;
+  if (typeof stat.language !== "string") return false;
   const lower = stat.language.trim().toLowerCase();
   if (NOTE_MARKDOWN_LANGUAGES.has(lower)) return true;
   return lower.endsWith(".md") || lower.endsWith(".txt") || lower.startsWith("note");

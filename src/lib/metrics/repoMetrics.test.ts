@@ -161,4 +161,40 @@ describe("totalCodeLines", () => {
     expect(totalCodeLines({ stats: [{ code_lines: 10 }, { code_lines: 5 }, {}] } as never)).toBe(15);
     expect(totalCodeLines({ stats: [] } as never)).toBe(0);
   });
+
+  it("leaves documentation out of the count, whether known by category or by name", () => {
+    const stat = (language: string, category: string, code_lines: number) => ({
+      language,
+      color_hex: "#000000",
+      category,
+      code_lines,
+      file_count: 1,
+      percentage: 0,
+    });
+    const report = {
+      stats: [
+        stat("Rust", "programming", 100),
+        stat("Svelte", "markup", 40),
+        stat("JSON", "data", 7),
+        stat("Markdown", "prose", 900),
+        stat("AsciiDoc", "prose", 50),
+        // A note the backend did not tag as prose is still documentation.
+        stat("Text", "data", 30),
+      ],
+      truncated: false,
+      scanned_files: 6,
+      candidate_files: 6,
+    };
+    expect(totalCodeLines(report)).toBe(147);
+  });
+
+  it("is zero, not null, for a repository that holds only documentation", () => {
+    const report = {
+      stats: [{ language: "Markdown", color_hex: "#000", category: "prose", code_lines: 12, file_count: 1, percentage: 100 }],
+      truncated: false,
+      scanned_files: 1,
+      candidate_files: 1,
+    };
+    expect(totalCodeLines(report)).toBe(0);
+  });
 });
