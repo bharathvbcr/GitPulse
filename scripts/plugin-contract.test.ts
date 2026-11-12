@@ -894,23 +894,36 @@ describe("notify routes", () => {
 describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
   const AGY_PLUGIN = path.join(ROOT, "plugins", "gitpulse-agy");
 
-  it("carries a valid Antigravity manifest, logo asset, MCP config, and named-hook root hooks.json", () => {
-    const manifest = loadJsonAt(path.join(AGY_PLUGIN, "plugin.json"));
-    expect(manifest.name).toBe("gitpulse-agy");
-    expect(manifest.logo).toBe("assets/logo.svg");
-    expect(existsSync(path.join(AGY_PLUGIN, "assets", "logo.svg"))).toBe(true);
+  type AgyHandler = {
+    type?: unknown;
+    command?: unknown;
+    timeout?: unknown;
+    env?: Record<string, unknown>;
+  };
+  type AgyEntry = AgyHandler & {
+    matcher?: unknown;
+    hooks?: AgyHandler[];
+  };
 
-    const mcp = loadJsonAt(path.join(AGY_PLUGIN, "mcp_config.json")) as {
-      mcpServers: Record<string, { command: string }>;
-    };
-    expect(mcp.mcpServers.gitpulse.command).toBe("gitpulse-mcp");
+  const hooks = loadJsonAt(path.join(AGY_PLUGIN, "hooks.json")) as Record<
+    string,
+    Record<string, AgyEntry[]>
+  >;
+  const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
+  const known = source.match(/pub const SUBCOMMANDS: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
+  const implemented = new Set([...known.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]));
 
-    const hooks = loadJsonAt(path.join(AGY_PLUGIN, "hooks.json")) as Record<
-      string,
-      Record<string, Array<{ matcher?: string; command?: string; env?: Record<string, string>; hooks?: Array<{ command?: string; env?: Record<string, string> }> }>>
-    >;
-    expect(Object.keys(hooks)).toEqual(["gitpulse"]);
-    expect(Object.keys(hooks.gitpulse).sort()).toEqual([
+  function rustSeconds(name: string): number {
+    const declared = new RegExp(
+      `pub const ${name}: Duration = Duration::from_secs\\((\\d+)\\)`,
+    ).exec(source);
+    expect(declared, `${name} is no longer whole seconds; update this contract`).toBeTruthy();
+    return Number(declared![1]);
+  }
+
+  function validateAgyHooks(candidate: Record<string, Record<string, AgyEntry[]>>) {
+    expect(Object.keys(candidate)).toEqual(["gitpulse"]);
+    expect(Object.keys(candidate.gitpulse).sort()).toEqual([
       "PostInvocation",
       "PostToolUse",
       "PreInvocation",
@@ -918,22 +931,138 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
       "SessionStart",
       "Stop",
     ]);
+    expect(implemented.size).toBeGreaterThan(0);
 
-    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
-    const known = source.match(/pub const SUBCOMMANDS: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
-    const implemented = new Set([...known.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]));
+    const totalBudget = rustSeconds("TOTAL_BUDGET");
+    const peerInboxBudget = rustSeconds("PEER_INBOX_BUDGET");
+    const margin = rustSeconds("HOST_TIMEOUT_MARGIN");
+    const groupedEvents = new Set(["PreToolUse", "PostToolUse"]);
 
-    for (const [event, entries] of Object.entries(hooks.gitpulse)) {
+    for (const [event, entries] of Object.entries(candidate.gitpulse)) {
+      expect(entries.length, `${event} has no entries`).toBeGreaterThan(0);
       for (const item of entries) {
+        if (groupedEvents.has(event)) {
+          expect(Array.isArray(item.hooks), `${event} must use grouped hooks wrapper`).toBe(true);
+          expect(typeof item.matcher, `${event} group must declare a matcher`).toBe("string");
+          const matcher = String(item.matcher);
+          if (event === "PreToolUse") {
+            expect(matcher.startsWith("^") && matcher.endsWith("$"), matcher).toBe(true);
+          } else {
+            expect(matcher).toBe("*");
+          }
+        } else {
+          expect(item.hooks, `${event} is a flat lifecycle event in agy`).toBeUndefined();
+          expect(item.matcher, `${event} ignores matchers in agy`).toBeUndefined();
+        }
+
         const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+        expect(handlers.length, `${event} group has no handlers`).toBeGreaterThan(0);
         for (const handler of handlers) {
-          const [bin, sub] = bareHookCommand(String(handler.command)).split(/\s+/);
+          expect(handler.type, `${event}`).toBe("command");
+          expect(typeof handler.command, `${event}`).toBe("string");
+          const [bin, ...rest] = bareHookCommand(String(handler.command)).split(/\s+/);
           expect(bin, `${event}`).toBe("gitpulse-hook");
-          expect(implemented, `${event}: ${sub}`).toContain(sub);
-          expect(handler.env?.GITPULSE_HOST).toBe("antigravity");
-          expect(handler.env?.GITPULSE_AGY_PLUGIN_ROOT).toBe("$PLUGIN_ROOT");
+          expect(rest.length, `${event}: ${handler.command}`).toBeGreaterThan(0);
+          expect(rest.length, `${event}: ${handler.command}`).toBeLessThanOrEqual(2);
+          if (rest.length === 2) {
+            expect(rest[0], `${event}: ${handler.command}`).toBe("notify");
+          }
+          expect(implemented, `${event}: ${rest[0]}`).toContain(rest[0]);
+
+          // Antigravity's `hooks.json` contract (`HookHandlerConfig.timeout` int32)
+          // measures `timeout` in whole seconds (default 30), NOT milliseconds.
+          expect(typeof handler.timeout, `${event}: ${handler.command} has no timeout`).toBe("number");
+          const timeout = handler.timeout as number;
+          expect(Number.isInteger(timeout), `${event}: ${handler.command} timeout must be an int`).toBe(true);
+          expect(timeout, `${event}: ${handler.command}`).toBeGreaterThan(0);
+          expect(timeout, `${event}: ${handler.command}`).toBeLessThanOrEqual(60);
+
+          const sub = rest[0];
+          const minTimeout =
+            sub === "notify"
+              ? margin + 1
+              : sub === "peer-inbox" || sub === "stop-or-notify"
+                ? peerInboxBudget + margin
+                : totalBudget + margin;
+          expect(
+            timeout,
+            `${event} "${handler.command}" times out at ${timeout}s before its ${minTimeout}s internal budget + margin`,
+          ).toBeGreaterThanOrEqual(minTimeout);
+
+          // `agy` natively injects `PLUGIN_ROOT` into plugin hook subprocesses
+          // and does NOT interpolate `$PLUGIN_ROOT` in JSON `env` maps.
+          expect(handler.env, `${event}: ${handler.command}`).toEqual({
+            GITPULSE_HOST: "antigravity",
+          });
         }
       }
     }
+  }
+
+  it("carries a valid Antigravity manifest, logo asset, MCP config, and named-hook root hooks.json", () => {
+    const manifest = loadJsonAt(path.join(AGY_PLUGIN, "plugin.json"));
+    expect(manifest.name).toBe("gitpulse-agy");
+    expect(manifest.logo).toBe("assets/logo.svg");
+    expect(existsSync(path.join(AGY_PLUGIN, "assets", "logo.svg"))).toBe(true);
+
+    const mcp = loadJsonAt(path.join(AGY_PLUGIN, "mcp_config.json")) as {
+      mcpServers: Record<string, { command: string; env?: Record<string, unknown> }>;
+    };
+    expect(mcp.mcpServers.gitpulse.command).toBe("gitpulse-mcp");
+    expect(mcp.mcpServers.gitpulse.env).toEqual({ GITPULSE_HOST: "antigravity" });
+
+    validateAgyHooks(hooks);
+  });
+
+  it("rejects millisecond, zero, negative, fractional, missing, or below-budget timeouts, invalid matchers, and uninterpolated env vars", () => {
+    // Boundary acceptance: 60s (the synchronous ceiling) is valid.
+    const atCeiling = structuredClone(hooks);
+    atCeiling.gitpulse.PreToolUse[0].hooks![0].timeout = 60;
+    expect(() => validateAgyHooks(atCeiling)).not.toThrow();
+
+    // Invalid timeouts: missing, string, 0, negative, float, >60s, millisecond values, and below internal budget.
+    for (const badTimeout of [undefined, "10", 0, -5, 5.5, 61, 5000, 10000, 9]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PreToolUse[0].hooks![0].timeout = badTimeout;
+      expect(() => validateAgyHooks(copy), `collision-guard timeout=${String(badTimeout)}`).toThrow();
+    }
+    const belowPeerBudget = structuredClone(hooks);
+    belowPeerBudget.gitpulse.PreInvocation[0].timeout = 3;
+    expect(() => validateAgyHooks(belowPeerBudget)).toThrow();
+
+    // Uninterpolated `$PLUGIN_ROOT` or missing `GITPULSE_HOST` in `env`.
+    const uninterpolatedEnv = structuredClone(hooks);
+    uninterpolatedEnv.gitpulse.Stop[0].env = {
+      GITPULSE_HOST: "antigravity",
+      GITPULSE_AGY_PLUGIN_ROOT: "$PLUGIN_ROOT",
+    };
+    expect(() => validateAgyHooks(uninterpolatedEnv)).toThrow();
+
+    const emptyEnv = structuredClone(hooks);
+    emptyEnv.gitpulse.Stop[0].env = {};
+    expect(() => validateAgyHooks(emptyEnv)).toThrow();
+
+    // Missing or invalid matchers on grouped vs flat events.
+    for (const badPostMatcher of [undefined, ""]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PostToolUse[0].matcher = badPostMatcher;
+      expect(() => validateAgyHooks(copy), `PostToolUse matcher=${String(badPostMatcher)}`).toThrow();
+    }
+    const unanchoredPre = structuredClone(hooks);
+    unanchoredPre.gitpulse.PreToolUse[1].matcher = "run_command";
+    expect(() => validateAgyHooks(unanchoredPre)).toThrow();
+
+    const flatWithMatcher = structuredClone(hooks);
+    flatWithMatcher.gitpulse.Stop[0].matcher = "*";
+    expect(() => validateAgyHooks(flatWithMatcher)).toThrow();
+
+    // Empty event or handler arrays.
+    const emptyGroup = structuredClone(hooks);
+    emptyGroup.gitpulse.PostToolUse[0].hooks = [];
+    expect(() => validateAgyHooks(emptyGroup)).toThrow();
+
+    const emptyEvent = structuredClone(hooks);
+    emptyEvent.gitpulse.Stop = [];
+    expect(() => validateAgyHooks(emptyEvent)).toThrow();
   });
 });
