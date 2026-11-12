@@ -264,7 +264,7 @@ impl Host {
                     receipts: self.receipts.clone(),
                     run_id: request.run_id.clone(),
                 });
-                match engine::start_session(&self.engine, request, self.sink(), events, None) {
+                match engine::start_unobserved(&self.engine, request, self.sink(), events) {
                     Ok(started) => {
                         let (process, process_error) = match started.process {
                             Ok(process) => (Some(process), None),

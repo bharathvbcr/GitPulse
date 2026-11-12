@@ -314,6 +314,38 @@ pub(crate) trait SessionObserver: Send + Sync {
     fn finished(&self, payload: &TerminalExitPayload);
 }
 
+/// The observer of a session nobody observes: it has no values, so a
+/// [`start_session_with`] instantiated with it carries no observer calls.
+///
+/// The terminal host starts every session this way. Through `dyn
+/// SessionObserver` its copy of the engine was shared with the app's, and
+/// release LTO folded those calls into the app's one implementor
+/// (`workbench::terminal_run::RunObserver<Wry>`), whose window-stack code the
+/// host's own LTO had already dropped: `gitpulse-ptyd` stopped linking.
+pub(crate) enum NoObserver {}
+
+impl SessionObserver for NoObserver {
+    fn run_id(&self) -> &str {
+        match *self {}
+    }
+    fn before_spawn(&self, _session_id: &str) -> Result<(), String> {
+        match *self {}
+    }
+    fn started(
+        &self,
+        _session_id: &str,
+        _process: Result<(u32, String), String>,
+    ) -> Result<(), String> {
+        match *self {}
+    }
+    fn spawn_failed(&self, _session_id: &str, _reason: &str) {
+        match *self {}
+    }
+    fn finished(&self, _payload: &TerminalExitPayload) {
+        match *self {}
+    }
+}
+
 pub const AGENT_META_EVENT: &str = "terminal-agent-meta";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2803,6 +2835,28 @@ pub(crate) fn start_session(
     output: OutputSink,
     events: Arc<dyn SessionEvents>,
     observer: Option<Arc<dyn SessionObserver>>,
+) -> Result<Started, CommandError> {
+    start_session_with(state, request, output, events, observer)
+}
+
+/// [`start_session`] for a session nobody observes: the terminal host's. Its
+/// own instantiation, so no observer call is compiled into it (see
+/// [`NoObserver`]).
+pub(crate) fn start_unobserved(
+    state: &TerminalSessions,
+    request: SpawnRequest,
+    output: OutputSink,
+    events: Arc<dyn SessionEvents>,
+) -> Result<Started, CommandError> {
+    start_session_with::<NoObserver>(state, request, output, events, None)
+}
+
+fn start_session_with<O: SessionObserver + ?Sized + 'static>(
+    state: &TerminalSessions,
+    request: SpawnRequest,
+    output: OutputSink,
+    events: Arc<dyn SessionEvents>,
+    observer: Option<Arc<O>>,
 ) -> Result<Started, CommandError> {
     let SpawnRequest {
         session_id,

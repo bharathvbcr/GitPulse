@@ -48,6 +48,7 @@
     "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --bin gitpulse-hook --locked --force && node scripts/record-install.mjs",
     "mcp:doctor": "node scripts/check-mcp-install.mjs",
     "gusset:check": "node scripts/gusset-check.mjs",
+    "check:ptyd-release": "node scripts/check-ptyd-release.mjs",
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
     "check:vendor-edits": "node scripts/vendor-crates.mjs --check --allow-drift",
